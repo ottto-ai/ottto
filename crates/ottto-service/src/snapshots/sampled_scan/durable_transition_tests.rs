@@ -40,7 +40,8 @@ impl M1 {
         assert_eq!(warm.modes, (1, 0, 0));
         warm.enrich(&c);
         warm.finish();
-        let (status, bodies, _) = upload(&warm.scan.snapshots, &mut e2_progress(), ack);
+        let mut progress = e2_progress();
+        let (status, bodies, _) = upload(&warm.scan.snapshots, &mut progress, ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
         let result = RouteResult::emitted(Mode::ColdFull, SOURCE, bodies, &warm.scan.snapshots);
         let accepted = warm
@@ -65,6 +66,13 @@ impl M1 {
                 .iter()
                 .map(|s| s.snapshot_fingerprint.clone())
                 .collect(),
+        );
+        // Settlement also records each file's upload-context receipt from
+        // the exact ACKs, as the service does after every delivered page.
+        accept_upload_context_acks_for_test(
+            &mut warm.index,
+            &warm.scan.snapshots,
+            &progress.fresh_context_body_acks,
         );
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
@@ -219,6 +227,13 @@ impl TransitionDriver for M1 {
                     .iter()
                     .map(|s| s.snapshot_fingerprint.clone())
                     .collect(),
+            );
+            // The exact ACKs earn per-file upload-context receipts, as the
+            // service's settlement records them.
+            accept_upload_context_acks_for_test(
+                &mut page.index,
+                &page.scan.snapshots,
+                &progress.fresh_context_body_acks,
             );
             bodies
         };
@@ -774,6 +789,13 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         // Native partial settlement keeps the old root, never an unACKed r4.
         // The sibling's real native rename failed before either POST; partial
         // index settlement still grants no acceptance to the failed root POST.
+        // The partial checkpoint records the ACKed sibling's upload-context
+        // receipt, as the service does; the unACKed root earns none.
+        accept_upload_context_acks_for_test(
+            &mut attempt.index,
+            &attempt.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         let mut partial = attempt.index.committable_subset(
             &attempt.committed,
             &progress.accepted_fingerprints,
@@ -829,6 +851,11 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         cold_page
             .index
             .record_accepted_snapshot_fingerprints(&cold_progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut cold_page.index,
+            &cold_page.scan.snapshots,
+            &cold_progress.fresh_context_body_acks,
+        );
         let cold = RouteResult::emitted(Mode::ColdFull, SOURCE, batches, &cold_page.scan.snapshots);
 
         // Native RAM re-scan starts at the actual saved partial generation;
@@ -862,6 +889,11 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         retry_page
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut retry_page.index,
+            &retry_page.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         f.prior = f
             .disk
             .commit(&retry_page.cache, SOURCE, &mut retry_page.index);
@@ -1269,6 +1301,235 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
     });
 }
 
+/// [money] The requested tier from thread settings, from old keyless state:
+/// both counting versions start from durable records of a pre-epoch prefix
+/// that holds a Fast snapshot and no reducer key. Post-epoch growth then emits
+/// what a cold Full emits on RAM and restart, in totals and placement, first
+/// with no new snapshot, where the pre-epoch evidence stamps nothing on any
+/// route, then through an explicit tier, a clearing snapshot and another
+/// explicit tier. Controls: swapped accounts and a changed tier fail the
+/// comparator.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M1 requires qualified native heap layout"
+)]
+fn shared_codex_thread_tier_upgrade_from_old_keyless_state_matches_cold_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !supported("shared_codex_thread_tier") {
+        return;
+    }
+    const SECOND: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let source = SnapshotSource::Codex;
+    let settings = |at: &str, tier: Option<&str>| {
+        let mut settings = json!({"model": "gpt-5.2"});
+        if let Some(tier) = tier {
+            settings["service_tier"] = json!(tier);
+        }
+        json!({"type":"event_msg","timestamp":at,"payload":{
+            "type":"thread_settings_applied","thread_settings":settings}})
+        .to_string()
+            + "\n"
+    };
+    let tiers = |scan: &SourceScanResult| {
+        let mut tiers = BTreeMap::<Option<String>, u64>::new();
+        let root = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        for row in &root.model_usage {
+            *tiers
+                .entry(row.selector_context.get("service_tier").cloned())
+                .or_default() += row.input_tokens;
+        }
+        tiers
+    };
+    for legacy in [false, true] {
+        let c = corpus(if legacy {
+            "transition-codex-tier-legacy"
+        } else {
+            "transition-codex-tier-v2"
+        });
+        let mut disk = Disk::new(&c);
+        // The session id in the file name is what lets each header's creator
+        // pair reach the row as account evidence.
+        let files = [ROOT, SECOND].map(|session| {
+            let name = format!("rollout-2026-10-27T07-00-00-{session}.jsonl");
+            (c.root.join(name), session)
+        });
+        let grow = |text: &str| {
+            for (path, session) in &files {
+                append(path, &text.replace(ROOT, session));
+                input_clock(path);
+            }
+        };
+        for (path, session) in &files {
+            let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"id":session,"timestamp":"2026-10-27T07:00:00Z",
+                "creator_user_id":format!("synthetic-user-{session}"),
+                "creator_account_id":format!("synthetic-workspace-{session}")}})
+            .to_string()
+                + "\n";
+            std::fs::write(path, header).unwrap();
+        }
+        grow(&(settings("2026-10-27T07:00:00Z", Some("priority")) + &codex_rows("turn-a", 10)));
+        let scanner = disk.owner(source);
+        // The record binds the cutover active at its commit.
+        let mut prior = {
+            let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+            let (mut live, scan, modes) = other_page(&c, &scanner, source, ScanIndex::default());
+            assert_eq!(modes, (2, 0, 0));
+            live.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            disk.commit(&scanner.cache, source, &mut live)
+        };
+        let _cutover = crate::snapshots::TestCutover::set(0);
+        if legacy {
+            // A real prior Legacy ACK keeps this file Legacy under the cutover.
+            grow(&codex_rows("turn-b", 20));
+            let (mut upgraded, scan, modes) = other_page(&c, &scanner, source, prior);
+            assert_eq!(modes, (2, 0, 0));
+            assert!(!scan.snapshots.is_empty());
+            prior = disk.commit(&scanner.cache, source, &mut upgraded);
+        }
+        let records = disk.record_bytes();
+        assert_eq!(records.len(), files.len());
+        let key = b"codex_thread_tier";
+        for old in records.values() {
+            assert!(!old.windows(key.len()).any(|bytes| bytes == key));
+        }
+        let mut flex = 0;
+        for (step, tier) in [None, Some(Some("flex")), Some(None), Some(Some("priority"))]
+            .into_iter()
+            .enumerate()
+        {
+            let at = "2026-11-09T07:00:00Z";
+            let snapshot = tier.map_or(String::new(), |tier| settings(at, tier));
+            let rows = codex_rows(&format!("tier-{step}"), 30 + step as u64)
+                .replace("2026-10-27", "2026-11-09");
+            grow(&(snapshot + &rows));
+            let (cold_index, cold_scan, cold_modes) =
+                other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+            assert_eq!(cold_modes, (2, 0, 0));
+            let owner = disk.owner(source);
+            let (restart_index, restart_scan, restart_modes) =
+                other_page(&c, &owner, source, prior.clone());
+            assert_eq!(restart_modes, (0, 2, 0));
+            assert_eq!(durable_restores(&owner.cache, source).1, 2);
+            disk.begin(&scanner, source);
+            let (mut ram_index, ram_scan, ram_modes) =
+                other_page(&c, &scanner, source, prior.clone());
+            assert_eq!(ram_modes, (0, 2, 0));
+            let route = |mode, index: &ScanIndex, scan: &SourceScanResult| {
+                let mut route = RouteResult::emitted(
+                    mode,
+                    source,
+                    vec![other_wire(source, scan)],
+                    &scan.snapshots,
+                );
+                route.codex_evidence = fixture::codex_evidence(index, scan);
+                route
+            };
+            let cold = route(Mode::ColdFull, &cold_index, &cold_scan);
+            let restart = route(Mode::Restart, &restart_index, &restart_scan);
+            money_oracle::assert_equivalent(&cold, &restart);
+            money_oracle::assert_equivalent(&cold, &route(Mode::Ram, &ram_index, &ram_scan));
+            let restored = tiers(&restart_scan);
+            let tiers = tiers(&cold_scan);
+            assert_eq!(restored, tiers, "restored and cold Full tiers");
+            let flex_now = tiers.get(&Some("flex".to_string())).copied().unwrap_or(0);
+            match step {
+                0 => {
+                    assert_eq!(tiers.len(), 1);
+                    assert!(
+                        tiers.contains_key(&None::<String>),
+                        "pre-epoch evidence stamps no post-epoch usage"
+                    );
+                }
+                1 => {
+                    assert_eq!(tiers.len(), 2);
+                    assert!(flex_now > 0);
+                    flex = flex_now;
+                }
+                2 => {
+                    assert_eq!(tiers.len(), 2);
+                    assert_eq!(flex_now, flex, "a clearing snapshot leaks no earlier tier");
+                }
+                _ => {
+                    assert_eq!(tiers.len(), 3);
+                    assert!(tiers.contains_key(&Some("priority".to_string())));
+                    let evidence =
+                        |session: &str| cold.snapshots[session]["session_account_evidence"].clone();
+                    let (a, b) = (evidence(ROOT), evidence(SECOND));
+                    assert!(a.is_object() && b.is_object(), "placement evidence");
+                    assert_ne!(a, b, "two accounts");
+                    let mut wrong = restart.clone();
+                    wrong.snapshots.get_mut(ROOT).unwrap()["session_account_evidence"] = b;
+                    wrong.snapshots.get_mut(SECOND).unwrap()["session_account_evidence"] = a;
+                    assert!(std::panic::catch_unwind(|| {
+                        money_oracle::assert_placement_equivalent(&cold, &wrong)
+                    })
+                    .is_err());
+                    let mut wrong = restart.clone();
+                    for row in wrong.snapshots.get_mut(ROOT).unwrap()["model_usage"]
+                        .as_array_mut()
+                        .unwrap()
+                    {
+                        if row["selector_context"].get("service_tier").is_some() {
+                            row["selector_context"]["service_tier"] = json!("standard");
+                        }
+                    }
+                    assert!(std::panic::catch_unwind(|| {
+                        money_oracle::assert_equivalent(&cold, &wrong)
+                    })
+                    .is_err());
+                }
+            }
+            ram_index.record_accepted_snapshot_fingerprints(
+                &ram_scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            prior = disk.commit(&scanner.cache, source, &mut ram_index);
+        }
+        // Nothing changed: a restarted process starts a first walk, which opens
+        // each file once for its identity samples and parses no byte of it.
+        let opens = crate::snapshots::all_transcript_opens_for_test();
+        let owner = disk.owner(source);
+        let ((_, quiet_scan, modes), consumed) =
+            fixture::observe_consumed(|| other_page(&c, &owner, source, prior.clone()));
+        assert!(quiet_scan.snapshots.is_empty());
+        let identity_opens = crate::snapshots::all_transcript_opens_for_test() - opens;
+        assert_eq!(identity_opens, files.len());
+        const IDENTITY_SAMPLE_BYTES: u64 = 4096;
+        let anchor_window = files
+            .iter()
+            .map(|(path, _)| match std::fs::metadata(path).unwrap().len() {
+                len if len > IDENTITY_SAMPLE_BYTES => 2 * IDENTITY_SAMPLE_BYTES,
+                len => len,
+            })
+            .sum::<u64>();
+        let mut quiet = RouteResult::emitted(Mode::Restart, source, Vec::new(), &[]);
+        quiet.modes = modes;
+        quiet.io = IoBytes {
+            consumed,
+            cheap_checks: Some(0),
+            anchor_reads: Some(anchor_window),
+            other_reads: Some(0),
+            ..Default::default()
+        };
+        money_oracle::assert_quiet_restart_with_anchor_window(&quiet, anchor_window);
+    }
+}
+
 /// 24b observes version state at the real growth/EOF seam after a retired-pin
 /// rebuild, then tails the native successor through two committed restarts.
 struct Codex24b {
@@ -1276,6 +1537,20 @@ struct Codex24b {
     disk: Disk,
     prior: ScanIndex,
     pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
+    v2: bool,
+}
+
+/// A restarted owner. A published v2 index stays at its bound custody path:
+/// M3's fork moves it to an unbound path whose save is refused as foreign.
+/// Each 24b commit has one durable arm, so the committed store is already
+/// every arm's predecessor.
+fn owner_24b(disk: &mut Disk, source: SnapshotSource, v2: bool) -> E2ScanFixture {
+    if !v2 {
+        return disk.owner(source);
+    }
+    let owner = E2ScanFixture::default();
+    disk.begin(&owner, source);
+    owner
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1306,7 +1581,7 @@ impl TransitionDriver for Codex24b {
         let mut scanner = if mode == Mode::ColdFull {
             E2ScanFixture::default()
         } else {
-            self.disk.owner(source)
+            owner_24b(&mut self.disk, source, self.v2)
         };
         if mode != Mode::ColdFull
             && self
@@ -1386,8 +1661,17 @@ impl TransitionDriver for Codex24b {
     }
 }
 
-fn codex_24b_old_writer_row() {
-    let mut c = corpus("transition-codex-24b");
+fn codex_24b_old_writer_row(v2: bool) {
+    let mut c = corpus(if v2 {
+        "transition-codex-24b-state-v2"
+    } else {
+        "transition-codex-24b"
+    });
+    if v2 {
+        // Custody, record store and writer lock share one canonical prefix.
+        c.base = c.base.canonicalize().unwrap();
+        c.support = c.base.join("support");
+    }
     c.root = c.base.join(".codex/sessions");
     std::fs::create_dir_all(&c.root).unwrap();
     let path = c.root.join("rollout.jsonl");
@@ -1398,10 +1682,23 @@ fn codex_24b_old_writer_row() {
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
     let mut disk = Disk::new(&c);
+    // Codex-ON: on a published state v2 route every save and reload below
+    // goes through the store; dropping the custody erases it.
+    let (custody, start) = if v2 {
+        let (custody, start) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Codex,
+            &ScanIndex::default(),
+            &disk.dir,
+        );
+        disk.index = custody.path().to_owned();
+        (Some(custody), start)
+    } else {
+        (None, ScanIndex::default())
+    };
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
-    let writer = disk.owner(source);
-    let (mut index, scan, modes) = other_page(&c, &writer, source, ScanIndex::default());
+    let writer = owner_24b(&mut disk, source, v2);
+    let (mut index, scan, modes) = other_page(&c, &writer, source, start);
     assert_eq!(modes, (1, 0, 0));
     assert!(scan.snapshots[0].request_count > 0);
     index.record_accepted_snapshot_fingerprints(
@@ -1425,6 +1722,7 @@ fn codex_24b_old_writer_row() {
         disk,
         prior,
         pages: BTreeMap::new(),
+        v2,
     };
     append(&path, &codex_rows("golden-rebuild", 5));
     input_clock(&path);
@@ -1480,10 +1778,14 @@ fn codex_24b_old_writer_row() {
         assert!(!committed.accepted.is_empty(), "native ACK baseline exists");
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
+        assert_eq!(
+            crate::snapshots::state_v2_growth_retention_active(&driver.prior),
+            v2
+        );
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
         // M3's unchanged restart performs no acquisition/body decode. The
         // M1 raw-restored-EOF/version-observation subarm has no M3 equivalent.
-        let owner = driver.disk.owner(source);
+        let owner = owner_24b(&mut driver.disk, source, v2);
         let (quiet_index, quiet, modes) =
             other_page(&driver.c, &owner, source, driver.prior.clone());
         assert_eq!(modes.0, 0);
@@ -1507,6 +1809,7 @@ fn codex_24b_old_writer_row() {
             0
         );
     }
+    drop(custody);
 }
 
 /// [format] shared 24b old writer restored version tail and unchanged restart twice.
@@ -1518,7 +1821,16 @@ fn codex_24b_old_writer_row() {
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_24b"));
-    codex_24b_old_writer_row();
+    codex_24b_old_writer_row(false);
+}
+
+/// [money] Codex-ON: the same 24b row with its index published to state v2.
+/// Cold Full, restored Tail and restarted arms emit equal money and placement.
+#[test]
+fn shared_24b_old_writer_on_published_state_v2_matches_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    assert!(supported("shared_24b_state_v2"));
+    codex_24b_old_writer_row(true);
 }
 
 /// M3 uses the shared native pipeline and its single money oracle. Each

@@ -1967,121 +1967,6 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Capture is process-local in RAM, but a durable checkpoint crosses a
-/// restart. Both toggle directions must change Claude's binding (Codex is
-/// unaffected) and refuse the old record under the actual env setting.
-#[test]
-fn attribution_capture_toggle_refuses_the_previous_claude_record() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    if !crate::test_isolation::run_here() {
-        return;
-    }
-    for before in [false, true] {
-        let root = crate::test_scratch::private_dir("ottto-dt-attribution");
-        let lock = test_locks::hold(&root);
-        let source = SnapshotSource::ClaudeCode;
-        let namespace = Scope("attribution-test".into());
-        let scope = Scope("attribution-file".into());
-        let index_path = root.join("index.json");
-        let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
-        native_fixture(&path);
-        let key = local_index_key(&path);
-        let mut index = ScanIndex::default();
-        index.files.insert(
-            key.clone(),
-            serde_json::from_value(serde_json::json!({
-                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
-            }))
-            .unwrap(),
-        );
-        index.save(&index_path).unwrap();
-        // Isolated child process: no concurrent test can observe the env.
-        std::env::set_var(
-            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
-            if before { "1" } else { "0" },
-        );
-        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-        let codex_before =
-            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
-        let binding = expected(
-            DurableSource::ClaudeCode,
-            source,
-            &key,
-            &scope,
-            &index,
-            &interpretation,
-            None,
-        )
-        .unwrap()
-        .binding;
-        let (reduction, _) = native_record(&path, &scope);
-        let mut store = fixture::store(&index_path, durable_source(source).unwrap());
-        let receipt = store
-            .write_after_save(
-                lock,
-                index.generation,
-                0,
-                vec![PendingRecord {
-                    acquisition: fixture_acquisition(source),
-                    binding: binding.clone(),
-                    certificate: certificate(&path, &scope),
-                    body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
-                        .unwrap(),
-                    allowlist: codec::allowlist_digest(source),
-                }],
-            )
-            .unwrap();
-        assert_eq!(
-            receipt.written, 1,
-            "each toggle starts from its own persisted binding"
-        );
-        std::env::set_var(
-            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
-            if before { "0" } else { "1" },
-        );
-        let after = Interpretation::of(source, &key, &index, false, &namespace);
-        let changed = expected(
-            DurableSource::ClaudeCode,
-            source,
-            &key,
-            &scope,
-            &index,
-            &after,
-            None,
-        )
-        .unwrap()
-        .binding;
-        assert_ne!(binding.scope, changed.scope);
-        assert_eq!(binding.entry, changed.entry);
-        assert_eq!(binding.key, changed.key);
-        assert_eq!(binding.context, changed.context);
-        assert_eq!(
-            codex_before.identity_contract,
-            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace)
-                .identity_contract
-        );
-        let cache = fixture::cache(source, &index_path, &namespace, false);
-        assert!(cache
-            .durable_restore(
-                source,
-                &key,
-                &path,
-                &scope,
-                &mut File::open(&path).unwrap(),
-                &index,
-                &after
-            )
-            .into_test_option()
-            .is_none());
-        let (counts, disk) = cache.durable_counters(source).unwrap();
-        // The finite original-binding classifier owns Claude scope misses.
-        assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
-        assert_eq!(counts.restored, 0);
-        assert_eq!(disk.records_read, 1);
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
 /// A Codex transcript whose open call's id is `call_id_bytes` long: the id
 /// is kept verbatim in the record body, so it sizes the body. Three counted
 /// requests close the session-start window first, so its re-derived opening
@@ -3403,11 +3288,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
             assert!(!old.ineligible.contains_key("selection_cleared"));
             assert_eq!(old.ineligible["history_owed"], 1);
             assert_eq!(old.durable_held, [0; 9]);
-            let text = old.summary(source, &disk);
-            assert!(!text.contains("restore_attempts="));
-            assert!(text.contains("disk_records="));
-            assert!(text.contains("not_persisted="));
-            // No new record or recovery operation is performed by these diagnostics.
+            // Inspecting counters performs no record or recovery I/O.
             assert_eq!(disk.records_read, 0);
         } else {
             assert!(cache.durable_counters(source).is_none());
@@ -3749,10 +3630,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     let before = Interpretation::of(source, &key, &index, true, &namespace);
     assert_eq!(
         before.identity_contract,
-        format!(
-            "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true|attr={}",
-            claude_attribution_capture_enabled()
-        ),
+        "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true|attr=false",
         "the pre-cutover interpretation bytes"
     );
     let capture = claude_request_identity::captures(source);
@@ -5057,11 +4935,11 @@ fn a1a_scan_at(
 #[test]
 #[cfg(target_os = "macos")]
 fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
-    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::local_resource_diagnostics::rearm_cause;
+    use crate::snapshots::evidence_owed::EvidenceContract;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
 
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _owed = EvidenceOwedForTest::on();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -5161,10 +5039,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         assert_eq!(initial.snapshots[0].input_tokens, 100);
         let stamped = EvidenceContract::current(&index);
         assert!(stamped.is_some());
-        assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            stamped
-        );
+        // The complete census retires the family pending (main's completion;
+        // the removed switch kept unproven pending). The stamp written on
+        // accumulation is pinned by
+        // `evidence_owed::tests::contract_stamp_is_written_on_accumulation_and_never_laundered`.
+        assert!(index.claude_usage_family_pending.get(SESSION).is_none());
         finalize_scan_after_policy(source, &mut initial, &mut index);
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -5182,7 +5061,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         // Keep the physical file and its revision unchanged across the re-arm.
         prior.claude_usage_family_pending.clear();
         prior.traversal = None;
-        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        // The terminal-retry re-arm owes it.
+        rearm_cause::clear(
+            &key,
+            prior.files.get_mut(&key).unwrap(),
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+        );
         assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
         assert!(prior.files[&key].observed_fingerprint().is_empty());
         prior.save(&disk.index_path).unwrap();
@@ -5223,9 +5107,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             &scan_money(source, &index, &restored),
         );
         let current = EvidenceContract::current(&index);
+        // The owed route's family pending (and its contract stamp) is the
+        // cold Full's.
         assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            current
+            index.claude_usage_family_pending.get(SESSION),
+            cold_index.claude_usage_family_pending.get(SESSION)
         );
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -8607,7 +8493,7 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
             let ((result, content_reads), samples) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     capture_rederive_reads(|| {
-                        cache.durable_restore_record_scoped(
+                        cache.restore_record_content(
                             source,
                             &record,
                             &expected,
@@ -8627,14 +8513,6 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
                 cache.durable().unwrap().counters.restore_pending_quiet
                     [diagnostic_source_slot(source)],
                 1
-            );
-            assert_eq!(
-                cache
-                    .durable()
-                    .unwrap()
-                    .counters
-                    .rederive_failed_first_attempt,
-                [0; 3]
             );
             assert!(samples.is_empty());
             assert_eq!(content_reads, 0);
@@ -8748,9 +8626,9 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
 
 // F4: all certificate edit reasons dominate decode on the production scoped
 // entry. This portable row complements the macOS writer/retirement matrix.
-/// [format] bounded restore certificate edit reasons precede decode and count first failure.
+/// [format] bounded restore certificate edit reasons precede decode.
 #[test]
-fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failure() {
+fn bounded_restore_certificate_edit_reasons_precede_decode() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::{Seek, SeekFrom, Write};
     for reason in [
@@ -8822,7 +8700,7 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             namespace: &scope,
         };
         let (result, reads) = capture_rederive_reads(|| {
-            cache.durable_restore_record_scoped(
+            cache.restore_record_content(
                 source,
                 &record,
                 &expected,
@@ -8841,14 +8719,6 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             "{reason:?}"
         );
         assert_eq!(reads, 0);
-        assert_eq!(
-            cache
-                .durable()
-                .unwrap()
-                .counters
-                .rederive_failed_first_attempt[1],
-            1
-        );
         lease.release();
     }
 }
@@ -9011,16 +8881,11 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
                 stores.counters.retire_exact_held.get(edge.label()),
                 Some(&2)
             );
-            assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         }
         assert!(rows
             .iter()
             .any(|r| r["counts"]["retire_exact_held"][edge.label()] == 1
                 && r["counts"]["retire_exact_held_exit"] == "revalidated_retire_exact"));
-        assert!(rows
-            .iter()
-            .any(|r| r["counts"]["retire_exact_held_first_attempt"] == 1
-                && r["process_id"] == std::process::id()));
         // Named exit: the next verified read re-establishes the same eligible
         // predecessor, then the existing post-save writer runs retire_exact.
         let current = {
@@ -9042,7 +8907,6 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
             stores.counters.ineligible.get("rederive_retire.retired"),
             Some(&1)
         );
-        assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         assert_eq!(stores.key_debt[&binding.key].retire_source, None);
         assert!(!stores.key_debt[&binding.key].retire_sync);
     }
@@ -11386,7 +11250,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
-    let restored = cache.durable_restore_record_scoped(
+    let restored = cache.restore_record_content(
         source,
         &record,
         &expected,

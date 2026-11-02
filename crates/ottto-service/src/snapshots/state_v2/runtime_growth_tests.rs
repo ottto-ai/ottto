@@ -360,7 +360,7 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     guard().unwrap();
     let receipt = super::super::ack::ProgressRecovery::for_index(&old, &f.path).unwrap();
     assert!(receipt.is_some());
-    old.upload_context_fingerprint = Some("synthetic-next-context".into());
+    old.historical_replay_generation = Some("synthetic-next-context".into());
     old.save(&f.path).unwrap();
     assert!(
         guard().is_err(),
@@ -381,8 +381,8 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     );
     assert_eq!(reopened.v2().growth_retention, old.v2().growth_retention);
     assert_eq!(
-        reopened.upload_context_fingerprint,
-        old.upload_context_fingerprint
+        reopened.historical_replay_generation,
+        old.historical_replay_generation
     );
     assert_eq!(
         serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
@@ -451,7 +451,7 @@ fn row_claim_commits_expected_rows_without_a_hydrate() {
     index
         .files
         .insert(expired.into(), index.files[&f.key].clone());
-    index.upload_context_fingerprint = Some("synthetic-next-context".into());
+    index.historical_replay_generation = Some("synthetic-next-context".into());
     let desired = index.v2().growth_retention.clone();
     let durable_rows = |index: &ScanIndex| {
         let mut rows = BTreeMap::new();
@@ -497,7 +497,7 @@ fn row_claim_refuses_a_stale_generation() {
     let mut owner = f.load();
     let mut stale = f.load();
     let candidate = f.candidate(&stale);
-    owner.upload_context_fingerprint = Some("synthetic-next-context".into());
+    owner.historical_replay_generation = Some("synthetic-next-context".into());
     owner.save(&f.path).unwrap();
     let (claimed, untouched) = admit_without_hydrate(&mut stale, &candidate, NOW);
     assert!(!claimed);

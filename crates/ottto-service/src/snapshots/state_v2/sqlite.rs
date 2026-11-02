@@ -735,6 +735,8 @@ impl Sqlite {
         // a nonzero allocated WAL by itself is not a checkpoint debt.
         store.maintenance(false)?;
         store.control("phase", &1_u8)?;
+        // Runtime loads re-emit any separate save/custody hold after hydration.
+        super::telemetry::event("hold", &"none");
         Ok(store)
     }
     pub(super) fn finish_import(mut self) -> Result<()> {
@@ -798,6 +800,10 @@ impl Sqlite {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Some(0),
             _ => None,
         }
+    }
+    #[cfg(test)]
+    pub(super) fn validate_references(&self) -> Result<()> {
+        references::verify_counts(self.conn()?, self.references)
     }
     #[cfg(test)]
     pub(super) fn validate_parts(&mut self) -> Result<()> {
@@ -1717,42 +1723,25 @@ fn validate_schema_revision(conn: &Connection, revision: u32) -> Result<()> {
     );
     Ok(())
 }
-unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
-    // Callback is installed only for quick_check and removed before the stack
-    // deadline is dropped. No panic crosses the C boundary.
-    let deadline = unsafe { &*(raw.cast::<Instant>()) };
-    (Instant::now() >= *deadline) as std::ffi::c_int
-}
 fn quick_check(conn: &Connection, budget: Duration) -> Result<()> {
-    let mut deadline = Instant::now()
-        .checked_add(budget)
-        .context("state_v2_work_budget")?;
+    #[cfg(test)]
+    let budget = open_check_tests::budget(budget);
     super::telemetry::event("quick_check", &1);
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            conn.handle(),
-            1000,
-            Some(progress),
-            (&mut deadline as *mut Instant).cast(),
-        );
-    }
+    // An interrupted check starts over on every open. Finish the finite scan;
+    // the former deadline is an alarm threshold, never an ingestion gate.
+    let started = Instant::now();
     let result = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0));
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
-    }
-    let checked = result.map_err(|error| {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
-            anyhow::Error::from(super::Hold::IntegrityRetry)
-        } else {
-            error.into()
-        }
-    })?;
-    ensure!(
-        checked == "ok",
-        "state_v2_integrity_requires_explicit_repair"
-    );
+    let elapsed = started.elapsed();
+    super::telemetry::event("quick_check_ms", &elapsed.as_millis());
+    super::telemetry::event("quick_check_slow_alarm", &(elapsed > budget));
+    let checked = result?;
+    ensure!(checked == "ok", INTEGRITY_REPAIR);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sqlite/open_check_tests.rs"]
+mod open_check_tests;
 
 #[cfg(test)]
 #[path = "sqlite/fixtures.rs"]

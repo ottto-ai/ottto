@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(in super::super) enum Hold {
+pub(crate) enum Hold {
     Future,
     UnknownRecordKind,
     DbUnavailable,
@@ -20,7 +20,6 @@ pub(in super::super) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
-    IntegrityRetry,
     SaveCeiling,
     SaveOversize,
     SaveFull,
@@ -38,7 +37,6 @@ impl std::fmt::Display for Hold {
             Self::SaveCeiling => "state_v2_save_ceiling",
             Self::SaveOversize => "state_v2_save_oversize",
             Self::SaveFull => "state_v2_sqlite_full",
-            Self::IntegrityRetry => "state_v2_integrity_retry",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
@@ -59,6 +57,14 @@ impl Hold {
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
+        }
+        let integrity_repair = error
+            .chain()
+            .any(|cause| cause.to_string() == INTEGRITY_REPAIR);
+        if integrity_repair {
+            // Publish the refusal before any diagnostic snapshot can retain
+            // the preceding successful open's cleared hold.
+            telemetry::event("hold", &"integrity_repair");
         }
         let reason = error
             .downcast_ref::<rusqlite::Error>()
@@ -93,6 +99,9 @@ impl Hold {
         let codes = error.chain().filter_map(code).collect::<Vec<_>>();
         let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
         telemetry::event("db_unavailable_cause", &cause);
+        if integrity_repair {
+            return anyhow::anyhow!(INTEGRITY_REPAIR);
+        }
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
@@ -155,6 +164,15 @@ impl RouteState {
     fn custody_held(&self) -> bool {
         self.custody_retry_at.is_some_and(|at| Instant::now() < at)
     }
+    fn report_hold(&self) {
+        if self.custody_held() {
+            telemetry::event("hold", &Hold::AckCustody);
+        } else if let Some(hold) = self.save_hold {
+            telemetry::event("hold", &hold);
+        } else {
+            telemetry::event("hold", &"none");
+        }
+    }
     fn reduce_page(&mut self) {
         let previous = self.page_limit;
         self.page_limit = (self.page_limit / 2).max(1);
@@ -173,6 +191,7 @@ impl RouteState {
             return;
         }
         self.save_hold = None;
+        self.report_hold();
         self.last_read = None;
         self.save_retry_completed = false;
         if over_target {
@@ -281,7 +300,7 @@ pub(in super::super) fn load_locked(
     importable: bool,
     custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
-    // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
+    // Unbound paths and sources outside `v2_on` never probe the store.
     let Some(binding) = binding(path) else {
         return Ok((None, false));
     };
@@ -341,7 +360,7 @@ fn load_with_custody(
                             // Digest the exact persisted image: a save then
                             // also persists whatever normalization changes.
                             let digests = kinds::baseline(&index, &mut cx)?;
-                            normalize_hydrated(&mut index)?;
+                            normalize_hydrated(&mut index, binding.source)?;
                             state.save_digests = Some(digests);
                             // Same session and stamp: rollovers its commits
                             // wrote stay committed for graphs that outlive
@@ -351,6 +370,7 @@ fn load_with_custody(
                             }
                             session.cx = cx;
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            state.report_hold();
                             telemetry::event("route", &"v2");
                             return Ok(Some(index));
                         }
@@ -372,7 +392,7 @@ fn load_with_custody(
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
-            normalize_hydrated(&mut index).context("state_v2_open_normalize")?;
+            normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
             state.save_digests = Some(digests);
             index.v2_mut().persistence_v2 = Some(Arc::new(Runtime {
@@ -387,6 +407,7 @@ fn load_with_custody(
                 })),
             }));
             register(state, &index)?;
+            state.report_hold();
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }
@@ -447,16 +468,23 @@ fn load_with_custody(
     }
     result
 }
-fn normalize_hydrated(index: &mut ScanIndex) -> Result<()> {
-    use super::super::lenient_decode;
-    lenient_decode::post_decode_hydrated(index, "load", "claude_code").map_err(
-        |error| match error {
-            lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-                Hold::Future.into()
-            }
-            error => error.into(),
-        },
-    )
+fn normalize_hydrated(
+    index: &mut ScanIndex,
+    source: super::super::scan_index_persistence::Source,
+) -> Result<()> {
+    use super::super::{lenient_decode, scan_index_persistence::Source, SnapshotSource};
+    let slug = match source {
+        Source::Claude => SnapshotSource::ClaudeCode,
+        Source::Codex => SnapshotSource::Codex,
+        Source::Pi => SnapshotSource::Pi,
+    }
+    .api_slug();
+    lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
+        lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
+            Hold::Future.into()
+        }
+        error => error.into(),
+    })
 }
 
 fn pause(state: &mut RouteState, class: Pause) {
@@ -1226,7 +1254,6 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         Err(e) => return Err(e.into()),
     }
     super::super::sync_checkpoint_parent(path)?;
-    telemetry::event("source_erasure_confirmed", &1);
     // Retain the invalidated route's custody latch: erased artifacts must not
     // let this process resume v1 or re-create v2 without an explicit new lineage.
     Ok(())
@@ -1236,7 +1263,58 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
 /// existing whole-tree removal owns legacy files and unregistered artifacts;
 /// discovering those files here would register routes for files no source reads.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
-    close_tree(support, true)
+    close_tree(support, true)?;
+    telemetry::event("source_erasure_confirmed", &1);
+    Ok(())
+}
+
+/// Unlinks one source's local copy in every namespace. `indexes` are the only
+/// routed paths; `family` (their shared file stem) also covers progress, locks,
+/// legacy and policy-scoped indexes and temps. An error leaves `complete` uncalled,
+/// so the caller's marker stays pending and the next cycle repeats this sweep.
+pub(crate) fn erase_source(
+    indexes: &[PathBuf],
+    family: &str,
+    others: &[PathBuf],
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    for path in indexes {
+        {
+            // Erasure must not depend on decoding the files it removes.
+            let _owner =
+                super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
+            crate::snapshot_sync::with_state_v2_progress_lock(path, |_| erase_locked(path, None))?;
+        }
+        // Lock files go only after their flocks are released.
+        let parent = path.parent().context("source_erasure_parent")?;
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let rest = name.to_str().and_then(|name| name.strip_prefix(family));
+            let owned = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']));
+            if owned {
+                fence::remove_artifact(&entry.path())?;
+            }
+        }
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    for path in others {
+        fence::remove_artifact(path)?;
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    // All clones are closed; a dropped latch gives reconnect a fresh lineage.
+    let mut routes = states().lock().map_err(|_| Hold::DbUnavailable)?;
+    for path in indexes {
+        routes.remove(path);
+    }
+    drop(routes);
+    complete()?;
+    telemetry::event("source_erasure_confirmed", &indexes.len());
+    Ok(())
+}
+
+pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
+    telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
 fn close_tree(support: &Path, erase: bool) -> Result<()> {

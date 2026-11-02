@@ -4165,16 +4165,22 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
             })
             .arg("fixture")
             .arg(&pid_file);
-        let result: anyhow::Result<Value> = harvest::run_worker_process_timeout(
-            &mut command,
-            &"x".repeat(1024 * 1024),
-            Duration::from_millis(250),
-        );
         let expected = match phase {
             "input" | "work" => harvest::WorkerError::Timeout,
             "locked" => harvest::WorkerError::Locked,
             _ => harvest::WorkerError::Failed,
         };
+        // Only the timeout phases race the deadline. The others exit on
+        // their own, so their deadline is not under test: a short one lets
+        // a loaded runner (slow /bin/sh start, slow 1 MiB drain) turn their
+        // exit into a Timeout.
+        let timeout = if expected == harvest::WorkerError::Timeout {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(30)
+        };
+        let result: anyhow::Result<Value> =
+            harvest::run_worker_process_timeout(&mut command, &"x".repeat(1024 * 1024), timeout);
         assert_eq!(
             result.unwrap_err().downcast_ref::<harvest::WorkerError>(),
             Some(&expected)

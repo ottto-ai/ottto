@@ -1,5 +1,5 @@
-//! Claude's private, default-off state store. Storage rows convey custody, never
-//! acquisition, acceptance, or retirement authority.
+//! Private state store for the sources `v2_on` names. Storage rows convey
+//! custody, never acquisition, acceptance, or retirement authority.
 //!
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
@@ -10,6 +10,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{collections::BTreeMap, sync::Arc};
+
+pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_repair";
 
 mod fence;
 mod import;
@@ -22,21 +24,24 @@ mod runtime;
     )
 )]
 pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{IncompleteReason, LiveKeys};
+pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
+pub(super) use runtime::BaselineRelease;
+pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
     guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
     save_oversize_active, save_read_admitted, save_read_completed, settle_usage, visit_usage,
 };
-pub(super) use runtime::{BaselineRelease, Hold};
 mod catalogue;
 mod codec;
 mod ignored;
 mod interning;
 mod kinds;
+#[cfg(test)]
+pub(super) use kinds::tests::compact_reopened_for_test;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;
@@ -117,7 +122,8 @@ struct Identity {
 /// load the frozen JSON. Removing a source needs an explicit export back to
 /// v1, never an edit to this set.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    matches!(source, super::scan_index_persistence::Source::Claude)
+    use super::scan_index_persistence::Source;
+    matches!(source, Source::Claude | Source::Codex)
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
@@ -533,6 +539,8 @@ pub(crate) mod ack;
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
 pub(super) use runtime::before_collection;
 
+#[cfg(test)]
+mod codex_on_tests;
 #[cfg(test)]
 mod money_fault_tests;
 #[cfg(test)]

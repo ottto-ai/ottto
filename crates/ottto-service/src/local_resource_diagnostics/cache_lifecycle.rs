@@ -52,6 +52,8 @@ sparse_lifetime_counters! {
     // Pi fork copies stamped before the fork header: fixed content-free totals.
     pi_fork_copies_skipped_entries: PiForkCopiesSkippedEntries,
     pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
+    // Codex thread-settings snapshots asking for a non-default tier.
+    codex_non_default_thread_tier: CodexNonDefaultThreadTier,
 }
 
 pub(crate) fn snapshot() -> Counts {

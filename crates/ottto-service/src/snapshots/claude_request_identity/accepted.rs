@@ -172,12 +172,12 @@ pub(super) struct AcceptedShare {
     #[serde(with = "optional_digest_hex")]
     authority: Option<[u8; 32]>,
 }
-mod digest_hex {
+pub(crate) mod digest_hex {
     use super::*;
-    pub(super) fn encode(value: &[u8; 32]) -> String {
+    pub(crate) fn encode(value: &[u8; 32]) -> String {
         value.iter().map(|byte| format!("{byte:02x}")).collect()
     }
-    pub(super) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
+    pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
         if !hash_is_valid(value) {
             return Err(E::custom("invalid fingerprint"));
         }
