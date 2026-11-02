@@ -52611,7 +52611,7 @@ impl ScanIndex {
         };
         let load_origin = ScanIndexLoadOrigin::from(&origin);
         index.settle_claude_index_load(path, load_origin);
-        if source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(&index) {
+        if sampled_audit::growth_active(&index) {
             sampled_audit::bind_growth_claims(&mut index, path);
         }
         let first_load_in_process = index.mint_or_reuse_codex_proof_incarnation(path, origin);
