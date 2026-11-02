@@ -1,5 +1,5 @@
-//! Claude's private, default-off state store. Storage rows convey custody, never
-//! acquisition, acceptance, or retirement authority.
+//! Private state store for the sources `v2_on` names. Storage rows convey
+//! custody, never acquisition, acceptance, or retirement authority.
 //!
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
@@ -122,7 +122,8 @@ struct Identity {
 /// load the frozen JSON. Removing a source needs an explicit export back to
 /// v1, never an edit to this set.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    matches!(source, super::scan_index_persistence::Source::Claude)
+    use super::scan_index_persistence::Source;
+    matches!(source, Source::Claude | Source::Codex)
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
@@ -538,6 +539,8 @@ pub(crate) mod ack;
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
 pub(super) use runtime::before_collection;
 
+#[cfg(test)]
+mod codex_on_tests;
 #[cfg(test)]
 mod money_fault_tests;
 #[cfg(test)]
