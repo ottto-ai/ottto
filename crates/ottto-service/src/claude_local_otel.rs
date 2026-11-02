@@ -3079,9 +3079,27 @@ mod tests {
         API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
         let reuse_audit =
             crate::snapshot_audit::run_snapshot_audit(options, &mut Vec::new()).unwrap();
+        // The terminal's wall-clock time is logged, never compared.
+        fn without_terminal_ms(mut value: serde_json::Value) -> serde_json::Value {
+            match &mut value {
+                serde_json::Value::Object(map) => {
+                    map.remove("terminal_ms");
+                    for child in map.values_mut() {
+                        *child = without_terminal_ms(child.take());
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        *child = without_terminal_ms(child.take());
+                    }
+                }
+                _ => {}
+            }
+            value
+        }
         assert_eq!(
-            serde_json::to_value(reference_audit).unwrap(),
-            serde_json::to_value(reuse_audit).unwrap()
+            without_terminal_ms(serde_json::to_value(reference_audit).unwrap()),
+            without_terminal_ms(serde_json::to_value(reuse_audit).unwrap())
         );
         assert_eq!(reference_receipt.0, 2);
         assert_eq!(reference_receipt.1, expected_bytes * 2);
