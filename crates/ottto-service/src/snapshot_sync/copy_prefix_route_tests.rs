@@ -13,18 +13,18 @@ fn route(mode: Mode, page: &Page) -> RouteResult {
 
 /// Deliver a finished page: its exact ACKs earn per-file upload-context
 /// receipts, as the service records them after settlement.
-fn deliver(page: &mut Page) -> BTreeMap<String, String> {
-    deliver_counting(page).0
+fn deliver(page: &mut Page) {
+    deliver_counting(page);
 }
 
 /// `deliver`, also returning the page's POST count.
-fn deliver_counting(page: &mut Page) -> (BTreeMap<String, String>, usize) {
+fn deliver_counting(page: &mut Page) -> usize {
     let mut progress = e2_progress();
     let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     let acks = std::mem::take(&mut progress.fresh_context_body_acks);
     accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
-    (acks, sent.len())
+    sent.len()
 }
 
 /// The warm owner reads Full, is delivered as the service delivers every
@@ -83,18 +83,12 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         // The page is delivered: its exact ACKs earn per-file upload-context
         // receipts as the service records them, so only the grown copy is
         // read on the next pages; the delivered holder stays proven.
-        let acks = deliver(&mut first);
-        if let Some(why) = upload_context_owed_diagnosis_for_test(
-            &first.index,
-            &holder,
-            &first.scan.snapshots,
-            &acks,
-        ) {
-            panic!(
-                "the delivered holder owes its proof (modes {:?}): {why}",
-                first.modes
-            );
-        }
+        deliver(&mut first);
+        assert!(
+            !upload_context_owed_for_test(&first.index, &holder),
+            "the delivered holder owes its proof (modes {:?})",
+            first.modes
+        );
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
@@ -105,11 +99,10 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
                 // The page activates the same context before it selects.
                 let mut prior = prior.clone();
                 prior.activate_upload_context("e2-synthetic-destination".into());
-                if let Some(why) =
-                    upload_context_owed_diagnosis_for_test(&prior, &holder, &[], &BTreeMap::new())
-                {
-                    panic!("page {request}: the {arm} prior owes the holder again: {why}");
-                }
+                assert!(
+                    !upload_context_owed_for_test(&prior, &holder),
+                    "page {request}: the {arm} prior owes the holder again"
+                );
             }
             let restart = disk.owner(SnapshotSource::ClaudeCode);
             let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0), (0, 1, 0));
@@ -164,29 +157,19 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
-            let (_, sent) = deliver_counting(&mut p);
+            let sent = deliver_counting(&mut p);
             posts.push(sent);
             if page == 1 {
                 assert!(reads[0], "the owed holder is re-read beside the new copy");
                 assert!(
                     upload_context_receipt_earned_for_test(&p.index, &holder),
-                    "page 1 earns the holder's receipt: {:?}",
-                    upload_context_owed_diagnosis_for_test(
-                        &p.index,
-                        &holder,
-                        &p.scan.snapshots,
-                        &BTreeMap::new()
-                    )
+                    "page 1 earns the holder's receipt"
                 );
             }
-            let diagnosis =
-                upload_context_owed_diagnosis_for_test(&p.index, &holder, &[], &BTreeMap::new());
+            let owed = upload_context_owed_for_test(&p.index, &holder);
             prior = disk.commit(&p.cache, SnapshotSource::ClaudeCode, &mut p.index);
             if page >= 2 {
-                assert!(
-                    diagnosis.is_none(),
-                    "page {page}: the holder owes its proof again: {diagnosis:?}"
-                );
+                assert!(!owed, "page {page}: the holder owes its proof again");
             }
         }
         assert!(
