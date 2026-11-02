@@ -9538,7 +9538,8 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
             )
             .unwrap();
             let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
-            let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+            let owner =
+                crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::capturing_identity();
             let scan = |index| {
                 owner.scan(
                     std::slice::from_ref(&projects),
@@ -9578,8 +9579,7 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
                     .as_bytes(),
             )
             .unwrap();
-            let (mut index, mut next, _) = scan(index);
-            a1a_wire(&root, &mut index, &mut next);
+            let _ = scan(index);
             let cache = owner.cache.retained().unwrap();
             assert_eq!(
                 cache
