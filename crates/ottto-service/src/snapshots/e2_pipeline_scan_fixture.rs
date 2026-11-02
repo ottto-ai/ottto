@@ -13,7 +13,7 @@ fn scan_binding(source: SnapshotSource) -> (Scope, bool) {
 const CLAUDE_IDENTITY_CAPTURE: bool = false;
 
 /// The state database a fixture's Claude scans continue from.
-struct FixtureRoute {
+pub(crate) struct FixtureRoute {
     path: PathBuf,
     /// The caller saves through `Disk`; a page never commits on its own.
     caller_commits: bool,
@@ -25,13 +25,100 @@ fn fixture_routes() -> &'static Mutex<BTreeSet<PathBuf>> {
     ROUTES.get_or_init(Default::default)
 }
 
+/// Claude continues only from the state database, so an owner's retained
+/// state is its route: the prior this owner produced is committed there first,
+/// as the daemon saves between passes, and any other owner's prior moves to a
+/// new, empty route, which reads what changed Full. A caller's own session is
+/// left alone.
+pub(crate) fn routed_for_test(
+    cache: &sampled_scan::SharedCache,
+    index: ScanIndex,
+    dir: &Path,
+) -> ScanIndex {
+    let on = route_of(&index);
+    let mut own = cache.test_route.lock().unwrap();
+    if let Some(route) = own.as_ref() {
+        if route.caller_commits {
+            return match on {
+                Some(_) => index,
+                None => ScanIndex::load(&route.path).unwrap(),
+            };
+        }
+        if on.as_deref() == Some(route.path.as_path()) {
+            let mut page = index.clone();
+            if page.save(&route.path).is_ok() {
+                return ScanIndex::load(&route.path).unwrap();
+            }
+        }
+    }
+    if on
+        .as_ref()
+        .is_some_and(|path| !fixture_routes().lock().unwrap().contains(path))
+    {
+        return index;
+    }
+    let prior = if on.is_some() {
+        state_v2::money_test_support::resident(&index)
+    } else {
+        index
+    };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (session, cold) = StateV2ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &prior,
+        &dir.canonicalize().unwrap().join(format!("route-{n}")),
+    );
+    let path = session.path().to_owned();
+    // Other arms still read this route; the scratch dir owns it.
+    std::mem::forget(session);
+    E2ScanFixture::register_route_for_test(&path);
+    *own = Some(FixtureRoute {
+        path,
+        caller_commits: false,
+    });
+    cold
+}
+
+/// A scan fixture's Claude page continues from its owner's route. Other
+/// sources, and scans with no cache to own one, are left alone.
+pub(crate) fn route_claude_for_test(
+    source: SnapshotSource,
+    cache: Option<&sampled_scan::SharedCache>,
+    index: ScanIndex,
+) -> ScanIndex {
+    let Some(cache) = cache.filter(|_| source == SnapshotSource::ClaudeCode) else {
+        return index;
+    };
+    let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    routed_for_test(cache, index, &dir)
+}
+
+/// The state database `index` is bound to, if any.
+pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
+    state_v2::runtime_path(index).ok().flatten()
+}
+
+/// A fixture's save beside its own files. A routed index commits on its route
+/// and leaves an unrouted copy at `path`: a later load from there holds no
+/// Claude continuation, so its next change reads Full.
+pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
+    let Some(route) = route_of(index) else {
+        return index.save(path).unwrap();
+    };
+    index.save(&route).unwrap();
+    let mut copy = state_v2::money_test_support::resident(index);
+    copy.v2_mut().persistence_v2 = None;
+    copy.save(path).unwrap();
+}
+
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
-    route: Mutex<Option<FixtureRoute>>,
 }
 impl E2ScanFixture {
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
@@ -57,61 +144,14 @@ impl E2ScanFixture {
 
     /// This owner continues from `path`'s committed heads.
     pub(crate) fn on_committed_route(&self, path: &Path) {
-        *self.route.lock().unwrap() = Some(FixtureRoute {
+        *self.cache.test_route.lock().unwrap() = Some(FixtureRoute {
             path: path.to_owned(),
             caller_commits: true,
         });
     }
 
-    /// Claude continues only from the state database, so a fixture's retained
-    /// state is its own route: the prior this owner produced is committed
-    /// there first, as the daemon saves between passes, and any other owner's
-    /// prior moves to a new, empty route, which reads what changed Full. A
-    /// caller's own session is left alone.
     pub(crate) fn routed(&self, index: ScanIndex, dir: &Path) -> ScanIndex {
-        let on = state_v2::runtime_path(&index).ok().flatten();
-        let mut own = self.route.lock().unwrap();
-        if let Some(route) = own.as_ref() {
-            if route.caller_commits {
-                return match on {
-                    Some(_) => index,
-                    None => ScanIndex::load(&route.path).unwrap(),
-                };
-            }
-            if on.as_deref() == Some(route.path.as_path()) {
-                let mut page = index.clone();
-                if page.save(&route.path).is_ok() {
-                    return ScanIndex::load(&route.path).unwrap();
-                }
-            }
-        }
-        if on
-            .as_ref()
-            .is_some_and(|path| !fixture_routes().lock().unwrap().contains(path))
-        {
-            return index;
-        }
-        let prior = if on.is_some() {
-            state_v2::money_test_support::resident(&index)
-        } else {
-            index
-        };
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (session, cold) = StateV2ColdSession::publish(
-            scan_index_persistence::Source::Claude,
-            &prior,
-            &dir.canonicalize().unwrap().join(format!("route-{n}")),
-        );
-        let path = session.path().to_owned();
-        // Other arms still read this route; the test's scratch dir owns it.
-        std::mem::forget(session);
-        Self::register_route_for_test(&path);
-        *own = Some(FixtureRoute {
-            path,
-            caller_commits: false,
-        });
-        cold
+        routed_for_test(&self.cache, index, dir)
     }
 
     /// Begins this owner's pass, as the daemon does before a scan.
@@ -128,7 +168,6 @@ impl E2ScanFixture {
 
     pub(crate) fn evict(&self) {
         self.cache.clear();
-        *self.route.lock().unwrap() = None;
     }
 
     pub(crate) fn evict_for_pressure(&self) {
@@ -136,7 +175,7 @@ impl E2ScanFixture {
         let empty = sampled_scan::RetainedCache::default();
         let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
         assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
-        *self.route.lock().unwrap() = None;
+        *self.cache.test_route.lock().unwrap() = None;
     }
 
     #[allow(clippy::too_many_arguments)]

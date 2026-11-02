@@ -159,6 +159,11 @@ fn raw_scan_at(
     collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        SOURCE,
+        cache.as_deref(),
+        index,
+    );
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),
@@ -609,6 +614,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
                 cursor: Default::default(),
                 side: Default::default(),
                 quiet: Default::default(),
+                test_route: Default::default(),
             })
         } else {
             cache.clear();

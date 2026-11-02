@@ -45,23 +45,8 @@ pub(super) mod durable;
 #[cfg(test)]
 pub(super) mod preparation_tests {
     use super::*;
-    type Hook = Box<dyn FnMut(&crate::transcript_cache::Taken<CachedJsonlReduction>) -> Result<()>>;
     thread_local! {
-        static FAULT: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
         pub(super) static HEAP_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    pub(super) fn check(
-        taken: &crate::transcript_cache::Taken<CachedJsonlReduction>,
-    ) -> Result<()> {
-        FAULT.with(|fault| {
-            fault
-                .borrow_mut()
-                .as_mut()
-                .map_or(Ok(()), |fault| fault(taken))
-        })
-    }
-    pub(in crate::snapshots) fn set(hook: Option<Hook>) {
-        FAULT.with(|fault| *fault.borrow_mut() = hook);
     }
     pub(in crate::snapshots) fn heap_refused() -> bool {
         HEAP_REFUSAL.with(|flag| flag.get())
@@ -97,8 +82,8 @@ impl CachedJsonlReduction {
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
-    /// The copy's source (a durable record is written per source).
-    #[cfg(unix)]
+    /// The copy's source.
+    #[cfg(test)]
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
@@ -228,12 +213,6 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
-        #[cfg(test)]
-        if let Some(original) = taken.as_ref() {
-            if let Err(error) = preparation_tests::check(original) {
-                return Err(PrepareRejected { error, taken });
-            }
-        }
         self.prepare_acquisition_inner(taken, scope, debt, now, |_, _| Ok(true))
     }
 

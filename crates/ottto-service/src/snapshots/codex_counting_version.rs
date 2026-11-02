@@ -32,12 +32,6 @@ pub(super) fn active_cutover_unix_ms() -> i64 {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
-/// Preserve the optional representation at the pinned durable restore boundary.
-#[cfg(unix)]
-pub(super) fn cutover_unix_ms() -> Option<i64> {
-    Some(active_cutover_unix_ms())
-}
-
 /// Substitutes an epoch for scan-level tests on this thread until dropped.
 #[cfg(test)]
 pub(crate) struct TestCutover(i64);

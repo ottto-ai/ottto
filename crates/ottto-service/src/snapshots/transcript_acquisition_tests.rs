@@ -1175,6 +1175,11 @@ fn production_scan_page_at_with_setup(
     collected_at: &str,
     setup: impl FnOnce(&mut OwnedSourceScan),
 ) -> ProductionScanPage {
+    index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        source,
+        cache.as_deref(),
+        index,
+    );
     if source == SnapshotSource::ClaudeCode {
         if let Some(cache) = &cache {
             cache.bind_withheld(&mut index);
@@ -1447,7 +1452,7 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
         let index_path = fixture.dir.join("index.json");
-        index.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
         cache.clear();
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
@@ -1681,7 +1686,7 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             "mixed-files",
         );
         assert!(
-            cache.retained_checkpoint(&small_key).is_some(),
+            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -1821,7 +1826,7 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         assert!(
-            cache.retained_checkpoint(&small_key).is_some(),
+            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -2195,7 +2200,7 @@ fn sampled_production_terminal_row_loss_preserves_first_tail_debt_after_restart(
             production_body(source, full)
         );
         let path = fixture.dir.join("index.json");
-        index.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
         cache.clear();
         index = ScanIndex::load(&path).unwrap();
         assert_eq!(index.files[&key].unverified_deadline(), Some(deadline));

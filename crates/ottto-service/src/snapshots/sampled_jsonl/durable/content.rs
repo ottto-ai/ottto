@@ -8,7 +8,6 @@ use std::os::unix::fs::FileExt;
 pub(crate) struct RederivePlan {
     pub(crate) end: u64,
     pub(crate) title: Option<(u64, u64)>,
-    pub(crate) charge: u64,
 }
 impl RederivePlan {
     pub(crate) fn input_bytes(&self) -> u64 {
@@ -38,7 +37,6 @@ impl Decoded {
             return Ok(RederivePlan {
                 end: 0,
                 title: None,
-                charge: 0,
             });
         }
         let acc = &self.reduction.accumulator;
@@ -74,29 +72,10 @@ impl Decoded {
         {
             return Err("title");
         }
-        let input = end.checked_add(t).ok_or("charge")?;
-        let line = end.max(t);
-        // Requested-allocation ledger, simultaneous replay phase:
-        // input + serde scratch (2L) + Value (8 MiB) + fold string temporaries
-        // (4L) + retained X (2 input) + response keys (end+64) + SS (512 KiB).
-        // An independent 8 MiB covers reference-vector old/new backing while
-        // Value arrays are live; it is never double-spent as Value credit.
-        // Reducer includes closed filter/ring and capped native ids. Copying
-        // source_session_id has its own term. Fixed errors/frames: 64 KiB.
-        let charge = input
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(line.checked_mul(6)?))
-            .and_then(|n| n.checked_add(2 * LINE_VALUE_CREDIT))
-            .and_then(|n| n.checked_add(end.checked_add(64)?))
-            .and_then(|n| n.checked_add(524_288 + 65_536))
-            .and_then(|n| n.checked_add(codex_usage_occurrence::max_fixed_heap_bytes() as u64))
-            .and_then(|n| {
-                n.checked_add(acc.source_session_id.as_ref().map_or(0, |s| s.len() as u64))
-            })
-            .ok_or("charge")?;
+        end.checked_add(t).ok_or("charge")?;
         const _: () =
             assert!(size_of::<SnapshotAccumulator>() + size_of::<RederiveReceipt>() < 65_536);
-        Ok(RederivePlan { end, title, charge })
+        Ok(RederivePlan { end, title })
     }
 
     /// All fences precede every X move. Errors carry fixed class names only.

@@ -842,7 +842,6 @@ fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
         content(production_body(CLAUDE, result)),
         content(full_body(&base.fixture, CLAUDE))
     );
-    assert!(base.cache.retained_checkpoint(&base.key).is_some());
 }
 
 /// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
@@ -1388,7 +1387,7 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
     let entry = grown.index.files.remove(&grown.base.key).unwrap();
     grown.index.files.insert_shared(moved.clone(), entry);
     let path = grown.base.fixture.root.join("prefix-index.json");
-    grown.index.save(&path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut grown.index, &path);
     let mut loaded =
         crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::load(&path).unwrap());
     assert_eq!(loaded.files[&moved].scan_identity_version, tag);
@@ -1601,7 +1600,6 @@ fn erased_hold(due: u64) -> ErasedHold {
     );
     assert_eq!(seen.modes, (1, 0, 0));
     assert_eq!(seen.unreadable, 0);
-    assert!(cache.retained_checkpoint(&key).is_some());
     let mut proven = index.clone();
     assert!(mints_v1(&mut proven, &first, 0..6));
     index.claude_usage_family_witnesses = proven.claude_usage_family_witnesses;
@@ -1647,7 +1645,7 @@ fn erased_hold(due: u64) -> ErasedHold {
     assert!(!entry.has_unverified_source());
     assert_eq!(entry.audit_obligation(due), None, "the deadline is lost");
     let path = fixture.dir.join("erased-index.json");
-    index.save(&path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
     drop(index);
     cache.clear();
     let index =
@@ -1732,7 +1730,10 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     assert_eq!(restore_dated(&mut restored_index, due), 1);
     assert_eq!(restored(), restored_before + 2);
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    restored_index.save(&hold.index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(
+        &mut restored_index,
+        &hold.index_path,
+    );
     drop(restored_index);
     let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
         ScanIndex::load(&hold.index_path).unwrap(),
@@ -1918,7 +1919,10 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     assert_eq!(restore_dated(&mut restored_index, due), 1);
     assert_eq!(restored(), restored_before + 2);
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    restored_index.save(&hold.index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(
+        &mut restored_index,
+        &hold.index_path,
+    );
     drop(restored_index);
     let loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
         ScanIndex::load(&hold.index_path).unwrap(),

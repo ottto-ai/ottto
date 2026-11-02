@@ -728,7 +728,8 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     use crate::snapshots::scan_index_persistence::Source;
-    for source in [Source::Claude, Source::Codex, Source::Pi] {
+    // Pi has no v2 route to forget.
+    for source in [Source::Claude, Source::Codex] {
         f6_forget(source);
     }
 }

@@ -280,13 +280,32 @@ impl Disk {
     }
 }
 
-/// The warm owner's first page, Full and committed.
+/// The page's bodies reach the destination and their exact ACKs land in its
+/// index, as the service does before it saves. Without them the next read owes
+/// the upload context and is Full.
+fn accept_page(page: &mut Page) {
+    let mut progress = e2_progress();
+    assert_eq!(
+        upload(&page.scan.snapshots, &mut progress, ack).0.unwrap(),
+        ResumableUploadResult::Completed
+    );
+    page.index
+        .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+        &mut page.index,
+        &page.scan.snapshots,
+        &progress.fresh_context_body_acks,
+    );
+}
+
+/// The warm owner's first page, Full, accepted and committed.
 fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     let scanner = E2ScanFixture::default();
     disk.begin(&scanner, SnapshotSource::ClaudeCode);
     let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
     warm.enrich(c);
     warm.finish();
+    accept_page(&mut warm);
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
     (scanner, prior)
 }
@@ -535,6 +554,7 @@ fn claude_case(name: &str) {
                 // owner commits its failed step, and both Tail arms continue
                 // from that commit.
                 let [_, full_failed, mut disk_failed] = failed;
+                accept_page(&mut disk_failed);
                 let disk_prior = disk.commit(
                     &disk_failed.cache,
                     SnapshotSource::ClaudeCode,
@@ -877,6 +897,7 @@ fn restart_between_pages() {
             finish_claude_pages(&c, &mut pages);
             bodies.push(compare_claude_uploads(&pages));
             let [_, full, mut disk_page] = pages;
+            accept_page(&mut disk_page);
             let next = disk.commit(
                 &disk_page.cache,
                 SnapshotSource::ClaudeCode,
@@ -912,6 +933,7 @@ fn upgrade_without_semantic_revision() {
         );
         quiet.enrich(&c);
         quiet.finish();
+        accept_page(&mut quiet);
         let committed = disk.commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
         assert!(committed.generation > prior.generation);
         grow(&path, "r2", 20);
@@ -2296,6 +2318,7 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let mut warm = c.raw(&retained, ScanIndex::default(), 100, true, &[]);
         warm.enrich(&c);
         warm.finish();
+        accept_page(&mut warm);
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
         let switch = json!({"type":"attachment","sessionId":ROOT,
             "attachment":{"type":"session_context","context":{}}})

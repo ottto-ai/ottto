@@ -159,7 +159,7 @@ impl Drop for ScanFixture {
 /// as `transcript_acquisition_tests::acquire` builds one. Its checkpoint
 /// carries the file's current mtime as its eviction rank.
 fn retained_reduction(fixture: &ScanFixture) -> Retained<sampled_jsonl::CachedJsonlReduction> {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let mut file = File::open(&fixture.path).unwrap();
     opened_object_identity(source, &mut file).unwrap();
     let metadata = CodexTitleMetadata::default();
@@ -331,7 +331,7 @@ fn filler_key(number: usize) -> String {
 /// The charge one retained reduction of a `records`-response file adds to an
 /// empty shared cache. Its lifecycle events are kept out of any caller's.
 fn filler_charge_for(records: usize) -> usize {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let filler = ScanFixture::new(source);
     filler.append_usage(source, 0..records);
     observe(|| {
@@ -387,7 +387,7 @@ fn filler_records() -> usize {
 /// Insert `FILLERS` real retained reductions of one `filler_records` file
 /// under unrelated keys, as #653 T3 does. `modified` pins the fillers' rank.
 fn insert_fillers(cache: &Arc<sampled_scan::SharedCache>, modified: Option<u64>) {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let filler = ScanFixture::new(source);
     filler.append_usage(source, 0..filler_records());
     if let Some(modified) = modified {
@@ -443,7 +443,7 @@ struct FullCache {
 /// `older_tail` pins the tailed file's mtime two days back, below every
 /// filler's rank.
 fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
-    full_cache_in(SnapshotSource::ClaudeCode, older_tail, None)
+    full_cache_in(SnapshotSource::Codex, older_tail, None)
 }
 
 /// `full_cache_with_retained_file` for a `source` file, with the fillers'
@@ -527,18 +527,13 @@ fn append_padded_usage_at(tailed: &ScanFixture, id: usize) {
         "type": "synthetic-padding",
         "text": "x".repeat(TAIL_PADDING_BYTES),
     }));
-    tailed.append(&usage(
-        SnapshotSource::ClaudeCode,
-        140 + id as u64,
-        id,
-        MODEL,
-    ));
+    tailed.append(&usage(SnapshotSource::Codex, 140 + id as u64, id, MODEL));
 }
 
 /// `full_cache_with_retained_file`, then `append` to the file and read the
 /// append as a tail that meets a zero copy budget at a step start.
 fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBesideFullCache {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let FullCache {
         cache,
         tailed,
@@ -635,7 +630,7 @@ fn tail_growth_records() -> usize {
 /// The tailed file's append for test (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
-    tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + tail_growth_records());
+    tailed.append_usage(SnapshotSource::Codex, 1..1 + tail_growth_records());
 }
 
 /// Test (ii), corrected.
@@ -721,7 +716,7 @@ fn tail_active(full: &FullCache, older_tail: bool) -> OwnedSourceScan {
 /// `tail_active`, with the tailed file's mtime set to `modified` after the
 /// append.
 fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     full.tailed.append(&usage(source, 140, 1, MODEL));
     if let Some(modified) = modified {
         full.tailed.set_modified(modified);
@@ -905,7 +900,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     if unexecuted("M1_hot_tail") {
         return;
     }
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let FullCache {
         cache,
         tailed,
@@ -964,7 +959,7 @@ fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
     if unexecuted("M1_exempt_remeasure") {
         return;
     }
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let (cache, _) = filled_cache();
     let fixture = ScanFixture::new(source);
     fixture.append_usage(source, 0..150);
@@ -1138,8 +1133,8 @@ fn m_a_tail_with(
         ..
     } = full_cache_in(source, false, Some(fillers_modified));
     for (key, modified) in extra {
-        let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
-        entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
+        let entry = ScanFixture::new(SnapshotSource::Codex);
+        entry.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
         entry.set_modified(*modified);
         let retained = retained_reduction(&entry);
         assert!(
@@ -1256,7 +1251,7 @@ fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
         sampled_scan::XOut::Bound(usize::MAX),
     ] {
         let run = m_a_tail(
-            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
             now - OLD_SECONDS,
             now - 600,
             &[],
@@ -1389,7 +1384,7 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
     let now = unix_now();
     let tail_modified = now - 600;
     m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         tail_modified,
         &[
@@ -1427,7 +1422,7 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
     let now = unix_now();
     let tail_modified = now - 600;
     let run = m_a_tail(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         tail_modified,
         &[],
@@ -1490,15 +1485,15 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         for grew in [false, true] {
             for idle_modified in [now - OLD_SECONDS, file_modified, newer_modified] {
                 let releases =
                     grew && idle_modified < file_modified && source == SnapshotSource::ClaudeCode;
                 let label = format!("{source:?} grew={grew} idle_modified={idle_modified}");
                 let cache = Arc::new(sampled_scan::SharedCache::default());
-                let idle = ScanFixture::new(SnapshotSource::ClaudeCode);
-                idle.append_usage(SnapshotSource::ClaudeCode, 0..filler_records() / 10);
+                let idle = ScanFixture::new(SnapshotSource::Codex);
+                idle.append_usage(SnapshotSource::Codex, 0..filler_records() / 10);
                 idle.set_modified(idle_modified);
                 let mut residents_inserted = 0;
                 observe(|| {
@@ -1518,8 +1513,8 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
                     ("cache-policy-equal", file_modified),
                     ("cache-policy-newer", newer_modified),
                 ] {
-                    let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
-                    entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
+                    let entry = ScanFixture::new(SnapshotSource::Codex);
+                    entry.append(&usage(SnapshotSource::Codex, 100, 0, MODEL));
                     entry.set_modified(modified);
                     let retained = retained_reduction(&entry);
                     assert!(
@@ -1662,7 +1657,7 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
         "precondition: cold"
     );
     let run = m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         now - 600,
         &[],
@@ -1729,7 +1724,7 @@ fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
         .insert(path.clone(), (SystemTime::now(), u3_identity("warm")));
     let replace = path.clone();
     let run = m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         now - 600,
         &[],

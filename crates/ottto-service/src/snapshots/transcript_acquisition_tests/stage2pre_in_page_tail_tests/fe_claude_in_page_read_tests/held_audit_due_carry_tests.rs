@@ -128,7 +128,7 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
             .count(),
         1
     );
-    index.save(&hold.index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &hold.index_path);
     let index = ScanIndex::load(&hold.index_path).unwrap();
     assert!(sampled_audit::awaits_hold_deadline_restoration(
         &index, &failing
@@ -369,7 +369,7 @@ fn fe_n1_rescue_and_failed_open_use_captured_due_across_clock_edge() {
             assert!(hold_released(&index, &key));
             assert_eq!(sampled_audit::held_audit_open_failed(due + 1), (0, 0));
         }
-        index.save(&hold.index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &hold.index_path);
         let index = ScanIndex::load(&hold.index_path).unwrap();
         assert_eq!(
             index.held_audit_progress.as_ref().unwrap().due,

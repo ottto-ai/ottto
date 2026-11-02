@@ -353,7 +353,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
     /// Borrow resident keys under the existing retained lock (at most CACHE_ENTRIES).
-    #[cfg(unix)]
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.entries.keys()
     }
@@ -891,10 +891,10 @@ mod tests {
             assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
         }
         // origin/main Entry<String>: Retained + u64 + usize + (i64,i64)
-        // + usize + bool, rounded to eight bytes. Cache root: map + four usize.
+        // + usize + bool, rounded to eight bytes. Cache root: map + three usize.
         let main_entry = std::mem::size_of::<Retained<String>>() + 48;
         assert_eq!(std::mem::size_of::<Entry<String>>(), main_entry);
-        assert_eq!(std::mem::size_of::<TranscriptCache<String>>(), 56);
+        assert_eq!(std::mem::size_of::<TranscriptCache<String>>(), 48);
         assert_eq!(
             entry_slot_bytes::<String>(0),
             Some(352 + 11 * (24 + main_entry))

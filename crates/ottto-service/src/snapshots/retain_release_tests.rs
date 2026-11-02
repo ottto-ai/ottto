@@ -438,7 +438,7 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         let mut world = World::new(source);
         assert!(
             matches!(
@@ -584,7 +584,7 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let fixture = resident(
             source,
@@ -748,7 +748,7 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         let spec = Spec {
             older: 1,
             rows: 0,
@@ -773,7 +773,7 @@ fn r0_tail_past_the_visit_limit_is_granted_without_release() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let mut world = World::build(
         source,
         Spec {
@@ -820,7 +820,7 @@ fn r0_non_f_shapes_keep_clear_other_active() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         let mut world = World::new(source);
         let index = std::mem::take(&mut world.index);
         let mut scan = step_until(
@@ -943,7 +943,7 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
             counts.clear_no_active,
         )
     };
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         // A: a new file read Full beside one resident.
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let base = SystemTime::now() - Duration::from_secs(3_600);
@@ -1025,7 +1025,7 @@ fn r0_unknown_resident_evicts_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    for source in [SnapshotSource::Codex] {
         let mut world = World::new(source);
         let cache = Arc::clone(&world.cache);
         let run = run(

@@ -1604,39 +1604,7 @@ impl CertificateRefusal {
 
 #[cfg(unix)]
 impl DurableCertificate {
-    /// Whether the held FD is still this certificate's object with `[0, s)`
-    /// unchanged as far as samples can tell: the same device, inode and (when
-    /// both are known) birth; not shorter; at an equal length, the same mtime;
-    /// both windows hash to the certified digests; and no stamp change while
-    /// the windows were read. ctime is never compared. A refusal is the reason
-    /// the read must be Full; no partial state exists to undo. It seeks the
-    /// FD; the caller's read plan positions it again before any native read.
-    #[cfg(test)]
-    pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
-        self.admit_samples(file, false)
-            .map(|(admission, ..)| admission)
-            .map_err(|refusal| match refusal {
-                CertificateRefusal::Changed(reason) => reason,
-                CertificateRefusal::ReadError => FullReason::InvalidCheckpoint,
-            })
-    }
-
-    /// `admits`, then the RAM checkpoint a restore continues from: this
-    /// certificate's stamp (with the current ctime, which is never a refusal
-    /// input), `scope`, the sample windows just re-read and verified from the
-    /// held FD, and the certified audit clock and debt. `select_mode` then
-    /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
-    #[cfg(test)]
-    pub(crate) fn restore(
-        &self,
-        file: &mut File,
-        scope: Scope,
-    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        self.restore_with_append(file, scope, false)
-    }
-
     /// The native engine's grown path permits concurrent appends outside the certified prefix.
-    /// The legacy certificate fixture above keeps its exact metadata guard.
     pub(crate) fn restore_grown(
         &self,
         file: &mut File,

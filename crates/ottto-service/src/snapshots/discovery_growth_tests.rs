@@ -129,6 +129,11 @@ impl Fixture {
         now: &str,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            source,
+            Some(self.cache.as_ref()),
+            index,
+        );
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
@@ -183,7 +188,7 @@ impl Fixture {
         let path = self.root.join("index.json");
         // Preserve the production save's updated optimistic-concurrency stamp
         // in the index passed into the next real page.
-        index.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
@@ -923,7 +928,7 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         let mut f = Fixture::new();
         let mut index = kept_generation(&f, source, true);
         let path = f.root.join("index.json");
-        index.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
         let index = ScanIndex::load(&path).unwrap();
         f.cache = Arc::new(sampled_scan::SharedCache::default());
         let opens = all_transcript_opens_for_test();

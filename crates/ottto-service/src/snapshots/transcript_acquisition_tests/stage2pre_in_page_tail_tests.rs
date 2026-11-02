@@ -101,6 +101,11 @@ fn page(
     cache: &Arc<sampled_scan::SharedCache>,
     mut before_step: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Seen) {
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        source,
+        Some(cache.as_ref()),
+        index,
+    );
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -300,11 +305,18 @@ fn baseline(source: SnapshotSource, rows: usize, pre: usize) -> Baseline {
     );
     let path = fixture.file.0.clone();
     let key = local_index_key(&path);
-    let checkpoint = cache
-        .retained_checkpoint(&key)
-        .expect("precondition: the first Full retains a copy");
-    let sealed = checkpoint.sealed_offset();
-    assert_eq!(sealed, len(&path), "precondition: the whole file is sealed");
+    // Claude's baseline is its committed head, which seals the whole file.
+    let sealed = len(&path);
+    if source != SnapshotSource::ClaudeCode {
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("precondition: the first Full retains a copy");
+        assert_eq!(
+            checkpoint.sealed_offset(),
+            sealed,
+            "precondition: the whole file is sealed"
+        );
+    }
     append_raw(&path, &row_bytes(source, rows..rows + pre));
     Baseline {
         fixture,

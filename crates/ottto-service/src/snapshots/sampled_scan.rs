@@ -164,6 +164,10 @@ pub(crate) struct SharedCache {
     /// another. Outside the state budget: pass-scoped, never walked.
     #[cfg(unix)]
     pub(in crate::snapshots) quiet: Mutex<sampled_audit::quiet_retirement::QuietRetirements>,
+    /// The state database this owner's fixture scans continue from: Claude's
+    /// continuation lives there, not in RAM.
+    #[cfg(test)]
+    pub(crate) test_route: Mutex<Option<e2_pipeline_scan_fixture::FixtureRoute>>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
@@ -175,6 +179,8 @@ impl Default for SharedCache {
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
             quiet: Mutex::default(),
+            #[cfg(test)]
+            test_route: Default::default(),
         }
     }
 }
@@ -270,6 +276,10 @@ impl SharedCache {
             record(Event::ClearPoisonedLock);
         }
         self.with_cursor(|cursor| cursor.headers.clear());
+        #[cfg(test)]
+        if let Ok(mut route) = self.test_route.lock() {
+            *route = None;
+        }
     }
     /// Evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
@@ -1928,7 +1938,6 @@ pub(super) mod test_hooks {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(in crate::snapshots) enum Point {
-        BeforeRetireWitness,
         /// The first opened-object identity sample has actually been read.
         AfterIdentityHead,
         /// After revalidation, before `retain_reduction`.

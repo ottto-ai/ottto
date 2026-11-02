@@ -16,13 +16,6 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "R1 consumes this staged crate-visible erasure seam"
-    )
-)]
 pub(crate) use runtime::{
     erase_source, remove_retired_record_dir, retired_record_dir, source_erasure_alarm,
 };

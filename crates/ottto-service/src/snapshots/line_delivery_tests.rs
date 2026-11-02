@@ -167,6 +167,11 @@ fn claude_page(
     observer: Option<&Recorder>,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> (ScanIndex, SourceScanResult, usize, Vec<Value>) {
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        SnapshotSource::ClaudeCode,
+        cache.map(|cache| cache.as_ref()),
+        index,
+    );
     let ((index, result, steps), rows) = capture(|| {
         let mut scan = new_scan(root, index);
         if let Some(cache) = cache {
@@ -1258,10 +1263,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
 /// Gate counters are decisions, and overlapping owed arms count only once.
 #[test]
 fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
+    // Claude rediscovers any size change for Tail recovery, so only Codex gates
+    // a shrunk file by age.
     for (source, recovery_overlap) in [
-        (SnapshotSource::ClaudeCode, false),
         (SnapshotSource::Codex, false),
-        (SnapshotSource::ClaudeCode, true),
         (SnapshotSource::Codex, true),
     ] {
         let root = Root::new("ld-grown-gates");
@@ -1685,6 +1690,11 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
             days_from_now(days)
         };
         let recorder = Recorder::default();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         let ((index, result, _), _) = capture(|| {
             finish(
                 OwnedSourceScan::new(
@@ -2011,6 +2021,11 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let page = |index: ScanIndex, collected_at: &str| {
         let recorder = Recorder::default();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         let ((index, result, _), _) = capture(|| {
             finish(
                 OwnedSourceScan::new(
@@ -2254,7 +2269,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         fs::rename(&original, &moved).unwrap();
         assert_eq!(fs::metadata(&moved).unwrap().modified().unwrap(), modified);
         let checkpoint = root.0.join("held-rename-index.json");
-        held.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut held, &checkpoint);
         held = ScanIndex::load(&checkpoint).unwrap();
         let mut active = held.clone();
         if hint_only {
@@ -2535,7 +2550,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         );
         assert!(committed.claude_account_deferred_holds.contains_key(&key));
         assert!(!committed.files[&key].source_file_fingerprint.is_empty());
-        committed.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut committed, &checkpoint);
         *committed = ScanIndex::load(&checkpoint).unwrap();
     };
     let touch = || {
@@ -3342,6 +3357,11 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let page = |index: ScanIndex, hints: &[PathBuf], at: &str| {
             let recorder = Recorder::default();
+            let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+                SnapshotSource::ClaudeCode,
+                Some(cache.as_ref()),
+                index,
+            );
             let ((index, scan, _), counts) = capture(|| {
                 finish(
                     OwnedSourceScan::new(
@@ -3788,7 +3808,7 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         assert!(!held.files.contains_key(&key));
         assert!(held.claude_account_deferred_holds.contains_key(&key));
         let checkpoint = root.0.join("hold-only.json");
-        held.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut held, &checkpoint);
         let held = ScanIndex::load(&checkpoint).unwrap();
         fs::remove_file(&path).unwrap();
         if removed == "project" {
@@ -4076,7 +4096,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     }
     let checkpoint = root.0.join("equal-held.json");
     let reload = |index: &mut ScanIndex| {
-        index.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &checkpoint);
         let mut index = ScanIndex::load(&checkpoint).unwrap();
         index.withheld_memo = memo.clone();
         activate(&mut index, revision);

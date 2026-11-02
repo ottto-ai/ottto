@@ -1155,6 +1155,7 @@ fn pending_row_content_bytes(
 
 /// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
 /// two response ids, the open turn id, the closed-turn ring and the filter.
+#[cfg(test)]
 pub(super) const fn max_fixed_heap_bytes() -> usize {
     std::mem::size_of::<OccurrenceReducer>()
         + std::mem::align_of::<OccurrenceReducer>()

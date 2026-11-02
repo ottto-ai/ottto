@@ -532,7 +532,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
         if !reads_full {
             assert_eq!(delays[0]["counts"]["audit_cap_delay"], 1);
         }
-        selected.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
         index = ScanIndex::load(&index_path).unwrap();
     }
     // A healthy retirement save frees capacity for the NEXT scan. No remote
@@ -543,7 +543,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
         production_scan(&fixture, source, index, Some(cache.clone()), "partial-cap");
     assert_eq!(modes, (0, 0, 1));
     assert!(!healthy.files[&quiet_key].has_unverified_source());
-    healthy.save(&index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut healthy, &index_path);
     let loaded = ScanIndex::load(&index_path).unwrap();
     assert_eq!(
         loaded
@@ -746,7 +746,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         assert_eq!(selected.files[&key].size_bytes, committed_size);
         assert!(selected.files[&key].source_file_fingerprint.is_empty());
         let index_path = fixture.dir.join("cap-delay-index.json");
-        selected.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert!(sampled_audit::path_requires_verification(
             &loaded.files,
@@ -818,7 +818,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         let (_, cold, _, _, _) = finish_production_scan_page(make_scan(loaded), source);
         assert!(!cold.snapshots.is_empty());
         assert_eq!(production_body(source, raw), production_body(source, cold));
-        serviced.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut serviced, &index_path);
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert_eq!(loaded.files[&key].size_bytes, actual_size);
         assert!(!loaded.files[&key].source_file_fingerprint.is_empty());
@@ -919,7 +919,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         );
         assert!(selected.claude_account_deferred_holds.contains_key(&key));
         assert_eq!(selected.files[&key].unverified_deadline(), Some(due));
-        selected.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
         index = ScanIndex::load(&index_path).unwrap();
         assert_eq!(
             index
@@ -955,7 +955,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     let after = cache.retained_checkpoint(&key).unwrap();
     assert_eq!(after.audit_debt(), None);
     assert_eq!(after.last_full_verified(), checkpoint.last_full_verified());
-    retired.save(&index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut retired, &index_path);
     let loaded = ScanIndex::load(&index_path).unwrap();
     let (_, _, modes, _) = production_scan_at_with_setup(
         &fixture,
@@ -1191,7 +1191,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         );
         assert!(selected.files[&quiet_key].has_unverified_source());
         assert!(!selected.files[&held_key].has_unverified_source());
-        selected.save(&index_path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
         index = ScanIndex::load(&index_path).unwrap();
         assert_eq!(
             index
@@ -1308,7 +1308,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                     && record["counts"]["retry_queued"] == 1));
         }
         let path = fixture.dir.join("released-index.json");
-        accepted.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut accepted, &path);
         // Make the file quiet far beyond the activity window WITHOUT changing
         // its stamp or either sample. The equal-length file still owes service.
         let modified = fs::metadata(&fixture.file.0).unwrap().modified().unwrap();
@@ -1383,7 +1383,7 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                 .count(),
             usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
         );
-        serviced.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut serviced, &path);
         let loaded = ScanIndex::load(&path).unwrap();
         assert!(!loaded.files[&key].has_unverified_source());
         let (_, _, modes, _) = production_scan_at_with_setup(
@@ -1551,7 +1551,7 @@ fn staged_quiet_retirement_commits_only_with_its_second_save() {
     assert_eq!(modes, (0, 1, 0));
     assert!(index.files[&key].has_unverified_source());
     let body = index.files[&key].source_file_fingerprint.clone();
-    index.save(&index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
     // Unproven: nothing retires, and nothing stays staged.
     assert!(cache.quiet_stage(source, &key, &body, false));
     assert_eq!(
@@ -1718,7 +1718,7 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
             );
             assert!(!retired.claude_account_deferred_holds.contains_key(&key));
             let index_path = fixture.dir.join("absence-index.json");
-            retired.save(&index_path).unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut retired, &index_path);
             drop(cache);
             fs::create_dir_all(&parent).unwrap();
             fs::write(&fixture.file.0, contents).unwrap();
@@ -2102,7 +2102,7 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
         let state = fixture.dir.join("pi-recordless-audit-index.json");
-        index.save(&state).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &state);
         let mut index = ScanIndex::load(&state).unwrap();
         let cache = if evict {
             cache.clear();
@@ -2145,7 +2145,7 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         assert_eq!(events["audits_started"], 1);
         assert_eq!(events["audits_completed"], 1);
         assert!(!index.files[&key].has_unverified_source());
-        index.save(&state).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &state);
         // Lose the verified copy too: retirement must survive without RAM,
         // and the later real change must exercise the transitional Full.
         cache.clear();

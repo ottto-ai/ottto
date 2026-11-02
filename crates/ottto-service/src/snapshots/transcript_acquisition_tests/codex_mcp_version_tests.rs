@@ -25,41 +25,6 @@ fn write_meta(f: &ScanFixture, start: &str, version: Option<&str>) {
 fn feed(f: &ScanFixture) -> Arc<CodexVersionFeed> {
     Arc::new(CodexVersionFeed::new(Some(&f.dir.join("home"))))
 }
-fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
-    let source = SnapshotSource::Codex;
-    let mut census = ScanCensus::default();
-    let mut candidate = candidate_from_traversal_path(
-        source,
-        ScanTraversalPath {
-            scan_root: f.root.clone(),
-            path: f.file.0.clone(),
-            census_member: true,
-            watcher_hint: false,
-        },
-        &mut census,
-        None,
-        BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
-    )
-    .unwrap();
-    prepare_owned_scan_candidate(
-        source,
-        &mut candidate,
-        &CodexTitleMetadata::default(),
-        &ClaudeTitleMetadata::default(),
-        None,
-    );
-    open_and_identify_scan_candidate(
-        source,
-        candidate,
-        &mut census,
-        None,
-        BACKFILL_WINDOW_DAYS,
-        crate::snapshots::DiscoveryRetention::unverified(&index.files),
-    )
-    .unwrap()
-    .0
-}
 fn run(f: &ScanFixture, projection: &Arc<CodexVersionFeed>) {
     let (_, scan, _, _) = production_scan_at_with_setup(
         f,

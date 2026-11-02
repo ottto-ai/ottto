@@ -395,12 +395,6 @@ impl Shape {
     pub(crate) fn leave(&mut self) {
         self.text.push('}');
     }
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"ottto-durable-tail-shape:v1");
-        hasher.update(self.text.as_bytes());
-        hasher.finalize().into()
-    }
     #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
         &self.text

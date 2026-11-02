@@ -177,7 +177,9 @@ impl Corpus {
         self.reload_in(index, "scan-index.json")
     }
     fn reload_in(&self, index: &mut ScanIndex, name: &str) -> ScanIndex {
-        let path = self.base.join(name);
+        // Claude continues from its route; anything else from its own file.
+        let path = crate::snapshots::e2_pipeline_scan_fixture::route_of(index)
+            .unwrap_or_else(|| self.base.join(name));
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }

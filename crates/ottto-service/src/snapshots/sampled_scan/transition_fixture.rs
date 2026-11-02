@@ -122,7 +122,6 @@ pub(crate) struct RouteResult {
     pub(crate) codex_evidence: Value,
     pub(crate) io: IoBytes,
     pub(crate) modes: (usize, usize, usize),
-    pub(crate) restored: u64,
 }
 impl RouteResult {
     /// Exact existing cross-build sentinel: only physical fingerprint and its
@@ -200,7 +199,6 @@ impl RouteResult {
             codex_evidence: Value::Null,
             io: IoBytes::default(),
             modes: (0, 0, 0),
-            restored: 0,
         }
     }
 }
@@ -946,11 +944,6 @@ pub(crate) fn with_scan_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// Read native ACK membership without granting or copying it into another index.
-pub(crate) fn accepted_fingerprints(index: &super::super::ScanIndex) -> &BTreeSet<String> {
-    &index.accepted_snapshot_fingerprints
-}
-
 /// [format] scan clock restores after nested scope and unwind.
 #[test]
 fn scan_clock_restores_after_nested_scope_and_unwind() {
@@ -966,104 +959,8 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
 /// Native cold-store setup shared by transition tests. Scans stop before
 /// policy finalization, ACK and save; each driver chooses its settlement.
 pub(crate) mod native_cold {
-    use super::super::SharedCache;
-    #[cfg(target_os = "macos")]
-    use super::super::SharedCache;
     use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
-    #[cfg(target_os = "macos")]
-    use std::sync::Arc;
-
-    pub(crate) struct NativeColdStore {
-        pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
-        #[cfg(target_os = "macos")]
-        pub(crate) source: SnapshotSource,
-        pub(crate) root: PathBuf,
-        pub(crate) sessions: PathBuf,
-        #[cfg(target_os = "macos")]
-        pub(crate) index_path: PathBuf,
-        pub(crate) namespace: Scope,
-        #[cfg(target_os = "macos")]
-        pub(crate) cache: Arc<SharedCache>,
-        #[cfg(target_os = "macos")]
-        pub(crate) index: ScanIndex,
-        scratch: Option<crate::test_scratch::ScratchDir>,
-    }
-    impl NativeColdStore {
-        #[cfg(target_os = "macos")]
-        pub(crate) fn restart(&mut self) {
-            self.cache = Arc::new(SharedCache::default());
-            self.index = ScanIndex::load(&self.index_path).unwrap();
-        }
-        pub(crate) fn path(&self, session: &str) -> PathBuf {
-            self.sessions.join(format!("{session}.jsonl"))
-        }
-        #[cfg(target_os = "macos")]
-        pub(crate) fn key(&self, session: &str) -> String {
-            local_index_key(&self.path(session))
-        }
-    }
-
-    pub(crate) fn jsonl(lines: impl IntoIterator<Item = serde_json::Value>) -> String {
-        lines
-            .into_iter()
-            .map(|line| line.to_string() + "\n")
-            .collect()
-    }
-    pub(crate) fn save(index_path: &Path, index: &mut ScanIndex) {
-        index.save(index_path).unwrap();
-    }
-
-    pub(crate) fn cache(
-        source: SnapshotSource,
-        index: &Path,
-        namespace: &Scope,
-        capture: bool,
-    ) -> SharedCache {
-        let cache = SharedCache::default();
-        cache.quiet_begin_pass(source, index, namespace, capture);
-        cache
-    }
-
-    /// Advance production scanning only. The pre-step counters match native
-    /// drivers; source-specific finish/save/ACK remains with each caller.
-    pub(crate) fn scan(
-        mut owned: OwnedSourceScan,
-        steps: usize,
-    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize), u64) {
-        for _ in 0..steps {
-            let (modes, bytes) = owned.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
-                (
-                    (s.full_files, s.tail_files, s.unchanged_files),
-                    s.native_bytes,
-                )
-            });
-            match owned.step(None) {
-                OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => {
-                    return (index, scan, modes, bytes)
-                }
-            }
-        }
-        panic!("native fixture scan did not complete");
-    }
-
-    /// Seal the exact complete bytes through production ReadPlan, retaining
-    /// the caller's open file and resulting position for later growth reads.
-    pub(crate) fn checkpoint(
-        file: &mut std::fs::File,
-        scope: &Scope,
-        now: u64,
-    ) -> crate::transcript_acquisition::Checkpoint {
-        use std::io::Read;
-        let mut plan =
-            crate::transcript_acquisition::ReadPlan::prepare(file, None, scope, None, now).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        plan.observe_complete_records(&bytes).unwrap();
-        plan.commit_after_native_completion(file, scope, now)
-            .unwrap()
-    }
 
     pub(in crate::snapshots) fn parser(
         source: SnapshotSource,
