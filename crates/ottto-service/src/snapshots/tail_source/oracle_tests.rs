@@ -51,11 +51,11 @@ fn stored(route: &Route, path: &Path, key: &str) -> (PendingTail, RouteResult, R
     )
 }
 
-/// [money] Restart, eviction and a long/non-ASCII skill all use the same
+/// [money] Restart and a long/non-ASCII skill use the same
 /// durable continuation. No RAM admission is required; expected totals are
 /// independent of either serializer or finalizer.
 #[test]
-fn restart_append_eviction_and_skill_labels_match_full() {
+fn restart_append_and_skill_labels_match_full() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 300);
     let sealed = len(&path);
@@ -81,11 +81,6 @@ fn restart_append_eviction_and_skill_labels_match_full() {
         .provider_skills
         .iter()
         .any(|name| !name.is_ascii() && name.len() > 96));
-    let cache = sampled_scan::SharedCache::default();
-    cache.clear();
-    let (_, evicted, mode, _) = stored(&route, &path, &key);
-    assert!(matches!(mode, ReadMode::Tail));
-    money_oracle::assert_equivalent(&cold, &evicted);
 }
 
 /// [money] An explicitly selected quiet file is Unchanged, consumes zero
@@ -241,7 +236,10 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
         };
         state_v2::stage_tail(&route.path, &key, staged).unwrap();
         route.save(false);
-        let head = route.head(&key).unwrap().body;
+        let head = state_v2::load_head(&route.index, &key, u32::MAX)
+            .unwrap()
+            .unwrap()
+            .body;
         let (load, records) = loaded(&route, &path, &key);
         if future {
             assert!(matches!(load, Load::Held));
@@ -266,7 +264,13 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
                 &emitted(Mode::Restart, &native.unwrap().snapshots),
             );
         }
-        assert_eq!(route.head(&key).unwrap().body, head);
+        assert_eq!(
+            state_v2::load_head(&route.index, &key, u32::MAX)
+                .unwrap()
+                .unwrap()
+                .body,
+            head
+        );
     }
 }
 
@@ -307,12 +311,14 @@ fn held_selection(reason: CandidateParseReason) {
         .unwrap();
 }
 
+/// [money] Upload-context re-finalization, held until its selection is enabled.
 #[test]
 #[ignore = "D138"]
 fn upload_context_stored_oracle() {
     held_selection(CandidateParseReason::UploadContext);
 }
 
+/// [money] Body-witness adoption, held until its selection is enabled.
 #[test]
 #[ignore = "D138"]
 fn body_witness_adoption_stored_oracle() {

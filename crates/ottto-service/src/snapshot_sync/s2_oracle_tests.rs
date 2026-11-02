@@ -8,6 +8,16 @@ use crate::snapshots::StateV2ColdSession;
 
 const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
 
+// State stores require canonical ancestors; CI deliberately gives TMPDIR a
+// symlink, just as macOS does. Canonicalize before creating any fixture paths.
+fn corpus(name: &str) -> Corpus {
+    let mut c = Corpus::new(name);
+    c.base = c.base.canonicalize().unwrap();
+    c.root = c.base.join("projects");
+    c.support = c.base.join("support");
+    c
+}
+
 /// Canonical upload and exact ACK, including the observed placement ledger.
 fn result(page: &Page, mode: Mode) -> RouteResult {
     let mut progress = e2_progress();
@@ -93,7 +103,7 @@ fn accepted(result: &mut RouteResult, items: &[SnapshotItem]) {
 /// Independent accounts, a switch, side-call and evidence gap. Every fixture
 /// line and telemetry row is consumed by the native pipeline.
 fn placement_corpus(name: &str) -> (Corpus, PathBuf) {
-    let mut c = Corpus::new(name);
+    let mut c = corpus(name);
     let path = c.root(
         ROOT,
         &(line(ROOT, "a", AT, 10)
@@ -158,7 +168,10 @@ fn append_after_restart_and_eviction_preserves_placement() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let prior = commit(&session, page(&c, index, 100, true));
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        let prior = commit(&session, seed);
         append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         assert!(
@@ -171,7 +184,6 @@ fn append_after_restart_and_eviction_preserves_placement() {
         assert!(stored.modes.1 > 0);
         let warm = result(&stored, Mode::Restart);
         money_oracle::assert_equivalent(&cold, &warm);
-        let scanner = E2ScanFixture::capturing_identity();
         scanner.evict_for_pressure();
         let mut evicted = c.raw(&scanner, prior, 100, true, &[]);
         evicted.enrich(&c);
@@ -191,7 +203,7 @@ fn append_after_restart_and_eviction_preserves_placement() {
 #[test]
 fn restart_between_pages_matches_single_full() {
     with_e2(|| {
-        let mut c = Corpus::new("s2-restart-pages");
+        let mut c = corpus("s2-restart-pages");
         c.root(ROOT, &line(ROOT, "a", AT, 10));
         c.root(COPY, &line(COPY, "b", AT, 20));
         let (session, mut index) = StateV2ColdSession::publish(
@@ -244,21 +256,24 @@ fn restart_between_pages_matches_single_full() {
 #[test]
 fn partial_ack_keeps_the_unaccepted_sibling_owed() {
     with_e2(|| {
-        let (c, _) = placement_corpus("s2-partial-ack");
+        let (c, path) = placement_corpus("s2-partial-ack");
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let mut first = page(&c, index, 100, true);
-        first.finish();
-        let mut prior = session.save_reload(&mut first.index).0;
-        for entry in prior.files.values_mut() {
-            entry.source_file_fingerprint.clear();
-        }
+        let prior = commit(&session, page(&c, index, 100, true));
+        append(
+            &path,
+            &line(ROOT, "partial-later", "2026-08-02T07:04:00Z", 6),
+        );
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "partial-agent", "2026-08-02T07:04:00Z", 3),
+        );
         let current = page(&c, prior, 100, true);
-        assert_eq!(current.modes.0, 0, "partial ACK uses a restored body");
-        assert!(current.modes.2 > 0);
+        assert_eq!(current.modes.0, 0, "partial ACK uses a stored Tail");
+        assert!(current.modes.1 > 0);
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let mut progress = e2_progress();
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
@@ -309,7 +324,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
 #[test]
 fn scan_below_floor_holds_without_a_smaller_reemit() {
     with_e2(|| {
-        let mut c = Corpus::new("s2-scan-floor");
+        let mut c = corpus("s2-scan-floor");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
@@ -338,7 +353,7 @@ fn scan_below_floor_holds_without_a_smaller_reemit() {
 #[test]
 fn lossy_prefix_retains_the_previous_head_and_matches_full() {
     with_e2(|| {
-        let mut c = Corpus::new("s2-lossy-prefix");
+        let mut c = corpus("s2-lossy-prefix");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
@@ -403,7 +418,7 @@ fn assert_family_converges(c: &Corpus, session: &StateV2ColdSession, mut index: 
 #[test]
 fn forced_family_converges_after_resolve() {
     with_e2(|| {
-        let mut c = Corpus::new("s2-family-convergence");
+        let mut c = corpus("s2-family-convergence");
         c.write_at(
             &format!("a/{ROOT}.jsonl"),
             &line(ROOT, "a", AT, 10),
