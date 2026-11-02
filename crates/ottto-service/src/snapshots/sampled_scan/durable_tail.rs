@@ -2896,7 +2896,7 @@ impl SharedCache {
             let entry = index.files.get(key);
             return RestoreOutcome::Miss(if entry.is_none() && !has_slot {
                 MissClass::NoEntry
-            } else if entry.is_some_and(|entry| entry.source_file_fingerprint.is_empty()) {
+            } else if selection_cleared(index, key) {
                 MissClass::SelectionCleared
             } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
                 MissClass::HistoryOwed
@@ -3014,7 +3014,7 @@ impl SharedCache {
                 RestoreOutcome::Held,
             );
         }
-        let result = self.restore_known(
+        let result = match self.restore_known(
             snapshot_source,
             key,
             path,
@@ -3023,7 +3023,19 @@ impl SharedCache {
             index,
             interpretation,
             &mut lease,
-        );
+        ) {
+            // A re-armed entry (cleared selection) whose record no longer matches
+            // its binding takes OFF's immediate Full, never a pace or stale hold.
+            // Only Claude arrives here re-armed: Codex's selection gate returns
+            // first, and Pi is not a durable source. The S2 floor below still
+            // holds first; every other Stale reason keeps its route.
+            Err(RestoreOutcome::Stale(reason) | RestoreOutcome::StaleUnregistered(reason, _))
+                if reason == "old_binding_no_match" && selection_cleared(index, key) =>
+            {
+                Err(MissClass::StaleSelection.into())
+            }
+            result => result,
+        };
         // The common guard held U/T14 before acquisition; this sees class changes since.
         let outcome = match result {
             Ok(Ok(completed)) => {
@@ -3038,10 +3050,7 @@ impl SharedCache {
                             );
                             stores.counters.durable_restore_after_selection_clear += u64::from(
                                 snapshot_source == SnapshotSource::ClaudeCode
-                                    && index
-                                        .files
-                                        .get(key)
-                                        .is_some_and(|e| e.source_file_fingerprint.is_empty()),
+                                    && selection_cleared(index, key),
                             );
                         }
                         RestoreOutcome::Restored(Box::new(taken), lease)
@@ -3321,6 +3330,17 @@ impl SharedCache {
             );
         }
         granted
+    }
+
+    /// Count a re-armed Claude entry's no-match Full at the same input boundary
+    /// as the real Full selection counter. Never paced (OFF == ON).
+    pub(in crate::snapshots) fn note_stale_selection_full(&self) {
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                "selection_cleared.stale_record_full",
+            );
+        }
     }
 
     /// Missing authority preserves the predecessor and discoverability. The
@@ -3642,12 +3662,7 @@ impl SharedCache {
             stores.counters.restore_attempts += 1;
             stores.note_indexed(source, index);
             // Codex keeps its predecessor selection gate; Claude first proves the original binding.
-            if source == DurableSource::Codex
-                && index
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
-            {
+            if source == DurableSource::Codex && selection_cleared(index, key) {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
                 // A record surviving behind a cleared selection
                 // (the strict rebind's carrier, no new persisted field) is a
@@ -5776,7 +5791,8 @@ pub(crate) enum MissClass {
     Unavailable,
     NoEntry,
     SelectionCleared,
-    /// A Codex record survived a cleared selection: refused, paced Full.
+    /// A record cannot serve a re-armed (selection-cleared) entry: refused and
+    /// counted. Codex's Full is paced; a Claude no-match takes OFF's immediate Full.
     StaleSelection,
     HistoryOwed,
     Missing,
@@ -6007,6 +6023,14 @@ fn on_proof_restore(key: &str, outcome: &RestoreOutcome) {
         RestoreOutcome::Held(_) => crate::on_proof::hold("restore.held", key),
         _ => {}
     }
+}
+
+/// The index cleared this entry's selection (a re-arm): OFF reads it Full.
+fn selection_cleared(index: &ScanIndex, key: &str) -> bool {
+    index
+        .files
+        .get(key)
+        .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
 }
 
 /// Held-FD length past the committed end; metadata only, no read.
