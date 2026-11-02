@@ -87,6 +87,9 @@ struct RejectedUsageEvidence {
     machine_ref: String,
     reason: RejectedUsageReason,
     permanent: bool,
+    /// Optional classification keeps the persisted reason vocabulary compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retryable_reason: Option<String>,
     exclusive_usage_contract: bool,
     // request, input, output, cache_read, cache_creation_5m,
     // cache_creation_1h, reasoning_output, unattributed_total.
@@ -119,15 +122,9 @@ pub(crate) enum RejectedUsageReason {
 }
 
 impl RejectedUsageReason {
-    /// The backend already holds an equal-or-better (authority downgrade) or
-    /// newer (stale older upload) accepted record for this entity. Refusing
-    /// the body loses no usage the server does not already own.
+    /// An authority refusal is distinct from timestamp order, which proves no coverage.
     pub(crate) fn is_dominated(self) -> bool {
-        matches!(
-            self,
-            RejectedUsageReason::UsageAccountingAuthorityDowngrade
-                | RejectedUsageReason::AcceptedLogStaleOlderUpload
-        )
+        matches!(self, RejectedUsageReason::UsageAccountingAuthorityDowngrade)
     }
 
     pub(crate) fn from_wire(reason: &str) -> Self {
@@ -226,6 +223,8 @@ fn rejected_usage_evidence(
         machine_ref: format!("{:x}", Sha256::digest(request.machine_id.as_bytes()))[..12].into(),
         reason: RejectedUsageReason::from_wire(rejection.safe_reason()),
         permanent: rejection.permanent,
+        retryable_reason: (rejection.safe_reason() == "accepted_log_stale_older_mixed")
+            .then(|| "accepted_log_stale_older_mixed".to_string()),
         exclusive_usage_contract: item.usage_accounting_contract.as_deref()
             == Some("session_exclusive_reported_usage:v1"),
         counters: [

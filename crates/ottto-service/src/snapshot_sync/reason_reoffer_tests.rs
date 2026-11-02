@@ -52,6 +52,7 @@ fn refused(
         progress.permanent_rejections.insert(
             fp(*value),
             PermanentSnapshotRejection {
+                exposure: None,
                 body_witness: body(*value),
                 reason: crate::upload_receipts::RejectedUsageReason::Other,
                 reoffer: *reoffer,

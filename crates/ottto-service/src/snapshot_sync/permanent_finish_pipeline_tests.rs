@@ -355,6 +355,10 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
                 // The refused body is settled unproven-terminal residue; the
                 // server already owns a better or newer record for it.
                 FinishOutcome::Dominated {
+                    reason: "accepted_log_stale_older_upload",
+                    ..
+                } => "backend_validation_error",
+                FinishOutcome::Dominated {
                     admit_residue: true,
                     ..
                 } => "census_residue",
@@ -368,16 +372,24 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             },
             "{outcome:?}, cycle {cycle}"
         );
-        if let FinishOutcome::Dominated { admit_residue, .. } = outcome {
-            assert_eq!(terminal[cycle]["last_census_residue_settled"], true);
-            assert_eq!(terminal[cycle]["last_snapshot_unproven_terminal_count"], 1);
+        if let FinishOutcome::Dominated {
+            reason,
+            admit_residue,
+        } = outcome
+        {
+            let dominated = reason != "accepted_log_stale_older_upload";
+            assert_eq!(terminal[cycle]["last_census_residue_settled"], dominated);
+            assert_eq!(
+                terminal[cycle]["last_snapshot_unproven_terminal_count"],
+                u64::from(dominated)
+            );
             assert_eq!(
                 terminal[cycle]["consecutive_failures"],
-                u64::from(!admit_residue)
+                u64::from(!admit_residue || !dominated)
             );
             assert_eq!(
                 terminal[cycle]["last_success_at"].is_string(),
-                admit_residue
+                admit_residue && dominated
             );
         }
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
@@ -459,9 +471,8 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
 }
 
-/// The page's only permanent refusals are dominated, no holds. The
-/// first refusal and both quiet retained cycles report settled residue, never
-/// `backend_validation_error`, and the native lease outcome is unchanged.
+/// [regress] Authority refusals retain their residue status; older activity
+/// alone stays owed on the first refusal and quiet cycles, never dominated.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]

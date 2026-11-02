@@ -4142,6 +4142,9 @@ pub struct ScanIndex {
     /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
+    /// Runtime-only entities whose durably claimed operator action requires a fresh Full.
+    #[serde(skip)]
+    stale_reopen_retries: BTreeSet<String>,
     /// Runtime-only: this index's path was loaded in this process with no
     /// verified prior history (missing, quarantined, or generation 0 with no
     /// files), so a census absence there is not positive and retires nothing.
@@ -4545,6 +4548,7 @@ impl Default for ScanIndex {
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
             terminal_contract_retries: BTreeMap::new(),
+            stale_reopen_retries: BTreeSet::new(),
             claude_history_unverified_in_process: false,
             claude_rebuild_read_load_eligible: false,
             reason_reoffer_cooldowns: BTreeMap::new(),
@@ -34950,6 +34954,7 @@ impl OwnedSourceScan {
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
                             && !forced_family
+                            && !index.stale_reopen_leased(&key)
                             && !comparison_target
                             && !parent_proof_required;
                         context
@@ -52082,6 +52087,33 @@ impl ScanIndex {
         }
     }
 
+    /// Counts-only diagnostics resolve member aliases through the existing entity incidence.
+    pub(crate) fn authority_owed_snapshot_fingerprints(&self) -> (BTreeSet<&str>, usize) {
+        let mut entities = BTreeSet::new();
+        let mut unbound = self
+            .claude_usage_authority_quarantine
+            .iter()
+            .flat_map(|(root, record)| {
+                record
+                    .member_source_file_fingerprints
+                    .keys()
+                    .map(move |member| (root.as_str(), member.as_str()))
+            })
+            .collect::<BTreeSet<_>>();
+        for (key, fingerprints) in &self.file_snapshot_fingerprints {
+            if unbound.is_empty() {
+                break;
+            }
+            let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
+                continue;
+            };
+            if !fingerprints.is_empty() && unbound.remove(&(root.as_str(), member.as_str())) {
+                entities.extend(fingerprints.iter().map(String::as_str));
+            }
+        }
+        (entities, unbound.len())
+    }
+
     pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {
         self.quarantined_snapshot_fingerprints
             .values()
@@ -52322,6 +52354,20 @@ impl ScanIndex {
         records: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> bool {
         terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
+    }
+
+    pub(crate) fn activate_stale_reopen_retries(&mut self, leases: BTreeSet<String>) {
+        self.stale_reopen_retries = leases;
+    }
+
+    fn stale_reopen_leased(&self, key: &str) -> bool {
+        self.file_snapshot_fingerprints
+            .get(key)
+            .is_some_and(|entities| {
+                entities
+                    .iter()
+                    .any(|entity| self.stale_reopen_retries.contains(entity))
+            })
     }
 
     pub(crate) fn activate_terminal_contract_retries(
@@ -54763,6 +54809,7 @@ impl ScanIndex {
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
             terminal_contract_retries: self.terminal_contract_retries.clone(),
+            stale_reopen_retries: self.stale_reopen_retries.clone(),
             claude_history_unverified_in_process: self.claude_history_unverified_in_process,
             claude_rebuild_read_load_eligible: self.claude_rebuild_read_load_eligible,
             reason_reoffer_cooldowns: self.reason_reoffer_cooldowns.clone(),
