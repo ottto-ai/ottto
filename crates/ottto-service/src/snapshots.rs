@@ -26558,6 +26558,9 @@ pub(crate) struct OwnedSourceScan {
     /// LD: this pass's line observer, if one is registered.
     line_delivery: Option<line_delivery::LineDelivery>,
     codex_versions: Option<Arc<codex_version::CodexVersionFeed>>,
+    /// Launch evidence for the source fingerprint when no attribution context
+    /// supplies it: a file's identity does not depend on the toggle.
+    launch_events: Option<Arc<crate::launch_events::LaunchEventInventory>>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -27083,6 +27086,7 @@ impl OwnedSourceScan {
             codex_side_pass: None,
             continuation_ticket: None,
             line_delivery: None,
+            launch_events: None,
             codex_versions: None,
         }
     }
@@ -27941,8 +27945,15 @@ impl OwnedSourceScan {
             codex_side_pass: None,
             continuation_ticket: None,
             line_delivery: None,
+            launch_events: None,
             codex_versions: None,
         }
+    }
+    pub(crate) fn with_launch_events(mut self, home: &Path) -> Self {
+        self.launch_events = Some(Arc::new(
+            crate::launch_events::LaunchEventInventory::cached(home),
+        ));
+        self
     }
     pub(crate) fn with_codex_versions(
         mut self,
@@ -28025,7 +28036,10 @@ impl OwnedSourceScan {
             && self.codex_join_active.is_none()
             && (self.source != SnapshotSource::Codex || self.codex_join_prepared)
         {
-            if let Some(context) = attribution_context {
+            let launch_lookup = attribution_context
+                .map(|context| context.launch_events())
+                .or(self.launch_events.as_deref());
+            if let Some(events) = launch_lookup {
                 let first = self
                     .codex_join_groups
                     .front()
@@ -28043,7 +28057,7 @@ impl OwnedSourceScan {
                 // A completed batch covers its remaining members. Looking at
                 // a sliding window here would add one new worker after every
                 // file and repeat the complete retained-store sweep per file.
-                if !context.launches_prepared(&first) {
+                if !events.prepared(&first) {
                     let mut workers = BTreeSet::new();
                     for worker in self
                         .codex_join_groups
@@ -28066,7 +28080,7 @@ impl OwnedSourceScan {
                         }
                     }
                     let workers = workers.into_iter().collect::<Vec<_>>();
-                    match context.prepare_launch_step(&workers) {
+                    match events.prepare_step(&workers) {
                         Ok(false) => return Ok(OwnedSourceScanStep::Pending(self)),
                         Err(()) => {} // Candidate handling keeps unreadable evidence owed.
                         Ok(true) => {}
@@ -28157,7 +28171,12 @@ impl OwnedSourceScan {
             mut continuation_ticket,
             mut line_delivery,
             codex_versions,
+            launch_events,
         } = self;
+        let scan_launch_events = launch_events.clone();
+        let launch_lookup = attribution_context
+            .map(|context| context.launch_events())
+            .or(scan_launch_events.as_deref());
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
         let index = &mut index_storage;
@@ -28810,7 +28829,7 @@ impl OwnedSourceScan {
                     codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
                 );
                 let outcome = boot.step_with_cache(
-                    attribution_context,
+                    launch_lookup,
                     index,
                     sampling.as_ref().map(|context| context.cache.as_ref()),
                 );
@@ -29789,7 +29808,7 @@ impl OwnedSourceScan {
                         active.parser.accumulator.source_session_id.as_deref(),
                         &active.candidate.path,
                     );
-                    match context.prepare_launch_step(&workers) {
+                    match context.launch_events().prepare_step(&workers) {
                         Ok(false) => {
                             active_file = Some(active);
                             pending!();
@@ -33564,10 +33583,10 @@ impl OwnedSourceScan {
             let mut restore_floor = accepted_floor;
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
-            if let Some(context) = attribution_context {
+            if let Some(events) = launch_lookup {
                 let workers =
                     launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
-                match context.prepare_launch_step(&workers) {
+                match events.prepare_step(&workers) {
                     Ok(false) => {
                         identified_candidates.push_front(candidate);
                         pending!();
@@ -33680,10 +33699,10 @@ impl OwnedSourceScan {
             }
             // The preflight fences physical/sidecar identity. Local launcher facts
             // are semantic context and must not contaminate that two-open witness.
-            if let Some(context) = attribution_context {
+            if let Some(events) = launch_lookup {
                 let workers =
                     launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
-                if let Some(witness) = context.launch_witness(&workers) {
+                if let Some(witness) = events.witness(&workers) {
                     candidate.source_file_fingerprint = sha256_hex(&[
                         "launcher_worker_context:v1",
                         &candidate.source_file_fingerprint,
@@ -33696,7 +33715,7 @@ impl OwnedSourceScan {
             // the two-open equality check above physical. Every family member must
             // match the retained revision before withdrawing a forced retry.
             if source == SnapshotSource::ClaudeCode {
-                if let Some(context) = attribution_context {
+                if let Some(events) = launch_lookup {
                     if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
                         if forced_claude_family_reparses.contains(&root)
                             && claude_held_family_matches_launch_context(
@@ -33704,7 +33723,7 @@ impl OwnedSourceScan {
                                 &root,
                                 &candidate,
                                 &identified_candidates,
-                                context,
+                                events,
                             )
                         {
                             forced_claude_family_reparses.remove(&root);
@@ -35927,6 +35946,7 @@ impl OwnedSourceScan {
             continuation_ticket,
             line_delivery,
             codex_versions,
+            launch_events,
         }))
     }
 }
@@ -35989,7 +36009,7 @@ fn claude_held_family_matches_launch_context(
     root: &str,
     current: &CandidateFile,
     remaining: &VecDeque<CandidateFile>,
-    context: &crate::session_attribution::SessionAttributionContext,
+    events: &crate::launch_events::LaunchEventInventory,
 ) -> bool {
     let Some(record) = index.claude_usage_authority_quarantine.get(root) else {
         return false;
@@ -36006,10 +36026,10 @@ fn claude_held_family_matches_launch_context(
         let mut semantic = member.clone();
         if member.path != current.path {
             let workers = launch_workers_for_path(SnapshotSource::ClaudeCode, &member.path);
-            if !context.launches_prepared(&workers) {
+            if !events.prepared(&workers) {
                 return false;
             }
-            if let Some(witness) = context.launch_witness(&workers) {
+            if let Some(witness) = events.witness(&workers) {
                 semantic.source_file_fingerprint = sha256_hex(&[
                     "launcher_worker_context:v1",
                     &semantic.source_file_fingerprint,
@@ -37154,7 +37174,7 @@ impl OwnedJsonlParser {
                 self.accumulator.source_session_id.as_deref(),
                 path,
             );
-            if !context.launches_prepared(&workers) {
+            if !context.launch_events().prepared(&workers) {
                 self.reader.reader.close();
                 anyhow::bail!("launch evidence lookup incomplete");
             }
@@ -38206,7 +38226,8 @@ fn parse_opened_jsonl_file(
         // This compatibility reader already synchronously drains the transcript.
         // Production OwnedSourceScan prepares in its resumable step before finish.
         while !context
-            .prepare_launch_step(&workers)
+            .launch_events()
+            .prepare_step(&workers)
             .map_err(|()| anyhow::anyhow!("launch evidence lookup incomplete"))?
         {}
     }

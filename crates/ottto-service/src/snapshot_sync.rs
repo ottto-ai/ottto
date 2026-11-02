@@ -6981,6 +6981,7 @@ fn prepare_sync_source_inner(
         &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
+    .with_launch_events(home)
     .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
@@ -7387,6 +7388,7 @@ fn prepare_continuation_source(
     )
     .with_continuation_deadline(deadline)
     .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
+    .with_launch_events(home)
     .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());

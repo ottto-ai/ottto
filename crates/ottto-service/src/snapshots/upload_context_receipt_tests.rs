@@ -3,6 +3,8 @@ use super::*;
 use upload_context_receipt::{Candidate, RearmCounts};
 #[path = "privacy_flip_tests.rs"]
 mod privacy_flip;
+#[path = "privacy_flip_launch_tests.rs"]
+mod privacy_flip_launch;
 #[path = "upload_context_released_entry_fixture.rs"]
 mod released;
 

@@ -306,8 +306,10 @@ files move to `~/.ottto/launch-events/processed/` and expire after thirty days;
 rejected files move to `~/.ottto/launch-events/rejected/` and expire after seven
 days, with the local log line naming only a reason code and never the file's
 contents. Two events naming the same session with different controllers produce
-no relationship at all. This intake reads only that directory, only while
-session attribution is enabled, and adds no watcher, process inspection, or
+no relationship at all. This intake reads only that directory. It runs whether
+or not session attribution is enabled, so that turning the setting on or off
+does not change a file's identity; the relationship is uploaded only while the
+setting is on. It adds no watcher, process inspection, or
 permission prompt.
 
 Codex session-start footprint: for each new Codex session (in `~/.codex` and

@@ -4023,9 +4023,9 @@ pub(super) mod tests {
                 _ => panic!("the legacy group boots"),
             }
         }
-        assert!(context.launches_prepared(&workers));
+        assert!(context.launch_events().prepared(&workers));
         context.expire_launch_lookup_for_test();
-        assert!(!context.launches_prepared(&workers));
+        assert!(!context.launch_events().prepared(&workers));
         let events = root.join(".ottto/launch-events/processed");
         fs::create_dir_all(&events).unwrap();
         for n in 1..=600 {
@@ -4088,7 +4088,7 @@ pub(super) mod tests {
             "completed members must not be read twice"
         );
         assert_eq!(job.group.as_mut().unwrap().take_legacy_baselines().len(), 2);
-        assert!(context.launches_prepared(&workers));
+        assert!(context.launch_events().prepared(&workers));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -308,18 +308,22 @@ impl GroupBoot {
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         index: &ScanIndex,
     ) -> Boot {
-        self.step_with_cache(attribution, index, None)
+        self.step_with_cache(
+            attribution.map(|context| context.launch_events()),
+            index,
+            None,
+        )
     }
 
     pub(in crate::snapshots) fn step_with_cache(
         &mut self,
-        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
         let n = self.group.members.len();
         if self.identified < n {
-            return self.identify(attribution, index, cache);
+            return self.identify(launch_events, index, cache);
         }
         if !self.admitted {
             if self.unchanged_joined(index) {
@@ -382,20 +386,20 @@ impl GroupBoot {
 
     fn identify(
         &mut self,
-        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
-        if let Some(context) = attribution {
+        if let Some(events) = launch_events {
             let workers = vec![self.group.owner.clone()];
-            match context.prepare_launch_step(&workers) {
+            match events.prepare_step(&workers) {
                 Ok(false) => return Boot::Pending,
                 Err(()) => return Boot::Strict,
                 Ok(true) => {}
             }
-            if let Some(witness) = context.launch_witness(&workers) {
+            if let Some(witness) = events.witness(&workers) {
                 candidate.source_file_fingerprint = sha256_hex(&[
                     "launcher_worker_context:v1",
                     &candidate.source_file_fingerprint,
@@ -996,7 +1000,7 @@ fn member_eof(
             .unwrap_or_else(|| launch_workers_for_path(SnapshotSource::Codex, &member.path));
         // The legacy baseline below needs the lookup; park the finished
         // member until it is prepared.
-        match context.prepare_launch_step(&workers) {
+        match context.launch_events().prepare_step(&workers) {
             Ok(false) => return Ok(false),
             Err(()) => return Err(GroupEnd::Strict),
             Ok(true) => {}
