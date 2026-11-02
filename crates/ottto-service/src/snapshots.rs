@@ -2891,8 +2891,10 @@ pub(crate) struct TailDiscovery {
     pub(crate) last_complete_discovery_at: Option<u64>,
     /// Cumulative files erased while they still held unaccepted usage.
     pub(crate) deleted_unaccepted_files: u64,
+    /// Oldest known unaccepted change among those erased files, in Unix milliseconds.
+    pub(crate) deleted_unaccepted_oldest_at: Option<u64>,
 }
-crate::heap_layout_bound::fields!(TailDiscovery; last_complete_discovery_at, deleted_unaccepted_files);
+crate::heap_layout_bound::fields!(TailDiscovery; last_complete_discovery_at, deleted_unaccepted_files, deleted_unaccepted_oldest_at);
 impl TailDiscovery {
     fn is_empty(&self) -> bool {
         *self == Self::default()

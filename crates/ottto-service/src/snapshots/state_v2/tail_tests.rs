@@ -1000,6 +1000,7 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.tail_discovery.deleted_unaccepted_oldest_at, None);
     stage_tail(
         &f.path,
         FILE,
@@ -1015,12 +1016,16 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     )
     .unwrap();
     save_with(&f.path, &mut index).unwrap();
-    observe_tail(
-        &f.path,
-        "/synthetic/tail/staged.jsonl",
-        observation(&[b"new"]),
-    )
-    .unwrap();
+    let mut pending = observation(&[b"new"]);
+    pending.summary.earliest_unacked_change_at = Some(3_000);
+    observe_tail(&f.path, "/synthetic/tail/staged.jsonl", pending).unwrap();
+
+    erase_tail(&f.path, &mut index, [FILE.to_owned()]).unwrap();
+    assert_eq!(index.tail_discovery.deleted_unaccepted_files, 1);
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(7_000)
+    );
 
     let keys = [FILE, SIBLING, "/synthetic/tail/staged.jsonl"].map(str::to_owned);
     erase_tail(&f.path, &mut index, keys.clone()).unwrap();
@@ -1029,6 +1034,10 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
         index.tail_discovery.deleted_unaccepted_files, 2,
         "once each"
     );
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(3_000)
+    );
     save_with(&f.path, &mut index).unwrap();
     for key in &keys {
         assert_eq!(all_tail_rows(&index, key), 0, "{key}");
@@ -1036,6 +1045,10 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     }
     let index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(index.tail_discovery.deleted_unaccepted_files, 2);
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(3_000)
+    );
 }
 
 /// A published store whose head, page and live WAL hold these literals in the

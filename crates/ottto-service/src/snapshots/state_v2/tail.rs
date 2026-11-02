@@ -316,17 +316,31 @@ impl TailStage {
         );
     }
     /// Erasure of the key's whole scope; anything staged for it goes. `true`:
-    /// newly erased while it held unaccepted revisions, committed or staged.
-    pub(super) fn erase(&mut self, key: &str, committed_debt: bool) -> bool {
+    /// newly erased while it held unaccepted revisions, committed or staged;
+    /// the timestamp is the oldest known change in that debt.
+    pub(super) fn erase(
+        &mut self,
+        key: &str,
+        committed: (bool, Option<u64>),
+    ) -> (bool, Option<u64>) {
         let key = key.as_bytes().to_vec();
-        let staged_debt = self
-            .debt
-            .remove(&key)
-            .and_then(|debt| debt.observation)
+        let observation = self.debt.remove(&key).and_then(|debt| debt.observation);
+        let staged_debt = observation
+            .as_ref()
             .is_some_and(|observation| !observation.added.is_empty());
+        let oldest = committed
+            .1
+            .into_iter()
+            .chain(
+                observation.and_then(|observation| observation.summary.earliest_unacked_change_at),
+            )
+            .min();
         self.files.remove(&key);
         self.retire.remove(&key);
-        self.erase.insert(key) && (committed_debt || staged_debt)
+        (
+            self.erase.insert(key) && (committed.0 || staged_debt),
+            oldest,
+        )
     }
     pub(super) fn stage(&mut self, key: &str, mut file: StagedFile) {
         let key = key.as_bytes().to_vec();
@@ -913,10 +927,16 @@ fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
         found.extend(rows);
     }
 }
-/// Whether the file holds unresolved debt; erasure must not decode what it removes.
-pub(super) fn has_revisions(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+/// Debt presence from row headers, with its oldest known change when the head
+/// is readable. A damaged head must never prevent scope erasure.
+pub(super) fn erasure_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(bool, Option<u64>)> {
     let kind = RecordKind::parse(REVISION)?;
-    Ok(!tx.scan_record_key(&kind, file, None, 1)?.is_empty())
+    let owed = !tx.scan_record_key(&kind, file, None, 1)?.is_empty();
+    let oldest = read_head(tx, file)
+        .ok()
+        .flatten()
+        .and_then(|head| head.common.debt.earliest_unacked_change_at);
+    Ok((owed, oldest))
 }
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 struct Applied {

@@ -62,7 +62,8 @@ pub(in crate::snapshots) fn dispose_tail(
 }
 /// Source withdrawal or a foreign scope: every Tail row of `keys`, debt included,
 /// is erased with the next save. A file that still held unaccepted revisions
-/// adds one to `tail_discovery.deleted_unaccepted_files`, which `index` saves.
+/// adds one to `tail_discovery.deleted_unaccepted_files` and contributes its
+/// oldest known change to `deleted_unaccepted_oldest_at`; `index` saves both.
 pub(in crate::snapshots) fn erase_tail(
     path: &Path,
     index: &mut ScanIndex,
@@ -70,12 +71,20 @@ pub(in crate::snapshots) fn erase_tail(
 ) -> Result<()> {
     for key in keys {
         let committed = read_txn(index, |tx| {
-            super::super::tail::has_revisions(tx, key.as_bytes())
+            super::super::tail::erasure_debt(tx, key.as_bytes())
         })?
         .0;
-        let counted = with_state(path, |state| Ok(state.tail.erase(&key, committed)))?;
-        let erased = &mut index.tail_discovery.deleted_unaccepted_files;
-        *erased = erased.saturating_add(u64::from(counted));
+        let (counted, oldest) = with_state(path, |state| Ok(state.tail.erase(&key, committed)))?;
+        if counted {
+            let discovery = &mut index.tail_discovery;
+            discovery.deleted_unaccepted_files =
+                discovery.deleted_unaccepted_files.saturating_add(1);
+            discovery.deleted_unaccepted_oldest_at = discovery
+                .deleted_unaccepted_oldest_at
+                .into_iter()
+                .chain(oldest)
+                .min();
+        }
     }
     Ok(())
 }
