@@ -366,22 +366,15 @@ impl PreparedRetry {
                         ),
                         "optional snapshot wire request exceeds admission limit"
                     );
-                    let mut token = client.issue_relay_token_bounded(
+                    let mut token = policy_checked_relay_token(
+                        client,
                         device,
                         device_secret,
                         source,
+                        live_policy,
                         budget,
                         validate,
                     )?;
-                    if let Some(expected) = live_policy {
-                        let mut hint =
-                            client.get_activity_hint_bounded(&token, budget, validate)?;
-                        anyhow::ensure!(
-                            super::live_snapshot_retry::fresh_policy_seal(&mut hint).as_ref()
-                                == Some(expected),
-                            "optional snapshot policy changed"
-                        );
-                    }
                     let response = match client
                         .upload_batch_bounded(&token, &request, false, budget, validate)
                     {
@@ -390,23 +383,15 @@ impl PreparedRetry {
                         {
                             // No old token or report is held across a wait. Auth replay
                             // uses this same turn and the same remaining POST counter.
-                            token = client.issue_relay_token_bounded(
+                            token = policy_checked_relay_token(
+                                client,
                                 device,
                                 device_secret,
                                 source,
+                                live_policy,
                                 budget,
                                 validate,
                             )?;
-                            if let Some(expected) = live_policy {
-                                let mut hint =
-                                    client.get_activity_hint_bounded(&token, budget, validate)?;
-                                anyhow::ensure!(
-                                    super::live_snapshot_retry::fresh_policy_seal(&mut hint)
-                                        .as_ref()
-                                        == Some(expected),
-                                    "optional snapshot policy changed"
-                                );
-                            }
                             client
                                 .upload_batch_bounded(&token, &request, false, budget, validate)?
                         }
@@ -455,6 +440,29 @@ impl PreparedRetry {
         self.baseline = checkpoint;
         Ok(outcome)
     }
+}
+
+/// A fresh bounded relay token. Under a live policy, the activity hint it
+/// authorizes must still carry that policy's seal.
+fn policy_checked_relay_token(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    live_policy: Option<&[u8; 32]>,
+    budget: &RetryBudget,
+    validate: &mut dyn FnMut() -> Result<()>,
+) -> Result<String> {
+    let token =
+        client.issue_relay_token_bounded(device, device_secret, source, budget, validate)?;
+    if let Some(expected) = live_policy {
+        let mut hint = client.get_activity_hint_bounded(&token, budget, validate)?;
+        anyhow::ensure!(
+            super::live_snapshot_retry::fresh_policy_seal(&mut hint).as_ref() == Some(expected),
+            "optional snapshot policy changed"
+        );
+    }
+    Ok(token)
 }
 
 /// Complete bodies share one bounded owner reservation. One source slot and
