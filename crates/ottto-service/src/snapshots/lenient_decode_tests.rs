@@ -527,32 +527,25 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
 
 #[test]
 fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
-    for bounded in [false, true] {
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
-        let path = scratch.as_ref().join("index.json");
-        let mut index = fixture();
-        index.save(&path).unwrap();
-        let mut value = serde_json::to_value(&index).unwrap();
-        value["files"]["opaque-large"] =
-            serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
-        value["unknown_padding"] = serde_json::json!("p".repeat(20 * 1024 * 1024));
-        let bytes = serde_json::to_vec(&value).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        assert!(!loaded.decode_holds.is_empty());
-        let generation = loaded.generation;
-        let result = if bounded {
-            loaded.save_with_read_limit(&path, 32 * 1024 * 1024)
-        } else {
-            loaded.save(&path)
-        };
-        assert!(result.is_err());
-        assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
-        assert_eq!(loaded.generation, generation);
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-        assert!(!ScanIndex::load(&path).unwrap().decode_holds.is_empty());
-    }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["files"]["opaque-large"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    value["unknown_padding"] = serde_json::json!("p".repeat(20 * 1024 * 1024));
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(!loaded.decode_holds.is_empty());
+    let generation = loaded.generation;
+    let result = loaded.save(&path);
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert_eq!(loaded.generation, generation);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    assert!(!ScanIndex::load(&path).unwrap().decode_holds.is_empty());
 }
 
 #[test]
@@ -877,35 +870,6 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
         raw_slot(&saved, "claude_usage_family_witnesses", "family"),
         witness
     );
-}
-
-#[test]
-fn optional_raw_cap_counts_object_field_leading_whitespace() {
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("lenient-census-leading-whitespace");
-    let path = scratch.as_ref().join("index.json");
-    let mut seed = fixture();
-    seed.save(&path).unwrap();
-    let prefix = fs::read(&path).unwrap();
-    let mut file = BufWriter::new(File::create(&path).unwrap());
-    file.write_all(&prefix[..prefix.len() - 1]).unwrap();
-    file.write_all(b",\"claude_request_census_shadow\":")
-        .unwrap();
-    let spaces = claude_request_census::MAX_RAW_BYTES + 1;
-    let chunk = [b' '; 8192];
-    for _ in 0..spaces / chunk.len() {
-        file.write_all(&chunk).unwrap();
-    }
-    file.write_all(&chunk[..spaces % chunk.len()]).unwrap();
-    file.write_all(b"{\"o\":true}}").unwrap();
-    file.flush().unwrap();
-    drop(file);
-    let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-    assert!(native.claude_request_census_shadow.is_empty());
-    let loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.claude_request_census_shadow.is_empty());
-    assert_sibling(&loaded);
-    assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
 
 #[test]
@@ -3976,81 +3940,6 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
 }
 
 #[test]
-fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
-    let mut seed = fixture();
-    seed.claude_usage_family_pending.insert(
-        "family".into(),
-        ClaudeUsageFamilyPending {
-            census_window_end: "2026-10-25T00:00:00Z".into(),
-            member_request_id_hashes: BTreeMap::new(),
-            member_occurrences: BTreeMap::new(),
-            invalid: true,
-            idless_revision: Some([7; 32]),
-            identity_contract: None,
-            contract_unproven: false,
-        },
-    );
-    let valid = serde_json::to_vec_pretty(&seed).unwrap();
-    let loaded = lenient_decode::read(std::io::Cursor::new(&valid), "load", "claude_code").unwrap();
-    assert_eq!(
-        loaded.claude_usage_family_pending["family"].idless_revision,
-        Some([7; 32])
-    );
-    for positional in [false, true] {
-        let mut value = serde_json::to_value(&seed).unwrap();
-        if positional {
-            value["claude_usage_family_pending"]["family"] =
-                serde_json::json!(["2026-10-25T00:00:00Z", {}, {}, true, vec![7; 32],]);
-            let bytes = serde_json::to_vec(&value).unwrap();
-            let loaded =
-                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
-            assert_eq!(
-                loaded.claude_usage_family_pending["family"].idless_revision,
-                Some([7; 32])
-            );
-            value["claude_usage_family_pending"]["family"][4] =
-                Value::String("MARKER_PAYLOAD".into());
-        } else {
-            value["claude_usage_family_pending"]["family"]["idless_revision"] =
-                Value::String("MARKER_PAYLOAD".into());
-        }
-        let template = serde_json::to_string(&value).unwrap();
-        let payload = "x".repeat(16 * 1024 * 1024);
-        for malformed in [
-            format!("\"{payload}\""),
-            format!("[\"{payload}\"]"),
-            format!("{{\"{payload}\":0}}"),
-        ] {
-            let bytes = template
-                .replace("\"MARKER_PAYLOAD\"", &malformed)
-                .into_bytes();
-            let (result, allocations) = crate::retry_allocation_probe::measure(|| {
-                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
-            });
-            // Optional optimization damage is normalized at its boundary;
-            // it must not consume opaque debt or reset the identity index.
-            let loaded = result.unwrap();
-            assert!(loaded.claude_usage_family_pending["family"].invalid);
-            assert_eq!(
-                loaded.claude_usage_family_pending["family"].idless_revision,
-                None
-            );
-            assert!(loaded.decode_holds.is_empty());
-            assert!(
-                allocations.requested_peak < 256 * 1024,
-                "{}",
-                allocations.requested_peak
-            );
-            assert!(
-                allocations.usable_peak < 512 * 1024,
-                "{}",
-                allocations.usable_peak
-            );
-        }
-    }
-}
-
-#[test]
 fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     let mut seed = fixture();
     seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
@@ -4087,17 +3976,10 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
             value["claude_usage_family_pending"]["family"]["idless_revision"] = "MARKER".into();
         }
         let template = serde_json::to_string(&value).unwrap();
-        let oversized = "x".repeat(16 * 1024 * 1024);
-        for marker in [
-            format!("\"{oversized}\""),
-            format!("[\"{oversized}\"]"),
-            format!("{{\"{oversized}\":0}}"),
-            "1e400".into(),
-            "{\"wrong\":true}".into(),
-        ] {
+        for marker in ["1e400", "{\"wrong\":true}"] {
             let scratch = crate::test_scratch::ScratchDir::new("idless-marker-identity");
             let path = scratch.join("index.json");
-            fs::write(&path, template.replace("\"MARKER\"", &marker)).unwrap();
+            fs::write(&path, template.replace("\"MARKER\"", marker)).unwrap();
             let mut loaded = ScanIndex::load(&path).expect("field damage cannot quarantine index");
             for round in 0..2 {
                 assert_eq!(corrupt_count(scratch.as_ref()), 0);

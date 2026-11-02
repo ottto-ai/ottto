@@ -75,7 +75,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
 | `wal_peak_bytes`, `wal_alarm`, `wal_measurement_unavailable` | Measured WAL peak, alarm at 64 MiB, and unavailable measurements. The alarm is not a cap. |
-| `import_peak_rss_bytes`, `v1_load_peak_rss_bytes`, `comparison_same_process_corpus`, `import_exceeds_v1_load` | Import peak versus v1 load on the same process/path corpus; comparison/exceed flag is unavailable until both comparable measurements exist. |
+| `import_peak_rss_bytes` | Sampled process RSS peak during the latest import attempt. |
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
@@ -325,6 +325,9 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
+Claude Code's local-evidence stage adds three such footprint records (empty
+counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
@@ -622,6 +625,13 @@ owed source (a Codex owed-residue set, a compressed hold) registers as one field
 plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
 separate exemption.
 
+The `local_resources` stage `oversized_discovery_alarm` reports oversized debt
+per source, per page: `outstanding_file_count`, `outstanding_bytes` (last
+observed total size) and `first_seen_oversized_age_seconds` (oldest first-seen
+age in the current traversal). The row is omitted at zero outstanding files.
+Debt follows the existing traversal checkpoint lifetime. Older checkpoints
+without these scalars default bytes to zero and first-seen to load time.
+
 `counts.line_delivery_unselected` counts discovery skip decisions for the page's
 source: `age` (outside the backfill window, not held for verification and not
 withheld for an unresolved Claude account) and `size` (over the source's
@@ -722,7 +732,7 @@ fragment per source preparation; never Full; fail-open; fragment bytes only
 (from the committed fragment offset to EOF)**. A preparation is a fresh source
 scan frame: the ordinary rotation offers each due source once per sync cycle
 (`snapshot_sync.rs:4569`, index reload `:6051`), after its negotiated cadence and
-backend-backoff gates. Resuming a parked frame's `step` does not reload it.
+backend-backoff gates. Later `step` turns of the same frame do not reload it.
 Each admitted Codex continuation worker page also prepares and reloads its own
 frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it is
 not limited to once per outer sync cycle. Thus the bound is per preparation,
@@ -903,14 +913,6 @@ reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account
 keeps usage off the server; token/age disclosure is implemented, and
 bounded-lifetime release remains a SOURCE follow-up.
-
-`counts.source_rotation_serial_fallback` counts failed parking decisions while
-sibling sources wait, drained by that source's next completed page. Closed
-causes are `unsupported_layout` and `bound_refused`. A refused bound (`None`)
-covers both opaque ownership and over-limit frames; it does not distinguish
-their causes. Unavailable shared allowance also uses `bound_refused`.
-Each decision continues the same owned frame serially and counts once; ordinary
-serial turns with no waiting sibling do not count.
 
 ## Context Footprint Discovery
 
@@ -2038,17 +2040,36 @@ on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records a
-whole-save refusal above 256 MiB; at page size one, `save_oversize_alarm` and
-`state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records the
+charged bytes of a save refused as save pressure, with `save_ceiling_cause`:
+`charged_work` above 256 MiB or `value_admission` for one row over its cap; at page size one,
+`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
+`path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
+string diff passed its 32 MiB memory budget: the save commits and requires
+erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
+`store_growth` samples the SQLite store once per idle daily reference-maintenance
+pass, after reference verification (an hourly retry of a failed pass samples again).
+It reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
+(`rows`), `key_bytes` and `value_bytes` for each present catalogue kind, plus
+`shared_value_bytes` and `chunk_bytes`. Value bytes use the store's logical
+length metadata; chunk bytes sum stored chunk lengths and overlap the logical
+record/shared values, so do not add them together. These are payload lengths,
+not per-table allocated space. Sampling uses what remains of the existing
+reference-check VM budget. `partial: true` means
+sampling was interrupted, failed or ran out of budget; completed counts remain,
+unavailable scalar counts are null and missing kinds are unknown, not zero.
+Only registered kind labels and counts are emitted, never keys or values.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`
-also reports `uncollapsed`, the interior windows of equal-evidence runs left in a
-store-only archive (boundaries unchecked). A complete v2 load keeps archived account
+also reports `uncollapsed`, the windows older than their equal-evidence run's
+newest left in a store-only archive (boundaries unchecked), and `replaced` and
+`pushed`, the store-only archive rollovers this save wrote that replaced their
+run's newest window or were appended (resident archives, kept only with raw
+holds or before a complete v2 load, are not counted). A complete v2 load keeps archived account
 windows in the store, so the retained-pending byte diagnostic is unavailable while
 any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
 `cold_row_unknown`) when a stored archived row no longer matches its baseline, and

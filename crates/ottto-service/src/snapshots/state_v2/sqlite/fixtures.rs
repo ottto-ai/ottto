@@ -215,3 +215,6 @@ pub(in super::super) fn set_space_reader(db: &mut Sqlite, read: Option<fn(&Path)
 pub(in super::super) fn set_save_ceiling(db: &mut Sqlite, bytes: u64) {
     db.purge_policy.save_ceiling = bytes;
 }
+pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
+    db.purge_policy.path_diff_budget = bytes;
+}

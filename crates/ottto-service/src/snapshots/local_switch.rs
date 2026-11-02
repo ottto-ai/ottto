@@ -34,13 +34,6 @@ macro_rules! local_switch {
 }
 pub(super) use local_switch;
 
-/// The same owner marker check for switches whose test policy differs
-/// (the copy-prefix switch, `claude_request_money::e2`).
-pub(in crate::snapshots) fn marker_at(support: &std::path::Path, name: &str) -> bool {
-    std::fs::symlink_metadata(support.join(name))
-        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-}
-
 /// Sets a test switch for this thread until dropped; unwind restores the
 /// previous value. Rc makes the guard !Send/!Sync, so moving it cannot
 /// silently change another fixture's policy.

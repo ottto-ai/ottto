@@ -2,6 +2,7 @@
 // Uses the real native parser, usage/owner fold, candidate decision, selected
 // checkpoint and locked save/load. It is NOT the complete two-phase scanner.
 use super::*;
+use crate::snapshots::disappearance_diagnostics::tests::finish;
 
 /// Physical positive preparation needs the validated container layout.
 /// Unsupported runs retain the separate BASE/refusal checks, never pretend
@@ -330,15 +331,6 @@ impl SelectionFixture {
             false,
         )
     }
-    fn run(mut native: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
-        for _ in 0..1024 {
-            match native.step(None) {
-                OwnedSourceScanStep::Pending(next) => native = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
-            }
-        }
-        panic!("bounded fixture native scan did not complete");
-    }
 }
 
 /// Restores a file's original mode at teardown, also when an assertion panics.
@@ -368,7 +360,7 @@ impl NativePreparationFixture {
             false,
             false,
         );
-        let (mut index, mut scan) = SelectionFixture::run(native);
+        let (mut index, mut scan) = finish(native);
         assert!(scan.census_complete);
         let (api, trace) = reports(&parent, false);
         let disposition = apply_claude_reported_usage_with_index(
@@ -455,7 +447,7 @@ fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
         before
     );
     assert!(state.snapshots.is_empty());
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert_eq!(scan.scanned_file_count, 0);
     writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: actual_skip_certificates=2 retained_proof_unchanged=true body_mutations=0 reuse_activated=false").unwrap();
 }
@@ -508,7 +500,7 @@ fn native_comparison_current_nonreported_member_withdraws_whole_family() {
         serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
         proof_before
     );
-    let (mut index, mut scan) = SelectionFixture::run(state);
+    let (mut index, mut scan) = finish(state);
     let disposition = apply_claude_reported_usage_with_index(
         &mut scan.snapshots,
         &fixture.api,
@@ -701,7 +693,7 @@ fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_pa
     let native = native_recovery_priority_scan(&fixture, rearmed, 1, &fixture.paths[..1]);
     assert_eq!(native.identified_candidates.len(), 1);
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
-    let (index, scan) = SelectionFixture::run(native);
+    let (index, scan) = finish(native);
     assert_eq!(scan.scanned_file_count, 1);
     assert_eq!(scan.snapshots.len(), 1);
     assert!(index.files[&local_index_key(&fixture.paths[1])]
@@ -886,7 +878,7 @@ fn native_comparison_quiet_bounded_page(
         false,
         false,
     );
-    let (mut index, mut scan) = SelectionFixture::run(native);
+    let (mut index, mut scan) = finish(native);
     assert!(!scan.census_complete);
     assert_eq!(scan.scanned_file_count, 0);
     assert!(scan.snapshots.is_empty(), "no new body needs an ACK");
@@ -1188,7 +1180,7 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
         "withdrawn family cannot target twice in a pass"
     );
     state.resume_native_comparison_base();
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert_eq!(scan.scanned_file_count, 3);
     writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes:?} rss_measured=false").unwrap();
 }
@@ -1279,7 +1271,7 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     );
     assert_eq!(qualification.certified_member_count(), 0);
     state.resume_native_comparison_base();
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert!(!scan.census_complete);
 }
 
@@ -1312,7 +1304,7 @@ fn native_observation_duplicate_fixture() -> (
         false,
         false,
     );
-    let (index, scan) = SelectionFixture::run(native);
+    let (index, scan) = finish(native);
     assert!(scan.census_complete);
     assert_eq!(scan.scanned_file_count, 2);
     assert_eq!(scan.snapshots.len(), 2);
@@ -1484,7 +1476,7 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
             false,
             false,
         );
-        let (mut index, mut scan) = SelectionFixture::run(native);
+        let (mut index, mut scan) = finish(native);
         assert_eq!(scan.scanned_file_count, 3);
         assert!(scan.census_complete);
         apply_claude_reported_usage_with_index(
@@ -1614,7 +1606,7 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
     );
     assert!(consumed.ready_for_fold_sources.is_empty());
     state.resume_native_comparison_base();
-    SelectionFixture::run(state);
+    finish(state);
     writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
 }
 
@@ -1653,7 +1645,7 @@ fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() 
         .snapshots
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert_eq!(scan.scanned_file_count, 3);
     assert_eq!(
         scan.snapshots.len(),
@@ -1689,7 +1681,7 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
             "generation rollback or a later positive boolean cannot revive the controller"
         );
         assert!(state.identified_candidates.is_empty());
-        let (_, scan) = SelectionFixture::run(state);
+        let (_, scan) = finish(state);
         assert_eq!(scan.scanned_file_count, 1);
         assert_eq!(
             scan.snapshots.len(),
@@ -1765,7 +1757,7 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
         "no eligibility remains; only terminal-traversal custody survives"
     );
     assert!(controller.receipt_for_test().0.acquired_roots.is_empty());
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert!(!scan.census_complete);
     assert!(scan
         .snapshots
@@ -1814,7 +1806,7 @@ fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
     state.resume_native_comparison_base();
-    let (_, scan) = SelectionFixture::run(state);
+    let (_, scan) = finish(state);
     assert!(!scan.census_complete);
     writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
 }
@@ -1952,7 +1944,7 @@ fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
     let mut controller = claude_native_comparison::Controller::new(qualification);
     assert!(controller.advance(&mut state, true));
     let mut window = controller.into_window(&state.census_window_end).unwrap();
-    let (mut index, mut scan) = SelectionFixture::run(state);
+    let (mut index, mut scan) = finish(state);
     assert!(!scan.census_complete);
     assert!(scan.snapshots.is_empty());
     let disposition = apply_claude_reported_usage_with_index(
@@ -2714,7 +2706,7 @@ fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture
             false,
             false,
         );
-        let (index, scan) = SelectionFixture::run(native);
+        let (index, scan) = finish(native);
         assert_eq!(
             scan.scanned_file_count, 0,
             "only the existing unchanged cursor tail is consumed"
@@ -2774,7 +2766,7 @@ fn native_comparison_corrected_native_receipt_fixture(
     });
     let mut controller = claude_native_comparison::Controller::new(qualification);
     assert!(controller.advance(&mut state, true));
-    let (mut index, mut scan) = SelectionFixture::run(state);
+    let (mut index, mut scan) = finish(state);
     assert!(
         !scan.census_complete,
         "an earlier bounded page, before terminal rearm"
@@ -3038,7 +3030,7 @@ fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before
     let native = fixture.prepare(index, 1); // ordinary constructor, NO supplied recovery list
     assert_eq!(native.identified_candidates.len(), 1);
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
-    let (index, scan) = SelectionFixture::run(native);
+    let (index, scan) = finish(native);
     assert_eq!(scan.scanned_file_count, 1);
     assert!(index.files[&local_index_key(&fixture.paths[1])]
         .audit_requires_full(sampled_scan::now_seconds()));

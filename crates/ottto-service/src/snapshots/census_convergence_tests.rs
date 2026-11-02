@@ -161,32 +161,35 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     let family_root = claude_snapshot_family_root(&full);
 
     // An identical later page keeps the family valid.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     for _ in 0..2 {
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(&full),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
     }
     assert!(!pending[&family_root].invalid);
 
     // Growth or shrinkage on a later page of the same window invalidates.
     for pages in [[&prefix, &full], [&full, &prefix]] {
-        let mut pending = BTreeMap::new();
+        let mut pending = UsagePending::default();
         accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[0]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         let counts = accumulate_claude_usage_family_pending_with_limit(
             std::slice::from_ref(pages[1]),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
+        )
+        .unwrap();
         assert!(pending[&family_root].invalid);
         assert_eq!(
             counts,
@@ -198,19 +201,21 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     }
 
     // A new census window starts over.
-    let mut pending = BTreeMap::new();
+    let mut pending = UsagePending::default();
     accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&prefix),
         &mut pending,
         OLDER_WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     let counts = accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&full),
         &mut pending,
         WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
+    )
+    .unwrap();
     assert!(!pending[&family_root].invalid);
     assert_eq!(counts.page_invalidated_member_changed_count, 0);
     assert_eq!(pending[&family_root].census_window_end, WINDOW);
@@ -617,6 +622,106 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
         Some(Some(false)),
         "the held root is excluded"
     );
+
+    // [money] Cold under state v2: the same graph on a live session keeps
+    // the family as a head (Unknown, not absent), and the terminal join,
+    // run after a whole-kind load, decides as the resident view does.
+    let dir = crate::test_scratch::canonical_private_dir("unchanged-proof-cold");
+    let (custody, cold) = state_v2::money_test_support::ColdSession::publish(&held, &dir);
+    assert!(cold.claude_usage_family_pending.family(&root).is_err());
+    let resident = state_v2::money_test_support::resident(&cold);
+    let joined = |index: &ScanIndex| {
+        let mut index = index.clone();
+        state_v2::load_usage(&mut index, None).unwrap();
+        unchanged(&index)
+    };
+    let release = |index: &ScanIndex| {
+        let mut index = index.clone();
+        index.claude_usage_authority_quarantine.remove(&root);
+        index
+    };
+    assert_eq!(joined(&release(&cold)), unchanged(&release(&resident)));
+    assert_eq!(joined(&release(&cold)), Some(Some(true)));
+    assert_eq!(joined(&cold), unchanged(&resident));
+    assert_eq!(joined(&cold), Some(Some(false)));
+    drop(custody);
+    let _ = fs::remove_dir_all(dir);
+}
+
+// [money] A2 at a matching stamp: a stored usage row missing from the
+// session's own store (generation and data version unchanged) refuses the
+// whole page that names its family, counted. Nothing of the page is
+// installed, not even its readable family, and the missing family stays
+// discoverable. A healthy page through the same entry point loads both.
+#[test]
+fn cold_usage_row_missing_at_a_matching_stamp_refuses_the_whole_page() {
+    use state_v2::money_test_support as v2;
+    let (root, parent, items) = claude_account_family_fixture(false);
+    let mut other = items[0].clone();
+    other.source_session_id = "other-root".into();
+    other
+        .attribution_facts
+        .retain(|fact| fact.field != "root_session_ref");
+    assert_eq!(claude_snapshot_family_root(&other), "other-root");
+    assert_eq!(claude_snapshot_family_root(&items[0]), parent);
+    let pending = |member: &str| ClaudeUsageFamilyPending {
+        census_window_end: WINDOW.to_string(),
+        member_request_id_hashes: BTreeMap::from([(
+            member.to_string(),
+            BTreeSet::from([hex64('c')]),
+        )]),
+        member_occurrences: BTreeMap::new(),
+        invalid: false,
+        idless_revision: None,
+        identity_contract: None,
+        contract_unproven: false,
+    };
+    let mut index = ScanIndex::default();
+    for family in [parent.as_str(), "other-root"] {
+        index
+            .claude_usage_family_pending
+            .insert(family.to_string(), pending(family));
+    }
+    let scratch = crate::test_scratch::canonical_private_dir("usage-row-missing");
+    let (custody, cold) = v2::ColdSession::publish(&index, &scratch);
+    let page = |index: &mut ScanIndex| {
+        let mut snapshots = vec![items[0].clone(), other.clone()];
+        apply_claude_reported_usage_with_identity(
+            &mut snapshots,
+            &Default::default(),
+            &Default::default(),
+            index,
+            false,
+            WINDOW,
+            None,
+        )
+    };
+
+    // Positive control: the same entry point loads the page's families.
+    let mut healthy = cold.clone();
+    page(&mut healthy);
+    assert!(v2::usage_loaded(&healthy, &parent));
+    assert!(v2::usage_loaded(&healthy, "other-root"));
+
+    v2::delete_usage_row_in_session(&cold, &parent);
+    let mut refused = cold.clone();
+    let before = v2::usage_unknown_count();
+    let disposition = page(&mut refused);
+    assert!(v2::usage_unknown_count() > before, "counted");
+    for session in [items[0].source_session_id.as_str(), "other-root"] {
+        assert!(disposition.quarantined_source_session_ids.contains(session));
+    }
+    assert!(!v2::usage_loaded(&refused, &parent));
+    assert!(
+        !v2::usage_loaded(&refused, "other-root"),
+        "nothing installed"
+    );
+    let usage = &refused.claude_usage_family_pending;
+    assert!(usage.contains_key(&parent));
+    assert!(usage.family(&parent).is_err(), "Unknown, not absent");
+    drop(custody);
+    let _ = fs::remove_dir_all(scratch);
+    let _ = fs::remove_dir_all(root);
 }
 
 // A held key keeps its committed revision, its activity and accepted

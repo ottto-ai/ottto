@@ -844,7 +844,7 @@ fn h360_quarantined_probe_carries_exact_held_body_without_request() {
         let fp = probes[0].snapshot_fingerprint.clone();
         let body = snapshot_upload_body_witness(&probes[0]);
         let mut ledger = progress();
-        ledger.quarantine_retryable_body(&fp, &body);
+        ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
         let record = ledger.quarantined_fingerprints.get_mut(&fp).unwrap();
         record.disposition = disposition;
         if disposition != SnapshotQuarantineDisposition::RetryPending {
@@ -960,7 +960,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     std::fs::create_dir_all(&dir).unwrap();
     let progress_path = dir.join("progress.json");
     let mut ledger = progress();
-    ledger.quarantine_retryable_body(&held_fp, &held_body);
+    ledger.quarantine_retryable_body(&held_fp, &held_body, quarantine_retry_after(&held_fp));
     let mut calls = Vec::new();
     let deferred = bootstrap_cache_heads(
         &probes,
@@ -1442,14 +1442,18 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
     ] {
         let mut ledger = progress();
         match case {
-            "cache_bearing_body" => {
-                ledger.quarantine_retryable_body(&fp, &snapshot_upload_body_witness(&cache_bearing))
-            }
-            "older_body" => {
-                ledger.quarantine_retryable_body(&fp, &snapshot_upload_body_witness(&older))
-            }
+            "cache_bearing_body" => ledger.quarantine_retryable_body(
+                &fp,
+                &snapshot_upload_body_witness(&cache_bearing),
+                quarantine_retry_after(&fp),
+            ),
+            "older_body" => ledger.quarantine_retryable_body(
+                &fp,
+                &snapshot_upload_body_witness(&older),
+                quarantine_retry_after(&fp),
+            ),
             "witnessless" => {
-                ledger.quarantine_retryable_body(&fp, &body);
+                ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
                 ledger
                     .quarantined_fingerprints
                     .get_mut(&fp)
@@ -1457,7 +1461,7 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
                     .upload_body_witness = None;
             }
             "leased" => {
-                ledger.quarantine_retryable_body(&fp, &body);
+                ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
                 ledger
                     .quarantined_fingerprints
                     .get_mut(&fp)
@@ -1735,6 +1739,7 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
     restarted.quarantine_retryable_body(
         &probe.snapshot_fingerprint,
         &snapshot_upload_body_witness(&probe),
+        quarantine_retry_after(&probe.snapshot_fingerprint),
     );
     let mut carried = vec![item];
     assert_eq!(
@@ -1767,7 +1772,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     let index_path = dir.join("index.json");
     let progress_path = dir.join("progress.json");
     let mut ledger = progress();
-    ledger.quarantine_retryable_body(&fp, &body);
+    ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
     // Completed-cycle commit: the index keeps the exact record, the ledger retires.
     let mut index = ScanIndex::default();
     index
@@ -1922,7 +1927,11 @@ fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
 fn a_pending_newer_body_unbinds_its_dominated_refusal() {
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
-    ledger.quarantine_retryable_body(&format!("{:064x}", 0), "newer-body-0");
+    ledger.quarantine_retryable_body(
+        &format!("{:064x}", 0),
+        "newer-body-0",
+        quarantine_retry_after(&format!("{:064x}", 0)),
+    );
     let refusals = PermanentRefusalCounts::of(&ledger);
     assert_eq!(
         refusals,

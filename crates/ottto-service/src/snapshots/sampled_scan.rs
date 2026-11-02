@@ -1838,8 +1838,9 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
 /// together under the retained lock; release iff `|P*| <= |P_C|` (as
 /// `K' >= C`, exactly when the copy-only prefix suffices), capped at
 /// `|P_C|` at execution. Anything unknown, overflowing, infeasible or over
-/// the bound releases nothing. A Full on the legacy decision releases nothing:
-/// with neither X_out nor `F_prev`, nothing proves its finished output fits.
+/// the bound releases nothing. A Full on the legacy decision never gets a
+/// proof (its completion step skips `tail_completion_budget`): with neither
+/// X_out nor `F_prev`, nothing proves its finished output fits.
 /// A Full reaches this proof only after file growth against the pre-read index
 /// size. With X_out it has no churn bound: the margin over `C` can keep `|P*|`
 /// above `|P_C|` among small residents and lock a growing file out of RAM.
@@ -1862,7 +1863,6 @@ pub(super) fn prove_release(
         return granted;
     };
     match x_out {
-        XOut::Legacy if proof.full => granted,
         XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget, decode_peak),
         XOut::Refused => granted,
         XOut::Bound(x_out) => {
