@@ -440,7 +440,7 @@ pub fn run_context_composition_worker() -> Result<()> {
 
 /// Background work: let the system run it on efficiency cores and behind
 /// interactive work.
-pub(crate) fn set_utility_qos() {
+fn set_utility_qos() {
     #[cfg(target_os = "macos")]
     {
         extern "C" {

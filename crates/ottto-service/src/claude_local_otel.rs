@@ -1172,14 +1172,10 @@ fn decode_api_sidecar(
     }
     health.oversized_files = u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
     let before_opened = api_file_generation(&opened);
-    let allowance = protected_allowance(
-        MAX_EVIDENCE_FILE_BYTES,
-        strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1)),
-    );
-    if opened.len() >= allowance {
-        health.unreadable_lines += 1;
-        return Ok(empty(health));
-    }
+    let pair_bytes =
+        strict_cohort_bytes(support_dir, session_id).max(opened.len().saturating_add(1));
+    note_oversized_pair(pair_bytes);
+    let allowance = MAX_EVIDENCE_FILE_BYTES.max(pair_bytes);
     // Preserve ordinary API read-through on concurrent appends within the
     // protected per-pair allowance.
     let mut reader = BufReader::new((&file).take(allowance));
@@ -1272,8 +1268,9 @@ impl ApiSidecarDecoder<'_> {
     }
 }
 
-fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
-    if pair_bytes > quantum {
+/// Counts a root whose paired sidecars exceed the normal allowance.
+fn note_oversized_pair(pair_bytes: u64) {
+    if pair_bytes > MAX_EVIDENCE_FILE_BYTES {
         crate::local_resource_diagnostics::traversal_point(
             "claude_sidecar_read",
             "claude_code",
@@ -1283,7 +1280,6 @@ fn protected_allowance(quantum: u64, pair_bytes: u64) -> u64 {
             ]),
         );
     }
-    quantum.max(pair_bytes)
 }
 
 /// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
@@ -1341,17 +1337,10 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         report.oversized_files += u64::from(opened.len() >= MAX_EVIDENCE_FILE_BYTES);
-        let allowance = protected_allowance(
-            MAX_EVIDENCE_FILE_BYTES,
-            strict_cohort_bytes(support_dir, &session_id).max(opened.len().saturating_add(1)),
-        );
-        if opened.len() >= allowance {
-            report.unreadable_lines += 1;
-            continue;
-        }
         // A concurrent writer must not extend the read past the opened
         // length; one extra byte is the growth sentinel.
-        let limit = allowance.min(opened.len().saturating_add(1));
+        let limit = opened.len().saturating_add(1);
+        note_oversized_pair(strict_cohort_bytes(support_dir, &session_id).max(limit));
         #[cfg(test)]
         TRACE_BEFORE_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {

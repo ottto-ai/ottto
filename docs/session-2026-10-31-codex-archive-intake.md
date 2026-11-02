@@ -26,10 +26,10 @@ reservations for the page before any Full body bytes. Decoder allocation is prep
 existing shared cache. The same native parser continues in RAM across decoded
 pages to EOF; a process restart loses that checkpoint.
 
-Power, CPU, contention and byte-budget refusal before a Full remain eligible on
+Power, contention and byte-budget refusal before a Full remain eligible on
 the next pass. A spent Full keeps its saved six-hour retry deadline. An unchanged
 structural cause does not trigger another Full. Parent support and same-session
-union bodies are follow-up work. The archive CPU/work allowance gates admission
+union bodies are follow-up work. The archive wall-work allowance gates admission
 of the next archive; a started Full retains its RAM parser to EOF. Unconsumed
 reservations cancel without a Full penalty. Power is sampled once per page.
 Caps retain owed discovery and disclose refusal.
@@ -49,8 +49,9 @@ generic correction/evidence debt remains a named follow-up.
 Other follow-ups are same-session union bodies, retained resend, durable
 continuation if measurement justifies it, archive parents, shared listing/owed
 resolution, end-to-end placement route and tagged positive-control coverage and resource measurements. The
-historical-writer compatibility probe currently runs in Linux CI; running it only
-at release cuts is follow-up work.
+historical-writer compatibility probe does not run in CI:
+`scripts/test_codex_zst_downgrade.py` is an uninvoked driver, and its two Rust
+verifier tests return early unless the driver supplies their environment.
 
 Header and Full reservation batches currently require up to two committed index
 saves per pass. Held counts aggregate by cause; generic alarms occur on transitions.
@@ -64,7 +65,7 @@ Known missing archives retire their markers. Unknown collection metadata has one
 named, non-path debt marker; typed records are checked on load.
 
 A started Full retains the native RAM parser across decoded-byte pages and runs
-to EOF. Work/CPU allowances gate the next admission, never discard a started
+to EOF. Wall-work allowances gate the next admission, never discard a started
 parser. Live content, archive and directory witnesses are rechecked for each
 archive at admission and publication; only immutable coverage is memoized.
 One damaged or unknown header defers every archive uniqueness proof. Resource

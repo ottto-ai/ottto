@@ -977,7 +977,8 @@ impl<'a> Interpretation<'a> {
             index.claude_request_identity_contract_changed,
         );
         if source == SnapshotSource::ClaudeCode {
-            identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
+            // Retired attribution switch: the binding keeps its OFF value.
+            identity_contract.push_str("|attr=false");
         }
         Self {
             accepted: (restart_restore::enabled() && source == SnapshotSource::ClaudeCode)

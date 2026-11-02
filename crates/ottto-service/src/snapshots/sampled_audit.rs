@@ -608,15 +608,10 @@ fn open_blocked(key: &str, now: u64) -> bool {
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
     with_open_backoff(|backoff| {
         (
+            backoff.keys.len(),
             backoff
                 .keys
                 .values()
-                .filter(|failure| failure.failures > 0)
-                .count(),
-            backoff
-                .keys
-                .values()
-                .filter(|failure| failure.failures > 0)
                 .map(|failure| now.saturating_sub(failure.first_failed))
                 .max()
                 .unwrap_or(0),
@@ -658,22 +653,6 @@ struct HeldAuditOpenParked {
     held_audit_open_failed_keys: usize,
 }
 
-// All actual failed opens of an already owed key, including constructor
-// preflight, share the bounded failure record. No census/ACK state changes.
-fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
-    let (recorded, keys) =
-        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked.as_ref() {
-        // Counts only; no path or id. Once per park.
-        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
-            held_audit_open_failures: parked.failures,
-            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
-            held_audit_open_failed_keys: keys,
-        });
-    }
-    recorded
-}
-
 /// The queued progress Full for `key` failed its secure open. Back the key
 /// off (or park it), then rotate the turn, wrapping to `key` itself when no
 /// other member is eligible, but keep the owed due: a failed open never
@@ -687,7 +666,17 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
     else {
         return;
     };
-    let recorded = record_open_failure(key, due, now);
+    // The bounded failure record only; no census/ACK state changes.
+    let (recorded, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = recorded.parked.as_ref() {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
