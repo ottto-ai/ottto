@@ -5734,6 +5734,24 @@ impl SharedCache {
         );
     }
 
+    /// A settled read that cannot clear debt, as a historical lossy read left it.
+    #[cfg(test)]
+    pub(crate) fn settle_layout_unverified_for_test(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+    ) {
+        let source = durable_source(snapshot_source).unwrap();
+        let mut stores = self.durable().unwrap();
+        stores.slot(source).as_mut().unwrap().decided.insert(
+            key.to_owned(),
+            ScopeDecision::LayoutUnavailable {
+                settled: true,
+                verified: false,
+            },
+        );
+    }
+
     /// This process's durable counts and the source's store counters.
     pub(crate) fn durable_counters(
         &self,

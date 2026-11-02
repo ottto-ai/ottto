@@ -394,6 +394,9 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             snapshot_upload_body_witness(&cold.scan.snapshots[0])
         );
         let key = f.key();
+        // A valid read now settles verified and may retire A without a carrier.
+        // The carrier rule below guards a historical lossy settlement.
+        cache.settle_layout_unverified_for_test(SOURCE, &key);
         // Checked historical completed-loss marker, independent of current parsing.
         read.index
             .files
