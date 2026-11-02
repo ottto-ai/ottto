@@ -989,14 +989,8 @@ fn handle_control_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto control"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "control") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = control_cors_headers(origin);
 
@@ -1058,14 +1052,8 @@ fn handle_whoami_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto identity"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "identity") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1117,14 +1105,8 @@ fn handle_local_health_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(origin) = origin {
-        if !is_allowed_control_origin(origin) {
-            return write_json_response(
-                stream,
-                403,
-                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto health"}),
-            );
-        }
+    if let Some(forbidden) = forbidden_origin_body(origin, "health") {
+        return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1192,6 +1174,20 @@ fn local_health_response_payload(
         "machine_id": status.machine.machine_id,
         "machine_name": status.machine.display_name,
         "health": health,
+    }))
+}
+
+/// The 403 body for a browser `Origin` outside the control allowlist, or `None`
+/// when the request has no `Origin` or an allowed one. `noun` names the
+/// endpoint in the message ("control", "identity", "health").
+fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
+    let origin = origin?;
+    if is_allowed_control_origin(origin) {
+        return None;
+    }
+    Some(json!({
+        "error": "origin_forbidden",
+        "message": format!("Origin is not allowed for local Ottto {noun}"),
     }))
 }
 
@@ -1709,6 +1705,24 @@ pub(crate) mod tests {
         assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
         assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn forbidden_origin_body_refuses_only_a_present_unlisted_origin() {
+        for noun in ["control", "identity", "health"] {
+            assert_eq!(forbidden_origin_body(None, noun), None);
+            assert_eq!(forbidden_origin_body(Some("https://ottto.net"), noun), None);
+        }
+        for (noun, message) in [
+            ("control", "Origin is not allowed for local Ottto control"),
+            ("identity", "Origin is not allowed for local Ottto identity"),
+            ("health", "Origin is not allowed for local Ottto health"),
+        ] {
+            assert_eq!(
+                forbidden_origin_body(Some("https://ottto.net.evil"), noun),
+                Some(json!({"error": "origin_forbidden", "message": message}))
+            );
+        }
     }
 
     #[test]

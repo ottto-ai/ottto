@@ -28375,6 +28375,20 @@ impl OwnedSourceScan {
                     break 'scan_step
                 };
             }
+            // Every Codex disclosure in this step writes into the same five
+            // step-local sinks.
+            macro_rules! targets {
+                () => {
+                    sampled_scan::codex_cursor::DisclosureTargets {
+                        census: &mut census,
+                        residue_index_keys: &mut residue_index_keys,
+                        residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                        codex_state_only_blocked_session_ids:
+                            &mut codex_state_only_blocked_session_ids,
+                        pending_finalization: &mut pending_finalization,
+                    }
+                };
+            }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
                     if !inventory.step_with_archives(
@@ -29017,14 +29031,7 @@ impl OwnedSourceScan {
                         codex_file_join::disclose_strict(
                             &boot.group.owner,
                             &boot.group.members,
-                            sampled_scan::codex_cursor::DisclosureTargets {
-                                census: &mut census,
-                                residue_index_keys: &mut residue_index_keys,
-                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                codex_state_only_blocked_session_ids:
-                                    &mut codex_state_only_blocked_session_ids,
-                                pending_finalization: &mut pending_finalization,
-                            },
+                            targets!(),
                         );
                         pending!();
                     }
@@ -29043,14 +29050,7 @@ impl OwnedSourceScan {
                             &codex_file_join::refusal_disclosure(&boot.group.owner),
                             &boot.group.members,
                             index,
-                            sampled_scan::codex_cursor::DisclosureTargets {
-                                census: &mut census,
-                                residue_index_keys: &mut residue_index_keys,
-                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                codex_state_only_blocked_session_ids:
-                                    &mut codex_state_only_blocked_session_ids,
-                                pending_finalization: &mut pending_finalization,
-                            },
+                            targets!(),
                         );
                         pending!();
                     }
@@ -29111,14 +29111,7 @@ impl OwnedSourceScan {
                                 entry.disclosure(),
                                 &boot.group.members,
                                 index,
-                                sampled_scan::codex_cursor::DisclosureTargets {
-                                    census: &mut census,
-                                    residue_index_keys: &mut residue_index_keys,
-                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                    codex_state_only_blocked_session_ids:
-                                        &mut codex_state_only_blocked_session_ids,
-                                    pending_finalization: &mut pending_finalization,
-                                },
+                                targets!(),
                             );
                             pending!();
                         }
@@ -29135,14 +29128,7 @@ impl OwnedSourceScan {
                             &disclosure,
                             &boot.group.members,
                             index,
-                            sampled_scan::codex_cursor::DisclosureTargets {
-                                census: &mut census,
-                                residue_index_keys: &mut residue_index_keys,
-                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                codex_state_only_blocked_session_ids:
-                                    &mut codex_state_only_blocked_session_ids,
-                                pending_finalization: &mut pending_finalization,
-                            },
+                            targets!(),
                         );
                         pending!();
                     }
@@ -29221,18 +29207,7 @@ impl OwnedSourceScan {
                     if let Some(context) = sampling.as_ref() {
                         context.cache.cursor_unwait(&context.namespace, &boot_key);
                     }
-                    codex_file_join::disclose_strict(
-                        &owner,
-                        &group_members,
-                        sampled_scan::codex_cursor::DisclosureTargets {
-                            census: &mut census,
-                            residue_index_keys: &mut residue_index_keys,
-                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                            codex_state_only_blocked_session_ids:
-                                &mut codex_state_only_blocked_session_ids,
-                            pending_finalization: &mut pending_finalization,
-                        },
-                    );
+                    codex_file_join::disclose_strict(&owner, &group_members, targets!());
                     pending!();
                 };
                 if let Some(context) = sampling.as_ref().filter(|_| paged) {
@@ -29406,14 +29381,7 @@ impl OwnedSourceScan {
                         },
                         index,
                         &mut identified_candidates,
-                        sampled_scan::codex_cursor::DisclosureTargets {
-                            census: &mut census,
-                            residue_index_keys: &mut residue_index_keys,
-                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                            codex_state_only_blocked_session_ids:
-                                &mut codex_state_only_blocked_session_ids,
-                            pending_finalization: &mut pending_finalization,
-                        },
+                        targets!(),
                     ) {
                         sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
                             if index.context_only_read(&job.candidate) {
@@ -29810,14 +29778,7 @@ impl OwnedSourceScan {
                         codex_file_join::EndInputs {
                             sampling: sampling.as_ref(),
                             index,
-                            targets: sampled_scan::codex_cursor::DisclosureTargets {
-                                census: &mut census,
-                                residue_index_keys: &mut residue_index_keys,
-                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                codex_state_only_blocked_session_ids:
-                                    &mut codex_state_only_blocked_session_ids,
-                                pending_finalization: &mut pending_finalization,
-                            },
+                            targets: targets!(),
                         },
                     );
                     pending!();
@@ -29860,15 +29821,7 @@ impl OwnedSourceScan {
                                         &job,
                                         &disclosure,
                                         index,
-                                        sampled_scan::codex_cursor::DisclosureTargets {
-                                            census: &mut census,
-                                            residue_index_keys: &mut residue_index_keys,
-                                            residue_blocked_session_ids:
-                                                &mut residue_blocked_session_ids,
-                                            codex_state_only_blocked_session_ids:
-                                                &mut codex_state_only_blocked_session_ids,
-                                            pending_finalization: &mut pending_finalization,
-                                        },
+                                        targets!(),
                                     );
                                     sampled_scan::codex_cursor::dequeue_members(
                                         index,
@@ -29923,14 +29876,7 @@ impl OwnedSourceScan {
                             codex_file_join::disclose_strict(
                                 &group.owner,
                                 &group.members,
-                                sampled_scan::codex_cursor::DisclosureTargets {
-                                    census: &mut census,
-                                    residue_index_keys: &mut residue_index_keys,
-                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                    codex_state_only_blocked_session_ids:
-                                        &mut codex_state_only_blocked_session_ids,
-                                    pending_finalization: &mut pending_finalization,
-                                },
+                                targets!(),
                             );
                             sampled_scan::codex_cursor::dequeue_members(index, &group.members);
                             pending!();
@@ -30448,14 +30394,7 @@ impl OwnedSourceScan {
                                 &active,
                                 &disclosure,
                                 index,
-                                sampled_scan::codex_cursor::DisclosureTargets {
-                                    census: &mut census,
-                                    residue_index_keys: &mut residue_index_keys,
-                                    residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                    codex_state_only_blocked_session_ids:
-                                        &mut codex_state_only_blocked_session_ids,
-                                    pending_finalization: &mut pending_finalization,
-                                },
+                                targets!(),
                             );
                             sampled_scan::codex_cursor::dequeue_members(
                                 index,
@@ -34505,14 +34444,7 @@ impl OwnedSourceScan {
                             &candidate,
                             previous,
                             index,
-                            sampled_scan::codex_cursor::DisclosureTargets {
-                                census: &mut census,
-                                residue_index_keys: &mut residue_index_keys,
-                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                                codex_state_only_blocked_session_ids:
-                                    &mut codex_state_only_blocked_session_ids,
-                                pending_finalization: &mut pending_finalization,
-                            },
+                            targets!(),
                         );
                         // The fresh path's session count, replayed.
                         scanned_session_count += entry.disclosure().parsed_snapshot_count;
@@ -34579,14 +34511,7 @@ impl OwnedSourceScan {
                         &candidate,
                         previous,
                         index,
-                        sampled_scan::codex_cursor::DisclosureTargets {
-                            census: &mut census,
-                            residue_index_keys: &mut residue_index_keys,
-                            residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                            codex_state_only_blocked_session_ids:
-                                &mut codex_state_only_blocked_session_ids,
-                            pending_finalization: &mut pending_finalization,
-                        },
+                        targets!(),
                     );
                     pending!();
                 }
