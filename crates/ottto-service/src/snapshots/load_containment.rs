@@ -717,10 +717,7 @@ fn override_scan_index_rebuild_loop(
     rebuilt.claude_retired_family_tombstones_initialized = true;
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
-    let prior_stamp = match fs::read(&stamp_path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => None,
-    };
+    let prior_stamp = fs::read(&stamp_path).ok();
     // This replacement deliberately bypasses save_internal's record normalizers
     // and CAS: the locked damaged index cannot pass its ordinary CAS decoder.
     // Safe today because the rebuild starts from Default, carries identity
