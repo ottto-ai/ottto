@@ -1862,6 +1862,30 @@ fn require_cloud_session_success(
     }
 }
 
+/// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
+/// error so the caller can refresh credentials; 400/422 means the `label`
+/// contract drifted.
+fn relay_token_upload_response(
+    sent: std::result::Result<ureq::Response, ureq::Error>,
+    label: &str,
+) -> Result<Value> {
+    match sent {
+        Ok(response) => response
+            .into_json()
+            .map_err(|error| anyhow!("parse {label} response failed: {error}")),
+        Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+            Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                status: code,
+                suppressed: false,
+            }))
+        }
+        Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+            Err(anyhow!("backend rejected {label}: HTTP {code}"))
+        }
+        Err(error) => Err(anyhow!("upload {label} failed: {error}")),
+    }
+}
+
 /// A failed cloud-session request: 401/403 is an authorization rejection,
 /// 400/404/409/422 a contract rejection; any other status or a transport
 /// failure carries upload diagnostics. Response bodies are never kept.
@@ -2806,54 +2830,27 @@ impl SnapshotApiClient {
     /// 401/403 surfaces as a relay-authorization error so the caller can refresh
     /// credentials; 400/422 means the inventory contract drifted.
     pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        self.post_with_relay_token(
-            "/api/v1/mcp/inventory",
-            relay_token,
-            "mcp inventory",
-            |post| post.send_json(request),
-        )
+        let sent = self
+            .relay_token_post("/api/v1/mcp/inventory", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "mcp inventory")
     }
 
     pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        self.post_with_relay_token(
-            "/api/v1/context-footprint/snapshot",
-            relay_token,
-            "context footprint",
-            |post| post.send_json(request),
-        )
+        let sent = self
+            .relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
+            .send_json(request);
+        relay_token_upload_response(sent, "context footprint")
     }
 
-    /// POST with the source-scoped relay token. A 401/403 surfaces as a
-    /// relay-authorization error; 400/422 means the `label` contract drifted.
-    fn post_with_relay_token(
-        &self,
-        path: &str,
-        relay_token: &str,
-        label: &str,
-        send: impl FnOnce(ureq::Request) -> std::result::Result<ureq::Response, ureq::Error>,
-    ) -> Result<Value> {
-        let post = self
-            .agent
+    /// A POST with the source-scoped relay token; see
+    /// `relay_token_upload_response` for its outcome.
+    fn relay_token_post(&self, path: &str, relay_token: &str) -> ureq::Request {
+        self.agent
             .post(&self.api_url(path))
             .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"));
-        match send(post) {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse {label} response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected {label}: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload {label} failed: {error}")),
-        }
+            .set("Authorization", &format!("Bearer {relay_token}"))
     }
-
     /// Upload one bounded, content-free cloud-session batch using the same
     /// source-scoped relay principal as local snapshots. Response bodies are
     /// never retained on auth/contract failures.
@@ -3053,15 +3050,11 @@ impl SnapshotApiClient {
     /// Sends the serialized body, so the bytes the run counts are the bytes
     /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
-        self.post_with_relay_token(
-            "/api/v1/context-composition/snapshot",
-            relay_token,
-            "context composition",
-            |post| {
-                post.set("Content-Type", "application/json")
-                    .send_bytes(body)
-            },
-        )
+        let sent = self
+            .relay_token_post("/api/v1/context-composition/snapshot", relay_token)
+            .set("Content-Type", "application/json")
+            .send_bytes(body);
+        relay_token_upload_response(sent, "context composition")
     }
 
     /// The daily composition run health: one request, never retried. A
