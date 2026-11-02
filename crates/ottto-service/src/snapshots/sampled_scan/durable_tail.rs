@@ -67,9 +67,9 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
     TEST_WRITE_BYTES.with(|budget| budget.set(bytes));
 }
 
-/// Upper bound of both stores' resident maps (two sources), ONE canonical value:
-/// - memo 2*256*256 = 131,072 bytes;
-/// - compact store pending 2*(32+1)*4096 = 270,336 bytes: a wire pending
+/// Upper bound of the stores' resident maps (three sources):
+/// - memo 3*256*256 = 196,608 bytes;
+/// - compact store pending 3*(32+1)*4096 = 405,504 bytes: a wire pending
 ///   entry stays <=320 bytes per node. Root's expanded stage/receipt metadata
 ///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
 ///   charged on the acquisition's active lease inside `stream_reserve_bytes`
@@ -80,16 +80,17 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
 /// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
-/// Total 2,204,088 bytes; the previous canonical pin was 1,978,368 bytes.
+/// Total 2,404,792 bytes. Shared key-map capacities remain unchanged.
 /// The 526,336-byte key reserve is debited from STATE_BYTES, within the
 /// existing cache budget. Native/container evidence remains required; this
 /// explicit prepayment is separate from the retained graph's heap walk.
 #[cfg(test)]
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
-    + 2 * (store::MAX_BATCH + 1) * 4096
-    + super::RETAIL_RESERVE_BYTES
-    + KEY_RESERVE_BYTES
-    + STALE_PREDECESSOR_RESERVE_BYTES;
+pub(crate) const STORES_RESIDENT_BOUND: usize =
+    crate::snapshots::durable_sources::SOURCES.len() * store::MAX_RECORDS * 256
+        + crate::snapshots::durable_sources::SOURCES.len() * (store::MAX_BATCH + 1) * 4096
+        + super::RETAIL_RESERVE_BYTES
+        + KEY_RESERVE_BYTES
+        + STALE_PREDECESSOR_RESERVE_BYTES;
 
 /// Per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
@@ -161,8 +162,9 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
-/// Only an actual restored Tail may report this disposition. The extent is
-/// frozen at native preparation, before index mutations or later appends.
+/// Only a restored read the source's `BelowAccepted` row publishes may report
+/// this disposition. The extent is frozen at native preparation, before index
+/// mutations or later appends.
 pub(in crate::snapshots) fn restored_tail_below_accepted(
     source: SnapshotSource,
     restored: bool,
@@ -915,6 +917,15 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     DurableSource::from_snapshot(source)
 }
 
+// One key per source for the layout-skip counter and its store alarm.
+fn layout_skipped_key(source: DurableSource) -> &'static str {
+    match source {
+        DurableSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
+        DurableSource::Codex => "native_stage_skipped.layout_unsupported.codex",
+        DurableSource::Pi => "native_stage_skipped.layout_unsupported.pi",
+    }
+}
+
 /// S2: freeze accepted facts before working-index mutation. Unknown object
 /// identity keeps this floor; only independently proved replacement may skip it.
 #[derive(Clone, Copy)]
@@ -974,7 +985,9 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str("|attr=false");
         }
         Self {
-            accepted: (restart_restore::enabled() && source == SnapshotSource::ClaudeCode)
+            accepted: (restart_restore::enabled()
+                && crate::snapshots::durable_sources::below_accepted(source)
+                    == crate::snapshots::durable_sources::BelowAccepted::Held)
                 .then(|| AcceptedFloor::of(index, key))
                 .flatten(),
             identity_contract,
@@ -1351,10 +1364,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
 }
 
 // Process totals by source: native physical Tail bytes and old-suffix overlap.
-static RETAIL_BYTES: [[AtomicU64; 4]; 2] = [
-    [const { AtomicU64::new(0) }; 4],
-    [const { AtomicU64::new(0) }; 4],
-];
+static RETAIL_BYTES: [[AtomicU64; 4]; crate::snapshots::durable_sources::SOURCES.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; crate::snapshots::durable_sources::SOURCES.len()];
 fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     durable_source(source).map_or(0, |s| {
         RETAIL_BYTES[s as usize][metric].load(Ordering::Relaxed)
@@ -4294,14 +4305,11 @@ impl SharedCache {
     }
 
     pub(in crate::snapshots) fn durable_note_native_layout_skipped(&self, source: SnapshotSource) {
+        let Some(source) = durable_source(source) else {
+            return;
+        };
         if let Some(mut stores) = self.durable() {
-            Counters::bump(
-                &mut stores.counters.ineligible,
-                match source {
-                    SnapshotSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
-                    _ => "native_stage_skipped.layout_unsupported.codex",
-                },
-            );
+            Counters::bump(&mut stores.counters.ineligible, layout_skipped_key(source));
         }
     }
 
@@ -4784,11 +4792,12 @@ impl SharedCache {
                         Some(keep) => {
                             slot.store
                                 .purge_private_labels_kept(writer, keep, reason, |body| {
-                                    codec::body_has_skill_labels(body).unwrap_or(true)
+                                    codec::body_has_skill_labels(snapshot_source, body)
+                                        .unwrap_or(true)
                                 })
                         }
                         None => slot.store.purge_private_labels(writer, |body| {
-                            codec::body_has_skill_labels(body).unwrap_or(true)
+                            codec::body_has_skill_labels(snapshot_source, body).unwrap_or(true)
                         }),
                     }
                 };
@@ -5074,7 +5083,7 @@ impl SharedCache {
             }
         };
         for record in &pending {
-            if codec::body_has_skill_labels(&record.body).unwrap_or(true)
+            if codec::body_has_skill_labels(snapshot_source, &record.body).unwrap_or(true)
                 && slot
                     .store
                     .mark_private_labels(writer, record.binding.key)
@@ -5578,11 +5587,7 @@ impl SharedCache {
         let skipped = stores
             .counters
             .ineligible
-            .get(if claude {
-                "native_stage_skipped.layout_unsupported.claude"
-            } else {
-                "native_stage_skipped.layout_unsupported.codex"
-            })
+            .get(layout_skipped_key(source))
             .copied()
             .unwrap_or(0);
         let unavailable = stores
