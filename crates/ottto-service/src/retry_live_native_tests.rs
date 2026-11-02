@@ -1310,7 +1310,24 @@ fn pi_publication_post(f: &mut PiLiveFixture, retained: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
         .with_bounded_retry_loopback_http_for_test();
+    let hint = serde_json::json!({"source":"pi", "server_time":"2026-10-06T10:05:00Z",
+        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+        "local_usage_reconciliation_enabled":true,"backfill_window_days":30,
+        "recommended_scan_after":"2026-10-06T10:10:00Z"})
+    .to_string();
     let server = bounded_native_server(listener, move |listener| {
+        if retained {
+            // The retained turn issues a fresh token and rechecks its policy first.
+            for (path, body) in [
+                ("/relay-token ", "{\"token\":\"fresh\"}"),
+                ("/activity-hints ", hint.as_str()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = decoded_http_request(&bounded_native_read(&mut stream));
+                assert!(request.contains(path), "{path}");
+                bounded_native_response(&mut stream, "200 OK", body);
+            }
+        }
         let (mut stream, _) = listener.accept().unwrap();
         let bytes = bounded_native_read(&mut stream);
         let request = String::from_utf8(bytes).unwrap();
@@ -1340,6 +1357,10 @@ fn pi_publication_post(f: &mut PiLiveFixture, retained: bool) {
                 "synthetic-secret",
                 live.policy(),
                 &mut || live.validate_inputs(&f.home.0),
+            );
+            assert!(
+                matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+                "{result:?}"
             );
             page.restore_live_authority(live);
             result
@@ -1402,22 +1423,31 @@ fn pi_publication_post(f: &mut PiLiveFixture, retained: bool) {
         assert!(f
             .progress
             .contains_body(&item.snapshot_fingerprint, &witness));
-        let entry = f
+        let (key, entry) = f
             .baseline
             .files
-            .values()
-            .find(|entry| {
+            .iter()
+            .find(|(_, entry)| {
                 Some(entry.source_file_fingerprint.as_str())
                     == item.source_file_fingerprint.as_deref()
             })
             .expect("accepted native file entry");
+        // The ACKed entity is exactly this file's published set, and the entry's
+        // file-set digests are the finalized working entry's.
         assert_eq!(
-            entry.last_snapshot_fingerprint.as_deref(),
-            Some(item.snapshot_fingerprint.as_str())
+            f.baseline.file_snapshot_fingerprints.get(key).cloned(),
+            Some(BTreeSet::from([item.snapshot_fingerprint.clone()]))
+        );
+        let finalized = &f.working.files[key];
+        assert!(entry.last_snapshot_fingerprint.is_some());
+        assert!(entry.last_upload_body_witness.is_some());
+        assert_eq!(
+            entry.last_snapshot_fingerprint,
+            finalized.last_snapshot_fingerprint
         );
         assert_eq!(
-            entry.last_upload_body_witness.as_deref(),
-            Some(witness.as_str())
+            entry.last_upload_body_witness,
+            finalized.last_upload_body_witness
         );
     }
 }
