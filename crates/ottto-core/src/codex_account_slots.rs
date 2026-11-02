@@ -258,16 +258,7 @@ impl FileCodexAccountSlotSettingsStore {
         if persisted.setup_operation.operation_id.as_deref() == Some(operation_id.as_str()) {
             return Ok(status_contract(&persisted));
         }
-        if matches!(
-            persisted.setup_operation.state,
-            CodexAccountSetupOperationStateV1::WaitingForUserLogin
-                | CodexAccountSetupOperationStateV1::Validating
-        ) || persisted.verifying_pinned_workspace
-        {
-            return Err(CodexAccountSlotSettingsError::Invalid(
-                "another Codex account setup operation is already active".to_string(),
-            ));
-        }
+        reject_active_setup(&persisted)?;
         // Check capacity before the owner signs in, never after: finishing a
         // provider login only to be told there was no room is a wasted trip.
         if persisted.managed_slot_ids.len() >= MAX_MANAGED_CODEX_ACCOUNT_SLOTS {
@@ -277,29 +268,7 @@ impl FileCodexAccountSlotSettingsStore {
         }
         self.discard_pending_open_slot(&mut persisted)?;
 
-        let slot_id = generate_opaque_slot_id()?;
-        ensure_managed_directory(&self.managed_accounts_root()?)?;
-        let slot_root = self.slot_root_unchecked(&slot_id)?;
-        let home = slot_root.join("home");
-        let created_root = create_managed_slot_directory(&slot_root)?;
-        let created_home = match create_managed_slot_directory(&home) {
-            Ok(created) => created,
-            Err(error) => {
-                if created_root {
-                    let _ = fs::remove_dir(&slot_root);
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = write_codex_home_config(&home, None) {
-            if created_home {
-                let _ = fs::remove_dir(&home);
-            }
-            if created_root {
-                let _ = fs::remove_dir(&slot_root);
-            }
-            return Err(error);
-        }
+        let (slot_id, home) = self.create_managed_slot_home()?;
         persisted.pending_open_slot_id = Some(slot_id.clone());
         persisted.setup_operation = CodexAccountSetupOperationV1 {
             state: CodexAccountSetupOperationStateV1::WaitingForUserLogin,
@@ -323,6 +292,36 @@ impl FileCodexAccountSlotSettingsStore {
         persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
+    }
+
+    /// Create a new slot's directories and its home config, and return the new
+    /// slot id and home. On failure, removes only the directories this call
+    /// created (home first, then root) and returns the original error.
+    fn create_managed_slot_home(&self) -> Result<(String, PathBuf), CodexAccountSlotSettingsError> {
+        let slot_id = generate_opaque_slot_id()?;
+        ensure_managed_directory(&self.managed_accounts_root()?)?;
+        let slot_root = self.slot_root_unchecked(&slot_id)?;
+        let home = slot_root.join("home");
+        let created_root = create_managed_slot_directory(&slot_root)?;
+        let created_home = match create_managed_slot_directory(&home) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_root {
+                    let _ = fs::remove_dir(&slot_root);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_codex_home_config(&home, None) {
+            if created_home {
+                let _ = fs::remove_dir(&home);
+            }
+            if created_root {
+                let _ = fs::remove_dir(&slot_root);
+            }
+            return Err(error);
+        }
+        Ok((slot_id, home))
     }
 
     /// Remove a reserved-but-unadopted open slot and its tree.
@@ -376,16 +375,7 @@ impl FileCodexAccountSlotSettingsStore {
             }
             return Ok(status_contract(&persisted));
         }
-        if matches!(
-            persisted.setup_operation.state,
-            CodexAccountSetupOperationStateV1::WaitingForUserLogin
-                | CodexAccountSetupOperationStateV1::Validating
-        ) || persisted.verifying_pinned_workspace
-        {
-            return Err(CodexAccountSlotSettingsError::Invalid(
-                "another Codex account setup operation is already active".to_string(),
-            ));
-        }
+        reject_active_setup(&persisted)?;
         let existing_slot = persisted
             .managed_bindings
             .iter()
@@ -417,29 +407,7 @@ impl FileCodexAccountSlotSettingsStore {
             write_codex_home_config(&home, None)?;
             (slot_id, home)
         } else {
-            let slot_id = generate_opaque_slot_id()?;
-            ensure_managed_directory(&self.managed_accounts_root()?)?;
-            let slot_root = self.slot_root_unchecked(&slot_id)?;
-            let home = slot_root.join("home");
-            let created_root = create_managed_slot_directory(&slot_root)?;
-            let created_home = match create_managed_slot_directory(&home) {
-                Ok(created) => created,
-                Err(error) => {
-                    if created_root {
-                        let _ = fs::remove_dir(&slot_root);
-                    }
-                    return Err(error);
-                }
-            };
-            if let Err(error) = write_codex_home_config(&home, None) {
-                if created_home {
-                    let _ = fs::remove_dir(&home);
-                }
-                if created_root {
-                    let _ = fs::remove_dir(&slot_root);
-                }
-                return Err(error);
-            }
+            let (slot_id, home) = self.create_managed_slot_home()?;
             persisted.managed_slot_ids.push(slot_id.clone());
             persisted.managed_slot_ids.sort();
             persisted.managed_bindings.insert(
@@ -509,16 +477,7 @@ impl FileCodexAccountSlotSettingsStore {
             }
             return Ok(status_contract(&persisted));
         }
-        if matches!(
-            persisted.setup_operation.state,
-            CodexAccountSetupOperationStateV1::WaitingForUserLogin
-                | CodexAccountSetupOperationStateV1::Validating
-        ) || persisted.verifying_pinned_workspace
-        {
-            return Err(CodexAccountSlotSettingsError::Invalid(
-                "another Codex account setup operation is already active".to_string(),
-            ));
-        }
+        reject_active_setup(&persisted)?;
         let binding = persisted.managed_bindings.get(slot_id).ok_or_else(|| {
             CodexAccountSlotSettingsError::Invalid("unknown managed Codex account slot".to_string())
         })?;
@@ -1656,6 +1615,24 @@ fn require_setup_operation(
     if persisted.setup_operation.operation_id.as_deref() != Some(operation_id) {
         return Err(CodexAccountSlotSettingsError::Invalid(
             "unknown Codex account setup operation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to start a setup while another one is waiting for sign-in, validating
+/// or verifying its pinned workspace.
+fn reject_active_setup(
+    persisted: &PersistedCodexAccountSlotsV1,
+) -> Result<(), CodexAccountSlotSettingsError> {
+    if matches!(
+        persisted.setup_operation.state,
+        CodexAccountSetupOperationStateV1::WaitingForUserLogin
+            | CodexAccountSetupOperationStateV1::Validating
+    ) || persisted.verifying_pinned_workspace
+    {
+        return Err(CodexAccountSlotSettingsError::Invalid(
+            "another Codex account setup operation is already active".to_string(),
         ));
     }
     Ok(())
