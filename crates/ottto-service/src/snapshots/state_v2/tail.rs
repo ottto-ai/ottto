@@ -40,9 +40,13 @@ pub(in crate::snapshots) enum Collection {
     PriorityTurns,
     UsageHours,
     Requests,
+    PiUsageKeys,
+    CodexActiveTurns,
+    CodexOpenCalls,
+    CodexNameCounts,
 }
 impl Collection {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 13] = [
         Self::Responses,
         Self::ToolUses,
         Self::ChangedFiles,
@@ -52,6 +56,10 @@ impl Collection {
         Self::PriorityTurns,
         Self::UsageHours,
         Self::Requests,
+        Self::PiUsageKeys,
+        Self::CodexActiveTurns,
+        Self::CodexOpenCalls,
+        Self::CodexNameCounts,
     ];
     fn kind(self) -> &'static str {
         catalogue::TAIL_KINDS[self as usize]
@@ -375,12 +383,15 @@ fn encode_head(revision: u32, table: &MembershipTable, body: &[u8]) -> Vec<u8> {
     out
 }
 /// A committed head, decoded. `revision` below the caller's is the caller's
-/// decision; above it, `load` holds.
+/// decision; above it, `load_head` holds. Only `load_head` makes one: the private
+/// fields bind `load_pages` to the generation and row it was read from.
 #[derive(PartialEq, Eq)]
 pub(in crate::snapshots) struct TailHead {
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) table: MembershipTable,
     pub(in crate::snapshots) body: Vec<u8>,
+    generation: u64,
+    row_digest: [u8; 16],
 }
 fn decode_head(bytes: &[u8]) -> Result<TailHead> {
     let mut input = Reader(bytes);
@@ -413,24 +424,48 @@ fn decode_head(bytes: &[u8]) -> Result<TailHead> {
         revision,
         table,
         body: input.0.to_vec(),
+        generation: 0,
+        row_digest: [0; 16],
     })
 }
 
-/// One read snapshot, one page at a time: `visit` owns each page's bytes as it
-/// goes and must discard them all on `Err`. A future revision is `Hold::Future`,
-/// never a Full; missing, swapped or leftover rows are any other error, the row
-/// staying until replaced.
-pub(super) fn load(
+/// The file's committed head and nothing else; no page is visited. A future
+/// revision is `Hold::Future`, never a Full. `generation` is the authenticated
+/// generation of this read transaction.
+pub(super) fn load_head(
     tx: &mut dyn Transaction,
     file: &[u8],
     revision: u32,
-    visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
+    generation: u64,
 ) -> Result<Option<TailHead>> {
     let Some(header) = tx.get(&row(HEAD, file, 0)?)? else {
         return Ok(None);
     };
     let head = decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?)?;
     ensure!(head.revision <= revision, Hold::Future);
+    Ok(Some(TailHead {
+        generation,
+        row_digest: header.digest,
+        ..head
+    }))
+}
+/// `head`'s pages in one read snapshot, one page at a time: `visit` owns each
+/// page's bytes as it goes and must discard them all on `Err`. A later generation
+/// is `Hold::ReloadRequired`, before any page; a changed head, or missing, swapped
+/// or leftover rows, are any other error, the row staying until replaced.
+pub(super) fn load_pages(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    head: &TailHead,
+    generation: u64,
+    visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    ensure!(head.generation == generation, Hold::ReloadRequired);
+    let stored = tx.get(&row(HEAD, file, 0)?)?;
+    ensure!(
+        stored.is_some_and(|header| header.digest == head.row_digest),
+        "state_v2_tail_membership"
+    );
     for collection in Collection::ALL {
         let kind = RecordKind::parse(collection.kind())?;
         let (mut pages, mut commit) = (0_u64, [0_u8; 32]);
@@ -459,7 +494,26 @@ pub(super) fn load(
             "state_v2_tail_membership"
         );
     }
-    Ok(Some(head))
+    Ok(())
+}
+/// Every file with a committed head, from row headers alone; no value is read.
+/// Absence authority, so any failure is an error and never a partial set.
+pub(super) fn head_keys(tx: &mut dyn Transaction) -> Result<BTreeSet<String>> {
+    let kind = RecordKind::parse(HEAD)?;
+    let (mut keys, mut after) = (BTreeSet::new(), None);
+    loop {
+        let rows = tx.scan_kind(&kind, after.as_ref(), HEADER_PAGE)?;
+        let Some(last) = rows.last() else {
+            return Ok(keys);
+        };
+        after = Some(last.key.clone());
+        for header in &rows {
+            let RowKey::Record { key_bytes, .. } = &header.key else {
+                bail!("state_v2_record_key");
+            };
+            keys.insert(String::from_utf8(key_bytes.clone())?);
+        }
+    }
 }
 pub(super) fn read_set_aside(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<SetAside>> {
     let Some(header) = tx.get(&set_aside_key(file)?)? else {
@@ -537,7 +591,8 @@ fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result
             None => MembershipTable::new(),
         }
     };
-    if staged.change != Change::Ordinary {
+    // A reset's purge of actual prior rows marks itself; a bootstrap owes nothing.
+    if staged.change == Change::DropsPrivate {
         tx.mark_erasure()?;
     }
     for (collection, meta) in &staged.collections {
@@ -558,7 +613,7 @@ fn replace(tx: &mut dyn Transaction, file: &[u8], staged: &StagedFile) -> Result
                 &mut entry.commit,
                 &term(collection.kind(), page, &old.digest),
             );
-            // A wrong stored count fails `load`'s one membership check.
+            // A wrong stored count fails `load_pages`' one membership check.
             entry.pages = entry.pages.wrapping_sub(1);
             tx.delete(&page_key)?;
             delete_fragments(tx, file, collection.owner(), page, 0)?;

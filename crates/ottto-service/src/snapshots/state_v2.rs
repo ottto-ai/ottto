@@ -28,7 +28,7 @@ pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, L
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
-pub(super) use runtime::BaselineRelease;
+pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
@@ -55,7 +55,15 @@ mod sqlite;
 )]
 mod tail;
 use kinds::KindCx;
+#[allow(unused_imports)]
+pub(in crate::snapshots) use runtime::tail_route::{
+    load_head, load_tail, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
+#[allow(unused_imports)]
+pub(in crate::snapshots) use tail::{
+    Change, Collection, CollectionMeta, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+};
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
 /// inline graph. An absent attachment borrows this immutable empty value.

@@ -3,7 +3,9 @@
 use super::super::tail::{
     Change, Collection, CollectionMeta, SetAsideCause, Shape, StagedFile, TailHead,
 };
-use super::tail_route::{load_tail, retire_tail, set_aside_tail, stage_tail, tail_set_aside};
+use super::tail_route::{
+    load_head, load_tail, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+};
 use super::tests::{load_with, save_with, save_with_mode, with_session_db, Fixture, G};
 use super::*;
 
@@ -38,11 +40,14 @@ fn staged(head: &[u8], pages: &[(Collection, u64, &[u8])]) -> StagedFile {
 type Pages = BTreeMap<(Collection, u64), Vec<u8>>;
 fn read(index: &ScanIndex, key: &str) -> Result<(Option<TailHead>, Pages)> {
     let mut pages = Pages::new();
-    let head = load_tail(index, key, REVISION, |collection, page, value| {
+    let Some(head) = load_head(index, key, REVISION)? else {
+        return Ok((None, pages));
+    };
+    load_tail(index, key, &head, |collection, page, value| {
         pages.insert((collection, page), value);
         Ok(())
     })?;
-    Ok((head, pages))
+    Ok((Some(head), pages))
 }
 fn rows(index: &ScanIndex, kind: &str, key: &str) -> Vec<Header> {
     let mut found = Vec::new();
@@ -379,7 +384,20 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
     )
     .unwrap();
 
+    // The owner's drop alone never writes: discarded, counted, G unchanged.
     drop(BaselineRelease::new(&f.path, &index));
+    assert!(stage_empty(&f.path));
+    assert!(telemetry::take_thread_event_for_test("tail_stage_dropped").is_some());
+    assert!(!progress.exists());
+    with_session_db(&index, |db| assert_eq!(db.stamp().unwrap().0, G));
+    stage_tail(
+        &f.path,
+        FILE,
+        staged(b"head", &[(Collection::Responses, 0, b"page")]),
+    )
+    .unwrap();
+
+    BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
 
     assert_eq!(fs::read(&progress).unwrap(), next, "receipt replayed first");
     assert!(stage_empty(&f.path));
@@ -414,7 +432,10 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         staged(b"head", &[(Collection::Responses, 0, b"page")]),
     )
     .unwrap();
-    drop(BaselineRelease::new(&f.path, &index));
+    let release = BaselineRelease::new(&f.path, &index);
+    assert!(release.commit_tail().is_err());
+    assert!(!stage_empty(&f.path), "the owner's drop decides");
+    drop(release);
     assert!(stage_empty(&f.path), "dropped and counted");
     assert!(telemetry::take_thread_event_for_test("tail_stage_dropped").is_some());
     with_session_db(&index, |db| assert_eq!(db.stamp().unwrap().0, G));
@@ -440,7 +461,9 @@ fn exit_commit_outcomes_reload_and_older_layouts_are_not_raised() {
             staged(b"head", &[(Collection::Responses, 0, b"page")]),
         )
         .unwrap();
-        drop(BaselineRelease::new(&f.path, &index));
+        let release = BaselineRelease::new(&f.path, &index);
+        assert!(release.commit_tail().is_err());
+        drop(release);
         assert!(stage_empty(&f.path));
         assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
         let reloaded = load_with(&f.path, false).unwrap().unwrap();
@@ -453,7 +476,7 @@ fn exit_commit_outcomes_reload_and_older_layouts_are_not_raised() {
     let index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| db.control("catalogue_layout", &2_u32).unwrap());
     stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
-    drop(BaselineRelease::new(&f.path, &index));
+    BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
     let mut reloaded = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&reloaded, |db| {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(2));
@@ -478,15 +501,92 @@ fn future_revision_and_newer_writer_hold() {
     save_with(&f.path, &mut index).unwrap();
     let error = read(&index, FILE).err().unwrap();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
-    let head = load_tail(&index, FILE, REVISION + 2, |_, _, _| Ok(()));
+    let head = load_head(&index, FILE, REVISION + 2);
     assert_eq!(head.unwrap().unwrap().revision, REVISION + 1);
 
     with_session_db(&index, sqlite::future_writer_for_test);
     stage_tail(&f.path, FILE, staged(b"newer", &[])).unwrap();
-    drop(BaselineRelease::new(&f.path, &index));
+    let release = BaselineRelease::new(&f.path, &index);
+    assert!(release.commit_tail().is_err());
+    drop(release);
     assert!(telemetry::take_thread_event_for_test("tail_stage_dropped").is_some());
     let error = load_with(&f.path, false).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::NewerSchema));
+}
+
+/// [behaviour] The source-facing reads: a head without its pages, pages streamed
+/// and bound to that head's generation, and exactly the committed head keys. A
+/// bootstrap reset owes no purge, and each late kind roundtrips.
+#[test]
+fn split_reads_head_keys_late_kinds_and_bootstrap_reset() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(tail_head_keys(&index).unwrap().is_empty());
+    let kinds = [
+        Collection::PiUsageKeys,
+        Collection::CodexActiveTurns,
+        Collection::CodexOpenCalls,
+        Collection::CodexNameCounts,
+    ];
+    let pages = kinds.map(|collection| (collection, 0, b"page".as_slice()));
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"head", &pages)
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    stage_tail(&f.path, SIBLING, staged(b"sibling", &[])).unwrap();
+    set_aside_tail(
+        &f.path,
+        "/synthetic/tail/headless.jsonl",
+        SetAsideCause::Encode,
+    )
+    .unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(erasure_marks(&index), 0, "nothing prior to purge");
+    assert_eq!(
+        tail_head_keys(&index).unwrap(),
+        std::collections::BTreeSet::from([FILE.to_owned(), SIBLING.to_owned()])
+    );
+
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    let mut seen = Vec::new();
+    load_tail(&index, FILE, &head, |collection, page, value| {
+        seen.push((collection, page, value));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        kinds.map(|collection| (collection, 0, b"page".to_vec()))
+    );
+    let mut visits = 0;
+    let stopped = load_tail(&index, FILE, &head, |_, _, _| {
+        visits += 1;
+        Err(anyhow::anyhow!("stop"))
+    });
+    assert_eq!(stopped.unwrap_err().to_string(), "stop");
+    assert_eq!(visits, 1, "pages arrive one at a time");
+
+    // A missing page fails only the page phase: the head never visited it.
+    let page = rows(&index, "tail.page.pi_usage_keys", FILE)[0].clone();
+    with_session_db(&index, |db| sqlite::delete_row_for_test(db, &page.key));
+    let again = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(again.table[&Collection::PiUsageKeys].pages, 1);
+    let refused = load_tail(&index, FILE, &again, |_, _, _| Ok(()));
+    assert_eq!(refused.unwrap_err().to_string(), "state_v2_tail_membership");
+
+    // Pages never pair with a head from another generation.
+    stage_tail(&f.path, SIBLING, staged(b"sibling2", &[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let mut visits = 0;
+    let stale = load_tail(&index, FILE, &head, |_, _, _| {
+        visits += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(stale.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    assert_eq!(visits, 0);
 }
 
 /// A published store whose head, page and live WAL hold these literals in the

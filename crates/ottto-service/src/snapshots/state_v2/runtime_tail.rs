@@ -4,10 +4,6 @@ use super::super::tail::{Collection, SetAside, SetAsideCause, StagedFile, TailHe
 use super::*;
 
 /// Staged state never declines; a later completion of the file merges into it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover stages")
-)]
 pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile) -> Result<()> {
     with_state(path, |state| {
         state.tail.stage(key, file);
@@ -15,10 +11,6 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
     })
 }
 /// This file's completion could not encode: its predecessor stays.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover stages")
-)]
 pub(in crate::snapshots) fn set_aside_tail(
     path: &Path,
     key: &str,
@@ -31,10 +23,6 @@ pub(in crate::snapshots) fn set_aside_tail(
 }
 /// `keys`: files a complete census proved absent. The next save deletes their
 /// rows. No sweep or age ever supplies this list.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover retires")
-)]
 pub(in crate::snapshots) fn retire_tail(
     path: &Path,
     keys: impl IntoIterator<Item = String>,
@@ -44,26 +32,38 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
-/// One file's committed head and pages, one short read transaction, on the
-/// graph's authenticated session. See `tail::load` for its outcomes.
-#[cfg_attr(not(test), expect(dead_code, reason = "the acquisition cutover loads"))]
-pub(in crate::snapshots) fn load_tail(
+/// One file's committed head, on the graph's authenticated session; no page is
+/// visited. A future revision holds; a lower one is the caller's to decide.
+pub(in crate::snapshots) fn load_head(
     index: &ScanIndex,
     key: &str,
     revision: u32,
-    mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<Option<TailHead>> {
+    read_txn_at(index, |tx, stamp| {
+        super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
+    })
+}
+/// `head`'s pages, one short read transaction, streamed to `visit`. See
+/// `tail::load_pages` for its outcomes.
+pub(in crate::snapshots) fn load_tail(
+    index: &ScanIndex,
+    key: &str,
+    head: &TailHead,
+    mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
     let started = Instant::now();
-    let (head, _) = read_txn(index, |tx| {
-        super::super::tail::load(tx, key.as_bytes(), revision, &mut visit)
+    read_txn_at(index, |tx, stamp| {
+        super::super::tail::load_pages(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })?;
     telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
-    Ok(head)
+    Ok(())
 }
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover retries")
-)]
+/// Every key with a committed head, this route's graph generation, keys only.
+pub(in crate::snapshots) fn tail_head_keys(
+    index: &ScanIndex,
+) -> Result<std::collections::BTreeSet<String>> {
+    Ok(read_txn(index, super::super::tail::head_keys)?.0)
+}
 pub(in crate::snapshots) fn tail_set_aside(
     index: &ScanIndex,
     key: &str,
@@ -74,17 +74,20 @@ pub(in crate::snapshots) fn tail_set_aside(
     .0)
 }
 
-/// Cycle exit: a stage no later save will carry gets one Tail-only commit, and
-/// whatever could not commit is dropped and counted, its next read replaying
-/// from the previous head. No external effect follows this write.
-pub(super) fn publish_at_exit(path: &Path, runtime: &std::sync::Weak<Runtime>) {
-    if !with_state(path, |state| Ok(!state.tail.is_empty())).unwrap_or(false) {
-        return;
+/// Normal cycle exit: a stage no later save will carry gets one Tail-only commit.
+/// On `Err` the stage stays for the pass owner's drop. No external effect follows.
+pub(super) fn commit_at_exit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
+    if with_state(path, |state| Ok(state.tail.is_empty()))? {
+        return Ok(());
     }
-    let committed = exit_commit(path, runtime).is_ok();
+    exit_commit(path, runtime)
+}
+/// The pass owner's drop never writes, unwinding or not: whatever is left is
+/// dropped and counted, its next read replaying from the previous head.
+pub(super) fn discard_at_exit(path: &Path) {
     let _ = with_state(path, |state| {
         let dropped = std::mem::take(&mut state.tail);
-        if !committed {
+        if !dropped.is_empty() {
             telemetry::event(
                 "tail_stage_dropped",
                 &serde_json::json!({"files": dropped.files(), "bytes": dropped.bytes()}),

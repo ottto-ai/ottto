@@ -1094,9 +1094,10 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
 }
 
 /// idle releases the page baseline when a cycle completes; an error exit skips
-/// idle, so dropping this at the cycle's end releases it as well. It also ends
-/// the pass for staged Tail state no later save carried.
-pub(in super::super) struct BaselineRelease(Option<(PathBuf, std::sync::Weak<Runtime>)>);
+/// idle, so dropping this at the cycle's end releases it as well. It also owns
+/// the end of the pass for staged Tail state no later save carried: `commit_tail`
+/// is the normal exit's one write, and dropping only discards and counts.
+pub(crate) struct BaselineRelease(Option<(PathBuf, std::sync::Weak<Runtime>)>);
 impl BaselineRelease {
     pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
         // A v1 graph has no runtime: hold nothing, so drop is a no-op.
@@ -1108,11 +1109,19 @@ impl BaselineRelease {
                 .map(|runtime| (path.to_owned(), Arc::downgrade(runtime))),
         )
     }
+    /// The normal cycle exit's Tail-only commit, when anything is staged.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the acquisition cutover exits"))]
+    pub(crate) fn commit_tail(&self) -> Result<()> {
+        match &self.0 {
+            Some((path, runtime)) => tail_route::commit_at_exit(path, runtime),
+            None => Ok(()),
+        }
+    }
 }
 impl Drop for BaselineRelease {
     fn drop(&mut self) {
-        if let Some((path, runtime)) = &self.0 {
-            tail_route::publish_at_exit(path, runtime);
+        if let Some((path, _)) = &self.0 {
+            tail_route::discard_at_exit(path);
             let _ = with_state(path, |state| {
                 state.save_digests = None;
                 Ok(())
@@ -1374,6 +1383,13 @@ fn read_txn<R>(
     index: &ScanIndex,
     f: impl FnOnce(&mut dyn Transaction) -> Result<R>,
 ) -> Result<(R, (u64, u64))> {
+    read_txn_at(index, |tx, stamp| Ok((f(tx)?, stamp)))
+}
+/// `read_txn`, handing `f` the authenticated stamp before it reads.
+fn read_txn_at<R>(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut dyn Transaction, (u64, u64)) -> Result<R>,
+) -> Result<R> {
     // The save path's rule: a claim-only growth save in this pass moved the
     // store past the working graph. Authenticate before the session lock.
     let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
@@ -1396,7 +1412,7 @@ fn read_txn<R>(
         Hold::DbUnavailable
     );
     let mut tx = session.db.begin(TxnMode::Read)?;
-    Ok((f(&mut tx)?, stamp))
+    f(&mut tx, stamp)
 }
 
 /// Cold usage pending: load the families a page names before it
@@ -1634,7 +1650,11 @@ pub(in super::super) fn confirmed_growth_stamp(
 mod growth_tests;
 
 #[path = "runtime_tail.rs"]
-mod tail_route;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the acquisition cutover calls these")
+)]
+pub(super) mod tail_route;
 #[cfg(test)]
 #[path = "tail_tests.rs"]
 mod tail_tests;

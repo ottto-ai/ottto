@@ -86180,7 +86180,10 @@ pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool
 }
 /// Hold for the whole collection cycle: releases a committed-page baseline on
 /// every exit, including the error exits that skip maintain_state_v2_idle.
-pub(crate) fn state_v2_baseline_release(path: &Path, index: &ScanIndex) -> impl Drop {
+pub(crate) fn state_v2_baseline_release(
+    path: &Path,
+    index: &ScanIndex,
+) -> state_v2::BaselineRelease {
     state_v2::BaselineRelease::new(path, index)
 }
 pub(crate) fn state_v2_side_effect_guard(
