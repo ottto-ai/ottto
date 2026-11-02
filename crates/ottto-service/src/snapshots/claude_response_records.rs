@@ -47,10 +47,6 @@ impl ClaudeResponseBook {
         self.responses.is_empty()
     }
 
-    pub(super) fn contains_key(&self, key: &str) -> bool {
-        self.index.contains_key(key)
-    }
-
     /// Responses in first-seen order.
     pub(super) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
         self.responses.iter()
@@ -111,15 +107,11 @@ impl ClaudeResponseBook {
         let mut peak = 0;
         let mut output = Some(BookOutput::default());
         for response in self.responses.iter() {
-            // A response over the record limit resolves to nothing (only a
-            // dropped-usage count), so it adds no output either.
-            if !response.record_limit_exceeded {
-                let response = decoded_response_bounds(&response.records, &self.selectors, limit)?;
-                peak = peak.max(response.peak);
-                output = output
-                    .zip(response.output)
-                    .and_then(|(book, response)| book.add(response, limit));
-            }
+            let response = decoded_response_bounds(&response.records, &self.selectors, limit)?;
+            peak = peak.max(response.peak);
+            output = output
+                .zip(response.output)
+                .and_then(|(book, response)| book.add(response, limit));
         }
         // finalize_claude_responses sorts the response vector before decoding;
         // this scratch never overlaps the per-response decode/sort scratch.
@@ -690,11 +682,13 @@ struct ClaudeToolUse {
 
 impl CompactClaudeResponseRecord {
     /// `first` is the response's first retained record, absent for that
-    /// record itself.
+    /// record itself. `position` is its index in the response. Decoding reads
+    /// that index from the vector; the saved field keeps its old width, so past
+    /// `u16::MAX` it saturates.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode(
         first: Option<&Self>,
-        physical_sequence: u16,
+        position: usize,
         usage: UsageTotals,
         model: Option<String>,
         selector: CompactClaudeSelector,
@@ -715,7 +709,7 @@ impl CompactClaudeResponseRecord {
         Self {
             usage: CompactClaudeUsage::encode(usage),
             slot,
-            physical_sequence,
+            physical_sequence: u16::try_from(position).unwrap_or(u16::MAX),
             model: ClaudeRecordText::encode(model, first.map(|first| &first.model)),
             reasoning_effort: ClaudeRecordText::encode(
                 reasoning_effort,
@@ -744,13 +738,14 @@ impl CompactClaudeResponseRecord {
 
     fn decode(
         self,
+        position: usize,
         first: Option<&ClaudeResponseRecord>,
         selectors: &ClaudeSelectorTable,
     ) -> Option<ClaudeResponseRecord> {
         let Self {
             usage,
             slot,
-            physical_sequence,
+            physical_sequence: _,
             model,
             reasoning_effort,
             request_id,
@@ -766,7 +761,7 @@ impl CompactClaudeResponseRecord {
         let cache_slot = slot.decode(&request_id, &timestamp, &model, &reasoning_effort);
         Some(ClaudeResponseRecord {
             cache_slot,
-            physical_sequence: u64::from(physical_sequence),
+            physical_sequence: position as u64,
             usage: usage.decode(),
             model,
             selector: selectors.decode(selector)?,
@@ -1002,8 +997,8 @@ pub(super) fn decode_records(
     selectors: &ClaudeSelectorTable,
 ) -> Option<Vec<ClaudeResponseRecord>> {
     let mut decoded: Vec<ClaudeResponseRecord> = Vec::with_capacity(records.len());
-    for record in records {
-        let record = record.decode(decoded.first(), selectors)?;
+    for (position, record) in records.into_iter().enumerate() {
+        let record = record.decode(position, decoded.first(), selectors)?;
         decoded.push(record);
     }
     Some(decoded)
@@ -1288,7 +1283,7 @@ mod output_tests {
             tool_bytes += tool_id.len() + "Bash".len();
             records.push(CompactClaudeResponseRecord::encode(
                 records.first(),
-                index as u16,
+                index,
                 UsageTotals::default(),
                 (index == 2).then(|| late.to_string()),
                 selectors.intern(selector),
