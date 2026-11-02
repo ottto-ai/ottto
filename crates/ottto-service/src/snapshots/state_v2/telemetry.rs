@@ -594,3 +594,8 @@ mod ops_tests {
         assert!(json.contains("family.requests"));
     }
 }
+
+#[cfg(test)]
+pub(super) fn decoded_rows_for_test() -> u64 {
+    PASS.with(|pass| pass.borrow().decoded.rows)
+}

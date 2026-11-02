@@ -77,6 +77,27 @@ pub(super) fn import_graph(
 /// value digests while decoding. Never return
 /// a partially hydrated graph or normalize unknown raw holds away.
 pub(super) fn hydrate_context(store: &mut sqlite::Sqlite) -> Result<(ScanIndex, KindCx)> {
+    hydrate_context_inner(store, &mut Default::default())
+}
+pub(super) fn hydrate_context_memo(
+    store: &mut sqlite::Sqlite,
+    memo: &mut Vec<u8>,
+) -> Result<(ScanIndex, KindCx)> {
+    // The only retained representation is encoded. Expansion and encoding run
+    // inside the caller's hydrate stage; no admission limit on the memo.
+    let mut heads = if memo.is_empty() {
+        kinds_accounts::UsageMemo::new()
+    } else {
+        serde_json::from_slice(&codec::expand(memo, isize::MAX as u64)?)?
+    };
+    let hydrated = hydrate_context_inner(store, &mut heads)?;
+    *memo = codec::encode(&serde_json::to_vec(&heads)?)?;
+    Ok(hydrated)
+}
+fn hydrate_context_inner(
+    store: &mut sqlite::Sqlite,
+    heads: &mut kinds_accounts::UsageMemo,
+) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
     let header = tx
         .get(&RowKey::Meta("identity".into()))?
@@ -86,7 +107,7 @@ pub(super) fn hydrate_context(store: &mut sqlite::Sqlite) -> Result<(ScanIndex, 
     tx.read_value(&header, &mut bytes)?;
     let identity: Identity = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(v2_on(identity.binding.source), Hold::ForeignBinding);
-    kinds::hydrate_txn(&mut tx, identity.binding)
+    kinds::hydrate_txn(&mut tx, identity.binding, heads)
 }
 /// The one production save: merge current CAS custody, then run the
 /// semantic delta under the resident committed context. Emit the complete

@@ -2122,3 +2122,6 @@ fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
         );
     }
 }
+
+#[path = "usage_memo_tests.rs"]
+mod usage_memo_tests;

@@ -122,13 +122,14 @@ pub(super) fn hydrate(
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
-    let (mut index, cx) = hydrate_txn(&mut tx, binding)?;
+    let (mut index, cx) = hydrate_txn(&mut tx, binding, &mut Default::default())?;
     kinds_accounts::materialize(&mut tx, &mut index)?;
     Ok((index, cx))
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     binding: super::super::scan_index_persistence::Binding,
+    memo: &mut kinds_accounts::UsageMemo,
 ) -> Result<(ScanIndex, KindCx)> {
     let identity_header = tx
         .get(&RowKey::Meta("identity".into()))?
@@ -176,7 +177,7 @@ pub(super) fn hydrate_txn(
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
-    kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
+    kinds_accounts::hydrate_txn(tx, &mut index, &mut cx, memo)?;
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
     cx.valid = true;
     Ok((index, cx))

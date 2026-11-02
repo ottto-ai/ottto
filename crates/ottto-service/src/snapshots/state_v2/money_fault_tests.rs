@@ -236,7 +236,12 @@ fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         assert!(tx.delete(key).unwrap());
         assert!(
-            kinds::hydrate_txn(&mut tx, money_test_support::binding(Source::Claude)).is_err(),
+            kinds::hydrate_txn(
+                &mut tx,
+                money_test_support::binding(Source::Claude),
+                &mut Default::default()
+            )
+            .is_err(),
             "{key:?}"
         );
         drop(tx); // Preserve evidence for the next domain's fault.
@@ -378,7 +383,12 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
             .unwrap_or_else(|| panic!("{kind} fixture must span physical chunks"));
         sqlite::remove_value_chunk(&tx, row);
         assert!(
-            kinds::hydrate_txn(&mut tx, money_test_support::binding(Source::Claude)).is_err(),
+            kinds::hydrate_txn(
+                &mut tx,
+                money_test_support::binding(Source::Claude),
+                &mut Default::default()
+            )
+            .is_err(),
             "missing {kind} segment"
         );
         drop(tx);

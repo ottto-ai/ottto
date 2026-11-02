@@ -665,6 +665,10 @@ fn routed(page: &Page) -> crate::snapshots::sampled_scan::transition_fixture::Ro
 /// Both arms emit the same bodies, totals and account placement.
 #[cfg(unix)]
 fn cold_row(name: &str) {
+    cold_row_with_memo(name, false);
+}
+#[cfg(unix)]
+fn cold_row_with_memo(name: &str, reuse: bool) {
     if !crate::heap_layout_bound::layout_supported() {
         println!("STATE_V2_COLD_ROW {name} UNEXECUTED: native retained layout unavailable");
         return;
@@ -691,6 +695,12 @@ fn cold_row(name: &str) {
             crate::snapshots::state_v2_cold_usage_families(&v2).is_some_and(|n| n > 0),
             "positive control: stored usage pending loads cold"
         );
+        let v2 = if reuse {
+            let next = custody.rehydrate(&v2);
+            custody.rehydrate(&next)
+        } else {
+            v2
+        };
         v1.generation = v2.generation;
         let mut pages = [v1, v2].map(|prior| c.raw(&scanner(), prior, 100, false, &[]));
         for page in &mut pages {
@@ -748,3 +758,7 @@ cold_rows! {
     v2_cold_side_without_owner_places_money_identically => "side_without_owner",
     v2_cold_side_owner_directory_unlisted_places_money_identically => "side_owner_directory_unlisted",
 }
+
+#[cfg(unix)]
+#[path = "state_v2_usage_memo_tests.rs"]
+mod usage_memo_tests;

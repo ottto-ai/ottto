@@ -274,6 +274,7 @@ pub(in super::super) struct Session {
     path: PathBuf,
     reload: bool,
     stamp: (u64, u64),
+    usage_memo: Vec<u8>,
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -288,6 +289,7 @@ fn active(
     identity: Identity,
     path: &Path,
     stamp: (u64, u64),
+    usage_memo: Vec<u8>,
 ) -> Arc<Runtime> {
     Arc::new(Runtime {
         active: true,
@@ -298,6 +300,7 @@ fn active(
             path: path.to_owned(),
             reload: false,
             stamp,
+            usage_memo,
         })),
     })
 }
@@ -366,7 +369,8 @@ fn load_with_custody(
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
+                        let (mut index, mut cx) =
+                            import::hydrate_context_memo(&mut session.db, &mut session.usage_memo)?;
                         #[cfg(test)]
                         if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
                         {
@@ -408,15 +412,16 @@ fn load_with_custody(
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
-            let (mut index, mut cx) =
-                import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
+            let mut usage_memo = Vec::new();
+            let (mut index, mut cx) = import::hydrate_context_memo(&mut db, &mut usage_memo)
+                .context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
             normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
             state.save_digests = Some(digests);
-            index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
+            index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp, usage_memo));
             register(state, &index)?;
             state.report_hold();
             telemetry::event("route", &"v2");
@@ -581,7 +586,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         );
         index.generation = stamp.0;
         let digests = kinds::baseline(index, &mut cx)?;
-        index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
+        index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp, Vec::new()));
         telemetry::pass_start();
         register(state, index)?;
         state.save_digests = Some(digests);

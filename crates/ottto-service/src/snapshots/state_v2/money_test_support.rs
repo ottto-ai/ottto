@@ -124,6 +124,15 @@ impl ColdSession {
         assert!(cold.v2().persistence_v2.is_some(), "a live session");
         (Self { path }, cold)
     }
+    /// Rehydrate through the production reused-session path for money oracles.
+    pub(crate) fn rehydrate(&self, previous: &ScanIndex) -> ScanIndex {
+        let next = ScanIndex::load(&self.path).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            previous.v2().persistence_v2.as_ref().unwrap(),
+            next.v2().persistence_v2.as_ref().unwrap(),
+        ));
+        next
+    }
     /// The published index path.
     pub(crate) fn path(&self) -> &Path {
         &self.path

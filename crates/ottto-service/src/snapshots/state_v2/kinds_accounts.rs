@@ -2,7 +2,7 @@
 use super::super::account_pending_retention::{
     checked_collapse, Archived, ArchivedWindows, ColdFold, ColdWindows,
 };
-use super::super::usage_pending::{ColdUsage, Unknown, UsagePending};
+use super::super::usage_pending::{ColdUsage, Unknown, UsageHead, UsagePending};
 use super::super::{
     ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow, ClaudeUsageFamilyPending,
 };
@@ -301,9 +301,16 @@ fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     }
     rows.put(mapper::key("usage.pending", "", 0)?, &families)
 }
-/// A complete hydrate folds each usage row into its head, seeds its digest
-/// and drops the value: one decoded family at a time.
-fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<UsagePending> {
+// Session-local summaries, authenticated by the stored row header, never saves.
+pub(super) type UsageMemo =
+    std::collections::BTreeMap<String, ((u32, [u8; 16], [u8; 16], u64, u16), UsageHead)>;
+/// Reuse only the previous snapshot's matching heads; fold changed values.
+fn cold_usage(
+    tx: &mut dyn Transaction,
+    seed: &mut mapper::Digests,
+    memo: &mut UsageMemo,
+) -> Result<UsagePending> {
+    let mut previous = std::mem::take(memo);
     let manifest = tx
         .get(&mapper::key("usage.pending", "", 0)?)?
         .context("state_v2_missing_manifest")?;
@@ -315,9 +322,21 @@ fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<Us
             return Ok(());
         };
         count += 1;
-        let family: ClaudeUsageFamilyPending = mapper::read(tx, &h, Some(&mut *seed))?;
-        let digest = *seed.get(&h.key).context("state_v2_row_digest")?;
-        cold.fold(&dependency_family(key_bytes)?, &family, digest);
+        let root = dependency_family(key_bytes)?;
+        let token = (h.value_version, h.digest, h.row_checksum, h.len, h.parts);
+        let head = match previous.remove(&root).filter(|(old, _)| *old == token) {
+            Some((_, head)) => {
+                seed.insert(h.key, head.digest);
+                head
+            }
+            None => {
+                let family: ClaudeUsageFamilyPending = mapper::read(tx, &h, Some(&mut *seed))?;
+                let digest = *seed.get(&h.key).context("state_v2_row_digest")?;
+                UsageHead::of(&family, digest)
+            }
+        };
+        cold.set_head(&root, head.clone());
+        memo.insert(root, (token, head));
         Ok(())
     })?;
     ensure!(count == expected, "state_v2_missing_member");
@@ -409,8 +428,9 @@ pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
     index: &mut ScanIndex,
     cx: &mut KindCx,
+    memo: &mut UsageMemo,
 ) -> Result<()> {
-    hydrate_filtered(tx, index, cx, None)
+    hydrate_filtered_memo(tx, index, cx, None, memo)
 }
 /// Test view of a complete hydrate: cold archives read back resident through
 /// the custody (filtered) read.
@@ -461,6 +481,15 @@ pub(super) fn hydrate_filtered(
     cx: &mut KindCx,
     roots: Option<&BTreeSet<String>>,
 ) -> Result<()> {
+    hydrate_filtered_memo(tx, index, cx, roots, &mut Default::default())
+}
+fn hydrate_filtered_memo(
+    tx: &mut dyn Transaction,
+    index: &mut ScanIndex,
+    cx: &mut KindCx,
+    roots: Option<&BTreeSet<String>>,
+    memo: &mut UsageMemo,
+) -> Result<()> {
     // Only a complete hydrate seeds a baseline; CAS views stay unhashed.
     let mut seed = roots.is_none().then_some(&mut cx.digests);
     // A complete hydrate keeps archived windows in the store. Raw holds keep
@@ -477,8 +506,9 @@ pub(super) fn hydrate_filtered(
     // Custody views read their usage families resident; a complete hydrate
     // without raw holds keeps heads only.
     index.claude_usage_family_pending = if cold {
-        cold_usage(tx, seed.as_deref_mut().context("state_v2_seed")?)?
+        cold_usage(tx, seed.as_deref_mut().context("state_v2_seed")?, memo)?
     } else {
+        memo.clear();
         mapper::read_map::<ClaudeUsageFamilyPending>(
             tx,
             "usage.pending",

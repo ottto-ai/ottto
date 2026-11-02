@@ -90,7 +90,7 @@ impl std::ops::DerefMut for UsagePending {
 
 /// Everything a summary reader may see of a stored family: its row's digest
 /// and what the row says without its request hashes and occurrences.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct UsageHead {
     window: String,
     invalid: bool,
@@ -258,6 +258,7 @@ impl std::fmt::Debug for ColdUsage {
 }
 impl ColdUsage {
     /// Fold one stored row into its head; the value is dropped by the caller.
+    #[cfg(test)]
     pub(super) fn fold(&mut self, root: &str, family: &ClaudeUsageFamilyPending, digest: [u8; 32]) {
         self.set_head(root, UsageHead::of(family, digest));
     }
@@ -271,7 +272,7 @@ impl ColdUsage {
     pub(super) fn patched(&self, root: &str) -> bool {
         self.unproven.contains(root)
     }
-    fn set_head(&mut self, root: &str, head: UsageHead) {
+    pub(super) fn set_head(&mut self, root: &str, head: UsageHead) {
         self.head_occurrences = self.head_occurrences.saturating_add(head.occurrences);
         if let Some(old) = self.heads.insert(root.to_owned(), head) {
             self.head_occurrences = self.head_occurrences.saturating_sub(old.occurrences);

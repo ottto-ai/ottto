@@ -52,6 +52,11 @@ file-system hint / periodic listing → select file → read new bytes from save
 
 ## Hot and cold state
 
+A live state-store session retains usage summaries as one encoded memo between loads.
+Each load reuses only summaries whose stored row headers match; changed families are
+folded again. Reopening the session discards the memo. Full evidence reads keep their
+existing digest checks, and the memo never supplies request proof.
+
 Resident state stays small: what is needed to decide what to do with a file (identity, offset,
 totals, revisions, acknowledgement references) and per-session-group summaries (current account,
 flags, counts, cursors). Per-request evidence is read for the session group a decision affects and
