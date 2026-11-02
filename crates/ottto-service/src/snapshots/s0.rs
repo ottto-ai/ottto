@@ -50,6 +50,7 @@ struct FileCount {
     phase: String,
     full: bool,
     last_native_bytes: u64,
+    last_forced_drain_pass: u64,
     not_persisted: String,
     reasons: BTreeSet<String>,
     grew: bool,
@@ -86,6 +87,10 @@ struct Recorder {
     toggle_diffs: BTreeMap<String, BTreeMap<String, u64>>,
     no_save: BTreeMap<String, u64>,
     exit_cause: String,
+    forced_origins: BTreeMap<String, BTreeSet<String>>,
+    forced_loop: BTreeMap<String, [u64; 2]>,
+    forced_loop_files: BTreeMap<String, BTreeSet<String>>,
+    forced_loop_fields: BTreeMap<String, u64>,
 }
 struct Context {
     mode: String,
@@ -113,6 +118,7 @@ pub(crate) fn begin(phase: &str, pass: u64, source: &str) {
         r.stage.clear();
         r.stage_peak = [0; 4];
         r.exit_cause = "not_reached".into();
+        r.forced_origins.clear();
     });
 }
 pub(crate) fn context(key: &str, mode: &str, reason: &str, bytes: u64, native: u64, accepted: u64) {
@@ -524,6 +530,13 @@ pub(super) fn state(
         let (mode, reason, bytes, native, accepted) = ctx
             .map(|c| (c.mode, c.reason, c.bytes, c.native, c.accepted))
             .unwrap_or_else(|| ("unobserved".into(), "unobserved".into(), 0, 0, 0));
+        let forced =
+            reason.contains("ForcedFamily") && mode.starts_with("Full") && r.phase == "drain";
+        let origin = claude_index_path_family_member(path)
+            .and_then(|(root, _)| r.forced_origins.get(&root))
+            .map(|set| set.iter().map(String::as_str).collect::<Vec<_>>().join("+"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".into());
         let reason = r
             .clears
             .remove(&key)
@@ -734,6 +747,38 @@ pub(super) fn state(
         *r.rows.entry("estimated_head_bytes_sum".into()).or_default() += head;
         *r.rows.entry("appended_bytes_sum".into()).or_default() += bytes.saturating_sub(accepted);
         let f = r.files.entry(key).or_default();
+        if forced {
+            let class = format!(
+                "pass{}|{}|{}|{}",
+                r.pass,
+                origin,
+                bucket(bytes),
+                if f.not_persisted.is_empty() {
+                    "no_observed_reason"
+                } else {
+                    &f.not_persisted
+                }
+            );
+            let cell = r.forced_loop.entry(class).or_default();
+            cell[0] += 1;
+            cell[1] += native;
+            r.forced_loop_files
+                .entry(origin.clone())
+                .or_default()
+                .insert(r.current_key.clone());
+            if f.last_forced_drain_pass > 0 {
+                r.completion_geometry
+                    .entry("drain_forcedfamily.recurrence_gap".into())
+                    .or_default()
+                    .push(r.pass - f.last_forced_drain_pass);
+            }
+            f.last_forced_drain_pass = r.pass;
+            for (old, new) in f.fields.iter().zip(&samples) {
+                if old.hash.zip(new.hash).is_some_and(|(a, b)| a != b) {
+                    *r.forced_loop_fields.entry(new.name.into()).or_default() += 1;
+                }
+            }
+        }
         let table = r.diffs.entry(reason.clone()).or_default();
         *table.entry("completions".into()).or_default() += 1;
         *table.entry("native_bytes".into()).or_default() += native;
@@ -975,6 +1020,7 @@ pub(crate) fn row() -> Value {
 }
 pub(crate) fn end() -> Value {
     let mut out = Value::Null;
+    let unresolved = crate::on_proof::unresolved_keys();
     with(|r| {
         let mut groups: BTreeMap<String, Vec<&FileCount>> = BTreeMap::new();
         for f in r.files.values().filter(|f| f.completions > 0) {
@@ -1039,7 +1085,26 @@ pub(crate) fn end() -> Value {
                         .any(|s| s.name != "claude_responses" && s.encoded.is_none())
             })
             .count();
-        out = json!({"v2": {"candidate_G":CANDIDATE_G,"E_nonempty":r.e_fields,"FINISH":r.finish_fields,"toggle_state_diffs":r.toggle_diffs,
+        let mut unresolved_join: BTreeMap<String, u64> = BTreeMap::new();
+        for (key, class) in &unresolved {
+            let f = r.files.get(key);
+            let joined = format!(
+                "{}|{}|{}|{}",
+                class,
+                f.map(|f| f.source.as_str()).unwrap_or("unobserved"),
+                f.map(|f| bucket(f.bytes)).unwrap_or("unknown"),
+                f.map(|f| if f.not_persisted.is_empty() {
+                    "no_observed_reason"
+                } else {
+                    &f.not_persisted
+                })
+                .unwrap_or("no_observed_reason")
+            );
+            *unresolved_join.entry(joined).or_default() += 1;
+        }
+        out = json!({"on_unresolved_join":unresolved_join,"forced_drain_loop":r.forced_loop,
+        "forced_drain_unique_files":r.forced_loop_files.iter().map(|(k,v)|(k,v.len())).collect::<BTreeMap<_,_>>(),"forced_drain_field_diffs":r.forced_loop_fields,
+        "v2": {"candidate_G":CANDIDATE_G,"E_nonempty":r.e_fields,"FINISH":r.finish_fields,"toggle_state_diffs":r.toggle_diffs,
         "page_plans":r.page_plans.iter().map(|(k,v)|(k,stats(v.clone()))).collect::<BTreeMap<_,_>>(),
         "completion_geometry":r.completion_geometry.iter().map(|(k,v)|(k,stats(v.clone()))).collect::<BTreeMap<_,_>>(),"no_save_passes":r.no_save},
         "head_unknown_files":head_unknown_files,"largest_files":largest,"sizes":sizes,"heads_encoded_known_subtotal":heads,"peaks":peaks,"touches":r.touches,
@@ -1232,5 +1297,14 @@ pub(super) fn page_encode_unknown() {
         *r.rows
             .entry("page_encode_unknown_elements".into())
             .or_default() += 1;
+    });
+}
+
+pub(crate) fn forced_origin(root: &str, cause: &str) {
+    with(|r| {
+        r.forced_origins
+            .entry(root.into())
+            .or_default()
+            .insert(cause.into());
     });
 }

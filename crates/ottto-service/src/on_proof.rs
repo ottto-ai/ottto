@@ -195,3 +195,10 @@ pub(crate) fn end() -> Value {
     });
     out
 }
+
+/// Private join input for the counts recorder. Keys never leave the process.
+pub(crate) fn unresolved_keys() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    with(|r| out.extend(r.open.keys().cloned()));
+    out
+}

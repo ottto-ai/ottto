@@ -385,13 +385,12 @@ fn one(dir: &Path, path: &Path, source: SnapshotSource, label: &str) -> Value {
         }
     };
     let acc = std::mem::replace(&mut p.accumulator, SnapshotAccumulator::new(source));
-    let reduction = sampled_jsonl::CachedJsonlReduction {
-        accumulator: acc,
-        report: p.reader.report,
-        recognized_usage_drop_count: p.recognized_usage_drop_count,
-        positive_recognized_usage_count: p.positive_recognized_usage_count,
-        positive_usage_evidence: p.positive_usage_evidence,
-    };
+    let report = p.reader.report;
+    let scalars = (
+        p.recognized_usage_drop_count,
+        p.positive_recognized_usage_count,
+        p.positive_usage_evidence,
+    );
     drop(p);
     if input.seek(SeekFrom::Start(cut)).is_err() {
         return json!({"error":"seek"});
@@ -406,8 +405,7 @@ fn one(dir: &Path, path: &Path, source: SnapshotSource, label: &str) -> Value {
     drop(output);
     let mut coverage = Coverage::default();
     let decode_floor = footprint();
-    let (restored, decode_peak, decode_ms) =
-        measure(|| roundtrip(reduction.accumulator, &mut coverage));
+    let (restored, decode_peak, decode_ms) = measure(|| roundtrip(acc, &mut coverage));
     let restored = match restored {
         Ok(a) => a,
         Err(field) => {
@@ -422,10 +420,7 @@ fn one(dir: &Path, path: &Path, source: SnapshotSource, label: &str) -> Value {
             let mode = p.prepare_acquisition(
                 Some(crate::transcript_cache::Retained {
                     checkpoint,
-                    state: sampled_jsonl::CachedJsonlReduction {
-                        accumulator: restored,
-                        ..reduction
-                    },
+                    state: sampled_jsonl::s0_reduction(restored, report, scalars),
                 }),
                 &Scope("copied-proxy".into()),
                 None,

@@ -1022,3 +1022,20 @@ pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Bucket {
         Refusal::Admission { charge } => by_charge(charge),
     }
 }
+
+/// The offline measurement proxy moves a completed reduction back to the
+/// native parser without exposing mutable production state.
+#[cfg(test)]
+pub(in crate::snapshots) fn s0_reduction(
+    accumulator: SnapshotAccumulator,
+    report: JsonlReadReport,
+    scalars: (usize, usize, bool),
+) -> CachedJsonlReduction {
+    CachedJsonlReduction {
+        accumulator,
+        report,
+        recognized_usage_drop_count: scalars.0,
+        positive_recognized_usage_count: scalars.1,
+        positive_usage_evidence: scalars.2,
+    }
+}

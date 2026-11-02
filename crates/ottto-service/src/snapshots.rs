@@ -27762,6 +27762,8 @@ impl OwnedSourceScan {
                         .cloned()
                         .collect()
                 {
+                    #[cfg(test)]
+                    s0::forced_origin(root_session_id, "family_membership_mismatch");
                     forced_claude_family_reparses.insert(root_session_id.clone());
                 }
             }
@@ -27827,6 +27829,8 @@ impl OwnedSourceScan {
             for root in
                 claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
             {
+                #[cfg(test)]
+                s0::forced_origin(&root, "selected_path_twin");
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
                 }
@@ -55682,6 +55686,18 @@ impl ScanIndex {
             == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
             && record.retry_after_unix_seconds <= now
             || claude_terminal_predates_e2(record);
+        #[cfg(test)]
+        if !witness_matches || !revision_matches || retry_due {
+            if !witness_matches {
+                s0::forced_origin(&root_session_id, "authority_witness_mismatch");
+            }
+            if !revision_matches {
+                s0::forced_origin(&root_session_id, "authority_revision_mismatch");
+            }
+            if retry_due {
+                s0::forced_origin(&root_session_id, "authority_retry_due");
+            }
+        }
         (!witness_matches || !revision_matches || retry_due).then_some(root_session_id)
     }
 
