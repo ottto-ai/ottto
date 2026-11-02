@@ -1184,9 +1184,6 @@ fn claude_expected(
     if record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode) {
         return Err("old_binding_representation");
     }
-    if record.format != store::FORMAT_V3 {
-        return Err("old_binding_representation");
-    }
     claude_expected_v3(
         key,
         scope,
@@ -3842,7 +3839,7 @@ impl SharedCache {
             }));
         }
         expected.binding.scope = record.record.binding.scope;
-        let restored = self.durable_restore_record_scoped(
+        let restored = self.restore_record_content(
             snapshot_source,
             &record,
             &expected,
@@ -4070,22 +4067,7 @@ impl SharedCache {
         held: &mut File,
         lease: &mut store::ActiveLease,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
-        self.durable_restore_record_scoped(source, record, expected, path, scope, held, lease, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn durable_restore_record_scoped(
-        &self,
-        source: SnapshotSource,
-        record: &store::DurableRecord,
-        expected: &Expected,
-        path: &Path,
-        scope: &Scope,
-        held: &mut File,
-        lease: &mut store::ActiveLease,
-        v3: Option<V3RestoreScope<'_>>,
-    ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
-        self.restore_record_content(source, record, expected, path, scope, held, lease, v3)
+        self.restore_record_content(source, record, expected, path, scope, held, lease, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4104,9 +4086,6 @@ impl SharedCache {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
-        }
-        if record.format != store::FORMAT_V3 {
-            return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         record

@@ -8565,7 +8565,7 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
             let ((result, content_reads), samples) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     capture_rederive_reads(|| {
-                        cache.durable_restore_record_scoped(
+                        cache.restore_record_content(
                             source,
                             &record,
                             &expected,
@@ -8772,7 +8772,7 @@ fn bounded_restore_certificate_edit_reasons_precede_decode() {
             namespace: &scope,
         };
         let (result, reads) = capture_rederive_reads(|| {
-            cache.durable_restore_record_scoped(
+            cache.restore_record_content(
                 source,
                 &record,
                 &expected,
@@ -8937,8 +8937,11 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
             .unwrap()
             .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
             .unwrap();
-        cache.queue_rederive_retirement(ds, &record, &expected, edge);
-        cache.queue_rederive_retirement(ds, &record, &expected, edge);
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            cache.queue_rederive_retirement(ds, &record, &expected, edge);
+            cache.queue_rederive_retirement(ds, &record, &expected, edge);
+            cache.durable_rederive_proxies(source);
+        });
         assert_eq!(std::fs::read(&record_path).unwrap(), original);
         assert!(cache.owes_discovery(source, &key));
         {
@@ -8951,6 +8954,10 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
                 Some(&2)
             );
         }
+        assert!(rows
+            .iter()
+            .any(|r| r["counts"]["retire_exact_held"][edge.label()] == 1
+                && r["counts"]["retire_exact_held_exit"] == "revalidated_retire_exact"));
         // Named exit: the next verified read re-establishes the same eligible
         // predecessor, then the existing post-save writer runs retire_exact.
         let current = {
@@ -11315,7 +11322,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
-    let restored = cache.durable_restore_record_scoped(
+    let restored = cache.restore_record_content(
         source,
         &record,
         &expected,
