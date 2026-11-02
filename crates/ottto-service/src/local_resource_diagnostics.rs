@@ -1216,6 +1216,60 @@ impl Drop for StageWindow {
         });
     }
 }
+/// Named window summed over repeated steps inside a source stage: one record
+/// with summed wall time and process CPU, and no footprint fields. Empty
+/// counts; unwinding emits nothing, like `StageWindow`.
+pub(crate) struct StageSum {
+    stage: &'static str,
+    source: Source,
+    wall_us: u64,
+    cpu_us: Option<u64>,
+}
+impl StageSum {
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            wall_us: 0,
+            cpu_us: Some(0),
+        }
+    }
+    /// Runs `step` unchanged and adds its wall and CPU to the window.
+    pub(crate) fn time<T>(&mut self, step: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let before = process_sample();
+        let result = step();
+        let delta = Observation::between(
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            before,
+            process_sample(),
+        );
+        self.wall_us = self.wall_us.saturating_add(delta.wall_elapsed_us);
+        self.cpu_us = self
+            .cpu_us
+            .zip(delta.shared_process_cpu_delta_us)
+            .map(|(sum, cpu)| sum.saturating_add(cpu));
+        result
+    }
+}
+impl Drop for StageSum {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let mut observation = Observation::point();
+        observation.wall_elapsed_us = self.wall_us;
+        observation.shared_process_cpu_delta_us = self.cpu_us;
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: self.stage,
+            source: self.source,
+            observation,
+            counts: EmptyCounts {},
+        });
+    }
+}
 /// Point outcome at an existing Codex authority boundary. Two fixed records at
 /// most per completed page, using the existing best-effort stderr carrier.
 /// This is not a completion heartbeat, resource window or ingestion verdict.
