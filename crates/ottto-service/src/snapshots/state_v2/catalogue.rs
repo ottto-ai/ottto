@@ -274,6 +274,7 @@ mod tests {
         assert_eq!(group("family.requests"), Some(Group::Census));
         // Each graph kind is introduced at a supported layout.
         assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
+        assert_eq!(TAIL_LAYOUT, LAYOUT);
         // Tail kinds are a closed list too: no wildcard, and no graph owner.
         assert_eq!(group("tail.head"), Some(Group::Tail));
         assert_eq!(group("tail.page.future"), None);
