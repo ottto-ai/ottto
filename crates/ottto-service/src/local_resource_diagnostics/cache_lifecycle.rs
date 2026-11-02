@@ -43,6 +43,12 @@ sparse_lifetime_counters! {
     retention_clone_bound_refused: RetentionCloneBoundRefused,
     retention_finalization_bound_refused: RetentionFinalizationBoundRefused,
     retention_produced: RetentionProduced,
+    // One per bound or clone refusal above, by cause (`classify_refusal`).
+    retention_refused_budget_zero: RetentionRefusedBudgetZero,
+    retention_refused_walk_lock: RetentionRefusedWalkLock,
+    retention_refused_walk_visit_limit: RetentionRefusedWalkVisitLimit,
+    retention_refused_over_budget: RetentionRefusedOverBudget,
+    retention_refused_over_entry: RetentionRefusedOverEntry,
     // Fixed content-free totals, never per-file history.
     prefix_excluded_bodies: PrefixExcludedBody,
     prefix_tag_clears: PrefixTagCleared,

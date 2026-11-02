@@ -3,10 +3,13 @@
 //! diagnostic packet's
 //! refusal buckets. Its own block, apart from the shared appends above.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
+use crate::heap_layout_bound::{take_walk_stop, WalkStop};
+use crate::local_resource_diagnostics::cache_lifecycle::{
+    observe, observed, record, Counts, Event,
+};
 use crate::session_attribution::SessionAttributionContext;
 use crate::snapshots::cache_policy_tests::u3_identity;
-use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
+use sampled_jsonl::{classify_refusal, Refusal, RefusalView};
 use sampled_scan::test_hooks::{self, Decision, Point, Probe};
 use sampled_scan::{ReleaseOutcome, RetainBudget};
 use std::cell::RefCell;
@@ -328,7 +331,6 @@ fn resident(
 struct Run {
     probe: Probe,
     decisions: Vec<Decision>,
-    buckets: Vec<Bucket>,
     /// Residents before the scan, without the incumbent.
     before: Victims,
     /// Counts after revalidation, before `retain_reduction`: the step starts
@@ -414,7 +416,6 @@ fn run(world: &mut World, opts: Opts) -> Run {
     let run = Run {
         probe: test_hooks::last_probe(),
         decisions: test_hooks::decisions(),
-        buckets: test_hooks::buckets(),
         before,
         before_retain: before_retain.borrow_mut().take(),
         at_retain: at_retain.borrow_mut().take(),
@@ -424,8 +425,8 @@ fn run(world: &mut World, opts: Opts) -> Run {
     };
     test_hooks::clear();
     eprintln!(
-        "R0 {:?}: probe {:?}, decisions {:?}, buckets {:?}",
-        world.source, run.probe, run.decisions, run.buckets
+        "R0 {:?}: probe {:?}, decisions {:?}",
+        world.source, run.probe, run.decisions
     );
     run
 }
@@ -505,7 +506,11 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
         {
             assert!(after.contains(&key(resident)), "{source:?}");
         }
-        assert!(run.buckets.is_empty(), "{source:?}");
+        assert_eq!(
+            run.counts.retention_bound_refused + run.counts.retention_clone_bound_refused,
+            0,
+            "{source:?}"
+        );
         // Nothing released before or at retention; no unreadable cause and
         // no failed finish.
         assert_eq!(
@@ -619,76 +624,110 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
     }
 }
 
-/// The packet: one bucket per refused pass, from the budget it was admitted
-/// against and what refused it; excluded and unsealed passes get no budget.
+/// The packet: one cause counted per refused pass, from the budget it was
+/// admitted against and what refused it; excluded and unsealed passes get no
+/// budget.
 #[test]
 fn packet_refusal_buckets_and_budget_variants() {
     let entry = crate::transcript_cache::ENTRY_BYTES;
-    let granted = |budget, resident_measured, active_measured| {
+    let walked = |budget, resident_measured, active_measured, walk_stop| {
         RefusalView::of(&RetainBudget::Granted {
             budget,
             resident_measured,
             active_measured,
+            walk_stop,
         })
     };
+    let granted = |budget| RefusalView::of(&RetainBudget::granted_unclassified(budget));
     let admission = |charge| Refusal::Admission { charge };
     let cases = [
-        (granted(0, false, true), admission(Some(10)), Bucket::Walk),
-        (granted(9, true, false), admission(Some(10)), Bucket::Walk),
         (
-            granted(0, true, true),
+            walked(0, false, true, WalkStop::LockBusy),
             admission(Some(10)),
-            Bucket::BudgetZero,
+            Event::RetentionRefusedWalkLock,
         ),
         (
-            granted(5, true, true),
+            walked(9, true, false, WalkStop::VisitLimit),
             admission(Some(10)),
-            Bucket::OverBudget,
+            Event::RetentionRefusedWalkVisitLimit,
         ),
-        (granted(5, true, true), admission(None), Bucket::Walk),
         (
-            granted(2 * entry, true, true),
+            walked(0, false, true, WalkStop::ByteLimit),
+            admission(Some(10)),
+            Event::RetentionRefusedBudgetZero,
+        ),
+        (
+            granted(0),
+            admission(Some(10)),
+            Event::RetentionRefusedBudgetZero,
+        ),
+        (
+            granted(5),
+            admission(Some(10)),
+            Event::RetentionRefusedOverBudget,
+        ),
+        (
+            granted(5),
+            admission(None),
+            Event::RetentionRefusedWalkVisitLimit,
+        ),
+        (
+            granted(2 * entry),
             admission(Some(entry + 1)),
-            Bucket::OverEntry,
+            Event::RetentionRefusedOverEntry,
         ),
         (
-            granted(5, false, false),
+            walked(5, false, false, WalkStop::LockBusy),
             Refusal::Clone { charge: Some(10) },
-            Bucket::OverBudget,
+            Event::RetentionRefusedOverBudget,
         ),
         (
             RefusalView::deferred(100, 50),
             Refusal::Release(ReleaseOutcome::Race),
-            Bucket::OverBudget,
+            Event::RetentionRefusedOverBudget,
         ),
         (
             RefusalView::deferred(100, 50),
             Refusal::Release(ReleaseOutcome::Unmeasurable),
-            Bucket::Walk,
+            Event::RetentionRefusedWalkVisitLimit,
         ),
         (
             RefusalView::deferred(0, 50),
             Refusal::Release(ReleaseOutcome::Race),
-            Bucket::BudgetZero,
+            Event::RetentionRefusedBudgetZero,
         ),
         (
             RefusalView::deferred(100, 50),
             admission(Some(60)),
-            Bucket::OverEntry,
+            Event::RetentionRefusedOverEntry,
         ),
         (
             RefusalView::deferred(100, 50),
             admission(Some(120)),
-            Bucket::OverBudget,
+            Event::RetentionRefusedOverBudget,
         ),
         (
             RefusalView::of(&RetainBudget::TierOrJoinExcluded { raw: 7 }),
             admission(Some(1)),
-            Bucket::BudgetZero,
+            Event::RetentionRefusedBudgetZero,
         ),
     ];
-    for (index, (view, refusal, bucket)) in cases.into_iter().enumerate() {
-        assert_eq!(classify_refusal(view, refusal), bucket, "case {index}");
+    for (index, (view, refusal, event)) in cases.into_iter().enumerate() {
+        let (_, counts) = observe(|| record(classify_refusal(view, refusal)));
+        let mut expected = Counts::default();
+        expected.add(event, 1);
+        assert_eq!(counts, expected, "case {index}");
+    }
+
+    // A walk reports the lock it found busy (the visit limit: `r0_tail_past_*`).
+    if crate::heap_layout_bound::layout_supported() {
+        let lock = std::sync::Mutex::new(String::new());
+        let _held = lock.lock().unwrap();
+        take_walk_stop();
+        assert_eq!(crate::heap_layout_bound::bound(&lock, usize::MAX), None);
+        assert_eq!(take_walk_stop(), WalkStop::LockBusy);
+        assert_eq!(crate::heap_layout_bound::bound(&lock, 0), None);
+        assert_eq!(take_walk_stop(), WalkStop::ByteLimit);
     }
 
     // Only a deferred release carries a released finalization limit
@@ -768,7 +807,7 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
 
 /// T-R0c: a Claude Tail whose active state passes the walk's 4096 visits.
 /// No step-start clear; the completion is granted 0 with the active
-/// unmeasured (bucket `Walk`), and nothing is released.
+/// unmeasured (cause: visit limit), and nothing is released.
 #[test]
 fn r0_tail_past_the_visit_limit_is_granted_without_release() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -791,8 +830,8 @@ fn r0_tail_past_the_visit_limit_is_granted_without_release() {
             active_measured: false,
         }]
     );
-    assert_eq!(run.buckets, vec![Bucket::Walk]);
     let counts = run.counts;
+    assert_eq!(counts.retention_refused_walk_visit_limit, 1);
     assert_eq!(
         (
             counts.clear_other_active,
@@ -1017,7 +1056,7 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
 
 /// T-R0f: an unknown resident bound (a poisoned retained lock while a Tail
 /// is active). Shape F evicts nothing at step start or completion, and its
-/// own copy is refused (granted 0, residents unmeasured: bucket `Walk`; the
+/// own copy is refused (granted 0, residents unmeasured: a poisoned lock files with the visit limit; the
 /// step measure still walks the active, so it reads measured).
 /// An unsupported layout is not reachable here: every R0 test returns early
 /// without it, and a supported CI build always has it.
@@ -1047,7 +1086,10 @@ fn r0_unknown_resident_evicts_nothing() {
             }],
             "{source:?}"
         );
-        assert_eq!(run.buckets, vec![Bucket::Walk], "{source:?}");
+        assert_eq!(
+            run.counts.retention_refused_walk_visit_limit, 1,
+            "{source:?}"
+        );
         assert_eq!(
             (
                 run.counts.insert_entries_evicted,

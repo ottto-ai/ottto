@@ -1,7 +1,7 @@
 //! Production glue. One process-owned cache is shared by background and manual
 //! cycles; provider parsing, durable index/CAS and delivery remain native.
 use super::*;
-use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::heap_layout_bound::{take_walk_stop, Counter, HeapLayoutBound, WalkStop};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
@@ -920,6 +920,8 @@ pub(super) struct StepMeasure {
     /// The active's charge in this step's copy budget: its whole walk, line
     /// buffer included (`None`: none, so the budget is zero).
     pub(super) used: Option<usize>,
+    /// What stopped an unmeasured walk here, for the refusal counters.
+    pub(super) walk_stop: WalkStop,
 }
 impl StepMeasure {
     /// The active's per-step walk hit the visit cap, so its optional charge
@@ -964,8 +966,7 @@ pub(super) fn release_cache_for_copy_refusal(
         active,
         measured_resident.map(|resident| StepMeasure {
             resident: Some(resident),
-            active: None,
-            used: None,
+            ..StepMeasure::default()
         }),
     );
 }
@@ -1328,6 +1329,7 @@ pub(super) fn copy_budget_step(
     // authority either: the walk's `room` goes with the budget, and where
     // main allocates against it the proof is retired first
     // (`retire_proof_beside_copy`, fix round 2 DB1).
+    take_walk_stop();
     let resident = codex_cursor::bound_for_main(context, state_bytes());
     let remaining = resident.and_then(|resident| state_bytes().checked_sub(resident));
     let Some(active) = active else {
@@ -1338,6 +1340,7 @@ pub(super) fn copy_budget_step(
                 resident,
                 active: None,
                 used: None,
+                walk_stop: take_walk_stop(),
             },
         );
     };
@@ -1406,6 +1409,7 @@ pub(super) fn copy_budget_step(
             )
         }
     };
+    let walk_stop = take_walk_stop();
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
@@ -1419,20 +1423,22 @@ pub(super) fn copy_budget_step(
             resident,
             active: optional,
             used,
+            walk_stop,
         },
     )
 }
 
 /// The copy budget a completion hands to retention (and to its
-/// diagnostic packet). No production counter reads the variant.
+/// diagnostic packet). Only the refusal counters read the variant.
 pub(super) enum RetainBudget {
     /// Admit against `budget` now. The flags say whether the walk behind it
-    /// measured the residents and the active file; only refusal
-    /// classification reads them.
+    /// measured the residents and the active file, and `walk_stop` what
+    /// stopped it; only refusal classification reads them.
     Granted {
         budget: usize,
         resident_measured: bool,
         active_measured: bool,
+        walk_stop: WalkStop,
     },
     /// Aliases or an applied receipt: never retained, and not a budget
     /// refusal. `raw` is this completion's pre-release budget.
@@ -1455,6 +1461,7 @@ impl RetainBudget {
             budget,
             resident_measured: true,
             active_measured: true,
+            walk_stop: WalkStop::default(),
         }
     }
     /// This completion's pre-release budget.
@@ -1482,11 +1489,13 @@ impl RetainBudget {
             Self::Granted {
                 resident_measured,
                 active_measured,
+                walk_stop,
                 ..
             } => Self::Granted {
                 budget: granted,
                 resident_measured,
                 active_measured,
+                walk_stop,
             },
             Self::Deferred {
                 budget_after,
@@ -1546,6 +1555,7 @@ impl From<(usize, StepMeasure)> for RetainBudget {
             budget,
             resident_measured: step.resident.is_some(),
             active_measured: step.used.is_some(),
+            walk_stop: step.walk_stop,
         }
     }
 }
@@ -1682,15 +1692,7 @@ pub(super) fn tail_completion_budget(
     // 2. The insert-aware budget, computed before the clone charge.
     let Some(slot) = crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key_len)
     else {
-        return (
-            RetainBudget::Granted {
-                budget: 0,
-                resident_measured: true,
-                active_measured: true,
-            },
-            step,
-            None,
-        );
+        return (RetainBudget::granted_unclassified(0), step, None);
     };
     let ins_extra = slot.saturating_sub(
         std::mem::size_of::<CachedJsonlReduction>()
@@ -1702,11 +1704,7 @@ pub(super) fn tail_completion_budget(
     let ins_extra = test_hooks::ins_extra().unwrap_or(ins_extra);
     let floor = a.max(ins_extra);
     let b_ins = remaining.checked_sub(floor).map_or(0, |room| room / 2);
-    let granted = RetainBudget::Granted {
-        budget: b_ins,
-        resident_measured: true,
-        active_measured: true,
-    };
+    let granted = RetainBudget::granted_unclassified(b_ins);
     #[cfg(test)]
     test_hooks::probe(|probe| {
         *probe = test_hooks::Probe {
@@ -2110,7 +2108,6 @@ pub(super) mod test_hooks {
         static AFTER_SELECTION: RefCell<Option<SelectionHook>> = const { RefCell::new(None) };
         static PROBE: RefCell<Probe> = RefCell::new(Probe::default());
         static DECISIONS: RefCell<Vec<Decision>> = const { RefCell::new(Vec::new()) };
-        static BUCKETS: RefCell<Vec<super::sampled_jsonl::Bucket>> = const { RefCell::new(Vec::new()) };
         static UNREADABLE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -2156,7 +2153,6 @@ pub(super) mod test_hooks {
         AFTER_SELECTION.with(|slot| slot.borrow_mut().take());
         PROBE.with(|probe| *probe.borrow_mut() = Probe::default());
         DECISIONS.with(|decisions| decisions.borrow_mut().clear());
-        BUCKETS.with(|buckets| buckets.borrow_mut().clear());
         UNREADABLE.with(|causes| causes.borrow_mut().clear());
         FINISH_ERRORS.with(|errors| errors.borrow_mut().clear());
         INS_EXTRA.with(|term| term.set(None));
@@ -2193,6 +2189,7 @@ pub(super) mod test_hooks {
                 budget,
                 resident_measured,
                 active_measured,
+                ..
             } => Decision::Granted {
                 budget: *budget,
                 resident_measured: *resident_measured,
@@ -2212,14 +2209,6 @@ pub(super) mod test_hooks {
 
     pub(in crate::snapshots) fn decisions() -> Vec<Decision> {
         DECISIONS.with(|decisions| decisions.borrow().clone())
-    }
-
-    pub(in crate::snapshots) fn record_bucket(bucket: super::sampled_jsonl::Bucket) {
-        BUCKETS.with(|buckets| buckets.borrow_mut().push(bucket));
-    }
-
-    pub(in crate::snapshots) fn buckets() -> Vec<super::sampled_jsonl::Bucket> {
-        BUCKETS.with(|buckets| buckets.borrow().clone())
     }
 
     /// A census unreadable cause, by its `UnreadableCause` ordinal.
