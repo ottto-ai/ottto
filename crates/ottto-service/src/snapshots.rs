@@ -86441,7 +86441,10 @@ pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool
 }
 /// Hold for the whole collection cycle: releases a committed-page baseline on
 /// every exit, including the error exits that skip maintain_state_v2_idle.
-pub(crate) fn state_v2_baseline_release(path: &Path, index: &ScanIndex) -> impl Drop {
+pub(crate) fn state_v2_baseline_release(
+    path: &Path,
+    index: &ScanIndex,
+) -> state_v2::BaselineRelease {
     state_v2::BaselineRelease::new(path, index)
 }
 pub(crate) fn state_v2_side_effect_guard(
@@ -86669,6 +86672,11 @@ pub(crate) use state_v2::money_test_support::{
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;
+#[cfg(test)]
+pub(crate) use state_v2::{
+    seed_tail_literals_for_test, stage_tail_for_test as state_v2_stage_tail_for_test,
+    tail_published_for_test as state_v2_tail_published_for_test,
+};
 
 /// Local-only recovery bypasses a save-pressure hold, never custody fencing.
 /// OFF returns before allocating a guard or consulting any route state.
