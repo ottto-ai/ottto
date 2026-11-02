@@ -17,14 +17,6 @@ fn fixtures() -> [FixtureRow; 2] {
         (Source::Codex, codex_fixture),
     ]
 }
-fn snapshot_source_of(source: Source) -> SnapshotSource {
-    match source {
-        Source::Claude => SnapshotSource::ClaudeCode,
-        Source::Codex => SnapshotSource::Codex,
-        Source::Pi => unreachable!("Pi is not served by the store yet"),
-    }
-}
-
 /// Every persisted Codex field non-default, beside a Codex-bearing file.
 fn codex_fixture() -> ScanIndex {
     let mut index = ScanIndex::default();
@@ -174,7 +166,7 @@ fn source_rows_import_hydrate_and_save_like_v1() {
         );
     }
     for (source, build) in fixtures() {
-        let snapshot_source = snapshot_source_of(source);
+        let snapshot_source = source.snapshot();
         let route = Route::new(source);
         std::fs::write(&route.path, serde_json::to_vec(&build()).unwrap()).unwrap();
         let load = |support: Option<&Path>| {

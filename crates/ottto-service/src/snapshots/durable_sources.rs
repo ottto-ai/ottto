@@ -22,6 +22,10 @@ pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
     pub(crate) tag: u8,
+    /// Its index routes through the state v2 store. Only ever set: a published
+    /// route's custody wins, and clearing it would let v1 load the frozen
+    /// JSON. Leaving needs an explicit export back to v1.
+    pub(crate) state_v2: bool,
     pub(crate) write_format: u16,
     pub(crate) representations: &'static [Representation],
     #[cfg(unix)]
@@ -42,6 +46,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
+        state_v2: true,
         write_format: 3,
         representations: &representations(
             "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
@@ -54,6 +59,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
+        state_v2: true,
         write_format: 3,
         representations: &representations(
             "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
@@ -63,6 +69,17 @@ pub(crate) const SOURCES: &[Properties] = &[
         verify: durable::verify,
     },
 ];
+
+impl scan_index_persistence::Source {
+    // Lives here, not beside the enum: the integration tests compile that file alone.
+    pub(crate) fn snapshot(self) -> SnapshotSource {
+        match self {
+            Self::Claude => SnapshotSource::ClaudeCode,
+            Self::Codex => SnapshotSource::Codex,
+            Self::Pi => SnapshotSource::Pi,
+        }
+    }
+}
 
 impl DurableSource {
     pub(crate) fn slot(self) -> usize {
