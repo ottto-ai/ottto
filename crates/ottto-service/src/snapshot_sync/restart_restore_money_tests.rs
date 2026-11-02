@@ -1193,18 +1193,15 @@ impl PiProof {
         });
     }
 
-    fn finish(self, c: &Corpus, disk: &Disk) {
-        let name = c.base.file_name().unwrap().to_str().unwrap();
-        receipt(name, &self.bodies);
-        if self.durable {
-            assert!(disk.records() > 0, "native Pi receipt must survive");
-            println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} SUPPORTED");
-            println!("MONEY_EQUIVALENCE_DISK {name} VERIFIED");
-        } else {
-            assert_eq!(disk.records(), 0, "base has no durable Pi receipt");
-            println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} UNSUPPORTED");
-            println!("MONEY_EQUIVALENCE_DISK {name} UNSUPPORTED");
+    /// Same-build proof only: the cross-build receipt catalog has no Pi rows,
+    /// so this checks the identity scope and the durable record, emitting nothing.
+    fn finish(self, disk: &Disk) {
+        assert!(!self.bodies.is_empty(), "zero emitted bodies is no proof");
+        for body in &self.bodies {
+            body.cross_build();
         }
+        assert!(self.durable, "head restores Pi durably");
+        assert!(disk.records() > 0, "native Pi receipt must survive");
     }
 }
 
@@ -1220,23 +1217,12 @@ fn pi_disk_corpus(
     let scanner = disk.owner(SnapshotSource::Pi);
     let (mut index, scan, modes) =
         other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
-    // The copied harness also runs on the base, which may predate Pi RAM: its
-    // own build decides there, and head must sample.
-    let sampled = match std::env::var("OTTTO_MONEY_EQUIVALENCE_PI_RAM_EXPECTED").as_deref() {
-        Ok("any") => modes == (1, 0, 0),
-        Ok("1") | Err(_) => true,
-        Ok(other) => panic!("invalid Pi RAM expectation: {other}"),
-    };
-    assert_eq!(
-        modes,
-        if sampled { (1, 0, 0) } else { (0, 0, 0) },
-        "head must exercise sampled Pi; base must exercise cold Full"
-    );
+    assert_eq!(modes, (1, 0, 0), "head must exercise sampled Pi");
     assert!(!scan.snapshots.is_empty());
     let prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut index);
     let durable = disk.records() > 0;
     let mut proof = PiProof {
-        sampled,
+        sampled: true,
         durable,
         bodies: Vec::new(),
     };
@@ -1509,7 +1495,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
         requests,
         "{name}"
     );
-    proof.finish(&c, &disk);
+    proof.finish(&disk);
     scan
 }
 
@@ -1591,7 +1577,7 @@ fn pi_ledger_splits(
         };
     }
     assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
-    proof.finish(&c, &disk);
+    proof.finish(&disk);
 }
 
 /// [money] A plain Pi session split at every line boundary emits cold Full's
@@ -1959,7 +1945,7 @@ fn pi_cli_fork_preserves_double_count() {
         ),
         EXPECTED_FORK_TOTALS
     );
-    proof.finish(&c, &disk);
+    proof.finish(&disk);
 }
 
 fn pi_lifecycle_case(name: &str) {
@@ -2080,7 +2066,7 @@ fn pi_lifecycle_case(name: &str) {
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
     }
-    proof.finish(&c, &disk);
+    proof.finish(&disk);
 }
 
 /// [money] A version rewrite after Tail must reacquire Full without double billing.
@@ -2177,7 +2163,7 @@ fn pi_acquisition_metadata_changes() {
         [tail, full, next],
         PiPageExpect::modes((0, 1, 0), (0, 1, 0), 1),
     );
-    proof.finish(&c, &disk);
+    proof.finish(&disk);
 }
 
 /// [money] Admission branches omitted by the native-authority sticky fixture. Check
