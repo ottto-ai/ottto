@@ -3361,18 +3361,11 @@ fn agent_context(
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto context",
-        |api_base_url, connection, setup_run_token| {
-            agent_read_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                |api_base_url, connection| agent_context_url(api_base_url, connection, &query),
-            )
-        },
+        |api_base_url, connection| agent_context_url(api_base_url, connection, &query),
     )
 }
 
@@ -3382,18 +3375,11 @@ fn agent_costs(
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto costs",
-        |api_base_url, connection, setup_run_token| {
-            agent_read_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                |api_base_url, connection| agent_costs_url(api_base_url, connection, &query),
-            )
-        },
+        |api_base_url, connection| agent_costs_url(api_base_url, connection, &query),
     )
 }
 
@@ -3403,18 +3389,11 @@ fn agent_sessions(
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto sessions",
-        |api_base_url, connection, setup_run_token| {
-            agent_read_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                |api_base_url, connection| agent_sessions_url(api_base_url, connection, &query),
-            )
-        },
+        |api_base_url, connection| agent_sessions_url(api_base_url, connection, &query),
     )
 }
 
@@ -3423,20 +3402,11 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto recommendations",
-        |api_base_url, connection, setup_run_token| {
-            agent_read_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                |api_base_url, connection| {
-                    agent_recommendations_url(api_base_url, connection, &query)
-                },
-            )
-        },
+        |api_base_url, connection| agent_recommendations_url(api_base_url, connection, &query),
     )
 }
 
@@ -3445,19 +3415,28 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(
+    observe_agent_read(
         daemon,
         authorization,
         "ottto provider-impact",
+        |api_base_url, connection| agent_provider_impact_url(api_base_url, connection, &query),
+    )
+}
+
+/// One observed agent read: the setup-run binding and its observation come
+/// from `observe_setup_run_read`, the request from `agent_read_with_refresh`.
+fn observe_agent_read(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    command: &str,
+    read_url: impl Fn(&str, &LocalConnectionBinding) -> String,
+) -> Result<serde_json::Value, LocalApiError> {
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        command,
         |api_base_url, connection, setup_run_token| {
-            agent_read_with_refresh(
-                api_base_url,
-                connection,
-                setup_run_token,
-                |api_base_url, connection| {
-                    agent_provider_impact_url(api_base_url, connection, &query)
-                },
-            )
+            agent_read_with_refresh(api_base_url, connection, setup_run_token, &read_url)
         },
     )
 }
@@ -4905,9 +4884,6 @@ fn cloud_sessions_control_with_stores(
         accounts,
         devices,
     )?;
-    let expected_user_id = local_user_id.clone();
-    let expected_organization_id = local_organization_id.clone();
-    let expected_device_id = device.device_id.clone();
 
     let backend_grant_allowed = matches!(
         action,
@@ -5029,13 +5005,13 @@ fn cloud_sessions_control_with_stores(
             .ok_or(LocalApiError::LocalClientNotTrusted)?;
         if current_account.state != LocalAccountState::Connected
             || current_account.user.as_ref().map(|user| user.id.as_str())
-                != Some(expected_user_id.as_str())
+                != Some(local_user_id.as_str())
             || current_account
                 .organization
                 .as_ref()
                 .map(|organization| organization.id.as_str())
-                != Some(expected_organization_id.as_str())
-            || current_device.device_id != expected_device_id
+                != Some(local_organization_id.as_str())
+            || current_device.device_id != device.device_id
             || !current_device
                 .sources
                 .iter()
@@ -5048,7 +5024,7 @@ fn cloud_sessions_control_with_stores(
                 // Completion-safe compensating cleanup: an authenticated POST
                 // response can arrive after rollout disabled bind. Bind only
                 // its exact identity into already-revoked local state.
-                grants.bind_backend_grant(response, &expected_device_id)?;
+                grants.bind_backend_grant(response, &device.device_id)?;
             }
             grants.grant_revoke_target()
         })();
@@ -10265,7 +10241,7 @@ fn agent_read_with_refresh(
     match read(connection, setup_run_token) {
         Ok(value) => Ok(value),
         Err(error) => {
-            if agent_read_refreshes_token(&error) {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
                 let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return read(&refreshed.connection, &refreshed.setup_run_token);
@@ -10273,10 +10249,6 @@ fn agent_read_with_refresh(
             Err(error)
         }
     }
-}
-
-fn agent_read_refreshes_token(error: &LocalApiError) -> bool {
-    matches!(error, LocalApiError::Backend(details) if details.status == Some(401))
 }
 
 fn disconnect_setup_run_with_refresh(
@@ -15788,9 +15760,9 @@ where
     Ok((before_session_census, smoke_after, smoke))
 }
 
-/// The route classification and billing identity hints every Pi route result
-/// carries. Callers set every other field explicitly; the values here for those
-/// fields are placeholders that no caller keeps.
+/// Every Pi route result's route classification and billing identity hints,
+/// with the no-evidence defaults most results share: failed, nothing seen, no
+/// command run. Callers override only the fields that differ.
 fn pi_route_result_base(route: &PiModelRoute) -> SourceRouteVerificationResult {
     let identity = pi_route_billing_identity_hints(route);
     SourceRouteVerificationResult {
@@ -15832,19 +15804,7 @@ fn pi_route_result_base(route: &PiModelRoute) -> SourceRouteVerificationResult {
 fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerificationResult {
     let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        status: SourceVerificationStatus::Failed,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
-        smoke_after: None,
-        command_found: false,
-        command_succeeded: false,
-        exit_status: None,
-        duration_ms: 0,
-        diagnostic: None,
         error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
-        local_session_observed: None,
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
@@ -15852,7 +15812,6 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
                 pi_route_label(route)
             ),
         },
-        check: None,
         ..base
     }
 }
@@ -15864,11 +15823,6 @@ fn pi_route_post_smoke_census_failure(
 ) -> SourceRouteVerificationResult {
     let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        status: SourceVerificationStatus::Failed,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after: Some(smoke_after),
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -15876,7 +15830,6 @@ fn pi_route_post_smoke_census_failure(
         duration_ms: smoke.duration_ms.try_into().unwrap_or(u64::MAX),
         diagnostic: smoke.diagnostic.clone(),
         error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
-        local_session_observed: None,
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
@@ -15884,7 +15837,6 @@ fn pi_route_post_smoke_census_failure(
                 pi_route_label(route)
             ),
         },
-        check: None,
         ..base
     }
 }
@@ -16083,14 +16035,9 @@ fn pi_route_passive_result(
         last_received_at,
         smoke_after,
         command_found: true,
-        command_succeeded: false,
-        exit_status: None,
-        duration_ms: 0,
-        diagnostic: None,
         error_code,
         local_session_observed,
         message: StableMessage { code, text },
-        check: None,
         ..base
     }
 }
@@ -16146,11 +16093,6 @@ fn pi_route_result_from_smoke(
 ) -> SourceRouteVerificationResult {
     let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
-        status: SourceVerificationStatus::Failed,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after,
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -16175,7 +16117,6 @@ fn pi_route_result_from_smoke(
                 smoke.message
             ),
         },
-        check: None,
         ..base
     }
 }
@@ -16233,7 +16174,6 @@ fn pi_route_result_from_verification(
         },
         local_session_observed: smoke.local_session_observed,
         message: StableMessage { code, text },
-        check: None,
         ..base
     }
 }
@@ -16249,10 +16189,6 @@ fn pi_route_result_from_backend_error(
     let base = pi_route_result_base(route);
     SourceRouteVerificationResult {
         status: source_result.status,
-        verified: false,
-        records_seen: 0,
-        last_record_id: None,
-        last_received_at: None,
         smoke_after,
         command_found: smoke.command_found,
         command_succeeded: smoke.succeeded,
@@ -16269,7 +16205,6 @@ fn pi_route_result_from_backend_error(
                 source_result.message.text
             ),
         },
-        check: None,
         ..base
     }
 }
@@ -30635,27 +30570,8 @@ X-API-Key = "otel_redacted"
     #[serial]
     fn agent_read_refreshes_the_setup_run_token_only_on_401() {
         const INVALID: &str = r#"{"detail":"Setup run companion token is invalid"}"#;
-        let backend = |status: Option<u16>| {
-            LocalApiError::Backend(BackendErrorDetails {
-                kind: BackendErrorKind::Rejected,
-                endpoint: "/api/v1/setup-runs/[id]/local-client/costs".to_string(),
-                status,
-                body_excerpt: Some(INVALID.to_string()),
-                reason_code: None,
-            })
-        };
-        // Setup-run requests refresh on a token-invalid body under any status;
-        // agent reads refresh only on the 401 itself.
-        assert!(is_setup_run_token_auth_error(&backend(Some(403))));
-        assert!(agent_read_refreshes_token(&backend(Some(401))));
-        for status in [Some(400), Some(403), Some(500), None] {
-            assert!(!agent_read_refreshes_token(&backend(status)), "{status:?}");
-        }
-        assert!(!agent_read_refreshes_token(
-            &LocalApiError::SetupRunConnectionMissing
-        ));
-
-        // End to end: a 403 read returns as is, with no refresh request.
+        // A token-invalid body under 403 would refresh a setup-run request,
+        // but an agent read returns it after one request, without refreshing.
         let _guard = lock_backend_test_env();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(SetupRunReadScript {

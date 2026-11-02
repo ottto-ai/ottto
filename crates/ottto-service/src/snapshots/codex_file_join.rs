@@ -154,20 +154,13 @@ pub(super) struct HeaderWitness {
 /// A header-pass candidate from its discovery stat. Opening the file later
 /// refreshes size, mtime and identity from the opened object.
 fn header_candidate(scan_root: PathBuf, path: PathBuf, stat: &fs::Metadata) -> CandidateFile {
-    let seconds = stat.modified().ok().and_then(unix_seconds).unwrap_or(0);
     CandidateFile {
         physical_identity: None,
         scan_root,
         path,
         size_bytes: stat.len(),
-        modified_unix_seconds: seconds,
-        // Same form as the scan opener. The fallback is always 0: unix_nanos
-        // and unix_seconds fail together (pre-epoch mtime).
-        modified_unix_nanos: stat
-            .modified()
-            .ok()
-            .and_then(unix_nanos)
-            .unwrap_or(seconds.saturating_mul(1_000_000_000)),
+        modified_unix_seconds: stat.modified().ok().and_then(unix_seconds).unwrap_or(0),
+        modified_unix_nanos: stat.modified().ok().and_then(unix_nanos).unwrap_or(0),
         source_file_fingerprint: String::new(),
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,

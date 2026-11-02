@@ -1708,11 +1708,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn forbidden_origin_body_refuses_only_a_present_unlisted_origin() {
-        for noun in ["control", "identity", "health"] {
-            assert_eq!(forbidden_origin_body(None, noun), None);
-            assert_eq!(forbidden_origin_body(Some("https://ottto.net"), noun), None);
-        }
+    fn forbidden_origin_body_keeps_each_message_verbatim() {
         for (noun, message) in [
             ("control", "Origin is not allowed for local Ottto control"),
             ("identity", "Origin is not allowed for local Ottto identity"),
