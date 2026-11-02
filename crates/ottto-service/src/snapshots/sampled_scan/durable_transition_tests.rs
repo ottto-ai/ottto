@@ -349,6 +349,12 @@ pub(super) trait SharedSource: TransitionDriver {
     /// Whether bounded head rederive reads through the native reader, so its
     /// bytes are part of `io.consumed` (Claude), or by pread (Pi).
     const HEAD_REDERIVE_CONSUMED: bool;
+    /// Whether a record restore spends the owner's head-once pace (the record
+    /// carries content): the same owner's later restore of the same record
+    /// extent is then a paced Full.
+    const RESTORE_SPENDS_HEAD_ONCE: bool;
+    /// This route owner's paced/resource Full count of one phase.
+    fn resource_full(&self, mode: Mode, phase: &str) -> u64;
     /// The session entity the row follows.
     fn entity(&self) -> &str;
     /// Appends billed growth number `n`; returns the bytes past the committed
@@ -357,6 +363,11 @@ pub(super) trait SharedSource: TransitionDriver {
 }
 impl SharedSource for M1 {
     const HEAD_REDERIVE_CONSUMED: bool = true;
+    const RESTORE_SPENDS_HEAD_ONCE: bool = false;
+    fn resource_full(&self, mode: Mode, phase: &str) -> u64 {
+        let (counts, _) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        counts.resource_full.get(phase).copied().unwrap_or(0)
+    }
     fn entity(&self) -> &str {
         ROOT
     }
@@ -379,6 +390,18 @@ pub(super) fn tail_routes_across_two_restarts<D: SharedSource>(f: &mut D) {
         assert!(!cold.batches.is_empty());
         for mode in [Mode::Ram, Mode::DiskRestore, Mode::EvictRetry] {
             let route = f.emit_bodies(mode);
+            if D::RESTORE_SPENDS_HEAD_ONCE && mode == Mode::EvictRetry && page > 0 {
+                // After a restart this owner's Ram route restored the same
+                // committed record extent; its second head read is paced Full.
+                assert_eq!(
+                    (route.modes, route.restored),
+                    ((1, 0, 0), 0),
+                    "page {page} {mode:?}"
+                );
+                assert_eq!(f.resource_full(mode, "rederive_paced"), 1, "page {page}");
+                money_oracle::assert_equivalent(&cold, &route);
+                continue;
+            }
             assert_eq!(route.modes, (0, 1, 0), "page {page} {mode:?}");
             if mode != Mode::Ram || page > 0 {
                 assert_eq!(route.restored, 1);
