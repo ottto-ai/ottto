@@ -344,7 +344,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             assert!(progress.permanent_rejections[fingerprint]
                 .exposure
                 .is_some());
-            let refusals = PermanentRefusalCounts::of(&progress);
+            // Finish transfers terminal quarantine custody to the saved
+            // index. Rebind it through ordinary preparation before counting
+            // dominance, exactly as the next source cycle does.
+            let mut rebound = progress.clone();
+            rebound.prepare_quarantine_retries(&saved.quarantined_snapshot_fingerprints);
+            let refusals = PermanentRefusalCounts::of(&rebound);
             assert_eq!(
                 refusals.dominated, 1,
                 "fresh server coverage survives reload"
