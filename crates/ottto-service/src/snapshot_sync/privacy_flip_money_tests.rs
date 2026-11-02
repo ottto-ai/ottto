@@ -1,7 +1,8 @@
 // A Tail under a flipped policy after a parse under the old one equals a Full
-// under the new one, on the real E2 pipeline with two accounts placed.
+// under the new one, on the real E2 pipeline with two accounts placed, a side
+// call and an evidence gap.
 use super::money_equivalence_tests::{claude_change, claude_corpus, input_clock};
-use super::state_v2_money_tests::{routed, second_account};
+use super::state_v2_money_tests::{otel_rows, routed, second_account, tagged_api};
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent;
 
@@ -47,6 +48,29 @@ fn page_under(
         delivered: None,
     }
 }
+/// A sibling session whose telemetry names no account: an evidence gap,
+/// grown with the root.
+fn evidence_gap(c: &mut Corpus, grown: bool) {
+    let mut text = line(COPY, "gap-1", AT, 6);
+    let mut rows = vec![api_for(COPY, "gap-1", 6, 60)];
+    if grown {
+        text += &line(COPY, "gap-2", AT, 7);
+        rows.push(api_for(COPY, "gap-2", 7, 70));
+    }
+    let path = c.root(COPY, &text);
+    c.evidence_for(COPY, &rows, &[]);
+    input_clock(&path);
+}
+/// A telemetry-only request the root owns through its trace, on account b.
+fn side_call(c: &Corpus) {
+    let mut effort: Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence> =
+        otel_rows(c, "claude-code-effort");
+    let mut traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
+        otel_rows(c, "claude-code-trace-ownership");
+    effort.push(tagged_api("r-side", 5, Some(&"b".repeat(64))));
+    traces.push(trace("r-side", ""));
+    c.evidence(&effort, &traces);
+}
 fn settle(c: &Corpus, page: &mut Page, policy: SnapshotUploadPolicy) {
     page.enrich(c);
     crate::snapshots::apply_upload_policy(
@@ -85,22 +109,46 @@ fn flipped_policy_tail_places_money_like_a_full() {
                 let mut after = before;
                 *field(&mut after) = !start;
 
-                let (c, path) = claude_corpus("progressive_response");
+                let (mut c, path) = claude_corpus("progressive_response");
+                evidence_gap(&mut c, false);
                 let scanner = E2ScanFixture::with_identity_capture(true);
                 let mut warm = page_under(&c, &scanner, ScanIndex::default(), before);
                 settle(&c, &mut warm, before);
                 claude_change(&c, &path, "progressive_response");
                 second_account(&c, &path);
+                side_call(&c);
+                evidence_gap(&mut c, true);
                 input_clock(&path);
 
                 let mut tail = page_under(&c, &scanner, warm.index.clone(), after);
                 settle(&c, &mut tail, after);
-                assert_eq!(tail.modes, (0, 1, 0), "bit {bit} from {start}");
+                assert_eq!(tail.modes, (0, 2, 0), "bit {bit} from {start}");
 
                 let fresh = E2ScanFixture::with_identity_capture(true);
                 let mut cold = page_under(&c, &fresh, ScanIndex::default(), after);
                 settle(&c, &mut cold, after);
-                assert_eq!(cold.modes.0, 1, "bit {bit} from {start}: control is a Full");
+                assert_eq!(cold.modes.0, 2, "bit {bit} from {start}: control is a Full");
+                let root = cold
+                    .scan
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == ROOT)
+                    .unwrap();
+                assert_eq!(
+                    root.request_count, 4,
+                    "positive control: three transcript requests and the side call"
+                );
+                assert!(
+                    cold.scan
+                        .snapshots
+                        .iter()
+                        .flat_map(|item| &item.usage_buckets)
+                        .flat_map(|bucket| &bucket.model_usage)
+                        .any(|row| row.account_identifier_hash.is_none()
+                            && row.evidence_ref.is_none()
+                            && row.identity_parts.is_none()),
+                    "positive control: an evidence gap"
+                );
 
                 let accounts = tail
                     .scan

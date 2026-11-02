@@ -370,6 +370,8 @@ impl ScanIndex {
             && receipt.source_witness == entry.source_file_fingerprint
     }
 
+    /// Also refused when an entity it covers was sent since under another
+    /// context: the receipt no longer proves what the server holds.
     fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
         entry
             .upload_context_receipt
@@ -377,6 +379,9 @@ impl ScanIndex {
             .is_some_and(|receipt| {
                 self.receipt_proves(key, entry, receipt)
                     && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                    && self
+                        .unstamped_covered_entities(key, &receipt.context_fingerprint)
+                        .is_some()
             })
     }
 
@@ -410,9 +415,39 @@ impl ScanIndex {
         self.file_upload_context_requires_adoption(key) && !self.privacy_only_debt(key)
     }
 
+    /// How many entities this file covers carry no stamp, or `None` when one
+    /// was sent since under a context outside `context`'s family. Without a
+    /// pass closure nothing is judged.
+    fn unstamped_covered_entities(&self, key: &str, context: &str) -> Option<usize> {
+        let closure = self.upload_context_closure.as_deref();
+        let mut unstamped = 0;
+        for entity in self
+            .file_snapshot_fingerprints
+            .get(key)
+            .into_iter()
+            .flatten()
+        {
+            match self.upload_context_proof.entity_stamps.get(entity) {
+                None => unstamped += 1,
+                Some(stamp)
+                    if stamp.context_fingerprint != context
+                        && closure.is_some_and(|closure| {
+                            !closure.same_family(&stamp.context_fingerprint, context)
+                        }) =>
+                {
+                    return None
+                }
+                Some(_) => {}
+            }
+        }
+        Some(unstamped)
+    }
+
     /// The file's receipt proves these exact bytes and bodies under a context
-    /// differing only by privacy, and no entity it covers was sent since under
-    /// another one. A file that fails any of this selects as before.
+    /// differing only by privacy, and every entity it covers is stamped in the
+    /// receipt's own family: none was sent since under another one. A file
+    /// without its entity set, or with an unstamped entity, selects as before;
+    /// only a confirmed-empty file covers nothing.
     fn privacy_only_debt(&self, key: &str) -> bool {
         let (Some(closure), Some(entry)) =
             (self.upload_context_closure.as_ref(), self.files.get(key))
@@ -428,13 +463,12 @@ impl ScanIndex {
             && (self.confirmed_empty_files.contains(key)
                 || entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness))
             && closure.admits_receipt(context, self.unaffected_file(key))
-            && self
-                .file_snapshot_fingerprints
-                .get(key)
-                .into_iter()
-                .flatten()
-                .filter_map(|entity| self.upload_context_proof.entity_stamps.get(entity))
-                .all(|stamp| closure.same_family(&stamp.context_fingerprint, context))
+            && (self.confirmed_empty_files.contains(key)
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|entities| !entities.is_empty()))
+            && self.unstamped_covered_entities(key, context) == Some(0)
     }
 
     /// Prepare only, before the first compare: tier receipts and archive

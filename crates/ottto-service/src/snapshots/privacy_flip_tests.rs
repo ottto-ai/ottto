@@ -342,64 +342,162 @@ fn flip_back_after_acknowledged_upload_resends_on_next_read() {
     assert!(!f.debt());
 }
 
-/// [behaviour] T4: a failed upload under B rolls back, and the grown file still
-/// selects under A.
+/// [behaviour] T4: a page partly acknowledged under B is checkpointed, then the
+/// pass fails and rolls back to that checkpoint. Back under A the file still
+/// holds A's receipt, but the entities ACKed under B make it select, and the
+/// read resends exactly those.
 #[test]
-fn partial_upload_under_flip_rolls_back_and_still_selects() {
-    let mut f = settled(SnapshotSource::Codex, all(false));
-    let b = flipped(all(false), &BITS[0]);
-    f.flip(b);
-    f.append(&growth(f.source));
+fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.flip(all(false));
+    let a = f.index.active_upload_context_fingerprint.clone().unwrap();
+    let empty = f.index.clone();
+    let items = uploader_group(&mut f, 51);
+    f.uploader.activate(f.source, a.clone(), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &empty, &items)
+            .unwrap()
+            .0,
+        1
+    );
+    assert!(!f.debt());
+    f.flip(flipped(all(false), &BITS[0]));
+    assert!(f.debt() && !f.read_owed());
     let committed = f.index.clone();
-    let walked = f.flip_walk(b, None);
-    f.uploader.fail_after = Some(f.uploader.posts.len());
-    let context = f.index.active_upload_context_fingerprint.clone().unwrap();
-    f.uploader.activate(f.source, context, &mut f.index);
+    let b = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, b.clone(), &mut f.index);
+    f.uploader.fail_after = Some(f.uploader.posts.len() + 1);
     assert!(f
         .uploader
-        .send(f.source, &mut f.index, &committed, &walked.scan.snapshots)
+        .send(f.source, &mut f.index, &committed, &items)
         .is_err());
-    f.uploader.fail_after = None;
+    let fingerprints = |posts: &[Vec<Value>]| {
+        posts
+            .iter()
+            .flatten()
+            .map(|v| v["snapshot_fingerprint"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let acked = fingerprints(std::slice::from_ref(f.uploader.posts.last().unwrap()));
+    assert!(!acked.is_empty() && acked.len() < items.len());
+    // The checkpoint commits the page's ACKs; the failed pass rolls back to it.
     f.index = committed;
+    f.uploader.checkpoint_stamps(&mut f.index);
+    f.uploader.restart(f.source, &b);
+    f.uploader.fail_after = None;
     f.flip(all(false));
-    let walked = f.flip_walk(all(false), None);
-    assert_eq!(walked.scan.scanned_file_count, 1);
     assert!(
-        !walked.scan.snapshots.is_empty(),
-        "the grown body is offered"
+        f.debt(),
+        "A's receipt no longer proves what the server holds"
     );
+    assert!(f.read_owed());
+    let committed = f.index.clone();
+    let before = f.uploader.posts.len();
+    f.uploader.activate(f.source, a, &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .unwrap();
+    assert_eq!(fingerprints(&f.uploader.posts[before..]), acked);
+    assert!(!f.debt());
 }
 
-/// [behaviour] T4: this file's entity was sent since under another context, by a
-/// sibling alias or a partly acknowledged page, so its receipt proves nothing.
+/// [behaviour] T4: one entity shared by two files, through A -> B -> A. The
+/// alias read under B earns B; the untouched file keeps A's receipt, which is
+/// no current proof of the shared entity once back under A.
 #[test]
-fn entity_stamped_under_another_context_selects_untouched_file() {
-    let mut f = settled(SnapshotSource::Codex, all(false));
-    let b = flipped(all(false), &BITS[0]);
-    f.flip(b);
-    assert!(!f.read_owed());
-    let sent = f.index.active_upload_context_fingerprint.clone().unwrap();
-    let entities = f
-        .index
-        .file_snapshot_fingerprints
-        .get(&f.key())
-        .unwrap()
+fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    f.flip(all(false));
+    let a = f.index.active_upload_context_fingerprint.clone().unwrap();
+    let empty = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    let mut shared = scan.snapshots[0].clone();
+    shared.source_session_id = "synthetic-shared-session".into();
+    scan.snapshots.push(shared.clone());
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, a.clone(), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &empty, &scan.snapshots)
+        .unwrap();
+    let untouched = f.key();
+    let shared_entity = scan
+        .snapshots
         .iter()
-        .cloned()
-        .collect::<Vec<String>>();
-    assert!(!entities.is_empty());
-    for entity in entities {
-        f.index
-            .upload_context_proof
-            .entity_stamps
-            .get_mut(&entity)
-            .unwrap()
-            .context_fingerprint
-            .clone_from(&sent);
+        .find(|item| item.source_session_id == shared.source_session_id)
+        .unwrap()
+        .snapshot_fingerprint
+        .clone();
+
+    let alias_session = "019fa111-2222-7333-8444-777777777777";
+    let alias_path = f.root.join(format!("{alias_session}.jsonl"));
+    fs::write(
+        &alias_path,
+        [
+            json!({"type":"session","id":alias_session,"timestamp":"2026-10-29T10:00:00Z"}),
+            json!({"type":"message_end","message":{"responseId":"synthetic-alias","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":7,"output":3}}}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let alias = local_index_key(&alias_path);
+    let committed = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    assert!(
+        scan.snapshots
+            .iter()
+            .all(|item| item.source_session_id != SESSION),
+        "only the new alias is read"
+    );
+    let alias_file = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == alias_session)
+        .unwrap()
+        .source_file_fingerprint
+        .clone();
+    scan.snapshots.push(SnapshotItem {
+        source_file_fingerprint: alias_file,
+        ..shared
+    });
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    let alias_items = scan.snapshots;
+    f.uploader.activate(f.source, a, &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &alias_items)
+        .unwrap();
+    for key in [&untouched, &alias] {
+        assert!(f.index.file_snapshot_fingerprints[key].contains(&shared_entity));
+        assert!(!f.index.file_upload_context_requires_adoption(key));
     }
-    assert!(f.read_owed());
-    let (scan, _) = f.walk(true);
-    assert_eq!(scan.scanned_file_count, 1);
+
+    // Under B the alias is read and acknowledged; the untouched file is not.
+    f.flip(flipped(all(false), &BITS[0]));
+    assert!(!f.index.file_context_read_owed(&untouched));
+    let committed = f.index.clone();
+    let b = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, b, &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &alias_items)
+        .unwrap();
+    assert!(!f.index.file_upload_context_requires_adoption(&alias));
+    assert!(
+        f.index.file_context_read_owed(&untouched),
+        "the shared entity was sent under B"
+    );
+
+    f.flip(all(false));
+    assert!(
+        !f.index.file_context_read_owed(&alias),
+        "the alias owes delivery only"
+    );
+    assert!(
+        f.index.file_upload_context_requires_adoption(&untouched)
+            && f.index.file_context_read_owed(&untouched),
+        "A's receipt is no current proof of the entity acknowledged under B"
+    );
 }
 
 /// [behaviour] T5: values persisted by the previous binary, bound to the delivery

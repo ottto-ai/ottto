@@ -7,8 +7,10 @@ full upload context.
 
 A file whose receipt differs from the active context only by privacy owes delivery, not a read. The
 debt is paid when the file is next acquired for an ordinary reason. Every entity the receipt covers
-must still be stamped in the receipt's own family, so a sibling sent under another context selects.
-Key, cache and copy changes select as before.
+must still be stamped in the receipt's own family; a missing entity set or stamp selects. A receipt of
+the active context is current only while no entity it covers was sent since under another context,
+so after A -> B -> A an untouched alias of an entity sent under B, or a file partly acknowledged
+under B, selects and resends. Key, cache and copy changes select as before.
 
 Session links are always scraped; the toggle and the server's 512-byte limit apply at upload, and
 over-limit links are counted. Consequences: turning links on adds them only to sessions acquired

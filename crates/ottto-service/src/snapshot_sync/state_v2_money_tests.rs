@@ -7,7 +7,7 @@ use super::money_equivalence_tests::{
 use super::*;
 use serde_json::Value;
 
-fn tagged_api(
+pub(super) fn tagged_api(
     request: &str,
     tokens: u64,
     account: Option<&str>,
@@ -590,22 +590,8 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
 /// are kept, so its ownership cases are unchanged.
 #[cfg(unix)]
 pub(super) fn second_account(c: &Corpus, path: &Path) {
-    fn rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
-        let path = c
-            .support
-            .join("local-otel")
-            .join(directory)
-            .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
-        std::fs::read_to_string(path)
-            .map(|text| {
-                text.lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
     let mut effort: Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence> =
-        rows(c, "claude-code-effort");
+        otel_rows(c, "claude-code-effort");
     if effort.is_empty() {
         effort.push(api("r1", 10, 100));
     }
@@ -614,13 +600,30 @@ pub(super) fn second_account(c: &Corpus, path: &Path) {
         .map(|row| tag(row, Some(&"a".repeat(64))))
         .collect();
     let mut traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
-        rows(c, "claude-code-trace-ownership");
+        otel_rows(c, "claude-code-trace-ownership");
     for (request, tokens, account) in [("r-account-a", 40, "a"), ("r-account-b", 50, "b")] {
         append(path, &line(ROOT, request, AT, tokens));
         effort.push(tagged_api(request, tokens, Some(&account.repeat(64))));
         traces.push(trace(request, ""));
     }
     c.evidence(&effort, &traces);
+}
+
+/// The root session's telemetry rows of one kind, as last written.
+#[cfg(unix)]
+pub(super) fn otel_rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
+    let path = c
+        .support
+        .join("local-otel")
+        .join(directory)
+        .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The page's real upload with ACK, as the placement oracle reads it.
