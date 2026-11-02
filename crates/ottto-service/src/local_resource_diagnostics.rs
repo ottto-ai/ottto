@@ -536,7 +536,8 @@ pub(crate) enum UnselectedReason {
 }
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
-const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
+const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
+const UNSELECTED_REASONS: usize = PAGE_SELECTION_START + 4;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -580,6 +581,29 @@ pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u
         });
     }
 }
+/// One page's selection, counted after it was made; never a gate input.
+#[derive(Clone, Copy)]
+pub(crate) enum PageSelection {
+    /// Queued paths the page took.
+    Selected,
+    /// The selected paths whose index entry is re-armed (owed).
+    OwedSelected,
+    /// Selected paths that ended as a Skip (unchanged or confirmed empty).
+    Skipped,
+    /// Claude roots put back at the queue front to wait for their family.
+    DeferredRoots,
+}
+pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
+    source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+const PAGE_SELECTION: [(&str, usize); 4] = [
+    ("selected", PAGE_SELECTION_START),
+    ("owed_selected", PAGE_SELECTION_START + 1),
+    ("skipped", PAGE_SELECTION_START + 2),
+    ("deferred_roots", PAGE_SELECTION_START + 3),
+];
 const UNACKED_LOST: [(&str, usize); 4] = [
     ("files", UNACKED_LOST_START),
     ("requests", UNACKED_LOST_START + 1),
@@ -980,6 +1004,8 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            page_selection: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -1014,6 +1040,7 @@ impl Probe {
                 })
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
+            page_selection: drain(source, &PAGE_SELECTION),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {

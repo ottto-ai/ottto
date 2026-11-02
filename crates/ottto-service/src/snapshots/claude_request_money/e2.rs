@@ -3589,10 +3589,13 @@ pub(crate) fn side_calls_page(
     unresolved
 }
 
-/// Every path component of the directories the traversal queued but has not
+/// Every path component of the directories the census walk queued but has not
 /// listed. A family's member transcripts live under `<root>/subagents/`; the
 /// root file being on a page means its own directory was listed, so the
 /// family's directory is still to be listed exactly when `<root>` is here.
+/// A re-listing pass's directories (not census members) are left out: that
+/// pass starts only after the walk listed every directory, so their members
+/// are already observed and their roots need not wait.
 fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
@@ -3604,6 +3607,7 @@ fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
 fn directory_names(queued: &VecDeque<ScanTraversalPath>) -> BTreeSet<String> {
     queued
         .iter()
+        .filter(|directory| directory.census_member)
         .flat_map(|directory| directory.path.components())
         .filter_map(|component| match component {
             std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
@@ -3635,6 +3639,11 @@ pub(in crate::snapshots) fn defer_roots_of_queued_families(
         });
     *selected = kept;
     diag("deferred_root_queued_family", deferred.len() as u64);
+    crate::local_resource_diagnostics::page_selection(
+        "claude_code",
+        crate::local_resource_diagnostics::PageSelection::DeferredRoots,
+        deferred.len() as u64,
+    );
     let locations = deferred
         .iter()
         .map(|candidate| location_key(&local_index_key(&candidate.path)))
