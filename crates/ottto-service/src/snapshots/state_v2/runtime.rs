@@ -2,7 +2,7 @@
 //! store; any other load stays v1 before publication. Custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure, Context};
-use import::{Mapper, Pace, Pause};
+use import::{Pace, Pause};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -274,25 +274,27 @@ fn held<T>(result: Result<T>) -> Result<T> {
 
 /// Present root: caller already owns CheckpointLock, BEFORE v1 decode.
 /// Missing root calls the same function from check_missing's existing lock.
+/// Without a support dir (unit tests, tools) `importable` is false and only an
+/// existing route loads. The returned flag says the caller's v1 load may import.
 pub(in super::super) fn load_locked(
     path: &Path,
-    support: Option<&Path>,
+    importable: bool,
     custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
     // Do not probe the Claude sentinel for Codex, Pi or unbound paths.
-    if binding(path).is_none() {
-        return Ok((None, false));
-    }
-    // Without a support dir (unit tests, tools) only an existing route loads.
-    let importable = support.is_some();
-    let index = load_with_custody(path, importable, custody)?;
-    let sample_v1 = importable && index.is_none();
-    Ok((index, sample_v1))
-}
-fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Option<ScanIndex>> {
     let Some(binding) = binding(path) else {
-        return Ok(None);
+        return Ok((None, false));
     };
+    let index = load_with_custody(path, &binding, importable, custody)?;
+    let try_import = importable && index.is_none();
+    Ok((index, try_import))
+}
+fn load_with_custody(
+    path: &Path,
+    binding: &super::super::scan_index_persistence::Binding,
+    importable: bool,
+    custody: bool,
+) -> Result<Option<ScanIndex>> {
     if !importable && !route_needed(path, custody)? {
         return Ok(None);
     }
@@ -301,7 +303,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
         state.inventory_ready = false;
         state.original = None;
         state.save_digests = None;
-        let pair = fence::reconcile(path, &binding, state.latched)?;
+        let pair = fence::reconcile(path, binding, state.latched)?;
         state.pass_written_start = (importable || pair.is_some())
             .then(telemetry::process_written_bytes)
             .flatten();
@@ -324,7 +326,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = Mapper.hydrate_context(&mut session.db)?;
+                        let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
                         #[cfg(test)]
                         if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
                         {
@@ -360,18 +362,13 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                 state.current = None;
             }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-            let (deadline, work) = purge_policy();
-            let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
-                .map_err(Hold::storage)?;
-            db.path_extractor(Mapper::private_paths);
-            db.reference_extractor(Mapper::references);
+            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
-            let (mut index, mut cx) = Mapper
-                .hydrate_context(&mut db)
-                .context("state_v2_open_hydrate")?;
+            let (mut index, mut cx) =
+                import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
@@ -410,7 +407,7 @@ fn load_with_custody(path: &Path, importable: bool, custody: bool) -> Result<Opt
                 telemetry::event("import_restart_attempt", &1);
             }
             // Inventory precedes v1 recovery/decoding and never creates artifacts.
-            match Mapper.inventory_context(path) {
+            match import::inventory_context(path) {
                 Ok(original) => {
                     state.inventory_ready = true;
                     state.original = original;
@@ -491,7 +488,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             pause(state, Pause::Partial);
             return Ok(());
         }
-        let _gauge = telemetry::Stage::import(path);
+        let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
         let result = (|| -> Result<KindCx> {
             let original = state.original.as_mut().ok_or(Pause::Mismatch)?;
             original.unchanged()?;
@@ -504,7 +501,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            let generation = Mapper.import_generation(index)?;
+            let generation = import::import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
@@ -517,11 +514,9 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             telemetry::baseline(path);
             let import = fence::sibling(path, ".v2.sqlite.import");
             let mut db = sqlite::Sqlite::create_import(&import)?;
-            db.path_extractor(Mapper::private_paths);
-            db.reference_extractor(Mapper::references);
             db.control("identity", &identity)?;
             db.control("generation", &index.generation)?;
-            let cx = Mapper.import_graph(&mut db, index, state.original.as_ref())?;
+            let cx = import::import_graph(&mut db, index, state.original.as_ref())?;
             original.unchanged()?;
             original.publish_import(path, &identity, db, &mut state.latched)?;
             Ok(cx)
@@ -543,15 +538,11 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         // Publication succeeded: adoption failure is a hold, never a v1 result.
         let (identity, db_path) =
             fence::reconcile(path, &binding_for(path)?, true)?.ok_or(Hold::DbUnavailable)?;
-        let (deadline, work) = purge_policy();
-        let mut db = sqlite::Sqlite::open_with_policy(&db_path, &identity, deadline, work)
-            .map_err(Hold::storage)?;
-        db.path_extractor(Mapper::private_paths);
-        db.reference_extractor(Mapper::references);
+        let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
         db.audit_headers()?;
         let stamp = db.stamp()?;
         ensure!(
-            stamp.0 == Mapper.import_generation(index)?,
+            stamp.0 == import::import_generation(index)?,
             Hold::DbUnavailable
         );
         index.generation = stamp.0;
@@ -612,7 +603,7 @@ fn save_with_custody(
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let (previous, mut cx) = Mapper.hydrate_context(&mut session.db)?;
+                let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
                 // Committed rollovers outlive the dropped baseline: a sibling
@@ -627,7 +618,7 @@ fn save_with_custody(
             index.generation = previous.generation;
         }
         recovered_write(path, progress_owner, &id, session, |session| {
-            let digests = Mapper.save(
+            let digests = import::save(
                 &mut session.db,
                 &id,
                 previous,
@@ -1077,16 +1068,6 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
     .unwrap_or(requested.min(250))
 }
 
-pub(super) fn purge_policy() -> (Duration, Duration) {
-    let seconds = std::env::var("OTTTO_CLAUDE_STATE_V2_ERASURE_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(86400)
-        .min(72 * 3600);
-    (Duration::from_secs(seconds), Duration::from_secs(2))
-}
-
 /// idle releases the page baseline when a cycle completes; an error exit skips
 /// idle, so dropping this at the cycle's end releases it as well.
 pub(in super::super) struct BaselineRelease(Option<PathBuf>);
@@ -1376,60 +1357,92 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
 /// accumulates (`Some`), or every family before a decision that joins them
 /// (`None`). A missing, changed or unreadable row, or a store this graph does
 /// not hold, is Unknown and the caller refuses its whole decision. Counted.
-/// Rows install one at a time, only after every wanted row was read: a later
-/// digest mismatch can leave earlier verified rows installed while the caller
-/// still refuses the whole decision.
+/// Nothing installs unless every wanted row was read and matches its head.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    let usage = &index.claude_usage_family_pending;
-    if usage.cold().is_none() {
+    if roots.is_none() && index.claude_usage_family_pending.all().is_ok() {
         return Ok(());
     }
-    let wanted = match roots {
-        Some(roots) => {
-            let wanted = usage.unloaded(roots.iter().map(String::as_str));
-            if wanted.is_empty() {
-                return Ok(());
-            }
-            Some(wanted)
-        }
-        None if usage.all().is_ok() => return Ok(()),
-        None => None,
+    let mut read = Vec::new();
+    read_unloaded(index, roots, roots.is_none(), &mut |root, value, digest| {
+        read.push((root, value, digest));
+    })?;
+    let Some(cold) = index.claude_usage_family_pending.cold_mut() else {
+        return Ok(());
     };
-    let result = (|| -> Result<()> {
-        let mut read = Vec::new();
-        read_cold(
-            index,
-            "usage.pending",
-            wanted.as_ref(),
-            &mut |root, value, digest| {
-                read.push((root, value, digest));
-                Ok(())
-            },
-        )?;
-        // Every wanted row must have been read before any is installed.
-        if let Some(wanted) = &wanted {
-            let read: std::collections::BTreeSet<&String> =
-                read.iter().map(|(root, _, _)| root).collect();
-            ensure!(
-                wanted.iter().all(|root| read.contains(root)),
-                super::super::usage_pending::Unknown
-            );
+    for (root, value, digest) in read {
+        cold.install(root, value, digest)?;
+    }
+    if roots.is_none() {
+        cold.complete()?;
+    }
+    Ok(())
+}
+
+/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
+/// time, as this graph holds it: its loaded value, else its stored row,
+/// which must still match its head. Keeps nothing and visits in no set
+/// order. Unknown, counted: a row unlike its head, a head without a row, or a
+/// store this graph does not hold.
+pub(in super::super) fn visit_usage(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let held = usage.resident().or(usage.cold().map(|cold| cold.loaded()));
+    for (root, family) in held.into_iter().flatten() {
+        if roots.map_or(true, |roots| roots.contains(root)) {
+            f(root.as_str(), family);
         }
-        let cold = index
-            .claude_usage_family_pending
-            .cold_mut()
-            .ok_or(Hold::DbUnavailable)?;
-        for (root, value, digest) in read {
-            cold.install(root, value, digest)?;
-        }
-        if wanted.is_none() {
-            cold.complete()?;
-        }
+    }
+    read_unloaded(index, roots, false, &mut |root, value, _| f(&root, &value))
+}
+
+/// The cold families `roots` names (`None`: every head) that this graph has
+/// not loaded, one stored row at a time, each matching its head; every one
+/// must be read. `None` reads the whole kind, complete by its manifest count,
+/// and with `whole` reads it even when nothing is unloaded. Unknown, counted:
+/// a row unlike its head, a head without a row, or a store this graph does
+/// not hold.
+fn read_unloaded(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    whole: bool,
+    f: &mut dyn FnMut(String, super::super::ClaudeUsageFamilyPending, [u8; 32]),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        return Ok(());
+    };
+    let unread = match roots {
+        Some(roots) => usage.unloaded(roots.iter().map(String::as_str)),
+        None => usage.unloaded(cold.head_roots().map(String::as_str)),
+    };
+    if unread.is_empty() && !whole {
+        return Ok(());
+    }
+    let mut seen = 0_usize;
+    let read = read_cold(
+        index,
+        "usage.pending",
+        roots.map(|_| &unread),
+        &mut |root, value: super::super::ClaudeUsageFamilyPending, digest| {
+            if !unread.contains(&root) {
+                return Ok(()); // loaded already, or removed by this graph
+            }
+            cold.admits(&root, digest)?;
+            seen += 1;
+            f(root, value, digest);
+            Ok(())
+        },
+    );
+    let result = read.and_then(|()| {
+        ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
         Ok(())
-    })();
+    });
     if result.is_err() {
         telemetry::count("usage_pending_unknown", 1);
     }

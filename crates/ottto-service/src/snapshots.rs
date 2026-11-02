@@ -6357,6 +6357,7 @@ fn claude_fence_closed_retry_carry(
         &mut Default::default(),
         claude_contract_debt_scope(index),
     )
+    .expect("usage_pending_unknown")
 }
 
 fn claude_fence_closed_retry_carry_observed(
@@ -6367,15 +6368,15 @@ fn claude_fence_closed_retry_carry_observed(
     scoped_retry_allowed: bool,
     diagnostics: &mut StaleCarryRejectionCounts,
     debt_scope: Option<&BTreeSet<String>>,
-) -> ClaudeStaleFamilyCarry {
+) -> Result<ClaudeStaleFamilyCarry, usage_pending::Unknown> {
     if !index.persistence_available() {
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
 
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
         diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
     let needs_independent_acceptance =
         prior_unsettled_upload || claude_stale_rearm_can_reopen_fence(index, stale);
@@ -6387,7 +6388,7 @@ fn claude_fence_closed_retry_carry_observed(
             StaleCarryRejectionCounts::start_gate(index, same_context_retry),
             stale.len(),
         );
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
     let legacy_witness_count = index
         .claude_usage_family_witnesses
@@ -6404,14 +6405,8 @@ fn claude_fence_closed_retry_carry_observed(
         eprintln!(
             "local snapshot census kept every stale Claude family re-arm: the carry check was not admitted under its scratch budget"
         );
-        return ClaudeStaleFamilyCarry::default();
+        return Ok(ClaudeStaleFamilyCarry::default());
     }
-    // The carry joins every family's requests. Cold families are loaded at
-    // traversal start; without them nothing is carried (every family re-arms).
-    let Ok(all_pending) = index.claude_usage_family_pending.all() else {
-        diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
-        return ClaudeStaleFamilyCarry::default();
-    };
     let mut blocked = BTreeMap::<&str, (bool, bool)>::new();
     for (index_key, entry) in &index.files {
         let Some(member_ref) = claude_index_path_member_ref(Path::new(index_key)) else {
@@ -6464,14 +6459,16 @@ fn claude_fence_closed_retry_carry_observed(
             .values()
             .filter(|witness| !claude_usage_family_witness_legacy_free(witness)),
     );
-    let mut carried = complete_claude_usage_family_members_where(index, |root_session_id| {
+    // The carry joins every family's requests. Two streamed passes read one
+    // family at a time from one store state: the stale families' own checks,
+    // then every family's requests against the carried owners. An
+    // unreadable or changed row carries nothing: the start defers, counted.
+    let candidates = complete_claude_usage_family_members_where(index, |root_session_id| {
         stale.contains(root_session_id)
-    })
-    .into_iter()
-    .filter(|(root_session_id, members)| {
-        let Some(pending) = all_pending.get(root_session_id) else {
-            return false;
-        };
+    });
+    let qualifies = |root_session_id: &String,
+                     members: &BTreeSet<String>,
+                     pending: &ClaudeUsageFamilyPending| {
         if index
             .claude_usage_authority_quarantine
             .contains_key(root_session_id)
@@ -6531,44 +6528,64 @@ fn claude_fence_closed_retry_carry_observed(
                         })
             })
             && claude_stale_pending_matches_witness(pending, witness, members)
+    };
+    // Pass 1: the carried roots, and the owner of each carried request.
+    let mut carried = BTreeSet::new();
+    let mut request_owners = Vec::<([u8; 32], &str)>::new();
+    let roots = candidates.keys().cloned().collect::<BTreeSet<_>>();
+    state_v2::visit_usage(index, Some(&roots), &mut |root, pending| {
+        let Some((root_session_id, members)) = candidates.get_key_value(root) else {
+            return;
+        };
+        if qualifies(root_session_id, members, pending) {
+            carried.insert(root_session_id.clone());
+            request_owners.extend(pending.member_request_id_hashes.values().flatten().map(
+                |request_hash| {
+                    (
+                        lenient_decode::repair_key(request_hash),
+                        root_session_id.as_str(),
+                    )
+                },
+            ));
+        }
     })
-    .map(|(root_session_id, _)| root_session_id)
-    .collect::<BTreeSet<_>>();
+    .map_err(|_| usage_pending::Unknown)?;
+    drop(roots);
     // Owners whose pending requests appear in another family's pending: a
     // legacy fork or takeover successor can derive its copied-prefix
     // exclusion only while the owner's root sequence is in the same window,
-    // so such an owner keeps the re-arm and is read alongside it.
-    let request_owners = carried
-        .iter()
-        .flat_map(|root_session_id| {
-            all_pending[root_session_id]
+    // so such an owner keeps the re-arm and is read alongside it. A request
+    // in two carried roots is owned by the later root in root order.
+    request_owners.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)));
+    request_owners.dedup_by_key(|(key, _)| *key);
+    // Pass 2: every family's requests against those owners.
+    let mut shared_owners = BTreeSet::new();
+    if !request_owners.is_empty() {
+        state_v2::visit_usage(index, None, &mut |root_session_id, pending| {
+            for request_hash in pending
                 .member_request_id_hashes
                 .values()
                 .flatten()
-                .map(move |request_hash| (request_hash.as_str(), root_session_id.as_str()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut shared_owners = BTreeSet::new();
-    for (root_session_id, pending) in all_pending {
-        for request_hash in pending
-            .member_request_id_hashes
-            .values()
-            .flatten()
-            .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
-        {
-            if let Some(owner) = request_owners.get(request_hash.as_str()) {
-                if *owner != root_session_id.as_str() {
-                    shared_owners.insert(owner.to_string());
+                .chain(pending.member_occurrences.values().flat_map(BTreeMap::keys))
+            {
+                let key = lenient_decode::repair_key(request_hash);
+                if let Ok(at) = request_owners.binary_search_by(|(owned, _)| owned.cmp(&key)) {
+                    let owner = request_owners[at].1;
+                    if owner != root_session_id {
+                        shared_owners.insert(owner);
+                    }
                 }
             }
-        }
+        })
+        .map_err(|_| usage_pending::Unknown)?;
     }
+    drop(request_owners);
     carried.retain(|root_session_id| {
         (accepted_admitted
             && blocked
                 .get(root_session_id.as_str())
                 .is_some_and(|(_, refused)| !refused))
-            || !shared_owners.contains(root_session_id)
+            || !shared_owners.contains(root_session_id.as_str())
     });
     diagnostics.reject(
         if index.claude_request_identity_contract_changed {
@@ -6582,12 +6599,12 @@ fn claude_fence_closed_retry_carry_observed(
     let replay = fund_claude_family_carry_cancellations(index, &mut carried, |_, stage| {
         diagnostics.reject(stage, 1)
     });
-    ClaudeStaleFamilyCarry {
+    Ok(ClaudeStaleFamilyCarry {
         origin: None, // The traversal start binds the retained carry.
         roots: carried,
         capped_roots: BTreeSet::new(),
         replay,
-    }
+    })
 }
 
 /// Fix 2 at a traversal start: a start right after a full re-arm terminal
@@ -27236,6 +27253,25 @@ impl OwnedSourceScan {
             } else {
                 file_limit
             };
+        // A due quarantine retry of an unchanged file is neither fresh nor a
+        // census member, so no dedicated turn below selects it and it would
+        // wait for an ordinary page. It rides the next selecting page first.
+        // Order only: its flags, budgets and retry backoff are unchanged.
+        if selection_limit > 0 && !index.terminal_contract_retries.is_empty() {
+            let due_retries = index
+                .terminal_contract_retries
+                .values()
+                .map(Path::new)
+                .collect::<BTreeSet<_>>();
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && due_retries.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
@@ -27299,8 +27335,9 @@ impl OwnedSourceScan {
                 }
             }
         }
-        // Dedicated turns select only their own work: new hinted members,
-        // audits or old groups cannot consume the other turn's allowance.
+        // Dedicated turns select only their own work, plus any retry riders:
+        // new hinted members, audits or old groups cannot consume the other
+        // turn's allowance.
         let selection_limit = if freshness_page || census_page {
             pending_paths.len()
         } else {
@@ -27428,6 +27465,7 @@ impl OwnedSourceScan {
             // hint for a path this generation already processed), so each
             // page completes a first read and re-reads cannot starve one.
             // Audits keep their place; the order is otherwise unchanged.
+            // Queued retry leases ride ahead of this order.
             let (members, rereads): (Vec<_>, Vec<_>) = pending_paths
                 .split_off(audited)
                 .into_iter()
@@ -32635,6 +32673,7 @@ impl OwnedSourceScan {
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
+                    oversized_discovery::alarm(source, &traversal.oversized_discovery);
                 }
                 let traversal_snapshot = index
                     .traversal
@@ -45436,6 +45475,23 @@ enum TraversalProgress {
     Resumed,
 }
 
+/// A traversal start whose stored usage pending could not be read whole
+/// defers its stale retry, as when it could not fund the carry: the start's
+/// markers return and no fingerprint is cleared. Counted by the read.
+fn claude_stale_retry_usage_unknown(
+    index: &mut ScanIndex,
+    prior_unsettled_upload: bool,
+    prior_unsettled_causes: u16,
+    prior_held_family_roots: Option<BTreeSet<String>>,
+) -> TraversalProgress {
+    index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
+    index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
+    index.claude_full_rearm_progress.held_family_roots = prior_held_family_roots;
+    eprintln!("local snapshot census deferred a stale Claude retry: stored usage pending is unknown; no fingerprints cleared");
+    state_v2::settle_usage(index, &BTreeSet::new());
+    TraversalProgress::Resumed
+}
+
 fn ensure_bounded_traversal(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -45709,15 +45765,8 @@ fn ensure_bounded_traversal(
         // witnessed, accepted families and compacts their pending to member
         // keys: it credits no evidence, keeps that census invalid so the fence
         // stays closed, and the next complete census retires it.
-        // Cold usage pending: the carry joins every family's requests, so
-        // every family is loaded first. Unknown defers this retry, counted.
-        if state_v2::load_usage(index, None).is_err() {
-            index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
-            index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
-            index.claude_full_rearm_progress.held_family_roots = prior_held_family_roots;
-            eprintln!("local snapshot census deferred a stale Claude retry: stored usage pending is unknown; no fingerprints cleared");
-            return TraversalProgress::Resumed;
-        }
+        // Cold usage pending: the carry streams the families it joins.
+        // Unknown defers this retry, counted.
         let stale_pending_roots = index
             .claude_usage_family_pending
             .views()
@@ -45815,7 +45864,7 @@ fn ensure_bounded_traversal(
                     debt_scope,
                 )
             };
-            match whole {
+            Ok(match whole {
                 Ok(carry) => carry,
                 Err(refusal) if owed_route => {
                     // No new batch admission: every stale root returns to the
@@ -45864,13 +45913,13 @@ fn ensure_bounded_traversal(
                         return TraversalProgress::Resumed;
                     }
                 }
-            }
+            })
         } else if !window_scratch_admitted {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::WindowScratch,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else if scoped_retry_allowed || full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry_observed(
                 index,
@@ -45886,7 +45935,7 @@ fn ensure_bounded_traversal(
                 StaleCarryRejection::ProvenanceOrContext,
                 stale_pending_roots.len(),
             );
-            ClaudeStaleFamilyCarry::default()
+            Ok(ClaudeStaleFamilyCarry::default())
         } else {
             stale_carry_rejection_counts.reject(
                 StaleCarryRejection::ProvenanceOrContext,
@@ -45903,6 +45952,14 @@ fn ensure_bounded_traversal(
                 &mut stale_carry_rejection_counts,
                 debt_scope,
             )
+        };
+        let Ok(carry) = carry else {
+            return claude_stale_retry_usage_unknown(
+                index,
+                prior_unsettled_upload,
+                prior_unsettled_causes,
+                prior_held_family_roots,
+            );
         };
         let ClaudeStaleFamilyCarry {
             roots: mut carried_roots,
@@ -45941,11 +45998,21 @@ fn ensure_bounded_traversal(
             capped_roots.retain(|root| retained_roots.contains(root));
             replay
         };
-        for root_session_id in carried_roots.iter().chain(&capped_roots) {
+        // Cold: the carried and capped families load before they compact.
+        let compacted = carried_roots.union(&capped_roots).cloned().collect();
+        if state_v2::load_usage(index, Some(&compacted)).is_err() {
+            return claude_stale_retry_usage_unknown(
+                index,
+                prior_unsettled_upload,
+                prior_unsettled_causes,
+                prior_held_family_roots,
+            );
+        }
+        for root_session_id in &compacted {
             if let Some(pending) = index
                 .claude_usage_family_pending
-                .loaded_all_mut()
-                .get_mut(root_session_id)
+                .family_mut(root_session_id)
+                .expect("usage_pending_loaded_before_join")
             {
                 pending.member_occurrences.clear();
                 pending
@@ -45954,6 +46021,7 @@ fn ensure_bounded_traversal(
                     .for_each(BTreeSet::clear);
             }
         }
+        drop(compacted);
         let window_root_digests = full_rearm_window_roots
             .iter()
             .map(|root| claude_full_rearm_root_digest(root))
@@ -46628,6 +46696,7 @@ fn refresh_retained_codex_roster(
                     source,
                     &scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -47259,6 +47328,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     source,
                     &directory.scan_root,
                     &path,
+                    metadata.len(),
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
@@ -47497,6 +47567,7 @@ fn candidate_from_traversal_path_at(
                 source,
                 &pending.scan_root,
                 &pending.path,
+                metadata.len(),
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &pending.path);
@@ -47851,7 +47922,13 @@ fn collect_recent_jsonl_files(
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
             census.oversized_file_count += 1;
-            oversized_discovery::record(source, scan_root, &path, &mut census.oversized_discovery);
+            oversized_discovery::record(
+                source,
+                scan_root,
+                &path,
+                metadata.len(),
+                &mut census.oversized_discovery,
+            );
             continue;
         }
         selection.insert(CandidateFile {
@@ -48289,6 +48366,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
                 source,
                 &candidate.scan_root,
                 &candidate.path,
+                candidate.size_bytes,
                 &mut census.oversized_discovery,
             );
             retention.note_withheld_oversized(source, &candidate.path);
@@ -52490,7 +52568,8 @@ impl ScanIndex {
             ));
         }
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
-        let (v2_index, sample_v1) = state_v2::load_locked(path, support_dir, _lock.custody)?;
+        let (v2_index, try_import) =
+            state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
         if let Some(mut index) = v2_index {
             let file = File::open(path)?;
             let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
@@ -52501,7 +52580,6 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded(opened)));
         }
-        let v1_gauge = state_v2::telemetry::Stage::v1(path, sample_v1);
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         let opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
@@ -52560,10 +52638,7 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
-                if let Some(gauge) = v1_gauge {
-                    gauge.finish();
-                }
-                if sample_v1 {
+                if try_import {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
                 Ok((index, LoadOrigin::Loaded(opened)))
@@ -53887,7 +53962,7 @@ impl ScanIndex {
     }
 
     /// The caller already owns the scanned graph. Restore only held keys in
-    /// that allocation; the unchanged borrowed implementation remains a test-only oracle.
+    /// that allocation.
     pub(crate) fn into_locally_held_keys_reverted(
         mut self,
         previous: &ScanIndex,

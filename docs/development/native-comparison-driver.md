@@ -399,23 +399,23 @@ revocations remain unwired; this component does not establish their acceptance.
 
 ## Shared allowance for future retained certificates
 
-The rotation now has optional owner hooks for graphs retained outside every
-moving or parked frame. Owners without a carry graph report zero. Rotation
-deducts queue capacity, parked frames and external retention from its existing
-single allowance before parking; it also checks retention after finish and on
-entry to the next cycle. A graph moved into a frame must be charged by the
-frame alone. Moving it back to process retention does not create another
-allowance, and a finish must account for siblings already parked.
+The rotation has optional owner hooks for graphs retained outside the active
+frame. Owners without a carry graph report zero. Rotation deducts queue
+capacity and external retention from its single allowance before each prepare,
+step and finish; it also checks retention after finish and on entry to the
+next cycle. Sources run serially, one frame at a time. A graph moved into the
+frame is not charged as retention, and moving it back to process retention
+does not create another allowance.
 
 An unknown or refused charge invokes whole-window and permit discard, including
 revocation tombstones. Rotation rechecks once; persistent unknown continues the
 same frame serially, without restarting a source. Queue charge overflow or an
-insufficient total allowance refuses optional retention/parking. No budget,
+insufficient total allowance refuses optional retention. No budget,
 compiler allowlist, requested-layout estimator or mutable shared-graph sizing
 rule is changed. Concrete owners must use the existing measurement gate.
 
 Five synthetic tests of the actual rotation exercise budget equality/overflow,
-already parked siblings, a single moved allocation through frame/finish/next
+finish carry over the allowance, a single moved allocation through frame/finish/next
 cycle, refused/unknown accounting without loops, and failed-finish cleanup.
 Their declared costs test arithmetic and ownership transfer, not compiler
 layout or RSS. They require hosted CI. The concrete lifecycle certificate graph

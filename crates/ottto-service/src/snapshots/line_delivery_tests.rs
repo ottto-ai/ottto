@@ -3707,9 +3707,6 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
             self.rows.push(page_counts(&counts));
             Step::Complete(())
         }
-        fn bound(&self, _: &(), _: usize) -> Option<usize> {
-            Some(0)
-        }
         fn finish(&mut self, _: (), _: Option<usize>) -> Result<()> {
             Ok(())
         }

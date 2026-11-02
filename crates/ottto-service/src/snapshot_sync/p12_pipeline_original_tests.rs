@@ -162,7 +162,6 @@ struct RearmFixture {
     // Synthetic watcher events supplied through the actual scan constructor.
     hinted_paths: Vec<PathBuf>,
     native_file_limit: usize,
-    serial_active_frame: bool,
     owned_base_preparation: bool,
     /// Sessions every page holds locally after the fold, through the
     /// production E2 hold (`hold_request_owned`): unbound, so
@@ -191,7 +190,6 @@ impl RearmFixture {
             request_identity: false,
             hinted_paths: Vec::new(),
             native_file_limit: REARM_PAGE_FILES,
-            serial_active_frame: false,
             owned_base_preparation: false,
             local_holds: BTreeSet::new(),
             body_trace: Default::default(),
@@ -340,12 +338,7 @@ impl RearmFixture {
         index: ScanIndex,
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        let frame = self.native_preparation(index, collected_at);
-        if self.serial_active_frame {
-            collect_unparkable_preparation_with_rotation(frame)
-        } else {
-            collect_native_preparation_with_rotation(frame)
-        }
+        collect_native_preparation_with_rotation(self.native_preparation(index, collected_at))
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
@@ -1184,7 +1177,6 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         request_identity: source.request_identity,
         hinted_paths: source.hinted_paths.clone(),
         native_file_limit: source.native_file_limit,
-        serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
         local_holds: source.local_holds.clone(),
         body_trace: Default::default(),
