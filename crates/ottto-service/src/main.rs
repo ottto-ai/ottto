@@ -704,6 +704,16 @@ fn run_startup_step(step: StartupStep) {
 /// Everything `serve` and `serve-xpc` do before their first relay or
 /// listener. `serve --once` skips the local state sweep.
 fn prepare_to_serve(sweep_local_state: bool) {
+    // Report only presence and a numeric value, never arbitrary environment text.
+    eprintln!(
+        "ottto-service: local_resources {}",
+        serde_json::json!({
+            "stage": "startup",
+            "malloc_large_cache_set": std::env::var_os("MallocLargeCache").is_some(),
+            "malloc_large_cache": std::env::var("MallocLargeCache")
+                .ok().and_then(|value| value.parse::<u64>().ok()),
+        })
+    );
     for step in startup_steps(sweep_local_state) {
         run_startup_step(step);
     }
