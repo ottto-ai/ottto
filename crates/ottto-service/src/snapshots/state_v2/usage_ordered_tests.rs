@@ -85,12 +85,11 @@ fn visit(
 /// The cross-family facts a terminal joins from visitor outputs: each
 /// request owned by more than one root, and each (prefix root, longer root)
 /// pair whose root member's ordered occurrences are a strict prefix.
-fn joins(
-    seen: &Seen,
-) -> (
+type Joins = (
     BTreeMap<String, BTreeSet<String>>,
     BTreeSet<(String, String)>,
-) {
+);
+fn joins(seen: &Seen) -> Joins {
     let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
     let mut sequences = BTreeMap::<String, Vec<String>>::new();
     for (root, family) in seen {
