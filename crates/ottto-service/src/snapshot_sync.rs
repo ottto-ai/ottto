@@ -11622,6 +11622,14 @@ where
             adaptive_attempts += 1;
         }
         let attempt_started = Instant::now();
+        // The same exact witnesses, looked up instead of re-hashed: the input
+        // map above refused any fingerprint with two bodies.
+        let known_body_witness = |item: &T| {
+            current_body_witnesses
+                .get(fingerprint(item))
+                .cloned()
+                .unwrap_or_else(|| body_witness(item))
+        };
         let attempt = attempt_snapshot_page(
             items,
             &indices,
@@ -11629,7 +11637,7 @@ where
             progress,
             accepted,
             &fingerprint,
-            &body_witness,
+            &known_body_witness,
             &session_id,
             &mut upload,
             &mut persist,

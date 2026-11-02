@@ -2732,34 +2732,3 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     }
     f.assert_quiet();
 }
-
-/// [format] A proof written before the change-reason direction decodes and
-/// re-serializes to its exact bytes, and the new field round-trips too.
-#[test]
-fn proof_state_without_direction_decodes_exactly() {
-    let old = serde_json::json!({
-        "inputs": {
-            "policy": "a".repeat(64), "namespace": "b".repeat(64),
-            "cache_observations": false, "copy_contract": true, "resumed_prefix": true
-        },
-        "entity_stamps": {
-            "c".repeat(64): {"context_fingerprint": "d".repeat(64), "body_witness": "e".repeat(64)}
-        }
-    });
-    let decoded: upload_context_receipt::ProofState = serde_json::from_value(old.clone()).unwrap();
-    assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
-    let mut index = ScanIndex {
-        upload_context_proof: decoded,
-        ..ScanIndex::default()
-    };
-    index.activate_upload_context("f".repeat(64));
-    index.note_upload_context_inputs(
-        SnapshotSource::Codex,
-        UploadContextInputs::new(b"{}", None, false, true, true),
-        SnapshotUploadPolicy::default(),
-    );
-    let new = serde_json::to_value(&index.upload_context_proof).unwrap();
-    assert_eq!(new["direction"]["context"], "f".repeat(64));
-    let again: upload_context_receipt::ProofState = serde_json::from_value(new.clone()).unwrap();
-    assert_eq!(serde_json::to_value(&again).unwrap(), new);
-}

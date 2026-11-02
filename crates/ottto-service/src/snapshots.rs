@@ -33840,6 +33840,7 @@ impl OwnedSourceScan {
                 index.mark_bounded_sweep_unsettled();
                 pending!();
             }
+            let mut source_change = None;
             let (mut decision, mut parse_reason) =
                 match claude_index_path_family_member(&candidate.path).filter(
                     |(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id),
@@ -33870,6 +33871,7 @@ impl OwnedSourceScan {
                         audit_now,
                         census_unix_seconds,
                         backfill_window_days,
+                        &mut source_change,
                     ),
                 };
             if source == SnapshotSource::ClaudeCode {
@@ -35688,7 +35690,7 @@ impl OwnedSourceScan {
                 pending!();
             }
             if side_origin.is_none() {
-                index.note_change_reason_selected(source, &candidate, parse_reason);
+                index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
@@ -55377,6 +55379,7 @@ impl ScanIndex {
         audit_now: u64,
         census_now: Option<u64>,
         window: u64,
+        source_change: &mut Option<change_reason::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let growth_only = census_now
             .is_some_and(|now| !is_recent_enough_at(candidate.modified_unix_seconds, now, window))
@@ -55385,7 +55388,14 @@ impl ScanIndex {
                 .files
                 .get(&local_index_key(&candidate.path))
                 .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
-        self.candidate_decision_with_reason_gated(candidate, audit_now, true, true, growth_only)
+        self.candidate_decision_refined(
+            candidate,
+            audit_now,
+            true,
+            true,
+            growth_only,
+            source_change,
+        )
     }
 
     #[cfg(test)]
@@ -55483,6 +55493,27 @@ impl ScanIndex {
         upload_context_adoption: bool,
         growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        self.candidate_decision_refined(
+            candidate,
+            now,
+            body_witness_adoption,
+            upload_context_adoption,
+            growth_only,
+            &mut None,
+        )
+    }
+
+    /// The gated decision; `source_change` names the `SourceChanged` arm that
+    /// selected the file, for the change-reason counts only.
+    fn candidate_decision_refined(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+        body_witness_adoption: bool,
+        upload_context_adoption: bool,
+        growth_only: bool,
+        source_change: &mut Option<change_reason::SourceChange>,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
             return (CandidateDecision::Skip, None);
@@ -55551,6 +55582,7 @@ impl ScanIndex {
             .claude_copy_removals
             .pending(claude_money_birth_store::location_key(&key))
         {
+            *source_change = Some(change_reason::SourceChange::CopyRemoval);
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::SourceChanged),
@@ -55729,6 +55761,7 @@ impl ScanIndex {
             let reason = if entry.source_file_fingerprint.is_empty() {
                 CandidateParseReason::Rearmed
             } else {
+                *source_change = Some(change_reason::SourceChange::Fingerprint);
                 CandidateParseReason::SourceChanged
             };
             (CandidateDecision::Parse, Some(reason))

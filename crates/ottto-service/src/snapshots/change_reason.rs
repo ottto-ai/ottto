@@ -4,6 +4,14 @@
 use super::*;
 use crate::local_resource_diagnostics::change_reason::{self as counts, Token};
 
+/// The selector arm behind a `SourceChanged` read (an account memo-miss
+/// carries none).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SourceChange {
+    CopyRemoval,
+    Fingerprint,
+}
+
 impl ScanIndex {
     /// Tag a file the scan is about to read with its first cause.
     pub(super) fn note_change_reason_selected(
@@ -11,10 +19,10 @@ impl ScanIndex {
         source: SnapshotSource,
         candidate: &CandidateFile,
         reason: Option<CandidateParseReason>,
+        source_change: Option<SourceChange>,
     ) {
         let key = local_index_key(&candidate.path);
-        let (token, sidecar) =
-            self.change_reason(source, &key, &candidate.source_file_fingerprint, reason);
+        let (token, sidecar) = self.change_reason(source, &key, reason, source_change);
         counts::selected(source.api_slug(), key, token, sidecar);
     }
 
@@ -25,8 +33,8 @@ impl ScanIndex {
         &self,
         source: SnapshotSource,
         key: &str,
-        source_file_fingerprint: &str,
         reason: Option<CandidateParseReason>,
+        source_change: Option<SourceChange>,
     ) -> (Token, bool) {
         use CandidateParseReason as R;
         let receipt_context = || {
@@ -49,19 +57,12 @@ impl ScanIndex {
             {
                 Token::PrivacyOffErase
             }
-            Some(R::SourceChanged)
-                if self
-                    .claude_copy_removals
-                    .pending(claude_money_birth_store::location_key(key)) =>
-            {
-                Token::CopyOwnership
-            }
-            Some(R::SourceChanged)
-                if self.files.get(key).is_some_and(|entry| {
-                    entry.source_file_fingerprint != source_file_fingerprint
-                }) =>
-            {
-                return (Token::AdminOther, true);
+            Some(R::SourceChanged) => {
+                return match source_change {
+                    Some(SourceChange::CopyRemoval) => (Token::CopyOwnership, false),
+                    Some(SourceChange::Fingerprint) => (Token::AdminOther, true),
+                    None => (Token::AdminOther, false),
+                };
             }
             _ => Token::AdminOther,
         };
@@ -112,7 +113,7 @@ mod tests {
         let reset = ReadMode::Full(FullReason::SameSizeEdit);
         type Setup = fn(&mut ScanIndex);
         let none: Setup = |_| {};
-        let cases: [(R, Setup, ReadMode, &str); 11] = [
+        let cases: [(R, Setup, ReadMode, &str); 10] = [
             (R::TranscriptChanged, none, tail, "append"),
             (R::TranscriptChanged, none, reset, "source_reset"),
             (R::TerminalDisposition, none, tail, "parser_revision"),
@@ -182,27 +183,27 @@ mod tests {
                 "privacy_off_erase",
             ),
             (R::UploadContext, none, tail, "admin_other"),
-            (
-                R::SourceChanged,
-                |index| {
-                    index
-                        .files
-                        .get_mut("/synthetic/one.jsonl")
-                        .unwrap()
-                        .source_file_fingerprint = "moved".into();
-                },
-                tail,
-                "admin_other",
-            ),
         ];
-        for (reason, setup, mode, expected) in cases {
+        let changes = [
+            (SourceChange::CopyRemoval, "copy_ownership"),
+            (SourceChange::Fingerprint, "admin_other"),
+        ];
+        let cases =
+            cases
+                .into_iter()
+                .map(|(reason, setup, mode, expected)| (reason, None, setup, mode, expected))
+                .chain(changes.map(|(change, expected)| {
+                    (R::SourceChanged, Some(change), none, tail, expected)
+                }));
+        for (reason, change, setup, mode, expected) in cases {
             let mut index = ScanIndex::default();
             index.files.insert(key.into(), ScanIndexEntry::default());
             index
                 .file_snapshot_fingerprints
                 .insert(key.into(), BTreeSet::from([entity.clone()]));
             setup(&mut index);
-            let (token, _) = index.change_reason(SnapshotSource::ClaudeCode, key, "", Some(reason));
+            let (token, _) =
+                index.change_reason(SnapshotSource::ClaudeCode, key, Some(reason), change);
             counts::selected("claude_code", key.into(), token, false);
             counts::read("claude_code", key, mode, 10, 2);
             counts::propagate("claude_code", &index);
@@ -215,5 +216,38 @@ mod tests {
             assert_eq!(page["read"][expected].as_object().unwrap().len(), 1);
             counts::index_loaded("claude_code", false, None);
         }
+    }
+
+    /// [format] A proof written before the change-reason direction decodes and
+    /// re-serializes to its exact bytes, and the new field round-trips too.
+    #[test]
+    fn proof_state_without_direction_decodes_exactly() {
+        let old = serde_json::json!({
+            "inputs": {
+                "policy": "a".repeat(64), "namespace": "b".repeat(64),
+                "cache_observations": false, "copy_contract": true, "resumed_prefix": true
+            },
+            "entity_stamps": {
+                "c".repeat(64): {"context_fingerprint": "d".repeat(64), "body_witness": "e".repeat(64)}
+            }
+        });
+        let decoded: upload_context_receipt::ProofState =
+            serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+        let mut index = ScanIndex {
+            upload_context_proof: decoded,
+            ..ScanIndex::default()
+        };
+        index.activate_upload_context("f".repeat(64));
+        index.note_upload_context_inputs(
+            SnapshotSource::Codex,
+            UploadContextInputs::new(b"{}", None, false, true, true),
+            SnapshotUploadPolicy::default(),
+        );
+        let new = serde_json::to_value(&index.upload_context_proof).unwrap();
+        assert_eq!(new["direction"]["context"], "f".repeat(64));
+        let again: upload_context_receipt::ProofState =
+            serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), new);
     }
 }
