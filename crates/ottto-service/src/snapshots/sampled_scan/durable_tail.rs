@@ -546,18 +546,12 @@ struct FullPace {
 const HEAD_USED: u8 = 1;
 const FULL_SPENT: u8 = 2;
 const DEFERRED: u8 = 4;
-const NEAR_EXTRA: u8 = 8;
 const _: () = assert!(size_of::<FullPace>() <= 24);
 fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
     match durable_source(source) {
         Some(ds) => store::key_digest(ds, key),
         None => store::context_digest(source.api_slug(), Some(key)),
     }
-}
-
-fn near_source_cap(source: SnapshotSource, length: u64) -> bool {
-    let cap = max_jsonl_file_bytes(source);
-    length >= cap - cap / 10
 }
 
 impl Slot {
@@ -1713,10 +1707,9 @@ impl SharedCache {
         key: &str,
         now: std::time::SystemTime,
         active_bound: bool,
-        near_cap: bool,
         start: bool,
     ) -> bool {
-        self.paced_with_cause(source, key, now, (active_bound, near_cap, start), None)
+        self.paced_with_cause(source, key, now, (active_bound, start), None)
     }
 
     fn paced_with_cause(
@@ -1724,7 +1717,7 @@ impl SharedCache {
         source: SnapshotSource,
         key: &str,
         now: SystemTime,
-        (active_bound, near_cap, start): (bool, bool, bool),
+        (active_bound, start): (bool, bool),
         cause: Option<usize>,
     ) -> bool {
         let Some(mut stores) = self.durable() else {
@@ -1755,7 +1748,7 @@ impl SharedCache {
         }) {
             stores.counters.pace_anomaly += 1;
         }
-        let delayed = !near_cap && full_at.is_some_and(|at| full_pace_delayed(at, now));
+        let delayed = full_at.is_some_and(|at| full_pace_delayed(at, now));
         if !delayed && !start {
             return true;
         }
@@ -1797,13 +1790,10 @@ impl SharedCache {
                 });
                 stamp.at = now;
                 stamp.structural = structural;
-                stamp.flags = (stamp.flags | FULL_SPENT) & !NEAR_EXTRA;
+                stamp.flags |= FULL_SPENT;
             }
             if let Some(debt) = stores.key_debt.get_mut(&key) {
-                debt.full_spend = Some(owed::FullSpend {
-                    at: now,
-                    near_extra: false,
-                });
+                debt.full_spend = Some(owed::FullSpend { at: now });
             }
         }
         if let Some(stamp) = stores.retail_full_at.get_mut(&key).filter(|_| active_bound) {
@@ -1836,14 +1826,7 @@ impl SharedCache {
             };
             crate::local_resource_diagnostics::durable_tail_alarm(
                 source.api_slug(),
-                &serde_json::json!({(class): {"active_bound": [1, total]},
-                    "near_cap": u64::from(near_cap)}),
-            );
-        } else if near_cap {
-            // An annotation, not a second [delta,total] admission emission.
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({"near_cap": {"retail_exhausted": 1}}),
+                &serde_json::json!({(class): {"active_bound": [1, total]}}),
             );
         }
         !delayed
@@ -1876,17 +1859,10 @@ impl SharedCache {
         file: &File,
         start: bool,
     ) -> bool {
-        let Ok(metadata) = file.metadata() else {
+        if file.metadata().is_err() {
             return false;
-        };
-        self.paced_admission(
-            source,
-            key,
-            std::time::SystemTime::now(),
-            true,
-            near_source_cap(source, metadata.len()),
-            start,
-        )
+        }
+        self.paced_admission(source, key, std::time::SystemTime::now(), true, start)
     }
 
     /// Compatibility entry for resource leaves: the single b4/A0-h map owns
@@ -1918,18 +1894,9 @@ impl SharedCache {
         if metadata.len() <= accepted_end {
             return false;
         }
-        let allowed = self.paced_with_cause(
-            source,
-            key,
-            now,
-            (false, near_source_cap(source, metadata.len()), true),
-            cause,
-        );
+        let allowed = self.paced_with_cause(source, key, now, (false, true), cause);
         if let Some(mut stores) = self.durable() {
             if allowed {
-                if near_source_cap(source, metadata.len()) {
-                    stores.counters.near_cap += 1;
-                }
                 if cause == Some(4) {
                     stores.counters.upgrade_missing_full += 1;
                 } else if cause == Some(3) {
@@ -2685,13 +2652,7 @@ impl SharedCache {
         if !self
             .durable()
             .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
-            || !self.paced_with_cause(
-                source,
-                key,
-                SystemTime::now(),
-                (false, false, true),
-                Some(4),
-            )
+            || !self.paced_with_cause(source, key, SystemTime::now(), (false, true), Some(4))
         {
             return false;
         }
@@ -2744,31 +2705,17 @@ impl SharedCache {
             return cause != "repin"; // Quiet retired records consume no source input.
         }
         if cause == "repin" {
-            if metadata.len() > max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
-                || !page.reserve(key, metadata.len())
-            {
+            if !page.reserve(key, metadata.len()) {
                 return false;
             }
             return if start {
                 self.start_missing_full(source, key)
             } else {
-                self.paced_with_cause(
-                    source,
-                    key,
-                    SystemTime::now(),
-                    (false, false, false),
-                    Some(4),
-                )
+                self.paced_with_cause(source, key, SystemTime::now(), (false, false), Some(4))
             };
         }
         if !start {
-            return self.paced_with_cause(
-                source,
-                key,
-                SystemTime::now(),
-                (false, near_source_cap(source, metadata.len()), false),
-                Some(4),
-            );
+            return self.paced_with_cause(source, key, SystemTime::now(), (false, false), Some(4));
         }
         self.paced_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
     }
@@ -3178,15 +3125,8 @@ impl SharedCache {
                 )
             } else if source == SnapshotSource::Codex {
                 grown(held, index, key)
-                    && held.metadata().is_ok_and(|m| {
-                        self.paced_admission(
-                            source,
-                            key,
-                            SystemTime::now(),
-                            false,
-                            near_source_cap(source, m.len()),
-                            false,
-                        )
+                    && held.metadata().is_ok_and(|_| {
+                        self.paced_admission(source, key, SystemTime::now(), false, false)
                     })
             } else {
                 self.paced_growth_full(
@@ -3238,7 +3178,7 @@ impl SharedCache {
             // Restore itself read no input. The scanner already selected this
             // key for an ordinary reparse and checked its history-upgrade gate.
             // Spend the existing cross-cause pace only at native Full start.
-            self.paced_admission(source, key, SystemTime::now(), false, false, true)
+            self.paced_admission(source, key, SystemTime::now(), false, true)
         } else if phase.starts_with("rederive_") || phase == "decode" {
             self.rederive_full(source, key, file, accepted_end, true)
         } else {
@@ -3264,16 +3204,13 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
         key: &str,
-        held: &File,
+        _held: &File,
     ) -> RestoreOutcome {
-        let near_cap = held
-            .metadata()
-            .is_ok_and(|m| near_source_cap(source, m.len()));
         let granted = self.paced_with_cause(
             source,
             key,
             SystemTime::now(),
-            (false, near_cap, false),
+            (false, false),
             Some(STALE_SELECTION_CAUSE),
         );
         if !granted {
@@ -3297,16 +3234,13 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
         key: &str,
-        held: &File,
+        _held: &File,
     ) -> bool {
-        let near_cap = held
-            .metadata()
-            .is_ok_and(|m| near_source_cap(source, m.len()));
         let granted = self.paced_with_cause(
             source,
             key,
             SystemTime::now(),
-            (false, near_cap, true),
+            (false, true),
             Some(STALE_SELECTION_CAUSE),
         );
         if let Some(mut stores) = self.durable() {
@@ -3505,10 +3439,8 @@ impl SharedCache {
         }
         // Custody is funded independently of pace-node eviction. No synthetic
         // receipt debt: this bit cannot block settlement/upload of other keys.
-        let prior_full = (stamp.flags & FULL_SPENT != 0).then_some(owed::FullSpend {
-            at: stamp.at,
-            near_extra: stamp.flags & NEAR_EXTRA != 0,
-        });
+        let prior_full =
+            (stamp.flags & FULL_SPENT != 0).then_some(owed::FullSpend { at: stamp.at });
         let Some(debt) = stores.fund_debt(digest) else {
             stores.owed_overflow[ds.slot()] = true;
             return Err(Failure::Resource("rederive_custody"));
@@ -3539,8 +3471,7 @@ impl SharedCache {
         Ok(())
     }
 
-    /// Re-derive failures share the cross-cause Full stamp, with at most one
-    /// extra near-cap read per six-hour window (rotation can remove discovery).
+    /// Re-derive failures share the cross-cause Full stamp.
     fn rederive_full(
         &self,
         source: SnapshotSource,
@@ -3556,52 +3487,7 @@ impl SharedCache {
             return false;
         }
         let now = SystemTime::now();
-        if self.paced_admission(source, key, now, false, false, start) {
-            return true;
-        }
-        if !near_source_cap(source, meta.len()) {
-            return false;
-        }
-        let Some(mut stores) = self.durable() else {
-            return false;
-        };
-        let digest = full_pace_key(source, key);
-        let spent_extra = stores
-            .key_debt
-            .get(&digest)
-            .and_then(|d| d.full_spend)
-            .map(|spend| spend.near_extra)
-            .or_else(|| {
-                stores
-                    .retail_full_at
-                    .get(&digest)
-                    .map(|stamp| stamp.flags & NEAR_EXTRA != 0)
-            });
-        // Missing spend evidence grants no additional near-cap exception.
-        if spent_extra != Some(false) {
-            return false;
-        }
-        if start {
-            if let Some(spend) = stores
-                .key_debt
-                .get_mut(&digest)
-                .and_then(|d| d.full_spend.as_mut())
-            {
-                spend.near_extra = true;
-            }
-            if let Some(stamp) = stores.retail_full_at.get_mut(&digest) {
-                stamp.flags |= NEAR_EXTRA;
-            }
-            Counters::bump(
-                &mut stores.counters.resource_full,
-                "rederive_failure_full.near_cap",
-            );
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                source.api_slug(),
-                &serde_json::json!({"rederive_failure_full":{"near_cap":1}}),
-            );
-        }
-        true
+        self.paced_admission(source, key, now, false, start)
     }
 
     /// P2: reserves `bytes` of this pass's restored head budget before input.

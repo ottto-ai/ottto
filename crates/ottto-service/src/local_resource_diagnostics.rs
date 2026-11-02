@@ -560,9 +560,6 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
-    Size,
-    /// The subset of size skips whose key holds a withheld-account revision.
-    WithheldOversized,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
@@ -1249,6 +1246,7 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    first_read_bytes: Option<u64>,
 }
 impl StageWindow {
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
@@ -1257,7 +1255,20 @@ impl StageWindow {
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            first_read_bytes: None,
         }
+    }
+    pub(crate) fn first_read(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| {
+            let mut window = Self::begin(source.api_slug(), "first_read");
+            window.first_read_bytes = Some(bytes);
+            window
+        })
     }
 }
 impl Drop for StageWindow {
@@ -1265,16 +1276,47 @@ impl Drop for StageWindow {
         if std::thread::panicking() {
             return;
         }
+        let observation = self.probe.stage_observation(self.footprint.as_ref());
+        let counts = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
+            serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
+                "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
+        });
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
-            counts: EmptyCounts {},
+            observation,
+            counts,
         });
     }
 }
+/// Process high-water file sizes, without paths or read admission decisions.
+pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LARGEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let slot = match source {
+        crate::snapshots::SnapshotSource::ClaudeCode => 0,
+        crate::snapshots::SnapshotSource::Codex => 1,
+        crate::snapshots::SnapshotSource::Pi => 2,
+    };
+    let previous = LARGEST[slot].fetch_max(bytes, Ordering::Relaxed);
+    if bytes > previous {
+        traversal_point(
+            "file_size",
+            source.api_slug(),
+            &serde_json::json!({"largest_file_bytes": bytes, "file_over_1gib": bytes > 1024 * 1024 * 1024}),
+        );
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
+    }
+}
+
 /// Named window summed over repeated steps inside a source stage: one record
 /// with summed wall time and process CPU, and no footprint fields. Empty
 /// counts; unwinding emits nothing, like `StageWindow`.

@@ -841,9 +841,7 @@ impl super::ScanIndex {
         use super::*;
         let key = local_index_key(&candidate.path);
         let meta = std::fs::symlink_metadata(&candidate.path)?;
-        if self.archive_size_refused(&candidate.path, meta.len()) {
-            return Ok(HeaderRead::Deferred);
-        }
+
         let stamp = crate::transcript_acquisition::FileStamp::capture(meta.clone())?;
         if self.archives.get(&key).map_or(true, |a| {
             a.stamp
@@ -3522,74 +3520,26 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
-    /// [off=main] A cold oversized archive is archive-only debt; the plain
-    /// census and real source finish still complete, with a transition alarm.
+    /// [regress] Compressed byte length never refuses an archive before decoder admission.
     #[test]
-    #[serial_test::serial]
-    #[serial_test::serial(source_cadences, source_manifests, client_report)]
-    fn cold_oversized_archive_keeps_plain_finish_and_disclosed_custody() {
-        let _lock = DECODER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f =
+    fn archive_over_the_former_file_limit_reaches_opened_identity() {
+        let fixture =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let bytes = former_file_cap(SnapshotSource::Codex) + 1;
         File::options()
             .write(true)
-            .open(&f.0)
+            .open(&fixture.0)
             .unwrap()
-            .set_len(max_jsonl_file_bytes(SnapshotSource::Codex) + 1)
+            .set_len(bytes)
             .unwrap();
-        let plain = f.0.parent().unwrap().join("rollout-plain.jsonl");
-        fs::write(
-            &plain,
-            String::from_utf8(synthetic_rollout())
-                .unwrap()
-                .replace("compressed-fixture", "plain"),
-        )
-        .unwrap();
-        let mut candidate = f.candidate();
-        let error =
+        let mut candidate = fixture.candidate();
+        let (file, _) =
             open_candidate_file_stat_retained(SnapshotSource::Codex, &mut candidate, None, false)
-                .unwrap_err();
-        assert!(error.get_ref().unwrap().is::<ArchiveAdmissionYield>());
-        let scan = OwnedSourceScan::new(
-            SnapshotSource::Codex,
-            &[f.0.parent().unwrap().to_owned()],
-            ScanIndex::default(),
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            false,
-            None,
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(
-            Arc::new(sampled_scan::SharedCache::default()),
-            Scope("archive-size-test".into()),
-        );
-        let checkpoint = fixture(b"", ".json");
-        fs::remove_file(&checkpoint.0).unwrap();
-        let ((index, mut result), logs) =
-            crate::local_resource_diagnostics::capture(|| finish_selector(scan, &checkpoint.0));
-        assert!(result.census_complete);
-        assert_eq!(result.oversized_file_count, 0);
-        assert_eq!(result.unreadable_path_count, 0);
-        assert!(result.archive_owed_count > 0);
-        assert_eq!(result.snapshots.len(), 1);
-        assert_eq!(result.snapshots[0].input_tokens, 750);
-        assert!(logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
-        assert!(!logs
-            .iter()
-            .any(|l| l["stage"] == "codex_zst_input" || l["stage"] == "codex_zst_inventory"));
-        let accepted = crate::snapshot_sync::archive_upload_checkpoint(
-            index.clone(),
-            &result,
-            &index,
-            "accept",
-        );
-        result.snapshots.clear();
-        crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(accepted, result, 0);
+                .expect("archive size is not decoder admission");
+        assert_eq!(file.metadata().unwrap().len(), bytes);
+        assert_eq!(candidate.size_bytes, bytes);
+        // This exercises bounded metadata/identity admission only. Appended
+        // sparse padding is not a valid archive and is not sent to the decoder.
     }
 
     /// [format] Unopened header permission is cancelled, an opened attempt stays
