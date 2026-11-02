@@ -226,6 +226,18 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     assert!(progress
         .quarantined_fingerprints
         .contains_key(&item.snapshot_fingerprint));
+    // [money] The owed answer does not wait behind the 6-12 h quarantine
+    // timer: the real selection leases the held body for the next page.
+    assert!(
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint].retry_after_unix_seconds
+            <= current_unix_seconds()
+    );
+    let mut selecting = progress.clone();
+    selecting.prepare_quarantine_retries(&BTreeMap::new());
+    assert_eq!(
+        selecting.active_quarantine_retries,
+        BTreeSet::from([item.snapshot_fingerprint.clone()])
+    );
 
     // The owed challenge survives a restart through the persisted ledger.
     let root = crate::test_scratch::ScratchDir::new("head-conflict-restart");
@@ -442,19 +454,22 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     assert!(progress.head_conflict_challenges.is_empty());
 }
 
+/// [regress] A refused answer holds only its identical re-send, and for at
+/// most one hour. A new challenge, or a new revision of the session, gets the
+/// next answer attempt instead of inheriting the old refusal's hold.
 #[test]
 #[serial_test::serial(client_report)]
-fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
+fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     let item = item();
     let key = cache_session_key(&item.source_session_id);
-    let window = crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS;
+    let fingerprint = item.snapshot_fingerprint.clone();
+    let hour = 3_600;
     let mut progress = progress_with_stale_head(&item);
 
     let _ = cycle(&mut progress, &item, 1_000, |item| {
         conflict(item, &challenge(0xa))
     });
-    // The answer itself is refused (the head moved again).
-    let answered_at = current_unix_seconds();
+    // The answer is refused because the head moved again: a NEW challenge.
     let (result, wire) = cycle(&mut progress, &item, 1_001, |item| {
         conflict(item, &challenge(0xb))
     });
@@ -466,17 +481,55 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
     let record = progress.head_conflict_challenges[&key].clone();
     assert_eq!(record.challenge, challenge(0xb));
     assert_eq!(record.answer_attempts, 1);
-    assert!(record.last_answer_unix >= answered_at);
+    assert_eq!(
+        record.last_answer_unix, 0,
+        "a new challenge inherits no hold"
+    );
+    assert!(
+        progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds
+            <= current_unix_seconds()
+    );
 
-    // Inside the window every offer keeps today's stale-base behaviour, and
-    // an unanswered conflict neither counts an attempt nor resets the window.
-    for offset in [0, 1, window - 1] {
-        let (result, wire) = cycle(
-            &mut progress,
-            &item,
-            record.last_answer_unix + offset,
-            |item| conflict(item, &challenge(0xe)),
-        );
+    // So the next page answers it, and the server refuses the IDENTICAL answer.
+    let answered_at = current_unix_seconds();
+    let (result, wire) = cycle(&mut progress, &item, 1_002, |item| {
+        conflict(item, &challenge(0xb))
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
+    let record = progress.head_conflict_challenges[&key].clone();
+    assert_eq!(record.answer_attempts, 2);
+    assert!(record.last_answer_unix >= answered_at);
+    let due = conflict_probe_after(&fingerprint, record.last_answer_unix);
+    assert!((record.last_answer_unix + hour / 2..record.last_answer_unix + hour).contains(&due));
+    assert_eq!(
+        progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds, due,
+        "the held body is retried exactly when its answer is due"
+    );
+
+    // A new revision of the session carries the owed answer at once.
+    let mut changed = item.clone();
+    changed.avg_duration_ms = Some(changed.avg_duration_ms.unwrap_or_default() + 1);
+    changed.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &changed);
+    assert_ne!(changed.snapshot_fingerprint, fingerprint);
+    let mut revised = progress.clone();
+    let (result, wire) = cycle(&mut revised, &changed, record.last_answer_unix, |item| {
+        accepted(item, &"3".repeat(64))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
+    assert!(revised.head_conflict_challenges.is_empty());
+
+    // Inside the hold the identical body keeps today's stale-base behaviour,
+    // and an unanswered repeat neither counts an attempt nor moves the hold.
+    for at in [record.last_answer_unix, due - 1] {
+        let (result, wire) = cycle(&mut progress, &item, at, |item| {
+            conflict(item, &challenge(0xb))
+        });
         assert_eq!(
             result.unwrap(),
             ResumableUploadResult::Deferred { count: 1 }
@@ -484,27 +537,24 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
         assert_eq!(envelope(&wire)["base_head_etag"], stale_head());
         assert!(envelope(&wire).get("conflict_head_challenge").is_none());
         let current = &progress.head_conflict_challenges[&key];
-        assert_eq!(current.answer_attempts, 1);
+        assert_eq!(current.answer_attempts, 2);
         assert_eq!(current.last_answer_unix, record.last_answer_unix);
     }
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
 
-    // One answer per window, never terminal: the session stays retryable.
-    let (result, wire) = cycle(
-        &mut progress,
-        &item,
-        record.last_answer_unix + window,
-        |item| conflict(item, &challenge(0xf)),
-    );
+    // The identical answer repeats within the hour, never terminal.
+    let (result, wire) = cycle(&mut progress, &item, due, |item| {
+        conflict(item, &challenge(0xb))
+    });
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Deferred { count: 1 }
     );
-    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xe));
-    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 2);
+    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
+    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 3);
     assert!(progress.permanent_rejections.is_empty());
     assert_eq!(
-        progress.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
+        progress.quarantined_fingerprints[&fingerprint].disposition,
         SnapshotQuarantineDisposition::RetryPending
     );
 
@@ -547,7 +597,7 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
     let (result, _) = cycle(
         &mut progress,
         &item,
-        current_unix_seconds() + window,
+        current_unix_seconds() + hour,
         |item| conflict(item, &challenge(0xb)),
     );
     assert!(result.is_ok());
@@ -555,7 +605,7 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
         progress.head_conflict_challenges[&key].challenge,
         challenge(0xb)
     );
-    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 3);
+    assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 4);
 
     for permanent in [false, true] {
         let mut rejected_item = item.clone();
@@ -596,6 +646,92 @@ fn refused_answers_are_counted_and_paced_by_the_quarantine_window() {
             assert_eq!(rejected.head_conflict_challenges[&key].answer_attempts, 0);
         }
     }
+}
+
+/// [regress] A plain conflict (no challenge) is never input-change-only: the
+/// identical body is held but probed within one hour, because backend state
+/// can change without a local change. A changed body is offered at once.
+#[test]
+fn plain_conflict_is_probed_within_an_hour_and_a_changed_body_goes_at_once() {
+    let item = item();
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    );
+    // One page without the head-CAS contract: the server's conflict carries
+    // no challenge and the ordinary ACK validator applies.
+    fn page(
+        progress: &mut SnapshotUploadProgress,
+        item: &SnapshotItem,
+    ) -> (ResumableUploadResult, usize, u64) {
+        let mut sent = 0;
+        let mut accepted_count = 0;
+        let before = current_unix_seconds();
+        let result = upload_resumable_batches_with_body_witness(
+            std::slice::from_ref(item),
+            SCOPE,
+            progress,
+            &mut accepted_count,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                sent += batch.len();
+                let request = request(batch);
+                let mut response = empty_ack();
+                response
+                    .conflict_entities
+                    .push(reference(&request.snapshots[0]));
+                response.validate_entity_ack(&request)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        );
+        (result.unwrap(), sent, before)
+    }
+
+    let (result, sent, before) = page(&mut progress, &item);
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(sent, 1);
+    assert!(progress.head_conflict_challenges.is_empty());
+    let held = &progress.quarantined_fingerprints[&item.snapshot_fingerprint];
+    assert_eq!(
+        held.disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert_eq!(
+        held.failed_reconstruction_count, 1,
+        "no poison attempt spent"
+    );
+    let probe = held.retry_after_unix_seconds;
+    assert!(probe >= before + 30 * 60, "not re-sent every page");
+    assert!(
+        probe < current_unix_seconds() + 60 * 60,
+        "mandatory probe within one hour, not 6-12 h"
+    );
+    assert!(!progress
+        .clone()
+        .prepare_quarantine_retries(&BTreeMap::new()));
+
+    // Until the probe the identical body is not re-sent...
+    assert!(progress.contains_body(
+        &item.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&item)
+    ));
+    let (_, sent, _) = page(&mut progress, &item);
+    assert_eq!(sent, 0);
+    // ...but a changed input is a new body and goes out on this page.
+    let mut changed = item.clone();
+    changed.avg_duration_ms = Some(changed.avg_duration_ms.unwrap_or_default() + 1);
+    changed.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &changed);
+    assert_ne!(changed.snapshot_fingerprint, item.snapshot_fingerprint);
+    let (result, sent, _) = page(&mut progress, &changed);
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(sent, 1);
+    assert!(
+        progress.quarantined_fingerprints[&changed.snapshot_fingerprint].retry_after_unix_seconds
+            < current_unix_seconds() + 60 * 60
+    );
 }
 
 #[test]

@@ -1355,11 +1355,12 @@ fn identity_cache_wire_reserve(
     )
 }
 
-/// Answer each owed head-CAS challenge on the outgoing body of its session,
-/// at most once per quarantine retry window after a validated conflict
-/// refuses an answer. Only a body that sends the stale base under the head-CAS contract
-/// carries the answer; the body itself, its fingerprint and its witness are
-/// unchanged.
+/// Answer each owed head-CAS challenge on the outgoing body of its session.
+/// After a validated conflict refuses this exact challenge's answer, only a
+/// re-send of a held conflicted body waits, until that body's own conflict
+/// probe (within one hour); a new revision answers at once. Only a body that
+/// sends the stale base under the head-CAS contract carries the answer; the
+/// body itself, its fingerprint and its witness are unchanged.
 fn attach_head_conflict_answers(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
@@ -1379,11 +1380,11 @@ fn attach_head_conflict_answers(
         else {
             continue;
         };
-        if record.answer_attempts > 0
-            && now
-                < record
-                    .last_answer_unix
-                    .saturating_add(crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS)
+        if record.last_answer_unix != 0
+            && progress
+                .quarantined_fingerprints
+                .contains_key(&snapshot.snapshot_fingerprint)
+            && now < conflict_probe_after(&snapshot.snapshot_fingerprint, record.last_answer_unix)
         {
             continue;
         }
@@ -1514,8 +1515,9 @@ struct HeadConflictChallenge {
     /// so an unrecovered session keeps today's retryable conflict hold.
     #[serde(default)]
     answer_attempts: u32,
-    /// When the last refused answer was observed. The next answer waits one
-    /// quarantine retry window after it.
+    /// When an answer to THIS challenge and revision was last refused; 0 when
+    /// none was. A re-send of the same held body waits its conflict probe
+    /// after it; a new challenge or revision resets it.
     #[serde(default)]
     last_answer_unix: u64,
 }
@@ -2464,15 +2466,18 @@ impl SnapshotUploadProgress {
     }
 
     /// Keep the newest challenge for this session. A refused answer counts one
-    /// attempt and restarts the answer window; an unanswered conflict keeps
-    /// the existing count. Returns the attempt count for diagnostics.
+    /// attempt. The server binds a challenge to its current head and the exact
+    /// stale revision, so a changed pair is new work: it inherits no hold and
+    /// its answer is owed on the next page. Only the identical pair refusing
+    /// an answer again starts the answer hold. Returns the cumulative attempt
+    /// count for diagnostics and whether the answer is owed now.
     fn record_head_conflict_challenge(
         &mut self,
         session_id: &str,
         challenge: &str,
         rescan: &crate::snapshot_client::SnapshotConflictRescan,
         now: u64,
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         if !is_snapshot_fingerprint(challenge) || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
         {
             return None;
@@ -2487,18 +2492,19 @@ impl SnapshotUploadProgress {
             head_conflict::note("capacity_hold");
             return None;
         }
-        let (answer_attempts, last_answer_unix) = if rescan.answered {
-            (
-                previous
-                    .map_or(0, |record| record.answer_attempts)
-                    .saturating_add(1),
-                now,
-            )
-        } else {
-            previous.map_or((0, 0), |record| {
-                (record.answer_attempts, record.last_answer_unix)
-            })
+        let identical = previous.filter(|record| {
+            record.challenge == challenge
+                && record.stale_revision_v2_hash == rescan.revision_v2_hash
+        });
+        let answer_attempts = previous
+            .map_or(0, |record| record.answer_attempts)
+            .saturating_add(u32::from(rescan.answered));
+        let last_answer_unix = match identical {
+            None => 0,
+            Some(_) if rescan.answered => now,
+            Some(record) => record.last_answer_unix,
         };
+        let owed_now = identical.is_none();
         self.head_conflict_challenges.insert(
             key,
             HeadConflictChallenge {
@@ -2508,7 +2514,7 @@ impl SnapshotUploadProgress {
                 last_answer_unix,
             },
         );
-        Some(answer_attempts)
+        Some((answer_attempts, owed_now))
     }
 
     fn record_cache_state<T: Serialize>(
@@ -3286,12 +3292,29 @@ fn current_unix_seconds() -> u64 {
 }
 
 pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
-    let digest = Sha256::digest(fingerprint.as_bytes());
-    let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
-        % SNAPSHOT_QUARANTINE_RETRY_SECONDS;
-    current_unix_seconds()
-        .saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS)
-        .saturating_add(jitter)
+    jittered_retry_after(
+        fingerprint,
+        current_unix_seconds(),
+        SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    )
+}
+
+/// Base of a head-CAS conflict's probe. Jitter adds less than the base, so
+/// every conflict probe and refused-answer hold ends within one hour.
+const SNAPSHOT_CONFLICT_PROBE_SECONDS: u64 = 30 * 60;
+
+/// A conflict's mandatory probe: `[30 min, 1 h)` after `from`, per body.
+/// Backend state can change without a local change, so a conflict is never
+/// left waiting for new input alone.
+fn conflict_probe_after(fingerprint: &str, from: u64) -> u64 {
+    jittered_retry_after(fingerprint, from, SNAPSHOT_CONFLICT_PROBE_SECONDS)
+}
+
+/// `[from + base, from + 2 * base)`, staggered deterministically by `key`.
+fn jittered_retry_after(key: &str, from: u64, base: u64) -> u64 {
+    let digest = Sha256::digest(key.as_bytes());
+    let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix")) % base;
+    from.saturating_add(base).saturating_add(jitter)
 }
 
 /// Last computed scan-index manifest per (upload destination, source).
@@ -11076,6 +11099,8 @@ where
             settled_sessions.insert(key);
         }
         let now = current_unix_seconds();
+        // Conflicted bodies whose new challenge answer is owed on the next page.
+        let mut answer_owed_now = BTreeSet::new();
         for entity in &response.conflict_entities {
             let key = cache_session_key(&entity.source_session_id);
             if settled_sessions.contains(&key) {
@@ -11087,12 +11112,15 @@ where
             ) else {
                 continue;
             };
-            if let Some(attempts) = progress.record_head_conflict_challenge(
+            if let Some((attempts, owed_now)) = progress.record_head_conflict_challenge(
                 &entity.source_session_id,
                 challenge,
                 rescan,
                 now,
             ) {
+                if owed_now {
+                    answer_owed_now.insert(entity.snapshot_fingerprint.as_str());
+                }
                 head_conflicts_recorded.push((
                     SessionHash::of(&entity.source_session_id),
                     attempts,
@@ -11200,10 +11228,24 @@ where
                     );
                 }
             } else if conflicted.contains(item_fingerprint) {
+                // An owed new answer rides the next selecting page; any other
+                // conflict gets its mandatory probe within one hour. A counted
+                // terminal-contract re-arm keeps its own 6-12 h pace.
+                let contract_rearm = progress
+                    .quarantined_fingerprints
+                    .get(item_fingerprint)
+                    .is_some_and(|record| record.contract_retry_claims.is_some());
+                let retry_after = if contract_rearm {
+                    quarantine_retry_after(item_fingerprint)
+                } else if answer_owed_now.contains(item_fingerprint) {
+                    now
+                } else {
+                    conflict_probe_after(item_fingerprint, now)
+                };
                 progress.quarantine_retryable_body(
                     item_fingerprint,
                     &body_witness(item),
-                    quarantine_retry_after(item_fingerprint),
+                    retry_after,
                 );
             }
         }
