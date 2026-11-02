@@ -9997,6 +9997,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // A witnessed family rebuilt from the reports; one the reports name but
+    // cannot rebuild is an ignored veto.
+    let reconstruct =
+        |root_session_id: &String, witness: &ClaudeUsageFamilyWitness, ignored_vetoes: &mut u16| {
+            let family = reconstruct_claude_usage_family(
+                root_session_id,
+                witness,
+                api_report,
+                trace_report,
+                legacy_request_owners,
+            );
+            if family.is_none()
+                && (api_report.evidence.contains_key(root_session_id)
+                    || trace_report.evidence.contains_key(root_session_id))
+            {
+                *ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
+            }
+            family.map(|family| (root_session_id.clone(), family))
+        };
     if let Some(join) = terminal.as_mut().filter(|_| reports_healthy) {
         // Owed evidence (a terminal-retry re-arm) proves nothing until it
         // resolves (the sweep skipped owed and uncertified roots).
@@ -10011,20 +10030,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !proven.contains_key(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
         // Path-(a) tombstone: a retired family keeps its witness
@@ -10074,20 +10080,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && !uncertified_roots.contains(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                let family = reconstruct_claude_usage_family(
-                    root_session_id,
-                    witness,
-                    api_report,
-                    trace_report,
-                    legacy_request_owners,
-                );
-                if family.is_none()
-                    && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id))
-                {
-                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
-                }
-                family.map(|family| (root_session_id.clone(), family))
+                reconstruct(root_session_id, witness, &mut ignored_vetoes)
             })
             .collect();
     }
