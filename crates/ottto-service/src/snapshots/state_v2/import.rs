@@ -91,8 +91,8 @@ pub(super) fn hydrate_context(store: &mut sqlite::Sqlite) -> Result<(ScanIndex, 
 /// The one production save: merge current CAS custody, then run the
 /// semantic delta under the resident committed context. Emit the complete
 /// dirty delta with per-key SQLite header reads. Saves above 5k rows /
-/// 32 MiB reduce the next collection page; the whole save rolls back at its
-/// hard ceiling. More than 64 account windows is an alarm, never permission
+/// 32 MiB reduce the next collection page; above 256 MiB, charged work alarms
+/// without refusing the save. More than 64 account windows is an alarm, never permission
 /// to drop unsettled custody. KEEP persisted shared refs: decode only each
 /// changed row's old refs, diff against new refs, adjust/reclaim in this
 /// transaction. Never perform whole-history GC during a save.

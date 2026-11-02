@@ -790,7 +790,7 @@ fn f6_forget(
         .insert("uncommitted".into(), index.files["committed"].clone());
     // Even a mutated live graph cannot add an uncommitted key to membership.
     assert_eq!(live().digests, BTreeSet::from([digest]));
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    fill_session(&mut index);
     assert!(save_with(&f.path, &mut index).is_err());
     let held = live();
     assert!(!held.complete);
@@ -1645,14 +1645,17 @@ mod hydrate_parity {
     }
 }
 
-/// [format] ceiling reloads the prior generation halves then retries and grows back.
+/// [format] value admission reloads the prior generation halves then retries and grows back.
 #[test]
-fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
+fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        "oversize".into(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -1704,7 +1707,10 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        "oversize".into(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
     let current = load_with(&f.path, false).unwrap().unwrap();
