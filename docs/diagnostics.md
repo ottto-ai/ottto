@@ -1720,6 +1720,58 @@ Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
+Pi fork files exclude copied usage entries whose envelope timestamp is strictly
+before their session header time. If the envelope time is absent, the provider
+time can establish the cutoff. Entries at or after the header time retain normal
+identity and deduplication. Missing or invalid cutoff evidence never proves a
+copy; ordinary timestamp validation still applies. A fork's durable Pi section
+stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
+ledger. The L cutoff never enters logs, diagnostics or uploads.
+The `parentSession` value is checked at the header and never retained in the
+ledger or included in records, logs, diagnostics or uploads.
+
+The fixed cache lifecycle counters `pi_fork_copies_skipped_entries` and
+`pi_fork_copies_skipped_tokens` count physical usage-bearing entries excluded
+and their tokens. A copied message/message_end pair contributes two skipped
+entries, even though normal pairing would count one request. Counts accumulate
+per process and in the existing per-page observer; repeated Full reads count
+again.
+
+Historical parent spend is excluded even if its file was never uploaded. Copies
+from a machine whose clock ran ahead can have timestamps at or after the fork
+header and still count; detecting them needs parent history, which this reader
+does not acquire. There is no clock-skew counter. Correcting an earlier inflated
+Pi session produces a normal lower-usage revision, without a Claude usage-decrease
+marker or an additional history read. A complete fork containing only copied
+usage publishes a zero-usage revision; copied usage does not make that read
+incomplete. Malformed owned evidence retains normal loss handling.
+
+Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
+counts report Full, Tail and Unchanged decisions with the actual planner reasons.
+Pi inherits the accepted sampled residual: an interior same-length rewrite plus
+growth can Tail a stale prefix until the next Full. Pi's writer is append-only,
+and its header rewrite reads Full. The shared
+`sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
+pins it for Claude Code, Codex and Pi.
+Age and clock changes do not invalidate checkpoints. Admission of a new sampled
+obligation follows the shared audit cap: with no slot left, an unmarked change
+reads a counted cap Full (or waits); already-marked files keep Tailing.
+Pi uses the shared durable restore path. An indexed file that changes without
+an available RAM or durable reduction reads Full under the shared `state_missing`
+planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
+fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
+A Pi usage ledger above 65,536 keys refuses persistence through the shared
+`not_persisted{wa.entry_cap}` class; the ledger is never truncated.
+
+`restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
+counts a durable-restored Tail read ending strictly below the frozen indexed
+accepted extent when it offers a complete body after policy and semantic no-op
+suppression. Pi has no accepted-body floor. Full, Unchanged and RAM-retained
+reads do not count. Upload retries count again. The same signal uses source
+`codex` for surviving restored Tail offers and source `claude_code` with outcome
+`held` for accepted-floor holds. It contains only counts, source and outcome,
+with no file names, response ids or content.
+
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
 main's narrower current-representation binding formula. Grouped Codex members
@@ -1895,8 +1947,8 @@ change any persisted format.
 Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
 actual decision edges. The discovery dependency continues to hard-gate the
 production switch; RAM pacing does not establish restart-persistent bounds.
-Codex and Pi report `restored_behind_accepted.published` only when a complete
-restored Tail body below the frozen accepted extent reaches publication.
+Codex and Pi report `restored_behind_accepted.published` when a complete restored
+Tail body below the frozen accepted extent reaches publication.
 
 `rederive_failed_first_attempt{source}` and `restore_pending_quiet{source}` are
 **proxies**, emitted once per source pass as cumulative process totals on the
