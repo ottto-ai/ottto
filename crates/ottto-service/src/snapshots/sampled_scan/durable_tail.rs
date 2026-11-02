@@ -68,9 +68,9 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
     TEST_WRITE_BYTES.with(|budget| budget.set(bytes));
 }
 
-/// Upper bound of both stores' resident maps (two sources), ONE canonical value:
-/// - memo 2*256*256 = 131,072 bytes;
-/// - compact store pending 2*(32+1)*4096 = 270,336 bytes: a wire pending
+/// Upper bound of the stores' resident maps (three sources):
+/// - memo 3*256*256 = 196,608 bytes;
+/// - compact store pending 3*(32+1)*4096 = 405,504 bytes: a wire pending
 ///   entry stays <=320 bytes per node. Root's expanded stage/receipt metadata
 ///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
 ///   charged on the acquisition's active lease inside `stream_reserve_bytes`
@@ -81,16 +81,17 @@ pub(in crate::snapshots) fn set_test_write_bytes(bytes: Option<usize>) {
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
 /// Plus the 225,720-byte fixed-digest diagnostic set (512 entries + root).
-/// Total 2,204,088 bytes; the previous canonical pin was 1,978,368 bytes.
+/// Total 2,404,792 bytes. Shared key-map capacities remain unchanged.
 /// The 526,336-byte M3 key reserve is debited from STATE_BYTES, within the
 /// existing cache budget. Native/container evidence remains required; this
 /// explicit prepayment is separate from the retained graph's heap walk.
 #[cfg(test)]
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
-    + 2 * (store::MAX_BATCH + 1) * 4096
-    + super::RETAIL_RESERVE_BYTES
-    + KEY_RESERVE_BYTES
-    + STALE_PREDECESSOR_RESERVE_BYTES;
+pub(crate) const STORES_RESIDENT_BOUND: usize =
+    crate::snapshots::durable_sources::SOURCES.len() * store::MAX_RECORDS * 256
+        + crate::snapshots::durable_sources::SOURCES.len() * (store::MAX_BATCH + 1) * 4096
+        + super::RETAIL_RESERVE_BYTES
+        + KEY_RESERVE_BYTES
+        + STALE_PREDECESSOR_RESERVE_BYTES;
 
 /// M3 per-key maps outside the A0-h custody node, each with its own prepaid
 /// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
@@ -162,8 +163,9 @@ pub(in crate::snapshots) fn record_rederive_refused(source: SnapshotSource, clas
     }
 }
 
-/// Only an actual restored Tail may report this disposition. The extent is
-/// frozen at native preparation, before index mutations or later appends.
+/// Only a restored read the source's `BelowAccepted` row publishes may report
+/// this disposition. The extent is frozen at native preparation, before index
+/// mutations or later appends.
 pub(in crate::snapshots) fn restored_tail_below_accepted(
     source: SnapshotSource,
     restored: bool,
@@ -302,14 +304,8 @@ fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
-    /// Per-process totals, emitted together once at the source pass boundary.
-    rederive_failed_first_attempt: [u64; 3],
     /// Missing authority at the closed set of retirement decision edges.
     pub(crate) retire_exact_held: BTreeMap<&'static str, u64>,
-    /// Process proxy only: no persisted key identity or restart streak.
-    retire_exact_held_first_attempt: [u64; 3],
-    retire_exact_first_attempt_tracking_closed: bool,
-    rederive_first_attempt_tracking_closed: bool,
     restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
     pub(crate) durable_restore_after_selection_clear: u64,
@@ -922,6 +918,15 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     DurableSource::from_snapshot(source)
 }
 
+// One key per source for the layout-skip counter and its store alarm.
+fn layout_skipped_key(source: DurableSource) -> &'static str {
+    match source {
+        DurableSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
+        DurableSource::Codex => "native_stage_skipped.layout_unsupported.codex",
+        DurableSource::Pi => "native_stage_skipped.layout_unsupported.pi",
+    }
+}
+
 /// S2: freeze accepted facts before working-index mutation. Unknown object
 /// identity keeps this floor; only independently proved replacement may skip it.
 #[derive(Clone, Copy)]
@@ -981,7 +986,9 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str("|attr=false");
         }
         Self {
-            accepted: (restart_restore::enabled() && source == SnapshotSource::ClaudeCode)
+            accepted: (restart_restore::enabled()
+                && crate::snapshots::durable_sources::below_accepted(source)
+                    == crate::snapshots::durable_sources::BelowAccepted::Held)
                 .then(|| AcceptedFloor::of(index, key))
                 .flatten(),
             identity_contract,
@@ -1191,9 +1198,6 @@ fn claude_expected(
     if record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode) {
         return Err("old_binding_representation");
     }
-    if record.format != store::FORMAT_V3 {
-        return Err("old_binding_representation");
-    }
     claude_expected_v3(
         key,
         scope,
@@ -1361,10 +1365,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
 }
 
 // Process totals by source: native physical Tail bytes and old-suffix overlap.
-static RETAIL_BYTES: [[AtomicU64; 4]; 2] = [
-    [const { AtomicU64::new(0) }; 4],
-    [const { AtomicU64::new(0) }; 4],
-];
+static RETAIL_BYTES: [[AtomicU64; 4]; crate::snapshots::durable_sources::SOURCES.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; crate::snapshots::durable_sources::SOURCES.len()];
 fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     durable_source(source).map_or(0, |s| {
         RETAIL_BYTES[s as usize][metric].load(Ordering::Relaxed)
@@ -3330,33 +3332,10 @@ impl SharedCache {
                 stores.owed_overflow[source.slot()] = true;
             }
         }
-        self.record_first_retire_result(source, key, true);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.properties().snapshot.api_slug(),
             &serde_json::json!({"retire_exact_held":{(edge.label()):1}, "retire_exact_held_exit":exit}),
         );
-    }
-
-    fn record_first_retire_result(&self, source: DurableSource, key: store::Digest32, held: bool) {
-        let Some(mut stores) = self.durable() else {
-            return;
-        };
-        if stores.counters.retire_exact_first_attempt_tracking_closed {
-            return;
-        }
-        if stores.fund_debt(key).is_none() {
-            stores.counters.retire_exact_first_attempt_tracking_closed = true;
-            return;
-        }
-        if stores.counters.retire_exact_first_attempt_tracking_closed {
-            return;
-        }
-        let debt = stores.key_debt.get_mut(&key).expect("funded");
-        if debt.first_retire_held.is_none() {
-            debt.first_retire_held = Some(held);
-            stores.counters.retire_exact_held_first_attempt
-                [diagnostic_source_slot(source.properties().snapshot)] += u64::from(held);
-        }
     }
 
     fn retire_or_hold(
@@ -3392,13 +3371,6 @@ impl SharedCache {
     ) {
         #[cfg(test)]
         super::test_hooks::fire(super::test_hooks::Point::BeforeRetireWitness);
-        // Early metadata/object edit edges can fence-drop before scoped
-        // content replay. They share the same first-attempt observation.
-        self.record_first_rederive_result(
-            source.properties().snapshot,
-            record.record.binding.key,
-            true,
-        );
         let Some(mut stores) = self.durable() else {
             return;
         };
@@ -3435,8 +3407,6 @@ impl SharedCache {
         let debt = stores.fund_debt(key).expect("funded");
         debt.retire_source = Some(source);
         debt.rederive_hold = Some(source);
-        drop(stores);
-        self.record_first_retire_result(source, key, false);
     }
 
     /// Head-once is an extent discriminator, never predecessor authority.
@@ -3723,7 +3693,7 @@ impl SharedCache {
                 }
             }
         };
-        if record.format == store::FORMAT_V3 && !crate::heap_layout_bound::layout_supported() {
+        if !crate::heap_layout_bound::layout_supported() {
             let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
             let slot = stores.slot(source).as_mut().ok_or(MissClass::Unavailable)?;
             if slot.decided.len() >= slot.indexed.saturating_add(2 * store::MAX_RECORDS)
@@ -3751,7 +3721,7 @@ impl SharedCache {
             .flatten();
             return Err(MissClass::LayoutUnavailable(audit_debt).into());
         }
-        let original_expected = expected(
+        let mut expected = expected(
             source,
             snapshot_source,
             key,
@@ -3785,10 +3755,9 @@ impl SharedCache {
                 return Err(MissClass::AcceptedFloor.into());
             }
             if source == DurableSource::ClaudeCode
-                && record.format == store::FORMAT_V3
                 && a.strict
                 && a.verified_extent
-                && record.record.binding.context == original_expected.binding.context
+                && record.record.binding.context == expected.binding.context
                 && record.record.certificate.sealed_offset < a.end
             {
                 // A binary without the store may have accepted a newer Full.
@@ -3812,20 +3781,6 @@ impl SharedCache {
         if source == DurableSource::ClaudeCode && interpretation.accepted.is_none() {
             return Err(self.stale("accepted_floor_missing"));
         }
-        let mut expected = expected(
-            source,
-            snapshot_source,
-            key,
-            scope,
-            index,
-            interpretation,
-            Some((
-                record.format,
-                record.record.allowlist,
-                effective_revision(snapshot_source),
-            )),
-        )
-        .ok_or(MissClass::NoEntry)?;
         if source == DurableSource::ClaudeCode {
             let (original, _) = match claude_expected(key, scope, index, interpretation, &record) {
                 Ok(proof) => proof,
@@ -3864,7 +3819,7 @@ impl SharedCache {
                                             false,
                                             source,
                                             &record,
-                                            &original_expected,
+                                            &expected,
                                             RetirementEdge::IndependentEdit,
                                         );
                                         return Err(MissClass::Failure(Failure::Certificate(
@@ -3886,19 +3841,17 @@ impl SharedCache {
             };
             expected = original;
         }
-        if record.format == store::FORMAT_V3 {
-            let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
-            let current = effective_revision(snapshot_source);
-            if acquisition.acquired_revision != current {
-                return Err(self.stale(if acquisition.acquired_revision > current {
-                    "revision_downgrade"
-                } else {
-                    "revision_adoption_required"
-                }));
-            }
-            expected.binding.scope = record.record.binding.scope;
+        let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
+        let current = effective_revision(snapshot_source);
+        if acquisition.acquired_revision != current {
+            return Err(self.stale(if acquisition.acquired_revision > current {
+                "revision_downgrade"
+            } else {
+                "revision_adoption_required"
+            }));
         }
-        let restored = self.durable_restore_record_scoped(
+        expected.binding.scope = record.record.binding.scope;
+        let restored = self.restore_record_content(
             snapshot_source,
             &record,
             &expected,
@@ -4126,35 +4079,7 @@ impl SharedCache {
         held: &mut File,
         lease: &mut store::ActiveLease,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
-        self.durable_restore_record_scoped(source, record, expected, path, scope, held, lease, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn durable_restore_record_scoped(
-        &self,
-        source: SnapshotSource,
-        record: &store::DurableRecord,
-        expected: &Expected,
-        path: &Path,
-        scope: &Scope,
-        held: &mut File,
-        lease: &mut store::ActiveLease,
-        v3: Option<V3RestoreScope<'_>>,
-    ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
-        let scoped = v3.is_some();
-        let result =
-            self.restore_record_content(source, record, expected, path, scope, held, lease, v3);
-        // Eligible scoped failures include certificate/fence drops. Quiet is
-        // an observation, not a content attempt. OFF uses the native M1 path.
-        if scoped
-            && !matches!(
-                result,
-                Err(Failure::Resource("rederive_quiet") | Failure::Ineligible(_))
-            )
-        {
-            self.record_first_rederive_result(source, record.record.binding.key, result.is_err());
-        }
-        result
+        self.restore_record_content(source, record, expected, path, scope, held, lease, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4173,9 +4098,6 @@ impl SharedCache {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
-        }
-        if record.format != store::FORMAT_V3 {
-            return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         record
@@ -4236,26 +4158,24 @@ impl SharedCache {
                 "skill_label_consent_off",
             )));
         }
-        if record.format == store::FORMAT_V3 {
-            let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
-            let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
-            let acquired = record
-                .record
-                .acquisition
-                .ok_or(Failure::Corrupt)?
-                .acquired_revision;
-            if record.record.binding.scope
-                != v3_replay_scope(
-                    source,
-                    scope,
-                    inputs.index,
-                    inputs.interpretation,
-                    acquired,
-                    &counting,
-                )
-            {
-                return Err(Failure::Ineligible(store::Ineligible::Scope));
-            }
+        let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
+        let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
+        let acquired = record
+            .record
+            .acquisition
+            .ok_or(Failure::Corrupt)?
+            .acquired_revision;
+        if record.record.binding.scope
+            != v3_replay_scope(
+                source,
+                scope,
+                inputs.index,
+                inputs.interpretation,
+                acquired,
+                &counting,
+            )
+        {
+            return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
         if decoded
             .cutover()
@@ -4330,35 +4250,7 @@ impl SharedCache {
         Ok((checkpoint, reduction, receipt))
     }
 
-    fn record_first_rederive_result(
-        &self,
-        source: SnapshotSource,
-        digest: store::Digest32,
-        failed: bool,
-    ) {
-        let Some(mut stores) = self.durable() else {
-            return;
-        };
-        if stores.counters.rederive_first_attempt_tracking_closed {
-            return;
-        }
-        if stores.fund_debt(digest).is_none() {
-            stores.close_first_rederive_tracking();
-            return;
-        }
-        // Funding may have reclaimed an idle diagnostic marker.
-        if stores.counters.rederive_first_attempt_tracking_closed {
-            return;
-        }
-        let debt = stores.key_debt.get_mut(&digest).expect("funded");
-        if debt.first_rederive_failed.is_none() {
-            debt.first_rederive_failed = Some(failed);
-            stores.counters.rederive_failed_first_attempt[diagnostic_source_slot(source)] +=
-                u64::from(failed);
-        }
-    }
-
-    /// Aggregate process proxies on the existing carrier, once per source pass.
+    /// Metadata-only quiet restores on the existing carrier, once per source pass.
     pub(crate) fn durable_rederive_proxies(&self, source: SnapshotSource) {
         if !restart_restore::enabled() {
             return;
@@ -4367,20 +4259,12 @@ impl SharedCache {
             return;
         };
         let slot = diagnostic_source_slot(source);
-        let failed = stores.counters.rederive_failed_first_attempt[slot];
         let quiet = stores.counters.restore_pending_quiet[slot];
-        let retire_held = stores.counters.retire_exact_held_first_attempt[slot];
-        let retire_tracking_closed = stores.counters.retire_exact_first_attempt_tracking_closed;
-        let stores_tracking_closed = stores.counters.rederive_first_attempt_tracking_closed;
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
             &serde_json::json!({
-                "rederive_failed_first_attempt": failed,
                 "restore_pending_quiet": quiet,
-                "rederive_first_attempt_tracking_closed": stores_tracking_closed,
-                "retire_exact_held_first_attempt": retire_held,
-                "retire_exact_first_attempt_tracking_closed": retire_tracking_closed,
             }),
         );
     }
@@ -4422,14 +4306,11 @@ impl SharedCache {
     }
 
     pub(in crate::snapshots) fn durable_note_native_layout_skipped(&self, source: SnapshotSource) {
+        let Some(source) = durable_source(source) else {
+            return;
+        };
         if let Some(mut stores) = self.durable() {
-            Counters::bump(
-                &mut stores.counters.ineligible,
-                match source {
-                    SnapshotSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
-                    _ => "native_stage_skipped.layout_unsupported.codex",
-                },
-            );
+            Counters::bump(&mut stores.counters.ineligible, layout_skipped_key(source));
         }
     }
 
@@ -4912,11 +4793,12 @@ impl SharedCache {
                         Some(keep) => {
                             slot.store
                                 .purge_private_labels_kept(writer, keep, reason, |body| {
-                                    codec::body_has_skill_labels(body).unwrap_or(true)
+                                    codec::body_has_skill_labels(snapshot_source, body)
+                                        .unwrap_or(true)
                                 })
                         }
                         None => slot.store.purge_private_labels(writer, |body| {
-                            codec::body_has_skill_labels(body).unwrap_or(true)
+                            codec::body_has_skill_labels(snapshot_source, body).unwrap_or(true)
                         }),
                     }
                 };
@@ -5202,7 +5084,7 @@ impl SharedCache {
             }
         };
         for record in &pending {
-            if codec::body_has_skill_labels(&record.body).unwrap_or(true)
+            if codec::body_has_skill_labels(snapshot_source, &record.body).unwrap_or(true)
                 && slot
                     .store
                     .mark_private_labels(writer, record.binding.key)
@@ -5706,11 +5588,7 @@ impl SharedCache {
         let skipped = stores
             .counters
             .ineligible
-            .get(if claude {
-                "native_stage_skipped.layout_unsupported.claude"
-            } else {
-                "native_stage_skipped.layout_unsupported.codex"
-            })
+            .get(layout_skipped_key(source))
             .copied()
             .unwrap_or(0);
         let unavailable = stores

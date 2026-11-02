@@ -70,7 +70,6 @@ const WAITER_FORGET_PAGES: u64 = 64;
 const ROTATION_KEYS: usize = 64;
 /// Owners with B's blocked-owner provenance (§d.1.3, L-1).
 const JOIN_OWNERS: usize = 64;
-const ARCHIVE_PASS_CPU_MICROS: u64 = 30_000_000;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
 /// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
@@ -270,12 +269,11 @@ pub(in crate::snapshots) enum StartRefusal {
 
 /// Archive catch-up pacing for one ordinary page and its continuation
 /// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
-/// durable authority. A refusal never resets it; unknown CPU denies, as
-/// continuation treats any non-`Allowed` platform answer.
+/// durable authority. A refusal never resets it; byte pages and continuation
+/// wall-work bound admission of the next archive.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchivePass {
     pub(crate) started: bool,
-    pub(crate) cpu: u64,
     pub(crate) work: u64,
     pub(crate) power: bool,
     /// Continuation's platform gates; a pass and its pages share them.
@@ -286,7 +284,7 @@ pub(crate) struct ArchivePass {
     pub(crate) deferred: std::collections::BTreeSet<String>,
 }
 crate::heap_layout_bound::split_fields!(ArchivePass;
-    inline: [started, cpu, work, power, dirty, prepared, headers_prepared];
+    inline: [started, work, power, dirty, prepared, headers_prepared];
     heap: [deferred]; shared: [gates]);
 
 impl ArchivePass {
@@ -295,32 +293,20 @@ impl ArchivePass {
     pub(crate) fn prepare(&mut self) {
         let Self {
             started,
-            cpu,
             work,
             power,
             gates,
             ..
         } = self;
-        (*started, *cpu, *work) = (
-            false,
-            if crate::context_composition::thread_cpu_micros().is_some() {
-                0
-            } else {
-                u64::MAX
-            },
-            0,
-        );
+        (*started, *work) = (false, 0);
         *power = gates.power_ready();
     }
 
     /// Archive work may start now: prepare-time and live power, the pass's
-    /// CPU and work (continuation's contention threshold), and `remaining`
+    /// wall work (continuation's contention threshold), and `remaining`
     /// page bytes.
     pub(crate) fn ready(&self, remaining: u64) -> bool {
-        self.power
-            && self.cpu < ARCHIVE_PASS_CPU_MICROS
-            && remaining > 0
-            && crate::snapshot_sync::archive_work_ready(self.work)
+        self.power && remaining > 0 && crate::snapshot_sync::archive_work_ready(self.work)
     }
 }
 

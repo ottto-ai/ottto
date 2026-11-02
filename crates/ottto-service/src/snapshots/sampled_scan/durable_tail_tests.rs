@@ -1397,7 +1397,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
             let purge = slot
                 .store
                 .purge_private_labels(lock, |body| {
-                    codec::body_has_skill_labels(body).unwrap_or(true)
+                    codec::body_has_skill_labels(source, body).unwrap_or(true)
                 })
                 .unwrap();
             assert_eq!((purge.erased, purge.refused), (0, 0));
@@ -1754,7 +1754,8 @@ pub(super) fn native_record_of(
 ) -> (CachedJsonlReduction, Checkpoint) {
     let apply = match source {
         SnapshotSource::Codex => apply_codex_line,
-        _ => apply_claude_code_line,
+        SnapshotSource::Pi => apply_pi_line,
+        SnapshotSource::ClaudeCode => apply_claude_code_line,
     };
     let mut parser = fixture::parser(source, path, File::open(path).unwrap(), apply);
     parser
@@ -3287,11 +3288,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
             assert!(!old.ineligible.contains_key("selection_cleared"));
             assert_eq!(old.ineligible["history_owed"], 1);
             assert_eq!(old.durable_held, [0; 9]);
-            let text = old.summary(source, &disk);
-            assert!(!text.contains("restore_attempts="));
-            assert!(text.contains("disk_records="));
-            assert!(text.contains("not_persisted="));
-            // No new record or recovery operation is performed by these diagnostics.
+            // Inspecting counters performs no record or recovery I/O.
             assert_eq!(disk.records_read, 0);
         } else {
             assert!(cache.durable_counters(source).is_none());
@@ -4938,11 +4935,11 @@ fn a1a_scan_at(
 #[test]
 #[cfg(target_os = "macos")]
 fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
-    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::local_resource_diagnostics::rearm_cause;
+    use crate::snapshots::evidence_owed::EvidenceContract;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
 
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _owed = EvidenceOwedForTest::on();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -5042,10 +5039,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         assert_eq!(initial.snapshots[0].input_tokens, 100);
         let stamped = EvidenceContract::current(&index);
         assert!(stamped.is_some());
-        assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            stamped
-        );
+        // The complete census retires the family pending (main's completion;
+        // the removed switch kept unproven pending). The stamp written on
+        // accumulation is pinned by
+        // `evidence_owed::tests::contract_stamp_is_written_on_accumulation_and_never_laundered`.
+        assert!(index.claude_usage_family_pending.get(SESSION).is_none());
         finalize_scan_after_policy(source, &mut initial, &mut index);
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -5063,7 +5061,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         // Keep the physical file and its revision unchanged across the re-arm.
         prior.claude_usage_family_pending.clear();
         prior.traversal = None;
-        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        // The terminal-retry re-arm owes it.
+        rearm_cause::clear(
+            &key,
+            prior.files.get_mut(&key).unwrap(),
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+        );
         assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
         assert!(prior.files[&key].observed_fingerprint().is_empty());
         prior.save(&disk.index_path).unwrap();
@@ -5104,9 +5107,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             &scan_money(source, &index, &restored),
         );
         let current = EvidenceContract::current(&index);
+        // The owed route's family pending (and its contract stamp) is the
+        // cold Full's.
         assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            current
+            index.claude_usage_family_pending.get(SESSION),
+            cold_index.claude_usage_family_pending.get(SESSION)
         );
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -8053,198 +8058,232 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
 #[test]
 fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
     let _reset = ClearWriteFaults;
-    for case in [
-        "consent",
-        "unreadable",
-        "failure",
-        "no-marker",
-        "key-absence",
-        "key-absence-failure",
+    for (source, fork) in [
+        (SnapshotSource::ClaudeCode, false),
+        (SnapshotSource::Pi, false),
+        (SnapshotSource::Pi, true),
     ] {
-        let orphan = case.starts_with("key-absence");
-        let failure = case.ends_with("failure");
-        let root = crate::test_scratch::ScratchDir::new("skill-consent-save");
-        let lock = test_locks::hold(&root);
-        let source = SnapshotSource::ClaudeCode;
-        let ds = durable_source(source).unwrap();
-        let path = root.join("synthetic.jsonl");
-        native_fixture(&path);
-        let scope = Scope("skill-consent".into());
-        let index_path = root.join("index.json");
-        let mut index = ScanIndex::default();
-        if orphan {
-            index.files.insert(
-                "live".into(),
-                serde_json::from_value(serde_json::json!({
-                    "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
-                }))
-                .unwrap(),
-            );
-        }
-        index.save(&index_path).unwrap();
-        let before_index = std::fs::read(&index_path).unwrap();
-        let key = if case == "unreadable" {
-            [255; 32]
-        } else {
-            store::key_digest(ds, "synthetic")
-        };
-        let dir = store::store_dir_for_index(&index_path);
-        let marker = dir.with_extension("private-labels");
-        if case != "no-marker" {
-            let _on = crate::snapshots::RestartRestoreForTest::enabled();
-            let mut disk = DurableTailStore::new(dir.clone(), ds);
-            disk.mark_private_labels(lock, key).unwrap();
-            let record = PendingRecord {
-                acquisition: fixture_acquisition(source),
-                binding: Binding {
-                    source: ds,
-                    key,
-                    context: [1; 32],
-                    scope: [2; 32],
-                    entry: [0; 32],
-                },
-                certificate: certificate(&path, &scope),
-                body: crate::snapshots::durable_store_fixture_body_with_skill(),
-                allowlist: codec::allowlist_digest(source),
-            };
-            let mut records = vec![record.clone()];
-            if orphan {
-                let mut live = record;
-                live.binding.key = store::key_digest(ds, "live");
-                disk.mark_private_labels(lock, live.binding.key).unwrap();
-                records.push(live);
-            }
-            disk.write_after_save(lock, index.generation, 0, records)
-                .unwrap();
-        }
-        let _off = crate::snapshots::RestartRestoreForTest::disabled();
-        let cache = fixture::cache(source, &index_path, &scope, false);
-        cache.durable_skill_label_permission(source, true);
-        cache.durable_write_after_save(lock, source, &index);
-        if case == "unreadable" {
-            std::fs::remove_file(&marker).unwrap();
-            std::fs::create_dir(&marker).unwrap();
-            // The unknown-inventory fallback must advance past a full page
-            // of retained, content-free records to reach the labelled tail.
-            let empty = PendingRecord {
-                acquisition: fixture_acquisition(source),
-                binding: Binding {
-                    source: ds,
-                    key: [0; 32],
-                    context: [1; 32],
-                    scope: [2; 32],
-                    entry: [3; 32],
-                },
-                certificate: certificate(&path, &scope),
-                body: codec::store_fixture_body(source, 0, 0),
-                allowlist: codec::allowlist_digest(source),
-            };
-            for n in 0..store::INVENTORY_BOUND {
-                let mut record = empty.clone();
-                record.binding.key[24..].copy_from_slice(&(n as u64).to_be_bytes());
-                let name: String = record
-                    .binding
-                    .key
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                let path = dir.join(format!("{name}.rec"));
-                std::fs::write(&path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
-                std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                    .unwrap();
-            }
-        }
-        if failure {
-            store::test_hooks::set_before_unlink(Some(Box::new(|_| {
-                Err(std::io::Error::other("erase failed"))
-            })));
-        }
-        let erase = || {
-            if orphan {
-                cache.durable_gc(lock, source, &index).unwrap();
-            } else {
-                cache.durable_skill_label_permission(source, false);
-                cache.durable_write_after_save(lock, source, &index);
-            }
-        };
-        erase();
-        store::test_hooks::set_before_unlink(None);
-        if case == "unreadable" {
-            erase();
-        }
-        if case == "no-marker" {
-            // Ordinary OFF registration allocates no store or counters.
-            assert!(cache.durable_counters(source).is_none());
-            assert!(cache.durable.lock().unwrap().state.is_none());
-            assert!(!dir.exists());
-        } else {
-            let (counts, stats) = cache.durable_counters(source).unwrap();
-            assert_eq!(stats.rec_orphans_erased, u64::from(orphan && !failure));
-            assert_eq!(
-                counts.not_persisted.get("skill_label_scanned"),
-                Some(&if case == "unreadable" {
-                    store::INVENTORY_BOUND as u64 + 1
-                } else {
-                    1
-                })
-            );
-            if failure {
-                assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&0));
-                assert_eq!(
-                    counts.not_persisted.get("skill_label_purge_failed"),
-                    Some(&1)
-                );
-                assert!(marker.exists());
-                erase();
-                assert_eq!(
-                    cache
-                        .durable_counters(source)
-                        .unwrap()
-                        .0
-                        .not_persisted
-                        .get("skill_label_purged"),
-                    Some(&1)
-                );
-            }
-            let record_path = |key: store::Digest32| {
-                dir.join(format!(
-                    "{}.rec",
-                    key.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                ))
-            };
-            assert!(
-                !record_path(key).exists(),
-                "the exact erased digest is absent"
-            );
-            let (counts, stats) = cache.durable_counters(source).unwrap();
-            assert_eq!(stats.rec_orphans_erased, u64::from(orphan));
-            assert!(counts
-                .summary(source, &stats)
-                .contains(&format!("rec_orphans_erased={}", u64::from(orphan))));
-            if orphan {
-                assert!(
-                    record_path(store::key_digest(ds, "live")).exists(),
-                    "live owner survives"
-                );
-                erase();
-                assert_eq!(
-                    cache.durable_counters(source).unwrap().1.rec_orphans_erased,
-                    1,
-                    "no repeat credit"
-                );
-                assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+        for case in [
+            "consent",
+            "unreadable",
+            "failure",
+            "no-marker",
+            "key-absence",
+            "key-absence-failure",
+        ] {
+            let orphan = case.starts_with("key-absence");
+            // Committed-key absence is source-generic GC: one source covers it.
+            if orphan && source != SnapshotSource::ClaudeCode {
                 continue;
             }
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.extension().is_some_and(|ext| ext == "rec") {
-                    let bytes = std::fs::read(path).unwrap();
-                    assert!(!bytes
-                        .windows(b"syntheticpurgelabel".len())
-                        .any(|s| s == b"syntheticpurgelabel"));
+            let failure = case.ends_with("failure");
+            let root = crate::test_scratch::ScratchDir::new("skill-consent-save");
+            let lock = test_locks::hold(&root);
+            let ds = durable_source(source).unwrap();
+            let path = root.join("synthetic.jsonl");
+            if source == SnapshotSource::Pi {
+                std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"synthetic\"}\n").unwrap();
+            } else {
+                native_fixture(&path);
+            }
+            let scope = Scope("skill-consent".into());
+            let index_path = root.join("index.json");
+            let mut index = ScanIndex::default();
+            if orphan {
+                index.files.insert(
+                    "live".into(),
+                    serde_json::from_value(serde_json::json!({
+                        "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+                    }))
+                    .unwrap(),
+                );
+            }
+            index.save(&index_path).unwrap();
+            let before_index = std::fs::read(&index_path).unwrap();
+            let key = if case == "unreadable" {
+                [255; 32]
+            } else {
+                store::key_digest(ds, "synthetic")
+            };
+            let dir = store::store_dir_for_index(&index_path);
+            let marker = dir.with_extension("private-labels");
+            if case != "no-marker" {
+                let _on = crate::snapshots::RestartRestoreForTest::enabled();
+                let (mut reduction, _) = native_record_of(&path, &scope, source);
+                let acc = reduction.accumulator_for_test();
+                acc.note_provider_skill(Some("SyntheticPurgeLabel".into()));
+                if fork {
+                    acc.seen_pi_usage_keys = PiLedger::from_parts(
+                        BTreeMap::from([("11".repeat(32), PiUsageDedupState::default())]),
+                        true,
+                        Some(1),
+                    );
+                }
+                let body = codec::encode_permitted(
+                    &reduction,
+                    store::RECORD_BYTES,
+                    jsonl_line_cap() as u64,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(codec::body_has_skill_labels(source, &body), Ok(true));
+                let mut disk = DurableTailStore::new(dir.clone(), ds);
+                disk.mark_private_labels(lock, key).unwrap();
+                let record = PendingRecord {
+                    acquisition: fixture_acquisition(source),
+                    binding: Binding {
+                        source: ds,
+                        key,
+                        context: [1; 32],
+                        scope: [2; 32],
+                        entry: [0; 32],
+                    },
+                    certificate: certificate(&path, &scope),
+                    body,
+                    allowlist: codec::allowlist_digest(source),
+                };
+                let mut records = vec![record.clone()];
+                if orphan {
+                    let mut live = record;
+                    live.binding.key = store::key_digest(ds, "live");
+                    disk.mark_private_labels(lock, live.binding.key).unwrap();
+                    records.push(live);
+                }
+                disk.write_after_save(lock, index.generation, 0, records)
+                    .unwrap();
+            }
+            let _off = crate::snapshots::RestartRestoreForTest::disabled();
+            let cache = fixture::cache(source, &index_path, &scope, false);
+            cache.durable_skill_label_permission(source, true);
+            cache.durable_write_after_save(lock, source, &index);
+            if case == "unreadable" {
+                std::fs::remove_file(&marker).unwrap();
+                std::fs::create_dir(&marker).unwrap();
+                // The unknown-inventory fallback must advance past a full page
+                // of retained, content-free records to reach the labelled tail.
+                let empty = PendingRecord {
+                    acquisition: fixture_acquisition(source),
+                    binding: Binding {
+                        source: ds,
+                        key: [0; 32],
+                        context: [1; 32],
+                        scope: [2; 32],
+                        entry: [3; 32],
+                    },
+                    certificate: certificate(&path, &scope),
+                    body: codec::store_fixture_body(source, 0, 0),
+                    allowlist: codec::allowlist_digest(source),
+                };
+                for n in 0..store::INVENTORY_BOUND {
+                    let mut record = empty.clone();
+                    record.binding.key[24..].copy_from_slice(&(n as u64).to_be_bytes());
+                    let name: String = record
+                        .binding
+                        .key
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    let path = dir.join(format!("{name}.rec"));
+                    std::fs::write(&path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+                    std::fs::set_permissions(
+                        path,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .unwrap();
                 }
             }
-            assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+            if failure {
+                store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+                    Err(std::io::Error::other("erase failed"))
+                })));
+            }
+            let erase = || {
+                if orphan {
+                    cache.durable_gc(lock, source, &index).unwrap();
+                } else {
+                    cache.durable_skill_label_permission(source, false);
+                    cache.durable_write_after_save(lock, source, &index);
+                }
+            };
+            erase();
+            store::test_hooks::set_before_unlink(None);
+            if case == "unreadable" {
+                erase();
+            }
+            if case == "no-marker" {
+                // Ordinary OFF registration allocates no store or counters.
+                assert!(cache.durable_counters(source).is_none());
+                assert!(cache.durable.lock().unwrap().state.is_none());
+                assert!(!dir.exists());
+            } else {
+                let (counts, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.rec_orphans_erased, u64::from(orphan && !failure));
+                assert_eq!(
+                    counts.not_persisted.get("skill_label_scanned"),
+                    Some(&if case == "unreadable" {
+                        store::INVENTORY_BOUND as u64 + 1
+                    } else {
+                        1
+                    })
+                );
+                if failure {
+                    assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&0));
+                    assert_eq!(
+                        counts.not_persisted.get("skill_label_purge_failed"),
+                        Some(&1)
+                    );
+                    assert!(marker.exists());
+                    erase();
+                    assert_eq!(
+                        cache
+                            .durable_counters(source)
+                            .unwrap()
+                            .0
+                            .not_persisted
+                            .get("skill_label_purged"),
+                        Some(&1)
+                    );
+                }
+                let record_path = |key: store::Digest32| {
+                    dir.join(format!(
+                        "{}.rec",
+                        key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    ))
+                };
+                assert!(
+                    !record_path(key).exists(),
+                    "the exact erased digest is absent"
+                );
+                let (counts, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.rec_orphans_erased, u64::from(orphan));
+                assert!(counts
+                    .summary(source, &stats)
+                    .contains(&format!("rec_orphans_erased={}", u64::from(orphan))));
+                if orphan {
+                    assert!(
+                        record_path(store::key_digest(ds, "live")).exists(),
+                        "live owner survives"
+                    );
+                    erase();
+                    assert_eq!(
+                        cache.durable_counters(source).unwrap().1.rec_orphans_erased,
+                        1,
+                        "no repeat credit"
+                    );
+                    assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+                    continue;
+                }
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.extension().is_some_and(|ext| ext == "rec") {
+                        let bytes = std::fs::read(path).unwrap();
+                        assert!(!bytes
+                            .windows(b"syntheticpurgelabel".len())
+                            .any(|s| s == b"syntheticpurgelabel"));
+                    }
+                }
+                assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+            }
         }
     }
 }
@@ -8271,7 +8310,10 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                 } else {
                     codec::store_fixture_body(source, 0, 0)
                 };
-                assert_eq!(codec::body_has_skill_labels(&body).unwrap(), labelled);
+                assert_eq!(
+                    codec::body_has_skill_labels(source, &body).unwrap(),
+                    labelled
+                );
                 let mut pending = Vec::new();
                 let mut live = BTreeSet::new();
                 for n in 0..257 {
@@ -8376,7 +8418,7 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                     }
                     let first = disk
                         .purge_private_labels(owner.writer, |body| {
-                            codec::body_has_skill_labels(body).unwrap_or(true)
+                            codec::body_has_skill_labels(source, body).unwrap_or(true)
                         })
                         .unwrap();
                     assert_eq!(first.scanned, store::INVENTORY_BOUND as u64);
@@ -8384,7 +8426,7 @@ fn live_private_label_inventory_above_256_converges_without_purge_failure() {
                     assert_eq!(disk.private_label_keys().unwrap().unwrap().len(), 1);
                     let second = disk
                         .purge_private_labels(owner.writer, |body| {
-                            codec::body_has_skill_labels(body).unwrap_or(true)
+                            codec::body_has_skill_labels(source, body).unwrap_or(true)
                         })
                         .unwrap();
                     assert_eq!(second.scanned, 1);
@@ -8451,7 +8493,7 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
             let ((result, content_reads), samples) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     capture_rederive_reads(|| {
-                        cache.durable_restore_record_scoped(
+                        cache.restore_record_content(
                             source,
                             &record,
                             &expected,
@@ -8471,14 +8513,6 @@ fn quiet_restore_has_no_sample_or_content_input_before_decode_on_all_sources() {
                 cache.durable().unwrap().counters.restore_pending_quiet
                     [diagnostic_source_slot(source)],
                 1
-            );
-            assert_eq!(
-                cache
-                    .durable()
-                    .unwrap()
-                    .counters
-                    .rederive_failed_first_attempt,
-                [0; 3]
             );
             assert!(samples.is_empty());
             assert_eq!(content_reads, 0);
@@ -8592,9 +8626,9 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
 
 // F4: all certificate edit reasons dominate decode on the production scoped
 // entry. This portable row complements the macOS writer/retirement matrix.
-/// [format] bounded restore certificate edit reasons precede decode and count first failure.
+/// [format] bounded restore certificate edit reasons precede decode.
 #[test]
-fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failure() {
+fn bounded_restore_certificate_edit_reasons_precede_decode() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use std::io::{Seek, SeekFrom, Write};
     for reason in [
@@ -8666,7 +8700,7 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             namespace: &scope,
         };
         let (result, reads) = capture_rederive_reads(|| {
-            cache.durable_restore_record_scoped(
+            cache.restore_record_content(
                 source,
                 &record,
                 &expected,
@@ -8685,14 +8719,6 @@ fn bounded_restore_certificate_edit_reasons_precede_decode_and_count_first_failu
             "{reason:?}"
         );
         assert_eq!(reads, 0);
-        assert_eq!(
-            cache
-                .durable()
-                .unwrap()
-                .counters
-                .rederive_failed_first_attempt[1],
-            1
-        );
         lease.release();
     }
 }
@@ -8855,16 +8881,11 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
                 stores.counters.retire_exact_held.get(edge.label()),
                 Some(&2)
             );
-            assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         }
         assert!(rows
             .iter()
             .any(|r| r["counts"]["retire_exact_held"][edge.label()] == 1
                 && r["counts"]["retire_exact_held_exit"] == "revalidated_retire_exact"));
-        assert!(rows
-            .iter()
-            .any(|r| r["counts"]["retire_exact_held_first_attempt"] == 1
-                && r["process_id"] == std::process::id()));
         // Named exit: the next verified read re-establishes the same eligible
         // predecessor, then the existing post-save writer runs retire_exact.
         let current = {
@@ -8886,7 +8907,6 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
             stores.counters.ineligible.get("rederive_retire.retired"),
             Some(&1)
         );
-        assert_eq!(stores.counters.retire_exact_held_first_attempt, [0, 1, 0]);
         assert_eq!(stores.key_debt[&binding.key].retire_source, None);
         assert!(!stores.key_debt[&binding.key].retire_sync);
     }
@@ -11230,7 +11250,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
         .unwrap()
         .write_all(b"{}\n")
         .unwrap();
-    let restored = cache.durable_restore_record_scoped(
+    let restored = cache.restore_record_content(
         source,
         &record,
         &expected,
