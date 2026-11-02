@@ -2065,7 +2065,7 @@ fn structural_verifier_large_body_still_allocates_nothing() {
 
 fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
     take_l_spans();
-    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
+    let rederive = rederive_digests(&reduction.accumulator, HEAD_BOUND, line_cap()).unwrap();
     let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
     reduction.put(&mut old).unwrap();
     rederive.put(&mut old).unwrap();
@@ -2480,7 +2480,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
         let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
         for cycle in 0..2 {
             let (native, _) = full_read(&path, source);
-            let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
+            let digests = rederive_digests(&native.accumulator, HEAD_BOUND, line_cap()).unwrap();
             assert!(digests.first_prompt.is_some());
             assert!(digests.session_start.is_none());
             assert!(digests.agent_label.is_none());

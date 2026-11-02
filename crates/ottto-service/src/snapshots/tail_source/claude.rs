@@ -475,10 +475,10 @@ impl TailSource for Claude {
             }
             next = response.sequence + 1;
         }
-        let markers_in_order = acc
-            .claude_org_markers
-            .as_ref()
-            .is_none_or(|markers| markers.positions().all(|position| position <= total));
+        let markers_in_order = match acc.claude_org_markers.as_ref() {
+            Some(markers) => markers.positions().all(|position| position <= total),
+            None => true,
+        };
         let compactions_in_order = acc
             .claude_compaction_observations
             .iter()

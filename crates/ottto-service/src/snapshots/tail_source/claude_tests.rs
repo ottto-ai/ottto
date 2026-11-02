@@ -6,7 +6,6 @@ use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::state_v2::StagedFile;
-use crate::snapshots::*;
 use crate::transcript_acquisition::{ReadMode, Scope};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
