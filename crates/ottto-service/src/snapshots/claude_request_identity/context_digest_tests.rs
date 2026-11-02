@@ -204,6 +204,42 @@ fn scrub_drops_a_pending_change_and_remembers_a_blank_sentence() {
     assert!(blank.email_home(1).is_none());
 }
 
+/// SOURCE condition 1 with no sentence digest to clear: a blank no-key sentence
+/// or a lone marker leaves no position, and still no flip is trusted afterwards.
+/// One count per scrubbed parse.
+#[test]
+fn scrub_without_a_digest_still_makes_the_next_sentence_a_baseline() {
+    take_context_digest_scrubs_for_test();
+    for before in [
+        vec![sentence(""), org(ORG_1)],
+        vec![sentence("")],
+        vec![org(ORG_1)],
+    ] {
+        bind_session_context_key(None);
+        let mut markers = None;
+        for line in &before {
+            note_marker_line(&mut markers, line, 0);
+        }
+        assert!(bind_session_context_key(Some(&attribution(1))));
+        markers.as_mut().unwrap().scrub_context_digest();
+        assert_eq!(take_context_digest_scrubs_for_test(), 1);
+        note_marker_line(&mut markers, &org(ORG_1), 0);
+        note_marker_line(&mut markers, &sentence("one@example.invalid"), 1);
+        assert!(!markers.as_ref().unwrap().context_changed);
+        note_marker_line(&mut markers, &org(ORG_2), 1);
+        assert_eq!(
+            markers.as_ref().unwrap().verdict(1, false),
+            MarkerVerdict::UntrustedFlip
+        );
+    }
+    // The count reaches the page line's identity counts.
+    OrgMarkers::default().scrub_context_digest();
+    assert_eq!(
+        serde_json::to_value(take_identity_counts()).unwrap()["claude_context_digest_scrubs"],
+        1
+    );
+}
+
 /// A key change is reported, and it scrubs retained digests. A process's first
 /// bind is not one: no Claude parse can exist before it.
 #[test]

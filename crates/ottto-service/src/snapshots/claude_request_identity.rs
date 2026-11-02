@@ -2965,6 +2965,32 @@ pub(crate) fn note_marker_line(
     }
 }
 
+#[cfg(not(test))]
+static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_context_digest_scrubs<T>(
+    use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CONTEXT_DIGEST_SCRUBS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&CONTEXT_DIGEST_SCRUBS)
+    }
+}
+
+/// This thread's count only, so a test takes no other test's identity counts.
+#[cfg(test)]
+pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
+    with_context_digest_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVerdict<'m> {
     None,
@@ -2975,18 +3001,20 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
-    /// Ends comparison with sentences digested under another key, keeping the
-    /// markers and their earlier verdicts. A sentence seen earlier stays on
-    /// record, as position 0 if it was blank, so the next one is a fresh baseline
-    /// rather than a first sentence, and any email basis stays refused.
+    /// Ends comparison across a key change, keeping the markers and their
+    /// earlier verdicts. This state exists only once a sentence or marker was
+    /// read, so position 0 stands in when none was recorded: the next sentence
+    /// is a fresh baseline, never a first sentence, and any email stays refused.
     pub(crate) fn scrub_context_digest(&mut self) {
-        let sentence_seen =
-            self.context_digest.take().is_some() || self.context_flip_position.is_some();
+        self.context_digest = None;
         self.context_changed = false;
-        if sentence_seen && self.context_position.is_none() {
+        if self.context_position.is_none() {
             self.context_position = Some(0);
             self.context_flip_position = Some(0);
         }
+        with_context_digest_scrubs(|counter| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     /// Binds the registered-folder key once the item's path is known.
@@ -4399,6 +4427,9 @@ pub(crate) struct IdentityCounts {
     /// compare the sentence before it. At most what a key would have explained.
     #[serde(skip_serializing_if = "is_zero")]
     claude_no_key_flip_refusals: u64,
+    /// Retained Claude parses scrubbed on an attribution key change.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_context_digest_scrubs: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -4421,6 +4452,9 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
         claude_carry_skipped_incomplete_transcripts: incomplete,
+        claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
         claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
             counter.swap(0, std::sync::atomic::Ordering::Relaxed)
         }),

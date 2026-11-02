@@ -9497,7 +9497,9 @@ fn off_retired_body_clear_keeps_retained_parses_and_reads_nothing() {
 /// sentence differs, so a Full under the new key would trust that flip instead.
 #[test]
 fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
-    use crate::snapshots::claude_request_identity::{bind_session_context_key, MarkerVerdict};
+    use crate::snapshots::claude_request_identity::{
+        bind_session_context_key, take_context_digest_scrubs_for_test, MarkerVerdict,
+    };
     use base64::Engine as _;
     let attribution = |byte: u8| {
         crate::session_attribution::SessionAttributionContext::from_activity_hint(
@@ -9565,7 +9567,9 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
             assert!(parses > 0);
 
             assert!(bind_session_context_key(to.map(attribution).as_ref()));
+            take_context_digest_scrubs_for_test();
             owner.cache.scrub_retained_context_digests();
+            assert_eq!(take_context_digest_scrubs_for_test(), parses as u64);
             assert_eq!(retained(), parses);
             let ((index, _, _), bytes) = observe_consumed(|| scan(index));
             assert_eq!(bytes, 0);
