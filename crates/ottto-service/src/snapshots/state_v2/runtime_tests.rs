@@ -967,19 +967,17 @@ fn generation_and_capability_are_checked_before_external_effects() {
 fn another_graph_save_cannot_advance_a_stale_external_guard() {
     let f = Fixture::new();
     f.published();
-    let (mut first, load_events) =
-        crate::local_resource_diagnostics::capture(|| load_with(&f.path, false).unwrap().unwrap());
-    let load = &load_events.last().unwrap()["counts"]["latest"]["load_span"];
+    let mut first = load_with(&f.path, false).unwrap().unwrap();
+    let load = telemetry::take_thread_event_for_test("load_span").unwrap();
     assert!(load["duration_ms"].is_u64());
     assert_eq!(load["generation"], G);
     assert_eq!(load.as_object().unwrap().len(), 2);
     let second = load_with(&f.path, false).unwrap().unwrap();
     let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
     stale().unwrap();
-    let (saved, save_events) =
-        crate::local_resource_diagnostics::capture(|| save_with(&f.path, &mut first).unwrap());
+    let saved = save_with(&f.path, &mut first).unwrap();
     assert!(saved);
-    let save = &save_events.last().unwrap()["counts"]["latest"]["save_span"];
+    let save = telemetry::take_thread_event_for_test("save_span").unwrap();
     assert!(save["duration_ms"].is_u64());
     assert_eq!(save["outcome"], "committed");
     assert_eq!(save["generation"], G + 1);
