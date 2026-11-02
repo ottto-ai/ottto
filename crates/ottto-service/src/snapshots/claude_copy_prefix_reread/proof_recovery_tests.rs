@@ -355,6 +355,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,
                 census_window_end: SCAN_AT,
+                held_index_keys: &Default::default(),
                 complete: true,
                 lossy: false,
                 source_verified: false,
