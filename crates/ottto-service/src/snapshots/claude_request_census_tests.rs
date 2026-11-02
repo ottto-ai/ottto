@@ -383,7 +383,6 @@ fn census_scan(root: &Path, index: &mut ScanIndex, collected_at: &str) -> Source
         collected_at,
         365,
         1_000,
-        true,
     )
     .expect("scan synthetic Claude corpus")
 }
@@ -1386,7 +1385,6 @@ fn census_failed_read_invalidates_old_record() {
         SECOND_WINDOW,
         365,
         100,
-        true,
         None,
         &[],
         false,
@@ -1935,7 +1933,6 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
             FIRST_WINDOW,
             365,
             1_000,
-            true,
             None,
             &[],
             false,

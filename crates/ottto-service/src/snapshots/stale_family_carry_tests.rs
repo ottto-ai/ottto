@@ -1808,7 +1808,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
                 Some(&CodexTitleMetadata::default()),
                 None,
                 None,
-                false,
             )
             .unwrap();
             assert_eq!(
@@ -2007,7 +2006,6 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
                 Some(&CodexTitleMetadata::default()),
                 None,
                 None,
-                false,
             )
             .unwrap();
             assert_eq!(
@@ -3544,7 +3542,8 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         match case {
             "ledger" => fixture.index.accepted_snapshot_fingerprint_ledger_version = 0,
             "upload_context" => {
-                fixture.index.active_upload_context_fingerprint = Some("changed".into())
+                fixture.index.active_upload_context_fingerprint = Some("changed".into());
+                fixture.index.active_acquisition_context = Some("changed".into());
             }
             _ => (),
         }
@@ -3868,7 +3867,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         CARRY_RETRY,
         BACKFILL_WINDOW_DAYS,
         1,
-        false,
         None,
         &[],
         false,
@@ -3901,7 +3899,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         CARRY_SECOND_RETRY,
         BACKFILL_WINDOW_DAYS,
         1,
-        false,
         None,
         &[],
         false,
@@ -4445,7 +4442,10 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
             reads.push(candidate.path.clone());
         }
     }
-    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| reads.contains(&candidate.path))
+    {
         index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
     }
     reads

@@ -589,7 +589,7 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
 /// ownership row, so each added request carries one; the row's own traces
 /// are kept, so its ownership cases are unchanged.
 #[cfg(unix)]
-fn second_account(c: &Corpus, path: &Path) {
+pub(super) fn second_account(c: &Corpus, path: &Path) {
     fn rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
         let path = c
             .support
@@ -625,7 +625,9 @@ fn second_account(c: &Corpus, path: &Path) {
 
 /// The page's real upload with ACK, as the placement oracle reads it.
 #[cfg(unix)]
-fn routed(page: &Page) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+pub(super) fn routed(
+    page: &Page,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
     use crate::snapshots::sampled_scan::transition_fixture::{Mode, RouteResult};
     let mut progress = e2_progress();
     progress

@@ -49,7 +49,7 @@ fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlPa
     } else {
         apply_claude_code_line
     };
-    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
+    OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
 }
 
 struct ClearPreparationFault;
@@ -266,7 +266,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -447,7 +446,6 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -1348,7 +1346,6 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -2149,7 +2146,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     "2026-10-20T12:00:00Z",
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     false,
@@ -2460,7 +2456,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     "2026-10-20T12:00:00Z",
                     365,
                     100,
-                    false,
                     Some(&root),
                     &[],
                     false,
@@ -2788,7 +2783,6 @@ pub(super) fn known_corrupt_scan(
         at,
         365,
         100,
-        false,
         Some(support),
         &[],
         false,
@@ -3798,7 +3792,6 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         None,
         None,
         None,
-        false,
     )
     .unwrap();
     let taken = cache
@@ -3899,7 +3892,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
             at,
             365,
             100,
-            false,
             None,
             &[],
             false,
@@ -4272,7 +4264,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     at,
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     rediscover,
@@ -4919,7 +4910,6 @@ fn a1a_scan_at(
             at,
             183,
             100,
-            false,
             Some(support),
             &[],
             false,
@@ -4977,7 +4967,6 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
                     "2026-08-02T08:00:00Z",
                     183,
                     100,
-                    false,
                     Some(&disk.root),
                     &[],
                     false,
@@ -5775,7 +5764,6 @@ fn b1g_owned(
             "2026-08-02T08:00:00Z",
             183,
             100,
-            false,
             Some(root),
             &[],
             false,
@@ -6533,7 +6521,6 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
                     "2026-10-29T12:00:00Z",
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     false,
@@ -6742,7 +6729,6 @@ impl O3Fixture {
             at,
             days,
             100,
-            false,
             Some(&self.root),
             &[],
             false,
@@ -7004,7 +6990,6 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
             "2026-10-29T12:00:00Z",
             365,
             100,
-            false,
             None,
             &[],
             false,
@@ -7212,7 +7197,6 @@ fn b4_structural_transition(near_cap: bool) {
                 at,
                 1,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -7499,7 +7483,6 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
                 at,
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -8002,7 +7985,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 None,
                 None,
                 None,
-                false,
             )
             .unwrap();
             codex_counting_version::configure_group_once(
@@ -10956,7 +10938,6 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 at,
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -11908,7 +11889,6 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             None,
             None,
             None,
-            false,
         )
         .unwrap();
         codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));

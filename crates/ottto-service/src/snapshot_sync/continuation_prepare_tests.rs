@@ -252,7 +252,9 @@ pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
 pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation {
     let fixture = ContinuationFixture::quiescent("continuation-mint-realistic");
     for n in 0..120 {
-        let schedule = fixture.home.join(format!(".codex/automations/schedule-{n}"));
+        let schedule = fixture
+            .home
+            .join(format!(".codex/automations/schedule-{n}"));
         std::fs::create_dir_all(&schedule).unwrap();
         std::fs::write(
             schedule.join("automation.toml"),
@@ -416,9 +418,10 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    activate_source_upload_context(
+    activate_source_contexts(
         source,
         cycle_upload_context(minted.upload_policy, checkpoint.as_deref(), false),
+        cycle_acquisition_context(false, false, false),
         &mut index,
         &mut progress,
     );
@@ -773,7 +776,10 @@ fn ordinary_durable_continuation_to_eof(
         false,
     );
     let (_, mut index) = fixture.load();
-    index.activate_upload_context(cycle_upload_context(inputs.upload_policy, None, false));
+    index.activate_cycle_contexts(
+        cycle_upload_context(inputs.upload_policy, None, false),
+        cycle_acquisition_context(false, false, false),
+    );
 
     index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
         SnapshotSource::Codex,
@@ -796,7 +802,6 @@ fn ordinary_durable_continuation_to_eof(
             &at,
             30,
             10,
-            false,
             None,
             &[],
             false,
@@ -866,11 +871,10 @@ fn ordinary_durable_continuation_to_eof(
                     );
                     let (mut index, scan) = state.finish_ordinary_eof(|| {
                         let mut index = ScanIndex::load(&fixture.index_path).unwrap();
-                        index.activate_upload_context(cycle_upload_context(
-                            inputs.upload_policy,
-                            None,
-                            false,
-                        ));
+                        index.activate_cycle_contexts(
+                            cycle_upload_context(inputs.upload_policy, None, false),
+                            cycle_acquisition_context(false, false, false),
+                        );
 
                         index.activate_effective_upload_body_witness_revision(
                             cycle_body_witness_revision(SnapshotSource::Codex),
@@ -882,7 +886,6 @@ fn ordinary_durable_continuation_to_eof(
                             &at,
                             30,
                             10,
-                            false,
                             None,
                             &[],
                             false,

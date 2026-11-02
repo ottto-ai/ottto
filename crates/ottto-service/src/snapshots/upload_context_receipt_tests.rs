@@ -1,6 +1,8 @@
 //! Synthetic production-scanner and exact entity-ACK fixtures. No live inputs.
 use super::*;
 use upload_context_receipt::{Candidate, RearmCounts};
+#[path = "privacy_flip_tests.rs"]
+mod privacy_flip;
 #[path = "upload_context_released_entry_fixture.rs"]
 mod released;
 
@@ -81,7 +83,6 @@ impl Fixture {
             "2026-10-29T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
             file_limit,
-            false,
             None,
             &[],
             false,
@@ -1047,17 +1048,14 @@ fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
     let original = f.index.quarantined_snapshot_fingerprints.clone();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
+    // A context change alone reassesses a held body at its deadline, not early.
     let (scan, _) = f.walk(true);
-    assert_eq!(
-        scan.scanned_file_count, 1,
-        "changed policy can repair a refusal"
-    );
-    assert!(!scan.snapshots.is_empty());
+    assert_eq!(scan.scanned_file_count, 0, "a held body stays held");
     let rebound = crate::snapshot_sync::upload_context_receipt_tests::reproject_context_refusal(
         f.source,
         &"d".repeat(64),
         original.clone(),
-        &scan.snapshots,
+        &items,
     );
     for (entity, record) in &rebound {
         assert_eq!(record.disposition, original[entity].disposition);

@@ -960,7 +960,6 @@ fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> Owned
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -1721,7 +1720,6 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             Some(&support),
             &[],
             false,
@@ -1805,7 +1803,6 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             Some(&support),
             &[],
             false,
@@ -3050,7 +3047,6 @@ fn hinted_page_limited(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         limit,
-        false,
         None,
         hints,
         false,
@@ -3261,7 +3257,6 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[fixture.file(SESSION_B)],
         false,
@@ -3489,7 +3484,6 @@ fn selected_page(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10000,
-        false,
         None,
         hints,
         false,
@@ -6837,6 +6831,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
     );
     let mut context = with_receipt(receipt("priority"));
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
+    context.active_acquisition_context = Some("another-upload-context".into());
     assert_ne!(reference, digest(&context, &codex, 1), "upload context");
     let flags: [fn(&mut CodexTitleMetadata); 3] = [
         |codex| {
@@ -7289,7 +7284,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
             NOW,
             365,
             10,
-            false,
             None,
             &[],
             false,
@@ -10660,7 +10654,6 @@ fn continuation_page_in(
         collected_at,
         days,
         10,
-        false,
         ordinary,
         carried(root),
     );
@@ -10830,7 +10823,6 @@ fn continuation_prepares_no_group_attempt() {
                 AT,
                 7,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -11327,7 +11319,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -11454,7 +11445,6 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 NOW,
                 BACKFILL_WINDOW_DAYS,
                 10,
-                false,
                 Some(secs(600)),
                 carried(&fixture.root),
             )

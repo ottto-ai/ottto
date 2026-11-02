@@ -95,7 +95,6 @@ impl E2ScanFixture {
             "2026-08-02T08:00:00Z",
             183,
             limit,
-            false,
             Some(support),
             hints,
             false,
@@ -137,7 +136,6 @@ impl E2ScanFixture {
             "2026-10-27T08:00:00Z",
             183,
             100,
-            false,
             Some(support),
             &[],
             false,
@@ -329,7 +327,7 @@ pub(crate) fn parse_ordinary(
     at: &str,
     fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
-    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default(), true)
+    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default())
 }
 
 pub(super) fn parse_ordinary_with_metadata(
@@ -337,7 +335,6 @@ pub(super) fn parse_ordinary_with_metadata(
     at: &str,
     fingerprint: String,
     metadata: &ClaudeTitleMetadata,
-    artifacts: bool,
 ) -> Result<Vec<SnapshotItem>> {
     let mut file = File::open(path)?;
     let opened = opened_object_identity(SnapshotSource::ClaudeCode, &mut file)?;
@@ -349,7 +346,6 @@ pub(super) fn parse_ordinary_with_metadata(
         None,
         None,
         None,
-        artifacts,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

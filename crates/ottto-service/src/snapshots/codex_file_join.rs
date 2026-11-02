@@ -991,6 +991,14 @@ impl AppliedTierReceipt {
         }
         bytes.0
     }
+    /// A privacy-only scope difference: the record digests and tiers it proves
+    /// have no policy input, so only the scope moves to the acquisition context.
+    pub(super) fn scope_in(&self, closure: &upload_context_receipt::ContextClosure) -> bool {
+        closure.admits_active(&self.scope)
+    }
+    pub(super) fn adopt_scope(&mut self, acquisition: &str) {
+        self.scope = acquisition.to_owned();
+    }
     pub(super) fn covered_by(&self, previous: &Self) -> bool {
         self.version == previous.version
             && self.derivation == previous.derivation
@@ -2003,14 +2011,12 @@ pub(super) mod tests {
             metadata: &metadata,
             traces,
             ledgers: None,
-            artifacts: false,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
             metadata: &metadata,
             attribution: None,
-            artifacts: false,
             live_scope: &no_scope,
         };
         for _ in 0..10_000 {
@@ -2258,7 +2264,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             limit,
-            false,
             None,
             &[],
             false,
@@ -2625,7 +2630,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2803,7 +2807,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2836,7 +2839,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2931,7 +2933,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -3034,7 +3035,6 @@ pub(super) mod tests {
             RETAINED_AT,
             7,
             10,
-            false,
             None,
             hints,
             false,
@@ -3404,7 +3404,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             3,
-            false,
             None,
             &[],
             false,
@@ -3980,7 +3979,6 @@ pub(super) mod tests {
                 None,
                 traces.clone(),
                 None,
-                false,
                 None,
             )
             .unwrap();
@@ -4055,7 +4053,6 @@ pub(super) mod tests {
                 metadata: &metadata,
                 traces: None,
                 ledgers: None,
-                artifacts: false,
                 index: &previous,
             })
             .unwrap();
@@ -4063,7 +4060,6 @@ pub(super) mod tests {
         let inputs = StepInputs {
             metadata: &metadata,
             attribution: Some(&context),
-            artifacts: false,
             live_scope: &no_scope,
         };
         let (mut steps, mut yields) = (0, 0);

@@ -159,7 +159,6 @@ fn identity_pipeline_cycle(
             preparation.backfill_pending,
         ),
         MAX_BACKFILL_FILES_PER_SOURCE,
-        preparation.upload_policy.session_artifacts_enabled,
         Some(&support),
         &[],
         false,

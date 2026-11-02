@@ -404,8 +404,8 @@ impl WindowEligibility {
                         && entry.scan_identity_version.as_deref()
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
-                }) && skip.upload_context == index.active_upload_context_fingerprint
-                    && !index.file_upload_context_requires_adoption(key)
+                }) && skip.upload_context == index.active_acquisition_context
+                    && !index.file_context_read_owed(key)
                     && !index.confirmed_empty_files.contains(key)
                     && !index.terminal_jsonl_dispositions.contains_key(key)
                     && !index.claude_account_deferred_holds.contains_key(key)
@@ -844,7 +844,7 @@ impl NativePhase {
             extra.add(window.len())?;
             extra.add(
                 index
-                    .active_upload_context_fingerprint
+                    .active_acquisition_context
                     .as_ref()
                     .map_or(0, String::len),
             )?;
@@ -1181,8 +1181,8 @@ impl NativePhase {
             || entry.last_snapshot_fingerprint.is_none()
             || entry.rearmed()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
-            || index.active_upload_context_fingerprint.is_none()
-            || index.file_upload_context_requires_adoption(&key)
+            || index.active_acquisition_context.is_none()
+            || index.file_context_read_owed(&key)
         {
             return;
         }
@@ -1193,7 +1193,7 @@ impl NativePhase {
                 member,
                 revision: candidate.source_file_fingerprint.clone(),
                 census_window_end: census_window_end.to_owned(),
-                upload_context: index.active_upload_context_fingerprint.clone(),
+                upload_context: index.active_acquisition_context.clone(),
                 candidate: candidate.clone(),
             },
         );
@@ -1629,7 +1629,7 @@ impl NativePhase {
                     && skip.census_window_end == census_window_end
                     && index.files.get(&key).is_some_and(|entry| {
                         entry.observed_fingerprint() == skip.revision
-                            && skip.upload_context == index.active_upload_context_fingerprint
+                            && skip.upload_context == index.active_acquisition_context
                     })
                     && retained
                         .member_request_id_fingerprints

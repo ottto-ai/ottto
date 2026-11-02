@@ -103,7 +103,6 @@ fn page(
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,

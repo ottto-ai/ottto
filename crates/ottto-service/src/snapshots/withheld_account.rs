@@ -221,7 +221,7 @@ impl ScanIndex {
                 &self
                     .active_effective_upload_body_witness_revision
                     .to_string(),
-                self.active_upload_context_fingerprint
+                self.active_acquisition_context
                     .as_deref()
                     .unwrap_or("\0none"),
             ]);

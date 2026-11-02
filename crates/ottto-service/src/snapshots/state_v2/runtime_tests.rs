@@ -1940,7 +1940,6 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
             "2050-10-31T12:00:00Z",
             30,
             10,
-            false,
         )
         .unwrap()
     };
@@ -2019,7 +2018,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                     &at(now),
                     30,
                     10,
-                    false,
                 )
                 .unwrap();
             }
@@ -2030,7 +2028,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                 &at(now),
                 30,
                 10,
-                false,
                 None,
                 &[],
                 false,

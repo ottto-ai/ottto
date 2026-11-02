@@ -112,7 +112,6 @@ fn cold_full(root: &PathBuf, now: &str, index: ScanIndex) -> (ScanIndex, SourceS
         now,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,

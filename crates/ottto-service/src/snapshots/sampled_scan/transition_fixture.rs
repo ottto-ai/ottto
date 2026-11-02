@@ -1701,7 +1701,7 @@ pub(crate) mod native_cold {
         file: std::fs::File,
         apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     ) -> OwnedJsonlParser {
-        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
     }
     pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,

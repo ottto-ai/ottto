@@ -123,3 +123,8 @@ text, paths or raw identifiers; types holding local-only text don't derive `Debu
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
 Erasure (consent off, retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+
+Local collection never depends on an upload toggle. Reuse of acquired bytes binds an acquisition
+context that excludes the policy and the attribution key; delivery proofs keep the full upload
+context. A toggle flip therefore owes delivery on the next read of a file and forces no read: what
+the server holds changes from then on, not retroactively.

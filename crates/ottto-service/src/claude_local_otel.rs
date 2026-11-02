@@ -2990,7 +2990,6 @@ mod tests {
             "2026-08-02T22:05:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             10,
-            false,
         )
         .unwrap();
         assert!(!scan.snapshots.is_empty());

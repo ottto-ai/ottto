@@ -85,7 +85,6 @@ fn scan(root: &Path, index: &mut ScanIndex, context: &str, revision: u64) -> Sou
         COLLECTED_AT,
         BACKFILL_WINDOW_DAYS,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        true,
     )
     .unwrap()
 }
@@ -395,7 +394,6 @@ fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
             COLLECTED_AT,
             BACKFILL_WINDOW_DAYS,
             PAGE_FILES,
-            true,
         )
         .unwrap();
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, index);
@@ -1328,7 +1326,6 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
             &at,
             BACKFILL_WINDOW_DAYS,
             2,
-            true,
         )
         .unwrap();
         let window = result.census_window_end.clone();

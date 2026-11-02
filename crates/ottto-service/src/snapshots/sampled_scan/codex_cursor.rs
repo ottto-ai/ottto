@@ -1200,7 +1200,7 @@ pub(in crate::snapshots) fn group_scope(index: &ScanIndex) -> String {
         SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
         index
-            .active_upload_context_fingerprint
+            .active_acquisition_context
             .as_deref()
             .unwrap_or("none"),
         index
@@ -5948,9 +5948,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.claude,
             context.support,
         )
-        .map(|dependency| {
-            sampling.file_scope(context.source, &job.candidate, &dependency, true, index)
-        })
+        .map(|dependency| sampling.file_scope(context.source, &job.candidate, &dependency, index))
     });
     // A group's counting view is built over every member.
     let counting = job_counting_view(&job, index);
@@ -6792,7 +6790,7 @@ pub(in crate::snapshots) fn memo_digest(
         &stamp.dev.to_string(),
         &stamp.ino.to_string(),
         index
-            .active_upload_context_fingerprint
+            .active_acquisition_context
             .as_deref()
             .unwrap_or("none"),
         counting,

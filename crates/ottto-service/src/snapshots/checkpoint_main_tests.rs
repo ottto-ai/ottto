@@ -71,7 +71,6 @@ fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
         "2026-08-20T10:02:00Z",
         183,
         1,
-        false,
     )
     .unwrap();
     let main_context = main_context_fingerprint_reference(

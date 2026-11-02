@@ -72,11 +72,72 @@ pub(crate) struct ProofState {
     replay_generation: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+    /// The attribution key namespace last active: attribution off leaves no
+    /// active namespace to recognise the receipts it wrote. One-way digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_attribution_namespace: Option<String>,
 }
 
 impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
         self.inputs.is_none() && self.entity_stamps.is_empty()
+    }
+}
+
+/// This pass's delivery contexts that differ from the active one only by
+/// privacy: all upload policies, this pass's cache and copy modes, and the key
+/// namespaces a toggle can move between. RAM only. Anything else, including a
+/// demonstrated key change, is never in it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextClosure {
+    /// Every mode form of a base context (U: `same_copy_prefix_base`) and the
+    /// base it belongs to.
+    families: BTreeMap<String, usize>,
+    /// The form this pass's mode gives each base.
+    active: BTreeSet<String>,
+}
+
+impl ContextClosure {
+    pub(crate) fn add_base(&mut self, base: String, claude: bool, copy_unproven: bool) {
+        let family = self.families.len();
+        let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+        let wire_on = crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
+        self.active.insert(if !claude {
+            base.clone()
+        } else if copy_unproven {
+            wire_on.clone()
+        } else {
+            local_on.clone()
+        });
+        if claude {
+            self.families.insert(local_on, family);
+            self.families.insert(wire_on, family);
+        }
+        self.families.insert(base, family);
+    }
+
+    pub(super) fn admits_active(&self, context: &str) -> bool {
+        self.active.contains(context)
+    }
+
+    pub(super) fn active_forms(&self) -> impl Iterator<Item = &str> {
+        self.active.iter().map(String::as_str)
+    }
+
+    /// Forms exactly as `proof_context_matches`: an unaffected Claude file
+    /// accepts every mode form of its base, any other file only the active one.
+    fn admits_receipt(&self, context: &str, unaffected: bool) -> bool {
+        if unaffected {
+            self.families.contains_key(context)
+        } else {
+            self.admits_active(context)
+        }
+    }
+
+    fn same_family(&self, left: &str, right: &str) -> bool {
+        self.families
+            .get(left)
+            .is_some_and(|family| self.families.get(right) == Some(family))
     }
 }
 
@@ -90,6 +151,8 @@ pub(crate) struct OwedCounts {
     pub wrong_context_bytes: u64,
     pub empty_pending_files: u64,
     pub empty_pending_bytes: u64,
+    /// Owed files that owe no read: they pay on their next ordinary read.
+    pub privacy_only_files: u64,
 }
 
 const OWED_LOG_INTERVAL_SECONDS: u64 = 3_600;
@@ -195,9 +258,38 @@ impl RearmCounts {
     }
 }
 
+/// Measured after install: always scraping links has no cap, so its cost is
+/// watched instead. Counts only.
+static LINK_SCRAPE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_link_scrape_bytes(bytes: usize) {
+    LINK_SCRAPE_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn emit_link_scrape_bytes() {
+    let bytes = LINK_SCRAPE_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if bytes > 0 {
+        crate::local_resource_diagnostics::traversal_point(
+            "session_link_scrape",
+            "unknown",
+            &BTreeMap::from([("bytes", bytes)]),
+        );
+    }
+}
+
 impl ScanIndex {
+    #[cfg(test)]
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
-        self.activate_upload_context(context);
+        self.activate_file_contexts(source, context.clone(), context);
+    }
+
+    pub(crate) fn activate_file_contexts(
+        &mut self,
+        source: SnapshotSource,
+        delivery: String,
+        acquisition: String,
+    ) {
+        self.activate_cycle_contexts(delivery, acquisition);
         self.activate_quarantine_witness(source);
     }
 
@@ -312,6 +404,96 @@ impl ScanIndex {
         !self.receipt_matches(key, entry)
     }
 
+    /// The selection and "is this file current" gate: a file whose only debt is
+    /// a privacy difference owes no read. It pays on its next ordinary read.
+    pub(super) fn file_context_read_owed(&self, key: &str) -> bool {
+        self.file_upload_context_requires_adoption(key) && !self.privacy_only_debt(key)
+    }
+
+    /// The file's receipt proves these exact bytes and bodies under a context
+    /// differing only by privacy, and no entity it covers was sent since under
+    /// another one. A file that fails any of this selects as before.
+    fn privacy_only_debt(&self, key: &str) -> bool {
+        let (Some(closure), Some(entry)) =
+            (self.upload_context_closure.as_ref(), self.files.get(key))
+        else {
+            return false;
+        };
+        let Some(receipt) = entry.upload_context_receipt.as_ref() else {
+            return false;
+        };
+        let context = receipt.context_fingerprint.as_str();
+        receipt.replay_generation == RECEIPT_REPLAY_EPOCH
+            && receipt.source_witness == entry.source_file_fingerprint
+            && (self.confirmed_empty_files.contains(key)
+                || entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness))
+            && closure.admits_receipt(context, self.unaffected_file(key))
+            && self
+                .file_snapshot_fingerprints
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter_map(|entity| self.upload_context_proof.entity_stamps.get(entity))
+                .all(|stamp| closure.same_family(&stamp.context_fingerprint, context))
+    }
+
+    /// Prepare only, before the first compare: tier receipts and archive
+    /// contexts a privacy-only difference left under a delivery context bind
+    /// the acquisition context from now on. Anything else stays a mismatch.
+    pub(crate) fn adopt_acquisition_context(
+        &mut self,
+        closure: &ContextClosure,
+        acquisition: &str,
+    ) {
+        self.adopt_archive_contexts(closure, acquisition);
+        let owed = self
+            .files
+            .iter()
+            .filter(|(_, entry)| {
+                [
+                    &entry.codex_captured_tier_receipt,
+                    &entry.codex_applied_tier_receipt,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|receipt| receipt.scope_in(closure))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in owed {
+            let Some(entry) = self.files.get_mut(&key) else {
+                continue;
+            };
+            for receipt in [
+                &mut entry.codex_captured_tier_receipt,
+                &mut entry.codex_applied_tier_receipt,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if receipt.scope_in(closure) {
+                    receipt.adopt_scope(acquisition);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn last_attribution_namespace(&self) -> Option<&str> {
+        self.upload_context_proof
+            .last_attribution_namespace
+            .as_deref()
+    }
+
+    pub(crate) fn note_attribution_namespace(&mut self, namespace: Option<&str>) {
+        if let Some(namespace) = namespace {
+            self.upload_context_proof.last_attribution_namespace = Some(namespace.to_owned());
+        }
+    }
+
+    pub(crate) fn set_upload_context_closure(&mut self, closure: Arc<ContextClosure>) {
+        self.upload_context_closure = Some(closure);
+    }
+
     /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries
     /// THIS file's receipt to the new revision instead of re-sending the same
     /// accepted bodies. The caller found a complete parse of the new revision
@@ -421,7 +603,11 @@ impl ScanIndex {
                                 .quarantined_snapshot_fingerprints
                                 .get(entity)
                                 .is_some_and(|record| {
-                                    self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                    self.active_quarantine_witness
+                                        .as_ref()
+                                        .is_some_and(|active| {
+                                            record.witness.same_retry_contract_any_context(active)
+                                        })
                                         && !self.quarantine_retry_selects_file(entity, &key)
                                 })
                     })
@@ -790,6 +976,7 @@ impl ScanIndex {
             if members.is_empty() || self.receipt_matches(key, entry) {
                 continue;
             }
+            counts.privacy_only_files += u64::from(self.privacy_only_debt(key));
             let owed = members.iter().filter(|fp| !stamped(fp.as_str())).count() as u64;
             if receipt.is_some_and(|receipt| {
                 !receipt.body_witness.is_empty() && receipt.context_fingerprint != *expected
@@ -823,6 +1010,7 @@ impl ScanIndex {
             return;
         }
         OWED_LOGGED_AT[slot].store(now, Relaxed);
+        emit_link_scrape_bytes();
         crate::local_resource_diagnostics::traversal_point(
             "upload_context_owed",
             source.api_slug(),
@@ -833,6 +1021,7 @@ impl ScanIndex {
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness);
 crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
-crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, last_attribution_namespace);
+crate::heap_layout_bound::fields!(ContextClosure; families, active);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);

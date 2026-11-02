@@ -466,7 +466,6 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
                 "2026-10-06T10:06:00Z",
                 30,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                false,
             )
             .unwrap();
             assert!(scan.snapshots.is_empty());

@@ -685,11 +685,10 @@ impl Context {
         source: SnapshotSource,
         candidate: &CandidateFile,
         sidecar: &str,
-        artifacts: bool,
         index: &ScanIndex,
     ) -> Scope {
         Scope(sha256_hex(&[
-            "sampled_native_reduction:v1",
+            "sampled_native_reduction:v2",
             &self.namespace.0,
             source.api_slug(),
             source.parser_version(),
@@ -697,15 +696,10 @@ impl Context {
             &local_index_key(&candidate.scan_root),
             &local_index_key(&candidate.path),
             sidecar,
-            if artifacts {
-                "artifacts"
-            } else {
-                "no_artifacts"
-            },
             // Retired full context-curve upload: keeps the scope bytes.
             "no_curve",
             index
-                .active_upload_context_fingerprint
+                .active_acquisition_context
                 .as_deref()
                 .unwrap_or("none"),
             index
@@ -2316,7 +2310,6 @@ pub(super) struct ParserOptions<'a> {
     pub(super) metadata: &'a CodexTitleMetadata,
     pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    pub(super) artifacts: bool,
     pub(super) identity_capture: bool,
     pub(super) cache: Option<&'a Arc<SharedCache>>,
 }
@@ -2332,7 +2325,6 @@ pub(super) fn new_source_parser(
         metadata,
         traces,
         parents,
-        artifacts,
         identity_capture,
         cache,
     } = options;
@@ -2379,7 +2371,6 @@ pub(super) fn new_source_parser(
         (source == SnapshotSource::Codex).then_some(metadata),
         traces,
         parents,
-        artifacts,
     )?;
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
@@ -2398,10 +2389,7 @@ pub(super) fn configure_tier_replay(
     parser.accumulator.codex_tier_replay = Some(codex_file_join::TierReplay::new(
         previous.0,
         previous.1,
-        index
-            .active_upload_context_fingerprint
-            .clone()
-            .unwrap_or_default(),
+        index.active_acquisition_context.clone().unwrap_or_default(),
     ));
 }
 

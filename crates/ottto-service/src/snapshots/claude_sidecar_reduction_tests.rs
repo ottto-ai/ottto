@@ -166,7 +166,6 @@ fn raw_scan_at(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         100,
-        false,
         Some(&fixture.support),
         &[],
         false,
@@ -643,6 +642,7 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
     f.evidence(1);
     let cached = raw_scan(&f, prior, Some(cache), |scan| {
         scan.index.active_upload_context_fingerprint = Some("changed-after-start".into());
+        scan.index.active_acquisition_context = Some("changed-after-start".into());
     });
     assert!(cached.result.snapshots.is_empty());
     assert!(!cached.result.census_complete);
@@ -1533,7 +1533,6 @@ mod durable_restart {
             COLLECTED,
             BACKFILL_WINDOW_DAYS,
             100,
-            false,
             Some(&f.support),
             &[],
             false,

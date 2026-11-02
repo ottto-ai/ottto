@@ -580,9 +580,7 @@ pub(super) fn equality_skip(
     decision_calls: &mut u64,
 ) -> bool {
     let key = local_index_key(&candidate.path);
-    if candidate.source_file_fingerprint.is_empty()
-        || index.file_upload_context_requires_adoption(&key)
-    {
+    if candidate.source_file_fingerprint.is_empty() || index.file_context_read_owed(&key) {
         return false;
     }
     *decision_calls += 1;

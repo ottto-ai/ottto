@@ -691,7 +691,6 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         "2026-10-22T00:00:00Z",
         BACKFILL_WINDOW_DAYS,
         4,
-        false,
     )
     .unwrap();
     scan.snapshots = vec![snapshot];
@@ -1986,7 +1985,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 "2026-10-22T00:01:00Z",
                 BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
                 None,
                 &[],
                 false,
@@ -2030,7 +2028,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     "2026-10-22T00:01:00Z",
                     BACKFILL_WINDOW_DAYS,
                     MAX_BACKFILL_FILES_PER_SOURCE,
-                    true,
                     None,
                     &[],
                     false,
@@ -2124,7 +2121,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                         "2026-10-22T00:03:00Z",
                         BACKFILL_WINDOW_DAYS,
                         MAX_BACKFILL_FILES_PER_SOURCE,
-                        true,
                         None,
                         &[],
                         false,

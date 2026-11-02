@@ -30,7 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
@@ -46,7 +45,6 @@ pub(in crate::snapshots) fn new_group_parser(
         Some(metadata),
         traces,
         ledgers,
-        artifacts,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
@@ -231,10 +229,7 @@ crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wak
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
-        let receipt_scope = index
-            .active_upload_context_fingerprint
-            .clone()
-            .unwrap_or_default();
+        let receipt_scope = index.active_acquisition_context.clone().unwrap_or_default();
         let mut previous_receipts = BTreeMap::new();
         let mut legacy_expected = BTreeMap::new();
         for member in &group.members {
@@ -636,7 +631,6 @@ impl GroupBoot {
             inputs.metadata,
             inputs.traces.clone(),
             inputs.ledgers.clone(),
-            inputs.artifacts,
         )?;
         let mut parser = new_group_parser(
             file,
@@ -644,7 +638,6 @@ impl GroupBoot {
             inputs.metadata,
             inputs.traces,
             inputs.ledgers,
-            inputs.artifacts,
             evidence,
         )
         .map_err(|_| GroupEnd::Strict)?;
@@ -717,7 +710,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    pub(in crate::snapshots) artifacts: bool,
     pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
@@ -747,7 +739,6 @@ fn legacy_tee(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
     refuse_compressed_codex(
         Some(&member.path),
@@ -767,7 +758,6 @@ fn legacy_tee(
         Some(metadata),
         traces,
         ledgers,
-        artifacts,
     )
     .map(|tee| Some(Box::new(tee)))
     .map_err(|_| GroupEnd::Strict)
@@ -899,7 +889,6 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
-    pub(in crate::snapshots) artifacts: bool,
     /// The live member's acquisition scope (cursor jobs), computed on demand.
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
@@ -1221,7 +1210,6 @@ fn open_member(
             .accumulator
             .codex_parent_ownership_ledgers
             .clone(),
-        inputs.artifacts,
     )?;
     let previous = group
         .previous_receipts

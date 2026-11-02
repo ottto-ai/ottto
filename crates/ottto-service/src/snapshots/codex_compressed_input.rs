@@ -1288,7 +1288,6 @@ pub(in crate::snapshots) mod tests {
             Some(&CodexTitleMetadata::default()),
             None,
             None,
-            false,
         )
         .unwrap()
     }
@@ -1680,7 +1679,6 @@ pub(in crate::snapshots) mod tests {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -3210,7 +3208,6 @@ pub(in crate::snapshots) mod tests {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -3510,7 +3507,6 @@ pub(in crate::snapshots) mod tests {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -3747,7 +3743,6 @@ pub(in crate::snapshots) mod tests {
                 NOW,
                 7,
                 10,
-                false,
                 None,
                 &[],
                 false,

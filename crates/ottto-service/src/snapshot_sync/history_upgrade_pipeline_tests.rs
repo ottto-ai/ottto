@@ -247,7 +247,6 @@ impl HistoryFixture {
             collected_at,
             183,
             100,
-            true,
         )
         .expect("scan Claude page");
         before_evidence(&mut scan);

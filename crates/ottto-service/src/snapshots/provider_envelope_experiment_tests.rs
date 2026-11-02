@@ -324,7 +324,6 @@ impl SelectionFixture {
             WINDOW,
             30,
             limit,
-            false,
             None,
             &[],
             false,
@@ -354,7 +353,6 @@ impl NativePreparationFixture {
             WINDOW,
             30,
             8,
-            false,
             None,
             &[],
             false,
@@ -375,6 +373,7 @@ impl NativePreparationFixture {
         assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
         index.active_upload_context_fingerprint = Some("native-preparation-test".into());
+        index.active_acquisition_context = Some("native-preparation-test".into());
         // Model delivered history: each file holds its receipt in this context.
         let context = index.active_upload_context_fingerprint.clone().unwrap();
         for entry in index.files.values_mut() {
@@ -406,7 +405,6 @@ impl NativePreparationFixture {
             WINDOW,
             30,
             limit,
-            false,
             None,
             &[],
             false,
@@ -671,7 +669,6 @@ fn native_recovery_priority_scan(
         WINDOW,
         30,
         limit,
-        false,
         None,
         &[],
         false,
@@ -882,7 +879,6 @@ fn native_comparison_quiet_bounded_page(
         WINDOW,
         30,
         1,
-        false,
         None,
         &[],
         false,
@@ -1308,7 +1304,6 @@ fn native_observation_duplicate_fixture() -> (
         WINDOW,
         30,
         8,
-        false,
         None,
         &[],
         false,
@@ -1480,7 +1475,6 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
             WINDOW,
             30,
             8,
-            false,
             None,
             &[],
             false,
@@ -2171,7 +2165,10 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
             2 => {
                 page.index.confirmed_empty_files.insert(key);
             }
-            _ => page.index.active_upload_context_fingerprint = Some("changed-context".into()),
+            _ => {
+                page.index.active_upload_context_fingerprint = Some("changed-context".into());
+                page.index.active_acquisition_context = Some("changed-context".into());
+            }
         }
         page.window.retain_current(&page.index);
         assert_eq!(page.window.certified_member_count(), 0);
@@ -2716,7 +2713,6 @@ fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture
             WINDOW,
             30,
             8,
-            false,
             None,
             &[],
             false,

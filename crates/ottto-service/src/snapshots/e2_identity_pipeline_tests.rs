@@ -101,7 +101,6 @@ fn e2_page_counted_with(
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         claude_request_identity::retain_root_accounts(
@@ -848,7 +847,6 @@ fn e2_page_with_stats(
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         claude_request_identity::retain_root_accounts(
