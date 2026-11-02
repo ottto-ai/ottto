@@ -159,6 +159,8 @@ struct RouteState {
     pass_written_start: Option<u64>,
     // Live ACK custody exceeded the companion bound: no collection before this.
     custody_retry_at: Option<Instant>,
+    // This pass's unsaved Tail state, published by the next full save or at exit.
+    tail: tail::TailStage,
 }
 impl RouteState {
     fn custody_held(&self) -> bool {
@@ -228,6 +230,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_retry_completed: false,
                     pass_written_start: None,
                     custody_retry_at: None,
+                    tail: Default::default(),
                 }))
             })
             .clone()
@@ -633,14 +636,21 @@ pub(in super::super) fn save_locked(
             index.generation = previous.generation;
         }
         recovered_write(path, progress_owner, &id, session, |session| {
-            let digests = import::save(
+            session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
+            let saved = import::save(
                 &mut session.db,
                 &id,
                 previous,
                 index,
                 &mut session.cx,
                 claim_only,
-            )?;
+            );
+            // A commit published the stage; otherwise it waits for the next
+            // save or the exit commit.
+            if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
+                state.tail = stage;
+            }
+            let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
             if !claim_only && !session.reload {
@@ -1084,17 +1094,25 @@ pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usiz
 }
 
 /// idle releases the page baseline when a cycle completes; an error exit skips
-/// idle, so dropping this at the cycle's end releases it as well.
-pub(in super::super) struct BaselineRelease(Option<PathBuf>);
+/// idle, so dropping this at the cycle's end releases it as well. It also ends
+/// the pass for staged Tail state no later save carried.
+pub(in super::super) struct BaselineRelease(Option<(PathBuf, std::sync::Weak<Runtime>)>);
 impl BaselineRelease {
     pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
         // A v1 graph has no runtime: hold nothing, so drop is a no-op.
-        Self(index.v2().persistence_v2.as_ref().map(|_| path.to_owned()))
+        Self(
+            index
+                .v2()
+                .persistence_v2
+                .as_ref()
+                .map(|runtime| (path.to_owned(), Arc::downgrade(runtime))),
+        )
     }
 }
 impl Drop for BaselineRelease {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
+        if let Some((path, runtime)) = &self.0 {
+            tail_route::publish_at_exit(path, runtime);
             let _ = with_state(path, |state| {
                 state.save_digests = None;
                 Ok(())
@@ -1199,6 +1217,7 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         state.latched = true;
         state.inventory_ready = false;
         state.save_digests = None;
+        state.tail = Default::default();
         state.current = None;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
             runtime
@@ -1613,6 +1632,16 @@ pub(in super::super) fn confirmed_growth_stamp(
 #[cfg(test)]
 #[path = "runtime_growth_tests.rs"]
 mod growth_tests;
+
+#[path = "runtime_tail.rs"]
+mod tail_route;
+#[cfg(test)]
+#[path = "tail_tests.rs"]
+mod tail_tests;
+#[cfg(test)]
+pub(crate) use tail_tests::{
+    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+};
 
 #[path = "runtime_live_keys.rs"]
 mod live_keys;

@@ -49,6 +49,11 @@ mod kinds_files;
 mod kinds_misc;
 mod mapper;
 mod sqlite;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the acquisition cutover reads and stages")
+)]
+mod tail;
 use kinds::KindCx;
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 
@@ -303,6 +308,16 @@ pub(super) trait Transaction {
         after_position: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Header>>;
+    /// The one per-file error boundary. `Ok(Err(cause))`: the body's rows and
+    /// this transaction's bookkeeping rolled back, and it stays usable. `Err`:
+    /// a systemic failure no boundary can isolate; abandon the transaction.
+    fn isolated(
+        &mut self,
+        body: &mut dyn FnMut(&mut dyn Transaction) -> Result<()>,
+    ) -> Result<Result<()>>;
+    /// An opaque value this transaction replaced or deleted may have held a
+    /// private string: require the existing physical purge at commit.
+    fn mark_erasure(&mut self) -> Result<()>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
@@ -328,6 +343,8 @@ fn value_cap(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
+        // Tail fragments logical values well below this physical row limit.
+        key if tail::owned(key) => VALUE_BYTES,
         // Measured on a copy of a real state store (245,006 values): only these two
         // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
         // Bound logical JSON on both admission and decompression, before chunks.
@@ -373,8 +390,8 @@ fn admit_header(key: &RowKey, fixed: &Fixed) -> Result<()> {
     );
     Ok(())
 }
-fn value_version_supported(_key: &RowKey, version: u32) -> bool {
-    version == 1
+fn value_version_supported(key: &RowKey, version: u32) -> bool {
+    version == 1 || tail::owned(key) && tail::version_supported(version)
 }
 fn preflight(row: &RowInput<'_>) -> Result<Header> {
     admit_header(row.key, row.fixed)?;
@@ -543,6 +560,10 @@ mod codex_on_tests;
 mod money_fault_tests;
 #[cfg(test)]
 pub(super) mod money_test_support;
+#[cfg(test)]
+pub(crate) use runtime::{
+    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+};
 // Growth receipts attest confirmed DB custody, independently of the root fence.
 pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 

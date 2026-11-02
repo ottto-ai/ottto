@@ -1160,14 +1160,29 @@ impl Sqlite {
         }
     }
 }
-pub(super) fn disk_full(error: &anyhow::Error) -> bool {
+fn engine_failure(error: &anyhow::Error, is: impl Fn(rusqlite::ErrorCode) -> bool) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::ffi::Error>()
-            .is_some_and(|e| e.code == rusqlite::ErrorCode::DiskFull)
+            .is_some_and(|e| is(e.code))
             || cause
                 .downcast_ref::<rusqlite::Error>()
-                .is_some_and(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+                .and_then(rusqlite::Error::sqlite_error_code)
+                .is_some_and(&is)
+    })
+}
+pub(super) fn disk_full(error: &anyhow::Error) -> bool {
+    engine_failure(error, |code| code == rusqlite::ErrorCode::DiskFull)
+}
+/// FULL/IOERR/NOMEM may already have rolled back the whole transaction.
+fn systemic(error: &anyhow::Error) -> bool {
+    engine_failure(error, |code| {
+        matches!(
+            code,
+            rusqlite::ErrorCode::DiskFull
+                | rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::OutOfMemory
+        )
     })
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -1227,6 +1242,10 @@ impl Txn<'_> {
         self.charge(charged, rows, pages)
     }
     fn remember_paths(&mut self, old: &Header) -> Result<()> {
+        // Binary: no paths to extract. Its owner marks erasure explicitly.
+        if tail::owned(&old.key) {
+            return Ok(());
+        }
         if matches!(old.key, RowKey::RequestSet(_)) {
             // Shared values are immutable evidence and may contain literal PL.
             // Conservatively mark every replacement/last-reference deletion;
@@ -1525,6 +1544,58 @@ impl Transaction for Txn<'_> {
         limit: usize,
     ) -> Result<Vec<Header>> {
         scan_record_key(self.store.conn()?, kind, key_bytes, after_position, limit)
+    }
+    fn isolated(
+        &mut self,
+        body: &mut dyn FnMut(&mut dyn Transaction) -> Result<()>,
+    ) -> Result<Result<()>> {
+        ensure!(self.write && !self.failed, "state_v2_transaction_refused");
+        self.store
+            .conn()?
+            .execute_batch("SAVEPOINT file_boundary")?;
+        // Moved, not cloned: a boundary per file must not copy the graph's sets.
+        let removed_keys = std::mem::take(&mut self.removed_keys);
+        let original_paths = std::mem::take(&mut self.original_paths);
+        let path_bytes = self.path_bytes;
+        let shared_erasure = self.shared_erasure;
+        let deltas = (self.record_delta, self.file_delta);
+        let dirty = (self.dirty_bytes, self.estimated_pages, self.dirty_rows);
+        let save_failure = self.store.save_failure;
+        let result = body(&mut *self);
+        if let Err(error) = &result {
+            if systemic(error) {
+                self.store.record_save_error(error);
+                self.failed = true;
+                return result.map(Ok);
+            }
+        }
+        let sql = if result.is_ok() {
+            "RELEASE file_boundary"
+        } else {
+            "ROLLBACK TO file_boundary; RELEASE file_boundary"
+        };
+        if let Err(error) = self.store.conn().and_then(|c| Ok(c.execute_batch(sql)?)) {
+            self.failed = true;
+            return Err(error);
+        }
+        if result.is_ok() {
+            self.removed_keys.extend(removed_keys);
+            self.original_paths.extend(original_paths);
+        } else {
+            self.removed_keys = removed_keys;
+            self.original_paths = original_paths;
+            self.path_bytes = path_bytes;
+            self.shared_erasure = shared_erasure;
+            (self.record_delta, self.file_delta) = deltas;
+            (self.dirty_bytes, self.estimated_pages, self.dirty_rows) = dirty;
+            self.store.save_failure = save_failure;
+            self.failed = false;
+        }
+        Ok(result)
+    }
+    fn mark_erasure(&mut self) -> Result<()> {
+        self.shared_erasure = true;
+        Ok(())
     }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
         self.commit_inner(expected, next)

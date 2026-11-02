@@ -27,6 +27,9 @@ pub(super) struct KindCx {
     /// Archive reads an ordinary save may spend compacting whole families.
     pub(super) compact_allowance: Option<usize>,
     pub(super) compaction: kinds_accounts::Compaction,
+    /// A full save's staged Tail state; claim-only saves leave this `None` and
+    /// publish none. The save's owner takes it back after the attempt.
+    pub(super) tail: Option<tail::TailStage>,
     valid: bool,
 }
 
@@ -194,14 +197,17 @@ pub(super) fn delta(
     cx.compaction = Default::default();
     let result = (|| {
         let mut rows = mapper::Rows {
-            tx: Some(tx),
+            tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
             ..Default::default()
         };
         let windows = enumerate(next, &mut rows, &previous.windows, cx)?;
+        let retired = tail::removed_files(&rows.old);
+        let digests = rows.finish()?;
+        tail::apply(tx, cx.tail.as_ref(), &retired)?;
         Ok(Baseline {
             generation: next.generation,
-            rows: rows.finish()?,
+            rows: digests,
             windows,
         })
     })();
@@ -308,6 +314,7 @@ pub(super) fn save_graph(
     } else {
         // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
+        committed.tail = pending.tail.take();
         if !published {
             next.generation = generation;
         }
