@@ -18,10 +18,21 @@ const fn representations(pin: &'static str) -> [Representation; 1] {
     }]
 }
 
+/// How a durable-restored read that ends strictly below the frozen accepted
+/// extent is treated (`restored_behind_accepted`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BelowAccepted {
+    /// The accepted floor holds the read.
+    Held,
+    /// A restored Tail publishes below it.
+    Tail,
+}
+
 pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
     pub(crate) tag: u8,
+    pub(crate) below_accepted: BelowAccepted,
     /// Its index routes through the state v2 store. Only ever set: a published
     /// route's custody wins, and clearing it would let v1 load the frozen
     /// JSON. Leaving needs an explicit export back to v1.
@@ -35,7 +46,14 @@ pub(crate) struct Properties {
             SnapshotSource,
             &mut crate::durable_tail_store::ActiveLease,
         ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
-    pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
+    /// The complete structural walk, including the end check, on the
+    /// caller's decoder (which may observe it, e.g. for private labels).
+    pub(super) verify: fn(&mut crate::durable_tail_codec::Dec<'_>) -> Result<(), Corrupt>,
+    /// The body walks and what the source's body adds to the allowlist shape.
+    pub(super) put: durable::PutBody,
+    pub(super) take:
+        fn(&mut crate::durable_tail_codec::Dec<'_>) -> Result<durable::Decoded, Corrupt>,
+    pub(super) shape_extension: fn(&mut crate::durable_tail_codec::Shape),
 }
 
 // Current PL-retained schema only. Historical pins refuse at dispatch; there is
@@ -46,6 +64,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
+        below_accepted: BelowAccepted::Held,
         state_v2: true,
         write_format: 3,
         representations: &representations(
@@ -53,12 +72,16 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
-        verify: durable::verify,
+        verify: durable::verify_body,
+        put: durable::put_body,
+        take: durable::take_body,
+        shape_extension: durable::no_shape_extension,
     },
     Properties {
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
+        below_accepted: BelowAccepted::Tail,
         state_v2: true,
         write_format: 3,
         representations: &representations(
@@ -66,7 +89,27 @@ pub(crate) const SOURCES: &[Properties] = &[
         ),
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
-        verify: durable::verify,
+        verify: durable::verify_body,
+        put: durable::put_body,
+        take: durable::take_body,
+        shape_extension: durable::no_shape_extension,
+    },
+    Properties {
+        source: DurableSource::Pi,
+        snapshot: SnapshotSource::Pi,
+        tag: 3,
+        below_accepted: BelowAccepted::Tail,
+        state_v2: true,
+        write_format: 3,
+        representations: &representations(
+            "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
+        ),
+        #[cfg(unix)]
+        decode_bounded: durable::decode_body_bounded,
+        verify: durable::pi::verify_body,
+        put: durable::pi::put_body,
+        take: durable::pi::take_body,
+        shape_extension: durable::pi::shape_extension,
     },
 ];
 
@@ -96,6 +139,13 @@ impl DurableSource {
             .find(|row| row.snapshot == source)
             .map(|row| row.source)
     }
+}
+
+/// A source without a durable row has no restored read to report.
+pub(crate) fn below_accepted(source: SnapshotSource) -> BelowAccepted {
+    DurableSource::from_snapshot(source).map_or(BelowAccepted::Held, |source| {
+        source.properties().below_accepted
+    })
 }
 
 impl Properties {

@@ -350,15 +350,13 @@ impl PreparedRetry {
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
                 &mut |snapshots| {
                     let lease = crate::client_report::lease();
-                    let request = SnapshotBatchRequest {
-                        schema_version: SNAPSHOT_SCHEMA_VERSION,
-                        source: source.api_slug().into(),
-                        machine_id: machine_id.clone(),
-                        collector_version: Some(collector_version()),
+                    let request = snapshot_batch_request(
+                        source,
+                        machine_id,
                         snapshots,
-                        upload_policy: policy,
-                        client_report: lease.report().clone(),
-                    };
+                        policy,
+                        lease.report().clone(),
+                    );
                     validate_snapshot_batch_request(&request).map_err(|reason| {
                         anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
                     })?;
@@ -369,22 +367,15 @@ impl PreparedRetry {
                         ),
                         "optional snapshot wire request exceeds admission limit"
                     );
-                    let mut token = client.issue_relay_token_bounded(
+                    let mut token = policy_checked_relay_token(
+                        client,
                         device,
                         device_secret,
                         source,
+                        live_policy,
                         budget,
                         validate,
                     )?;
-                    if let Some(expected) = live_policy {
-                        let mut hint =
-                            client.get_activity_hint_bounded(&token, budget, validate)?;
-                        anyhow::ensure!(
-                            super::live_snapshot_retry::fresh_policy_seal(&mut hint).as_ref()
-                                == Some(expected),
-                            "optional snapshot policy changed"
-                        );
-                    }
                     let response = match client
                         .upload_batch_bounded(&token, &request, false, budget, validate)
                     {
@@ -393,23 +384,15 @@ impl PreparedRetry {
                         {
                             // No old token or report is held across a wait. Auth replay
                             // uses this same turn and the same remaining POST counter.
-                            token = client.issue_relay_token_bounded(
+                            token = policy_checked_relay_token(
+                                client,
                                 device,
                                 device_secret,
                                 source,
+                                live_policy,
                                 budget,
                                 validate,
                             )?;
-                            if let Some(expected) = live_policy {
-                                let mut hint =
-                                    client.get_activity_hint_bounded(&token, budget, validate)?;
-                                anyhow::ensure!(
-                                    super::live_snapshot_retry::fresh_policy_seal(&mut hint)
-                                        .as_ref()
-                                        == Some(expected),
-                                    "optional snapshot policy changed"
-                                );
-                            }
                             client
                                 .upload_batch_bounded(&token, &request, false, budget, validate)?
                         }
@@ -435,7 +418,7 @@ impl PreparedRetry {
         // evidence back or adopts a competitor's disk generation.
         budget.remaining(Instant::now())?;
         validate()?;
-        let checkpoint = checkpoint_partial_snapshot_index_with_read_limit(
+        let checkpoint = checkpoint_partial_snapshot_index_with_audit_release(
             &self.working,
             &self.baseline,
             &self.progress,
@@ -448,12 +431,39 @@ impl PreparedRetry {
             &self.progress_path,
             validate,
             Some(crate::snapshot_retry::RESPONSE_BYTES),
+            None,
+            None,
+            None,
+            Default::default(),
         )?;
         self.working.generation = checkpoint.generation;
         self.working.mark_bounded_sweep_unsettled();
         self.baseline = checkpoint;
         Ok(outcome)
     }
+}
+
+/// A fresh bounded relay token. Under a live policy, the activity hint it
+/// authorizes must still carry that policy's seal.
+fn policy_checked_relay_token(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    live_policy: Option<&[u8; 32]>,
+    budget: &RetryBudget,
+    validate: &mut dyn FnMut() -> Result<()>,
+) -> Result<String> {
+    let token =
+        client.issue_relay_token_bounded(device, device_secret, source, budget, validate)?;
+    if let Some(expected) = live_policy {
+        let mut hint = client.get_activity_hint_bounded(&token, budget, validate)?;
+        anyhow::ensure!(
+            super::live_snapshot_retry::fresh_policy_seal(&mut hint).as_ref() == Some(expected),
+            "optional snapshot policy changed"
+        );
+    }
+    Ok(token)
 }
 
 /// Complete bodies share one bounded owner reservation. One source slot and

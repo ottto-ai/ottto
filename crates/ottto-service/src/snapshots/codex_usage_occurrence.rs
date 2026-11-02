@@ -953,27 +953,8 @@ impl SnapshotAccumulator {
         usage_event_identity: Option<String>,
         implicit_request_count: Option<u64>,
     ) -> Option<(String, UsageTotals, bool)> {
-        let resolved_model = model
-            .or_else(|| self.latest_model.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        self.latest_model = Some(resolved_model.clone());
-        if usage_event_identity.is_some()
-            && usage_event_identity == self.codex_last_usage_event_identity
-        {
-            self.codex_duplicate_usage_records_skipped =
-                self.codex_duplicate_usage_records_skipped.saturating_add(1);
-            return None;
-        }
-        if usage_event_identity.is_some() {
-            self.codex_last_usage_event_identity = usage_event_identity;
-        }
-        let previous = self.session_cumulative_usage.clone();
-        let reset = previous
-            .as_ref()
-            .is_some_and(|previous| !usage.is_monotonic_after(previous));
-        if reset {
-            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
-        }
+        let (resolved_model, previous, reset) =
+            self.admit_codex_cumulative_usage(model, &usage, usage_event_identity)?;
         // Today's delta: `last`, else the cumulative delta, else the whole
         // total on a first event or reset. A bound turn never counts that
         // inherited/reset base.
@@ -985,7 +966,6 @@ impl SnapshotAccumulator {
             }
             (None, _) => (usage.clone(), None),
         };
-        self.session_cumulative_usage = Some(usage.clone());
         let with_count = |mut delta: UsageTotals| {
             if !delta.is_zero() {
                 if let Some(count) = implicit_request_count {

@@ -1228,7 +1228,7 @@ fn si_unknown_contract_latches_through_observation_save_and_restart() {
 }
 
 #[test]
-fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
+fn hold_budget_floor_and_daily_rebuild_loop_guard() {
     // Small damage below the floor is contained, not a whole-source rebuild.
     let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-floor");
     let path = scratch.as_ref().join("index.json");
@@ -1314,12 +1314,12 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     let damage = whole_index_damage("budget");
     fs::write(&path, &damage).unwrap();
     refused(&damage);
-    // The pause names its automatic retry: seven days after the witness.
-    let week = 7 * 24 * 60 * 60;
+    // The pause names its automatic retry: 24 hours after the witness.
+    let day = 24 * 60 * 60;
     let retry = scan_index_rebuild_auto_retry_unix_seconds(source).unwrap();
     let now = unix_seconds_at(SystemTime::now());
     assert!(
-        retry > now + week - 60 && retry <= now + week + 1,
+        retry > now + day - 60 && retry <= now + day + 1,
         "{retry} vs {now}"
     );
     assert!(scan_index_rebuild_auto_retry_at(source).is_some());
@@ -1375,7 +1375,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     assert_eq!(corrupt_count(scratch.as_ref()), 2);
     assert!(scan_index_rebuilt_recently(&path, SystemTime::now()).unwrap());
 
-    // A fresh failure inside seven days of the override refuses again; the
+    // A fresh failure inside 24 hours of the override refuses again; the
     // spent press does not carry over.
     fs::write(&path, b"{  ").unwrap();
     refused(b"{  ");
@@ -2270,7 +2270,7 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
 }
 
 #[test]
-fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
+fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
     for previous in ["budget", "syntax", "collision"] {
         for current in ["budget", "syntax", "collision"] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
@@ -2330,7 +2330,7 @@ fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
 }
 
 #[test]
-fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
+fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
     let now = SystemTime::now();
     let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
     for current in ["budget", "syntax", "collision"] {
@@ -2346,7 +2346,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
         assert!(error.downcast_ref::<ScanIndexRebuildLoop>().is_some());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(corrupt_count(scratch.as_ref()), 1);
-        // The exact 7-day boundary is still protected.
+        // The exact 24-hour boundary is still protected.
         let boundary = UNIX_EPOCH
             + std::time::Duration::from_nanos(
                 u64::try_from(stamp + SCAN_INDEX_REBUILD_COOLDOWN_NANOS).unwrap(),
@@ -2372,7 +2372,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
 }
 
 // The user Repair override keeps the session-identity state the
-// seven-day guard was protecting, and its cooldown is source-wide.
+// 24-hour guard was protecting, and its cooldown is source-wide.
 const OVERRIDE_OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OVERRIDE_OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
