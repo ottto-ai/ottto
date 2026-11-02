@@ -1357,60 +1357,92 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
 /// accumulates (`Some`), or every family before a decision that joins them
 /// (`None`). A missing, changed or unreadable row, or a store this graph does
 /// not hold, is Unknown and the caller refuses its whole decision. Counted.
-/// Rows install one at a time, only after every wanted row was read: a later
-/// digest mismatch can leave earlier verified rows installed while the caller
-/// still refuses the whole decision.
+/// Nothing installs unless every wanted row was read and matches its head.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    let usage = &index.claude_usage_family_pending;
-    if usage.cold().is_none() {
+    if roots.is_none() && index.claude_usage_family_pending.all().is_ok() {
         return Ok(());
     }
-    let wanted = match roots {
-        Some(roots) => {
-            let wanted = usage.unloaded(roots.iter().map(String::as_str));
-            if wanted.is_empty() {
-                return Ok(());
-            }
-            Some(wanted)
-        }
-        None if usage.all().is_ok() => return Ok(()),
-        None => None,
+    let mut read = Vec::new();
+    read_unloaded(index, roots, roots.is_none(), &mut |root, value, digest| {
+        read.push((root, value, digest));
+    })?;
+    let Some(cold) = index.claude_usage_family_pending.cold_mut() else {
+        return Ok(());
     };
-    let result = (|| -> Result<()> {
-        let mut read = Vec::new();
-        read_cold(
-            index,
-            "usage.pending",
-            wanted.as_ref(),
-            &mut |root, value, digest| {
-                read.push((root, value, digest));
-                Ok(())
-            },
-        )?;
-        // Every wanted row must have been read before any is installed.
-        if let Some(wanted) = &wanted {
-            let read: std::collections::BTreeSet<&String> =
-                read.iter().map(|(root, _, _)| root).collect();
-            ensure!(
-                wanted.iter().all(|root| read.contains(root)),
-                super::super::usage_pending::Unknown
-            );
+    for (root, value, digest) in read {
+        cold.install(root, value, digest)?;
+    }
+    if roots.is_none() {
+        cold.complete()?;
+    }
+    Ok(())
+}
+
+/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
+/// time, as this graph holds it: its loaded value, else its stored row,
+/// which must still match its head. Keeps nothing and visits in no set
+/// order. Unknown, counted: a row unlike its head, a head without a row, or a
+/// store this graph does not hold.
+pub(in super::super) fn visit_usage(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let held = usage.resident().or(usage.cold().map(|cold| cold.loaded()));
+    for (root, family) in held.into_iter().flatten() {
+        if roots.map_or(true, |roots| roots.contains(root)) {
+            f(root.as_str(), family);
         }
-        let cold = index
-            .claude_usage_family_pending
-            .cold_mut()
-            .ok_or(Hold::DbUnavailable)?;
-        for (root, value, digest) in read {
-            cold.install(root, value, digest)?;
-        }
-        if wanted.is_none() {
-            cold.complete()?;
-        }
+    }
+    read_unloaded(index, roots, false, &mut |root, value, _| f(&root, &value))
+}
+
+/// The cold families `roots` names (`None`: every head) that this graph has
+/// not loaded, one stored row at a time, each matching its head; every one
+/// must be read. `None` reads the whole kind, complete by its manifest count,
+/// and with `whole` reads it even when nothing is unloaded. Unknown, counted:
+/// a row unlike its head, a head without a row, or a store this graph does
+/// not hold.
+fn read_unloaded(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    whole: bool,
+    f: &mut dyn FnMut(String, super::super::ClaudeUsageFamilyPending, [u8; 32]),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        return Ok(());
+    };
+    let unread = match roots {
+        Some(roots) => usage.unloaded(roots.iter().map(String::as_str)),
+        None => usage.unloaded(cold.head_roots().map(String::as_str)),
+    };
+    if unread.is_empty() && !whole {
+        return Ok(());
+    }
+    let mut seen = 0_usize;
+    let read = read_cold(
+        index,
+        "usage.pending",
+        roots.map(|_| &unread),
+        &mut |root, value: super::super::ClaudeUsageFamilyPending, digest| {
+            if !unread.contains(&root) {
+                return Ok(()); // loaded already, or removed by this graph
+            }
+            cold.admits(&root, digest)?;
+            seen += 1;
+            f(root, value, digest);
+            Ok(())
+        },
+    );
+    let result = read.and_then(|()| {
+        ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
         Ok(())
-    })();
+    });
     if result.is_err() {
         telemetry::count("usage_pending_unknown", 1);
     }

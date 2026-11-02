@@ -1,7 +1,6 @@
 use super::*;
 use crate::snapshot_sync::retained_with_withheld;
 use crate::source_rotation::{Owner, PaidReservation, Step, PARKED_BUDGET};
-use std::mem::size_of;
 use std::time::Duration;
 
 fn seed_held_memo(memo: &withheld_account::Memo) {
@@ -83,32 +82,12 @@ fn unsupported_sibling_preserves_only_a_memo_that_fits_the_allowance() {
     assert_unavailable_population(&state);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Source {
-    Parked,
-    Holds,
-}
-
-struct Frame {
-    source: Source,
-    steps_left: usize,
-    storage: Vec<u8>,
-}
-impl crate::heap_layout_bound::HeapLayoutBound for Frame {
-    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.storage, counter)
-    }
-}
-
 struct Cycle {
     memo: withheld_account::Memo,
     native: Arc<claude_native_comparison::lifecycle::Lifecycle>,
     versions: Arc<codex_version::CodexVersionFeed>,
-    storage_bytes: usize,
-    parked_charge: usize,
     memo_charge: usize,
     discards: usize,
-    parks: usize,
     completions: usize,
 }
 impl Cycle {
@@ -118,71 +97,42 @@ impl Cycle {
         versions.checked_add(native)
     }
 }
+// One serial source: the rotation budget alone creates the contention.
 impl Owner for Cycle {
-    type Source = Source;
-    type Frame = Frame;
-    type Completed = Source;
+    type Source = ();
+    type Frame = ();
+    type Completed = ();
 
-    fn prepare(&mut self, source: Source, remaining: Option<usize>) -> Result<Option<Frame>> {
+    fn prepare(&mut self, _: (), remaining: Option<usize>) -> Result<Option<()>> {
         assert!(remaining.is_some());
-        Ok(Some(Frame {
-            source,
-            steps_left: if source == Source::Parked { 65 } else { 0 },
-            storage: vec![
-                0;
-                if source == Source::Parked {
-                    self.storage_bytes
-                } else {
-                    0
-                }
-            ],
-        }))
+        Ok(Some(()))
     }
-    fn validate(&mut self, _: &Frame) -> Result<()> {
+    fn validate(&mut self, _: &()) -> Result<()> {
         Ok(())
     }
-    fn step(&mut self, mut frame: Frame, remaining: Option<usize>) -> Step<Frame, Source> {
+    fn step(&mut self, _: (), remaining: Option<usize>) -> Step<(), ()> {
         assert!(remaining.is_some());
-        if frame.steps_left == 0 {
-            Step::Complete(frame.source)
-        } else {
-            frame.steps_left -= 1;
-            Step::Pending(frame)
-        }
+        Step::Complete(())
     }
-    fn bound(&self, frame: &Frame, limit: usize) -> Option<usize> {
-        let bytes = crate::heap_layout_bound::bound(frame, limit)?;
-        assert_eq!(bytes, self.parked_charge);
-        Some(bytes)
-    }
-    fn finish(&mut self, source: Source, remaining: Option<usize>) -> Result<()> {
-        assert!(remaining.is_some());
-        if source == Source::Holds {
-            assert_eq!(self.parks, 1, "sibling still owns a real parked allocation");
-            let empty_memo = self.memo.retained_bound(PARKED_BUDGET).unwrap();
-            let available =
-                remaining.unwrap() + self.other_bound(PARKED_BUDGET).unwrap() + empty_memo;
-            seed_held_memo(&self.memo);
-            let other = self.other_bound(available).unwrap();
-            assert!(self.memo_charge <= available, "memo alone fits");
-            assert!(other <= available, "real sibling graphs alone fit");
-            assert!(
-                self.memo_charge + other > available,
-                "composition must refuse one graph"
-            );
-        }
+    fn finish(&mut self, _: (), remaining: Option<usize>) -> Result<()> {
+        let empty_memo = self.memo.retained_bound(PARKED_BUDGET).unwrap();
+        let available = remaining.unwrap() + self.other_bound(PARKED_BUDGET).unwrap() + empty_memo;
+        seed_held_memo(&self.memo);
+        let other = self.other_bound(available).unwrap();
+        assert!(self.memo_charge <= available, "memo alone fits");
+        assert!(other <= available, "real sibling graphs alone fit");
+        assert!(
+            self.memo_charge + other > available,
+            "composition must refuse one graph"
+        );
         Ok(())
     }
-    fn outcome(&mut self, _: Source, result: Result<()>) {
+    fn outcome(&mut self, _: (), result: Result<()>) {
         result.unwrap();
         self.completions += 1;
     }
     fn monotonic(&self) -> Duration {
         Duration::ZERO
-    }
-    fn parked(&mut self, bytes: usize) {
-        assert!(bytes <= PARKED_BUDGET);
-        self.parks += 1;
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
         retained_with_withheld(&self.memo, limit, |available| self.other_bound(available))
@@ -229,11 +179,8 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
         memo: state.clone(),
         native,
         versions: Arc::new(codex_version::CodexVersionFeed::new(None)),
-        storage_bytes: 0,
-        parked_charge: 0,
         memo_charge,
         discards: 0,
-        parks: 0,
         completions: 0,
     };
     let other = owner.other_bound(PARKED_BUDGET).unwrap();
@@ -243,18 +190,14 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
     );
     assert!(
         other + memo_charge < PARKED_BUDGET,
-        "both fit without a parked sibling"
+        "both fit in the full allowance"
     );
-    // First park a frame, then let sibling completion populate the hold memo.
-    // Target contention where memo alone fits but memo + native/versions do not.
+    // Let source completion populate the hold memo under a rotation budget
+    // where memo alone fits but memo + native/versions do not. A zero-sized
+    // source charges no queue bytes.
     state.discard_retained();
-    let queue = 2 * (size_of::<(Source, Frame, usize)>() + size_of::<Source>());
-    let available = memo_charge + other / 2;
-    owner.parked_charge = PARKED_BUDGET - queue - available;
-    owner.storage_bytes = owner.parked_charge - size_of::<Frame>();
-    crate::source_rotation::run(&mut owner, &[Source::Parked, Source::Holds], PARKED_BUDGET);
-    assert_eq!(owner.parks, 1);
-    assert_eq!(owner.completions, 2);
+    crate::source_rotation::run(&mut owner, &[()], memo_charge + other / 2);
+    assert_eq!(owner.completions, 1);
     assert_eq!(
         owner.discards, 0,
         "memo refusal must not reach owner-wide discard"
