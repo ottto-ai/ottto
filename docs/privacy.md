@@ -232,7 +232,10 @@ invoking the provider.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
-definitions in memory to derive tenant-scoped HMAC identifiers. When the
+definitions to derive tenant-scoped HMAC identifiers. Bounded native skill labels
+are kept in owner-only local records independently of upload settings; retirement,
+source removal, forget and uninstall still erase those records. The Companion
+session list also keeps local titles and workspace labels when uploads omit them. When the
 existing **session titles and minimal descriptions** setting is enabled and the
 backend advertises support, a template or skill fact may additionally include
 one display label: either a sanitized prompt prefix of at most 96 bytes or an
