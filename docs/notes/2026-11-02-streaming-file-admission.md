@@ -27,3 +27,19 @@ An interrupted Claude Full restarts from 0 until the one-DB Tail state lands.
 Claude first-unit reads above 1 GiB extrapolate beyond observed files; peaks remain unmeasured.
 The separate 640 KiB wire-item limit and offsets above 4 GiB remain outside this
 change. This change must land after #1224.
+
+## Diagnostic line budget after main integration
+
+The original resource-observation commit (`db0eccdc50`) introduced the native-page
+fixture's `< 2048` JSON-byte assertion alongside its direct stderr emitter.
+It is a compact-output regression guard; no parser, syslog or os_log truncation
+requirement was found in the emitter history or diagnostics documentation.
+The emitter writes the JSON without a length cap. Other stage-specific budgets
+include 4 KiB, so 2048 is not a universal carrier limit.
+
+Main's side-file reparse counters made the failing cold-page fixture 2067 bytes.
+They now omit zero scalars on the same page record (absent means zero), reducing
+that captured fixture to 2001 bytes. Nonzero file/byte totals remain exact and
+are drained once per Claude page. The existing 2048 assertion stays unchanged.
+File-size high-water and unread maxima already use their separate existing
+stage/transition records; this fix adds no window, counter, record or money logic.

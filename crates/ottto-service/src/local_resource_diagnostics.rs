@@ -407,9 +407,12 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
 
 /// Sidecar read attempts and actual input bytes since the last Claude page.
 /// Repeated reads count again; missing/refused files add nothing. No identities.
+/// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
+    #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_bytes: u64,
 }
 #[cfg(not(test))]
@@ -2236,6 +2239,41 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn sidecar_reparse_counts_are_sparse_exact_and_drained_per_page() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        // Drain earlier fixture activity on this test thread.
+        take_claude_sidecar_reparse();
+        let (_, rows) = capture(|| {
+            Probe::start().collection("claude_code", collection());
+            claude_sidecar_reparse(2, 123);
+            Probe::start().collection("claude_code", collection());
+            Probe::start().collection("claude_code", collection());
+        });
+        for row in [&rows[0], &rows[2]] {
+            for key in [
+                "claude_sidecar_reparse_files",
+                "claude_sidecar_reparse_bytes",
+            ] {
+                assert!(row["counts"].get(key).is_none());
+            }
+        }
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_files"], 2);
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_bytes"], 123);
+        let maximum = serde_json::to_value(ClaudeSidecarReparse {
+            claude_sidecar_reparse_files: u64::MAX,
+            claude_sidecar_reparse_bytes: u64::MAX,
+        })
+        .unwrap();
+        assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
+        assert_eq!(maximum["claude_sidecar_reparse_bytes"], u64::MAX);
+    }
 
     #[cfg(unix)]
     #[test]

@@ -3170,17 +3170,12 @@ mod tests {
         });
         for (i, record) in records.iter().enumerate() {
             let counts = &record["counts"];
-            if i == 0 || i == 2 {
+            if i == 0 || i == 2 || i == 4 {
                 assert!(counts.get("claude_sidecar_reparse_files").is_none());
+                assert!(counts.get("claude_sidecar_reparse_bytes").is_none());
             } else {
-                assert_eq!(
-                    counts["claude_sidecar_reparse_files"],
-                    if i == 4 { 0 } else { 2 }
-                );
-                assert_eq!(
-                    counts["claude_sidecar_reparse_bytes"],
-                    if i == 4 { 0 } else { expected_bytes }
-                );
+                assert_eq!(counts["claude_sidecar_reparse_files"], 2);
+                assert_eq!(counts["claude_sidecar_reparse_bytes"], expected_bytes);
             }
         }
         fs::remove_dir_all(dir).unwrap();
