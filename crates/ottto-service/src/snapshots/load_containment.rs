@@ -140,7 +140,7 @@ fn normalize_snapshot_quarantine_record(record: &mut SnapshotQuarantineRecord, n
 
 // Existing backup names encode the rename time, unlike mtime (which rename
 // preserves). Inspect only this checkpoint's siblings; retain no new state.
-const SCAN_INDEX_REBUILD_COOLDOWN_NANOS: u128 = 7 * 24 * 60 * 60 * 1_000_000_000;
+const SCAN_INDEX_REBUILD_COOLDOWN_NANOS: u128 = 24 * 60 * 60 * 1_000_000_000;
 /// Distinct source-health reason; canonical health accepts open string codes.
 pub(crate) const SCAN_INDEX_REBUILD_LOOP_CODE: &str = "scan_index_rebuild_loop";
 
@@ -252,12 +252,12 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
 }
 
 // User Repair override (#718 follow-up): one explicit,
-// interactive Repair of a paused source passes the seven-day guard once. The
+// interactive Repair of a paused source passes the 24-hour guard once. The
 // override rebuild is the ordinary gated rebuild (quarantined origin, so the
 // #712 history gate, protected list and latches apply) and its witness
-// re-arms the seven-day clock. Transcripts stay on disk: late, not lost.
+// re-arms the 24-hour clock. Transcripts stay on disk: late, not lost.
 /// The override witness keeps `.corrupt.`, so prior-history detection, the
-/// sweep's keep rule and the seven-day clock treat it as any quarantine; this
+/// sweep's keep rule and the 24-hour clock treat it as any quarantine; this
 /// extra segment is the durable evidence for the 24-hour cooldown.
 const SCAN_INDEX_OVERRIDE_WITNESS_SEGMENT: &str = "override.";
 const SCAN_INDEX_OVERRIDE_WITNESS_KIND: &str = "corrupt.override";
@@ -288,13 +288,12 @@ struct ScanIndexOverrideStamp {
     last_override_unix_seconds: u64,
 }
 
-/// A malformed stamp cools from its own mtime; an unreadable one cools
-/// indefinitely. Both fail closed: the seven-day automatic retry still runs.
+/// A malformed stamp cools from its own mtime; an unreadable one is absent,
+/// allowing one Repair to replace it with a fresh stamp.
 fn read_scan_index_override_stamp(support_dir: &Path, source: SnapshotSource) -> Option<u64> {
     let path = scan_index_override_stamp_path(support_dir, source);
     match fs::read(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => Some(u64::MAX),
+        Err(_) => None,
         Ok(bytes) => Some(
             serde_json::from_slice::<ScanIndexOverrideStamp>(&bytes)
                 .map(|stamp| stamp.last_override_unix_seconds)
@@ -426,7 +425,7 @@ fn note_scan_index_rebuild_refusal(
 ) {
     let source_wide = support_dir.and_then(|dir| read_scan_index_override_stamp(dir, source));
     with_scan_index_rebuild_override(source, |state| {
-        // The guard holds through the exact seven-day boundary.
+        // The guard holds through the exact 24-hour boundary.
         state.auto_retry_unix_seconds = stamps.newest.map(|stamp| {
             unix_seconds_ceil(stamp.saturating_add(SCAN_INDEX_REBUILD_COOLDOWN_NANOS + 1))
         });
@@ -452,7 +451,7 @@ pub(crate) enum ScanIndexRebuildOverride {
     Refused(&'static str),
 }
 
-/// Arm one rebuild past the seven-day guard. Only the companion's
+/// Arm one rebuild past the 24-hour guard. Only the companion's
 /// interactive Repair calls this; Verify, automatic retries and token (CLI
 /// or agent) requests never do.
 pub(crate) fn arm_scan_index_rebuild_manual_override(
@@ -502,7 +501,7 @@ pub(crate) fn scan_index_rebuild_override_refusal(source: SnapshotSource) -> Opt
 }
 
 /// When the guard lets an automatic load rebuild this paused source: just
-/// after seven days from the newest rebuild witness its refusal read.
+/// after 24 hours from the newest rebuild witness its refusal read.
 fn scan_index_rebuild_auto_retry_unix_seconds(source: SnapshotSource) -> Option<u64> {
     if !scan_index_rebuild_paused(source) {
         return None;
@@ -666,7 +665,7 @@ fn note_scan_index_quarantine_rebuild(
     ));
 }
 
-/// One armed user Repair passing the seven-day guard. The guard
+/// One armed user Repair passing the 24-hour guard. The guard
 /// was keeping the damaged index because it holds session-identity state;
 /// the override keeps that state too. It decodes
 /// `lenient_decode::IDENTITY_CARRY_FIELDS` by each field's policy, refusing
@@ -676,7 +675,7 @@ fn note_scan_index_quarantine_rebuild(
 /// generation-0 rebuild that carries them. A replacement scan that then
 /// fails reloads that carried state, never an empty graph. The damaged bytes
 /// stay as the `.corrupt.override.` witness (a hard link), which re-arms the
-/// seven-day clock and is prior-history evidence like any quarantine.
+/// 24-hour clock and is prior-history evidence like any quarantine.
 fn override_scan_index_rebuild_loop(
     path: &Path,
     cause: &str,
@@ -720,14 +719,7 @@ fn override_scan_index_rebuild_loop(
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
     let prior_stamp = match fs::read(&stamp_path) {
         Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => {
-            return Err(refuse_scan_index_override(
-                source,
-                SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE,
-                cause,
-            ))
-        }
+        Err(_) => None,
     };
     // This replacement deliberately bypasses save_internal's record normalizers
     // and CAS: the locked damaged index cannot pass its ordinary CAS decoder.
@@ -796,11 +788,11 @@ fn override_scan_index_rebuild_loop(
         ));
     }
     // Spend the press only once its witness and rebuild are durable: that
-    // witness re-arms the seven-day clock and carries the 24-hour cooldown.
+    // witness re-arms the 24-hour clock and carries the 24-hour cooldown.
     disarm_scan_index_rebuild_manual_override(source);
     let count = count_scan_index_rebuild_manual_override();
     emit_scan_index_containment_line(format!(
-        "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair scan_index_rebuild_manual_override={count} guard_rearmed=7d cooldown=24h rebuild=gated identity=carried; one interactive user Repair passed the seven-day guard, history stays gated",
+        "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair scan_index_rebuild_manual_override={count} guard_rearmed=24h cooldown=24h rebuild=gated identity=carried; one interactive user Repair passed the 24-hour guard, history stays gated",
         source.api_slug()
     ));
     note_scan_index_quarantine_rebuild(cause, None, Some(source));

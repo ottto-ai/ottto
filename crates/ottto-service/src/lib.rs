@@ -2935,7 +2935,7 @@ fn local_health_source_for_status(
             blocking_reason: Some(snapshots::SCAN_INDEX_REBUILD_LOOP_CODE.to_string()),
             next_action: Some("review_scan_index_repair".to_string()),
             // The automatic retry time is the guard's own witness stamp plus
-            // seven days; a user Repair may run one gated rebuild sooner.
+            // 24 hours; a user Repair may run one gated rebuild sooner.
             // A refused override names its code; the source and
             // its index stay as they were.
             clear_condition: Some(format!(
@@ -5775,7 +5775,7 @@ mod tests {
             .unwrap()
             .contains("never delete the index"));
         // The automatic retry time rides in the existing clear_condition:
-        // seven days after the quarantine witness this pause read.
+        // 24 hours after the quarantine witness this pause read.
         let retry_at = source
             .clear_condition
             .as_deref()
@@ -5787,8 +5787,8 @@ mod tests {
         let retry_at =
             time::OffsetDateTime::parse(retry_at, &time::format_description::well_known::Rfc3339)
                 .unwrap();
-        let week_out = time::OffsetDateTime::now_utc() + time::Duration::days(7);
-        assert!((retry_at - week_out).abs() < time::Duration::minutes(5));
+        let day_out = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        assert!((retry_at - day_out).abs() < time::Duration::minutes(5));
         assert!(health
             .blockers
             .iter()
