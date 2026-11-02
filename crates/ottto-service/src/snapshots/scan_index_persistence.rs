@@ -47,6 +47,16 @@ pub(crate) enum Source {
     Pi,
 }
 
+impl Source {
+    pub(crate) fn snapshot(self) -> super::SnapshotSource {
+        match self {
+            Self::Claude => super::SnapshotSource::ClaudeCode,
+            Self::Codex => super::SnapshotSource::Codex,
+            Self::Pi => super::SnapshotSource::Pi,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Field {

@@ -1,7 +1,6 @@
 //! Committed, content-free membership for the restart-record erasure sweep.
 use super::*;
 use crate::durable_tail_store::DurableSource;
-use crate::snapshots::scan_index_persistence::Source;
 use std::collections::BTreeSet;
 
 #[cfg_attr(
@@ -57,12 +56,10 @@ fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     else {
         return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
-    let source = match binding.source {
-        Source::Claude => DurableSource::ClaudeCode,
-        Source::Codex => DurableSource::Codex,
-        // No Pi key mapping yet: never vouch for an empty set (a sweep would
-        // erase every Pi record once Pi gains restart records). Map with Pi-ON.
-        Source::Pi => return Ok(LiveKeys::incomplete(IncompleteReason::Off)),
+    // A source without a durable_sources row (Pi until Pi-ON) never vouches
+    // for an empty set: a sweep would erase every record it later gains.
+    let Some(source) = DurableSource::from_snapshot(binding.source.snapshot()) else {
+        return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
     let route = {
         let states = states().lock().map_err(|_| Hold::DbUnavailable)?;
