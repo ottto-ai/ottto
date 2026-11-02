@@ -293,6 +293,7 @@ impl PiLiveFixture {
             self.live.take().unwrap(),
             &self.home.0,
             SnapshotSource::Pi,
+            None,
             &"a".repeat(64),
             SnapshotUploadPolicy::default(),
             self.daemon.snapshot_scan_account_witness().unwrap(),
@@ -405,19 +406,19 @@ fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
     assert!(owner.admit(bounded_native_capture(&f, now)));
     assert_eq!(owner.wake_before(ordinary), due);
     let mut turns = 0;
-    owner.boundary(std::iter::empty(), due - Duration::from_nanos(1), |_| {
+    owner.boundary(due - Duration::from_nanos(1), |_| {
         turns += 1;
         Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
     });
     assert_eq!(turns, 0);
     assert_eq!(owner.wake_before(ordinary), due);
-    owner.boundary(std::iter::empty(), due, |_| {
+    owner.boundary(due, |_| {
         turns += 1;
         Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
     });
     assert_eq!(turns, 1);
     assert_eq!(owner.wake_before(ordinary), ordinary);
-    owner.boundary(std::iter::empty(), ordinary, |_| {
+    owner.boundary(ordinary, |_| {
         turns += 1;
         Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
     });
@@ -998,6 +999,7 @@ fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settleme
         f.live.take().unwrap(),
         &f.home.0,
         SnapshotSource::Pi,
+        None,
         &"a".repeat(64),
         SnapshotUploadPolicy::default(),
         f.daemon.snapshot_scan_account_witness().unwrap(),

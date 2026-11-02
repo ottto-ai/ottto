@@ -20,7 +20,6 @@ pub(crate) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
-    IntegrityRetry,
     SaveCeiling,
     SaveOversize,
     SaveFull,
@@ -38,7 +37,6 @@ impl std::fmt::Display for Hold {
             Self::SaveCeiling => "state_v2_save_ceiling",
             Self::SaveOversize => "state_v2_save_oversize",
             Self::SaveFull => "state_v2_sqlite_full",
-            Self::IntegrityRetry => "state_v2_integrity_retry",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
@@ -59,6 +57,14 @@ impl Hold {
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
             return (*hold).into();
+        }
+        let integrity_repair = error
+            .chain()
+            .any(|cause| cause.to_string() == INTEGRITY_REPAIR);
+        if integrity_repair {
+            // Publish the refusal before any diagnostic snapshot can retain
+            // the preceding successful open's cleared hold.
+            telemetry::event("hold", &"integrity_repair");
         }
         let reason = error
             .downcast_ref::<rusqlite::Error>()
@@ -93,6 +99,9 @@ impl Hold {
         let codes = error.chain().filter_map(code).collect::<Vec<_>>();
         let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
         telemetry::event("db_unavailable_cause", &cause);
+        if integrity_repair {
+            return anyhow::anyhow!(INTEGRITY_REPAIR);
+        }
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
@@ -155,6 +164,15 @@ impl RouteState {
     fn custody_held(&self) -> bool {
         self.custody_retry_at.is_some_and(|at| Instant::now() < at)
     }
+    fn report_hold(&self) {
+        if self.custody_held() {
+            telemetry::event("hold", &Hold::AckCustody);
+        } else if let Some(hold) = self.save_hold {
+            telemetry::event("hold", &hold);
+        } else {
+            telemetry::event("hold", &"none");
+        }
+    }
     fn reduce_page(&mut self) {
         let previous = self.page_limit;
         self.page_limit = (self.page_limit / 2).max(1);
@@ -173,6 +191,7 @@ impl RouteState {
             return;
         }
         self.save_hold = None;
+        self.report_hold();
         self.last_read = None;
         self.save_retry_completed = false;
         if over_target {
@@ -351,6 +370,7 @@ fn load_with_custody(
                             }
                             session.cx = cx;
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            state.report_hold();
                             telemetry::event("route", &"v2");
                             return Ok(Some(index));
                         }
@@ -387,6 +407,7 @@ fn load_with_custody(
                 })),
             }));
             register(state, &index)?;
+            state.report_hold();
             telemetry::event("route", &"v2");
             return Ok(Some(index));
         }
@@ -1233,7 +1254,6 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
         Err(e) => return Err(e.into()),
     }
     super::super::sync_checkpoint_parent(path)?;
-    telemetry::event("source_erasure_confirmed", &1);
     // Retain the invalidated route's custody latch: erased artifacts must not
     // let this process resume v1 or re-create v2 without an explicit new lineage.
     Ok(())
@@ -1243,7 +1263,58 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
 /// existing whole-tree removal owns legacy files and unregistered artifacts;
 /// discovering those files here would register routes for files no source reads.
 pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
-    close_tree(support, true)
+    close_tree(support, true)?;
+    telemetry::event("source_erasure_confirmed", &1);
+    Ok(())
+}
+
+/// Unlinks one source's local copy in every namespace. `indexes` are the only
+/// routed paths; `family` (their shared file stem) also covers progress, locks,
+/// legacy and policy-scoped indexes and temps. An error leaves `complete` uncalled,
+/// so the caller's marker stays pending and the next cycle repeats this sweep.
+pub(crate) fn erase_source(
+    indexes: &[PathBuf],
+    family: &str,
+    others: &[PathBuf],
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    for path in indexes {
+        {
+            // Erasure must not depend on decoding the files it removes.
+            let _owner =
+                super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
+            crate::snapshot_sync::with_state_v2_progress_lock(path, |_| erase_locked(path, None))?;
+        }
+        // Lock files go only after their flocks are released.
+        let parent = path.parent().context("source_erasure_parent")?;
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let rest = name.to_str().and_then(|name| name.strip_prefix(family));
+            let owned = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']));
+            if owned {
+                fence::remove_artifact(&entry.path())?;
+            }
+        }
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    for path in others {
+        fence::remove_artifact(path)?;
+        super::super::sync_checkpoint_parent(path)?;
+    }
+    // All clones are closed; a dropped latch gives reconnect a fresh lineage.
+    let mut routes = states().lock().map_err(|_| Hold::DbUnavailable)?;
+    for path in indexes {
+        routes.remove(path);
+    }
+    drop(routes);
+    complete()?;
+    telemetry::event("source_erasure_confirmed", &indexes.len());
+    Ok(())
+}
+
+pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
+    telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
 fn close_tree(support: &Path, erase: bool) -> Result<()> {
@@ -1364,60 +1435,92 @@ pub(in super::super) fn read_cold<T: serde::de::DeserializeOwned + Serialize>(
 /// accumulates (`Some`), or every family before a decision that joins them
 /// (`None`). A missing, changed or unreadable row, or a store this graph does
 /// not hold, is Unknown and the caller refuses its whole decision. Counted.
-/// Rows install one at a time, only after every wanted row was read: a later
-/// digest mismatch can leave earlier verified rows installed while the caller
-/// still refuses the whole decision.
+/// Nothing installs unless every wanted row was read and matches its head.
 pub(in super::super) fn load_usage(
     index: &mut ScanIndex,
     roots: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    let usage = &index.claude_usage_family_pending;
-    if usage.cold().is_none() {
+    if roots.is_none() && index.claude_usage_family_pending.all().is_ok() {
         return Ok(());
     }
-    let wanted = match roots {
-        Some(roots) => {
-            let wanted = usage.unloaded(roots.iter().map(String::as_str));
-            if wanted.is_empty() {
-                return Ok(());
-            }
-            Some(wanted)
-        }
-        None if usage.all().is_ok() => return Ok(()),
-        None => None,
+    let mut read = Vec::new();
+    read_unloaded(index, roots, roots.is_none(), &mut |root, value, digest| {
+        read.push((root, value, digest));
+    })?;
+    let Some(cold) = index.claude_usage_family_pending.cold_mut() else {
+        return Ok(());
     };
-    let result = (|| -> Result<()> {
-        let mut read = Vec::new();
-        read_cold(
-            index,
-            "usage.pending",
-            wanted.as_ref(),
-            &mut |root, value, digest| {
-                read.push((root, value, digest));
-                Ok(())
-            },
-        )?;
-        // Every wanted row must have been read before any is installed.
-        if let Some(wanted) = &wanted {
-            let read: std::collections::BTreeSet<&String> =
-                read.iter().map(|(root, _, _)| root).collect();
-            ensure!(
-                wanted.iter().all(|root| read.contains(root)),
-                super::super::usage_pending::Unknown
-            );
+    for (root, value, digest) in read {
+        cold.install(root, value, digest)?;
+    }
+    if roots.is_none() {
+        cold.complete()?;
+    }
+    Ok(())
+}
+
+/// Every usage-pending family (`None`) or the named ones (`Some`), one at a
+/// time, as this graph holds it: its loaded value, else its stored row,
+/// which must still match its head. Keeps nothing and visits in no set
+/// order. Unknown, counted: a row unlike its head, a head without a row, or a
+/// store this graph does not hold.
+pub(in super::super) fn visit_usage(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let held = usage.resident().or(usage.cold().map(|cold| cold.loaded()));
+    for (root, family) in held.into_iter().flatten() {
+        if roots.map_or(true, |roots| roots.contains(root)) {
+            f(root.as_str(), family);
         }
-        let cold = index
-            .claude_usage_family_pending
-            .cold_mut()
-            .ok_or(Hold::DbUnavailable)?;
-        for (root, value, digest) in read {
-            cold.install(root, value, digest)?;
-        }
-        if wanted.is_none() {
-            cold.complete()?;
-        }
+    }
+    read_unloaded(index, roots, false, &mut |root, value, _| f(&root, &value))
+}
+
+/// The cold families `roots` names (`None`: every head) that this graph has
+/// not loaded, one stored row at a time, each matching its head; every one
+/// must be read. `None` reads the whole kind, complete by its manifest count,
+/// and with `whole` reads it even when nothing is unloaded. Unknown, counted:
+/// a row unlike its head, a head without a row, or a store this graph does
+/// not hold.
+fn read_unloaded(
+    index: &ScanIndex,
+    roots: Option<&std::collections::BTreeSet<String>>,
+    whole: bool,
+    f: &mut dyn FnMut(String, super::super::ClaudeUsageFamilyPending, [u8; 32]),
+) -> Result<()> {
+    let usage = &index.claude_usage_family_pending;
+    let Some(cold) = usage.cold() else {
+        return Ok(());
+    };
+    let unread = match roots {
+        Some(roots) => usage.unloaded(roots.iter().map(String::as_str)),
+        None => usage.unloaded(cold.head_roots().map(String::as_str)),
+    };
+    if unread.is_empty() && !whole {
+        return Ok(());
+    }
+    let mut seen = 0_usize;
+    let read = read_cold(
+        index,
+        "usage.pending",
+        roots.map(|_| &unread),
+        &mut |root, value: super::super::ClaudeUsageFamilyPending, digest| {
+            if !unread.contains(&root) {
+                return Ok(()); // loaded already, or removed by this graph
+            }
+            cold.admits(&root, digest)?;
+            seen += 1;
+            f(root, value, digest);
+            Ok(())
+        },
+    );
+    let result = read.and_then(|()| {
+        ensure!(seen == unread.len(), super::super::usage_pending::Unknown);
         Ok(())
-    })();
+    });
     if result.is_err() {
         telemetry::count("usage_pending_unknown", 1);
     }

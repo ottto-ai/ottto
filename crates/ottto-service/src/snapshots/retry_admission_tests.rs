@@ -751,7 +751,7 @@ fn oversized_complete_accepted_singleton_defers_without_healthy_full_reads() {
             &mut census,
             rfc3339_unix_seconds(CARRY_RETRY),
             BACKFILL_WINDOW_DAYS,
-            &mut crate::snapshots::CandidateDiscovery::new(&mut fixture.index, None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut fixture.index, None, None),
         )
         .unwrap();
         prepare_owned_scan_candidate(
