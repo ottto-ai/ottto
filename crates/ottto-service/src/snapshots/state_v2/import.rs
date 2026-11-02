@@ -1238,8 +1238,14 @@ mod application_cases {
     fn production_import_preserves_pre_archive_presence_and_rows() {
         // Preserve the historical inventory boundary independently of the
         // production exclusion predicate and its appended v1 decoder slots.
-        let fields = &super::super::super::lenient_decode::FIELDS[..89];
-        assert_eq!(fields.last(), Some(&"upload_context_proof"));
+        let historical = &super::super::super::lenient_decode::FIELDS[..89];
+        assert_eq!(historical.last(), Some(&"upload_context_proof"));
+        // Claude fields appended after the archive slots stay in presence.
+        let fields: Vec<&str> = historical
+            .iter()
+            .copied()
+            .chain(["copy_prefix_last_accepted_nonce"])
+            .collect();
         let positional = original_presence(b"[2,0,null,{}]".as_slice()).unwrap();
         let positional_expected: BTreeMap<String, bool> = fields
             .iter()
@@ -1298,7 +1304,7 @@ mod application_cases {
                 serde_json::to_vec(&presence).unwrap(),
                 serde_json::to_vec(&expected).unwrap()
             );
-            // Main's hydration rule accepts only its original field names.
+            // Hydration accepts only original names; layout 3 adds the nonce.
             assert!(presence.keys().all(|name| fields.contains(&name.as_str())));
             let (restored, mut actual) = hydrate_context(&mut db).unwrap();
             let mut control = KindCx::default();
