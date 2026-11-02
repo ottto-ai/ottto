@@ -1,6 +1,7 @@
 //! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::native_cold;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
@@ -762,6 +763,7 @@ thread_local! {
     pub(in crate::snapshots) static EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(in crate::snapshots) static GROUP_EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_EOF_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NARROW_MISSES_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 // Build certified fixture evidence through the same constructor and header
 // steps as an ordinary scan, without retaining evidence from a completed scan.
@@ -790,6 +792,17 @@ pub(in crate::snapshots) fn constrain_eof_park(job: &mut OwnedActiveFile) {
         let charge = paused_charge(job).expect("bounded EOF job");
         job.parser.restore_live_reduction_inputs(inputs);
         TEST_STATE_BUDGET.with(|limit| limit.set(Some(charge - 1)));
+    }
+}
+/// While `NARROW_MISSES_ROW` is set, the narrowed view disagrees with its
+/// page's full view (a conflict row the full view lacks).
+pub(in crate::snapshots) fn constrain_narrowed(codex: &mut CodexTitleMetadata, path: &Path) {
+    if NARROW_MISSES_ROW.with(std::cell::Cell::get) {
+        codex.identity_conflicts.extend(
+            codex_session_id_candidates_from_path(path)
+                .iter()
+                .map(|id| resolve_codex_identity(id)),
+        );
     }
 }
 fn carry(root: &Path, scan: &mut SourceScanResult) {
@@ -1513,6 +1526,7 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let traversal = index.traversal.as_mut().unwrap();
 
@@ -1827,7 +1841,7 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
             "precondition: an unsampled native read"
         );
         let context = claude.sampling.as_ref().unwrap();
-        let measured = crate::heap_layout_bound::bound(context, STATE_BYTES);
+        let measured = crate::heap_layout_bound::bound(context, state_bytes());
         assert!(measured.is_some(), "precondition: residents measured");
         let (_, lifecycle) = observe(|| {
             crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
@@ -1839,7 +1853,7 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
         assert_eq!(lifecycle.clear_other_active, 0);
         assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
         assert_eq!(lifecycle.clear_entries_released, 0);
-        assert!(crate::heap_layout_bound::bound(context, STATE_BYTES).is_some());
+        assert!(crate::heap_layout_bound::bound(context, state_bytes()).is_some());
         assert_eq!(cache.cursor_charge(), charge, "the paused job's charge");
         assert_eq!(cache.cursor_reserved(), 0, "no reservation");
         let (_, lifecycle) = observe(|| claude.release_sampled_cache_for_copy_refusal());
@@ -1889,7 +1903,7 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
         );
         let release = |scan: &OwnedSourceScan| {
             let measured =
-                crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), STATE_BYTES);
+                crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), state_bytes());
             assert!(measured.is_some(), "precondition: residents measured");
             crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
                 crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
@@ -2071,7 +2085,7 @@ fn many_hour_session_pauses_past_the_walk_visit_limit_and_publishes_once() {
             let held = cache.with_cursor(|cursor| match &cursor.slot {
                 Slot::Paused(job) => (
                     job.parser.accumulator.usage_buckets.len(),
-                    crate::heap_layout_bound::bound(&**job, STATE_BYTES).is_none(),
+                    crate::heap_layout_bound::bound(&**job, state_bytes()).is_none(),
                 ),
                 Slot::Empty | Slot::ActiveElsewhere { .. } => (0, false),
             });
@@ -2969,6 +2983,7 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let walked = index.traversal.as_mut().unwrap();
 
@@ -3256,6 +3271,7 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3277,18 +3293,30 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
 }
 
-/// The production-shaped 2,800-member revalidation backlog must not spend
-/// the byte budget before a new session or an appended, processed session.
-/// A persisted yield then gives the census a whole ordinary page even when
+/// [regress #789] A large revalidation backlog of owed old census re-reads
+/// must not spend the byte budget before fresh data. Each page's singleton
+/// budget is four fixture files, and the fresh bypass triggers once the
+/// pending bytes exceed it, so `MEMBERS` only has to dwarf a few pages.
+/// Two discovery arms share one warm fixture:
+/// (a) a new session and an appended, processed session (hinted). A
+/// persisted yield then gives the census a whole ordinary page even when
 /// fresh data continues to arrive. No upload fingerprints or totals change.
+/// (b) a new Codex day is a new date directory. Retained-roster refresh
+/// finds it with no watcher hint; its rollout must still reach the
+/// post-policy upload set within two ordinary pages.
+/// [regress] (c) a due quarantine retry of an unchanged, already read file is
+/// neither fresh nor a census member. It rides the next selecting page beside
+/// that work, keeps its flags, and with no new hint is not queued again.
 #[test]
-fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
+fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    const MEMBERS: usize = 300;
     const NEW: &str = "019fa111-2222-7333-8444-888888888888";
     const NEXT: &str = "019fa111-2222-7333-8444-888888888889";
-    let ids = (0..2800)
+    const NEW_DAY: &str = "019fa111-2222-7333-8444-888888888890";
+    let ids = (0..MEMBERS)
         .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
         .collect::<Vec<_>>();
     let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
@@ -3296,7 +3324,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     let fixture = ScanRoot::with_sessions(&sessions);
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 1);
     for id in &ids {
         index
             .files
@@ -3317,6 +3345,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     // SESSION already finished its census read; growth must not re-enroll it.
     index
@@ -3334,8 +3363,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         assert!(!scan.census_complete);
         let window = scan.census_window_end.clone();
         let old_pending = index.traversal.as_ref().unwrap().pending_candidates.len();
-        assert!(old_pending > 2700);
+        assert!(old_pending > MEMBERS - 100);
 
+        // Arm (a): hinted append plus a new session.
         let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
             "type": "session_meta", "payload": {"id": NEW}}));
         body.extend(token_line(1));
@@ -3352,12 +3382,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
             &[fixture.file(SESSION)],
         );
         index = next;
-        let published = fresh
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(published, BTreeSet::from([NEW, SESSION]));
+        assert_eq!(published_ids(&fresh), BTreeSet::from([NEW, SESSION]));
         assert_eq!(fresh.census_window_end, window);
         assert!(!fresh.census_complete);
         assert!(index.traversal.as_ref().unwrap().codex_freshness_yield);
@@ -3389,26 +3414,98 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         );
         assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
-        let (_, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
-        let published = fresh
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
+        let (next, fresh) = published_scan(&fixture, &cache, index, &collected_at(3), &[]);
+        index = next;
+        assert_eq!(published_ids(&fresh), BTreeSet::from([NEXT, SESSION]));
+
+        // Pay the owed ordinary turn so arm (b) starts, like a cold backlog,
+        // with no freshness yield pending.
+        let (next, ordinary) = published_scan(&fixture, &cache, index, &collected_at(4), &[]);
+        index = next;
+        assert!(
+            ordinary.snapshots.is_empty(),
+            "unchanged-output revalidation"
+        );
+        assert!(!ordinary.census_complete);
+        assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > MEMBERS - 100);
+
+        // Arm (b): an unhinted new date directory.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_dated_rollout(&fixture, "2026/10/08", NEW_DAY);
+        cache.clear();
+        let mut published = BTreeSet::new();
+        for page in 1..=2 {
+            let (next, scan) =
+                published_scan(&fixture, &cache, index, &collected_at(4 + page), &[]);
+            index = next;
+            assert_eq!(scan.census_window_end, window, "same open generation");
+            assert!(!scan.census_complete);
+            published.extend(published_ids(&scan).into_iter().map(String::from));
+            if published.contains(NEW_DAY) {
+                break;
+            }
+        }
+        assert_eq!(published, BTreeSet::from([NEW_DAY.to_string()]));
+
+        // Arm (c): NEW was read and is unchanged; its retry is due and leased.
+        // The owed census turn runs while SESSION has fresh bytes waiting.
+        let leased = fixture.file(NEW);
+        let key = local_index_key(&leased);
+        let fingerprint = index.file_snapshot_fingerprints[&key]
+            .first()
+            .unwrap()
+            .clone();
+        let mut record = snapshot_quarantine_record(SnapshotSource::Codex);
+        record.retry_after_unix_seconds = 0;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fingerprint.clone(), record);
+        let mut hints = index.activate_terminal_contract_retries(BTreeSet::from([fingerprint]));
+        assert_eq!(hints, vec![leased.clone()]);
+        fixture.append(SESSION, &token_line(7));
+        hints.push(fixture.file(SESSION));
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
+        let queued = index.traversal.as_ref().unwrap().pending_candidates.len();
+        cache.clear();
+        let selected = selected_page(&fixture, &cache, index, &collected_at(7), &hints);
+        assert_eq!(selected.codex_selected_flags[&key], (false, true));
+        let (next, ridden) = finish_published(selected);
+        index = next;
+        assert_eq!(published_ids(&ridden), BTreeSet::from([NEW]));
+        assert_eq!(ridden.census_window_end, window);
+        assert_eq!(pending_flags(&index, &leased), None);
+        assert_eq!(
+            pending_flags(&index, &fixture.file(SESSION)),
+            Some((false, true))
+        );
+        // SESSION joined the queue; the census turn still read its members.
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() <= queued);
+
+        // No new hint here: the file stays out of the queue. The sync loop
+        // re-hints a lease left unsettled, which this fixture does not cover.
+        let (_, after) = published_scan(&fixture, &cache, index, &collected_at(8), &[]);
+        assert_eq!(published_ids(&after), BTreeSet::from([SESSION]));
     });
 }
 
-/// One Codex page stepped to completion, returning the same post-policy
-/// upload set the collector would offer.
-fn published_scan(
+/// The session ids `scan` published.
+fn published_ids(scan: &SourceScanResult) -> BTreeSet<&str> {
+    scan.snapshots
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect()
+}
+
+/// One Codex page selected at `collected_at`, not yet stepped.
+fn selected_page(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
     index: ScanIndex,
     collected_at: &str,
     hints: &[PathBuf],
-) -> (ScanIndex, SourceScanResult) {
-    let mut scan = OwnedSourceScan::new(
+) -> OwnedSourceScan {
+    OwnedSourceScan::new(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
         index,
@@ -3420,7 +3517,23 @@ fn published_scan(
         hints,
         false,
     )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()))
+}
+
+/// One Codex page stepped to completion, returning the same post-policy
+/// upload set the collector would offer.
+fn published_scan(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    finish_published(selected_page(fixture, cache, index, collected_at, hints))
+}
+
+/// Step `scan` to completion and apply the collector's upload policy.
+fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -3481,6 +3594,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -3519,6 +3633,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
         discovery_retention!(index),
+        (&index.files).into(),
     );
     assert!(!index
         .traversal
@@ -3531,6 +3646,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
+        None,
     );
     assert!(index
         .traversal
@@ -3540,78 +3656,6 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         .is_empty());
     assert_eq!(flags(&index, &new), Some((true, true, true)));
     assert_eq!(flags(&index, &old), Some((true, false, false)));
-}
-
-/// A new Codex day is a new date directory. Retained-roster refresh finds it
-/// with no watcher hint; its rollout must still reach the post-policy upload
-/// set within two ordinary pages instead of waiting behind 2,800 owed old
-/// census members.
-#[test]
-fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    const NEW: &str = "019fa111-2222-7333-8444-888888888890";
-    let ids = (0..2800)
-        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
-        .collect::<Vec<_>>();
-    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
-    sessions.push((SESSION, 4));
-    let fixture = ScanRoot::with_sessions(&sessions);
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), 2801);
-    for id in &ids {
-        index
-            .files
-            .get_mut(&local_index_key(&fixture.file(id)))
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-    }
-    ensure_bounded_traversal(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        &mut index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-    );
-    advance_bounded_directory_traversal(
-        SnapshotSource::Codex,
-        &mut index,
-        BACKFILL_WINDOW_DAYS,
-        None,
-    );
-    let budget = fixture.len(SESSION) * 4;
-    cache.clear();
-    with_test_limits(2048, budget, 64, || {
-        let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
-        index = next;
-        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
-        assert!(!scan.census_complete);
-        let window = scan.census_window_end.clone();
-        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > 2700);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        write_dated_rollout(&fixture, "2026/10/08", NEW);
-        cache.clear();
-        let mut published = BTreeSet::new();
-        for page in 1..=2 {
-            let (next, scan) = published_scan(&fixture, &cache, index, &collected_at(page), &[]);
-            index = next;
-            assert_eq!(scan.census_window_end, window, "same open generation");
-            assert!(!scan.census_complete);
-            published.extend(
-                scan.snapshots
-                    .iter()
-                    .map(|item| item.source_session_id.clone()),
-            );
-            if published.contains(NEW) {
-                break;
-            }
-        }
-        assert_eq!(published, BTreeSet::from([NEW.to_string()]));
-    });
 }
 
 /// G1 carry: a census that closes while a re-read is still waiting hands it
@@ -4122,8 +4166,8 @@ fn accumulator_heap_bound_at_measured_event_counts() {
         // The paused charge walks the reader buffer with the accumulator.
         assert!(walked >= accumulator.saturating_add(buffer));
         assert!(
-            walked <= STATE_BYTES,
-            "{case}: {walked} exceeds STATE_BYTES"
+            walked <= state_bytes(),
+            "{case}: {walked} exceeds state_bytes()"
         );
         let (first, peak) = first_pause.zip(peak).expect("the read paused");
         assert!(peak >= first);
@@ -4343,6 +4387,18 @@ impl CreatedThreadHome {
         state_source: &str,
         spawn_parent: Option<&str>,
     ) -> Self {
+        Self::with_lineage_aged(written, fork, state_source, spawn_parent, 0)
+    }
+
+    /// `with_lineage` whose content and state row are `age_ms` older than the
+    /// rollout file's birth: a copied or recreated rollout.
+    fn with_lineage_aged(
+        written: usize,
+        fork: bool,
+        state_source: &str,
+        spawn_parent: Option<&str>,
+        age_ms: i64,
+    ) -> Self {
         let fixture = ScanRoot::with_sessions(&[]);
         let now = i64::try_from(
             SystemTime::now()
@@ -4351,7 +4407,7 @@ impl CreatedThreadHome {
                 .as_millis(),
         )
         .unwrap();
-        let base_ms = now - now % 1_000;
+        let base_ms = now - now % 1_000 - age_ms;
         let at = |offset: i64| bounded_rfc3339_millis(base_ms + offset).unwrap();
         let second = |offset: i64| u64::try_from(base_ms / 1_000 + offset).unwrap();
         let turn = |n: u64| format!("{}-5000-7000-8000-{n:012}", &CREATED[..8]);
@@ -4903,6 +4959,57 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     );
     assert_oracle(&home, &cache, &index, &cured, 3, true, &[]);
     assert_admitted_once(&home, &cache, index, &cured, 4);
+}
+
+/// [regress] A copied created thread: its header matches the state row's
+/// creation time, but the rollout file was born days later. A state-declared
+/// created thread proves its creation from that header, not from file birth,
+/// so the curing append binds it and credits its usage once, equal in totals
+/// and placement to a cold Full. A thread the state row does not classify as
+/// created (rollout-declared, spawn parent) keeps the file-birth check and
+/// stays held, as on main.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
+fn copied_created_thread_binds_from_its_header_not_file_birth() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    const COPIED_DAYS_LATER_MS: i64 = 5 * 86_400_000;
+    for (state_source, spawn_parent, admitted) in [
+        ("agent_created_thread", None, true),
+        ("user", Some(SPAWN_PARENT), false),
+    ] {
+        let home = CreatedThreadHome::with_lineage_aged(
+            3,
+            false,
+            state_source,
+            spawn_parent,
+            COPIED_DAYS_LATER_MS,
+        );
+        let cache = Arc::new(SharedCache::default());
+        let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+        assert!(created_usage(&held).is_empty(), "{state_source}");
+        home.flush_from(3);
+        let (index, cured) = home.generation(index, &cache, 1);
+        if !admitted {
+            assert!(created_usage(&cured).is_empty(), "{state_source}");
+            assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
+            continue;
+        }
+        assert_eq!(
+            created_usage(&cured),
+            vec![(200, 3)],
+            "{state_source}: {}",
+            counters(&cache)
+        );
+        let (cold_index, cold) = home.oracle(1);
+        money_oracle::assert_equivalent(
+            &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+            &scan_money(SnapshotSource::Codex, &index, &cured),
+        );
+        assert_admitted_once(&home, &cache, index, &cured, 2);
+    }
 }
 
 /// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by
@@ -5763,6 +5870,7 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     ignore = "needs macOS heap layout"
 )]
 fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_cold_full() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
     let source = SnapshotSource::Codex;
     let namespace = Scope("cursor-fixture".into());
@@ -7312,6 +7420,213 @@ fn released(
     released
 }
 
+/// [regress] Residue ownership survives a page checkpoint: both absence paths
+/// keep its entries and block inclusive publication; departed join provenance
+/// is retained for that owner while unrelated work completes normally.
+#[test]
+fn plain_codex_residue_keeps_owner_custody_across_reload() {
+    use crate::snapshots::disappearance_diagnostics::tests::finish;
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
+
+    let fixture = ScanRoot::with_sessions(&[]);
+    write_account_rollout(&fixture, SESSION, "a", 1);
+    let (prior_index, prior_scan) = page(&fixture, ScanIndex::default(), None);
+    let mut prior = scan_money(SnapshotSource::Codex, &prior_index, &prior_scan);
+    prior.accepted = prior_scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                Accepted {
+                    body: prior.snapshots[&item.source_session_id].clone(),
+                    witness: snapshot_upload_body_witness(item),
+                },
+            )
+        })
+        .collect();
+    assert!(prior.accepted.contains_key(SESSION));
+    fs::remove_file(fixture.file(SESSION)).unwrap();
+    let held_key = local_index_key(&fixture.file(SESSION));
+    let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
+    let last = fixture.root.join("last-page.jsonl");
+    fs::write(&last, b"").unwrap();
+    let new_scan = |index| {
+        OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            index,
+            NOW,
+            365,
+            10,
+            false,
+            None,
+            &[],
+            false,
+        )
+    };
+    let mut seed = ScanIndex::default();
+    for key in [&held_key, &retired_key] {
+        seed.files.insert(
+            key.clone(),
+            crate::snapshots::tests::manifest_index_entry(None),
+        );
+    }
+    let healthy_thread = CodexStateThread {
+        tokens_used: 10,
+        ..Default::default()
+    };
+
+    // Independent cold control: the observed held entry cannot be retired, and
+    // only the healthy state thread exists. No residue guard is needed here.
+    let mut cold = new_scan(seed.clone());
+    cold.codex_join_prepared = true;
+    cold.index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .observed_index_keys
+        .insert(held_key.clone());
+    cold.codex_title_metadata
+        .state_threads
+        .insert(SESSION_B.into(), healthy_thread.clone());
+    let (cold_index, cold_scan) = finish(cold);
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+
+    for removal_hint in [false, true] {
+        let mut first = new_scan(seed.clone());
+        first.codex_join_prepared = true;
+        // A plain ownership refusal, after its transient read failure clears.
+        // No per-file block or accepted file body may mask the restored block.
+        first.census.ownership_incomplete_file_count = 1;
+        first.census.causes.add(ownership::GROUP, 1);
+        first.residue_index_keys.insert(held_key.clone());
+        first.residue_blocked_session_ids.insert(SESSION.into());
+        first
+            .codex_state_only_blocked_session_ids
+            .insert(SESSION.into());
+        first
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .push_back(ScanTraversalPath {
+                scan_root: fixture.root.clone(),
+                path: last.clone(),
+                census_member: true,
+                watcher_hint: false,
+            });
+        let (mut index, page_one) = finish(first);
+        assert!(!page_one.census_complete);
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .blocked_session_ids
+            .contains(SESSION));
+        assert!(index.codex_state_only_blocked_session_ids.is_empty());
+        let checkpoint = fixture
+            ._dir
+            .0
+            .join(format!("residue-index-{removal_hint}.json"));
+        index.save(&checkpoint).unwrap();
+        let restored = ScanIndex::load(&checkpoint).unwrap();
+        let mut final_page = new_scan(restored);
+        final_page.codex_join_prepared = true;
+        final_page.codex_join_inventory = None;
+        final_page.identified_candidates.clear();
+        assert!(final_page
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .is_empty());
+        for id in [SESSION, SESSION_B] {
+            final_page
+                .codex_title_metadata
+                .state_threads
+                .insert(id.into(), healthy_thread.clone());
+        }
+        if removal_hint {
+            final_page
+                .census
+                .removed_index_keys
+                .extend([held_key.clone(), retired_key.clone()]);
+        }
+        let (index, result) = finish(final_page);
+        assert!(result.census_complete);
+        assert!(
+            index.files.contains_key(&held_key),
+            "filename owner is retained"
+        );
+        assert!(
+            !index.files.contains_key(&retired_key),
+            "unrelated entry retires"
+        );
+        let mut route = scan_money(SnapshotSource::Codex, &index, &result);
+        route.accepted = prior.accepted.clone();
+        money_oracle::assert_held(SESSION, &prior, &route, &cold);
+        money_oracle::assert_equivalent(&cold, &route);
+    }
+
+    // Join release needs a clean completed inventory. Seed only optional RAM
+    // provenance here so this also exercises release on unsupported layouts.
+    let cache = Arc::new(SharedCache::default());
+    let mut departing = new_scan(ScanIndex::default())
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("plain-residue-custody".into()));
+    departing.codex_join_prepared = true;
+    departing.codex_join_inventory = Some(codex_file_join::HeaderInventory::new(
+        &[],
+        &BTreeSet::new(),
+        Some(&codex_file_join::DirectoryCensus::new()),
+    ));
+    assert!(departing.codex_join_inventory.as_ref().unwrap().complete);
+    departing
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .residue
+        .blocked_session_ids
+        .insert(SESSION.into());
+    for (id, key) in [(SESSION, &held_key), (SESSION_B, &retired_key)] {
+        cache
+            .with_cursor(|cursor| {
+                let used = cursor.tick();
+                cursor.join_owners.insert(id.into(), (used, key.clone()));
+            })
+            .unwrap();
+        departing
+            .index
+            .codex_state_only_blocked_by_file
+            .insert(key.clone(), BTreeSet::from([id.into()]));
+        departing
+            .index
+            .codex_state_only_blocked_session_ids
+            .insert(id.into());
+    }
+    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
+    assert_eq!(join_entry(&cache, SESSION_B), Some(retired_key.clone()));
+    let (index, result) = finish(departing);
+    assert!(result.census_complete);
+    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
+    assert_eq!(join_entry(&cache, SESSION_B), None);
+    assert_eq!(
+        index.codex_state_only_blocked_by_file.get(&held_key),
+        Some(&BTreeSet::from([SESSION.into()]))
+    );
+    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
+    assert!(!index
+        .codex_state_only_blocked_by_file
+        .contains_key(&retired_key));
+    assert!(!index
+        .codex_state_only_blocked_session_ids
+        .contains(SESSION_B));
+}
+
 /// J-T4 (c): `keep` holds a queued or paused owner; without it the owner is
 /// released exactly once with its exact member keys, and only when every
 /// member left the census. Another owner's provenance survives.
@@ -7493,6 +7808,7 @@ fn hopeless_admission_evicts_nothing() {
         cache.insert(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -7518,7 +7834,7 @@ fn hopeless_admission_evicts_nothing() {
         // Fits the state with no provenance, never beside an empty retained
         // cache (before the fix: both entries and the copy were evicted).
         // Then a charge the state alone cannot hold.
-        for hopeless in [STATE_BYTES - empty - floor + 1, STATE_BYTES] {
+        for hopeless in [state_bytes() - empty - floor + 1, state_bytes()] {
             assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
             intact();
             assert_eq!(cache.cursor_resident(), resident);
@@ -7537,7 +7853,7 @@ fn hopeless_admission_evicts_nothing() {
         // Control: a reserve that fits once provenance is forgotten still
         // goes on (baseline progress), now that it is feasible.
         let credit = cache
-            .cursor_reserve(STATE_BYTES - empty - floor)
+            .cursor_reserve(state_bytes() - empty - floor)
             .expect("feasible after forgetting provenance and copies");
         assert_eq!(join_entry(&cache, JOIN_OWNER), None);
         assert_eq!(join_entry(&cache, JOIN_OTHER), None);
@@ -7574,6 +7890,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -7586,11 +7903,11 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         // F4b: the side ledger's reservation is part of the floor.
         let with_copy = admission_floor(&cache);
         let state = cursor_without_header_facts(&cache);
-        assert!(with_copy + state <= STATE_BYTES);
+        assert!(with_copy + state <= state_bytes());
         let copy = cache.take(&key).expect("retained").retained;
         // F4b exact boundary: a claim that leaves exactly the copy's room
         // beside the side ledger's reservation; the copy is kept.
-        let exact = STATE_BYTES - state - with_copy;
+        let exact = state_bytes() - state - with_copy;
         let credit = cache.cursor_reserve(exact).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
         assert!(
@@ -7599,7 +7916,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         );
         assert_eq!(
             admission_floor(&cache) + cache.cursor_resident(),
-            STATE_BYTES
+            state_bytes()
         );
         credit.refund();
         let copy = cache.take(&key).expect("retained").retained;
@@ -7608,7 +7925,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_none(), "refused");
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -7671,7 +7988,7 @@ fn credits_settle_once_on_every_path() {
     assert!(!cursor_held(), "reset on unwind");
     // Poisoned: measured as the whole budget; admits and settles nothing.
     assert_eq!(cache.cursor_reserved(), usize::MAX);
-    assert_eq!(cache.cursor_resident(), STATE_BYTES);
+    assert_eq!(cache.cursor_resident(), state_bytes());
     assert!(cache.cursor_reserve(1).is_none());
     stranded.refund();
     cache.record_join_owner(JOIN_OWNER, &join_members(&["a.jsonl"]));
@@ -7695,7 +8012,7 @@ fn corrupt_credit_accounting_fails_closed() {
         assert_eq!(unwound.is_err(), cfg!(debug_assertions));
         assert!(!cursor_held());
         assert_eq!(cache.cursor_reserved(), usize::MAX);
-        assert_eq!(cache.cursor_resident(), STATE_BYTES);
+        assert_eq!(cache.cursor_resident(), state_bytes());
         assert!(cache.cursor_reserve(1).is_none());
     }
 }
@@ -7842,11 +8159,11 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
             },
         );
     }
-    assert!(cache.cursor_resident() < STATE_BYTES);
+    assert!(cache.cursor_resident() < state_bytes());
     assert!(cache.with_cursor(|cursor| cursor.parents.len()).unwrap() <= ROTATION_KEYS);
     assert!(counter(&cache, |c| c.parent_namespace_refused) > 0);
     let credit = cache
-        .cursor_reserve(STATE_BYTES - empty - floor)
+        .cursor_reserve(state_bytes() - empty - floor)
         .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
     assert!(counter(&cache, |c| c.parent_witness_evicted) > 0);
     assert!(cache
@@ -7925,7 +8242,7 @@ fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
     assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
     // A mandatory admission still forgets witnesses for its room.
     let credit = cache
-        .cursor_reserve(STATE_BYTES - empty - floor)
+        .cursor_reserve(state_bytes() - empty - floor)
         .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
     assert!(cache
         .with_cursor(|cursor| cursor.parents.is_empty())
@@ -7974,6 +8291,7 @@ fn witness_admission() -> WitnessAdmission {
     cache.insert(
         key.clone(),
         sampled_jsonl::CompletedNativeAcquisition {
+            durable: Default::default(),
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
             released: None,
@@ -8049,7 +8367,7 @@ fn hopeless_admission_keeps_every_witness() {
         };
         intact();
         let resident = cache.cursor_resident();
-        for hopeless in [STATE_BYTES - setup.empty - setup.floor + 1, STATE_BYTES] {
+        for hopeless in [state_bytes() - setup.empty - setup.floor + 1, state_bytes()] {
             assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
             intact();
             assert_eq!(cache.cursor_resident(), resident);
@@ -8077,7 +8395,7 @@ fn hopeless_admission_keeps_every_witness() {
             - node
             - WITNESS_KEYS[0].len();
         let credit = cache
-            .cursor_reserve(STATE_BYTES - setup.floor - after)
+            .cursor_reserve(state_bytes() - setup.floor - after)
             .unwrap_or_else(|| panic!("fits after one witness: {}", counters(cache)));
         assert_eq!(counter(cache, |c| c.parent_witness_evicted), 1);
         assert_eq!(join_entry(cache, JOIN_OWNER), None);
@@ -8106,7 +8424,7 @@ fn feasible_reserve_forgets_provenance_then_witnesses() {
         let setup = witness_admission();
         let cache = &setup.cache;
         let credit = cache
-            .cursor_reserve(STATE_BYTES - setup.empty - setup.floor)
+            .cursor_reserve(state_bytes() - setup.empty - setup.floor)
             .unwrap_or_else(|| panic!("feasible: {}", counters(cache)));
         assert_eq!(join_entry(cache, JOIN_OWNER), None);
         assert_eq!(join_entry(cache, JOIN_OTHER), None);
@@ -9502,7 +9820,7 @@ fn proof_job(namespace: &str, path: &str, incarnation: &str, bytes: usize) -> Bo
 }
 
 fn proof_charge(job: &ProofJob) -> usize {
-    crate::heap_layout_bound::bound(job, STATE_BYTES).unwrap()
+    crate::heap_layout_bound::bound(job, state_bytes()).unwrap()
 }
 
 /// Suspend `job` through a lease, as the proof hook will.
@@ -9629,8 +9947,8 @@ fn proof_room_keeps_the_headroom() {
         completion_overdue_seconds: 0,
         admission: Default::default(),
     };
-    let resident = crate::heap_layout_bound::bound(&context, STATE_BYTES).unwrap();
-    let exact = STATE_BYTES - resident - PROOF_STEP_HEADROOM_BYTES;
+    let resident = crate::heap_layout_bound::bound(&context, state_bytes()).unwrap();
+    let exact = state_bytes() - resident - PROOF_STEP_HEADROOM_BYTES;
     assert_eq!(proof_room(&context), Some(exact));
 }
 
@@ -9659,6 +9977,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -9673,7 +9992,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
         let proof = proof_charge(&job);
         // Room for the copy and the proof exactly: both stay.
-        let claim = STATE_BYTES - state - with_copy - proof;
+        let claim = state_bytes() - state - with_copy - proof;
         let credit = cache.cursor_reserve(claim).expect("fits alone");
         assert!(suspend(&cache, job));
         let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
@@ -9682,7 +10001,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         assert_eq!(proof_drops(counts), 0);
         assert_eq!(
             admission_floor(&cache) + cache.cursor_resident(),
-            STATE_BYTES
+            state_bytes()
         );
         credit.refund();
         let copy = cache.take(&key).expect("retained").retained;
@@ -9704,7 +10023,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         );
         assert_eq!(cache.proof_suspended_for_test(), None);
         assert_eq!(proof_drops(counts), 1);
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -9727,7 +10046,7 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
     let cache = Arc::new(SharedCache::default());
     let credit = cache
         .cursor_reserve(
-            STATE_BYTES - admission_floor(&cache) - cache.cursor_resident() - 128 * 1024,
+            state_bytes() - admission_floor(&cache) - cache.cursor_resident() - 128 * 1024,
         )
         .unwrap();
     let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
@@ -9822,7 +10141,7 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
             1 => cache.release_older_to_fit(pinned, (1, 0)),
             _ => cache.release_older_prefix_to_fit(pinned, (1, 0), 0),
         };
-        assert!(!release(STATE_BYTES), "hopeless claims evict nothing");
+        assert!(!release(state_bytes()), "hopeless claims evict nothing");
         assert_eq!(
             cache
                 .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
@@ -9830,7 +10149,7 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
             before
         );
         let pinned =
-            STATE_BYTES - cache.cursor_resident_for_main() + before - retained_floor(&cache);
+            state_bytes() - cache.cursor_resident_for_main() + before - retained_floor(&cache);
         assert!(release(pinned));
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
@@ -9893,6 +10212,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -9916,7 +10236,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         assert_eq!(measured_with.resident, measured_without.resident);
         assert!(cache.proof_suspended_for_test().is_some());
         // One byte short of room for both: the copy needs the proof's room.
-        let claim = STATE_BYTES - state - with_copy - proof + 1;
+        let claim = state_bytes() - state - with_copy - proof + 1;
         let credit = cache.cursor_reserve(claim).expect("fits beside the proof");
         assert!(cache.proof_suspended_for_test().is_some());
         let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
@@ -9926,7 +10246,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         );
         assert_eq!(cache.proof_suspended_for_test(), None);
         assert_eq!(proof_drops(counts), 1);
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
         credit.refund();
     });
 }
@@ -9936,7 +10256,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
 /// (`retire_proof_beside_copy`) a suspended proof over `room - budget -
 /// min(budget, ENTRY_BYTES)` is retired, even one the finish/output share
 /// alone leaves room for (`room - budget - 1`); then `bound(context)` +
-/// copy + finish/output fit `STATE_BYTES`. `copy_budget_step` itself retires nothing, and nothing is
+/// copy + finish/output fit `state_bytes()`. `copy_budget_step` itself retires nothing, and nothing is
 /// retired where no copy is allocated (budget 0, as an unknown room gives):
 /// no drop on unavailable inputs. The retired job keeps only its `seq`s.
 #[test]
@@ -10005,7 +10325,7 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
 /// nothing keep a suspended proof of a third of the state budget; the page
 /// whose completion retains the certified copy retires it before the clone:
 /// the walk's resident + the proof left there (none) + the active + both
-/// shares fit `STATE_BYTES`.
+/// shares fit `state_bytes()`.
 #[test]
 fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -10020,7 +10340,7 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
         let cache = Arc::new(SharedCache::default());
         assert!(suspend(
             &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+            proof_job("ns-a", "/idx/a.json", "inc-1", state_bytes() / 3)
         ));
         super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
@@ -10052,7 +10372,7 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
 /// Fix round 3 (DM3(2)): with a room whose budget is over `ENTRY_BYTES`,
 /// the copy's share is the 8 MiB cap, so a suspended proof that fits
 /// beside both shares (`room - budget - ENTRY_BYTES`) is kept where main
-/// allocates, and the whole still fits `STATE_BYTES` at the clone.
+/// allocates, and the whole still fits `state_bytes()` at the clone.
 #[test]
 fn a_proof_beside_a_capped_copy_share_is_kept() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -10096,7 +10416,7 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
 /// and retires a suspended proof only over what both shares leave of the
 /// room: a third of the state budget is retired before the clone; one that
 /// fits beside the finish/output share and the 8 MiB-capped copy is kept.
-/// Either way the whole fits `STATE_BYTES` at the clone.
+/// Either way the whole fits `state_bytes()` at the clone.
 #[test]
 fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -10112,7 +10432,7 @@ fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
     assert!(room / 2 > ENTRY_BYTES + (2 << 20), "precondition: {room}");
     let beside = room / 2 - ENTRY_BYTES - (1 << 20) - fixed;
-    for (bytes, retired) in [(STATE_BYTES / 3, true), (beside, false)] {
+    for (bytes, retired) in [(state_bytes() / 3, true), (beside, false)] {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
@@ -10163,7 +10483,7 @@ fn a_completion_that_retains_no_copy_keeps_the_proof() {
         let cache = Arc::new(SharedCache::default());
         assert!(suspend(
             &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+            proof_job("ns-a", "/idx/a.json", "inc-1", state_bytes() / 3)
         ));
         super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
@@ -10245,14 +10565,14 @@ impl ReleaseScene {
     }
     /// The `pinned` at which the copies fit exactly beside main's state.
     fn exact(&self) -> usize {
-        STATE_BYTES - self.main - self.resident
+        state_bytes() - self.main - self.resident
     }
     /// `pinned` at which even an empty retained cache would not fit.
     fn unreachable(&self) -> usize {
         let floor =
-            crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), STATE_BYTES)
+            crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), state_bytes())
                 .unwrap();
-        STATE_BYTES - self.main - floor + 1
+        state_bytes() - self.main - floor + 1
     }
     /// M1's release (`release_to_fit`) or Path A (`release_older_to_fit`)
     /// at `rank`, observing both counter sets.
@@ -10311,7 +10631,7 @@ fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
     assert!(scene.cache.proof_suspended_for_test().is_some());
     assert_eq!(side, SideCounts::default());
     assert_eq!(evicted(&counts), (0, 0, 0));
-    assert_eq!(scene.charged(pinned), STATE_BYTES);
+    assert_eq!(scene.charged(pinned), state_bytes());
     // One byte more: the proof goes, and no copy does.
     let (released, side, counts) = scene.release(pinned + 1, None);
     assert!(released);
@@ -10323,7 +10643,7 @@ fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
     assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
     assert_eq!(scene.fillers(), FILLERS);
     assert_eq!(scene.cache.cursor_resident(), scene.main);
-    assert!(scene.charged(pinned + 1) <= STATE_BYTES);
+    assert!(scene.charged(pinned + 1) <= state_bytes());
     // (d) Nothing is held, locked or poisoned after the drop.
     assert!(!cursor_held());
     assert!(scene.cache.inner.try_lock().is_ok());
@@ -10356,7 +10676,7 @@ fn release_older_to_fit_retires_the_proof_only_where_path_a_fits() {
     );
     assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
     assert_eq!(scene.fillers(), FILLERS);
-    assert!(scene.charged(pinned) <= STATE_BYTES);
+    assert!(scene.charged(pinned) <= state_bytes());
 }
 
 /// D6(e) (c) and no-proof parity: an overflow past the proof retires the
@@ -10382,7 +10702,7 @@ fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
                 (side.side_proof_release_drops, side.side_proof_drops),
                 (u64::from(proof), 0)
             );
-            assert!(scene.charged(pinned) <= STATE_BYTES);
+            assert!(scene.charged(pinned) <= state_bytes());
             outcomes.push((
                 counts.copy_refusal_entries_evicted,
                 counts.copy_refusal_admission_evicted,
@@ -10439,7 +10759,7 @@ fn with_no_proof_the_release_is_m1s() {
     assert_eq!(side, SideCounts::default());
     assert_eq!(counts.copy_refusal_entries_evicted, 1);
     assert_eq!(scene.fillers(), FILLERS - 1);
-    assert!(scene.charged(exact + 1) <= STATE_BYTES);
+    assert!(scene.charged(exact + 1) <= state_bytes());
 }
 
 /// D6(e): a release that cannot measure keeps M1's refusal and drops no
@@ -11156,6 +11476,8 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         return;
     }
     let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let shared_root =
+        crate::snapshots::sampled_scan::OFF_MAIN_SHARED_BYTES.max(size_of::<SharedCache>());
     let cache = Arc::new(SharedCache::default());
     let walked = |cache: &SharedCache| {
         cache
@@ -11193,11 +11515,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     cache.withheld_memo.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
-        size_of::<SharedCache>()
-            + align_of::<SharedCache>()
-            + 2 * size_of::<usize>()
-            + parts.bytes
-            + side
+        shared_root + align_of::<SharedCache>() + 2 * size_of::<usize>() + parts.bytes + side
     );
     // The release math: `context_overhead` without the table, beside
     // `state_for_main` with it.
@@ -11219,20 +11537,19 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     let overhead = crate::snapshots::sampled_scan::context_overhead(context).unwrap();
     assert_eq!(
         overhead,
-        size_of::<crate::snapshots::sampled_scan::Context>() + size_of::<SharedCache>()
-            - size_of::<PaceTable>()
+        size_of::<crate::snapshots::sampled_scan::Context>() + shared_root - size_of::<PaceTable>()
             + align_of::<SharedCache>()
             + 2 * size_of::<usize>()
             + side
-            + bound(&context.namespace, STATE_BYTES).unwrap()
-            + bound(&context.admission, STATE_BYTES).unwrap()
+            + bound(&context.namespace, state_bytes()).unwrap()
+            + bound(&context.admission, state_bytes()).unwrap()
     );
     assert!(crate::snapshots::sampled_scan::context_overhead_covers(
         context
     ));
     let retained = cache.retained().unwrap();
     let room = cache.release_room_for_main(&retained, overhead, |_| true);
-    assert_eq!(room, Some(STATE_BYTES - state - overhead));
+    assert_eq!(room, Some(state_bytes() - state - overhead));
     drop(retained);
     // A job: its pace facts walk to nothing beyond its own size.
     let temp = Temp::new("pace-job", b"{}\n");
@@ -11393,6 +11710,185 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
             }
         }
         panic!("{}", counters(&cache));
+    });
+}
+
+/// The continuation mints of one page, as their `continuation_mint` counts.
+fn mint_counts(rows: &[Value]) -> Vec<Value> {
+    rows.iter()
+        .filter(|row| row["stage"] == "codex_continuation_mint")
+        .map(|row| row["counts"].clone())
+        .collect()
+}
+
+/// A state database with SESSION's thread row and `edges` (parent, child).
+fn write_thread_state(fixture: &ScanRoot, edges: &[(String, String)]) {
+    let state =
+        rusqlite::Connection::open(fixture.root.parent().unwrap().join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "CREATE TABLE threads (\
+                id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                thread_source TEXT, first_user_message TEXT, created_at_ms INTEGER,\
+                rollout_path TEXT\
+            );\
+            CREATE TABLE thread_spawn_edges (\
+                parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO threads VALUES (?1, 'Thread', 1, 'user', 'Summarize', ?2, ?3)",
+            rusqlite::params![
+                SESSION,
+                1_791_367_200_000_i64,
+                fixture.file(SESSION).to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    for (parent, child) in edges {
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![parent, child],
+            )
+            .unwrap();
+    }
+}
+
+/// [regress] A paused job's ticket carried its page's whole join evidence,
+/// whose lineage rows alone exceed the ticket's bounded walk, so every mint
+/// on a realistic Codex home was `over_bound` and no continuation page ran.
+/// The job's own share now fits; the continuation pages resume and read the
+/// job contiguously, and it publishes the unpaged read's output.
+#[test]
+fn a_realistic_home_mints_the_jobs_share_and_continuation_reads_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let edges = (0..2_500)
+        .map(|n| {
+            (
+                format!("019fb000-0000-7000-8000-{n:012}"),
+                format!("019fc000-0000-7000-8000-{n:012}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_thread_state(&fixture, &edges);
+    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+        std::slice::from_ref(&fixture.root),
+        &BTreeSet::from([fixture.file(SESSION).to_string_lossy().into_owned()]),
+    );
+    assert!(
+        crate::heap_layout_bound::bound(&whole, 8 << 20).is_none(),
+        "the page's whole evidence exceeds the ticket's walk"
+    );
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert!(mint_counts(&rows).is_empty(), "no refusal at the mint");
+        let share = CARRIED.with(|v| {
+            v.borrow()
+                .get(&fixture.root)
+                .map(|evidence| crate::heap_layout_bound::bound(evidence, 8 << 20))
+        });
+        assert!(
+            matches!(share, Some(Some(_))),
+            "the job's share fits the ticket's walk"
+        );
+        let paused_at = NATIVE_RANGES.with(|v| v.borrow().as_ref().unwrap().last().unwrap().end);
+        let mut published = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                Some(secs(600)),
+                |_| {},
+            );
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert!(scan.snapshots.is_empty());
+            if parked_eof(&cache) {
+                let (_, ordinary) = page(&fixture, index, Some(Arc::clone(&cache)));
+                published = Some(ordinary);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert!(end > paused_at, "the continuation pages advanced the job");
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert!(!published.snapshots.is_empty());
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
+    });
+}
+
+/// [behaviour] A narrowed view that cannot reproduce its page's reduction
+/// fingerprint mints nothing (`not_mintable`, no evidence carried), and the
+/// next ordinary pages resume the same job where it paused, reading no byte
+/// twice, to the unpaged read's output.
+#[test]
+fn an_unproven_share_mints_nothing_and_ordinary_pages_resume_the_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NARROW_MISSES_ROW.with(|v| v.set(false));
+        }
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    let _reset = Reset;
+    NARROW_MISSES_ROW.with(|v| v.set(true));
+    with_test_limits(2048, 1024, 64, || {
+        NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        let ((mut index, _), rows) =
+            crate::local_resource_diagnostics::capture(|| paused_singleton(&fixture, &cache));
+        assert_eq!(
+            mint_counts(&rows),
+            vec![json!({"continuation_mint": {"not_mintable": 1}})]
+        );
+        assert!(carried(&fixture.root).is_none(), "no continuation inputs");
+        let mut published = None;
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if !scan.snapshots.is_empty() {
+                published = Some(scan);
+                break;
+            }
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "never restarted");
+        NATIVE_RANGES.with(|v| {
+            let mut end = 0;
+            for range in v.borrow_mut().take().unwrap() {
+                assert_eq!(range.start, end, "no byte read twice");
+                end = range.end;
+            }
+            assert_eq!(end, fixture.len(SESSION));
+        });
+        assert_eq!(fingerprints(&published), fingerprints(&unpaged));
     });
 }
 
@@ -11687,14 +12183,15 @@ fn retained_held_singleton_ignores_ctime_but_wakes_on_content_birth_and_inode() 
             );
             assert_eq!(counter(&cache, |c| c.memo_hits), before, "{change}");
         }
-        let mut count = crate::heap_layout_bound::Counter::new(STATE_BYTES);
+        let mut count = crate::heap_layout_bound::Counter::new(state_bytes());
         cache
             .heap_bound(&mut count)
             .expect("shared cache remains bounded");
         eprintln!(
-            "codex_wake_budget: case={change} bytes={} visits={} state_limit={STATE_BYTES}",
+            "codex_wake_budget: case={change} bytes={} visits={} state_limit={}",
             count.bytes,
-            count.visits_for_test()
+            count.visits_for_test(),
+            state_bytes()
         );
         assert!(count.visits_for_test() <= 4096);
     }
@@ -12290,6 +12787,7 @@ fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
     ignore = "needs validated heap layout"
 )]
 fn decoder_release_and_unwind_follow_the_production_stores_guard() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12536,8 +13034,8 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
 /// staged transition once each. The job is not invalidated.
 #[test]
 fn parked_singleton_across_fresh_index_reprobes_record_debt() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     use crate::durable_tail_store as store;
-    use std::io::Read;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -12561,22 +13059,20 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     let now = crate::snapshots::sampled_scan::now_seconds();
     let due = now - 90;
     let mut file = fs::File::open(&path).unwrap();
-    let mut plan =
-        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
-            .unwrap();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    plan.observe_complete_records(&bytes).unwrap();
-    let mut certificate = plan
-        .commit_after_native_completion(&file, &scope, now)
-        .unwrap()
+    let mut certificate = native_cold::checkpoint(&mut file, &scope, now)
         .durable_certificate(0)
         .unwrap();
     certificate.audit_debt_unix_seconds = Some(due);
     let ds = store::DurableSource::Codex;
     let lock = crate::locked_state_dir::test_locks::hold(&state);
-    let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let mut disk = native_cold::store(&index_path, ds);
     let pending = store::PendingRecord {
+        acquisition: Some(store::AcquisitionFields {
+            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::Codex,
+            ),
+            protocol: crate::snapshots::AcquisitionProtocol::Legacy,
+        }),
         binding: store::Binding {
             source: ds,
             key: store::key_digest(ds, &key),
@@ -12591,7 +13087,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         ),
     };
     assert_eq!(
-        disk.write_after_save(lock, 1, vec![pending])
+        disk.write_after_save(lock, 1, 0, vec![pending])
             .unwrap()
             .written,
         1
@@ -12601,6 +13097,49 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     index.traversal = None;
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
+    struct ResetProbe;
+    impl Drop for ResetProbe {
+        fn drop(&mut self) {
+            crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(None);
+            store::active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = ResetProbe;
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = probes.clone();
+    let observer = cache.clone();
+    let before = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let previous = before.clone();
+    crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(Some(Box::new(
+        move || {
+            seen.set(seen.get() + 1);
+            if seen.get() == 1 {
+                // Real resumed EOF, missing index membership. Refuse classifier
+                // credit ONCE, before the cursor can complete/fence this import.
+                assert_eq!(
+                    counter(&observer, |c| c.jobs_certified)
+                        + counter(&observer, |c| c.jobs_uncertified),
+                    0
+                );
+                *previous.borrow_mut() =
+                    Some(observer.durable_counters(SnapshotSource::Codex).unwrap().1);
+                store::active::set_active_budget_for_test(Some(0));
+            } else if seen.get() == 2 {
+                assert_eq!(
+                    counter(&observer, |c| c.jobs_certified)
+                        + counter(&observer, |c| c.jobs_uncertified),
+                    0,
+                    "failed settlement admission never fences the attempt"
+                );
+                assert_eq!(
+                    observer.durable_counters(SnapshotSource::Codex).unwrap().1,
+                    previous.borrow().as_ref().copied().unwrap(),
+                    "no classifier I/O before credit"
+                );
+                store::active::set_active_budget_for_test(None);
+            }
+        },
+    )));
     let index = with_test_limits(2048, 1024, 64, || {
         let mut index = index;
         let mut cleared = false;
@@ -12639,6 +13178,12 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         index
     });
     assert_eq!(
+        probes.get(),
+        2,
+        "exact EOF job retries funding and settles without reparse/fence loss"
+    );
+    crate::snapshots::sampled_scan::durable_tail::set_before_carrier_probe(None);
+    assert_eq!(
         index.files[&key].unverified_deadline(),
         Some(due),
         "staged from the record at settlement"
@@ -12655,4 +13200,353 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         Some(&1)
     );
     assert_eq!(durable.restored, 0);
+}
+
+/// [money] active bound no record cursor preserves scope resumes and publishes.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
+fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let fixture = ScanRoot::new(80);
+    let (_, oracle) = page(&fixture, ScanIndex::default(), None);
+    assert!(!oracle.snapshots.is_empty());
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, first) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+        assert!(first.snapshots.is_empty());
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
+        cache
+            .with_cursor(|cursor| {
+                let Slot::Paused(job) = &mut cursor.slot else {
+                    panic!("real paused job")
+                };
+                let acquisition = job.sampling.as_mut().expect("resume scope metadata");
+                acquisition.no_record = true;
+                assert!(!acquisition.scope.0.is_empty(), "real file scope retained");
+            })
+            .unwrap();
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(cache.clone()));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert_eq!(fingerprints(&scan), fingerprints(&oracle));
+                assert!(counter(&cache, |c| c.jobs_resumed) > 0);
+                assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                assert!(
+                    cache
+                        .retained()
+                        .unwrap()
+                        .peek(&local_index_key(&fixture.file(SESSION)))
+                        .is_none(),
+                    "native publication retains no optional graph"
+                );
+                return;
+            }
+            assert!(scan.snapshots.is_empty());
+        }
+        panic!("no-record cursor never completed");
+    });
+}
+
+/// [money] structural restore page defer does not spend full pace.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native durable layout")]
+fn structural_restore_page_defer_does_not_spend_full_pace() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use crate::durable_tail_store as store;
+    struct ResetBudget;
+    impl Drop for ResetBudget {
+        fn drop(&mut self) {
+            store::active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = ResetBudget;
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 8), (SESSION_B, 8)]);
+    let state = fixture._dir.0.join("state");
+    fs::create_dir(&state).unwrap();
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let index_path = state.join("index.json");
+    let source = SnapshotSource::Codex;
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &Scope("cursor-fixture".into()), true);
+    let (mut index, prefix) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+    assert_eq!(prefix.snapshots.len(), 2);
+    index.save(&index_path).unwrap();
+    cache
+        .durable_write_after_save(lock, source, &index)
+        .unwrap();
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1.records_written,
+        2,
+        "native settlement wrote each record once before effects"
+    );
+    cache.retained().unwrap().clear();
+    for session in [SESSION, SESSION_B] {
+        fixture.append(session, &token_line(9));
+    }
+    let key_bytes = local_index_key(&fixture.file(SESSION)).len() as u64;
+    let limit = store::RESTORE_INPUT_BYTES
+        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+        + 4 * key_bytes;
+    store::active::set_active_budget_for_test(Some(limit));
+    let size = fixture.len(SESSION).max(fixture.len(SESSION_B));
+    with_test_limits(1 << 20, size + size / 2, 64, || {
+        let (index, first, modes) = page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
+        assert_eq!(modes, (1, 0));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(
+            counter(&cache, |c| c.deferred),
+            1,
+            "real planner budget Defer"
+        );
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.active_bound[1],
+            [1, 0],
+            "only the starting Full spends"
+        );
+        let deferred = [SESSION, SESSION_B]
+            .into_iter()
+            .find(|session| pending_hint(&index, &fixture.file(session)).is_some())
+            .expect("deferred growth");
+        let end = index.files[&local_index_key(&fixture.file(deferred))].size_bytes;
+        assert!(end < fixture.len(deferred));
+        let (caught, second, modes) =
+            page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
+        assert_eq!(
+            modes,
+            (1, 0),
+            "next page reads within the six-hour interval"
+        );
+        assert_eq!(second.snapshots.len(), 1);
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.active_bound[1],
+            [2, 0]
+        );
+        assert_eq!(
+            caught.files[&local_index_key(&fixture.file(deferred))].size_bytes,
+            fixture.len(deferred)
+        );
+        assert!(pending_hint(&caught, &fixture.file(deferred)).is_none());
+    });
+}
+
+/// A rollout whose header names its creator pair, with `lines` usage records.
+fn write_account_rollout(fixture: &ScanRoot, session: &str, account: &str, lines: u64) {
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": session,
+        "timestamp": "2026-10-07T09:59:00Z",
+        "creator_user_id": format!("synthetic-user-{account}"),
+        "creator_account_id": format!("synthetic-workspace-{account}")}}));
+    for n in 1..=lines {
+        body.extend(token_line(n));
+    }
+    fs::write(fixture.file(session), body).unwrap();
+}
+
+/// [money] A job continued on its minted share publishes what a cold read
+/// publishes, in totals and in placement, across two accounts (the positive
+/// control: swapping their evidence fails the comparator). Each row pauses the
+/// job and checks one part of its share first: a job with a spawn parent and
+/// child mints with the rows its fingerprint reads; a decided job keeps no
+/// parent ledger and an undecided one keeps all; an owner-file change holds the
+/// continuation and an unrelated roster file's change does not.
+#[test]
+fn a_continued_job_on_its_share_keeps_money_and_placement() {
+    use crate::snapshots::sampled_scan::transition_fixture::{
+        money_oracle, scan_money, RouteResult,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "spawned",
+        "ledger_decided",
+        "ledger_undecided",
+        "owner_file_changed",
+        "roster_file_changed",
+    ] {
+        let fixture = ScanRoot::with_sessions(&[]);
+        write_account_rollout(&fixture, SESSION, "a", 80);
+        write_account_rollout(&fixture, SESSION_B, "b", 1);
+        let roots = std::slice::from_ref(&fixture.root);
+        let job_path = fixture.file(SESSION);
+        if case == "spawned" {
+            write_thread_state(
+                &fixture,
+                &[
+                    (SPAWN_PARENT.to_owned(), SESSION.to_owned()),
+                    (SESSION.to_owned(), CHILD.to_owned()),
+                ],
+            );
+            let whole = CodexTitleMetadata::load_from_roots(roots);
+            let narrowed = whole.narrowed_to(&job_path);
+            assert_eq!(
+                narrowed.spawn_parents.get(SESSION).map(String::as_str),
+                Some(SPAWN_PARENT),
+                "the job's parent edge"
+            );
+            assert_eq!(
+                narrowed.spawn_parents.get(CHILD).map(String::as_str),
+                Some(SESSION),
+                "the job's child edge"
+            );
+            assert_eq!(
+                narrowed.path_reduction_fingerprint(&job_path),
+                whole.path_reduction_fingerprint(&job_path)
+            );
+            assert_ne!(
+                CodexTitleMetadata::default().path_reduction_fingerprint(&job_path),
+                whole.path_reduction_fingerprint(&job_path),
+                "the fingerprint reads the job's rows"
+            );
+        }
+        let settled =
+            |mut index: ScanIndex, cache: &Arc<SharedCache>, scan: &mut SourceScanResult| {
+                for _ in 0..4 {
+                    let (next, later) = page(&fixture, index, Some(Arc::clone(cache)));
+                    index = next;
+                    scan.snapshots.extend(later.snapshots);
+                }
+                scan.snapshots
+                    .sort_by(|a, b| a.snapshot_fingerprint.cmp(&b.snapshot_fingerprint));
+                scan.snapshots
+                    .dedup_by(|a, b| a.snapshot_fingerprint == b.snapshot_fingerprint);
+                scan.snapshots
+                    .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+                index
+            };
+        let cold_cache = Arc::new(SharedCache::default());
+        let (cold_index, mut cold) = page(
+            &fixture,
+            ScanIndex::default(),
+            Some(Arc::clone(&cold_cache)),
+        );
+        let cold_index = settled(cold_index, &cold_cache, &mut cold);
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let ((mut index, first), rows) = crate::local_resource_diagnostics::capture(|| {
+                page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)))
+            });
+            assert!(mint_counts(&rows).is_empty(), "{case}: no refusal");
+            assert_eq!(counter(&cache, |c| c.jobs_paused), 1, "{case}");
+            let carried_share = |read: &dyn Fn(&crate::snapshots::CodexContinuationEvidence)| {
+                CARRIED.with(|v| read(v.borrow().get(&fixture.root).expect("a minted share")));
+            };
+            carried_share(&|share| {
+                assert_eq!(share.inventory.headers.len(), 1, "{case}: only the job");
+                assert_eq!(share.inventory.directories.local_diagnostic_counts().1, 0);
+                assert!(share.content_unchanged(), "{case}");
+            });
+            match case {
+                "ledger_decided" | "ledger_undecided" => {
+                    let undecided = case == "ledger_undecided";
+                    let boundary = |to: Option<CodexOwnershipBoundary>| {
+                        cache
+                            .with_cursor(|cursor| match &mut cursor.slot {
+                                Slot::Paused(job) => {
+                                    let held = &mut job.parser.accumulator.codex_ownership_boundary;
+                                    let was = *held;
+                                    *held = to.unwrap_or(was);
+                                    was
+                                }
+                                _ => panic!("the job is paused"),
+                            })
+                            .unwrap()
+                    };
+                    let decided = boundary(None);
+                    assert_ne!(decided, CodexOwnershipBoundary::Undetermined, "header read");
+                    if undecided {
+                        boundary(Some(CodexOwnershipBoundary::Undetermined));
+                    }
+                    let mut whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+                        roots,
+                        &BTreeSet::from([job_path.to_string_lossy().into_owned()]),
+                    );
+                    whole.ledgers = Some(Arc::new(Mutex::new(BTreeMap::from([
+                        (PARENT.to_owned(), Default::default()),
+                        (GRANDPARENT.to_owned(), Default::default()),
+                    ]))));
+                    let share = whole
+                        .for_paused_job(Some(&*cache), first.continuation_ticket().unwrap())
+                        .expect("the job's share");
+                    let kept = share.ledgers.unwrap().lock().unwrap().len();
+                    assert_eq!(kept, if undecided { 2 } else { 0 }, "{case}");
+                    boundary(Some(decided));
+                }
+                "owner_file_changed" => {
+                    fixture.append(SESSION, &token_line(81));
+                    carried_share(&|share| assert!(!share.content_unchanged(), "holds"));
+                    return;
+                }
+                "roster_file_changed" => {
+                    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+                        roots,
+                        &BTreeSet::from([
+                            job_path.to_string_lossy().into_owned(),
+                            fixture.file(SESSION_B).to_string_lossy().into_owned(),
+                        ]),
+                    );
+                    fixture.append(SESSION_B, &token_line(2));
+                    assert!(!whole.content_unchanged(), "the whole roster would hold");
+                    carried_share(&|share| assert!(share.content_unchanged(), "no hold"));
+                    return;
+                }
+                _ => {}
+            }
+            let mut published = None;
+            for _ in 0..64 {
+                let (next, _) = continuation_page_in(
+                    &fixture.root,
+                    index,
+                    &cache,
+                    "cursor-fixture",
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    Some(secs(600)),
+                    |_| {},
+                );
+                index = next;
+                if parked_eof(&cache) {
+                    published = Some(page(&fixture, index, Some(Arc::clone(&cache))));
+                    break;
+                }
+            }
+            let (index, mut published) =
+                published.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
+            published.snapshots.extend(first.snapshots);
+            let index = settled(index, &cache, &mut published);
+            assert_eq!(
+                counter(&cache, |c| c.jobs_invalidated),
+                0,
+                "{case}: no restart"
+            );
+            let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold);
+            let continued = scan_money(SnapshotSource::Codex, &index, &published);
+            money_oracle::assert_equivalent(&cold, &continued);
+            if case != "spawned" {
+                let evidence = |route: &RouteResult, session: &str| {
+                    route.snapshots[session]["session_account_evidence"].clone()
+                };
+                let (a, b) = (evidence(&cold, SESSION), evidence(&cold, SESSION_B));
+                assert!(a.is_object() && b.is_object(), "{case}: placement evidence");
+                assert_ne!(a, b, "{case}: two accounts");
+                let mut wrong = continued.clone();
+                wrong.snapshots.get_mut(SESSION).unwrap()["session_account_evidence"] = b;
+                wrong.snapshots.get_mut(SESSION_B).unwrap()["session_account_evidence"] = a;
+                assert!(
+                    std::panic::catch_unwind(|| {
+                        money_oracle::assert_placement_equivalent(&cold, &wrong)
+                    })
+                    .is_err(),
+                    "{case}: the comparator sees swapped accounts"
+                );
+            }
+        });
+    }
 }

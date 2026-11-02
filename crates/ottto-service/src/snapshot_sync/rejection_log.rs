@@ -1,7 +1,15 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-pub(super) struct SessionHash(Option<[u8; 4]>);
+pub(crate) struct SessionHash(Option<[u8; 4]>);
+
+impl SessionHash {
+    /// The first 4 bytes of SHA-256(`session`).
+    pub(crate) fn of(session: &str) -> Self {
+        let digest = Sha256::digest(session.as_bytes());
+        Self(Some([digest[0], digest[1], digest[2], digest[3]]))
+    }
+}
 
 impl fmt::Display for SessionHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -48,8 +56,7 @@ where
     let Some(id) = matched.and_then(session_id).filter(|id| !id.is_empty()) else {
         return SessionHash(None);
     };
-    let digest = Sha256::digest(id.as_bytes());
-    SessionHash(Some([digest[0], digest[1], digest[2], digest[3]]))
+    SessionHash::of(id)
 }
 
 #[cfg(test)]

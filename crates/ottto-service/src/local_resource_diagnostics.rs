@@ -108,6 +108,28 @@ pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 
+/// Native label losses only, never label text. Twelve fixed u64 cells (96 B),
+/// no per-key state. Invalid activity signals count inputs, since the existing
+/// detector deliberately does not expose the unnamed/dropped labels.
+#[inline(never)]
+pub(crate) fn skill_label_native_dropped(source: &str, set: &'static str, reason: &'static str) {
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    let source_slot = match source {
+        "claude_code" => 0,
+        "codex" => 1,
+        "pi" => 2,
+        _ => return,
+    };
+    let slot = source_slot * 4
+        + usize::from(set == "activity") * 2
+        + usize::from(reason == "invalid_signal");
+    let total = COUNTS[slot].fetch_add(1, Relaxed).saturating_add(1);
+    durable_tail_alarm(
+        source,
+        &serde_json::json!({"skill_label_native_dropped": {(set): {(reason): total}}}),
+    );
+}
+
 #[cfg(not(test))]
 static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(test)]
@@ -443,7 +465,8 @@ pub(crate) enum UnselectedReason {
     WithheldAbsenceAmbiguous = 18,
 }
 const CAP_EVENT_START: usize = 19;
-const UNSELECTED_REASONS: usize = CAP_EVENT_START + 6;
+const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
+const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -471,13 +494,28 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
 }
-/// One failed parking decision; no logging, resource probes or scan ownership.
-pub(crate) fn source_rotation_serial_fallback(source: &str, layout_supported: bool) {
-    source_count(source, 16 + usize::from(layout_supported), |slot| {
-        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-            .unwrap_or_else(|n| n)
-    });
+
+/// A vanished file's index entry was retired while its parsed body was not
+/// ACKed; nothing holds or resends that body. `usage` is the resident
+/// reduction's `(requests, tokens)`; `None` (no copy in RAM, or Claude
+/// responses not yet folded) counts in `totals_unknown_files`, so
+/// `requests`/`tokens` are at least. Counted after
+/// the retirement; never a gate.
+pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u64)>) {
+    let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
+    for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
+        source_count(source, UNACKED_LOST_START + slot, |n| {
+            n.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
 }
+const UNACKED_LOST: [(&str, usize); 4] = [
+    ("files", UNACKED_LOST_START),
+    ("requests", UNACKED_LOST_START + 1),
+    ("tokens", UNACKED_LOST_START + 2),
+    ("totals_unknown_files", UNACKED_LOST_START + 3),
+];
 
 /// E3: Claude withheld-account hold events, in the slots after the reasons.
 #[derive(Clone, Copy)]
@@ -871,7 +909,7 @@ impl Probe {
             #[serde(flatten)]
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
+            unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -905,10 +943,7 @@ impl Probe {
                         .and_then(|memo| memo.held_gauge())
                 })
                 .flatten(),
-            source_rotation_serial_fallback: drain(
-                source,
-                &[("unsupported_layout", 16), ("bound_refused", 17)],
-            ),
+            unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
@@ -1073,6 +1108,39 @@ pub(crate) fn source_finish<T>(
         counts: EmptyCounts {},
     });
     result
+}
+/// Named footprint window inside a source stage. One record with empty counts
+/// when dropped normally; unwinding emits nothing, like `source_finish`.
+pub(crate) struct StageWindow {
+    stage: &'static str,
+    source: Source,
+    probe: Probe,
+    footprint: Option<footprint::Stage>,
+}
+impl StageWindow {
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            probe: Probe::start(),
+            footprint: footprint::Stage::begin(),
+        }
+    }
+}
+impl Drop for StageWindow {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: self.stage,
+            source: self.source,
+            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            counts: EmptyCounts {},
+        });
+    }
 }
 /// Point outcome at an existing Codex authority boundary. Two fixed records at
 /// most per completed page, using the existing best-effort stderr carrier.
@@ -1512,12 +1580,21 @@ crate::heap_layout_bound::no_heap!(false; NativeDecision);
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
     pub(crate) restore_outcome: RestoreCounts,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink: u64,
+    /// Native Full read completed; does not imply verification or publication.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) owed_full_after_lossy_shrink_completed: u64,
 }
 impl FullCauses {
     fn is_empty(&self) -> bool {
         self.restore_outcome.restored == 0
             && self.restore_outcome.held == 0
+            && self.restore_outcome.pending == 0
             && self.restore_outcome.miss.is_empty()
+            && self.restore_outcome.stale.is_empty()
+            && self.owed_full_after_lossy_shrink == 0
+            && self.owed_full_after_lossy_shrink_completed == 0
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -1526,17 +1603,36 @@ pub(crate) struct RestoreCounts {
     restored: u64,
     #[serde(skip_serializing_if = "is_zero")]
     held: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pending: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
     pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
-            RestoreOutcome::Restored(_) => &mut self.restored,
-            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Restored(..) => &mut self.restored,
+            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
+            RestoreOutcome::Pending | RestoreOutcome::QuietPending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
+            RestoreOutcome::StaleUnregistered(reason, obligation) => {
+                let label =
+                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
+                let attribution = self.stale_attribution.entry(label).or_default();
+                *attribution = attribution.saturating_add(1);
+                self.stale.entry(reason).or_default()
+            }
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }
@@ -2034,9 +2130,33 @@ mod tests {
             crate::durable_tail_store::Refusal::Unknown,
         ));
         assert_eq!(counts.held, u64::MAX);
-        counts.restored = 1;
+        counts.held = 0;
+        counts.record(&RestoreOutcome::Pending);
+        assert!(
+            !probe.full_causes.is_empty(),
+            "pending-only pages remain visible"
+        );
+        probe.full_causes.restore_outcome.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+        assert_eq!(json["restore_outcome"]["pending"], 1);
+        let causes = FullCauses {
+            owed_full_after_lossy_shrink: 1,
+            ..Default::default()
+        };
+        assert!(!causes.is_empty());
+        assert_eq!(
+            serde_json::to_value(causes).unwrap()["owed_full_after_lossy_shrink"],
+            1
+        );
+        let completed = FullCauses {
+            owed_full_after_lossy_shrink_completed: 1,
+            ..Default::default()
+        };
+        assert!(!completed.is_empty(), "completion may fall on a later page");
+        let json = serde_json::to_value(completed).unwrap();
+        assert_eq!(json["owed_full_after_lossy_shrink_completed"], 1);
+        assert!(json.get("owed_full_after_lossy_shrink").is_none());
     }
 
     #[test]
@@ -3085,6 +3205,7 @@ mod continuation_tests {
             "groups_completed",
             "no_remaining",
             "over_bound",
+            "not_mintable",
         ];
         let (_, rows) = super::capture(|| {
             for outcome in outcomes {

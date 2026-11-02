@@ -115,7 +115,9 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
         let hash = debt["content_hash"].as_str().unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(debt.as_object().unwrap().len(), 2);
+        assert_eq!(debt.as_object().unwrap().len(), 4);
+        assert_eq!(debt["size_bytes"], OVERSIZED_BYTES);
+        assert!(debt["first_seen_unix_seconds"].as_u64().unwrap() > 0);
     }
 }
 
@@ -698,14 +700,17 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     let listed = c1a_saved(&fixture);
     assert!(listed["traversal"]["counts"]["listing_generations"].as_u64() >= Some(1));
     assert_eq!(
-        listed["traversal"]["oversized_discovery"],
-        after["traversal"]["oversized_discovery"],
+        listed["traversal"]["oversized_discovery"], after["traversal"]["oversized_discovery"],
         "a re-listing pass records no oversized debt"
     );
     assert_eq!(listed["traversal"]["counts"]["oversized_file_count"], 1);
     assert_eq!(page.scan.oversized_file_count, 1);
     assert!(!page.scan.census_complete);
-    std::fs::write(&late, rearm_transcript_line(LATE, None, "req_late_shrunk", 0)).unwrap();
+    std::fs::write(
+        &late,
+        rearm_transcript_line(LATE, None, "req_late_shrunk", 0),
+    )
+    .unwrap();
     let page = oversized_tick(
         &fixture,
         oversized_deadline(&listed).max(listed_at + interval + 60),
@@ -803,100 +808,5 @@ fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
         let next_floor = oversized_floor(&c1a_saved(&fixture));
         assert_eq!(next_floor, floor + 6 * 3600);
         floor = next_floor;
-    }
-}
-
-/// [regress] Containment regression: real hold renews floor and three pages do not requeue it.
-/// Real demotion classification and selected-save custody, without oversized
-/// debt restarting the frozen window: each served hold must renew its floor.
-#[test]
-#[serial(source_manifests)]
-fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
-    let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let _manifests = SourceManifestTestGuard::new();
-    let fixture = PipelineFixture::new("terminal-off-real-hold-renewal");
-    fixture.baseline();
-    // Real demotion classification needs ordinary money: list only the held
-    // family after the unlisted baseline; every page loads the list.
-    fixture.list_held(&[PIPELINE_HELD_SESSION]);
-    let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
-    let cycle = PipelineCycle {
-        replay_generation: "terminal-off-held-replay",
-        proven_owner_session: Some(PIPELINE_HELD_SESSION),
-        historical_replay: true,
-        ..PIPELINE_HOLD_CYCLE
-    };
-    // Lead B B1: use the actual captured admission clock. The real seeded
-    // quarantine uses SystemTime; a historical audit clock would keep its D
-    // artificially in the future and would not exercise a renewing hold.
-    let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let pages_at = |now: u64, count: usize| {
-        (0..count)
-            .map(|_| {
-                crate::snapshots::with_terminal_off_audit_now_for_test(now, || {
-                    fixture.page(&oversized_clock(now), &cycle, PipelineUpload::Accept)
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    // Lead B P2-1: count actual body acquisitions of the held transcript,
-    // not only hold classifications, over each three-page group.
-    let held_reads = |reads: &std::collections::BTreeMap<std::path::PathBuf, usize>| {
-        reads
-            .iter()
-            .filter(|(path, _)| {
-                path.file_stem()
-                    .is_some_and(|stem| stem == PIPELINE_HELD_SESSION)
-            })
-            .map(|(_, count)| *count)
-            .sum::<usize>()
-    };
-    let (seed, seed_reads) =
-        crate::snapshots::terminal_contract_retry::source_acquisitions(|| pages_at(at, 3));
-    assert_eq!(
-        seed.iter().map(|p| p.held.len()).sum::<usize>(),
-        1,
-        "real hold classified once then parked across three pages"
-    );
-    assert_listed_fold_absent(&seed, PIPELINE_HELD_SESSION);
-    assert!(
-        held_reads(&seed_reads) <= 1,
-        "the seed's three-page hold reads the held transcript at most once: {seed_reads:?}"
-    );
-    for (now, expected) in [
-        (at + 6 * 3600, 1),
-        (at + 6 * 3600 + 300, 0),
-        (at + 12 * 3600, 1),
-    ] {
-        let (pages, reads) =
-            crate::snapshots::terminal_contract_retry::source_acquisitions(|| pages_at(now, 3));
-        assert_eq!(
-            held_reads(&reads),
-            expected,
-            "held transcript READ acquisitions at {now}: one renewing per-key six-hour floor"
-        );
-        assert_eq!(
-            pages.iter().map(|p| p.held.len()).sum::<usize>(),
-            expected,
-            "one renewing per-key six-hour floor"
-        );
-        assert!(
-            pages
-                .iter()
-                .all(|p| !p.scan.census_complete && p.uploaded.is_empty()),
-            "held bodies gain no upload/ACK/terminal credit"
-        );
-        assert_eq!(
-            pages
-                .last()
-                .unwrap()
-                .index
-                .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
-            Some(revision.clone())
-        );
     }
 }

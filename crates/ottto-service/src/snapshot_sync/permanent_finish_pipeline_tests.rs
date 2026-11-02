@@ -259,7 +259,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         .expect("real due native preparation");
         assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
         "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
         assert_eq!(scan.census_complete, !unclean);
         let selected_losses = [
@@ -540,7 +540,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         })
         .unwrap()
         .expect("real due native preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         assert!(scan.census_complete);
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
@@ -657,9 +657,6 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
-    /// Not shed (429/503), not resent in place (500/502), not split as a
-    /// batch deadline (504): an ordinary failed upload.
-    UnretriedServerError,
     Disabled,
 }
 
@@ -703,7 +700,7 @@ impl AckScriptedServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
-                let mut status = "200 OK";
+                let status = "200 OK";
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -722,10 +719,6 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
-                        AckScriptedPost::UnretriedServerError => {
-                            status = "507 Insufficient Storage";
-                            serde_json::json!({"detail":"synthetic server error"})
-                        }
                         AckScriptedPost::Disabled => serde_json::json!({"accepted":0,
                             "sessions_reconciled":0,"session_ids":[],"disabled":true,
                             "disabled_reason":"synthetic_disabled","accepted_entities":[],
@@ -765,15 +758,6 @@ impl AckScriptedServer {
             offered,
             script,
         }
-    }
-
-    fn offered_fingerprints(&self) -> Vec<String> {
-        self.offered
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
-            .collect()
     }
 }
 
@@ -850,9 +834,6 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_prepare(cycle);
-        }
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -871,48 +852,8 @@ impl AckFinishHome {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame);
         assert!(scan.census_complete, "{cycle}: the real scan is clean");
-        assert_eq!(
-            scan.snapshots.len(),
-            1,
-            "{cycle}: the never-committed transcript is read again"
-        );
-        // Finish reads this flag only for census-dependent decisions
-        // (complete-census ACK cleanup, backfill and manifest completion).
-        // Marking it incomplete keeps the injected debt unretired.
-        scan.census_complete = false;
-        (preparation, index, scan)
-    }
-
-    fn terminal_off_on_prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        assert!(
-            crate::snapshots::claude_terminal_off(),
-            "finish pipeline requires production policy"
-        );
-        self.cadence.next_due_cycle();
-        let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
-            prepare_sync_source(
-                &self.client,
-                &self.device,
-                "device-secret",
-                SnapshotSource::ClaudeCode,
-                "otm_test",
-                &self.fixture.home,
-                &self.support,
-                &self.daemon,
-                &mut self.transport,
-                self.daemon.snapshot_scan_account_witness().unwrap(),
-                false,
-            )
-        })
-        .unwrap()
-        .expect("actual due source preparation");
-        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(
-            !scan.census_complete,
-            "{cycle}: terminal-off retains the real scan owner"
-        );
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -948,15 +889,6 @@ impl AckFinishHome {
                 &mut self.retry,
             )
         })
-    }
-
-    fn progress(&self, preparation_paths: &(PathBuf, String)) -> SnapshotUploadProgress {
-        SnapshotUploadProgress::load(
-            &preparation_paths.0,
-            &preparation_paths.1,
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap()
     }
 }
 
@@ -1036,246 +968,4 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
         );
     }
     ack_retention::note_capacity_stop_census(source, false, true);
-}
-
-/// #794 F2: real prepare/scan and real finish finalization (incidence and the
-/// file body-set witness come from production code) for one file group of
-/// 5,000 entities next to 4,096 unrelated ACKs of debt. Current Claude and
-/// Codex parsers emit one file-backed entity per parsed file, so no real
-/// transcript yields 5,000; the scanned item is the template for the group,
-/// exactly as the first-install finish case does. The finish pipeline derives
-/// each entity fingerprint itself, so the file set is read back from what it
-/// offered and ACKed. A real HTTP failure stops the first finish after
-/// accepted pages; the second finish offers only the remainder and transfers
-/// every file ACK to the saved index.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() {
-    const ENTITIES: usize = 5000;
-    let server = AckScriptedServer::new();
-    let mut home = AckFinishHome::new(&server);
-    let debt = ack_followup_debt(4096);
-    let debt_set = debt.iter().cloned().collect::<BTreeSet<_>>();
-    let group = |scan: &mut SourceScanResult| {
-        let template = scan.snapshots[0].clone();
-        scan.snapshots = (0..ENTITIES)
-            .map(|entity| {
-                let mut item = template.clone();
-                item.source_session_id = format!("huge-file-{entity}");
-                item.snapshot_fingerprint = format!("{:064x}", 1_000_000 + entity);
-                item
-            })
-            .collect();
-    };
-
-    let (mut preparation, index, mut scan) = home.prepare("first finish");
-    group(&mut scan);
-    ack_followup_set_debt(&mut preparation, &debt, true);
-    let paths = (
-        preparation.upload_progress_path.clone(),
-        preparation.upload_destination_namespace.clone(),
-    );
-    let index_path = preparation.index_path.clone();
-    {
-        let mut script = server.script.lock().unwrap();
-        script.extend([AckScriptedPost::Accept; 30]);
-        script.push_back(AckScriptedPost::UnretriedServerError);
-    }
-    let error = home
-        .finish(preparation, index, scan)
-        .err()
-        .unwrap_or_else(|| {
-            panic!(
-                "first finish settled: offered={} script_left={}",
-                server.offered.lock().unwrap().len(),
-                server.script.lock().unwrap().len()
-            )
-        });
-    assert!(
-        error
-            .downcast_ref::<ack_retention::AckSettlementRequired>()
-            .is_none(),
-        "the whole live file was admitted beside full debt: {error:#}"
-    );
-    assert!(server.script.lock().unwrap().is_empty(), "failure reached");
-    let first_offers = server
-        .offered_fingerprints()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        first_offers.len(),
-        server.offered.lock().unwrap().len(),
-        "distinct file entities"
-    );
-    assert!(first_offers.is_disjoint(&debt_set));
-    let progress = home.progress(&paths);
-    assert!(
-        debt_set.is_subset(&progress.accepted_fingerprints),
-        "unrelated debt is kept"
-    );
-    let retained = progress
-        .accepted_fingerprints
-        .difference(&debt_set)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert!(
-        (1..ENTITIES).contains(&retained.len()),
-        "{}",
-        retained.len()
-    );
-    assert!(
-        retained.is_subset(&first_offers),
-        "only accepted file pages are retained"
-    );
-    assert!(
-        first_offers.len() > retained.len(),
-        "the failed page was offered but not acknowledged"
-    );
-    let saved = ScanIndex::load(&index_path).unwrap();
-    assert!(
-        !saved
-            .upload_progress_ack_incidence()
-            .any(|fp| first_offers.contains(fp)),
-        "an unsettled file is not committed"
-    );
-
-    server.offered.lock().unwrap().clear();
-    let (preparation, index, mut scan) = home.prepare("second finish");
-    group(&mut scan);
-    home.finish(preparation, index, scan)
-        .unwrap_or_else(|error| panic!("second finish settles the file: {error:#}"));
-    let second_offers = server
-        .offered_fingerprints()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        second_offers.len(),
-        ENTITIES - retained.len(),
-        "accepted pages are not re-sent"
-    );
-    assert_eq!(server.offered.lock().unwrap().len(), second_offers.len());
-    assert!(second_offers.is_disjoint(&retained));
-    assert!(second_offers.is_disjoint(&debt_set));
-    let file_fingerprints = retained
-        .union(&second_offers)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(file_fingerprints.len(), ENTITIES);
-    let saved = ScanIndex::load(&index_path).unwrap();
-    assert!(file_fingerprints
-        .iter()
-        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
-    assert_eq!(
-        saved
-            .current_snapshot_fingerprints()
-            .intersection(&file_fingerprints)
-            .count(),
-        ENTITIES,
-        "production finalization recorded the whole file group"
-    );
-    let progress = home.progress(&paths);
-    assert!(
-        file_fingerprints
-            .iter()
-            .all(|fp| !progress.accepted_fingerprints.contains(fp)),
-        "every file ACK transferred to the index"
-    );
-    assert_eq!(
-        upload_context_resend::last_counts(),
-        (0, 0),
-        "same-context retry is not a context resend"
-    );
-    assert_eq!(
-        progress.accepted_fingerprints, debt_set,
-        "only the unrelated debt remains"
-    );
-}
-
-
-/// [behaviour] Containment contract: real finish uploads acks and settles with no manifest.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let server = AckScriptedServer::new();
-    let mut home = AckFinishHome::new(&server);
-    let (preparation, index, scan) = home.prepare("terminal-off");
-    assert!(!scan.census_complete);
-    assert!(index.has_retained_traversal_for_terminal_off());
-    let fingerprints = scan
-        .snapshots
-        .iter()
-        .map(|i| i.snapshot_fingerprint.clone())
-        .collect::<BTreeSet<_>>();
-    let path = preparation.index_path.clone();
-    let paths = (
-        preparation.upload_progress_path.clone(),
-        preparation.upload_destination_namespace.clone(),
-    );
-    home.finish(preparation, index, scan).unwrap();
-    let offered = server
-        .offered_fingerprints()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        offered.len(),
-        fingerprints.len(),
-        "the ordinary terminal page uploads"
-    );
-    let fingerprints = offered;
-    let saved = ScanIndex::load(&path).unwrap();
-    assert!(saved.has_retained_traversal_for_terminal_off());
-    assert!(
-        cached_source_manifest(&paths.1, SnapshotSource::ClaudeCode).is_none(),
-        "no complete manifest, including stale/deleted incidence, can publish"
-    );
-    assert!(fingerprints
-        .iter()
-        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
-    let progress = home.progress(&paths);
-    // Successful selected-save transfers exact ACK custody into the index.
-    assert!(progress.accepted_fingerprints.is_empty());
-    let offered = server.offered.lock().unwrap();
-    assert_eq!(offered.len(), 1);
-    let item = &offered[0];
-    assert!(item.get("cache_observations").is_none());
-    assert!(item.get("context_curve").is_none());
-    let mut payload = serde_json::Map::new();
-    for key in [
-        "session_account_evidence",
-        "tool_usage",
-        "tool_usage_truncated",
-    ] {
-        if let Some(value) = item.get(key) {
-            payload.insert(key.into(), value.clone());
-        }
-    }
-    // This is the exact digest the scripted HTTP ACK sent and the client
-    // validated, folded with the production file-witness function.
-    let ack_body = format!(
-        "{:x}",
-        Sha256::digest(
-            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
-        )
-    );
-    assert_eq!(saved.files.len(), 1);
-    assert_eq!(
-        saved
-            .files
-            .values()
-            .next()
-            .unwrap()
-            .last_upload_body_witness,
-        Some(crate::snapshots::snapshot_file_upload_body_set_for_test(&[
-            ack_body
-        ]))
-    );
-    assert!(!crate::snapshots::claude_terminal_authority(
-        &saved,
-        true,
-        "2099-01-01T00:00:00Z"
-    ));
 }

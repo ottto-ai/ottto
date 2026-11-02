@@ -332,6 +332,29 @@ class MacBatchTests(unittest.TestCase):
                 for number, verdict in zip((3, 4), verdicts):
                     self.assertIn(f"#{number} {verdict} (", out)
 
+    def test_report_merge_queue_train(self):
+        # A queued train PR: members come from its "train: merge #<n>" commits.
+        r = self.repo
+        r.git("checkout", "-q", "-b", "train", r.base)
+        for n in (3, 4):
+            r.git("merge", "-q", "--no-ff", "-m", f"train: merge #{n} b{n}", f"b{n}")
+        r.git("push", "-q", "origin", "train")
+        tree = r.git("rev-parse", "train^{tree}").strip()
+        squash = r.git("commit-tree", tree, "-p", r.base, "-m", "train (#9)").strip()
+        branch = f"gh-readonly-queue/main/pr-9-{r.base}"
+        r.git("push", "-q", "origin", f"{squash}:refs/heads/{branch}")
+        r.git("checkout", "-q", "main")
+        self.prs[9] = pr(9, r.rev("train"), "train")
+        run = {"status": "completed", "conclusion": "failure", "headSha": squash, "headBranch": branch,
+               "event": "merge_group", "url": "u",
+               "jobs": [{"name": mb.MAC_JOB, "conclusion": "failure", "databaseId": 9,
+                         "steps": [{"name": "Runtime tests", "conclusion": "failure"}]}]}
+        rc, out, _ = self.run_main(["report", "--run", "5"], run=run,
+                                   job_log="test tests::ignored_off_mac ... FAILED")
+        self.assertEqual(rc, 4, out)
+        self.assertIn("#3 SUSPECT (", out)
+        self.assertIn("#4 CLEARED (", out)
+
     def test_attribution_tiers(self):
         r = mb.Runner(str(self.repo.work))
         changes = {

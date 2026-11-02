@@ -21,7 +21,7 @@ fn fixture() -> ScanIndex {
             scan_roots: Vec::new(),
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
-            observed_index_keys: BTreeSet::new(),
+            observed_index_keys: Default::default(),
             codex_rollout_paths: BTreeSet::new(),
             codex_join_directory_census: None,
             reconciliation_upper_bound: None,
@@ -317,6 +317,7 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         false,
         false,
         &[],
+        None,
     );
     assert!(scan.claude_family_shadow.is_none());
 }

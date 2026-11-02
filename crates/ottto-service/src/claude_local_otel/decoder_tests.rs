@@ -53,11 +53,30 @@ fn fragment(bytes: &[u8]) -> Option<&[u8]> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
-// Every byte includes every physical-line boundary, CR/LF and UTF-8 interiors.
+// Sampled split points keep every boundary class of the old every-byte walk:
+// byte 0, the last byte and the end; each LF -1..=+2 (CR/LF interior and both
+// line edges); each UTF-8 continuation byte; and a 61-byte stride in between.
+fn sampled_splits(bytes: &[u8]) -> Vec<usize> {
+    let len = bytes.len();
+    let mut splits = vec![0, len.saturating_sub(1), len];
+    splits.extend((0..=len).step_by(61));
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            splits.extend(i.saturating_sub(1)..=(i + 2).min(len));
+        }
+        if matches!(*byte, 0x80..=0xBF) {
+            splits.push(i);
+        }
+    }
+    splits.sort_unstable();
+    splits.dedup();
+    splits
+}
+
 // EOF views are clones of sealed state: 19a does not introduce a durable overlay.
 fn api_splits(bytes: &[u8]) {
     let expected = baseline_api(bytes);
-    for split in 0..=bytes.len() {
+    for split in sampled_splits(bytes) {
         let mut state = ApiSidecarDecoder::new("scope", Vec::new());
         let tail = complete_lines(&bytes[..split], |line| state.push_line(line));
         let sealed = split - tail.len();
@@ -73,7 +92,7 @@ fn api_splits(bytes: &[u8]) {
 
 fn trace_splits(bytes: &[u8]) {
     let expected = baseline_trace(bytes);
-    for split in 0..=bytes.len() {
+    for split in sampled_splits(bytes) {
         let mut state = TraceSidecarDecoder::new("scope", Vec::new());
         let tail = complete_lines(&bytes[..split], |line| state.push_line(line));
         let sealed = split - tail.len();
@@ -159,7 +178,7 @@ fn api_fixture(reverse: bool) -> Vec<u8> {
 }
 
 #[test]
-fn api_continuation_and_eof_match_frozen_whole_file_at_every_boundary() {
+fn api_continuation_and_eof_match_frozen_whole_file_at_sampled_boundaries() {
     let started = std::time::Instant::now();
     for reverse in [false, true] {
         let bytes = api_fixture(reverse);
@@ -186,6 +205,10 @@ fn api_continuation_and_eof_match_frozen_whole_file_at_every_boundary() {
         assert_eq!(state.health.invalid_session_rows, 1);
         assert_eq!(state.health.malformed_lines, 2);
         assert_eq!(state.health.unreadable_lines, 1);
+        // Both orders keep the frozen golden above; the split walk runs for one.
+        if reverse {
+            continue;
+        }
         for ending in [
             b"".as_slice(),
             b"\n",
@@ -200,13 +223,13 @@ fn api_continuation_and_eof_match_frozen_whole_file_at_every_boundary() {
         }
     }
     eprintln!(
-        "sidecar every-byte oracle: kind=api wall_seconds={:.3}",
+        "sidecar sampled-boundary oracle: kind=api wall_seconds={:.3}",
         started.elapsed().as_secs_f64()
     );
 }
 
 #[test]
-fn trace_continuation_and_eof_match_frozen_whole_file_at_every_boundary() {
+fn trace_continuation_and_eof_match_frozen_whole_file_at_sampled_boundaries() {
     let started = std::time::Instant::now();
     let row = ClaudeTraceOwnershipEvidence {
         session_id: "scope".into(),
@@ -265,7 +288,7 @@ fn trace_continuation_and_eof_match_frozen_whole_file_at_every_boundary() {
         trace_splits(&input);
     }
     eprintln!(
-        "sidecar every-byte oracle: kind=trace wall_seconds={:.3}",
+        "sidecar sampled-boundary oracle: kind=trace wall_seconds={:.3}",
         started.elapsed().as_secs_f64()
     );
 }

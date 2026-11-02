@@ -97,12 +97,22 @@ impl ScanIndexEntry {
         }
     }
     pub(super) fn carry_sampled_audit(&mut self, working: &Self) {
-        if let Some(due) = working.unverified_deadline() {
-            self.scan_identity_version = Some(provenance_marker(
-                self.unverified_deadline().map_or(due, |old| old.min(due)),
-                self.has_prefix_provenance() || working.has_prefix_provenance(),
-            ));
+        if let Some(version) = self.sampled_audit_carry(working) {
+            self.scan_identity_version = Some(version);
         }
+    }
+    /// Whether `carry_sampled_audit(working)` would change this entry. By
+    /// value: the carry rewrites even this entry's own v1 marker in v2 form.
+    pub(super) fn carry_sampled_audit_changes(&self, working: &Self) -> bool {
+        self.sampled_audit_carry(working)
+            .is_some_and(|version| self.scan_identity_version.as_deref() != Some(&*version))
+    }
+    fn sampled_audit_carry(&self, working: &Self) -> Option<String> {
+        let due = working.unverified_deadline()?;
+        Some(provenance_marker(
+            self.unverified_deadline().map_or(due, |old| old.min(due)),
+            self.has_prefix_provenance() || working.has_prefix_provenance(),
+        ))
     }
     pub(super) fn audit_obligation(&self, now: u64) -> Option<AuditDebt> {
         if !self.has_unverified_source() {
@@ -236,9 +246,6 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        if claude_terminal_off() {
-            with_open_backoff(|backoff| backoff.keys.remove(key));
-        }
         true
     }
 }
@@ -247,7 +254,7 @@ impl ScanIndex {
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
 pub(super) fn path_requires_verification(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
     files
@@ -255,18 +262,42 @@ pub(super) fn path_requires_verification(
         .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
 }
 
-pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    for entry in index
-        .files
-        .values_mut()
-        .filter(|entry| entry.has_unverified_source())
-    {
-        if entry
+/// Retain the existing partial growth safeguard and shorter/future floors
+/// until bounded old-directory rescue keeps all held growth discoverable.
+/// This predicate alone does NOT implement or qualify that dependency.
+/// Discovery grants no ACK, census proof or independent read permission.
+pub(super) fn path_requires_recovery(
+    source: SnapshotSource,
+    files: &SharedMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) -> bool {
+    path_requires_verification(files, path)
+        || (super::restart_restore::enabled()
+            && files.get(&local_index_key(path)).is_some_and(|entry| {
+                length != entry.size_bytes
+                    || entry.effective_upload_body_witness_revision
+                        > crate::snapshot_sync::effective_upload_body_witness_revision(source)
+            }))
+}
+
+fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
+    entry.has_unverified_source()
+        && entry
             .scan_identity_version
             .as_ref()
             .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
-        {
-            entry.set_unverified_deadline(0);
+}
+
+/// Runs every Claude and Codex scan, so an index with nothing to normalize
+/// stays shared with the committed baseline.
+pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
+    if !index.files.values().any(marker_storage_oversized) {
+        return;
+    }
+    for (_, entry) in index.files.slots_mut() {
+        if marker_storage_oversized(entry) {
+            entry.make_mut().set_unverified_deadline(0);
         }
     }
 }
@@ -374,16 +405,6 @@ pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<Aud
         .files
         .get(key)
         .and_then(|entry| entry.audit_obligation(now));
-    if claude_terminal_off() {
-        // The earliest of the entry, progress and failed-open obligations.
-        return obligation
-            .into_iter()
-            .chain(progress_debt(index, key, now))
-            .map(|debt| debt.due_unix_seconds)
-            .chain(failed_open_debt(key, now))
-            .min()
-            .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
-    }
     obligation.or_else(|| progress_debt(index, key, now))
 }
 
@@ -512,10 +533,9 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            (!claude_terminal_off() || failure.failures > 0)
-                && (failure.failures >= OPEN_PARK_FAILURES
-                    || (self.page < failure.retry_page
-                        && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+            (failure.failures >= OPEN_PARK_FAILURES
+                || (self.page < failure.retry_page
+                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
                 && open_stamp(key) == failure.stamp
         })
     }
@@ -583,30 +603,6 @@ fn open_blocked(key: &str, now: u64) -> bool {
     with_open_backoff(|backoff| backoff.blocked(key, now))
 }
 
-/// All candidate admissions share this stat-wake check, before secure open.
-pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
-    if !claude_terminal_off() {
-        return false;
-    }
-    open_blocked(key, now)
-}
-/// Scheduling only: an existing failed-open obligation may retry when its
-/// own throttle expires; a successful ordinary open is not such a retry.
-pub(super) fn failed_open_retry_ready(key: &str, now: u64) -> bool {
-    if !claude_terminal_off() {
-        return false;
-    }
-    with_open_backoff(|memo| {
-        memo.keys.get(key).is_some_and(|f| f.failures > 0) && !memo.blocked(key, now)
-    })
-}
-pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
-    if !claude_terminal_off() {
-        return None;
-    }
-    with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
-}
-
 /// Census-line counts: keys whose progress open failed and are still owed
 /// (backing off or parked), and the age of the oldest first failure.
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
@@ -643,29 +639,15 @@ mod open_backoff_tests;
 
 /// The queued progress Full for `key` passed its secure open: the slot's
 /// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends. Terminal-off clears throttling, NOT the
-/// owed verification: another key may own the slot, so it retains the exact
-/// numeric due in the bounded map until a marker/native acquisition carries
-/// it or a completed source verification retires it.
+/// any failed-open backoff ends.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
-    let terminal_off = claude_terminal_off();
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-        if !terminal_off {
-            with_open_backoff(|backoff| backoff.keys.remove(key));
-        }
-    }
-    if terminal_off {
-        with_open_backoff(|backoff| {
-            if let Some(failure) = backoff.keys.get_mut(key) {
-                failure.failures = 0;
-                failure.retry_page = backoff.page;
-            }
-        });
+        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
 }
 
@@ -691,42 +673,21 @@ fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
     }
     recorded
 }
-pub(super) fn candidate_open_failed(key: &str, now: u64) {
-    if !claude_terminal_off() {
-        return;
-    }
-    if let Some(due) = failed_open_debt(key, now) {
-        record_open_failure(key, due, now);
-    }
-}
 
 /// The queued progress Full for `key` failed its secure open. Back the key
 /// off (or park it), then rotate the turn, wrapping to `key` itself when no
 /// other member is eligible, but keep the owed due: a failed open never
 /// re-arms a later deadline.
 pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
-    let terminal_off = claude_terminal_off();
     let Some(due) = index
         .held_audit_progress
         .as_ref()
         .filter(|slot| slot.key == key && !slot.attempted)
         .map(|slot| slot.due)
-        // failed_open_debt is None with the switch OFF.
-        .or_else(|| failed_open_debt(key, now))
     else {
         return;
     };
     let recorded = record_open_failure(key, due, now);
-    // An ordinary admission can be a previously failed key while another
-    // member owns the progress slot. Its failure must not steal that turn.
-    if terminal_off
-        && index
-            .held_audit_progress
-            .as_ref()
-            .is_some_and(|slot| slot.key != key)
-    {
-        return;
-    }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
     // and its owed due moves into the slot: the debt is never dropped.
@@ -750,14 +711,9 @@ fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<Strin
         // Restoring a plain-v2 hold changes its representation, not its
         // failed-open obligation. Keep the same-stat park and original D
         // until source verification discharges them (or the entry is gone).
-        backoff.keys.retain(|key, _| {
-            awaits_hold_deadline_restoration(index, key)
-                || claude_terminal_off()
-                    && index
-                        .files
-                        .get(key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source)
-        });
+        backoff
+            .keys
+            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
     });
     let previous = index.held_audit_progress.clone();
     let keep = previous.as_ref().is_some_and(|slot| {
@@ -1529,7 +1485,7 @@ mod provenance_tests {
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
-            let mut entry = index().files.remove("file").unwrap();
+            let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
@@ -1647,6 +1603,32 @@ impl AbsenceParent {
             let _ = (self, other);
             false
         }
+    }
+}
+/// The pinned parent of the first configured root it is proven under,
+/// only when the root has no symlink in any component (its real path is
+/// itself) and that parent is on the root's device. A redirected prefix or a
+/// mounted-over or replaced volume is unmount-like and stays loss.
+pub(super) fn absence_parent_on_root_device(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Option<AbsenceParent> {
+    #[cfg(unix)]
+    {
+        roots.iter().find_map(|root| {
+            let configured: PathBuf = root.components().collect();
+            if fs::canonicalize(root).ok()? != configured {
+                return None;
+            }
+            let parent = absence_parent(path, std::slice::from_ref(root))?;
+            let device = fs::symlink_metadata(root).ok()?.dev();
+            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, roots);
+        None
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {
@@ -2138,6 +2120,32 @@ pub(super) fn queue_growth_retry(index: &mut ScanIndex, candidate: &CandidateFil
     );
 }
 
+/// A paced growth read (recent claim) is a deferral, never an unreadable: it
+/// keeps its debt and is not re-queued, since every page would refuse it
+/// again. Any other refusal keeps the re-queue and its unreadable Reduction.
+#[track_caller]
+pub(super) fn defer_growth_read(
+    index: &mut ScanIndex,
+    census: &mut ScanCensus,
+    candidate: &CandidateFile,
+) {
+    let key = local_index_key(&candidate.path);
+    let now = sampled_scan::now_seconds();
+    if !index
+        .v2()
+        .growth_retention
+        .get(&key)
+        .is_some_and(|state| growth_claim_recent(state, now))
+    {
+        queue_growth_retry(index, candidate);
+        return census.record_unreadable(UnreadableCause::Reduction, 1);
+    }
+    census.growth_deferred = census.growth_deferred.saturating_add(1);
+    if let Some(walk) = index.traversal.as_mut() {
+        walk.residue.index_keys.insert(key);
+    }
+}
+
 /// Only witnessed growth debt excludes retirement. An undiscovered range or
 /// residue without a growth entry conveys no retention authority.
 pub(super) fn growth_excluded_parts(
@@ -2214,15 +2222,27 @@ pub(super) const GROWTH_FULL_INTERVAL: u64 = 6 * 60 * 60;
 pub(super) fn prune_growth_retention(index: &mut ScanIndex, now: u64) {
     let files = &index.files;
     let Some(v2) = index.v2.as_mut() else { return };
-    let before = v2.growth_retention.len();
-    v2.growth_retention.retain(|key, state| {
-        files.contains_key(key)
+    let reclaimed = reclaim_growth(&mut v2.growth_retention, |key| files.contains_key(key), now);
+    if growth_active(index) {
+        note_growth_reclaimed(reclaimed);
+    }
+}
+fn reclaim_growth(
+    retention: &mut BTreeMap<String, GrowthRetention>,
+    has_file: impl Fn(&str) -> bool,
+    now: u64,
+) -> usize {
+    let before = retention.len();
+    retention.retain(|key, state| {
+        has_file(key)
             || state
                 .last_growth_full_unix
                 .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
     });
-    let reclaimed = before - v2.growth_retention.len();
-    if reclaimed > 0 && growth_active(index) {
+    before - retention.len()
+}
+fn note_growth_reclaimed(reclaimed: usize) {
+    if reclaimed > 0 {
         crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
             "growth_claim_reclaimed": reclaimed
         }));
@@ -2300,9 +2320,13 @@ fn authenticate_growth_generation(index: &ScanIndex, path: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Called by save while the checkpoint lock still protects this publication.
-/// A same-generation replacement must not become a claim-lineage CAS bypass.
-pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Result<()> {
+/// Called after the claim's commit at `generation`, still under the checkpoint
+/// lock. A same-generation replacement must not become a claim-lineage CAS bypass.
+pub(super) fn publish_growth_claim_receipt(
+    index: &ScanIndex,
+    path: &Path,
+    generation: u64,
+) -> Result<()> {
     let context = index
         .v2()
         .growth_claim_context
@@ -2314,15 +2338,12 @@ pub(super) fn publish_growth_claim_receipt(index: &ScanIndex, path: &Path) -> Re
         "growth claim owner changed"
     );
     let stamp = state_v2::confirmed_growth_stamp(index, path)?;
-    anyhow::ensure!(
-        stamp.0 == index.generation,
-        "growth claim publication changed"
-    );
+    anyhow::ensure!(stamp.0 == generation, "growth claim publication changed");
     *context
         .receipt
         .lock()
         .map_err(|_| anyhow::anyhow!("growth claim receipt unavailable"))? =
-        Some((index.generation, stamp));
+        Some((generation, stamp));
     Ok(())
 }
 
@@ -2341,13 +2362,20 @@ pub(super) fn merge_growth_claims(
     }
 }
 
+fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
+    state
+        .last_growth_full_unix
+        .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+}
+
+/// The claim is one store transaction CAS'd on this lineage's G; no
+/// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
-    let recent = |state: &GrowthRetention| {
-        state
-            .last_growth_full_unix
-            .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
-    };
-    if index.v2().growth_retention.get(key).is_some_and(recent)
+    if index
+        .v2()
+        .growth_retention
+        .get(key)
+        .is_some_and(|state| growth_claim_recent(state, now))
         || index.decode_holds.contains("growth_retention", key)
     {
         return Ok(false);
@@ -2357,30 +2385,12 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .growth_claim_context
         .clone()
         .context("growth Full needs a committed scan index")?;
-    // Decode the committed index, not the working page: persisting a claim
-    // must never publish unaccepted bodies, progress or census changes.
-    authenticate_growth_generation(index, &context.path)?;
-    let mut committed = ScanIndex::load(&context.path)?;
-    anyhow::ensure!(
-        growth_owner_matches(&committed, &context),
-        "growth claim owner changed"
-    );
+    let _lock = CheckpointLock::acquire(&context.path)?;
     authenticate_growth_generation(index, &context.path)?;
     let expected = own_growth_claim_generation(index, &context.path).unwrap_or(index.generation);
-    anyhow::ensure!(
-        committed.generation == expected,
-        "growth claim needs index reload"
-    );
-    committed.require_persistence_available()?;
-    if committed.v2().growth_retention.get(key).is_some_and(recent)
-        || committed.decode_holds.contains("growth_retention", key)
-    {
-        merge_growth_claims(
-            &mut index.v2_mut().growth_retention,
-            &committed.v2().growth_retention,
-        );
-        return Ok(false);
-    }
+    // The committed graph shares this lineage's normalization; only claim
+    // rows differ, so its availability is this graph's.
+    index.require_persistence_available()?;
     let mut claim = index
         .v2()
         .growth_retention
@@ -2388,21 +2398,33 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
         .cloned()
         .unwrap_or_default();
     claim.last_growth_full_unix = Some(now);
-    committed
-        .v2_mut()
-        .growth_retention
-        .insert(key.to_owned(), claim);
-    // Existing save owns lock, full CAS, atomic publication and fsync. If it
-    // fails (including ambiguous publication), no acquisition is authorized.
-    committed.v2_mut().growth_claim_context = Some(context.clone());
-    committed.save_growth_claim(&context.path)?;
-    let _lock = CheckpointLock::acquire(&context.path)?;
-    publish_growth_claim_receipt(&committed, &context.path)?;
-    merge_growth_claims(
-        &mut index.v2_mut().growth_retention,
-        &committed.v2().growth_retention,
-    );
-    Ok(true)
+    let decide =
+        |rows: &mut BTreeMap<String, GrowthRetention>, held: bool, files: &BTreeSet<String>| {
+            if held
+                || rows
+                    .get(key)
+                    .is_some_and(|state| growth_claim_recent(state, now))
+            {
+                return false;
+            }
+            // The save's merge keeps the larger claim; this one is not recent,
+            // so the committed claim is older. The save's pruning then applies.
+            rows.insert(key.to_owned(), claim);
+            note_growth_reclaimed(reclaim_growth(
+                rows,
+                |name| files.contains(name),
+                sampled_scan::now_seconds(),
+            ));
+            true
+        };
+    let (admitted, committed) =
+        state_v2::claim_growth_locked(&context.path, index, expected, key, decide)?;
+    if admitted {
+        let generation = expected.checked_add(1).context("growth claim generation")?;
+        publish_growth_claim_receipt(index, &context.path, generation)?;
+    }
+    merge_growth_claims(&mut index.v2_mut().growth_retention, &committed);
+    Ok(admitted)
 }
 
 /// Identity has already been checked by open_and_identify and ReadPlan.
@@ -2681,7 +2703,7 @@ mod growth_tests {
                 Some(now),
                 30,
                 // v2 growth follows the index (production derivation).
-                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut resumed.clone(), None, None),
             )
             .unwrap();
             assert!(open_and_identify_scan_candidate_at(
@@ -2694,7 +2716,6 @@ mod growth_tests {
                     retention: crate::snapshots::DiscoveryRetention::unverified(&resumed.files),
                     growth: Some(&resumed.v2().growth_retention),
                 },
-                sampled_scan::now_seconds(),
             )
             .is_some());
         }
@@ -2746,62 +2767,52 @@ mod growth_tests {
     /// [money] f2 admission pressure keeps retained hashes and defers new record.
     #[test]
     fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        for prechecked in [true, false] {
-            let fixture = Fixture::new();
-            let mut index = fixture.index();
-            fixture.grow();
-            if prechecked {
-                revalidate_growth(
-                    &mut index,
-                    &fixture.key,
-                    std::slice::from_ref(&fixture.root),
-                );
-            }
-            let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-            let record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                (0..cap as u64).collect(),
-            )
-            .with_modified_for_test(Some(1));
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        fixture.grow();
+        let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            (0..cap as u64).collect(),
+        )
+        .with_modified_for_test(Some(1));
+        index
+            .claude_request_census
+            .insert_for_test(&fixture.key, record);
+        let mut index = restart(&index);
+        let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            40 * 86400,
+            ClaudeRequestCensusShape::Exact,
+            vec![u64::MAX],
+        );
+        let outcome = index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
+        assert_ne!(
+            outcome,
+            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
             index
                 .claude_request_census
-                .insert_for_test(&fixture.key, record);
-            let mut index = restart(&index);
-            let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"b".repeat(64),
-                40 * 86400,
-                ClaudeRequestCensusShape::Exact,
-                vec![u64::MAX],
-            );
-            let outcome =
-                index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
-            assert_ne!(
-                outcome,
-                super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-            );
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .record_for_test(&fixture.key)
-                    .unwrap()
-                    .request_hashes_for_test()
-                    .len(),
-                cap
-            );
-            // Occupancy release also excludes this key, even above 90%.
-            assert_eq!(
-                index
-                    .retire_claude_transcript_records_for_test(40 * 86400)
-                    .0,
-                0
-            );
-            assert_eq!(
-                index.claude_request_census.totals_for_test(),
-                index.claude_request_census.recounted_for_test()
-            );
-        }
+                .record_for_test(&fixture.key)
+                .unwrap()
+                .request_hashes_for_test()
+                .len(),
+            cap
+        );
+        // Occupancy release also excludes this key, even above 90%.
+        assert_eq!(
+            index
+                .retire_claude_transcript_records_for_test(40 * 86400)
+                .0,
+            0
+        );
+        assert_eq!(
+            index.claude_request_census.totals_for_test(),
+            index.claude_request_census.recounted_for_test()
+        );
     }
 
     /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
@@ -2913,7 +2924,7 @@ mod growth_tests {
             Some(now),
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .is_some());
         assert!(reconcile_missing_index_entries_with_limit(&mut index, 1));
@@ -3011,7 +3022,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .unwrap();
         let (candidate, _) = open_and_identify_scan_candidate_at(
@@ -3024,7 +3035,6 @@ mod growth_tests {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap();
         for cause in [
@@ -3084,7 +3094,7 @@ mod growth_tests {
             None,
             30,
             // v2 growth follows the index (production derivation).
-            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None, None),
         )
         .unwrap();
         open_and_identify_scan_candidate_at(
@@ -3097,7 +3107,6 @@ mod growth_tests {
                 retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
                 growth: Some(&index.v2().growth_retention),
             },
-            sampled_scan::now_seconds(),
         )
         .unwrap()
         .0

@@ -6,11 +6,13 @@ set -euo pipefail
 # for the merge queue to merge it. The base branch must have a merge queue:
 # "Rust contracts" (macOS) is skipped on pull requests and runs only there.
 
-# Job names from .github/workflows/ci.yml; every other check is informational.
-# Only check runs of that workflow count, so a same-named job elsewhere cannot
-# stand in for (or block) a ci.yml job.
+# Required job name -> its workflow; every other check is informational. Only
+# check runs of the named workflow count, so a same-named job elsewhere cannot
+# stand in for (or block) a required job. Drafts run neither workflow; marking
+# the PR ready starts both, so the Linux tests always run before the merge.
 CI_WORKFLOW=".github/workflows/ci.yml"
-REQUIRED_CHECKS='["Rust contracts","Public surface checks","Rust advisory audit","Dependency review"]'
+LINUX_WORKFLOW=".github/workflows/linux-tests.yml"
+REQUIRED_CHECKS="{\"Rust contracts\":\"$CI_WORKFLOW\",\"Public surface checks\":\"$CI_WORKFLOW\",\"Rust advisory audit\":\"$CI_WORKFLOW\",\"Dependency review\":\"$CI_WORKFLOW\",\"Rust tests (Linux)\":\"$LINUX_WORKFLOW\",\"Rust format (Linux)\":\"$LINUX_WORKFLOW\"}"
 DEFAULT_INTERVAL=60
 MIN_INTERVAL=60
 # Two hours: a queued PR waits for its PR checks and then a full queue round
@@ -31,16 +33,17 @@ Usage: pr_merge_when_mac_green.sh [--repo <owner/name>] [--interval <seconds>]
                                   [--timeout <seconds>] <pr-number>
 
 Refuses at once unless the base branch has a merge queue. Marks the PR ready
-for review if it is a draft, then waits until each of the Public CI
-pull-request checks
-  "Rust contracts"          (macOS; skipped on pull requests counts as passed)
-  "Public surface checks"   (Linux)
-  "Rust advisory audit"     (Linux)
-  "Dependency review"       (Linux)
+for review if it is a draft, then waits until each pull-request check
+  "Rust contracts"          (ci.yml, macOS; skipped on pull requests counts as passed)
+  "Public surface checks"   (ci.yml, Linux)
+  "Rust advisory audit"     (ci.yml, Linux)
+  "Dependency review"       (ci.yml, Linux)
+  "Rust tests (Linux)"      (linux-tests.yml)
+  "Rust format (Linux)"     (linux-tests.yml)
 completed with conclusion success. For each name only the newest check run of
-that exact name counts, and only on a pull_request workflow run of this PR and
-its current base branch for the PR's head commit. Other checks (for example
-"Rust tests (Linux)") are ignored. Once all four passed and the PR is
+that exact name counts, and only on a pull_request run of its workflow for this
+PR and its current base branch on the PR's head commit. Other checks are
+ignored. Once all six passed and the PR is
 MERGEABLE it enqueues exactly <head-sha> with GitHub's enqueuePullRequest
 mutation (expectedHeadOid; independent of the repository's auto-merge setting)
 and waits until merged, removed from the queue, the head changes, or timeout.
@@ -159,7 +162,7 @@ refuse_unmergeable() {
 
 # Prints "<verdict>|<detail>" for the required checks on $1, judging for each
 # name the newest check run that belongs to a pull_request workflow run for
-# this PR and base in ci.yml. <verdict> is success (all four passed), red (at least one
+# this PR and base in that check's workflow. <verdict> is success (all passed), red (at least one
 # finished without success; <detail> names them) or wait (<detail> lists the
 # others as missing, pending or notready:<skipped|neutral>). A check-runs reply
 # that does not hold every run of the commit is "wait", never a verdict.
@@ -174,7 +177,6 @@ checks_status() {
     || return 1
   jq -nr \
     --argjson required "$REQUIRED_CHECKS" \
-    --arg workflow "$CI_WORKFLOW" \
     --arg sha "$sha" \
     --argjson pr "$pr" \
     --argjson pr_view "$pr_json" \
@@ -184,19 +186,21 @@ checks_status() {
       | "\($pr_view.headRepositoryOwner.login)/\($pr_view.headRepository.name)" as $head_repo
       | [ $runs.workflow_runs[]?
         | select(.event == "pull_request" and .head_sha == $sha)
-        | select(.path == $workflow)
+        | select(.path as $path | any($required[]; . == $path))
         | select(
             any(.pull_requests[]?; .number == $pr and .base.ref == $base)
             or ($pr_view.isCrossRepository == true
                 and ((.pull_requests // []) | length) == 0
                 and .head_branch == $pr_view.headRefName
                 and .head_repository.full_name == $head_repo))
-        | .check_suite_id ] as $suites
+        | {id: .check_suite_id, path} ] as $suites
       | [ $checks.check_runs[]?
           | select(.head_sha == $sha)
-          | select(.check_suite.id as $id | any($suites[]; . == $id)) ] as $pr_checks
-      | [ $required[] as $name
-          | ([ $pr_checks[] | select(.name == $name) ] | sort_by(.id) | last)
+          | .check_suite.id as $id
+          | . + {path: ([ $suites[] | select(.id == $id) | .path ] | first)}
+          | select(.path != null) ] as $pr_checks
+      | [ $required | to_entries[] | .key as $name | .value as $path
+          | ([ $pr_checks[] | select(.name == $name and .path == $path) ] | sort_by(.id) | last)
           | { name: $name,
               state: (if . == null then "missing"
                 elif .status != "completed" then "pending"

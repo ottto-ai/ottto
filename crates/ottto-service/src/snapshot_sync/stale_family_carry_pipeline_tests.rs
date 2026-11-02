@@ -1392,8 +1392,6 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
 }
 
-include!("retry_admission_pipeline_tests.rs");
-
 // Mirror prepare's existing baseline ordering, then use the shared full pipeline
 // and save/reload every synthetic page. No fixture alters acquisition policy.
 fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<RearmPage> {
@@ -1447,6 +1445,18 @@ fn source_latch_generation(
     panic!("bounded fixture ends");
 }
 
+/// Each transcript the single page re-reads adds one `SnapshotItem` to the
+/// scan's `snapshots` (~310 visits) plus entries in both index copies the
+/// frame holds. The money here is the standalone session's alone, so the
+/// shared fixture's unrelated three-member family and its sidecars go.
+fn latch_contract_drop_unrelated_family(fixture: &RearmFixture) {
+    std::fs::remove_file(fixture.member_path(None)).unwrap();
+    std::fs::remove_dir_all(fixture.root.join(REARM_ROOT)).unwrap();
+    for kind in ["claude-code-effort", "claude-code-trace-ownership"] {
+        std::fs::remove_file(fixture.sidecar_path(kind)).unwrap();
+    }
+}
+
 #[test]
 #[serial(source_manifests)]
 fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies() {
@@ -1464,6 +1474,7 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                 for base in [false, true] {
                     let _base = base.then(crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new);
                     let mut fixture = c1a_fixture("e3-latch-contract-money");
+                    latch_contract_drop_unrelated_family(&fixture);
                     fixture.owned_base_preparation = true;
                     fixture.native_file_limit = 100;
                     let session = "e7000000-0000-4000-8000-000000000007";

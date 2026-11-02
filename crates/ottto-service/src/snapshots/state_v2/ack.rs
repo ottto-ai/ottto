@@ -34,8 +34,8 @@ fn require(ok: bool, reason: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Runtime-only. Clones retain the authenticated source scope, not environment
-/// switch state. A companion from another DB or a newer recovery set holds.
+/// Runtime-only. Clones retain the authenticated source scope. A companion from
+/// another DB or a newer recovery set holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgressRecovery {
     scope: Scope,
@@ -277,12 +277,12 @@ impl OriginalProgress {
             Ok(proposed)
         })
     }
-    fn seal_locked<S: Store>(
+    fn seal_locked(
         &self,
         index_path: &Path,
         identity: &Identity,
         progress_path: &Path,
-        store: &mut S,
+        store: &mut sqlite::Sqlite,
     ) -> Result<()> {
         require(
             index_path == self.index_path && identity.binding.namespace_hash == self.namespace,
@@ -315,11 +315,11 @@ impl OriginalProgress {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) fn seal<S: Store>(
+    pub(super) fn seal(
         &self,
         index_path: &Path,
         identity: &Identity,
-        store: &mut S,
+        store: &mut sqlite::Sqlite,
     ) -> Result<()> {
         crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
             self.seal_locked(index_path, identity, path, store)
@@ -327,12 +327,12 @@ impl OriginalProgress {
     }
     /// Retain the existing progress owner through import close/fsync and fence
     /// publication. A progress save cannot slip between sealing and the fence.
-    pub(super) fn with_sealed_import<S: Store, T>(
+    pub(super) fn with_sealed_import<T>(
         &self,
         index_path: &Path,
         identity: &Identity,
-        mut store: S,
-        publish: impl FnOnce(S) -> Result<T>,
+        mut store: sqlite::Sqlite,
+        publish: impl FnOnce(sqlite::Sqlite) -> Result<T>,
     ) -> Result<T> {
         crate::snapshot_sync::with_state_v2_progress_lock(index_path, |path| {
             self.seal_locked(index_path, identity, path, &mut store)?;
@@ -377,7 +377,7 @@ impl ProgressRecovery {
     }
 
     /// Caller holds the source owner; called before progress decoding/containment.
-    /// OFF/v1 and Codex/Pi perform no extra reads, writes or normalization.
+    /// v1 and Codex/Pi perform no extra reads, writes or normalization.
     pub(crate) fn for_index(index: &ScanIndex, index_path: &Path) -> Result<Option<Self>> {
         if !state_v2_growth_retention_active(index) {
             return Ok(None);
@@ -385,7 +385,8 @@ impl ProgressRecovery {
         let generation =
             super::super::sampled_audit::own_growth_claim_generation(index, index_path)
                 .unwrap_or(index.generation);
-        guard_external(index_path, index.v2().persistence_v2.as_ref(), generation)?;
+        // Local binding only: a save hold must not block the pass that clears it.
+        guard_local(index_path, index.v2().persistence_v2.as_ref(), generation)?;
         let binding = super::super::scan_index_integration::scan_index_storage_binding(index_path)
             .context("state_v2_ack_binding")?;
         let (identity, _) =

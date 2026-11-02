@@ -162,7 +162,6 @@ struct RearmFixture {
     // Synthetic watcher events supplied through the actual scan constructor.
     hinted_paths: Vec<PathBuf>,
     native_file_limit: usize,
-    serial_active_frame: bool,
     owned_base_preparation: bool,
     /// Sessions every page holds locally after the fold, through the
     /// production E2 hold (`hold_request_owned`): unbound, so
@@ -191,7 +190,6 @@ impl RearmFixture {
             request_identity: false,
             hinted_paths: Vec::new(),
             native_file_limit: REARM_PAGE_FILES,
-            serial_active_frame: false,
             owned_base_preparation: false,
             local_holds: BTreeSet::new(),
             body_trace: Default::default(),
@@ -340,12 +338,7 @@ impl RearmFixture {
         index: ScanIndex,
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        let frame = self.native_preparation(index, collected_at);
-        if self.serial_active_frame {
-            collect_unparkable_preparation_with_rotation(frame)
-        } else {
-            collect_native_preparation_with_rotation(frame, true)
-        }
+        collect_native_preparation_with_rotation(self.native_preparation(index, collected_at))
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
@@ -399,12 +392,12 @@ impl RearmFixture {
             activity_hint: hint,
             receipt_window_days: 183,
             cache_observations_enabled: false,
-            scan_agent_status_collection: std::sync::Arc::new(AgentStatusCollection {
+            scan_agent_status_collection: Some(std::sync::Arc::new(AgentStatusCollection {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: Vec::new(),
                 codex_home_bindings: Vec::new(),
-            }),
+            })),
             attribution_context: None,
             upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: REARM_DESTINATION.to_owned(),
@@ -415,7 +408,6 @@ impl RearmFixture {
             committed_index: index,
             backfill_state: Default::default(),
             backfill_pending: false,
-            replay_generation: "replay-generation-rearm".to_owned(),
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: Some(scan),
@@ -436,14 +428,6 @@ impl RearmFixture {
         target: Option<&str>,
     ) -> RearmPage {
         self.page_with_input_index(collected_at, upload, target, None)
-    }
-
-    /// Scale-only adapter: retain ordinary settled state between the explicit
-    /// durable checkpoints, without repeatedly decoding the same large index.
-    fn scale_page(&self, index: ScanIndex, collected_at: &str) -> RearmPage {
-        assert!(self.serial_active_frame);
-        assert!(!crate::snapshots::claude_native_comparison::enabled());
-        self.page_with_input_index(collected_at, RearmUpload::Accept, None, Some(index))
     }
 
     fn page_with_input_index(
@@ -592,9 +576,9 @@ impl RearmFixture {
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
         };
         assert!(
-            comparison_completion
-                .as_ref()
-                .is_none_or(|completion| { !completion.ordinary_terminal_retained_for_test() }),
+            comparison_completion.as_ref().map_or(true, |completion| {
+                !completion.ordinary_terminal_retained_for_test()
+            }),
             "ordinary terminal graph is retired by the actual evidence/fold stage before upload"
         );
         let comparison_after_fold = comparison_requested(&comparison_completion);
@@ -700,7 +684,7 @@ impl RearmFixture {
             snapshot_upload_body_witness,
             |items| {
                 offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                actual_upload = if target.is_none_or(|session| {
+                actual_upload = if target.map_or(true, |session| {
                     items.iter().any(|item| item.source_session_id == session)
                 }) {
                     upload
@@ -1179,180 +1163,6 @@ fn rearm_digest<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn assert_late_import_checks_settled_request_owners(copied: bool) {
-    use sha2::{Digest, Sha256};
-    const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
-    let fixture = RearmFixture::new(if copied {
-        "claude-stable-proof-rearm-late-copy"
-    } else {
-        "claude-stable-proof-rearm-novel-import"
-    });
-    let established = fixture.establish();
-    assert_eq!(rearm_reads(&fixture.generation(10)), 0);
-    let request = if copied {
-        "req_root_1"
-    } else {
-        "req_novel_import"
-    };
-    let path = fixture
-        .root
-        .join("zz-import")
-        .join("nested")
-        .join(format!("{IMPORT}.jsonl"));
-    RearmFixture::append(&path, &rearm_transcript_line(IMPORT, None, request, 0));
-    let (api, trace) = rearm_evidence_lines(None, request, 1);
-    let mut api: crate::claude_local_otel::ClaudeLocalOtelEvidence =
-        serde_json::from_str(&api).expect("synthetic API row");
-    let mut trace: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
-        serde_json::from_str(&trace).expect("synthetic trace row");
-    api.session_id = IMPORT.to_string();
-    api.fingerprint.clear();
-    api.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&api).unwrap())
-    );
-    trace.session_id = IMPORT.to_string();
-    trace.fingerprint.clear();
-    trace.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&trace).unwrap())
-    );
-    for (kind, row) in [
-        ("claude-code-effort", serde_json::to_string(&api).unwrap()),
-        (
-            "claude-code-trace-ownership",
-            serde_json::to_string(&trace).unwrap(),
-        ),
-    ] {
-        let path = fixture
-            .support
-            .join("local-otel")
-            .join(kind)
-            .join(format!("{:x}.jsonl", Sha256::digest(IMPORT.as_bytes())));
-        RearmFixture::append(&path, &(row + "\n"));
-    }
-
-    let imported = fixture.generation(11);
-    let last = imported.last().unwrap();
-    assert!(
-        imported.len() > 1,
-        "the actual traversal crosses page boundaries"
-    );
-    assert!(last.scan.census_complete);
-    assert!(
-        last.duplicate_census.fence_after,
-        "unknown owner set cannot excuse skipped members"
-    );
-    assert!(!last.duplicate_census.coverage_complete);
-    assert!(last.duplicate_census.full_rearm);
-    assert_eq!(RearmFixture::family_heads(&last.index), established.heads);
-    assert_eq!(RearmFixture::family_rearm_debt(&last.index), 3);
-    let item = imported
-        .iter()
-        .flat_map(|page| &page.scan.snapshots)
-        .find(|item| item.source_session_id == IMPORT)
-        .expect("imported body");
-    assert_eq!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
-    assert_eq!(
-        item.first_turn_context_tokens, None,
-        "no falsely unique posture is offered before comparison"
-    );
-    assert_eq!(item.peak_context_fill_tokens, None);
-    assert_eq!(item.last_turn_context_tokens, None);
-
-    let covered = fixture.generation(12);
-    let last = covered.last().unwrap();
-    assert!(last.duplicate_census.coverage_complete);
-    assert!(!last.duplicate_census.fence_after);
-    let saved = serde_json::to_value(&last.index).unwrap();
-    if copied {
-        let owners = saved["claude_duplicate_request_owners"]
-            .as_object()
-            .expect("the copied request has a retained duplicate witness");
-        let hash = format!("{:x}", Sha256::digest(request.as_bytes()));
-        assert_eq!(
-            owners[&hash].as_array().unwrap().len(),
-            2,
-            "current request observations identify both owners after restart"
-        );
-    } else {
-        assert!(
-            saved.get("claude_duplicate_request_owners").is_none(),
-            "an empty duplicate map is omitted from the saved index"
-        );
-    }
-    let corrected = fixture.generation(13);
-    let last = corrected.last().unwrap();
-    assert!(last.duplicate_census.coverage_complete);
-    assert!(!last.duplicate_census.fence_after);
-    if copied {
-        // The import was already offered without unique posture. Re-parsing
-        // an identical safe body may be suppressed by normal finalization;
-        // its exact ACKed head must remain, without requiring another POST.
-        let key = path.to_string_lossy().to_string();
-        assert_eq!(
-            last.index.file_snapshot_fingerprints[&key],
-            BTreeSet::from([item.snapshot_fingerprint.clone()]),
-        );
-        assert!(last
-            .index
-            .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
-        assert!(corrected
-            .iter()
-            .flat_map(|page| &page.scan.snapshots)
-            .filter(|body| body.source_session_id == IMPORT)
-            .all(|body| body.first_turn_context_tokens.is_none()));
-    } else {
-        assert_eq!(
-            RearmFixture::family_heads(&last.index),
-            established.heads,
-            "known healthy siblings regain their exact ACKed posture after the fence opens"
-        );
-        let item = corrected
-            .iter()
-            .flat_map(|page| &page.scan.snapshots)
-            .find(|item| item.source_session_id == IMPORT)
-            .expect("corrective import body");
-        assert_eq!(item.first_turn_context_tokens, Some(10));
-        assert!(
-            last.index
-                .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint),
-            "only the exact offered corrective body becomes accepted"
-        );
-    }
-    for hour in [14, 15] {
-        let quiet = fixture.generation(hour);
-        assert_eq!(
-            rearm_reads(&quiet),
-            0,
-            "hour {hour}: stable imports go quiet"
-        );
-        assert!(quiet.iter().all(|page| page.offered.is_empty()));
-    }
-}
-
-#[test]
-#[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
-#[serial(source_manifests)]
-fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
-    let _source_manifests = SourceManifestTestGuard::new();
-    assert_late_import_checks_settled_request_owners(false);
-}
-
-#[test]
-#[ignore = "UNMET historical strict-fence aspiration; superseded by explicit native_comparison_novel_import_base_parity"]
-fn native_comparison_original_novel_import_oracle() {
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
-        return;
-    }
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    // Call the ORIGINAL function, including its original assertions and page2.
-    // Its own serial guard owns source_manifests; no nested serial lock here.
-    novel_import_recovers_after_owner_coverage_then_stops_reading();
-    writeln!(std::io::stderr().lock(), "native_comparison_original_novel_import: original_body_ran=true original_passed=true page_files=2 actual_SourcePreparation=true actual_existing_frame_budget=true exact_body_ACK_validator=true").unwrap();
-}
-
 // Separate naturally bootstrapped selected histories, sharing the SAME immutable
 // physical source/sidecar revisions. No index/permit/certificate is copied.
 fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture {
@@ -1367,7 +1177,6 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         request_identity: source.request_identity,
         hinted_paths: source.hinted_paths.clone(),
         native_file_limit: source.native_file_limit,
-        serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
         local_holds: source.local_holds.clone(),
         body_trace: Default::default(),
@@ -1480,6 +1289,7 @@ fn native_comparison_assert_ack_conservation(fixture: &RearmFixture, selected: &
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -1626,11 +1436,13 @@ fn native_comparison_novel_import_base_parity() {
         native_comparison_assert_old_bindings(&base_before, index);
     }
     writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
+    });
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
+    run_on_scan_worker_stack(|| {
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("native_comparison_deferred_no_target: supported_positive=UNEXECUTED");
         return;
@@ -1670,7 +1482,7 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
     let target_hook =
         crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
-    let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame, true).unwrap();
+    let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame).unwrap();
     assert_eq!(
         target_hook.hits(),
         0,
@@ -1698,11 +1510,13 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
         Some(1)
     );
     eprintln!("native_comparison_deferred_no_target: actual_SourcePreparation=true enough_target_capacity=true native_files=1 target_finish_calls=0 no_offer_or_checkpoint=true new_local_debt_visible=true abandoned_before_save_BASE=true");
+    });
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
 
     use sha2::{Digest, Sha256};
@@ -1869,9 +1683,12 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     );
     assert!(quiet.iter().all(|page| page.offered.is_empty()));
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
+    });
 }
 
+#[inline(never)]
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
+    run_on_scan_worker_stack(move || {
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
         return;
@@ -2061,6 +1878,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         "partial selected debt/restart must recover within ordinary bounded generations"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+    });
 }
 
 #[test]
@@ -2074,6 +1892,7 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
+    run_on_scan_worker_stack(|| {
     // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
 
     use sha2::{Digest, Sha256};
@@ -2181,4 +2000,5 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         "exact own C5 head, bytes, identity basis and per-request tags equal base"
     );
     writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
+    });
 }

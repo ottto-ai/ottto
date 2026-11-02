@@ -65,9 +65,13 @@ fn with_rotation_budget<T>(
     (collected, seen)
 }
 
-struct Guard;
+pub(in crate::snapshot_sync) struct Guard;
 impl Guard {
-    fn new(keep: bool, conflict_path: Option<PathBuf>, retry_clock: Option<u64>) -> Self {
+    pub(in crate::snapshot_sync) fn new(
+        keep: bool,
+        conflict_path: Option<PathBuf>,
+        retry_clock: Option<u64>,
+    ) -> Self {
         HOOK.with(|state| {
             assert!(!state.borrow().enabled);
             *state.borrow_mut() = Hook {
@@ -222,9 +226,8 @@ fn e2_real_caller_parity_at_tight_allowances() {
         })
         .unwrap()
         .expect("actual due preparation");
-        let ((mut preparation, index, scan), allowance) = with_rotation_budget(budget, || {
-            collect_native_preparation_with_rotation(frame, false)
-        });
+        let ((mut preparation, index, scan), allowance) =
+            with_rotation_budget(budget, || collect_native_preparation_with_rotation(frame));
         let (index, scan) = if shared {
             let (index, scan, started) = common
                 .entry((budget, conflict))

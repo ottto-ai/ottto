@@ -218,15 +218,15 @@ impl ScanIndex {
         }
         for root in &unbound {
             self.claude_usage_authority_quarantine.remove(root);
-            self.claude_usage_family_pending.remove(root);
+            self.claude_usage_family_pending.discard(root);
         }
         let mut rearmed = 0_usize;
-        for (index_key, entry) in &mut self.files {
+        for (index_key, entry) in self.files.slots_mut() {
             if claude_index_path_member_ref(Path::new(index_key))
                 .is_some_and(|member| unbound.contains(member.root))
                 && !entry.source_file_fingerprint.is_empty()
             {
-                entry.source_file_fingerprint.clear();
+                entry.make_mut().source_file_fingerprint.clear();
                 rearmed += 1;
             }
         }
@@ -302,7 +302,7 @@ impl ScanIndex {
         }
         for root in resolved {
             self.claude_usage_authority_quarantine.remove(&root);
-            self.claude_usage_family_pending.remove(&root);
+            self.claude_usage_family_pending.discard(&root);
         }
     }
 
@@ -504,8 +504,7 @@ impl ScanIndex {
                 .insert(drain.root.clone(), record);
             if let Some(pending) = pending {
                 self.claude_usage_family_pending
-                    .entry(drain.root.clone())
-                    .or_insert(pending);
+                    .add_absent(drain.root.clone(), pending);
             }
         }
         let mut owed_again = false;
@@ -594,7 +593,7 @@ impl ScanIndex {
                 .is_empty()
             {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -655,7 +654,7 @@ impl ScanIndex {
             correction.owed_member_ids.remove(&member);
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.remove(&root);
+                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -862,7 +861,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
         }
@@ -986,18 +985,34 @@ impl ScanIndex {
             if !acked_or_rejected && !noop {
                 continue;
             }
-            for item in group.iter().filter(|item| rejected(item)) {
-                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
+            let rejected_bodies: Vec<&str> = group
+                .iter()
+                .filter(|item| rejected(item))
+                .map(|item| item.body_witness.as_str())
+                .collect();
+            // Cold: the drained family's pending is the preimage a revert
+            // restores, so it is loaded first. Unknown leaves this drain owed
+            // (counted); nothing of it is applied.
+            let roots = BTreeSet::from([candidate.root.clone()]);
+            if !drains.families.contains_key(&candidate.root)
+                && state_v2::load_usage(self, Some(&roots)).is_err()
+            {
+                continue;
+            }
+            let Ok(pending) = self.claude_usage_family_pending.family(&candidate.root) else {
+                continue;
+            };
+            let pending = pending.cloned();
+            for body_witness in rejected_bodies {
+                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={body_witness}");
             }
             drains
                 .families
                 .entry(candidate.root.clone())
                 .or_insert_with(|| {
                     (
-                        record.clone(),
-                        self.claude_usage_family_pending
-                            .get(&candidate.root)
-                            .cloned(),
+                        self.claude_usage_authority_quarantine[&candidate.root].clone(),
+                        pending,
                     )
                 });
             let record = self
@@ -1012,7 +1027,7 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.remove(&candidate.root);
+                self.claude_usage_family_pending.discard(&candidate.root);
             }
             drains.drains.push(ClaudeProofBodyDrain {
                 root: candidate.root.clone(),
@@ -1025,44 +1040,5 @@ impl ScanIndex {
             });
         }
         drains
-    }
-}
-
-// Controlled historical INPUT for production-default pipeline fixtures. This
-// constructs a save an older completing reader could have produced. It never
-// runs the terminal fold, changes the fence, or proves a fresh release cohort.
-#[cfg(test)]
-impl ScanIndex {
-
-    pub(crate) fn restore_historical_claude_family_from_for_test(
-        &mut self,
-        root: &str,
-        coverage: &ScanIndex,
-        api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-        trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-        correction: bool,
-    ) -> String {
-        assert!(claude_terminal_off());
-        let pending = coverage
-            .claude_usage_family_pending
-            .get(root)
-            .expect("historical fixture retains exact transcript occurrences");
-        let members = pending.member_request_id_hashes.keys().cloned().collect();
-        let family = prove_claude_usage_family(
-            root,
-            &members,
-            pending,
-            api.evidence.get(root),
-            trace.evidence.get(root),
-            None,
-        )
-        .expect("controlled old-reader evidence must prove every fixture member");
-        let proof = claude_usage_family_witness_fingerprint(&family.witness);
-        if correction {
-            self.rebind_claude_authority_proof(root, &family.witness);
-        }
-        self.claude_usage_family_witnesses
-            .insert(root.into(), family.witness);
-        proof
     }
 }

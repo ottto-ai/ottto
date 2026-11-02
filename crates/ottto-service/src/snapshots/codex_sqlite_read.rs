@@ -15,9 +15,7 @@
 //! closed; the caller's retry routes it again.
 //!
 //! The path is resolved once, so a symlinked database is read, checked and
-//! verified through its target, beside which SQLite keeps the `-wal`. A
-//! database with a second hard link is refused for good: its live `-wal` or
-//! `-journal` may sit beside another name.
+//! verified through its target, beside which SQLite keeps the `-wal`.
 //!
 //! An idle database has no `-wal` or `-journal`, so its main file is
 //! complete: a WAL database's last connection checkpointed every frame and
@@ -35,7 +33,7 @@
 //! fails CANTOPEN.
 
 use super::state_v2::{sidecar, sqlite_uri};
-use crate::codex_scan_diagnostics::{LinkedDatabase, LoaderStage};
+use crate::codex_scan_diagnostics::LoaderStage;
 use crate::transcript_acquisition::FileStamp;
 use anyhow::{Context, Result};
 use rusqlite::{ffi, Connection, OpenFlags};
@@ -48,9 +46,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
-
-/// rusqlite's busy timeout for a new connection, restored after the probe.
-const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The guard VFS. URI-safe, so it goes into the query unencoded.
 const GUARD_VFS: &CStr = c"ottto-codex-read";
@@ -69,21 +64,24 @@ impl std::ops::Deref for CodexSqliteRead {
 
 impl CodexSqliteRead {
     /// Open and read the schema. `flags` must be read-only; `SQLITE_OPEN_URI`
-    /// is added. A lock held by Codex fails the probe as busy at once.
-    pub(crate) fn open(path: &Path, flags: OpenFlags) -> Result<Self> {
+    /// is added. A lock held by Codex fails the probe as busy at once; later
+    /// statements wait up to `busy_timeout`.
+    pub(crate) fn open(path: &Path, flags: OpenFlags, busy_timeout: Duration) -> Result<Self> {
         // A path that can't be resolved is opened as given; SQLite reports it.
         let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let route = route(&path);
-        Self::open_routed(&path, route, flags)
+        Self::open_routed(&path, route, flags, busy_timeout)
     }
 
-    fn open_routed(path: &Path, route: Route, flags: OpenFlags) -> Result<Self> {
+    fn open_routed(
+        path: &Path,
+        route: Route,
+        flags: OpenFlags,
+        busy_timeout: Duration,
+    ) -> Result<Self> {
         let stamp = match route {
             Route::Snapshot(stamp) => Some(stamp),
             Route::Plain => None,
-            Route::Linked => {
-                return Err(anyhow::Error::new(LinkedDatabase)).context(LoaderStage::Open)
-            }
         };
         let vfs = guard_vfs().context(LoaderStage::Open)?;
         let query = if stamp.is_some() {
@@ -110,7 +108,7 @@ impl CodexSqliteRead {
                 .context(LoaderStage::Prepare)
         })?;
         read.connection
-            .busy_timeout(DEFAULT_BUSY_TIMEOUT)
+            .busy_timeout(busy_timeout)
             .context(LoaderStage::Open)?;
         Ok(read)
     }
@@ -132,7 +130,7 @@ impl CodexSqliteRead {
     /// snapshot is current while its file is still idle, has one name and
     /// has the same content stamp; otherwise it fails as busy, so the caller
     /// keeps the read failed and retries it on a later pass.
-    pub(crate) fn verify(&self) -> Result<()> {
+    fn verify(&self) -> Result<()> {
         let Some((path, before)) = &self.snapshot else {
             return Ok(());
         };
@@ -154,20 +152,12 @@ fn moved() -> anyhow::Error {
 enum Route {
     Snapshot(FileStamp),
     Plain,
-    /// A database with another hard link: refused for good.
-    Linked,
 }
 
-/// `Linked` for a regular file with another hard link; `Snapshot` for an
-/// idle one with one name. Every other database takes the plain open, as
-/// does one that can't be inspected: SQLite reports what it can't open.
+/// `Snapshot` for an idle database with one name. Every other database takes
+/// the plain open, as does one that can't be inspected: SQLite reports what
+/// it can't open.
 fn route(path: &Path) -> Route {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Route::Plain;
-    };
-    if metadata.is_file() && metadata.nlink() != 1 {
-        return Route::Linked;
-    }
     idle_stamp(path).map_or(Route::Plain, Route::Snapshot)
 }
 
@@ -286,13 +276,10 @@ unsafe fn name_path<'a>(name: *const c_char) -> Option<&'a Path> {
 /// whose mode differs from the main file's. The length can drop to zero
 /// after this check (a checkpoint truncate), so a sidecar whose mode differs
 /// is refused whatever its length; then the chmod can never apply. The open's
-/// only other changes are a chown when running as root (refused here) and an
-/// unlink that needs an exclusive create (never passed by the guard).
+/// only other changes are a chown when running as root (the daemon runs as
+/// the user) and an unlink that needs an exclusive create (never passed by
+/// the guard).
 fn sidecar_open_changes_nothing(main: &Path, sidecar: &Path, missing_ok: bool) -> bool {
-    // SAFETY: `geteuid` has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        return false;
-    }
     let Ok(main) = fs::metadata(main) else {
         return false;
     };
@@ -683,12 +670,16 @@ mod tests {
         drop(raced_writer);
 
         let before = home_state(&home);
-        let open = |name: &str| CodexSqliteRead::open(&at(name), OpenFlags::SQLITE_OPEN_READ_ONLY);
+        let busy_timeout = Duration::from_secs(5);
+        let open = |name: &str| {
+            CodexSqliteRead::open(&at(name), OpenFlags::SQLITE_OPEN_READ_ONLY, busy_timeout)
+        };
 
         let Err(error) = CodexSqliteRead::open_routed(
             &at("raced.sqlite"),
             raced,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
+            busy_timeout,
         ) else {
             panic!("plain open of a database gone idle succeeded");
         };

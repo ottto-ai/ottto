@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped Mapper writes,
+//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
@@ -12,8 +12,8 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     states().lock().unwrap().remove(path);
 }
 
-fn load_with(path: &Path, switched: bool) -> Result<Option<ScanIndex>> {
-    load_with_custody(path, switched, published(path)?)
+fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+    Ok(load_locked(path, importable, published(path)?)?.0)
 }
 fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false, None)
@@ -29,6 +29,48 @@ fn save_with_mode(
 
 /// Generation of a freshly imported native fixture store.
 const G: u64 = 1;
+
+/// (generation, data version) before and after a raced delete.
+type RacedStamps = Option<((u64, u64), (u64, u64))>;
+thread_local! {
+    /// Delete this row from another connection right after the next
+    /// reused-session hydrate, before its stamp is re-read.
+    pub(super) static DELETE_DURING_HYDRATE: std::cell::Cell<Option<RowKey>> =
+        const { std::cell::Cell::new(None) };
+    /// That session connection's stamps around the delete.
+    pub(super) static RACED_STAMPS: std::cell::Cell<RacedStamps> =
+        const { std::cell::Cell::new(None) };
+    /// Commit G+1 on the session connection after the next growth claim
+    /// authenticated G, before its write transaction begins.
+    pub(super) static COMMIT_BEFORE_GROWTH_CLAIM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+use crate::snapshots::account_pending_retention::ArchivedWindows;
+
+/// A loaded graph with its cold archives read back from the session store.
+pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
+    let mut view = index.clone();
+    with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        kinds_accounts::materialize(&mut tx, &mut view).unwrap();
+    });
+    view
+}
+
+/// Delete one stored usage-pending row on the session's own connection,
+/// outside a transaction: neither the generation nor the data version moves,
+/// so the session's stamp still matches the graph.
+pub(in crate::snapshots) fn delete_usage_row_in_session(index: &ScanIndex, root: &str) {
+    let key = mapper::key("usage.pending", root, 1).unwrap();
+    with_session_db(index, |db| sqlite::delete_row_for_test(db, &key));
+}
+
+/// Process-lifetime count of refused cold usage-pending loads.
+pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
+    telemetry::latest_for_test("usage_pending_unknown")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
 
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
@@ -75,19 +117,20 @@ impl Fixture {
         self.import(true);
     }
     fn import(&self, mapped: bool) {
+        self.import_graph(mapped.then(ScanIndex::default).as_ref());
+    }
+    fn import_graph(&self, mapped: Option<&ScanIndex>) {
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
                 .unwrap();
-        db.path_extractor(kinds::private_paths);
-        db.reference_extractor(kinds::references);
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         let mut generation = 0;
-        if mapped {
+        if let Some(graph) = mapped {
             let mut cx = KindCx::default();
             cx.binding = Some(self.identity().binding);
             let mut tx = db.begin(TxnMode::Write).unwrap();
-            kinds::populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
+            kinds::populate(graph, &mut tx, &mut cx).unwrap();
             assert_eq!(tx.commit(0, G), DurableCommitOutcome::Committed(G));
             generation = G;
         }
@@ -114,7 +157,7 @@ impl Drop for Fixture {
     }
 }
 
-/// [off=main] Unbound v1 loads ignore growth fields for every source and never
+/// [behaviour] Unbound v1 loads ignore growth fields for every source and never
 /// consult the v2 registry, even when another route owns it.
 #[test]
 fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
@@ -264,20 +307,414 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
         }
     }
 }
-/// [format] f7 off after publication saves through the one semantic save and
-/// published custody without semantic rows holds.
+/// [format] f7 a load with no support dir saves a published route through the
+/// one semantic save and published custody without semantic rows holds.
 #[test]
-fn f7_off_after_publication_saves_natively_and_unmapped_custody_holds() {
+fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());
     assert_eq!(index.generation, G + 1);
+    // [money] Archived account windows stay row-only through the latched OFF
+    // load and save, and read back with the pre-switch placement.
+    let f = Fixture::new();
+    let window = member_window;
+    let mut pre = ScanIndex::default();
+    pre.claude_account_family_pending.insert(
+        "family".into(),
+        crate::snapshots::ClaudeAccountFamilyPending {
+            current: window(30),
+            previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
+            confirmed_absent_members: BTreeSet::new(),
+        },
+    );
+    f.import_graph(Some(&pre));
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let cold = |index: &ScanIndex| {
+        matches!(
+            index.claude_account_family_pending["family"].previous_windows,
+            ArchivedWindows::Cold(_)
+        )
+    };
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(cold(&index));
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let reloaded = load_with(&f.path, false).unwrap().unwrap();
+    assert!(cold(&reloaded));
+    assert_eq!(
+        materialized(&reloaded).claude_account_family_pending,
+        pre.claude_account_family_pending
+    );
     // A fresh route must decode the missing semantic rows, never treat them as empty.
     let f = Fixture::new();
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    assert!(load_locked(&f.path, None, published(&f.path).unwrap()).is_err());
+    assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
+}
+/// A synthetic account window ending on October `day`.
+fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    crate::snapshots::ClaudeAccountFamilyPendingWindow {
+        version: crate::snapshots::CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
+        census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
+        account_identifier_hash: "d".repeat(64),
+        evidence_request_count: 0,
+        census_complete: false,
+        members: BTreeMap::new(),
+        member_requests: BTreeMap::new(),
+        invalid: false,
+    }
+}
+/// An account window with one member request set. Decode marks a window
+/// without member requests invalid, so a typed fixture stored as valid needs
+/// one to load back canonical.
+fn member_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    let mut window = account_window(day);
+    let hash = format!("{:016x}{}", day, "0".repeat(48));
+    let requests =
+        crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
+            .unwrap();
+    window.members.insert("member".into(), 1);
+    window.member_requests.insert("member".into(), requests);
+    window.evidence_request_count = 1;
+    window
+}
+/// [money] A held page's subset save commits the working graph's queued cold
+/// rollovers; the committed-load route (every pass load, a growth claim's
+/// load and claim-only save) re-hydrates the same session; the retry's
+/// working graph adopts the generation, rolls on and checkpoints without a
+/// lineage miss. The family switches account mid-session and every window
+/// carries tagged member request sets. The held member keeps its committed
+/// file entry while the accepted one advances, and the store reads back the
+/// same per-account rows as the resident path.
+#[test]
+fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
+    use crate::snapshots::{
+        ClaudeAccountFamilyPending as Family, ClaudeAccountFamilyPendingWindow as Window,
+        ClaudeAccountRequestSet,
+    };
+    const A: &str = "/synthetic/family/a.jsonl";
+    const B: &str = "/synthetic/family/b.jsonl";
+    let fingerprint = |c: char| c.to_string().repeat(64);
+    fn family(index: &mut ScanIndex) -> &mut Family {
+        index
+            .claude_account_family_pending
+            .get_mut("family")
+            .unwrap()
+    }
+    // One request per member, tagged with this window's identity revision
+    // (64 hex, as decode requires; accounts are hex letters).
+    fn window(day: u32, account: char, members: &[&str]) -> Window {
+        let mut window = account_window(day);
+        window.account_identifier_hash = account.to_string().repeat(64);
+        for (n, member) in members.iter().enumerate() {
+            // Members of one window need distinct 16-hex prefixes.
+            let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
+            let mut requests =
+                ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
+            requests.identity_revision = Some(format!("{account}{day:063x}"));
+            window.members.insert((*member).into(), 1);
+            window.member_requests.insert((*member).into(), requests);
+            window.evidence_request_count += 1;
+        }
+        window
+    }
+    fn roll(index: &mut ScanIndex, day: u32) {
+        let family = family(index);
+        let old = std::mem::replace(&mut family.current, window(day, 'b', &[A, B]));
+        family.archive(old, true);
+    }
+    let run = |cold: bool, race: bool| {
+        let f = Fixture::new();
+        let mut pre = ScanIndex::default();
+        for (key, c) in [(A, '1'), (B, '2')] {
+            let entry =
+                crate::snapshots::tests::manifest_index_entry(Some(fingerprint(c).as_str()));
+            pre.files.insert(key.into(), entry);
+            pre.accepted_snapshot_fingerprints.insert(fingerprint(c));
+        }
+        pre.claude_account_family_pending.insert(
+            "family".into(),
+            Family {
+                current: window(27, 'b', &[A, B]),
+                previous_windows: ArchivedWindows::Resident(vec![
+                    window(25, 'a', &[A]),
+                    window(26, 'a', &[A]),
+                ]),
+                confirmed_absent_members: BTreeSet::new(),
+            },
+        );
+        f.import_graph(Some(&pre));
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        let loaded = load_with(&f.path, false).unwrap().unwrap();
+        let mut working = if cold { loaded } else { materialized(&loaded) };
+        let committed = working.clone();
+        // This page changed both members; A is accepted, B's upload is held.
+        for (key, c) in [(A, '3'), (B, '4')] {
+            working
+                .files
+                .get_mut(key)
+                .unwrap()
+                .last_snapshot_fingerprint = Some(fingerprint(c));
+        }
+        roll(&mut working, 28);
+        assert_eq!(
+            matches!(
+                family(&mut working).previous_windows,
+                ArchivedWindows::Cold(_)
+            ),
+            cold
+        );
+        let mut subset = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::from([fingerprint('3')]),
+            &BTreeMap::new(),
+            &BTreeSet::from([fingerprint('4')]),
+        );
+        assert!(save_with(&f.path, &mut subset).unwrap());
+        if race {
+            // The race: another connection deletes the family's oldest
+            // archived row (outside the endpoint tail) while this session's
+            // load hydrates.
+            let mut oldest = None;
+            with_session_db(&subset, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                let control = mapper::key("account.current", "family", 1).unwrap();
+                let header = tx.get(&control).unwrap().unwrap();
+                let (_, _, ids): (Option<u64>, u64, Vec<u64>) =
+                    mapper::read(&mut tx, &header, None).unwrap();
+                oldest = Some(mapper::key("account_window", "family", ids[0]).unwrap());
+            });
+            DELETE_DURING_HYDRATE.with(|delete| delete.set(oldest));
+            let _ = load_with(&f.path, false);
+            let (before, after) = RACED_STAMPS.with(std::cell::Cell::take).unwrap();
+            assert_eq!(before.0, after.0, "the generation is unchanged");
+            assert_ne!(before.1, after.1, "the full stamp moved");
+            // Nothing from that hydrate was adopted: the load reopened, so a
+            // graph that outlived it refuses instead of skipping its lineage
+            // over the missing row.
+            working.generation = subset.generation;
+            roll(&mut working, 29);
+            let mut checkpoint = working.committable_subset_with_local_holds(
+                &subset,
+                &BTreeSet::from([fingerprint('4')]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            );
+            assert!(save_with(&f.path, &mut checkpoint).is_err());
+            return None;
+        }
+        let mut claim = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(
+            claim.files[A].last_snapshot_fingerprint,
+            Some(fingerprint('3'))
+        );
+        assert_eq!(
+            claim.files[B].last_snapshot_fingerprint,
+            Some(fingerprint('2'))
+        );
+        assert!(save_with_mode(&f.path, &mut claim, true, None).unwrap());
+        working.generation = claim.generation;
+        roll(&mut working, 29);
+        let mut checkpoint = working.committable_subset_with_local_holds(
+            &claim,
+            &BTreeSet::from([fingerprint('4')]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(save_with(&f.path, &mut checkpoint).unwrap());
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(
+            reloaded.files[B].last_snapshot_fingerprint,
+            Some(fingerprint('4'))
+        );
+        let mut view = materialized(&reloaded);
+        Some(family(&mut view).clone())
+    };
+    let cold = run(true, false).unwrap();
+    assert_eq!(cold, run(false, false).unwrap());
+    assert!(run(true, true).is_none());
+    let archive = cold.previous_windows.resident();
+    assert_eq!(
+        archive,
+        &[
+            window(25, 'a', &[A]),
+            window(26, 'a', &[A]),
+            window(27, 'b', &[A, B]),
+            window(28, 'b', &[A, B]),
+        ]
+    );
+    assert_eq!(cold.current, window(29, 'b', &[A, B]));
+    // Positive control: both accounts, every window tagged and nonempty.
+    let accounts: BTreeSet<_> = archive
+        .iter()
+        .map(|w| w.account_identifier_hash.clone())
+        .collect();
+    assert_eq!(accounts.len(), 2);
+    assert!(archive
+        .iter()
+        .chain([&cold.current])
+        .all(|w| !w.member_requests.is_empty()
+            && w.member_requests
+                .values()
+                .all(|r| r.identity_revision.is_some())));
+}
+/// [money] Cold usage pending stores what the resident graph stores: a page
+/// loads only its own families, a sibling subset saves one of them, and the
+/// working graph then loads another, changes its occurrence count, removes a
+/// third and saves itself with no Unknown refusal. Its heads are refreshed by
+/// that save; a whole-kind join and a restart see the explicit rows, and the
+/// running total equals the sum of heads and the fold of the rows (A1).
+#[test]
+fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
+    use crate::snapshots::usage_pending::{tests::family, Families, UsagePending};
+    let total = |families: &Families| UsagePending::from(families.clone()).total_occurrences();
+    let roots =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|r| (*r).into()).collect() };
+    // r1 as the sibling saved it, r2 with one member's occurrences dropped
+    // by the working graph, r3 removed and r4 untouched.
+    let mut expected = Families::from([
+        ("r1".to_owned(), family("w1", 2, false)),
+        ("r2".to_owned(), family("w1", 3, false)),
+        ("r4".to_owned(), family("w1", 2, false)),
+    ]);
+    expected.get_mut("r1").unwrap().invalid = true;
+    expected
+        .get_mut("r2")
+        .unwrap()
+        .member_occurrences
+        .pop_first()
+        .unwrap();
+    let run = |cold: bool| {
+        let f = Fixture::new();
+        let mut pre = ScanIndex::default();
+        for (root, members) in [("r1", 2), ("r2", 3), ("r3", 4), ("r4", 2)] {
+            pre.claude_usage_family_pending
+                .insert(root.into(), family("w1", members, false));
+        }
+        f.import_graph(Some(&pre));
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        let loaded = load_with(&f.path, false).unwrap().unwrap();
+        let stored = materialized(&loaded).claude_usage_family_pending.clone();
+        assert_eq!(*stored, *pre.claude_usage_family_pending);
+        let mut working = if cold { loaded } else { materialized(&loaded) };
+        let usage = &working.claude_usage_family_pending;
+        assert_eq!(usage.cold().is_some(), cold);
+        assert_eq!(usage.total_occurrences(), total(&stored));
+        assert_eq!(
+            usage.roots().collect::<Vec<_>>(),
+            stored.keys().collect::<Vec<_>>()
+        );
+        let committed = working.clone();
+
+        // The page loads r1 alone; r2 stays Unknown, never absent.
+        load_usage(&mut working, Some(&roots(&["r1"]))).unwrap();
+        assert_eq!(
+            working.claude_usage_family_pending.family("r2").is_err(),
+            cold
+        );
+        let usage = &mut working.claude_usage_family_pending;
+        usage.family_mut("r1").unwrap().unwrap().invalid = true;
+        let mut subset = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(save_with(&f.path, &mut subset).unwrap());
+
+        // The working graph loads r2 after the sibling's save, drops one
+        // member's occurrences from it, removes r3 and saves itself: r1 is
+        // rewritten as the sibling saved it and r4 is kept by its head.
+        working.generation = subset.generation;
+        load_usage(&mut working, Some(&roots(&["r2"]))).unwrap();
+        let usage = &mut working.claude_usage_family_pending;
+        let r2 = usage.family_mut("r2").unwrap().unwrap();
+        r2.member_occurrences.pop_first().unwrap();
+        usage.discard("r3");
+        assert!(save_with(&f.path, &mut working).unwrap());
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
+        );
+        // The save refreshed the loaded heads: settling returns every loaded
+        // family to its head, and the running total is unchanged.
+        settle_usage(&mut working, &BTreeSet::new());
+        if let Some(cold) = working.claude_usage_family_pending.cold() {
+            assert!(cold.loaded().is_empty());
+        }
+        assert_eq!(
+            working.claude_usage_family_pending.total_occurrences(),
+            total(&expected)
+        );
+
+        // A join loads every family and sees exactly the saved rows.
+        load_usage(&mut working, None).unwrap();
+        assert_eq!(
+            *working.claude_usage_family_pending.all().unwrap(),
+            expected
+        );
+        settle_usage(&mut working, &BTreeSet::new());
+        assert_eq!(
+            working.claude_usage_family_pending.family("r4").is_err(),
+            cold
+        );
+
+        // Restart: production reloads this hold-free store cold in both runs.
+        // A1: running total == sum of heads == fold of the stored rows.
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        let usage = &reloaded.claude_usage_family_pending;
+        assert!(usage.cold().is_some());
+        let families = materialized(&reloaded)
+            .claude_usage_family_pending
+            .resident()
+            .unwrap()
+            .clone();
+        let heads: usize = usage.views().map(|(_, view)| view.occurrences()).sum();
+        assert_eq!(usage.total_occurrences(), heads);
+        assert_eq!(heads, total(&families));
+        assert_eq!(families, expected);
+        families
+    };
+    let cold = run(true);
+    assert_eq!(cold, run(false));
+    assert_eq!(cold, expected);
+}
+
+/// [money] A row deleted out of band makes the page's keyed load refuse as a
+/// whole (counted): no family of the page is applied and the deleted family
+/// stays discoverable, Unknown rather than absent.
+#[test]
+fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
+    use crate::snapshots::usage_pending::tests::family;
+    let f = Fixture::new();
+    let mut pre = ScanIndex::default();
+    for root in ["r1", "r2"] {
+        pre.claude_usage_family_pending
+            .insert(root.into(), family("w1", 2, false));
+    }
+    f.import_graph(Some(&pre));
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let mut working = load_with(&f.path, false).unwrap().unwrap();
+    assert!(working.claude_usage_family_pending.cold().is_some());
+    with_session_db(&working, |db| {
+        let key = mapper::key("usage.pending", "r2", 1).unwrap();
+        sqlite::delete_row_elsewhere_for_test(db, &key);
+    });
+    let unknown = || {
+        telemetry::latest_for_test("usage_pending_unknown")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    let before = unknown();
+    let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
+    assert!(load_usage(&mut working, Some(&page)).is_err());
+    assert!(unknown() > before);
+    let usage = &working.claude_usage_family_pending;
+    assert!(usage.cold().unwrap().loaded().is_empty());
+    assert!(usage.family("r1").is_err());
+    assert!(usage.contains_key("r2"));
+    assert!(usage.family("r2").is_err());
 }
 /// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
 /// and exposes only committed file membership to the restart-record sweep.
@@ -413,9 +850,9 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     assert!(save_with(&f.path, &mut stale).is_err());
     assert!(load_with(&f.path, false).is_err());
 }
-/// [format] publication pending pause does not touch v1 and off cancels inventory slot.
+/// [format] publication pending pause does not touch v1.
 #[test]
-fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
+fn publication_pending_pause_does_not_touch_v1() {
     let f = Fixture::new();
     let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
     raw["future_money"] = serde_json::json!({"owed": 1});
@@ -426,15 +863,21 @@ fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() 
     after_v1_locked(&f.path, &mut index).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
-    // An OFF load cancels a valid unpublished inventory slot.
-    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+}
+
+/// [behaviour] a load naming its support dir imports v1 and publishes custody.
+#[test]
+fn support_dir_load_imports_and_publishes() {
     let f = Fixture::new();
-    fs::write(&f.path, &bytes).unwrap();
-    assert!(load_with(&f.path, true).unwrap().is_none());
-    assert!(load_with(&f.path, false).unwrap().is_none());
-    after_v1_locked(&f.path, &mut index).unwrap();
-    assert!(index.v2().persistence_v2.is_none());
-    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    let index = ScanIndex::load_for_snapshot_source(
+        &f.path,
+        crate::snapshots::SnapshotSource::ClaudeCode,
+        &f.support,
+    )
+    .unwrap();
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
 }
 
 /// [format] absent parent containment guard never promotes a database.
@@ -725,8 +1168,14 @@ mod hydrate_parity {
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
+        // A loaded graph's cold usage map does not serialize: compare the
+        // families it stores.
+        let view = match actual.claude_usage_family_pending.cold() {
+            Some(_) => materialized(actual),
+            None => actual.clone(),
+        };
         assert_eq!(
-            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&view).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         assert!(actual.decode_holds.same_as(&expected.decode_holds));
@@ -861,7 +1310,7 @@ mod hydrate_parity {
             let f = Fixture::new();
             publish(&f, &index);
             let before = fs::read(&f.path).unwrap();
-            let error = load_locked(&f.path, None, published(&f.path).unwrap()).unwrap_err();
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }
@@ -1006,16 +1455,40 @@ mod hydrate_parity {
             "other-family".into(),
             s::ClaudeAccountFamilyPending {
                 current: window(30),
-                previous_windows: vec![window(25), window(26), window(27)],
+                previous_windows: ArchivedWindows::Resident(vec![
+                    window(25),
+                    window(26),
+                    window(27),
+                ]),
                 confirmed_absent_members: BTreeSet::new(),
             },
         );
-        let actual = typed_case(index);
+        // The shared load tail never walks a cold archive: the windows a v1
+        // load collapses stay in the store, counted as uncollapsed. Publish
+        // the decoded graph, as typed_case does: decode marks these
+        // member-less windows invalid, and rows hold only canonical values.
+        let index: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let f = Fixture::new();
+        publish(&f, &index);
+        let (actual, _) = ScanIndex::load_inner_with_support(
+            &f.path,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let family = &actual.claude_account_family_pending["other-family"];
+        assert!(matches!(family.previous_windows, ArchivedWindows::Cold(_)));
+        assert_eq!(family.previous_windows.uncollapsed(), 2);
+        assert_eq!(actual.claude_account_window_retention.roots_refused, 0);
+        assert_eq!(actual.claude_account_window_retention.windows_collapsed, 0);
         assert_eq!(
-            actual.claude_account_family_pending["other-family"]
+            materialized(&actual).claude_account_family_pending["other-family"]
                 .previous_windows
+                .resident()
                 .len(),
-            2
+            3
         );
     }
     /// [money] raw quarantine repairs and opaque file freezes match v1 custody.
@@ -1049,6 +1522,16 @@ mod hydrate_parity {
         assert_eq!(actual.decode_holds.v2_provenance().1, 1);
 
         let mut index = seed();
+        // A complete hydrate with raw holds keeps account archives resident.
+        let window = member_window;
+        index.claude_account_family_pending.insert(
+            "account-family".into(),
+            s::ClaudeAccountFamilyPending {
+                current: window(30),
+                previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
+                confirmed_absent_members: BTreeSet::new(),
+            },
+        );
         let key = "/synthetic/family.jsonl";
         let canonical = serde_json::to_string(&index).unwrap();
         let old = raw_slot(canonical.as_bytes(), "files", key);
@@ -1060,6 +1543,10 @@ mod hydrate_parity {
         attach_raw(&mut index, "files", key, &raw);
         let actual = compare(&bytes, index);
         assert!(actual.decode_holds_family("family"));
+        assert!(matches!(
+            &actual.claude_account_family_pending["account-family"].previous_windows,
+            ArchivedWindows::Resident(windows) if windows.len() == 2
+        ));
         assert!(actual.claude_usage_authority_quarantine.is_empty());
         assert!(actual.claude_usage_family_pending.is_empty());
     }
@@ -1166,6 +1653,13 @@ fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
         retry.generation
     )
     .is_err());
+    // [regress] Local receipt binding must not need the upload fence: the
+    // held pass that retries the save starts here, before collection.
+    assert!(
+        crate::snapshots::ProgressRecovery::for_index(&retry, &f.path)
+            .unwrap()
+            .is_some()
+    );
     let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
         .unwrap()
         .unwrap();
@@ -1314,6 +1808,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     seed.generation = 0;
     let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
     let committed = current.clone();
+    // Loads keep account archives cold; compare the bytes the store holds.
+    let committed_view = materialized(&committed);
     let committed_generation = current.generation;
     let committed_context = current.upload_context_fingerprint.clone();
     current.upload_context_fingerprint = Some("uncommitted-context".into());
@@ -1340,8 +1836,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         )
     });
     assert_eq!(
-        serde_json::to_vec(&restored).unwrap(),
-        serde_json::to_vec(&committed).unwrap()
+        serde_json::to_vec(&materialized(&restored)).unwrap(),
+        serde_json::to_vec(&committed_view).unwrap()
     );
     assert!(restored.decode_holds.same_as(&committed.decode_holds));
     assert_eq!(
@@ -1444,7 +1940,145 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
     );
 }
 
-/// [off=main] a bound v1-only source never opens, creates or migrates SQLite custody.
+/// [regress] A paced growth refusal was counted unreadable at both admission
+/// sites (sampled and unsampled), turning the traversal red. It now defers
+/// with its debt owed, and the next pass after the interval admits its Full.
+#[test]
+fn paced_growth_read_defers_at_both_admission_sites() {
+    use crate::snapshots::sampled_audit::GROWTH_FULL_INTERVAL;
+    use crate::snapshots::{
+        local_index_key, sampled_scan, scan_source_roots_with_test_limit, OwnedSourceScan,
+        OwnedSourceScanStep, SnapshotSource,
+    };
+    let at = |seconds: u64| {
+        ::time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&::time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let reduction = crate::codex_scan_diagnostics::UnreadableCause::Reduction as usize;
+    for sampled in [false, true] {
+        let f = Fixture::new();
+        let roots = f.support.join("transcripts");
+        fs::create_dir(&roots).unwrap();
+        let transcript = roots.join("11111111-1111-4111-8111-111111111111.jsonl");
+        let line = serde_json::json!({"type": "assistant",
+            "sessionId": "11111111-1111-4111-8111-111111111111", "uuid": "u1",
+            "cwd": "/synthetic", "timestamp": "2026-10-06T10:00:00.000Z",
+            "requestId": "req_u1", "message": {"id": "msg_u1", "model": "claude-opus-4-8",
+                "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+        fs::write(&transcript, format!("{line}\n")).unwrap();
+        let key = local_index_key(&transcript);
+        let claimed = sampled_scan::now_seconds();
+        let mut seed = ScanIndex::default();
+        seed.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap(),
+        );
+        seed.v2_mut().growth_retention.insert(
+            key.clone(),
+            serde_json::from_value(
+                serde_json::json!({"predecessor_size": 4, "last_growth_full_unix": claimed}),
+            )
+            .unwrap(),
+        );
+        let progress = br#"{"generation":0}"#;
+        let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        // Unsampled pages take the StateMissing site; sampled pages the
+        // acquisition site.
+        let page = |index: &mut ScanIndex, now: u64| {
+            if !sampled {
+                return scan_source_roots_with_test_limit(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&roots),
+                    index,
+                    &at(now),
+                    30,
+                    10,
+                    false,
+                )
+                .unwrap();
+            }
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&roots),
+                std::mem::take(index),
+                &at(now),
+                30,
+                10,
+                false,
+                None,
+                &[],
+                false,
+            )
+            .with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("paced-growth".into()),
+            );
+            loop {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete {
+                        index: done, scan, ..
+                    } => {
+                        *index = done;
+                        return scan;
+                    }
+                }
+            }
+        };
+
+        sampled_scan::test_hooks::clear();
+        let result = page(&mut index, claimed);
+        assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+        assert!(
+            !sampled_scan::test_hooks::unreadable().contains(&reduction),
+            "sampled={sampled}"
+        );
+        assert!(
+            index.traversal.as_ref().map_or(true, |walk| {
+                !walk.counts.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
+            }),
+            "sampled={sampled}: healthy, no unhealthy retry armed"
+        );
+        assert_eq!(index.files[&key].size_bytes, 4, "sampled={sampled}");
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()["predecessor_size"],
+            4,
+            "sampled={sampled}: the growth debt stays owed"
+        );
+
+        // A later pass after the interval selects the file again; the claim
+        // advancing to that pass's clock is its admitted Full.
+        let later = claimed + GROWTH_FULL_INTERVAL;
+        sampled_scan::set_test_now(Some(later));
+        for _ in 0..3 {
+            let result = page(&mut index, later);
+            assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+            if serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"]
+                == later
+            {
+                break;
+            }
+        }
+        sampled_scan::set_test_now(None);
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"],
+            later,
+            "sampled={sampled}: the aged-out Full was admitted"
+        );
+    }
+}
+
+/// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
 #[test]
 fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
     let f = Fixture::new();

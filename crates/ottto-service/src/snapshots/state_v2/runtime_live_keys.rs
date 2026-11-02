@@ -1,4 +1,4 @@
-//! Committed, content-free membership for R1's restart-record erasure sweep.
+//! Committed, content-free membership for the restart-record erasure sweep.
 use super::*;
 use crate::durable_tail_store::DurableSource;
 use crate::snapshots::scan_index_persistence::Source;
@@ -6,7 +6,10 @@ use std::collections::BTreeSet;
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "R1 consumes these staged sweep result fields")
+    expect(
+        dead_code,
+        reason = "the restart-record sweep consumes these staged result fields"
+    )
 )]
 #[derive(Debug)]
 pub(crate) struct LiveKeys {
@@ -41,7 +44,7 @@ impl LiveKeys {
     not(test),
     expect(
         dead_code,
-        reason = "R1 integrates this committed-membership seam in its sweep"
+        reason = "the restart-record sweep uses this store for committed membership"
     )
 )]
 pub(crate) fn live_key_digests(index_path: &Path) -> Result<LiveKeys> {
@@ -77,8 +80,8 @@ fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     };
     let Some((path, state)) = route else {
         // Not loaded yet (daemon start, a sweep before the first load):
-        // published custody makes v1 JSON stale, so S1 can't vouch until its
-        // load imports the route. OFF/unpublished opens no store or sentinel.
+        // published custody makes v1 JSON stale, so no answer is possible until its
+        // load imports the route. Unpublished opens no store or sentinel.
         let reason = if published(index_path)? {
             IncompleteReason::Import
         } else {

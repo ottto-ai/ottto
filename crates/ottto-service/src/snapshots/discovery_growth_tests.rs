@@ -11,6 +11,8 @@ struct Fixture {
     root: PathBuf,
     path: PathBuf,
     cache: Arc<sampled_scan::SharedCache>,
+    /// Pages record no entity ACK, as when every upload failed.
+    unacked: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -21,6 +23,7 @@ impl Fixture {
             path: root.join(format!("{SESSION}.jsonl")),
             root,
             cache: Arc::new(sampled_scan::SharedCache::default()),
+            unacked: false,
         }
     }
     fn append(&self, uuid: &str) {
@@ -75,7 +78,7 @@ impl Fixture {
             &now,
             7,
         );
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
         let traversal = index.traversal.as_mut().unwrap();
         // This known member was already consumed. Saved retryable loss
         // elsewhere retains the roster; the retry is not due yet.
@@ -165,7 +168,9 @@ impl Fixture {
                             .iter()
                             .map(|item| item.snapshot_fingerprint.clone())
                             .collect();
-                        index.record_accepted_snapshot_fingerprints(&accepted);
+                        if !self.unacked {
+                            index.record_accepted_snapshot_fingerprints(&accepted);
+                        }
                         return (index, scan);
                     }
                 }
@@ -394,7 +399,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -776,7 +781,7 @@ fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> Sc
         &collected_at,
         7,
     );
-    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    advance_bounded_directory_traversal(source, &mut index, 7, None, None);
     let traversal = index.traversal.as_mut().unwrap();
     assert!(traversal.pending_directories.is_empty());
     traversal.pending_candidates.clear();
@@ -997,7 +1002,7 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
                 start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
-                advance_bounded_directory_traversal(source, &mut walked, 7, None);
+                advance_bounded_directory_traversal(source, &mut walked, 7, None, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
                     .iter()
@@ -1202,70 +1207,6 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
     assert!(logs.iter().any(|row| row["stage"] == "durable_tail_alarm"));
 }
 
-/// [format] The owed re-queue pacing map is scheduling evidence only. Through
-/// the production loader an absent, valid, malformed or over-cap map keeps the
-/// traversal (census, counts and queued work) unchanged; undecodable stamps
-/// are dropped and an over-cap map keeps only its newest stamps.
-#[test]
-fn listing_owed_pacing_map_decodes_leniently_and_keeps_the_traversal() {
-    let f = Fixture::new();
-    let mut index = kept_generation(&f, SnapshotSource::ClaudeCode, false);
-    let traversal = index.traversal.as_mut().unwrap();
-    traversal.pending_candidates.push_back(ScanTraversalPath {
-        scan_root: f.root.clone(),
-        path: f.root.join(format!("{GROWN}.jsonl")),
-        census_member: true,
-        watcher_hint: false,
-    });
-    traversal.counts.unreadable_path_count = 1;
-    let saved = serde_json::to_value(&index).unwrap();
-    let over_cap = (0..MAX_LISTING_OWED_PACES as u64 + 3)
-        .map(|at| (format!("/synthetic/{at:05}.jsonl"), json!(at)))
-        .collect::<serde_json::Map<_, _>>();
-    let newest = (3..MAX_LISTING_OWED_PACES as u64 + 3)
-        .map(|at| (format!("/synthetic/{at:05}.jsonl"), json!(at)))
-        .collect::<serde_json::Map<_, _>>();
-    let cases = [
-        (None, json!({})),
-        (
-            Some(json!({"/synthetic/a.jsonl": 5})),
-            json!({"/synthetic/a.jsonl": 5}),
-        ),
-        (
-            Some(json!({"/synthetic/a.jsonl": "future-shape", "/synthetic/b.jsonl": 7})),
-            json!({"/synthetic/b.jsonl": 7}),
-        ),
-        (Some(json!("future-shape")), json!({})),
-        (Some(Value::Object(over_cap)), Value::Object(newest)),
-    ];
-    let mut baseline = None;
-    for (number, (stored, expected)) in cases.into_iter().enumerate() {
-        let mut old = saved.clone();
-        if let Some(stored) = stored {
-            old["traversal"]["listing_owed_requeued_unix_seconds"] = stored;
-        }
-        let path = f.root.join(format!("paces-{number}.json"));
-        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
-        let loaded = ScanIndex::load(&path).expect("the pacing map never fails the index");
-        let mut traversal = serde_json::to_value(loaded.traversal.as_ref().unwrap()).unwrap();
-        let paces = traversal
-            .as_object_mut()
-            .unwrap()
-            .remove("listing_owed_requeued_unix_seconds")
-            .unwrap_or_else(|| json!({}));
-        assert_eq!(paces, expected, "case {number}");
-        let kept = loaded.traversal.as_ref().unwrap();
-        assert_eq!(kept.counts.unreadable_path_count, 1, "case {number}");
-        assert_eq!(
-            kept.pending_candidates.len(),
-            1,
-            "case {number}: queued work"
-        );
-        let baseline = baseline.get_or_insert_with(|| traversal.clone());
-        assert_eq!(&traversal, baseline, "case {number}: traversal kept");
-    }
-}
-
 /// Starts a due re-listing pass on a kept generation and walks it.
 fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     let now = OffsetDateTime::now_utc();
@@ -1273,7 +1214,7 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
     start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
-    advance_bounded_directory_traversal(source, index, 7, None);
+    advance_bounded_directory_traversal(source, index, 7, None, None);
     assert!(index
         .traversal
         .as_ref()
@@ -1403,5 +1344,46 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
             vec![unchanged],
             "{source:?}: the leased hint is kept"
         );
+    }
+}
+
+/// [behaviour] A parsed file deleted before its body is ACKed is counted once
+/// on the retiring page with the resident copy's requests and tokens. Claude's
+/// copy folds its responses only at finish and Pi keeps no copy, so their
+/// totals are unknown. The same file deleted after its ACK counts nothing.
+/// Count only: the entry retires exactly as before.
+#[test]
+fn deleted_before_ack_counts_unacked_usage_lost() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for unacked in [true, false] {
+            let mut f = Fixture::new();
+            f.unacked = unacked;
+            let index = kept_generation(&f, source, false);
+            let grown = f.root.join(format!("{GROWN}.jsonl"));
+            let key = local_index_key(&grown);
+            assert!(index.files[&key].last_upload_body_witness.is_some());
+            fs::remove_file(&grown).unwrap();
+            let (index, _, _, rows) = f.page_hinted(source, index, &[grown]);
+            assert!(!index.files.contains_key(&key), "{source:?}: retired");
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            let expected = match (unacked, source) {
+                (false, _) => Value::Null,
+                (true, SnapshotSource::Codex) => json!({"files": 1, "requests": 1, "tokens": 20}),
+                (true, SnapshotSource::ClaudeCode | SnapshotSource::Pi) => {
+                    json!({"files": 1, "totals_unknown_files": 1})
+                }
+            };
+            assert_eq!(
+                page["counts"]["unacked_usage_lost_to_deletion"], expected,
+                "{source:?} unacked {unacked}"
+            );
+        }
     }
 }

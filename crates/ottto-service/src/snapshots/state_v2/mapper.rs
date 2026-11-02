@@ -1,5 +1,6 @@
 //! Shared typed-record mapping. Only semantic window and evidence hooks differ.
 use super::*;
+use crate::snapshots::{Shared, SharedMap};
 use anyhow::{ensure, Context};
 use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
@@ -28,6 +29,41 @@ pub(super) fn rows(
         after = page.last().map(|h| h.key.clone());
         for h in page {
             f(tx, h)?;
+        }
+    }
+    Ok(())
+}
+// A key has few rows of a kind, usually one.
+const KEY_PAGE: usize = 8;
+/// The whole kind, or only the requested keys' rows: each key from position
+/// 0, in key order. No other key's header is read.
+pub(super) fn visit(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: Option<&BTreeSet<String>>,
+    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
+) -> Result<()> {
+    let Some(roots) = roots else {
+        return rows(tx, kind, f);
+    };
+    let kind = RecordKind::parse(kind)?;
+    for root in roots {
+        let mut after = None;
+        loop {
+            let page = tx.scan_record_key(&kind, root.as_bytes(), after, KEY_PAGE)?;
+            let more = page.len() == KEY_PAGE;
+            if let Some(h) = page.last() {
+                let RowKey::Record { position, .. } = &h.key else {
+                    anyhow::bail!("state_v2_record_key")
+                };
+                after = Some(*position);
+            }
+            for h in page {
+                f(tx, h)?;
+            }
+            if !more {
+                break;
+            }
         }
     }
     Ok(())
@@ -201,11 +237,16 @@ pub(super) fn put<T: Serialize + ?Sized>(
     key: &RowKey,
     value: &T,
 ) -> Result<Header> {
-    let mut json = codec::json(value, input_cap(key))?;
     let kind = match key {
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",
     };
+    let mut json = codec::json(value, input_cap(key)).inspect_err(|e| {
+        // Refused while encoding, before its size is known: report it as over.
+        if e.to_string().contains("state_v2_value_admission") {
+            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_cap(key));
+        }
+    })?;
     let old = tx.get(key)?;
     // Compare restored logical JSON before acquiring references or compressing.
     if let Some(old) = &old {
@@ -233,10 +274,9 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
-    ensure!(
-        json.len() as u64 <= value_cap(key),
-        "state_v2_value_admission"
-    );
+    let cap = value_cap(key);
+    telemetry::row_cap(kind, json.len() as u64, cap);
+    ensure!(json.len() as u64 <= cap, "state_v2_value_admission");
     let encoded = codec::encode(&json)?;
     tx.put(RowInput {
         key,
@@ -310,6 +350,24 @@ impl Rows<'_> {
         );
         Ok(())
     }
+    /// Carry a row this save did not load. Only its committed digest, or the
+    /// one recorded when it was decoded, proves it unchanged. Anything else
+    /// is Unknown: the save refuses, and the row is never removed.
+    pub(super) fn keep(&mut self, key: RowKey, digest: [u8; 32]) -> Result<()> {
+        let known = match self.old.remove(&key) {
+            Some(known) => Some(known),
+            None => self.seed.remove(&key),
+        };
+        if known != Some(digest) {
+            telemetry::count("cold_row_unknown", 1);
+            anyhow::bail!("state_v2_cold_row_unknown");
+        }
+        ensure!(
+            self.next.insert(key, digest).is_none(),
+            "state_v2_duplicate_row"
+        );
+        Ok(())
+    }
     pub(super) fn raw(&mut self, key: RowKey, value: &[u8]) -> Result<()> {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(value).into();
@@ -349,19 +407,43 @@ impl Rows<'_> {
         Ok(self.next)
     }
 }
+/// A `ScanIndex` map field, hydrated from its rows under its own value type.
+pub(super) trait FieldMap {
+    type Value: DeserializeOwned + Serialize;
+    fn from_rows(rows: BTreeMap<String, Self::Value>) -> Self;
+}
+impl<T: DeserializeOwned + Serialize> FieldMap for BTreeMap<String, T> {
+    type Value = T;
+    fn from_rows(rows: Self) -> Self {
+        rows
+    }
+}
+impl<T: DeserializeOwned + Serialize> FieldMap for SharedMap<String, T> {
+    type Value = Shared<T>;
+    fn from_rows(rows: BTreeMap<String, Shared<T>>) -> Self {
+        rows.into()
+    }
+}
+pub(super) fn read_field_map<M: FieldMap>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    roots: Option<&BTreeSet<String>>,
+    seed: Option<&mut Digests>,
+) -> Result<M> {
+    read_map(tx, kind, roots, seed).map(M::from_rows)
+}
 pub(super) fn read_map<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
     roots: Option<&BTreeSet<String>>,
     mut seed: Option<&mut Digests>,
 ) -> Result<BTreeMap<String, T>> {
-    let manifest = tx
-        .get(&key(kind, "", 0)?)?
-        .context("state_v2_missing_manifest")?;
+    let Some(manifest) = root(tx, kind)? else {
+        return Ok(BTreeMap::new());
+    };
     let expected = read::<usize>(tx, &manifest, seed.as_deref_mut())?;
     let mut result = BTreeMap::new();
-    let mut count = 0;
-    rows(tx, kind, |tx, h| {
+    visit(tx, kind, roots, |tx, h| {
         let RowKey::Record {
             key_bytes,
             position,
@@ -375,14 +457,14 @@ pub(super) fn read_map<T: DeserializeOwned + Serialize>(
             return Ok(());
         }
         ensure!(*position == 1, "state_v2_member_position");
-        count += 1;
-        let name = family(key_bytes)?;
-        if roots.map_or(true, |roots| roots.contains(&name)) {
-            result.insert(name, read(tx, &h, seed.as_deref_mut())?);
-        }
+        result.insert(family(key_bytes)?, read(tx, &h, seed.as_deref_mut())?);
         Ok(())
     })?;
-    ensure!(count == expected, "state_v2_missing_member");
+    // The manifest counts every member, so only a whole-kind read can compare it.
+    ensure!(
+        roots.is_some() || result.len() == expected,
+        "state_v2_missing_member"
+    );
     Ok(result)
 }
 pub(super) fn private_paths(
@@ -462,14 +544,45 @@ pub(super) fn field_write<T: Serialize + ?Sized>(
     };
     rows.map(kind, &entries)
 }
+/// A recorded layout is authoritative. Unversioned stores use the authenticated
+/// original-field inventory to distinguish older writers from missing rows.
+pub(super) fn layout(tx: &mut dyn Transaction) -> Result<u32> {
+    let recorded = tx.get(&RowKey::Meta("catalogue_layout".into()))?;
+    let layout = if let Some(h) = recorded {
+        serde_json::from_slice::<u32>(&bytes(tx, &h)?)?
+    } else {
+        catalogue::legacy_layout(&kinds_misc::read_control("field_presence", tx)?)
+    };
+    ensure!(layout > 0, "state_v2_catalogue_layout");
+    ensure!(layout <= catalogue::LAYOUT, Hold::Future);
+    Ok(layout)
+}
+/// Only a kind unknown to the saved layout may lack its root. Orphan members
+/// still refuse: absence of a newly introduced kind means the entire kind.
+pub(super) fn root(tx: &mut dyn Transaction, kind: &str) -> Result<Option<Header>> {
+    if let Some(h) = tx.get(&key(kind, "", 0)?)? {
+        return Ok(Some(h));
+    }
+    ensure!(
+        catalogue::introduced(kind)? > layout(tx)?,
+        "state_v2_missing_field"
+    );
+    ensure!(
+        tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
+        "state_v2_missing_manifest"
+    );
+    Ok(None)
+}
 pub(super) fn field_read<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
     mode: Members,
     seed: Option<&mut Digests>,
+    default: impl FnOnce() -> T,
 ) -> Result<T> {
-    let root = key(kind, "", 0)?;
-    let h = tx.get(&root)?.context("state_v2_missing_field")?;
+    let Some(h) = root(tx, kind)? else {
+        return Ok(default());
+    };
     if matches!(mode, Members::Field) {
         return read(tx, &h, seed);
     }

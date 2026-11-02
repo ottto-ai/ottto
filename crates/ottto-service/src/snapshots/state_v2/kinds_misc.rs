@@ -30,8 +30,9 @@ fn read_field<T: serde::de::DeserializeOwned + Serialize>(
     kind: &str,
     tx: &mut dyn Transaction,
     seed: Option<&mut mapper::Digests>,
+    default: impl FnOnce() -> T,
 ) -> Result<T> {
-    mapper::field_read(tx, kind, field_mode(kind), seed)
+    mapper::field_read(tx, kind, field_mode(kind), seed, default)
 }
 #[derive(Serialize, Deserialize, Default)]
 struct HoldMetadata {
@@ -77,7 +78,12 @@ fn read_holds(
     txn: &mut dyn Transaction,
     seed: Option<&mut mapper::Digests>,
 ) -> Result<()> {
-    let metadata: HoldMetadata = read_field("v1_field.repair_provenance", txn, seed)?;
+    let metadata: HoldMetadata = read_field(
+        "v1_field.repair_provenance",
+        txn,
+        seed,
+        HoldMetadata::default,
+    )?;
     let mut holds = super::super::lenient_decode::Holds::default();
     let mut expected = 0;
     for (field, slots) in metadata.entries {
@@ -132,7 +138,7 @@ fn read_holds(
     index.decode_holds = holds;
     Ok(())
 }
-fn read_control<T: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     name: &str,
     txn: &mut dyn Transaction,
 ) -> Result<T> {
@@ -170,6 +176,7 @@ pub(super) fn merge_cas_at(
         "v1_field.accepted_snapshot_fingerprint_ledger_version",
         tx,
         None,
+        || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
     )?;
     kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
@@ -179,12 +186,7 @@ pub(super) fn merge_cas_at(
         .map(|(_, key, ..)| key.to_owned())
         .collect();
     let roots = super::super::lenient_decode::cas_hold_roots(&custody);
-    kinds_accounts::hydrate_filtered(
-        tx,
-        &mut custody,
-        &mut KindCx::default(),
-        Some((&roots, false)),
-    )?;
+    kinds_accounts::hydrate_filtered(tx, &mut custody, &mut KindCx::default(), Some(&roots))?;
     kinds_census::hydrate_cas_families(tx, &mut custody, &roots)?;
     super::super::lenient_decode::post_decode_hydrated(&mut custody, "cas", "claude_code")?;
 
@@ -215,12 +217,7 @@ pub(super) fn merge_cas_at(
             }
             let one = BTreeSet::from([root]);
             let mut family = ScanIndex::default();
-            kinds_accounts::hydrate_filtered(
-                tx,
-                &mut family,
-                &mut KindCx::default(),
-                Some((&one, true)),
-            )?;
+            kinds_accounts::hydrate_filtered(tx, &mut family, &mut KindCx::default(), Some(&one))?;
             super::super::lenient_decode::post_decode_hydrated(&mut family, "cas", "claude_code")?;
             super::super::lenient_decode::add_cas_provenance(&mut custody, &family);
         }
@@ -371,7 +368,7 @@ pub(super) fn hydrate_txn(
     );
     macro_rules! load {
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
-            index.$f = read_field($kind, tx, Some(&mut cx.digests))?;
+            index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };
         ($($t:tt)*) => {};
     }

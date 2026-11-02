@@ -241,9 +241,6 @@ impl ApcFixture {
     /// Traversal order is breadth-first with sorted names, so the family root,
     /// its sibling, and both subagents precede the nested unrelated session.
     fn new(case: &'static str, owners: bool) -> Self {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return Self::terminal_off_on_new(case, owners);
-        }
         let base = test_dir(case);
         let root = base.join("projects");
         let support = base.join("support");
@@ -269,54 +266,6 @@ impl ApcFixture {
             census_before_fold: std::cell::Cell::new(false),
             audit_release: std::cell::Cell::new(false),
         };
-        for (session, path) in [
-            (
-                APC_SIBLING,
-                fixture.root.join(format!("{APC_SIBLING}.jsonl")),
-            ),
-            (APC_TERMINAL, terminal.join(format!("{APC_TERMINAL}.jsonl"))),
-        ] {
-            std::fs::write(
-                path,
-                apc_transcript_line(session, None, &format!("req_{session}"), 0),
-            )
-            .expect("write unrelated transcript");
-        }
-        for (agent, request, second) in APC_FAMILY_REQUESTS {
-            fixture.append_family_request(agent, request, second);
-        }
-        fixture
-    }
-
-    fn terminal_off_on_new(case: &'static str, owners: bool) -> Self {
-        let base = test_dir(case);
-        let root = base.join("projects");
-        let support = base.join("support");
-        let subagents = root.join(APC_ROOT).join("subagents");
-        let terminal = root.join("zz-terminal").join("nested");
-        for directory in [&subagents, &terminal, &support] {
-            std::fs::create_dir_all(directory).expect("create synthetic directory");
-        }
-        let fixture = Self {
-            case,
-            index_path: base.join("claude-scan-index.json"),
-            progress_path: base.join("claude-upload-progress.json"),
-            base,
-            root,
-            support,
-            owners,
-            withheld_owners: std::cell::RefCell::new(BTreeSet::new()),
-            next_sequence: std::cell::Cell::new(1),
-            page_files: std::cell::Cell::new(APC_PAGE_FILES),
-            cutoff: std::cell::Cell::new(None),
-            retain_native_terminal: std::cell::Cell::new(false),
-            native_terminal_seen: std::cell::Cell::new(false),
-            census_before_fold: std::cell::Cell::new(false),
-            audit_release: std::cell::Cell::new(false),
-        };
-        let mut current = ScanIndex::default();
-        current.initialize_current_claude_contract_for_test();
-        current.save(&fixture.index_path).unwrap();
         for (session, path) in [
             (
                 APC_SIBLING,
@@ -547,9 +496,6 @@ impl ApcFixture {
     }
 
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_page_born(collected_at, upload);
-        }
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
         let mut index = before.clone();
@@ -958,432 +904,10 @@ impl ApcFixture {
         }
     }
 
-    fn terminal_off_on_page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
-        let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
-        let before = ScanIndex::load(&self.index_path).expect("load scan index");
-        let mut index = before.clone();
-        index.activate_upload_context("upload-context-apc".to_string());
-        index.activate_effective_upload_body_witness_revision(
-            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
-        );
-        self.load_exclusion_list(&mut index);
-        let empty_progress = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load(
-            &self.progress_path,
-            &empty_progress.destination_namespace_hash,
-            empty_progress.active_quarantine_witness.clone().unwrap(),
-        )
-        .expect("reload exact synthetic upload progress");
-        activate_source_upload_context(
-            SnapshotSource::ClaudeCode,
-            "upload-context-apc".to_string(),
-            &mut index,
-            &mut progress,
-        );
-        let committed_index = index.clone();
-        let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
-            let mut state = crate::snapshots::OwnedSourceScan::new(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&self.root),
-                index,
-                collected_at,
-                183,
-                self.page_files.get(),
-                true,
-                Some(&self.support),
-                &[],
-                false,
-            );
-            state.enable_native_comparison();
-            loop {
-                if state.native_comparison_ready() {
-                    // The same BASE continuation used without a controller.
-                    state.resume_native_comparison_base();
-                }
-                match state.step(None) {
-                    crate::snapshots::OwnedSourceScanStep::Pending(next) => state = next,
-                    crate::snapshots::OwnedSourceScanStep::Complete {
-                        index: completed,
-                        scan,
-                        terminal_native_traversal,
-                    } => {
-                        index = completed;
-                        self.native_terminal_seen
-                            .set(terminal_native_traversal.is_some());
-                        break (
-                            scan,
-                            crate::snapshots::claude_native_comparison::Completion::base(
-                                terminal_native_traversal,
-                            ),
-                        );
-                    }
-                }
-            }
-        } else {
-            self.native_terminal_seen.set(false);
-            let scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-                std::slice::from_ref(&self.root),
-                &mut index,
-                collected_at,
-                183,
-                self.page_files.get(),
-                &self.support,
-            )
-            .expect("scan bounded Claude page");
-            (scan, None)
-        };
-        self.census_before_fold.set(scan.census_complete);
-        let parsed = scan
-            .snapshots
-            .iter()
-            .map(|item| item.source_session_id.clone())
-            .collect();
-        let (mut disposition, _, _) = if self.retain_native_terminal.get() {
-            apply_claude_local_evidence_to_scan_with_comparison(
-                &self.support,
-                &mut scan,
-                &mut index,
-                None,
-                native_completion.as_mut(),
-                None,
-            )
-        } else {
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
-        };
-        self.stamp_owners(&mut scan);
-        let deferred_accounts = index.bind_session_accounts_with_mixed(
-            SnapshotSource::ClaudeCode,
-            APC_MACHINE_ID,
-            &mut scan.snapshots,
-            &[],
-            &disposition.mixed_uploads,
-        );
-        disposition.defer_sessions(deferred_accounts);
-        apply_upload_policy(
-            SnapshotSource::ClaudeCode,
-            &mut scan.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        let cutoff_state = crate::backfill::BackfillState {
-            backfill_cutoff_at: self.cutoff.get().map(str::to_string),
-            ..Default::default()
-        };
-        let cutoff_bytes = serde_json::to_vec(&cutoff_state).unwrap();
-        let (_, cutoff_candidates) = apply_backfill_cutoff_with_claude_corrections(
-            &mut scan,
-            &index,
-            &disposition,
-            &cutoff_state,
-        );
-        assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
-        exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
-        let candidates =
-            index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {
-                effective_snapshot_upload_body_witness(
-                    snapshot,
-                    &progress,
-                    false,
-                    false,
-                    &BTreeSet::new(),
-                    &disposition,
-                )
-            });
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::ClaudeCode,
-            &mut scan,
-            &mut index,
-            |snapshot| {
-                effective_snapshot_upload_body_witness(
-                    snapshot,
-                    &progress,
-                    false,
-                    false,
-                    &BTreeSet::new(),
-                    &disposition,
-                )
-            },
-        );
-        index.advance_empty_claude_proof_corrections(&scan);
-        let sessions_by_fingerprint = scan
-            .snapshots
-            .iter()
-            .map(|item| {
-                (
-                    item.snapshot_fingerprint.clone(),
-                    item.source_session_id.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let holds = LocalHoldSettlement::classify(
-            SnapshotSource::ClaudeCode,
-            &mut index,
-            &mut scan,
-            &disposition,
-        );
-        let held_sessions = holds
-            .held_fingerprints
-            .iter()
-            .filter_map(|fingerprint| sessions_by_fingerprint.get(fingerprint).cloned())
-            .collect();
-        if upload == ApcUpload::Crash {
-            // Nothing after the scan reaches the network or the disk.
-            return ApcPage {
-                upload,
-                scan,
-                parsed,
-                before_bytes,
-                before,
-                index: ScanIndex::load(&self.index_path).expect("reload scan index"),
-                fully_settled: false,
-                held: holds.held_fingerprints,
-                held_sessions,
-                offered: BTreeSet::new(),
-                offered_bodies: BTreeMap::new(),
-                uploaded: BTreeSet::new(),
-                shed: false,
-                candidates,
-                progress,
-            };
-        }
-        for snapshot in &mut scan.snapshots {
-            prepare_snapshot_cache_for_upload(snapshot, &progress, false, false, &BTreeSet::new());
-        }
-        let offered_bodies = scan
-            .snapshots
-            .iter()
-            .map(|item| {
-                (
-                    item.source_session_id.clone(),
-                    (
-                        item.snapshot_fingerprint.clone(),
-                        snapshot_upload_body_witness(item),
-                    ),
-                )
-            })
-            .collect();
-        let mut offered = BTreeSet::new();
-        let mut uploaded = BTreeSet::new();
-        let mut accepted = 0;
-        let persist_refusal = self.progress_path.exists()
-            || matches!(
-                upload,
-                ApcUpload::PermanentRejection | ApcUpload::RetryableRejection
-            );
-        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
-        let result = upload_resumable_batches_with_body_witness(
-            &scan.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |snapshot| snapshot.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |items| {
-                offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                match upload {
-                    ApcUpload::Accept | ApcUpload::Crash => {
-                        uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        exact_pipeline_accept(&items)
-                    }
-                    ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
-                        status: 503,
-                        retry_after: Some(Duration::from_secs(60)),
-                        code: None,
-                    })),
-                    ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
-                        let response = crate::snapshot_client::SnapshotBatchResponse {
-        conflict_rescans: Default::default(),
-                            accepted: 0,
-                            sessions_reconciled: 0,
-                            session_ids: Vec::new(),
-                            disabled: false,
-                            disabled_reason: None,
-                            entity_ack_contract: Some(
-                                crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
-                            ),
-                            accepted_entities: Vec::new(),
-                            unchanged_entities: Vec::new(),
-                            rejected_entities: items
-                                .iter()
-                                .filter(|_| upload == ApcUpload::PermanentRejection)
-                                .map(|item| crate::snapshot_client::SnapshotEntityRejection {
-                                    source_session_id: item.source_session_id.clone(),
-                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                    reason: "invalid".to_string(),
-                                    detail: "synthetic refusal".to_string(),
-                                    permanent: true,
-                                    occurrence_count: 1,
-                                })
-                                .collect(),
-                            // Retryable outcomes use the canonical conflict contract;
-                            // permanent:false rejections fail the real ACK validator.
-                            conflict_entities: items
-                                .iter()
-                                .filter(|_| upload == ApcUpload::RetryableRejection)
-                                .map(|item| crate::snapshot_client::SnapshotEntityRef {
-                                    source_session_id: item.source_session_id.clone(),
-                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                    occurrence_count: 1,
-                                    body_witness_version: None,
-                                    body_witness_digest: None,
-                                    head_etag: None,
-                                    head_challenge: None,
-                                    unchanged_basis: None,
-                                    retained_proof_missing: Vec::new(),
-                                })
-                                .collect(),
-                        };
-                        response.validate_entity_ack_identities(items.iter().map(|item| {
-                            (
-                                item.source_session_id.as_str(),
-                                item.snapshot_fingerprint.as_str(),
-                            )
-                        }))?;
-                        Ok(response)
-                    }
-                }
-            },
-            |progress| {
-                if persist_refusal {
-                    progress.save(&self.progress_path)
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .expect("in-process upload");
-        let shed = matches!(result, ResumableUploadResult::Shed { .. });
-        // Production order: exact upload progress is durable before this seam,
-        // and the following save commits both body state and correction
-        // progress, or neither.
-        let body_drains = index.settle_claude_proof_corrections(
-            &committed_index,
-            &candidates,
-            &progress.accepted_fingerprints,
-            &progress.accepted_body_witnesses,
-        );
-        index.log_claude_proof_correction_debt();
-        if shed {
-            progress
-                .save(&self.progress_path)
-                .expect("persist upload progress");
-            checkpoint_partial_snapshot_index_with_audit_release(
-                &index,
-                &committed_index,
-                &progress,
-                &scan.snapshots,
-                Some(&scan),
-                &holds.held_fingerprints,
-                &self.index_path,
-                &self.progress_path,
-                || Ok(()),
-                None,
-                None,
-                None,
-                None,
-                body_drains,
-            )
-            .expect("checkpoint shed page");
-            if !persist_refusal {
-                let _ = std::fs::remove_file(&self.progress_path);
-            }
-            return ApcPage {
-                upload,
-                scan,
-                parsed,
-                before_bytes,
-                before,
-                index: ScanIndex::load(&self.index_path).expect("reload scan index"),
-                fully_settled: false,
-                held: holds.held_fingerprints,
-                held_sessions,
-                offered,
-                offered_bodies,
-                uploaded,
-                shed,
-                candidates,
-                progress,
-            };
-        }
-        let settlement = match result {
-            ResumableUploadResult::Completed => {
-                settle_completed_upload(index, &committed_index, &progress, &holds)
-            }
-            ResumableUploadResult::Rejected { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
-            }
-            ResumableUploadResult::Deferred { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
-            }
-            other => panic!("unexpected synthetic upload {other:?}"),
-        };
-        let mut index = settlement.index;
-        settle_index_after_upload(&mut index, &committed_index, &progress);
-        // The production finish order. The opt-in account-audit release has
-        // an empty cache, so no retained custody: a released hold's entry is
-        // cleared and queued for retry.
-        let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
-        let fully_settled = finish_selected_settlement(
-            &mut index,
-            SelectedSettlementInputs {
-                scan: &scan,
-                committed_index: &committed_index,
-                progress: &progress,
-                candidates: &candidates,
-                cutoff_candidates: &cutoff_candidates,
-                transport_fully_settled: settlement.fully_settled,
-                body_drains,
-                comparison: None,
-                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
-                    previous: &committed_index,
-                    cache: &no_custody,
-                    roots: std::slice::from_ref(&self.root),
-                    backfill_window_days: 183,
-                }),
-            },
-        )
-        .expect("no paid restore");
-        let census_complete = scan.census_complete;
-        index.accept_file_upload_context_acks(
-            &progress.context_receipt_candidates,
-            &progress.fresh_context_body_acks,
-        );
-        let (window_start, window_end) =
-            snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
-        save_index_and_publish_manifest(
-            &mut index,
-            &self.index_path,
-            APC_DESTINATION,
-            SnapshotSource::ClaudeCode,
-            census_complete,
-            &window_start,
-            &window_end,
-        )
-        .expect("save index and publish manifest");
-        ApcPage {
-            upload,
-            scan,
-            parsed,
-            before_bytes,
-            before,
-            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
-            fully_settled,
-            held: holds.held_fingerprints,
-            held_sessions,
-            offered,
-            offered_bodies,
-            uploaded,
-            shed,
-            candidates,
-            progress,
-        }
-    }
 
     /// One bounded traversal generation. `upload` picks each page's upload
     /// outcome by page number; a crashed page is retried by the next page.
     fn generation(&self, hour: u32, upload: impl Fn(usize) -> ApcUpload) -> Vec<ApcPage> {
-        if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_generation(hour, upload);
-        }
         let mut pages = Vec::new();
         for number in 0..APC_MAX_PAGES {
             let mode = upload(number);
@@ -1400,28 +924,6 @@ impl ApcFixture {
         panic!("the generation ends within {APC_MAX_PAGES} bounded pages");
     }
 
-    fn terminal_off_on_generation(
-        &self,
-        hour: u32,
-        upload: impl Fn(usize) -> ApcUpload,
-    ) -> Vec<ApcPage> {
-        let mut pages = Vec::new();
-        for number in 0..APC_MAX_PAGES {
-            let mode = upload(number);
-            let page = self.page(&format!("2026-08-02T{hour:02}:{number:02}:00Z"), mode);
-            let ended = mode != ApcUpload::Crash
-                && (!page.index.scan_traversal_in_progress_for_test()
-                    || page.index.scan_traversal_exhausted_for_test()
-                    || page.parsed.contains(APC_TERMINAL));
-            self.assert_durable(&page, hour);
-            pages.push(page);
-            if ended {
-                self.receipt(hour, &pages);
-                return pages;
-            }
-        }
-        panic!("the generation ends within {APC_MAX_PAGES} bounded pages");
-    }
 
     /// Every save reloads with the family intact: never a quarantined index.
     fn assert_durable(&self, page: &ApcPage, hour: u32) {
@@ -1565,52 +1067,6 @@ impl ApcFixture {
         ApcEstablished { proven, heads }
     }
 
-    fn restore_historical_proof(&self, correction: bool) -> String {
-        let mut index = ScanIndex::load(&self.index_path).expect("load historical fixture input");
-        let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
-            &self.support,
-            [APC_ROOT.to_string()],
-        );
-        let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-            &self.support,
-            [APC_ROOT.to_string()],
-        );
-        // Build historical INPUT from a complete ordinary read of the actual
-        // fixture files, independently of this release's partial held window.
-        // This is setup work, not a claimed release terminal grant or receipt.
-        let mut coverage = ScanIndex::default();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&self.root),
-            &mut coverage,
-            "2026-08-02T08:00:00Z",
-            183,
-            100,
-            true,
-        )
-        .unwrap();
-        crate::snapshots::apply_claude_reported_usage_with_index(
-            &mut scan.snapshots,
-            &api,
-            &trace,
-            &mut coverage,
-            false,
-            "2026-08-02T08:00:00Z",
-        );
-        let proof = index.restore_historical_claude_family_from_for_test(
-            APC_ROOT, &coverage, &api, &trace, correction,
-        );
-        index
-            .save(&self.index_path)
-            .expect("restore old-reader proof/owed custody");
-        assert_eq!(
-            ScanIndex::load(&self.index_path)
-                .unwrap()
-                .claude_usage_family_witness_digest_for_test(APC_ROOT),
-            Some(proof.clone())
-        );
-        proof
-    }
 
     /// Natural regression: repeated subagent requests until the first complete
     /// census after the terminal hold. That census proves a changed witness,
@@ -3593,36 +3049,6 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     }
 }
 
-/// [money] Containment retains token, cost, account and exact ACK custody.
-#[test]
-#[serial(source_manifests)]
-fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction() {
-    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
-
-    let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("terminal-off-delayed-proof-custody", false);
-    for hour in [8, 9] {
-        let pages = fixture.generation(hour, |_| ApcUpload::Accept);
-        let last = pages.last().unwrap();
-        assert!(!last.scan.census_complete);
-        assert!(last
-            .index
-            .claude_usage_family_witness_digest_for_test(APC_ROOT)
-            .is_none());
-        assert!(last
-            .index
-            .claude_usage_family_pending_retained_for_test(APC_ROOT));
-        assert!(
-            !last.index.claude_authority_proof_correction_pending(),
-            "pending proof is counted custody, never a fabricated correction grant"
-        );
-        let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
-        assert!(reloaded.claude_usage_family_pending_retained_for_test(APC_ROOT));
-    }
-    // Demonstrate evidence was not lost: a controlled old-reader reconstruction
-    // input can still be formed; the release did not earn this proof itself.
-    fixture.restore_historical_proof(false);
-}
 
 /// The R2 invariant, strictly: every member this page drained certifies the
 /// exact revision its saved file entry has, the re-arm marker included (which
@@ -3843,12 +3269,16 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
 /// [regress] R2 on main, held seam, at the production E2 gate (ON) on an owed
 /// pre-flip correction (`ApcFixture::pre_flip_grant`): the same sidecar-only
 /// revision move, then a Deferred page that holds an account-deferred owed
-/// member. The finish selection keeps the committed entries of the unsettled
-/// keys, so the no-op-drained members stay owed with their pre-page pairs;
-/// the next clean generation re-drains them at their current revisions.
-/// Fails on main (no `restore_unselected_claude_proof_body_drains`): the
-/// finish saves the drain beside the kept entry, so `apc_r2_drained_pairs`
-/// panics "drained at a revision its saved entry ... does not have".
+/// member (agent b). Only the held key keeps its committed entry. The root,
+/// the one unheld member whose accepted body is unchanged, settles as on a
+/// page without the hold, so it no-op-drains at the revision its saved entry
+/// has (`apc_r2_drained_pairs` checks every page) with its exact accepted
+/// entities and credit, and nothing is left owed at a kept entry. Agent a
+/// (changed body, refused here) and the held member stay owed, and the next
+/// clean generation reads the family at most once.
+/// Failed on main (no `restore_unselected_claude_proof_body_drains`): the
+/// finish saved the drain beside a kept entry, so `apc_r2_drained_pairs`
+/// panicked "drained at a revision its saved entry ... does not have".
 #[test]
 #[serial(source_manifests)]
 #[serial(client_report)]
@@ -3877,20 +3307,39 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     );
     let reverted = apc_r2_reverted(&pages, "held");
     assert!(
-        !reverted.is_empty(),
-        "a no-op drain at a moved revision met a kept committed entry"
+        reverted.is_empty(),
+        "no unheld no-op member is kept at its committed entry: {reverted:?}"
     );
-    assert!(
-        !reverted.contains(&held_member),
-        "a held member never drains"
+    let root = apc_member_session(None);
+    let mut noop = BTreeSet::new();
+    for (number, page) in pages.iter().enumerate() {
+        noop.extend(ApcFixture::check(page, &format!("held page {number}")).noop);
+        assert!(
+            page.uploaded.is_disjoint(&entities[&root]),
+            "page {number}: the root's accepted body is not uploaded again"
+        );
+    }
+    assert_eq!(
+        noop,
+        BTreeSet::from([root.clone()]),
+        "the held generation no-op-drains exactly the unheld unchanged member"
     );
     let restarted = ScanIndex::load(&fixture.index_path).expect("restart after the held page");
+    assert_eq!(
+        ApcFixture::family_entities(&restarted)[&root],
+        entities[&root],
+        "the root keeps its exact accepted entities"
+    );
+    for fingerprint in &entities[&root] {
+        assert!(restarted.accepted_snapshot_fingerprint_recorded(fingerprint));
+    }
     let (proof, owed) = restarted
         .claude_authority_record_for_test(APC_ROOT)
         .and_then(|record| record.correction)
         .expect("the correction is owed");
     assert_eq!(proof, grant.proof);
-    assert!(reverted.is_subset(&owed), "the correction is not lost");
+    assert!(!owed.contains(&root), "the drained root owes nothing");
+    assert!(owed.contains(&held_member), "a held member never drains");
     fixture.withheld_owners.borrow_mut().clear();
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }

@@ -200,10 +200,6 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
-        // These history fixtures exercise the current request-owned reader;
-        // independent prefix-off proofs remain in e2_legacy/e2_pre_change_builder.
-        let _prefix = (cycle.revision >= 3)
-            .then(|| crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true));
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
         let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
@@ -2099,8 +2095,6 @@ const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
 };
 
 fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     fixture.install_list(&[]);
     crate::snapshots::with_max_gated_claude_revision(3, f)
 }
@@ -2595,8 +2589,6 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// while the list pauses adoption), never the literal and never withheld.
 #[test]
 fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
-    let _resumed_prefix =
-        crate::snapshots::claude_request_money::e2::ResumedPrefixForTest::set(true);
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
     fixture.baseline_at(2);
     fixture.install_list(&[]);
