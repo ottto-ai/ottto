@@ -1234,18 +1234,19 @@ impl FileFold {
 
     /// `placed` is the native finalizer's own placement of this response
     /// (None: zero usage, no native row), so the grain key equals the native
-    /// row's without placing twice.
+    /// row's without placing twice; `extra` holds the rows of its calls that
+    /// ran on another model, placed the same way.
     pub(in crate::snapshots) fn observe(
         &mut self,
         sequence: u64,
         has_request_id: bool,
-        usage: &UsageTotals,
+        (usage, placed): (&UsageTotals, Option<&PlacedClaudeUsage>),
+        extra: &[(UsageTotals, Option<PlacedClaudeUsage>)],
         at: Option<i128>,
-        placed: Option<&PlacedClaudeUsage>,
         effort: Option<&str>,
     ) {
         let started = Instant::now();
-        self.observe_response(sequence, has_request_id, usage, at, placed, effort);
+        self.observe_response(sequence, has_request_id, (usage, placed), extra, at, effort);
         self.spend(started);
     }
 
@@ -1253,9 +1254,9 @@ impl FileFold {
         &mut self,
         sequence: u64,
         has_request_id: bool,
-        usage: &UsageTotals,
+        (usage, placed): (&UsageTotals, Option<&PlacedClaudeUsage>),
+        extra: &[(UsageTotals, Option<PlacedClaudeUsage>)],
         at: Option<i128>,
-        placed: Option<&PlacedClaudeUsage>,
         effort: Option<&str>,
     ) {
         self.responses += 1;
@@ -1263,28 +1264,45 @@ impl FileFold {
         if copied == Some(false) {
             self.first_own.get_or_insert(sequence);
         }
-        let Some(placed) = placed else {
-            return;
+        // One row per model the response ran on (`extra`: its calls on another
+        // model); the response itself is observed once.
+        let parts = move || {
+            std::iter::once((usage, placed))
+                .chain(extra.iter().map(|(usage, placed)| (usage, placed.as_ref())))
+                .filter_map(|(usage, placed)| Some((usage, placed?)))
         };
-        if placed.fell_back {
-            self.model_fallbacks.insert(sequence, placed.model.clone());
+        if parts().next().is_none() {
+            return;
         }
-        let Some(placement) = placed.placement.as_ref() else {
-            // Native drops it as unplaceable usage; never publish over it.
-            self.entity
-                .fail_certificate(CertificateFailure::UnplaceableUsage);
-            self.disclose("unplaceable", 1);
-            return;
-        };
+        for (_, placed) in parts() {
+            if placed.fell_back {
+                self.model_fallbacks.insert(sequence, placed.model.clone());
+            }
+            if placed.placement.is_none() {
+                // Native drops it as unplaceable usage; never publish over it.
+                self.entity
+                    .fail_certificate(CertificateFailure::UnplaceableUsage);
+                self.disclose("unplaceable", 1);
+                return;
+            }
+        }
         // Gate off keeps only the hour tally: read the hour, build no key.
-        let key = {
-            Grain::Live(live_key(
-                &placed.model,
-                placement.bucket.clone(),
-                placement.reduced_context.clone(),
-                &placement.row_key,
-                effort,
-            ))
+        let grains = move || {
+            parts().filter_map(|(usage, placed)| {
+                let placement = placed.placement.as_ref()?;
+                let key = Grain::Live(live_key(
+                    &placed.model,
+                    placement.bucket.clone(),
+                    placement.reduced_context.clone(),
+                    &placement.row_key,
+                    effort,
+                ));
+                Some((
+                    ClaudeMoneyTokens::from_usage(usage),
+                    usage.request_count,
+                    key,
+                ))
+            })
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
             accounts.observe(sequence, copied == Some(true));
@@ -1293,15 +1311,16 @@ impl FileFold {
         if !has_request_id {
             self.first_idless.get_or_insert(sequence);
         }
-        let tokens = ClaudeMoneyTokens::from_usage(usage);
-        let requests = usage.request_count;
+        let requests: u64 = parts().map(|(usage, _)| usage.request_count).sum();
         if copied == Some(false) {
             self.own_requests += requests;
         }
         if copied == Some(true) {
             self.copied += 1;
-            self.entity.removed.add(&tokens);
-            self.entity.removed_requests += requests;
+            for (tokens, requests, _) in grains() {
+                self.entity.removed.add(&tokens);
+                self.entity.removed_requests += requests;
+            }
             if !has_request_id {
                 let marker = self
                     .accounts
@@ -1315,20 +1334,19 @@ impl FileFold {
                         .or_default(),
                     None => self.idless_copy.get_or_insert_with(Box::default),
                 };
-                key.put(into, &tokens, requests, at, account);
+                for (tokens, requests, key) in grains() {
+                    key.put(into, &tokens, requests, at, account.clone());
+                }
                 return;
             }
             match self.skipped.last_mut() {
                 Some((_, end)) if *end == sequence => *end += 1,
                 _ => self.skipped.push((sequence, sequence + 1)),
             }
-            key.put(
-                self.copy.get_or_insert_with(Box::default),
-                &tokens,
-                requests,
-                at,
-                account,
-            );
+            let into = self.copy.get_or_insert_with(Box::default);
+            for (tokens, requests, key) in grains() {
+                key.put(into, &tokens, requests, at, account.clone());
+            }
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
@@ -1348,7 +1366,9 @@ impl FileFold {
                 .or_default(),
             None => &mut self.entity,
         };
-        key.put(into, &tokens, requests, at, account);
+        for (tokens, requests, key) in grains() {
+            key.put(into, &tokens, requests, at, account.clone());
+        }
     }
 
     /// Confirm, or undo, the held pre-birth skip. A partial copy (own lines
