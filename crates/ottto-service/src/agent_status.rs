@@ -24024,8 +24024,8 @@ for line in sys.stdin:
 
     /// [behaviour] The probe starts Codex with its home-writing startup
     /// installers off, shares CODEX_HOME as the SQLite home, drops provider
-    /// keys and keeps stdin open until the asynchronous answer arrives. It
-    /// never forces a token refresh, in the default home or an account home.
+    /// keys and keeps stdin open for the asynchronous default-home answer.
+    /// Both home modes share the builder that always sends refreshToken:false.
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
