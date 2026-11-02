@@ -648,13 +648,16 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     }
 }
 
-/// [regress] A plain conflict (no challenge) is never input-change-only: the
-/// identical body is held but probed within one hour, because backend state
-/// can change without a local change. A changed body is offered at once.
+/// [regress] Observed: identical refused bodies were re-sent byte-identical
+/// and refused again for days, each waiting the 6-12 h quarantine retry. A
+/// plain conflict (no challenge) is never input-change-only either, because
+/// backend state can change without a local change: it is probed within one
+/// hour. Held-body suppression and changed-body admission are main's own
+/// quarantine tests.
 #[test]
-fn plain_conflict_is_probed_within_an_hour_and_a_changed_body_goes_at_once() {
+fn plain_conflict_is_probed_within_an_hour() {
     // A body without a cache patch sends no head-CAS contract, so its
-    // conflict carries no challenge.
+    // conflict carries no challenge and the ordinary ACK validator applies.
     let mut item = item();
     item.cache_observations = None;
     item.cache_observations_state = None;
@@ -664,79 +667,36 @@ fn plain_conflict_is_probed_within_an_hour_and_a_changed_body_goes_at_once() {
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
     );
-    // One page without the head-CAS contract: the server's conflict carries
-    // no challenge and the ordinary ACK validator applies.
-    fn page(
-        progress: &mut SnapshotUploadProgress,
-        item: &SnapshotItem,
-    ) -> (ResumableUploadResult, usize, u64) {
-        let mut sent = 0;
-        let mut accepted_count = 0;
-        let before = current_unix_seconds();
-        let result = upload_resumable_batches_with_body_witness(
-            std::slice::from_ref(item),
-            SCOPE,
-            progress,
-            &mut accepted_count,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |batch| {
-                sent += batch.len();
-                let request = request(batch);
-                let mut response = empty_ack();
-                response
-                    .conflict_entities
-                    .push(reference(&request.snapshots[0]));
-                response.validate_entity_ack(&request)?;
-                Ok(response)
-            },
-            |_| Ok(()),
-        );
-        (result.unwrap(), sent, before)
-    }
-
-    let (result, sent, before) = page(&mut progress, &item);
-    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
-    assert_eq!(sent, 1);
+    let before = current_unix_seconds();
+    let result = upload_resumable_batches_with_body_witness(
+        std::slice::from_ref(&item),
+        SCOPE,
+        &mut progress,
+        &mut 0,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            let request = request(batch);
+            let mut response = empty_ack();
+            response
+                .conflict_entities
+                .push(reference(&request.snapshots[0]));
+            response.validate_entity_ack(&request)?;
+            Ok(response)
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
     assert!(progress.head_conflict_challenges.is_empty());
-    let held = &progress.quarantined_fingerprints[&item.snapshot_fingerprint];
-    assert_eq!(
-        held.disposition,
-        SnapshotQuarantineDisposition::RetryPending
-    );
-    assert_eq!(
-        held.failed_reconstruction_count, 1,
-        "no poison attempt spent"
-    );
-    let probe = held.retry_after_unix_seconds;
+    let probe =
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint].retry_after_unix_seconds;
     assert!(probe >= before + 30 * 60, "not re-sent every page");
     assert!(
         probe < current_unix_seconds() + 60 * 60,
         "mandatory probe within one hour, not 6-12 h"
-    );
-    assert!(!progress
-        .clone()
-        .prepare_quarantine_retries(&BTreeMap::new()));
-
-    // Until the probe the identical body is not re-sent...
-    assert!(progress.contains_body(
-        &item.snapshot_fingerprint,
-        &snapshot_upload_body_witness(&item)
-    ));
-    let (_, sent, _) = page(&mut progress, &item);
-    assert_eq!(sent, 0);
-    // ...but a changed input is a new body and goes out on this page.
-    let mut changed = item.clone();
-    changed.avg_duration_ms = Some(changed.avg_duration_ms.unwrap_or_default() + 1);
-    changed.snapshot_fingerprint =
-        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &changed);
-    assert_ne!(changed.snapshot_fingerprint, item.snapshot_fingerprint);
-    let (result, sent, _) = page(&mut progress, &changed);
-    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
-    assert_eq!(sent, 1);
-    assert!(
-        progress.quarantined_fingerprints[&changed.snapshot_fingerprint].retry_after_unix_seconds
-            < current_unix_seconds() + 60 * 60
     );
 }
 

@@ -11229,8 +11229,8 @@ where
                 }
             } else if conflicted.contains(item_fingerprint) {
                 // An owed new answer rides the next selecting page; any other
-                // conflict gets its mandatory probe within one hour. A counted
-                // terminal-contract re-arm keeps its own 6-12 h pace.
+                // conflict gets its mandatory probe within one hour.
+                // Terminal-contract re-arm: main's 6-12 h cadence, unchanged (separate timer).
                 let contract_rearm = progress
                     .quarantined_fingerprints
                     .get(item_fingerprint)
