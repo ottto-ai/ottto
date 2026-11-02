@@ -21,8 +21,10 @@ pub(in crate::snapshots) fn set_aside_tail(
         Ok(())
     })
 }
-/// `keys`: files a complete census proved absent. The next save deletes their
-/// rows. No sweep or age ever supplies this list.
+/// `keys`: files a complete census proved absent, or whose stored state is void.
+/// The next save deletes their rows; anything staged for them is dropped, and a
+/// later `Reset` stage of a key cancels its retirement. No sweep or age ever
+/// supplies this list.
 pub(in crate::snapshots) fn retire_tail(
     path: &Path,
     keys: impl IntoIterator<Item = String>,
