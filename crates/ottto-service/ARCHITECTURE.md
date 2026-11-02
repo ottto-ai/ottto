@@ -9,7 +9,7 @@ behaviour described here, update this page in the same PR.
 
 ```
 file-system hint / periodic listing → select file → read new bytes from saved offset → per-source reducer
-  → running result kept in RAM and the record store → upload → exact acknowledgement → index save
+  → running result kept in RAM (and the record store when enabled) → upload → exact acknowledgement → index save
 ```
 
 - **Discovery.** The recursive watcher (`snapshot_watcher.rs`) turns file-system events into
@@ -32,13 +32,14 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
   accepted: per-file progress and fingerprints, full-scan state, account and usage evidence. It is
   saved atomically under the state directory's single-writer lock.
-- **Record store** (`durable_tail_store.rs`, `durable_tail_codec.rs`): one record per retained
-  transcript entry with its running reduction, so a restart can continue from where the RAM cache
-  (`transcript_cache.rs`) stopped. It is a cache, never an authority: a record restores only under
-  its own source, key, context, scope and format checks and a matching committed index generation.
-  Anything else falls back to a read whose result equals a cold Full, so a crash can cost a read,
-  never money. Records hold no path, transcript text or raw identifier, and nothing in the store is
-  uploaded.
+- **Record store** (`durable_tail_store.rs`, `durable_tail_codec.rs`): format v3 write-ahead
+  records stage the running reduction at native settlement, before publication effects and index
+  save. Exact local receipts settle record custody, never upload acknowledgement. Restore validates
+  source, key, context, scope, format, file certificate and committed index evidence before bounded
+  content replay and Tail. Refusals use counted recovery or hold without changing accepted usage.
+  Byte budgets pace writes and replay; deferred work stays discoverable. Consent-gated local-only
+  fields stay in the record and never enter diagnostics or uploads from the store. Erasure unlinks
+  records and syncs the directory under the existing writer lock; failures are counted and retried.
 - The two stores join by key digest and hold no references into each other.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
@@ -94,9 +95,16 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 
 ## One version
 
-- A runtime switch is a support-directory marker (`local_switch!`), never an environment variable
-  alone, and it is temporary. Its OFF state keeps `main`'s behaviour byte-for-byte. When the switch
-  is retired, the feature is either on by default with the OFF path deleted, or deleted.
+- A runtime switch is a support-directory marker (normally `local_switch!`), never an environment
+  variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
+  explicitly documented changes. When retired, the feature is either on by default with the OFF
+  path deleted, or deleted.
+- **Restart restore** (`snapshots/restart_restore.rs`) defaults OFF. Its process-fixed policy
+  requires the `restart_restore_enabled` marker and `DISCOVERY_DEPENDENCY_READY`. That constant is
+  false in this build, so the marker cannot turn it ON until the discovery dependency is implemented
+  and the constant flips. OFF disables ordinary record reads, writes, repair and GC; consent/source
+  erasure and counted deletion of outgrown v1 records remain active. The former v1 warm-restore
+  route is removed: files use no-record acquisition, with a paced Full on growth when needed.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.

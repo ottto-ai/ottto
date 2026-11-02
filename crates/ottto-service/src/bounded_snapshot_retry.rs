@@ -492,14 +492,9 @@ impl RetryOwner {
     }
     pub(super) fn boundary(
         &mut self,
-        busy: impl Iterator<Item = SnapshotSource>,
         now: Instant,
         mut send: impl FnMut(&mut PreparedRetry) -> Result<SnapshotPageOutcome>,
     ) {
-        let mut blocked = [false; 3];
-        for source in busy {
-            blocked[source.slot()] = true;
-        }
         for offset in 0..3 {
             let index = (self.next + offset) % 3;
             let Some(page) = self.slots[index].as_mut() else {
@@ -509,7 +504,7 @@ impl RetryOwner {
                 self.slots[index] = None;
                 continue;
             }
-            if blocked[index] || now < page.budget.due() {
+            if now < page.budget.due() {
                 continue;
             }
             self.next = (index + 1) % 3;

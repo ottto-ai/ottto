@@ -78,7 +78,7 @@ impl Fixture {
             &now,
             7,
         );
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
         let traversal = index.traversal.as_mut().unwrap();
         // This known member was already consumed. Saved retryable loss
         // elsewhere retains the roster; the retry is not due yet.
@@ -399,7 +399,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -781,7 +781,7 @@ fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> Sc
         &collected_at,
         7,
     );
-    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    advance_bounded_directory_traversal(source, &mut index, 7, None, None);
     let traversal = index.traversal.as_mut().unwrap();
     assert!(traversal.pending_directories.is_empty());
     traversal.pending_candidates.clear();
@@ -1002,7 +1002,7 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
                 start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
-                advance_bounded_directory_traversal(source, &mut walked, 7, None);
+                advance_bounded_directory_traversal(source, &mut walked, 7, None, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
                     .iter()
@@ -1100,7 +1100,7 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
     start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
-    advance_bounded_directory_traversal(source, index, 7, None);
+    advance_bounded_directory_traversal(source, index, 7, None, None);
     assert!(index
         .traversal
         .as_ref()
