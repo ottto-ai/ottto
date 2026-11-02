@@ -579,24 +579,9 @@ impl OpenBackoff {
     }
 }
 
-#[cfg(not(test))]
-static OPEN_BACKOFF: std::sync::Mutex<OpenBackoff> = std::sync::Mutex::new(OpenBackoff::new());
-#[cfg(test)]
-thread_local! {
-    static OPEN_BACKOFF: std::cell::RefCell<OpenBackoff> =
-        const { std::cell::RefCell::new(OpenBackoff::new()) };
-}
-
-/// A leaf lock: `run` never takes another lock or re-enters.
-fn with_open_backoff<T>(run: impl FnOnce(&mut OpenBackoff) -> T) -> T {
-    #[cfg(not(test))]
-    {
-        run(&mut OPEN_BACKOFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    OPEN_BACKOFF.with(|backoff| run(&mut backoff.borrow_mut()))
+process_state! {
+    /// A leaf lock: `body` never takes another lock or re-enters.
+    fn with_open_backoff: OpenBackoff = OpenBackoff::new(); clear_poison: false
 }
 
 fn open_blocked(key: &str, now: u64) -> bool {
