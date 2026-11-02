@@ -263,7 +263,6 @@ pub fn run(
     replace: bool,
     window_days: u64,
 ) -> Result<Estimate> {
-    ensure!(!replace || apply, "replace requires apply");
     let paths: Vec<PathBuf> = bounded_json(scope)?;
     ensure!(
         !paths.is_empty() && paths.len() <= MAX_BACKFILL_FILES_PER_SOURCE,

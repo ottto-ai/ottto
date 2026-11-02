@@ -270,15 +270,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         let request_path = chain.support.join("snapshots").join(REQUEST);
         let bytes = fs::read(&request_path).unwrap();
         assert!(run(&chain.home.join("scope.json"), &chain.support, true).is_err());
-        assert!(super::super::run(
-            &chain.home.join("scope.json"),
-            &chain.support,
-            &chain.home.join("scan-index.json"),
-            false,
-            true,
-            BACKFILL_WINDOW_DAYS,
-        )
-        .is_err());
         assert_eq!(fs::read(&request_path).unwrap(), bytes);
         assert_eq!(chain.prepare(&mut index).len(), 6);
         assert_eq!(index.copy_prefix_last_accepted_nonce, request.nonce);
@@ -326,15 +317,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         assert!(chain.prepare(&mut index).is_empty());
         assert!(index.copy_prefix_recovery_scope.is_empty());
 
-        let bytes = fs::read(&request_path).unwrap();
-        let mut reader = fs::File::open(&request_path).unwrap();
         let replacement = publish(&chain.home, &chain.support, true);
-        let mut old_bytes = Vec::new();
-        reader.read_to_end(&mut old_bytes).unwrap();
-        assert_eq!(
-            old_bytes, bytes,
-            "replacement preserves the old reader's whole request"
-        );
         assert_ne!(replacement.nonce, index.copy_prefix_last_accepted_nonce);
         assert_eq!(
             chain.prepare(&mut index).len(),

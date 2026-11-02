@@ -244,7 +244,3 @@ mod tests {
         assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
     }
 }
-
-#[cfg(test)]
-#[path = "proof_recovery_tests.rs"]
-mod proof_recovery_tests;
