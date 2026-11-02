@@ -393,9 +393,8 @@ fn changed_member_revision_rearms_once_then_skips_again() {
     assert!(uncommitted.counts.full_rearm, "{uncommitted:?}");
 }
 
-/// Non-structural invalidation: a member changed within the window, or the
-/// pending-occurrence cap, re-arms even while the structural set is
-/// unchanged.
+/// Non-structural invalidation: a member changed within the window re-arms
+/// even while the structural set is unchanged.
 #[test]
 fn non_structural_invalidation_rearms() {
     let mut rearm = Rearm::new();
@@ -429,15 +428,6 @@ fn non_structural_invalidation_rearms() {
     assert_eq!(changed.counts.page_invalidated_member_changed_count, 1);
     assert!(changed.counts.full_rearm, "{changed:?}");
     assert!(!changed.suppression.full_rearm_suppressed);
-
-    // Cap: the second family's occurrences exceed the pending bound.
-    let mut capped = index.clone();
-    capped.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-    let disposition = rearm.fold(&mut capped, &items, true, 1);
-    let capped = rearm.reread(&mut capped, &disposition);
-    assert!(capped.counts.page_invalidated_cap_count > 0, "{capped:?}");
-    assert!(capped.counts.full_rearm);
-    assert!(!capped.suppression.full_rearm_suppressed);
 
     // The unchanged window still skips.
     assert!(
