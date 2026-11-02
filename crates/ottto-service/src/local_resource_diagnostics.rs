@@ -405,61 +405,93 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
     );
 }
 
-/// Nonzero-only counters on the existing native_collection_page line.
+/// Nonzero-only counters on the existing native_collection_page line. They
+/// observe a finalized file's retained records and gate nothing.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_half_files: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_file: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_response: u64,
 }
 pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
+struct ClaudeRecordCounters {
+    half: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    max_file: std::sync::atomic::AtomicU64,
+    max_response: std::sync::atomic::AtomicU64,
+}
+impl ClaudeRecordCounters {
+    const fn new() -> Self {
+        Self {
+            half: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            max_file: std::sync::atomic::AtomicU64::new(0),
+            max_response: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
 #[cfg(not(test))]
-static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(not(test))]
-static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = ClaudeRecordCounters::new();
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
-    static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+    static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = const { ClaudeRecordCounters::new() };
 }
-fn with_claude_record_caps<T>(
-    f: impl FnOnce(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64) -> T,
-) -> T {
+fn with_claude_record_counters<T>(f: impl FnOnce(&ClaudeRecordCounters) -> T) -> T {
     #[cfg(test)]
     {
-        CLAUDE_CAP_HALF.with(|half| CLAUDE_CAP_HITS.with(|hits| f(half, hits)))
+        CLAUDE_RECORD_COUNTERS.with(f)
     }
     #[cfg(not(test))]
     {
-        f(&CLAUDE_CAP_HALF, &CLAUDE_CAP_HITS)
+        f(&CLAUDE_RECORD_COUNTERS)
     }
 }
-pub(crate) fn claude_record_cap_half_file() {
-    with_claude_record_caps(|half, _| {
-        half.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-pub(crate) fn claude_record_cap_hit() {
-    with_claude_record_caps(|_, hits| {
-        hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// `file_alarm` is the size this parser once refused past: nothing is dropped
+/// above it, the counters only show how memory grows.
+pub(crate) fn claude_record_counts(
+    file_records: usize,
+    largest_response_records: usize,
+    file_alarm: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| {
+        if file_records >= file_alarm / 2 {
+            counters.half.fetch_add(1, Relaxed);
+        }
+        if file_records > file_alarm {
+            counters.hits.fetch_add(1, Relaxed);
+        }
+        counters.max_file.fetch_max(file_records as u64, Relaxed);
+        counters
+            .max_response
+            .fetch_max(largest_response_records as u64, Relaxed);
     });
 }
 fn take_claude_record_caps() -> ClaudeRecordCaps {
-    with_claude_record_caps(|half, hits| ClaudeRecordCaps {
-        claude_money_record_cap_half_files: half.swap(0, std::sync::atomic::Ordering::Relaxed),
-        claude_money_record_cap_hits: hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| ClaudeRecordCaps {
+        claude_money_record_cap_half_files: counters.half.swap(0, Relaxed),
+        claude_money_record_cap_hits: counters.hits.swap(0, Relaxed),
+        claude_records_max_per_file: counters.max_file.swap(0, Relaxed),
+        claude_records_max_per_response: counters.max_response.swap(0, Relaxed),
     })
 }
 
 #[cfg(test)]
-pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
+pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64, u64, u64) {
     let c = take_claude_record_caps();
     (
         c.claude_money_record_cap_half_files,
         c.claude_money_record_cap_hits,
+        c.claude_records_max_per_file,
+        c.claude_records_max_per_response,
     )
 }
 
@@ -2820,7 +2852,7 @@ mod tests {
     fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_record_cap_half_file();
+            claude_record_counts(2, 1, 4);
             claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
             claude_reread::terminal_rearm(
                 claude_reread::IgnoredVeto::WithheldAccount.bit(),

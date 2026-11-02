@@ -1200,19 +1200,19 @@ mod tests {
         )
         .is_none());
     }
+    /// [behaviour] The alarm counts a file's physical records, not resolved
+    /// rows, and gates nothing.
     #[test]
     fn cap_alarm_physical_record_boundaries() {
         use crate::local_resource_diagnostics::take_claude_record_caps_for_test as take;
         for (records, half, hits) in [
-            (32_767, 0, 0),
+            (32_767_u64, 0, 0),
             (32_768, 1, 0),
             (65_536, 1, 0),
             (65_537, 1, 1),
         ] {
             take();
             let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-            // Distinct physical records, deliberately the same response id until
-            // its per-response cap, then another id: count is not resolved rows.
             for i in 0..records {
                 a.observe_claude_response(
                     &serde_json::json!({"message":{"id":format!("m{}", i / 4_096)}}),
@@ -1229,7 +1229,12 @@ mod tests {
                 );
             }
             a.finalize_claude_responses();
-            assert_eq!(take(), (half, hits), "physical records={records}");
+            assert_eq!(
+                take(),
+                (half, hits, records, records.min(4_096)),
+                "physical records={records}"
+            );
+            assert_eq!(a.dropped_usage_record_count, 0);
         }
     }
 }
