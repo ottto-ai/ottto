@@ -22,7 +22,7 @@ fn fixture() -> ScanIndex {
     );
     index
 }
-fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
+pub(super) fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
     let root: BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(bytes).unwrap();
     let slots: BTreeMap<String, &serde_json::value::RawValue> =

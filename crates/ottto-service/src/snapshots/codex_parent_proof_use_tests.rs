@@ -5,6 +5,7 @@
 //! synthetic bytes; nothing comes from a provider account.
 use super::*;
 use crate::transcript_acquisition::{PrefixSeal, SAMPLE_BYTES};
+use sampled_scan::codex_cursor::tests::zero_context;
 use sampled_scan::codex_cursor::OpenStamp;
 use std::os::unix::fs::FileExt;
 
@@ -1271,31 +1272,6 @@ fn an_ordinary_long_proof_line_retains_a_fixed_amount() {
 
 const HOOK_INDEX: &str = "/nonexistent/u1a2a-proof-hook-index.json";
 
-fn hook_context(cache: &Arc<sampled_scan::SharedCache>) -> sampled_scan::Context {
-    sampled_scan::Context {
-        cache: Arc::clone(cache),
-        namespace: crate::transcript_acquisition::Scope("proof-hook".into()),
-        audit_metadata_supported: true,
-        audit_slots: 0,
-        full_files: 0,
-        tail_files: 0,
-        unchanged_files: 0,
-        native_bytes: 0,
-        sample_bytes: 0,
-        full_reasons: [0; 11],
-        priority_replays: 0,
-        audits_started: 0,
-        audits_completed: 0,
-        audit_quiet_retired: 0,
-        audit_cap_full: 0,
-        audit_cap_delay: 0,
-        pace_evicted: 0,
-        start_overdue_seconds: 0,
-        completion_overdue_seconds: 0,
-        admission: Default::default(),
-    }
-}
-
 fn hook_pass() -> CodexSidePass {
     CodexSidePass {
         ns: sampled_scan::side_ledger::namespace_of(Path::new(HOOK_INDEX)),
@@ -1347,7 +1323,7 @@ impl Scene {
             CodexParentIdentities::new(SnapshotSource::Codex, self.index.traversal.as_ref());
         codex_parent_proof_hook::codex_parent_proof_step(
             &mut self.index,
-            &hook_context(cache),
+            &zero_context(cache, "proof-hook"),
             pass,
             &identities,
             page,

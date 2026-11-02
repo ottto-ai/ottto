@@ -50,7 +50,7 @@ impl Drop for Fixture {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
+pub(super) fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
     let timestamp = format!("2026-10-07T{:02}:00:00Z", 10 + id % 3);
     match source {
         SnapshotSource::Codex => json!({"type":"event_msg", "timestamp":timestamp,
@@ -1215,6 +1215,30 @@ fn production_scan_page_at_with_setup(
     finish_production_scan_page(scan, source)
 }
 
+/// The collector's post-scan for a finished page: upload policy and
+/// finalization on a projected copy, then exact acceptance into `index`.
+/// Returns the projected scan; `scan` stays the raw native output.
+pub(super) fn accept_after_policy(
+    source: SnapshotSource,
+    scan: &SourceScanResult,
+    index: &mut ScanIndex,
+) -> SourceScanResult {
+    let mut projected = scan.clone();
+    apply_upload_policy(
+        source,
+        &mut projected.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(source, &mut projected, index);
+    let accepted = projected
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect();
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    projected
+}
+
 // Also drive scans constructed with multiple roots through the same native
 // finalization and acceptance path as the ordinary single-root fixtures.
 fn finish_production_scan_page(
@@ -1241,19 +1265,7 @@ fn finish_production_scan_page(
                 // Exercise existing native post-policy finalization and exact
                 // acceptance before testing durable no-op suppression. Preserve
                 // raw native output separately for full-oracle comparisons.
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                let projected = accept_after_policy(source, &scan, &mut index);
                 return (index, scan, projected, modes, metrics);
             }
         }

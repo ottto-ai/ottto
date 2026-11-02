@@ -4,10 +4,10 @@ use super::*;
 use std::fs;
 use std::path::PathBuf;
 
-struct Scratch(PathBuf);
+struct Scratch(crate::test_scratch::ScratchDir);
 impl Scratch {
     fn new() -> Self {
-        Self(crate::test_scratch::canonical_private_dir("ottto-state-v2"))
+        Self(crate::test_scratch::ScratchDir::canonical("ottto-state-v2"))
     }
     fn path(&self) -> PathBuf {
         self.0.join("index.v2.sqlite.import")
@@ -37,11 +37,6 @@ impl Scratch {
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
         db
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

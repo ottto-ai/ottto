@@ -664,7 +664,7 @@ fn native_recovery_priority_scan(
     limit: usize,
     paths: &[PathBuf],
 ) -> OwnedSourceScan {
-    OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+    OwnedSourceScan::new_selecting(
         SnapshotSource::ClaudeCode,
         &fixture.roots,
         index,
@@ -677,6 +677,7 @@ fn native_recovery_priority_scan(
         false,
         false,
         paths,
+        None,
     )
 }
 

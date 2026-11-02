@@ -342,19 +342,23 @@ impl OriginalProgress {
 }
 
 impl ProgressRecovery {
+    /// The recovery for one bound index: its ACK receipt and v2 DB siblings.
+    fn new(identity: Identity, generation: u64, index_path: &Path) -> Self {
+        Self {
+            scope: Scope {
+                identity,
+                generation,
+            },
+            path: fence::sibling(index_path, ".v2-ack-receipt"),
+            db_path: Some(fence::sibling(index_path, ".v2.sqlite")),
+            custody_page: Default::default(),
+        }
+    }
     /// Runtime load already holds CheckpointLock and has authenticated the DB.
     /// Replay before returning a hydrated graph, without
     /// recursively acquiring the checkpoint/route/session locks.
     pub(super) fn recover_route(identity: &Identity, generation: u64, path: &Path) -> Result<()> {
-        let recovery = Self {
-            scope: Scope {
-                identity: identity.clone(),
-                generation,
-            },
-            path: fence::sibling(path, ".v2-ack-receipt"),
-            db_path: Some(fence::sibling(path, ".v2.sqlite")),
-            custody_page: Default::default(),
-        };
+        let recovery = Self::new(identity.clone(), generation, path);
         crate::snapshot_sync::recover_state_v2_progress(path, &recovery)
     }
 
@@ -364,15 +368,7 @@ impl ProgressRecovery {
         path: &Path,
         owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
-        let recovery = Self {
-            scope: Scope {
-                identity: identity.clone(),
-                generation,
-            },
-            path: fence::sibling(path, ".v2-ack-receipt"),
-            db_path: Some(fence::sibling(path, ".v2.sqlite")),
-            custody_page: Default::default(),
-        };
+        let recovery = Self::new(identity.clone(), generation, path);
         crate::snapshot_sync::recover_state_v2_progress_locked(path, &recovery, owner)
     }
 
@@ -391,15 +387,7 @@ impl ProgressRecovery {
             .context("state_v2_ack_binding")?;
         let (identity, _) =
             fence::reconcile(index_path, &binding, true)?.context("state_v2_ack_identity")?;
-        Ok(Some(Self {
-            scope: Scope {
-                identity,
-                generation,
-            },
-            path: fence::sibling(index_path, ".v2-ack-receipt"),
-            db_path: Some(fence::sibling(index_path, ".v2.sqlite")),
-            custody_page: Default::default(),
-        }))
+        Ok(Some(Self::new(identity, generation, index_path)))
     }
 
     /// Import must call this under the existing owner/checkpoint locks after
@@ -643,15 +631,7 @@ impl ProgressRecovery {
             "generation",
         )?;
         require(v2_on(identity.binding.source), "source")?;
-        let recovery = Self {
-            scope: Scope {
-                identity,
-                generation,
-            },
-            path: fence::sibling(index_path, ".v2-ack-receipt"),
-            db_path: Some(fence::sibling(index_path, ".v2.sqlite")),
-            custody_page: Default::default(),
-        };
+        let recovery = Self::new(identity, generation, index_path);
         recovery.adopt(progress)?;
         Ok(recovery)
     }

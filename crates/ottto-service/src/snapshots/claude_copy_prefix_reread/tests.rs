@@ -54,7 +54,7 @@ fn walk(
     index: ScanIndex,
     scope: &[PathBuf],
 ) -> (ScanIndex, SourceScanResult, Vec<PathBuf>) {
-    let mut scan = OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+    let mut scan = OwnedSourceScan::new_selecting(
         SnapshotSource::ClaudeCode,
         &[root.into()],
         index,
@@ -67,6 +67,7 @@ fn walk(
         false,
         true,
         scope,
+        None,
     );
     let mut opened = Vec::new();
     for _ in 0..100_000 {

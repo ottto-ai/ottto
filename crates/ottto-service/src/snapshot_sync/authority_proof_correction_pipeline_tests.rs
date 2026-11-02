@@ -24,6 +24,10 @@
 // quarantined the whole index. Every generation writes one count/hash-only
 // JSON receipt line directly to stderr, outside the test harness capture.
 
+use super::p12_pipeline_original_tests::{
+    rearm_evidence_lines as apc_evidence_lines, rearm_family_sessions as apc_family_sessions,
+    rearm_member_session as apc_member_session, rearm_transcript_line as apc_transcript_line,
+};
 use super::*;
 
 const APC_DESTINATION: &str = "authority-proof-correction-destination";
@@ -48,81 +52,11 @@ const APC_FAMILY_REQUESTS: [(Option<&str>, &str, u32); 4] = [
 /// the family's terminal authority hold.
 const APC_TERMINAL_SEARCH_HOURS: std::ops::Range<u32> = 10..16;
 
-fn apc_transcript_line(session: &str, agent: Option<&str>, request: &str, second: u32) -> String {
-    let agent = agent
-        .map(|agent| format!("\"agentId\":\"{agent}\",\"isSidechain\":true,"))
-        .unwrap_or_default();
-    format!(
-        "{{\"timestamp\":\"2026-08-02T07:00:{second:02}Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",{agent}\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
-    )
-}
-
 /// A transcript line with no request and no usage. It changes the member's
 /// source revision without changing any family request evidence.
 fn apc_note_line(session: &str, second: u32) -> String {
     format!(
         "{{\"timestamp\":\"2026-08-02T07:01:{second:02}Z\",\"type\":\"user\",\"sessionId\":\"{session}\",\"message\":{{\"role\":\"user\",\"content\":\"synthetic note\"}}}}\n"
-    )
-}
-
-fn apc_member_session(agent: Option<&str>) -> String {
-    match agent {
-        Some(agent) => format!("{APC_ROOT}_agent-{agent}"),
-        None => APC_ROOT.to_string(),
-    }
-}
-
-fn apc_family_sessions() -> BTreeSet<String> {
-    std::iter::once(apc_member_session(None))
-        .chain(
-            APC_AGENTS
-                .iter()
-                .map(|agent| apc_member_session(Some(*agent))),
-        )
-        .collect()
-}
-
-/// Paired API and trace rows for one root-session request, as the local OTEL
-/// receiver writes them.
-fn apc_evidence_lines(agent: Option<&str>, request: &str, sequence: u64) -> (String, String) {
-    let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
-        capture_revision: "claude_api_request:v2".to_string(),
-        session_id: APC_ROOT.to_string(),
-        request_id: request.to_string(),
-        client_request_id: format!("client-{request}"),
-        observed_at: format!("2026-08-02T07:00:{sequence:02}Z"),
-        model: "claude-haiku-4-5".to_string(),
-        effort: "high".to_string(),
-        query_source: "user".to_string(),
-        speed: "fast".to_string(),
-        cost_usd_micros: Some(100),
-        event_sequence: Some(sequence),
-        app_version: "2.1.226".to_string(),
-        input_tokens: 10,
-        output_tokens: 10,
-        request_count: 1,
-        ..Default::default()
-    };
-    api.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&api).expect("serialize API evidence"))
-    );
-    let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
-        capture_revision: "claude_llm_request_ownership:v1".to_string(),
-        session_id: APC_ROOT.to_string(),
-        request_id: request.to_string(),
-        client_request_id: format!("client-{request}"),
-        agent_id: agent.unwrap_or_default().to_string(),
-        observed_at: "2026-08-02T07:00:30Z".to_string(),
-        ..Default::default()
-    };
-    trace.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&trace).expect("serialize trace evidence"))
-    );
-    (
-        serde_json::to_string(&api).expect("encode API evidence") + "\n",
-        serde_json::to_string(&trace).expect("encode trace evidence") + "\n",
     )
 }
 

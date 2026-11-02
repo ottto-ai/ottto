@@ -11,7 +11,10 @@ fn hex64(seed: char) -> String {
     seed.to_string().repeat(64)
 }
 
-fn occurrence(sequence: u64, output_tokens: u64) -> ClaudeTranscriptUsageOccurrenceWitness {
+pub(super) fn occurrence(
+    sequence: u64,
+    output_tokens: u64,
+) -> ClaudeTranscriptUsageOccurrenceWitness {
     ClaudeTranscriptUsageOccurrenceWitness {
         sequence,
         input_tokens: 10,
