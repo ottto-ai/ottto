@@ -119,15 +119,13 @@ fn ack_replaces_hash_and_absent_settled_reack_keeps_it_across_restart() {
     ] {
         if let Some(hash) = &hash {
             assert_ne!(*hash, snapshot_upload_body_witness(&item));
-            assert_ne!(
-                *hash,
-                crate::snapshots::snapshot_semantic_envelope(
-                    SnapshotSource::Codex,
-                    &item,
-                    SnapshotUploadPolicy::default()
-                )
-                .revision_v2_hash
+            let local = crate::snapshots::snapshot_semantic_envelope(
+                SnapshotSource::Codex,
+                &item,
+                SnapshotUploadPolicy::default(),
             );
+            assert_ne!(*hash, local.content_hash);
+            assert_ne!(*hash, local.revision_v2_hash);
         }
         settle(
             &mut progress,
