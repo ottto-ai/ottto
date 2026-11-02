@@ -3013,9 +3013,10 @@ impl SharedCache {
         ) {
             // A re-armed entry (cleared selection) whose record cannot serve
             // takes OFF's path for every source: OFF's immediate Full, never a
-            // pace or stale hold. The S2 floor below still holds first.
-            Err(RestoreOutcome::Stale(_) | RestoreOutcome::StaleUnregistered(..))
-                if selection_cleared(index, key) =>
+            // pace or stale hold. The S2 floor below still holds first, and an
+            // unknown accepted floor stays closed.
+            Err(RestoreOutcome::Stale(reason) | RestoreOutcome::StaleUnregistered(reason, _))
+                if reason != "accepted_floor_missing" && selection_cleared(index, key) =>
             {
                 Err(MissClass::StaleSelection.into())
             }
