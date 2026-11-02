@@ -147,6 +147,10 @@ impl Lane {
                         disposition: Default::default(),
                         released: Default::default(),
                         unhealthy: Default::default(),
+                        stats: Default::default(),
+                        // Finish runs before this harness uploads; the exact
+                        // ACKs are accepted after settlement, as the service does.
+                        delivered: None,
                     };
                     page.enrich(c);
                     let holds = page.finish();
@@ -163,6 +167,11 @@ impl Lane {
                         settle_completed_upload(page.index, &page.committed, &progress, &holds)
                             .index;
                     settle_index_after_upload(&mut index, &page.committed, &progress);
+                    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+                        &mut index,
+                        &page.scan.snapshots,
+                        &progress.fresh_context_body_acks,
+                    );
                     return (index, page.scan, wires, rejected, failed);
                 }
                 index.bind_session_accounts(
@@ -192,6 +201,12 @@ impl Lane {
                         progress
                             .accepted_fingerprints
                             .extend(chunk.iter().map(|item| item.snapshot_fingerprint.clone()));
+                        progress.fresh_context_body_acks.extend(chunk.iter().map(|item| {
+                            (
+                                item.snapshot_fingerprint.clone(),
+                                snapshot_upload_body_witness(item),
+                            )
+                        }));
                         Some(canonical(&wire))
                     })
                     .collect();
@@ -203,6 +218,11 @@ impl Lane {
                 // outcome; this clears settled Codex capture facts, without
                 // which those files re-parse (`codex_capture`) every pass.
                 settle_index_after_upload(&mut index, &committed, &progress);
+                crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+                    &mut index,
+                    &scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
                 (index, scan, wires, rejected, false)
             })
         });
