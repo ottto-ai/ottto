@@ -944,6 +944,16 @@ impl AcceptedFloor {
     }
 }
 
+/// What a durable restore verifies: the record's key and file, and how its body is read.
+pub(crate) struct RestoreRequest<'a> {
+    pub(crate) source: SnapshotSource,
+    pub(crate) key: &'a str,
+    pub(crate) path: &'a Path,
+    pub(crate) scope: &'a Scope,
+    pub(crate) index: &'a ScanIndex,
+    pub(crate) interpretation: &'a Interpretation<'a>,
+}
+
 /// The interpretation inputs a record binds to beyond the file scope.
 pub(crate) struct Interpretation<'a> {
     pub(crate) accepted: Option<AcceptedFloor>,
@@ -2861,22 +2871,22 @@ impl SharedCache {
     /// or a typed pending/integrity/missing outcome. `held` is
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "restore keeps the existing verified boundary and a mandatory room callback"
-    )]
+    /// `reserve` makes state room for the verified graph's bytes, or refuses.
     #[inline(never)]
     pub(crate) fn durable_restore_reserved(
         &self,
-        snapshot_source: SnapshotSource,
-        key: &str,
-        path: &Path,
-        scope: &Scope,
+        request: RestoreRequest<'_>,
         held: &mut File,
-        index: &ScanIndex,
-        interpretation: &Interpretation<'_>,
         reserve: impl FnOnce(usize) -> bool,
     ) -> RestoreOutcome {
+        let RestoreRequest {
+            source: snapshot_source,
+            key,
+            path,
+            scope,
+            index,
+            interpretation,
+        } = request;
         if !restart_restore::enabled() {
             let Some(source) = durable_source(snapshot_source) else {
                 return RestoreOutcome::Miss(MissClass::Unavailable);
@@ -3021,15 +3031,14 @@ impl SharedCache {
         );
         // The common guard held U/T14 before acquisition; this sees class changes since.
         let outcome = match result {
-            Ok(Ok(mut completed)) => {
-                #[cfg(test)]
-                super::test_hooks::fire(super::test_hooks::Point::BeforeActiveRestore);
-                // restore_known has dropped its input/decode/rederive temporaries.
-                // Both the process lease and the active state budget must fit
-                // before transferring ownership; retained-entry bounds do not apply.
+            Ok(Ok(completed)) => {
+                // restore_known has dropped its input/decode/rederive temporaries
+                // and its decoder charged the graph to this lease. The active
+                // state budget must fit before transferring ownership;
+                // retained-entry bounds do not apply.
                 let bytes =
                     crate::heap_layout_bound::completed_bound(&completed, super::state_bytes());
-                if !bytes.is_some_and(|bytes| lease.charge(0).is_ok() && reserve(bytes)) {
+                if !bytes.is_some_and(reserve) {
                     drop(completed); // Drop the graph before its transfer credit.
                     lease.release();
                     return self.restore_resource_pending(
@@ -3040,22 +3049,8 @@ impl SharedCache {
                         index,
                     );
                 }
-                let rank = crate::transcript_cache::admission_rank(
-                    completed.checkpoint.modified_hint(),
-                    crate::transcript_cache::admission_now(),
-                );
-                let taken = Taken {
-                    retained: crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state: completed
-                            .reduction
-                            .take()
-                            .expect("verified restored reduction"),
-                    },
-                    durable: completed.durable,
-                    modified_hint: rank,
-                    finalization_charge: 0,
-                    e2_held_new_file: false,
+                let Ok(taken) = completed.into_taken(0, false) else {
+                    unreachable!("verified restored reduction");
                 };
                 if let Some(mut stores) = self.durable() {
                     stores.counters.restored += 1;
@@ -3163,7 +3158,7 @@ impl SharedCache {
     /// this record and cache state (including unsupported content obligations), so a
     /// file grown past its committed end takes the ordinary counted Full
     /// (a fresh native parse, its own funding) instead of an idle-drop hold.
-    pub(in crate::snapshots) fn restore_resource_pending(
+    fn restore_resource_pending(
         &self,
         source: SnapshotSource,
         phase: &'static str,
@@ -5855,8 +5850,6 @@ impl MissClass {
                 phase,
                 "decode",
                 "active_restore_no_room",
-                "active_restore_descriptor",
-                "active_restore_prepare",
                 "stores_unavailable",
                 "input",
                 "cache_key",

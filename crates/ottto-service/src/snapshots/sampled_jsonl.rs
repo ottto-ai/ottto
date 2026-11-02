@@ -148,6 +148,40 @@ pub(super) struct CompletedNativeAcquisition {
 }
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; durable, checkpoint, reduction, released, unsealed);
 
+impl CompletedNativeAcquisition {
+    /// The retained copy this completion carries, at its deferred-release rank
+    /// or ranked now. Without a reduction the completion comes back unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal returns the original inline graph; boxing adds an unfunded allocation"
+    )]
+    pub(super) fn into_taken(
+        mut self,
+        live_bytes: usize,
+        held_new: bool,
+    ) -> std::result::Result<crate::transcript_cache::Taken<CachedJsonlReduction>, Self> {
+        let Some(state) = self.reduction.take() else {
+            return Err(self);
+        };
+        let rank = self.released.unwrap_or_else(|| {
+            crate::transcript_cache::admission_rank(
+                self.checkpoint.modified_hint(),
+                crate::transcript_cache::admission_now(),
+            )
+        });
+        Ok(crate::transcript_cache::Taken {
+            retained: crate::transcript_cache::Retained {
+                checkpoint: self.checkpoint,
+                state,
+            },
+            durable: self.durable,
+            modified_hint: rank,
+            finalization_charge: live_bytes,
+            e2_held_new_file: held_new,
+        })
+    }
+}
+
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
 #[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
 pub(super) enum SideCertificate {

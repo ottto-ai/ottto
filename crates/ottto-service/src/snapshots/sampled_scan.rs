@@ -558,7 +558,7 @@ impl SharedCache {
     fn insert_with_custody(
         &self,
         key: String,
-        mut completed: sampled_jsonl::CompletedNativeAcquisition,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
         held_new: bool,
         write_candidate: bool,
@@ -567,33 +567,16 @@ impl SharedCache {
         Option<crate::transcript_cache::Taken<CachedJsonlReduction>>,
         sampled_jsonl::CompletedNativeAcquisition,
     > {
-        let Some(state) = completed.reduction.take() else {
-            return Err(completed);
-        };
-        let rank = completed.released.unwrap_or_else(|| {
-            crate::transcript_cache::admission_rank(
-                completed.checkpoint.modified_hint(),
-                crate::transcript_cache::admission_now(),
-            )
-        });
-        let taken = crate::transcript_cache::Taken {
-            retained: crate::transcript_cache::Retained {
-                checkpoint: completed.checkpoint,
-                state,
-            },
-            durable: completed.durable,
-            modified_hint: rank,
-            finalization_charge: live_bytes,
-            e2_held_new_file: held_new,
-        };
+        let (released, unsealed) = (completed.released, completed.unsealed);
+        let taken = completed.into_taken(live_bytes, held_new)?;
         match self.insert_taken(key, taken, write_candidate, take_back) {
             Ok(taken) => Ok(taken),
             Err(taken) => Err(sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 durable: taken.durable,
-                released: completed.released,
-                unsealed: completed.unsealed,
+                released,
+                unsealed,
             }),
         }
     }
@@ -1104,37 +1087,25 @@ fn admit_tail_copy(context: &Context, active: &OwnedActiveFile, step: StepMeasur
     if !tail || codex_cursor::byte_charged(active) || charge > ENTRY_BYTES {
         return;
     }
-    let pinned = step
-        .used
-        .zip(context_overhead(context))
-        .and_then(|(used, overhead)| {
-            overhead
-                .checked_add(used)?
-                .checked_add(charge.checked_mul(2)?)
-        });
-    if let Some(pinned) = pinned {
-        context
-            .cache
-            .release_older_to_fit(pinned, tail_rank(&active.candidate));
-    }
+    release_older_for(context, &active.candidate, step, charge.saturating_mul(2));
 }
 
-/// Make room for a verified graph before it enters the active file. Only
-/// strictly older residents yield, and an unfundable move evicts nothing.
-#[cfg(unix)]
-pub(super) fn reserve_active_restore(
+/// Fit `extra` beside the measured active walk by releasing only residents
+/// ranked strictly older than `candidate`; an unfundable fit evicts nothing.
+/// Also makes room for a verified restored graph before it enters the active file.
+pub(super) fn release_older_for(
     context: &Context,
-    active: &OwnedActiveFile,
+    candidate: &CandidateFile,
     step: StepMeasure,
-    bytes: usize,
+    extra: usize,
 ) -> bool {
     context_overhead(context)
         .zip(step.used)
-        .and_then(|(overhead, used)| overhead.checked_add(used)?.checked_add(bytes))
+        .and_then(|(overhead, used)| overhead.checked_add(used)?.checked_add(extra))
         .is_some_and(|pinned| {
             context
                 .cache
-                .release_older_to_fit(pinned, tail_rank(&active.candidate))
+                .release_older_to_fit(pinned, tail_rank(candidate))
         })
 }
 
@@ -2056,8 +2027,6 @@ pub(super) mod test_hooks {
         BeforeRetireWitness,
         /// A bounded restore is decoded, immediately before identity sampling.
         BeforeRestoredIdentity,
-        /// Verification finished; before either active restore budget is used.
-        BeforeActiveRestore,
         BeforeRestoreDecode,
         BeforeRestoreRederive,
         /// The first opened-object identity sample has actually been read.

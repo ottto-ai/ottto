@@ -24,13 +24,15 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
         self.durable_restore_reserved(
-            source,
-            key,
-            path,
-            scope,
+            RestoreRequest {
+                source,
+                key,
+                path,
+                scope,
+                index,
+                interpretation,
+            },
             held,
-            index,
-            interpretation,
             |_| true,
         )
     }
@@ -334,7 +336,12 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
             "rederive" => Some(super::super::test_hooks::Point::BeforeRestoreRederive),
             _ => None,
         } {
-            super::super::test_hooks::set(point, store::active::refuse_next_charge);
+            // Refuse that phase's charge; the ordinary Full read is funded again.
+            use super::super::test_hooks::{set, Point};
+            set(point, || store::active::set_active_budget_for_test(Some(0)));
+            set(Point::AfterRetain, move || {
+                store::active::set_active_budget_for_test(Some(limit))
+            });
         }
         sampled_jsonl::preparation_tests::refuse_heap(phase == "cache");
         if phase == "cache" {
@@ -425,31 +432,20 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
     }
 }
 
-// Actual production caller: fitting cold returns retain Q11 through warm
-// parking/retry; rejected nonresident graphs preserve growth with counted Full.
-/// [money] cold rejection and warm return retries preserve q11 and money.
+// Actual production caller, not the direct API fixtures above. A pending
+// transfer keeps Q11 for the next pass's Tail; a refused restored graph is
+// dropped under its credit and its growth reads by the granted Full.
+/// [money] production cold pending and prepare error next pass tail obeys q11.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
-fn production_cold_rejection_and_warm_parking_preserve_q11() {
+fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !crate::test_isolation::run_here() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _clear = ClearPreparationFault;
-    for return_mode in [
-        "accept",
-        "capacity",
-        "poison",
-        "persistent_capacity",
-        "spent",
-        "funding",
-        "funding_spent",
-        "audit_cap",
-        "prepare_io",
-        "cold_transient_refused",
-    ] {
-        let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
+    for return_mode in ["funding", "funding_spent", "audit_cap", "prepare_io"] {
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
         let lock = test_locks::hold(&root);
         let sessions = root.join("sessions");
@@ -745,435 +741,7 @@ fn production_cold_rejection_and_warm_parking_preserve_q11() {
                 panic!("Pending or spent refusal leaked transfer funding")
             };
             lease.release();
-            continue;
         }
-        if return_mode != "cold_transient_refused" {
-            // Populate RAM through the real fitting cold-return path first.
-            // The next injected rejection must exercise warm parking, with the
-            // same Q11 grant and a graph within ordinary retained admission.
-            sampled_jsonl::preparation_tests::reject_once(
-                sampled_jsonl::PreparationRefusal::Transient,
-            );
-            let (pending_index, result, modes) = finish(start(index));
-            index = pending_index;
-            assert!(result.snapshots.is_empty());
-            assert_eq!(modes, (0, 0, 0));
-            let retained = cache.retained().unwrap();
-            let resident = retained
-                .peek(&key)
-                .expect("fitting cold return parks in RAM");
-            assert!(crate::heap_layout_bound::bound(
-                resident,
-                crate::transcript_cache::ENTRY_BYTES
-            )
-            .is_some());
-            drop(retained);
-            assert_eq!(cache.durable().unwrap().counters.restored, 1);
-            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
-            assert!(cache.durable().unwrap().counters.resource_full.is_empty());
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("funded RAM return must release transfer credit")
-            };
-            lease.release();
-        }
-        let other_restore = other_source_restore_after_return_release(&root, lock);
-        let original_record = store_snapshot(&store::store_dir_for_index(&index_path));
-        let granted = Arc::new(Mutex::new(None));
-        let observation = granted.clone();
-        let pressure = cache.clone();
-        sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
-            let guard = taken
-                .durable
-                .state
-                .as_ref()
-                .expect("custody state")
-                .retail
-                .as_ref()
-                .expect("guard BEFORE owned prepare");
-            let facts = (
-                guard.object,
-                guard.next,
-                guard.end,
-                guard.old_end,
-                taken.modified_hint,
-                taken.finalization_charge,
-                taken.e2_held_new_file,
-                taken as *const _ as usize,
-                guard as *const _ as usize,
-            );
-            *observation.lock().unwrap() = Some(facts);
-            if return_mode == "cold_transient_refused" {
-                sampled_jsonl::preparation_tests::refuse_heap(true);
-            } else if return_mode == "poison" {
-                pressure.poison_retained();
-            } else if refuse_return {
-                *pressure.retained().unwrap() =
-                    crate::transcript_cache::TranscriptCache::with_byte_limit(0);
-            }
-            anyhow::bail!("injected native prepare failure")
-        })));
-        let before = (retail_bytes(source, 0), retail_bytes(source, 1));
-        let mut scan = start(index);
-        for _ in 0..10_000 {
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                _ => panic!("error must retain a pending pass"),
-            };
-            if granted.lock().unwrap().is_some() {
-                break;
-            }
-        }
-        let facts = granted
-            .lock()
-            .unwrap()
-            .expect("real owned preparation reached hook");
-        assert_eq!(facts.1, record_end);
-        assert_eq!(facts.2, record_end + suffix.len() as u64);
-        assert_eq!(facts.3, record_end);
-        assert_eq!(
-            (retail_bytes(source, 0), retail_bytes(source, 1)),
-            before,
-            "prepare failure reads no suffix"
-        );
-        assert_eq!(cache.durable().unwrap().restore_pending.len(), 1);
-        assert!(cache.durable().unwrap().retail_spent.is_empty());
-        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
-        assert_eq!(
-            cache.durable().unwrap().counters.restored,
-            1,
-            "the second rejection uses the RAM original, without another restore"
-        );
-        if return_mode == "cold_transient_refused" {
-            assert_eq!(
-                scan.sampling.as_ref().unwrap().full_files,
-                1,
-                "fallback Full is prepared before body input"
-            );
-            assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-            // This original refused retained admission. Drop it under credit;
-            // the growth grant prepares byte-zero Full without parking it.
-            let active = scan.active_file.as_ref().expect("fresh Full owner");
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .map_or(true, |pending| pending.pending_taken.is_none()));
-            assert!(matches!(
-                active.sampling.as_ref().unwrap().mode,
-                crate::transcript_acquisition::ReadMode::Full(_)
-            ));
-            assert_eq!(
-                cache.lock_poisoned_for_test(super::super::TestLock::Retained),
-                return_mode == "poison"
-            );
-            sampled_jsonl::preparation_tests::set(None);
-            other_restore(); // Transfer credit is free before any fallback body work.
-            assert_eq!(
-                store_snapshot(&store::store_dir_for_index(&index_path)),
-                original_record
-            );
-            let (index, result, modes) = finish(scan);
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].input_tokens, 125);
-            assert_eq!(modes, (1, 0, record_end + suffix.len() as u64));
-            assert_eq!(
-                (retail_bytes(source, 0), retail_bytes(source, 1)),
-                before,
-                "rejected Tail performs no suffix or overlap reads"
-            );
-            assert_eq!(
-                cache
-                    .durable_counters(source)
-                    .unwrap()
-                    .0
-                    .resource_full
-                    .get("active_restore_prepare"),
-                Some(&1)
-            );
-            let (mut cold_index, mut cold, _) = fixture::scan_reads(
-                OwnedSourceScan::new_with_identity_capture(
-                    source,
-                    std::slice::from_ref(&sessions),
-                    ScanIndex::default(),
-                    "2026-10-20T12:00:00Z",
-                    365,
-                    100,
-                    false,
-                    None,
-                    &[],
-                    false,
-                    true,
-                ),
-                100_000,
-            );
-            finalize_scan_after_policy(source, &mut cold, &mut cold_index);
-            assert_eq!(
-                serde_json::to_value(&result.snapshots).unwrap(),
-                serde_json::to_value(&cold.snapshots).unwrap()
-            );
-            assert_eq!(
-                cache.durable_counters(source).unwrap().1.records_written,
-                2,
-                "fresh Full replaces the predecessor before effects"
-            );
-            let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
-            let record =
-                store::tests::found(disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)));
-            assert_eq!(
-                record.record.certificate.sealed_offset,
-                index.files[&key].size_bytes
-            );
-            assert_eq!(
-                cache.durable().unwrap().counters.retail_attempts,
-                1,
-                "no second Q11 grant"
-            );
-            let (_, events) = crate::local_resource_diagnostics::capture(|| {
-                let store::LeaseWait::Granted(lease) =
-                    cache.acquire_active(source, store::ACTIVE_BYTES)
-                else {
-                    panic!("lease leaked")
-                };
-                lease.release();
-            });
-            assert!(!events
-                .iter()
-                .any(|event| event["counts"]["active_drop_release"] == 1));
-            sampled_jsonl::preparation_tests::refuse_heap(false);
-            continue;
-        }
-        assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
-        assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-        if matches!(return_mode, "poison" | "persistent_capacity") {
-            let active = scan.active_file.as_ref().expect("funded persistent hold");
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_taken
-                .as_ref()
-                .unwrap()
-                .durable
-                .state
-                .as_ref()
-                .expect("custody state")
-                .retail
-                .is_some());
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_funding
-                .is_some());
-            assert_eq!(
-                cache.lock_poisoned_for_test(super::super::TestLock::Retained),
-                return_mode == "poison"
-            );
-            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
-            assert!(matches!(
-                cache.acquire_active(SnapshotSource::Codex, 0),
-                store::LeaseWait::Busy
-            ));
-            let (scan, events) = crate::local_resource_diagnostics::capture(|| {
-                for attempt in 2..=RETURN_ADMISSION_ATTEMPTS {
-                    scan = match scan.step(None) {
-                        OwnedSourceScanStep::Pending(next) => next,
-                        _ => panic!("return retries must remain cooperative"),
-                    };
-                    assert_eq!(
-                        scan.active_file.is_some(),
-                        attempt < RETURN_ADMISSION_ATTEMPTS
-                    );
-                }
-                scan
-            });
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["counts"]["prepared_return_dropped"] == 1)
-                    .count(),
-                1
-            );
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| event["counts"]["active_drop_release"] == 1),
-                "terminal release is explicit"
-            );
-            assert!(scan.active_file.is_none());
-            assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-            assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
-            drop(scan);
-            sampled_jsonl::preparation_tests::set(None);
-            other_restore(); // Real other-source cold restore now acquires the owner.
-            assert_eq!(
-                store_snapshot(&store::store_dir_for_index(&index_path)),
-                original_record
-            );
-
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("cancel leaked funding")
-            };
-            lease.release();
-            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
-            assert_eq!(
-                {
-                    let stores = cache.durable().unwrap();
-                    stores.restore_pending.len() + stores.retail_spent.len()
-                },
-                1
-            );
-            sampled_jsonl::preparation_tests::set(None);
-            continue;
-        }
-        if refuse_return {
-            let active = scan
-                .active_file
-                .as_deref_mut()
-                .expect("funded actual native owner");
-            assert!(active
-                .parser
-                .pending
-                .as_ref()
-                .expect("M3 parser state")
-                .pending_funding
-                .is_some());
-            let taken = active
-                .parser
-                .pending
-                .as_mut()
-                .expect("M3 parser state")
-                .pending_taken
-                .as_mut()
-                .expect("original held");
-            assert_eq!(
-                &**taken as *const _ as usize, facts.7,
-                "same original through refused return"
-            );
-            assert_eq!(
-                taken.durable.retail_mut().unwrap() as *mut _ as usize,
-                facts.8,
-                "same one guard"
-            );
-            assert!(
-                active.parser.step().is_err(),
-                "held original cannot read through parser"
-            );
-            *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::default();
-        } else {
-            assert!(cache.retained().unwrap().peek(&key).is_some());
-        }
-        sampled_jsonl::preparation_tests::set(None);
-        let index = if refuse_return {
-            // Return to RAM before reading, then re-offer the same candidate.
-            scan = match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => next,
-                _ => panic!("return is a continuation"),
-            };
-            assert!(scan.active_file.is_none());
-            assert!(cache.retained().unwrap().peek(&key).is_some());
-            let (index, result, modes) = finish(scan);
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].input_tokens, 125);
-            assert_eq!(modes.0, 0);
-            assert_eq!(modes.1, 1);
-            index
-        } else {
-            let (index, result, modes) = finish(scan);
-            assert!(
-                result.snapshots.is_empty(),
-                "failed attempt publishes nothing"
-            );
-            assert_eq!(modes.0, 0);
-            index
-        };
-        if return_mode == "spent" {
-            let mut old = cache.take(&key).expect("returned original");
-            old.durable.take_retail().expect("one grant").finish();
-            drop(old); // Model cancellation: never reinsert an explicitly ended guard.
-                       // Keep the five passes inside a granted recovery's pacing window.
-            assert!(cache.retail_full(
-                &key,
-                &File::open(&path).unwrap(),
-                record_end,
-                SystemTime::now()
-            ));
-            let mut index = index;
-            for _ in 0..5 {
-                let (next, result, modes) = finish(start(index));
-                assert!(result.snapshots.is_empty());
-                assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
-                assert!(
-                    cache.retained().unwrap().peek(&key).is_none(),
-                    "spent guard cannot leave reusable A"
-                );
-                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
-                index = next;
-            }
-            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("denied grant leaked funding")
-            };
-            lease.release();
-            continue;
-        }
-        if !refuse_return {
-            let (_, result, modes) = finish(start(index));
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].input_tokens, 125);
-            assert_eq!(modes.0, 0);
-            assert_eq!(modes.1, 1);
-        }
-        assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
-        assert_eq!(
-            retail_bytes(source, 1) - before.1,
-            0,
-            "exact old accepted overlap"
-        );
-        assert!(
-            cache.durable().unwrap().restore_pending.is_empty(),
-            "native receipt consumed the pending grant"
-        );
-        assert!(
-            cache.durable().unwrap().retail_spent.is_empty(),
-            "zero old bytes needed no spent custody"
-        );
-        assert_eq!(
-            cache.durable_counters(source).unwrap().1.records_written,
-            2,
-            "initial and exact successor native receipts"
-        );
-        let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
-        let record =
-            store::tests::found(disk.read(&store::key_digest(DurableSource::ClaudeCode, &key)));
-        assert_eq!(
-            record.record.certificate.sealed_offset,
-            record_end + suffix.len() as u64
-        );
-        assert_eq!(
-            cache.durable().unwrap().counters.retail_attempts,
-            1,
-            "no second Q11 grant"
-        );
-        let (_, events) = crate::local_resource_diagnostics::capture(|| {
-            let store::LeaseWait::Granted(lease) =
-                cache.acquire_active(source, store::ACTIVE_BYTES)
-            else {
-                panic!("lease leaked")
-            };
-            lease.release();
-        });
-        assert!(!events
-            .iter()
-            .any(|event| event["counts"]["active_drop_release"] == 1));
     }
 }
 
@@ -4259,104 +3827,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         .files
         .get(&key)
         .is_some_and(ScanIndexEntry::has_unverified_source));
-}
-
-/// Seeds an actual no-content Codex record before the Claude owner is parked.
-/// The returned action drives the ordinary cold caller after bounded release.
-fn other_source_restore_after_return_release(
-    root: &Path,
-    lock: &crate::locked_state_dir::LockedStateDir,
-) -> impl FnOnce() {
-    let source = SnapshotSource::Codex;
-    let ds = DurableSource::Codex;
-    let path = root.join("019fa111-2222-7333-8444-555555555555.jsonl");
-    std::fs::write(&path, b"{}\n").unwrap();
-    let key = local_index_key(&path);
-    let namespace = Scope("other-owner".into());
-    let scope = Scope("other-file".into());
-    let index_path = root.join("other-index.json");
-    let mut index = ScanIndex::default();
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "other-fp"
-        }))
-        .unwrap(),
-    );
-    index.save(&index_path).unwrap();
-    let cache = fixture::cache(source, &index_path, &namespace, false);
-    let interp = Interpretation::of(source, &key, &index, false, &namespace);
-    let (reduction, _) = counted_codex_record_of(&path, &scope);
-    let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
-        .unwrap()
-        .binding;
-    // Format-3 scope binds the body's immutable (configured) counting.
-    binding.scope = v3_replay_scope(
-        source,
-        &scope,
-        &index,
-        &interp,
-        effective_revision(source),
-        &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
-    );
-    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
-    let mut disk = fixture::store(&index_path, ds);
-    assert_eq!(
-        disk.write_after_save(
-            lock,
-            index.generation,
-            0,
-            vec![PendingRecord {
-                acquisition: fixture_acquisition(source),
-                binding,
-                certificate: certificate(&path, &scope),
-                body: body.clone(),
-                allowlist: codec::allowlist_digest(source)
-            }]
-        )
-        .unwrap()
-        .written,
-        1
-    );
-    move || {
-        // Scoped restore requires real growth; a quiet file is a zero-input hold.
-        std::io::Write::write_all(
-            &mut std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap(),
-            b"{}\n",
-        )
-        .unwrap();
-        let interp = Interpretation::of(source, &key, &index, false, &namespace);
-        let restored = cache
-            .durable_restore(
-                source,
-                &key,
-                &path,
-                &scope,
-                &mut File::open(&path).unwrap(),
-                &index,
-                &interp,
-            )
-            .into_test_option()
-            .expect("other-source actual cold restore after terminal release");
-        assert_eq!(
-            codec::encode(
-                &restored.retained.state,
-                store::BODY_BYTES,
-                jsonl_line_cap() as u64
-            )
-            .unwrap(),
-            body
-        );
-        drop(restored);
-        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
-        else {
-            panic!("other restore leaked the released owner")
-        };
-        lease.release();
-    }
 }
 
 /// Existing MAIN/S2 leaves: a real resident take is losslessly returned, then
@@ -8104,50 +7574,33 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         )
         .with_sampled_acquisition(cache.clone(), namespace.clone());
         let context = scan.sampling.as_ref().unwrap();
-        let active = OwnedActiveFile {
-            comparison_target: false,
-            sampling: None,
-            recovered_audit_due: None,
-            candidate: CandidateFile {
-                path: path.clone(),
-                size_bytes: std::fs::metadata(&path).unwrap().len(),
-                modified_unix_seconds: 1,
-                modified_unix_nanos: 1_000_000_000,
-                scan_root: sessions.clone(),
-                physical_identity: None,
-                source_file_fingerprint: String::new(),
-                legacy_source_file_fingerprint: String::new(),
-                legacy_config_reconciliation_required: false,
-                opened_object_identity: String::new(),
-                fingerprint_changed_nanos: 0,
-                fingerprint_birth_nanos: 0,
-                withheld_content_stamp: None,
-            },
-            decision: CandidateDecision::Parse,
-            parse_reason: None,
-            previous_snapshot_fingerprint: None,
-            previous_upload_body_witness: None,
-            projection_adoption_required: false,
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: std::fs::metadata(&path).unwrap().len(),
+            modified_unix_seconds: 1,
+            modified_unix_nanos: 1_000_000_000,
+            scan_root: sessions.clone(),
+            physical_identity: None,
             source_file_fingerprint: String::new(),
-            parser: Box::new(owned_parser(source, &path, File::open(&path).unwrap())),
-            aliases: Vec::new(),
-            applied_receipts: BTreeMap::new(),
-            cursor: None,
-            charged_bytes: 0,
-            hold_offset: None,
-            group: None,
-            side_origin: None,
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         // Scale only the pre-existing active charge. Admission uses the actual
         // production reservation and header-reclaim path on the real inventory.
         let restored = cache.durable_restore_reserved(
-            source,
-            &key,
-            &path,
-            &scope,
+            RestoreRequest {
+                source,
+                key: &key,
+                path: &path,
+                scope: &scope,
+                index: &index,
+                interpretation: &interpretation,
+            },
             &mut File::open(&path).unwrap(),
-            &index,
-            &interpretation,
             |bytes| {
                 let pinned = if fits {
                     state_bytes() - cursor_without - empty
@@ -8160,7 +7613,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                         .and_then(|n| n.checked_sub(bytes)),
                     ..Default::default()
                 };
-                super::super::reserve_active_restore(context, &active, step, bytes)
+                super::super::release_older_for(context, &candidate, step, bytes)
             },
         );
         if fits {
@@ -12291,11 +11744,8 @@ fn nonresident_growth_tails_and_matches_cold_full() {
             "empty",
             "older_and_newer",
             "only_newer",
-            "active_lease",
             "audit_cap",
-            "prepare_rejected",
             "prepare_transient",
-            "prepare_transient_fits",
         ] {
             test_hooks::clear();
             store::active::set_active_budget_for_test(None);
@@ -12411,23 +11861,11 @@ fn nonresident_growth_tails_and_matches_cold_full() {
                 ));
                 let all = bound(&*cache, state_bytes()).unwrap();
                 test_hooks::active_restore_room(Some(newer + (all - newer) / 2));
-            } else if room == "active_lease" {
-                test_hooks::set(test_hooks::Point::BeforeActiveRestore, || {
-                    store::active::set_active_budget_for_test(Some(0));
-                });
             }
-            if matches!(
-                room,
-                "prepare_rejected" | "prepare_transient" | "prepare_transient_fits"
-            ) {
-                if room == "prepare_transient_fits" {
-                    sampled_jsonl::preparation_tests::refuse_heap(false);
-                }
-                sampled_jsonl::preparation_tests::reject_once(if room == "prepare_rejected" {
-                    sampled_jsonl::PreparationRefusal::NonTransient("prepare_incompatible")
-                } else {
-                    sampled_jsonl::PreparationRefusal::Transient
-                });
+            if room == "prepare_transient" {
+                sampled_jsonl::preparation_tests::reject_once(
+                    sampled_jsonl::PreparationRefusal::Transient,
+                );
             }
             for append in 1..=2 {
                 let suffix = if source == SnapshotSource::ClaudeCode {
@@ -12456,30 +11894,12 @@ fn nonresident_growth_tails_and_matches_cold_full() {
                 owner
                     .cache
                     .durable_begin_pass(source, &owner.index_path, &owner.namespace, true);
-                let (mut next, mut scan, mut modes) =
+                let (mut next, mut scan, modes) =
                     fixture::scan_reads(start(owner.cache.clone(), index), 100_000);
-                if append == 1 && room == "prepare_transient_fits" {
-                    assert_eq!(modes, (0, 0, 0));
-                    assert!(scan.snapshots.is_empty());
-                    assert!(owner.cache.retained().unwrap().peek(&key).is_some());
-                    assert!(owner
-                        .cache
-                        .durable_counters(source)
-                        .unwrap()
-                        .0
-                        .resource_full
-                        .is_empty());
-                    // The returned graph must Tail before a fresh facade is
-                    // needed. Completion again refuses optional retention.
-                    sampled_jsonl::preparation_tests::refuse_heap(true);
-                    (next, scan, modes) =
-                        fixture::scan_reads(start(owner.cache.clone(), next), 100_000);
-                }
                 finalize_scan_after_policy(source, &mut scan, &mut next);
-                let refused = append == 1 && matches!(room, "only_newer" | "active_lease");
-                if room == "audit_cap"
-                    || append == 1 && matches!(room, "prepare_rejected" | "prepare_transient")
-                {
+                let refused = append == 1 && room == "only_newer";
+                let rejected = append == 1 && room == "prepare_transient";
+                if room == "audit_cap" || rejected {
                     assert_eq!(
                         modes,
                         (1, 0, std::fs::metadata(&path).unwrap().len()),
@@ -12498,6 +11918,26 @@ fn nonresident_growth_tails_and_matches_cold_full() {
                     assert_eq!(modes, (0, 1, suffix.len() as u64));
                 }
                 assert!(owner.cache.retained().unwrap().peek(&key).is_none());
+                if rejected {
+                    // The rejected graph drops under its credit: no second Q11
+                    // grant, and the transfer lease was released, not leaked.
+                    assert_eq!(
+                        owner.cache.durable().unwrap().counters.retail_attempts,
+                        u64::from(source == SnapshotSource::ClaudeCode),
+                        "no second Q11 grant"
+                    );
+                    let (_, events) = crate::local_resource_diagnostics::capture(|| {
+                        let store::LeaseWait::Granted(lease) =
+                            owner.cache.acquire_active(source, store::ACTIVE_BYTES)
+                        else {
+                            panic!("lease leaked")
+                        };
+                        lease.release();
+                    });
+                    assert!(!events
+                        .iter()
+                        .any(|event| event["counts"]["active_drop_release"] == 1));
+                }
                 if append == 1 && matches!(room, "older_and_newer" | "only_newer") {
                     let cache = owner.cache.retained().unwrap();
                     assert!(cache.peek("newer").is_some(), "newer resident never yields");
@@ -12545,9 +11985,6 @@ fn nonresident_growth_tails_and_matches_cold_full() {
                     "canonical body"
                 );
                 next.save(&owner.index_path).unwrap();
-                if room == "active_lease" {
-                    break; // This arm proves refusal; it grants no new durable record.
-                }
                 owner
                     .cache
                     .durable_write_after_save(owner.writer, source, &next)
