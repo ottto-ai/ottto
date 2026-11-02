@@ -1684,6 +1684,14 @@ counts each `thread_settings_applied` line whose `service_tier` is `fast`,
 count again. It is a cumulative saturating process total with no labelled log
 line and no path or session id, and it never affects money.
 
+## Claude usage iteration on another model
+
+`usage_iteration_model_differs` in `process_retained_cache_lifecycle_totals`
+counts each Claude usage line with a `usage.iterations[]` entry whose `model`
+differs from the line's model (a refusal fallback's declined first attempt, which
+is billed at the line's model); rereads count again. It is a cumulative
+saturating process total with no path or session id, and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with

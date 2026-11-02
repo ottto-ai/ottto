@@ -93,6 +93,37 @@ fn claude_usage_takes_the_larger_of_top_level_and_iterations_per_kind() {
     }
 }
 
+/// [regress] A refusal fallback's declined first attempt, a call naming
+/// another model than the line, is counted by `usage_iteration_model_differs`;
+/// a call on the line's model, or naming none, is not.
+#[test]
+fn claude_iteration_on_another_model_is_counted() {
+    let count = |line: &Value| {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            apply_claude_code_line(line, &mut accumulator)
+        });
+        counts.usage_iteration_model_differs
+    };
+    let on = |model: &str, mut usage: Value| {
+        usage["model"] = json!(model);
+        usage
+    };
+    let at = "2026-11-02T10:00:00Z";
+    let served = billed(2, 60, 50_500, 500, 0);
+    let calls = [
+        on("claude-sonnet-4-5", billed(4, 30, 50_000, 1_000, 0)),
+        on("claude-opus-4-8", served.clone()),
+    ];
+    assert_eq!(count(&response(SESSION_PARTIAL, 0, &served, &calls, at)), 1);
+    let same = [on("claude-opus-4-8", served.clone())];
+    assert_eq!(count(&response(SESSION_PARTIAL, 0, &served, &same, at)), 0);
+    for (class, top, iterations, _) in classes() {
+        let line = response(SESSION_PARTIAL, 0, &top, &iterations, at);
+        assert_eq!(count(&line), 0, "{class}");
+    }
+}
+
 /// [money] Emitted money and placement equal a transcript whose top level
 /// already states every call, so the fold adds exactly the iterations-only
 /// usage.

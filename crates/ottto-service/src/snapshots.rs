@@ -41529,6 +41529,19 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.claude_context_curve_request_index_complete = false;
         }
         let selector = claude_code_selector_from_line(value);
+        let model = string_at(value, &["message", "model"])
+            .or_else(|| string_at(value, &["model"]))
+            .or_else(|| string_at(value, &["payload", "model"]));
+        // A call naming another model (a refusal fallback's declined first
+        // attempt) is billed here at the response's model; count it.
+        if claude_code_usage_iterations(root).iter().any(|iteration| {
+            iteration
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|other| Some(other) != model.as_deref())
+        }) {
+            crate::local_resource_diagnostics::claude_usage_iteration_model_differs();
+        }
         // The derived context bucket is attached only after all content-block
         // records for this response are canonically resolved. Early progressive
         // records may still have zero input/cache counters; classifying those
@@ -41545,9 +41558,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.observe_claude_response(
             value,
             usage,
-            string_at(value, &["message", "model"])
-                .or_else(|| string_at(value, &["model"]))
-                .or_else(|| string_at(value, &["payload", "model"])),
+            model,
             selector,
             timestamp,
             reasoning_effort,
