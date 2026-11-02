@@ -13226,7 +13226,7 @@ mod tests {
                 "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
                 "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
             receipt_window_days: 7, cache_observations_enabled: false,
-            scan_agent_status_collection: Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() }),
+            scan_agent_status_collection: Some(Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() })),
             attribution_context: None, upload_policy: SnapshotUploadPolicy::default(),
             upload_destination_namespace: destination.clone(), receipt_client: client.clone(),
             index_path: path.clone(), upload_progress_path: progress_path.clone(),
