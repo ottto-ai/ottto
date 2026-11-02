@@ -1626,9 +1626,6 @@ pub(super) fn attest_equality_skip(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
-    if !super::money_freshness::enabled() {
-        return;
-    }
     let Some(traversal) = index.traversal.as_ref() else {
         return;
     };
@@ -1667,9 +1664,6 @@ pub(super) fn observe_page(
     sampling: &Option<sampled_scan::Context>,
     now: u64,
 ) {
-    if !super::money_freshness::enabled() {
-        return;
-    }
     let none = Touched::default();
     let touched = touched.as_deref().unwrap_or(&none);
     let scope = scope_of(sampling);
@@ -1689,14 +1683,4 @@ pub(super) fn observe_page(
     if let Some(counts) = counts {
         crate::local_resource_diagnostics::claude_family_census_shadow(&counts);
     }
-}
-
-#[cfg(test)]
-pub(super) fn runtime_pristine_for_test() -> bool {
-    with_runtime(|runtime| {
-        runtime.scope_since.is_none()
-            && runtime.first_pending.stamps.is_empty()
-            && runtime.attested.len() == 0
-            && runtime.meter.attempts == 0
-    })
 }

@@ -27673,12 +27673,11 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow =
-            (source == SnapshotSource::ClaudeCode && money_freshness::enabled()).then(|| {
-                Box::new(claude_family_census_shadow::Touched::from_paths(
-                    pending_paths.iter().map(|pending| pending.path.as_path()),
-                ))
-            });
+        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
+            Box::new(claude_family_census_shadow::Touched::from_paths(
+                pending_paths.iter().map(|pending| pending.path.as_path()),
+            ))
+        });
         let codex_selected_flags =
             if source == SnapshotSource::Codex || index.file_upload_context_enabled() {
                 pending_paths
@@ -33038,7 +33037,7 @@ impl OwnedSourceScan {
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
-                if source == SnapshotSource::ClaudeCode && money_freshness::enabled() {
+                if source == SnapshotSource::ClaudeCode {
                     claude_family_census_shadow::observe_page(
                         index,
                         &claude_family_shadow,
@@ -34277,10 +34276,7 @@ impl OwnedSourceScan {
                     }
                     // E7-8a: the ordinary equality Skip attests this revision
                     // for the shadow family census. Counts only.
-                    if source == SnapshotSource::ClaudeCode
-                        && parse_reason.is_none()
-                        && money_freshness::enabled()
-                    {
+                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
                         claude_family_census_shadow::attest_equality_skip(
                             index, &candidate, &sampling, audit_now,
                         );
