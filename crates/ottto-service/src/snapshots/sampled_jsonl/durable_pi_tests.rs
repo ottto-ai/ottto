@@ -307,7 +307,7 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
     assert_eq!(
         row.representation(3, &pin).unwrap().allowlist_pin,
         // The Pi allowlist pin, including the fork fields of PiSection.
-        "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8"
+        "10a14138dc3d8c6c41f499fb728e96b9755ab21b87b7e850386a2c39a513f527"
     );
     for format in [0, 1, 2, 4] {
         assert!(row.representation(format, &pin).is_none());

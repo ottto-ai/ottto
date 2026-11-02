@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled body/allowlist; arbitrary test-only representations are U.
 pub(super) fn placeholder_allowlist() -> Digest32 {
-    parse_hex_digest("95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2").unwrap()
+    parse_hex_digest("cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3").unwrap()
 }
 pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     crate::snapshots::durable_store_fixture_body(
@@ -3868,7 +3868,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
             let mut record = pending(b.clone(), certificate(&transcript), n);
             // Existing source-tag2 v1 pin; no private codec module access.
             record.allowlist = parse_hex_digest(
-                "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
+                "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189",
             )
             .unwrap();
             record.body = crate::snapshots::durable_store_fixture_body(

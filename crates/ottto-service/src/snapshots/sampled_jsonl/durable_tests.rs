@@ -976,7 +976,8 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     assert!(occurrences(&body, &plain).is_empty());
     assert!(occurrences(&body, hex(plain).as_bytes()).is_empty());
     assert!(occurrences(&body, hex(separated).as_bytes()).is_empty());
-    assert_eq!(occurrences(&body, &separated).len(), 1);
+    // The sentence's digest and its one address's: here the sentence is the address.
+    assert_eq!(occurrences(&body, &separated).len(), 2);
 }
 
 /// Other E content still refuses; the approved mid-file skill label now persists.
@@ -1547,16 +1548,16 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
-        "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
+        "cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3",
     ),
     (
         SnapshotSource::Codex,
-        "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
+        "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189",
     ),
     (
         SnapshotSource::Pi,
         // The Pi allowlist pin, including the fork fields of PiSection.
-        "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
+        "10a14138dc3d8c6c41f499fb728e96b9755ab21b87b7e850386a2c39a513f527",
     ),
 ];
 
@@ -1660,6 +1661,7 @@ const H_AUDIT: &[(&str, &str)] = &[
         "Shape::digest: SHA-256(\"ottto-durable-tail-shape:v1\" || shape text)",
     ),
     (
+        "OrgMarkers.address",
         "OrgMarkers.context_digest",
         "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased email)",
     ),
@@ -2441,7 +2443,6 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
         [
             "CodexPrelude.skills_body",
             "OpeningCall.files",
-            "OrgMarkers.home",
             "SelectorCapture.context.attribution",
             "SnapshotAccumulator.codex_tier_replay",
             "SnapshotAccumulator.claude_desktop_identity",
