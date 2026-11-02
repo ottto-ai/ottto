@@ -191,11 +191,7 @@ pub(crate) fn build_instruction_inventory(
     let toplevel = crate::context_footprint::git_toplevel(workspace)?;
     let started_at_root = canonical_or_self(workspace) == canonical_or_self(&toplevel);
     let files = match paths {
-        InventoryPaths::Withhold => InstructionInventoryFiles {
-            complete: false,
-            partial_reasons: vec![PartialReason::PathsWithheld],
-            entries: Vec::new(),
-        },
+        InventoryPaths::Withhold => withheld_files(),
         InventoryPaths::Collect => collect_files(&toplevel, observed, Instant::now() + TIME_BUDGET),
     };
     Some(InstructionInventory {
@@ -203,6 +199,15 @@ pub(crate) fn build_instruction_inventory(
         claude_mode,
         files,
     })
+}
+
+/// The list when instruction paths may not leave the machine.
+pub(crate) fn withheld_files() -> InstructionInventoryFiles {
+    InstructionInventoryFiles {
+        complete: false,
+        partial_reasons: vec![PartialReason::PathsWithheld],
+        entries: Vec::new(),
+    }
 }
 
 fn collect_files(

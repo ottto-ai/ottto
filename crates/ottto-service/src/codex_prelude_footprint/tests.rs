@@ -472,17 +472,20 @@ fn request_labels_need_a_fetched_hint_that_allows_them() {
     };
 
     // Policy ON keeps today's labelled request.
-    let on = request(workspace_labels_allowed(Some(&hint(true))));
+    let on = request(SnapshotUploadPolicy::from_hint(&hint(true)).workspace());
     assert_eq!(on, request(true));
     assert!(on["workspace_label"].is_string());
     assert!(on["repository_label"].is_string());
     // Policy OFF and a failed hint fetch both withhold every label.
     let withheld = request(false);
     assert_eq!(
-        request(workspace_labels_allowed(Some(&hint(false)))),
+        request(SnapshotUploadPolicy::from_hint(&hint(false)).workspace()),
         withheld
     );
-    assert_eq!(request(workspace_labels_allowed(None)), withheld);
+    assert_eq!(
+        request(SnapshotUploadPolicy::MOST_PRIVATE.workspace()),
+        withheld
+    );
     for field in [
         "workspace_label",
         "workspace_label_source",

@@ -30,6 +30,7 @@ use super::{
 };
 use crate::composition_kinds::{Kind, Part};
 use crate::context_footprint::sha256_hex;
+use crate::snapshots::SnapshotUploadPolicy;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,7 +64,7 @@ pub(super) struct UploadTarget<'a> {
     /// Device, machine and server: an upload acknowledged by another
     /// destination does not count here.
     pub(super) destination: &'a str,
-    pub(super) labels_enabled: bool,
+    pub(super) policy: SnapshotUploadPolicy,
     pub(super) details_enabled: bool,
 }
 
@@ -71,10 +72,24 @@ pub(super) struct UploadTarget<'a> {
 pub(super) struct UploadAck {
     #[serde(default)]
     pub(super) details_enabled: bool,
+    /// `None` on an ack from before this field: treated as matching, so an
+    /// upgrade alone does not resend every scope.
+    #[serde(default)]
+    pub(super) names_enabled: Option<bool>,
     pub(super) generation: u64,
     pub(super) state_sha: String,
     pub(super) posted_at: i64,
     pub(super) destination: String,
+}
+
+impl UploadAck {
+    /// Whether the same totals would now upload differently.
+    pub(super) fn upload_shape_changed(&self, target: &UploadTarget) -> bool {
+        self.details_enabled != target.details_enabled
+            || self
+                .names_enabled
+                .is_some_and(|names| names != target.policy.names())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,13 +159,13 @@ pub(super) fn upload_scope(
         .day_generation
         .values()
         .any(|generation| *generation > acked_generation);
-    let capability_changed = ack
+    let shape_changed = ack
         .as_ref()
-        .is_some_and(|ack| ack.details_enabled != target.details_enabled);
-    if !stale && !changed && !capability_changed {
+        .is_some_and(|ack| ack.upload_shape_changed(target));
+    if !stale && !changed && !shape_changed {
         return UploadResult::only(UploadOutcome::Unchanged);
     }
-    let state_sha = state_sha(scope, target.labels_enabled, target.details_enabled);
+    let state_sha = state_sha(scope, target.policy.names(), target.details_enabled);
     if let Some(ack) = ack
         .as_ref()
         .filter(|ack| !stale && ack.state_sha == state_sha)
@@ -186,6 +201,7 @@ pub(super) fn upload_scope(
     };
     let ack = UploadAck {
         details_enabled: target.details_enabled,
+        names_enabled: Some(target.policy.names()),
         generation: scope.generation,
         state_sha,
         posted_at: now_secs,
@@ -354,7 +370,9 @@ pub(super) struct RequestV2 {
     pub(super) collector_version: String,
     pub(super) counter_source: String,
     pub(super) daily_aggregates: Vec<DailyRow>,
-    pub(super) top_files: Vec<FileRow>,
+    /// Omitted, not empty, while names are hidden: `[]` means measured empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_files: Option<Vec<FileRow>>,
     pub(super) sessions: Vec<SessionRow>,
     pub(super) kinds_version: u8,
     pub(super) parts: Vec<PartRow>,
@@ -491,10 +509,11 @@ pub(super) fn build_request(
         })
         .collect();
     let window_start = changed_days.first().copied().unwrap_or(window.today);
-    let labels = target.labels_enabled;
+    let names = target.policy.names();
+    let workspace_labels = target.policy.workspace();
     let identity = &scope.info.identity;
     let mut checked = |label: Option<&String>, safe: fn(&str) -> Option<String>| {
-        let label = label.filter(|_| labels)?;
+        let label = label.filter(|_| workspace_labels)?;
         let safe = safe(label);
         dropped.unsafe_text += u64::from(safe.is_none());
         safe
@@ -508,41 +527,39 @@ pub(super) fn build_request(
         (None, Some(label)) => (Some(label), Some("directory_name".to_string())),
         (None, None) => (None, None),
     };
-    let (sessions, session_count_window, session_count_30d) = build_sessions(
-        scope,
-        window,
-        target.details_enabled && labels,
-        &mut dropped,
-    );
+    let (sessions, session_count_window, session_count_30d) =
+        build_sessions(scope, window, target.details_enabled && names, &mut dropped);
     let short_window = Window {
         floor: window.floor.max(window.today - 6),
         period_floor: window.floor.max(window.today - 6),
         today: window.today,
     };
     let (top_files_7d, sessions_7d, session_count_7d) = if target.details_enabled {
-        let files = build_files(scope, short_window, true, &mut dropped)
-            .into_iter()
-            .map(|row| FileWindowRow {
-                relative_path_or_name: row.relative_path_or_name,
-                category: row.category,
-                part: row.part,
-                events: row.events_30d,
-                tokens_entered_est: row.tokens_entered_est_30d,
-                session_count: row.session_count_30d,
-                last_accessed_at: row.last_accessed_at,
-            })
-            .collect();
-        let (sessions, count, _) = build_sessions(scope, short_window, labels, &mut dropped);
-        (Some(files), Some(sessions), Some(count))
+        let files = names.then(|| {
+            build_files(scope, short_window, true, &mut dropped)
+                .into_iter()
+                .map(|row| FileWindowRow {
+                    relative_path_or_name: row.relative_path_or_name,
+                    category: row.category,
+                    part: row.part,
+                    events: row.events_30d,
+                    tokens_entered_est: row.tokens_entered_est_30d,
+                    session_count: row.session_count_30d,
+                    last_accessed_at: row.last_accessed_at,
+                })
+                .collect()
+        });
+        let (sessions, count, _) = build_sessions(scope, short_window, names, &mut dropped);
+        (files, Some(sessions), Some(count))
     } else {
         (None, None, None)
     };
-    let mut tools = if labels {
+    let mut tools = if names {
         build_tools(scope, window, "30d", true, &mut dropped)
     } else {
         Vec::new()
     };
-    if target.details_enabled && labels {
+    if target.details_enabled && names {
         // Reuse bounded daily totals; no transcript or state-file reads.
         tools.extend(build_tools(scope, short_window, "7d", false, &mut dropped));
     }
@@ -569,10 +586,10 @@ pub(super) fn build_request(
         collector_version: COLLECTOR_VERSION.to_string(),
         counter_source: COUNTER_SOURCE.to_string(),
         daily_aggregates,
-        top_files: build_files(scope, window, false, &mut dropped),
+        top_files: names.then(|| build_files(scope, window, false, &mut dropped)),
         sessions,
         kinds_version: 2,
-        parts: build_parts(scope, window, labels, &mut dropped),
+        parts: build_parts(scope, window, names, &mut dropped),
         tools,
         top_files_7d,
         sessions_7d,

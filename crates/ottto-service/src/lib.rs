@@ -74,6 +74,7 @@ mod transcript_acquisition;
 mod transcript_cache;
 #[cfg(unix)]
 pub mod unix_socket;
+mod upload_policy;
 pub mod upload_receipts;
 pub mod xpc_mach;
 

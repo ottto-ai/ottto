@@ -311,6 +311,29 @@ and skill text never leave the Mac. The context-footprint opt-outs (including
 `<support>/context_footprint/disabled`) apply, and
 `OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
 
+## Readable Labels
+
+The **Readable labels** setting applies only to what is uploaded. Local data stays
+on the Mac either way, and the Mac app keeps showing it.
+
+With Readable labels off:
+
+- Session titles and workspace and repository names are not uploaded.
+- Per-item names are not uploaded: skills, custom agents, memory and instruction
+  files, MCP servers and tools, and the files that entered a session's context.
+  Token totals per category still upload, so "MCP tools use 12k tokens" stays
+  visible without naming a tool.
+- Tool activity keeps its call counts, with every MCP tool counted under one
+  hidden name. Agent roles outside the providers' built-in set are sent as
+  `custom`.
+- The MCP inventory is not collected, so no MCP server is started for it.
+
+Workspace and repository path hashes still upload: they are the identity keys that
+group a user's sessions, and an unchanged path always gives the same hash.
+
+Turning the setting off applies going forward; names uploaded earlier are not
+recalled by the daemon.
+
 ## Live Telemetry
 
 Live telemetry is source-level opt-in. Setup can mint scoped setup keys and

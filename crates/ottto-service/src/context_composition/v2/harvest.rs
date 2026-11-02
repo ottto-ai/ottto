@@ -57,10 +57,9 @@ use super::{
     REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
-use crate::snapshot_client::{
-    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
-};
+use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
+use crate::upload_policy::remembered_policy;
 use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -553,7 +552,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             .issue_relay_token(&device, &device_secret, snapshot_source)
             .ok();
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
-        let mut labels_enabled = workspace_labels_allowed(None);
+        let mut hint_policy = None;
         let mut details_enabled = false;
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
@@ -564,7 +563,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
-                    labels_enabled = workspace_labels_allowed(Some(&hint));
+                    hint_policy = Some(remembered_policy(support_dir, &destination, Some(&hint)));
                     details_enabled = super::upload::details_enabled(
                         hint.context_composition_details_contract.as_deref(),
                     );
@@ -579,6 +578,8 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             health.remove(agent_source_label(snapshot_source));
             continue;
         }
+        let policy =
+            hint_policy.unwrap_or_else(|| remembered_policy(support_dir, &destination, None));
         let mut uploader = relay_token.map(|token| ClientUploader {
             client: &client,
             relay_token: token,
@@ -587,7 +588,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             uploader: uploader as &mut dyn Uploader,
             machine_id: &machine_id,
             destination: &destination,
-            labels_enabled,
+            policy,
             details_enabled,
         });
         let agent = agent_source_label(snapshot_source);
@@ -2614,7 +2615,7 @@ fn upload_other_scopes(
             .filter(|ack| ack.destination == target.destination);
         let due = ack.as_ref().map_or(true, |ack| {
             ack.generation < generation
-                || ack.details_enabled != target.details_enabled
+                || ack.upload_shape_changed(target)
                 || run.now.unix_timestamp() - ack.posted_at >= super::UPLOAD_STALENESS_SECS
         });
         if !due {

@@ -14,14 +14,14 @@ use crate::instruction_inventory::{
 };
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, workspace_labels_allowed, ActivityHintResponse,
-    SnapshotApiClient,
+    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
 };
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
 };
-use crate::snapshots::SnapshotSource;
+use crate::snapshots::{SnapshotSource, SnapshotUploadPolicy};
 use crate::transcript_acquisition::FileObject;
+use crate::upload_policy::{filter_footprint, remembered_policy};
 use anyhow::{anyhow, Result};
 use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
 use serde::{Deserialize, Serialize};
@@ -86,9 +86,9 @@ pub(crate) struct ContextFootprintItemInput {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct ContextFootprintMcpToolInput {
-    name: String,
-    server: String,
-    tokens: u64,
+    pub(crate) name: String,
+    pub(crate) server: String,
+    pub(crate) tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -307,7 +307,6 @@ fn harvest_source(
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
         Ok(hint) => {
-            let workspace_labels_enabled = workspace_labels_allowed(Some(&hint));
             if !hint.context_footprint_harvest_enabled {
                 write_marker(&marker, &identity);
                 return Ok(ContextHarvestOutcome::default());
@@ -320,7 +319,7 @@ fn harvest_source(
                 &identity,
                 home,
                 machine_id,
-                workspace_labels_enabled,
+                remembered_policy(support_dir, &identity, Some(&hint)),
                 inventory_paths(Some(&hint)),
                 projection,
             );
@@ -338,20 +337,25 @@ fn harvest_source(
         &identity,
         home,
         machine_id,
-        workspace_labels_allowed(None),
+        remembered_policy(support_dir, &identity, None),
         inventory_paths(None),
         projection,
     )
 }
 
 /// Instruction paths leave the machine only when the hint explicitly sent
-/// `workspace_labels_enabled: true`. Without a hint, or without that field,
-/// the policy is unknown, so no inventory block is built at all.
+/// `workspace_labels_enabled: true` and names are allowed. Without a hint, or
+/// without that field, the policy is unknown, so no inventory block is built.
 fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths> {
-    match hint?.workspace_labels_explicit? {
-        true => Some(InventoryPaths::Collect),
-        false => Some(InventoryPaths::Withhold),
-    }
+    let hint = hint?;
+    let explicit = hint.workspace_labels_explicit?;
+    Some(
+        if explicit && SnapshotUploadPolicy::from_hint(hint).names() {
+            InventoryPaths::Collect
+        } else {
+            InventoryPaths::Withhold
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,7 +366,7 @@ fn harvest_recent_workspaces(
     identity: &str,
     home: &Path,
     machine_id: &str,
-    workspace_labels_enabled: bool,
+    policy: SnapshotUploadPolicy,
     inventory_paths: Option<InventoryPaths>,
     projection: &CwdProjection,
 ) -> Result<ContextHarvestOutcome> {
@@ -397,14 +401,21 @@ fn harvest_recent_workspaces(
             &workspace.path,
             machine_id,
             &env,
-            workspace_labels_enabled,
+            policy.workspace(),
             inventory_paths,
             include_mcp_servers,
             home,
             salt.as_ref(),
         ) {
-            Ok(request) => {
-                match upload_if_changed(client, relay_token, support_dir, identity, &request) {
+            Ok(mut request) => {
+                match upload_if_changed(
+                    client,
+                    relay_token,
+                    support_dir,
+                    identity,
+                    &mut request,
+                    policy,
+                ) {
                     Ok(true) => uploaded += 1,
                     Ok(false) => skipped += 1,
                     Err(error) => {
@@ -1518,13 +1529,15 @@ struct FootprintCacheEntry {
     posted_at: String,
 }
 
-fn upload_if_changed(
+pub(crate) fn upload_if_changed(
     client: &SnapshotApiClient,
     relay_token: &str,
     support_dir: &Path,
     identity: &str,
-    request: &ContextFootprintIngestRequest,
+    request: &mut ContextFootprintIngestRequest,
+    policy: SnapshotUploadPolicy,
 ) -> Result<bool> {
+    filter_footprint(request, policy);
     let hash = request_content_hash_for_request(request)?;
     let path = cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();
@@ -2144,7 +2157,10 @@ mod tests {
             .unwrap()
         };
         let identity = |hint: Option<&ActivityHintResponse>| {
-            resolve_repository_identity(&repo, workspace_labels_allowed(hint))
+            let policy = hint.map_or(SnapshotUploadPolicy::MOST_PRIVATE, |hint| {
+                SnapshotUploadPolicy::from_hint(hint)
+            });
+            resolve_repository_identity(&repo, policy.workspace())
         };
 
         // Policy ON keeps today's labelled identity.
