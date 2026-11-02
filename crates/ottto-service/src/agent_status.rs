@@ -436,7 +436,6 @@ pub(crate) struct CodexHomeBinding {
 /// `Debug` nor `Serialize`: the access token must stay in memory and never
 /// become diagnostic or persistence material.
 struct ResolvedClaudeSlot {
-    descriptor: ClaudeConfigSlotDescriptorV1,
     account: AgentAccountStatus,
     account_identifier_hash: String,
     organization_identifier_hash: String,
@@ -6026,7 +6025,7 @@ fn collect_registered_claude_slot_step(
         return ClaudeSlotCollectionStep::UpkeepBlocked { status, paused };
     }
     let resolved = match local {
-        Some(local) => resolve_registered_claude_slot_from_local(descriptor.clone(), local),
+        Some(local) => resolve_registered_claude_slot_from_local(local),
         None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
     };
     let mut resolved = match resolved {
@@ -6672,7 +6671,7 @@ fn resolve_registered_claude_slot(
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     let local = read_registered_claude_slot_locally(&descriptor)
         .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
-    resolve_registered_claude_slot_from_local(descriptor, local)
+    resolve_registered_claude_slot_from_local(local)
 }
 
 /// Resolve a registered slot from local metadata alone. `claude auth status`
@@ -6681,7 +6680,6 @@ fn resolve_registered_claude_slot(
 /// same fields are read here directly, so no Claude command runs and nothing
 /// can refresh (or sign out) the login.
 fn resolve_registered_claude_slot_from_local(
-    descriptor: ClaudeConfigSlotDescriptorV1,
     local: ClaudeSlotLocalRead,
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     match local.state {
@@ -6719,7 +6717,6 @@ fn resolve_registered_claude_slot_from_local(
         &account.credential_fingerprint_hash,
     );
     Ok(ResolvedClaudeSlot {
-        descriptor,
         account,
         account_identifier_hash,
         organization_identifier_hash,
@@ -32864,8 +32861,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         }
 
         let resolved = || ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 plan_type: Some("team".to_string()),
@@ -32997,8 +32992,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ]
         });
         let resolved = || ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 plan_type: Some("max".to_string()),
@@ -33169,8 +33162,6 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     #[test]
     fn unavailable_claude_read_keeps_verified_slot_labels_without_quota() {
         let resolved = ResolvedClaudeSlot {
-            descriptor: ClaudeConfigDirSlot::Default
-                .descriptor("default", ClaudeConfigSlotOwnership::External),
             account: AgentAccountStatus {
                 login_state: AgentLoginState::SignedIn,
                 email: Some("test@example.invalid".to_string()),
