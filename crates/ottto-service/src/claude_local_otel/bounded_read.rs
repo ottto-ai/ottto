@@ -80,10 +80,12 @@ impl Input {
             return None;
         }
         bytes.resize(length, 0);
+        crate::local_resource_diagnostics::claude_sidecar_reparse(1, 0);
         after_open();
         let mut offset = 0usize;
         while offset < length {
             let consumed = file.read(&mut bytes[offset..]).ok()?;
+            crate::local_resource_diagnostics::claude_sidecar_reparse(0, consumed as u64);
             if consumed == 0 {
                 return None;
             }
@@ -98,6 +100,7 @@ impl Input {
         }
         let mut sentinel = [0u8; 1];
         let extra = file.read(&mut sentinel).ok()?;
+        crate::local_resource_diagnostics::claude_sidecar_reparse(0, extra as u64);
         #[cfg(test)]
         if matches!(kind, Some(ReadKind::Api)) {
             API_READ_RECEIPT.with(|receipt| {
