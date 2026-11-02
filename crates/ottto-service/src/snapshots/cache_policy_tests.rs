@@ -43,6 +43,7 @@
 //! test limit, decide how many entries fit.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+use crate::snapshots::transcript_acquisition_tests::usage;
 use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
 use crate::transcript_cache::Retained;
 use std::fs::OpenOptions;
@@ -151,22 +152,6 @@ impl ScanFixture {
 impl Drop for ScanFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
-    let timestamp = format!("2026-10-07T{:02}:00:00Z", 10 + id % 3);
-    match source {
-        SnapshotSource::Codex => json!({"type":"event_msg", "timestamp":timestamp,
-            "payload":{"type":"token_count", "info":{"model":model,
-            "total_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10},
-            "last_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10}}}}),
-        SnapshotSource::ClaudeCode => {
-            json!({"type":"assistant", "sessionId":"native-tail-fixture", "timestamp":timestamp,
-            "requestId":format!("req-{id}"), "message":{"id":format!("response-{id}"), "model":model,
-            "usage":{"input_tokens":n,"cache_read_input_tokens":n/2,"output_tokens":n/10}}})
-        }
-        _ => unreachable!(),
     }
 }
 
@@ -1649,7 +1634,7 @@ fn unique_workspace(tag: &str) -> String {
     )
 }
 
-fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+pub(super) fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
     crate::context_footprint::RepositoryIdentity {
         repository_hash: Some(format!("hash-{tag}")),
         repository_label: Some(format!("label-{tag}")),

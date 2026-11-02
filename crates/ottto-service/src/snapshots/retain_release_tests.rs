@@ -5,6 +5,7 @@
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
 use crate::session_attribution::SessionAttributionContext;
+use crate::snapshots::cache_policy_tests::u3_identity;
 use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
 use sampled_scan::test_hooks::{self, Decision, Point, Probe};
 use sampled_scan::{ReleaseOutcome, RetainBudget};
@@ -1185,16 +1186,6 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_account_display: _, // K (None at finish; set post-scan, contract-5 tagging)
         } = item;
     };
-}
-
-fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
-    crate::context_footprint::RepositoryIdentity {
-        repository_hash: Some(format!("hash-{tag}")),
-        repository_label: Some(format!("label-{tag}")),
-        repository_label_source: Some("git_remote".to_string()),
-        repository_identity_source: Some("git".to_string()),
-        workspace_kind: Some("git_repo".to_string()),
-    }
 }
 
 /// X_out family U3 control (c22 amendment 2): a cold or expired cache entry

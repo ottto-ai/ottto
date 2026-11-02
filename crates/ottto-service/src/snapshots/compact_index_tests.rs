@@ -2,6 +2,7 @@
 // every reader accepts both the older pretty files and the compact ones, and
 // the restart hold admission is measured on the exact bytes the save writes.
 // Synthetic fixtures only.
+use super::lenient_decode_tests::raw_slot;
 use super::*;
 use std::io::Cursor;
 
@@ -84,14 +85,6 @@ fn synthetic_index(families: usize) -> ScanIndex {
         );
     }
     index
-}
-
-fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
-    let root: BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_slice(bytes).unwrap();
-    let slots: BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_str(root[field].get()).unwrap();
-    slots[key].get().to_owned()
 }
 
 fn assert_same_state(actual: &ScanIndex, expected: &ScanIndex, label: &str) {

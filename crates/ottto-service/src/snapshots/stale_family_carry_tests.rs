@@ -7,6 +7,7 @@
 // `starting` row. A BASE arm runs the same start under
 // `KeepStaleClaudeFamilyRearmForTest`, which carries nothing. Fixtures are
 // synthetic and content-free.
+use super::census_convergence_tests::occurrence as carry_occurrence;
 use super::*;
 
 const CARRY_FAILED: &str = "2026-08-02T07:10:00Z";
@@ -26,21 +27,6 @@ fn carry_key(root: &str, subagent: Option<&str>) -> String {
 
 fn carry_member(root: &str, subagent: Option<&str>) -> String {
     subagent.map_or_else(|| root.to_string(), |stem| format!("{root}_{stem}"))
-}
-
-fn carry_occurrence(sequence: u64, output_tokens: u64) -> ClaudeTranscriptUsageOccurrenceWitness {
-    ClaudeTranscriptUsageOccurrenceWitness {
-        sequence,
-        input_tokens: 10,
-        output_tokens,
-        cache_read_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        reasoning_output_tokens: 0,
-        model: Some("model-a".to_string()),
-        speed_mode: None,
-        reasoning_effort: None,
-    }
 }
 
 /// One committed, accepted file for a family member.

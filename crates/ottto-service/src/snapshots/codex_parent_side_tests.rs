@@ -519,29 +519,10 @@ fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
 
 fn file_entry() -> ScanIndexEntry {
     ScanIndexEntry {
-        codex_fragment: None,
         size_bytes: 42,
         modified_unix_seconds: 1_700_000_000,
-        modified_unix_nanos: None,
         source_file_fingerprint: "sha256:test".to_string(),
-        last_snapshot_fingerprint: None,
-        last_upload_body_witness: None,
-        effective_upload_body_witness_revision: 0,
-        scan_identity_version: None,
-        codex_joined_member_set: None,
-        codex_captured_joined_member_set: None,
-        codex_protected_owner: None,
-        codex_applied_tier_receipt: None,
-        codex_applied_tier_receipt_required: false,
-        codex_captured_tier_receipt: None,
-        codex_captured_tier_receipt_required: false,
-        codex_captured_uncommitted: false,
-        codex_counting_v2: false,
-        codex_counting_owner: None,
-        opened_changed_nanos: 0,
-        opened_birth_nanos: 0,
-        upload_context_receipt: None,
-        evidence_owed: false,
+        ..ScanIndexEntry::default()
     }
 }
 
