@@ -1574,6 +1574,8 @@ fn pi_native_receipt_restores_tail(f: &PiLiveFixture) {
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_e4_receipted_captures_and_posts() {
+    // The native durable stage runs only with restart restore on.
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
