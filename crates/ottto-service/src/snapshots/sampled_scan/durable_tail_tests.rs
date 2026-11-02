@@ -8915,13 +8915,14 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         assert!(!cache.upgrade_full_allowed(source, &key, &file, &index, &mut full_files));
         let writable = fs::OpenOptions::new().write(true).open(&path).unwrap();
         writable.set_len(512 * 1024 * 1024 + 1).unwrap();
-        // The first unit progresses above the retired file cap; busy-page refusals above remain.
-        assert!(cache.upgrade_full_allowed(
+        // Probe first-unit admission above the retired cap without spending the later pace check.
+        assert!(cache.upgrade_full_admission(
             source,
             &key,
             &file,
             &index,
-            &mut HistoryPage::default()
+            &mut HistoryPage::default(),
+            false,
         ));
         writable.set_len(6).unwrap();
         {
