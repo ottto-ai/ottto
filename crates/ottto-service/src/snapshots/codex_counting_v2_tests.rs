@@ -732,7 +732,7 @@ fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
 }
 
 #[test]
-fn codex_v2_equal_total_repeat_is_dropped_and_legacy_is_unchanged() {
+fn codex_v2_and_legacy_drop_the_same_equal_total_repeat() {
     let values = [
         header(POST),
         started("2026-10-18T10:00:01Z", "turn-1"),
@@ -741,7 +741,9 @@ fn codex_v2_equal_total_repeat_is_dropped_and_legacy_is_unchanged() {
         ui("2026-10-18T10:00:20Z", S1, S1),
         aborted("2026-10-18T10:00:21Z", "turn-1"),
     ];
-    assert_eq!(legacy(&values).money(), five(sum(S1, S1)));
+    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
+    assert!(!selected_legacy.v2);
+    assert_eq!(selected_legacy.money(), five(S1));
     let counted = v2(&values);
     assert_eq!(counted.money(), five(S1));
     assert_eq!(counted.counters().ui_equal_total_repeat, 1);
@@ -766,6 +768,70 @@ fn codex_v2_real_reset_counts_first_post_reset_last() {
     assert_eq!(counted.money(), expected);
     assert_eq!(counted.counters().ui_equal_total_repeat, 0);
     assert_eq!(legacy(&values).money(), expected);
+    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
+    assert_eq!(selected_legacy.money(), expected);
+    assert_eq!(selected_legacy.counters().ui_equal_total_repeat, 0);
+}
+
+/// [regress] A pre-cutover (Legacy) session counted a re-emitted `token_count`
+/// with the same `last` and total and a new timestamp twice. The repeat gate's
+/// state survives a durable save and restore and the session stays Legacy.
+#[test]
+fn codex_legacy_equal_total_reemission_counts_once_across_restore() {
+    let lines = [
+        header(PRE),
+        started("2026-09-01T10:00:01Z", "turn-1"),
+        context("2026-09-01T10:00:02Z", "turn-1"),
+        ui("2026-09-01T10:00:15Z", S1, S1),
+        ui("2026-09-01T10:00:20Z", S1, S1),
+        completed("2026-09-01T10:00:21Z", "turn-1"),
+    ];
+    let cold = run(&lines, Some(AckEvidence::None));
+    assert!(!cold.v2);
+    assert_eq!(cold.money(), five(S1));
+    assert_eq!(cold.counters().ui_equal_total_repeat, 1);
+    assert_eq!(cold.counters().ui_equal_total_repeat_usage, S1);
+
+    use crate::durable_tail_codec::{Dec, Durable, Enc};
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    for value in &lines[..4] {
+        apply_codex_line(value, &mut accumulator);
+    }
+    let saved = accumulator.codex_counting.take().expect("configured");
+    assert!(
+        saved.counters().is_some(),
+        "the first counted UI line allocates the slot"
+    );
+    let mut e = Enc::bytes(1 << 20);
+    saved.put(&mut e).unwrap();
+    let body = e.into_bytes();
+    let restored =
+        codex_usage_occurrence::CodexCounting::take(&mut Dec::new(&body)).expect("decode");
+    let fresh = codex_usage_occurrence::CodexCounting::new(AckEvidence::None, Some(CUTOVER));
+    assert!(codex_counting_version::reusable(
+        Some(&restored),
+        Some(&fresh)
+    ));
+    accumulator.codex_counting = Some(Box::new(restored));
+    assert!(
+        !accumulator.codex_counting_v2(),
+        "the slot never selects V2"
+    );
+    for value in &lines[4..] {
+        apply_codex_line(value, &mut accumulator);
+    }
+    assert!(!accumulator.codex_counting_v2());
+    let path = PathBuf::from(format!(
+        "/synthetic/sessions/rollout-2026-10-18T10-00-00-{SESSION}.jsonl"
+    ));
+    let item = accumulator
+        .into_items(&path, "2026-10-21T00:00:00Z", "fp".into(), None)
+        .pop()
+        .expect("item");
+    assert_eq!(item.input_tokens, S1[0]);
+    assert_eq!(item.output_tokens, S1[3]);
+    assert_eq!(item.reasoning_output_tokens, S1[4]);
 }
 
 #[test]
@@ -1073,8 +1139,19 @@ fn codex_v2_legacy_selection_is_byte_identical_to_unconfigured_parse() {
         let fixture = values(timestamp);
         let selected = run(&fixture, Some(evidence));
         assert!(!selected.v2);
-        assert!(selected.counters.is_none());
-        assert_eq!(selected.wire(), legacy(&fixture).wire());
+        // The unconfigured parse of the same lines, less the one equal-total
+        // re-emission the shared repeat gate drops. Natives stay V2-only.
+        assert_eq!(
+            selected.counters,
+            Some(OccurrenceCounters {
+                ui_equal_total_repeat: 1,
+                ui_equal_total_repeat_usage: S2_FIRST,
+                ..Default::default()
+            })
+        );
+        let mut without_reemission = fixture.clone();
+        without_reemission.remove(5);
+        assert_eq!(selected.wire(), legacy(&without_reemission).wire());
     }
 }
 

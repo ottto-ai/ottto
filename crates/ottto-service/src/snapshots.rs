@@ -21212,8 +21212,8 @@ impl SnapshotAccumulator {
         // correct across compaction/restart resets. Older rollouts lack it; in
         // that case use a cumulative delta, beginning a new additive epoch on
         // a reset. Never erase usage already accepted from the same rollout.
-        let mut delta = match last_usage {
-            Some(last) => last,
+        let mut delta = match &last_usage {
+            Some(last) => last.clone(),
             None => match &previous {
                 Some(previous) if !reset => usage.delta_from(previous),
                 Some(_) | None => usage.clone(),
@@ -21225,6 +21225,11 @@ impl SnapshotAccumulator {
             }
         }
         if delta.is_zero() {
+            return None;
+        }
+        // The V2 equal-total repeat gate: a re-emitted line with the same
+        // `last` and total as the previous counted one is not a new request.
+        if self.codex_legacy_ui_repeat(last_usage, usage, &delta) {
             return None;
         }
         Some((resolved_model, delta))
