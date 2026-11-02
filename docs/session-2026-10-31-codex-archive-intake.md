@@ -26,10 +26,10 @@ reservations for the page before any Full body bytes. Decoder allocation is prep
 existing shared cache. The same native parser continues in RAM across decoded
 pages to EOF; a process restart loses that checkpoint.
 
-Power, CPU, contention and byte-budget refusal before a Full remain eligible on
+Power, contention and byte-budget refusal before a Full remain eligible on
 the next pass. A spent Full keeps its saved six-hour retry deadline. An unchanged
 structural cause does not trigger another Full. Parent support and same-session
-union bodies are follow-up work. The archive CPU/work allowance gates admission
+union bodies are follow-up work. The archive wall-work allowance gates admission
 of the next archive; a started Full retains its RAM parser to EOF. Unconsumed
 reservations cancel without a Full penalty. Power is sampled once per page.
 Caps retain owed discovery and disclose refusal.
@@ -65,7 +65,7 @@ Known missing archives retire their markers. Unknown collection metadata has one
 named, non-path debt marker; typed records are checked on load.
 
 A started Full retains the native RAM parser across decoded-byte pages and runs
-to EOF. Work/CPU allowances gate the next admission, never discard a started
+to EOF. Wall-work allowances gate the next admission, never discard a started
 parser. Live content, archive and directory witnesses are rechecked for each
 archive at admission and publication; only immutable coverage is memoized.
 One damaged or unknown header defers every archive uniqueness proof. Resource

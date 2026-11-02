@@ -650,15 +650,7 @@ impl HeaderInventory {
             match result {
                 Ok(Some(h)) => self.archive_headers.push(h),
                 Err(error) => {
-                    let change = if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        ArchiveTransition::Gone
-                    } else {
-                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                    };
-                    index.archive_transition(&path, change);
+                    index.archive_io_error(&path, error.downcast_ref::<std::io::Error>());
                     self.archive_complete = false;
                 }
                 Ok(None) => self.archive_complete = false,

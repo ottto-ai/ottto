@@ -106,26 +106,27 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         snapshot_quarantine_witness(SnapshotSource::Codex),
     );
     progress.save(&progress_path).unwrap();
-    let status = test_agent_status(SourceKind::Codex);
+    let fixture = ContinuationFixture {
+        home: root.join("home"),
+        support_dir: support.clone(),
+        index_path: path.clone(),
+        upload_progress_path: progress_path.clone(),
+    };
     let preparation = SourcePreparation {
-            native_comparison_reservation: None, native_comparison_lease: None,
-            prepared_claude_evidence: None, terminal_native_traversal: None,
-            native_comparison_controller: None, retry_authority: None,
-            source: SnapshotSource::Codex, claude_scan_roots: None,
-            account_witness: daemon.snapshot_scan_account_witness().unwrap(),
-            scan_started_at: scan.census_window_end.clone(),
-            activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,
-                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
-                "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
-            receipt_window_days: 7, cache_observations_enabled: false,
-            scan_agent_status_collection: Some(Arc::new(AgentStatusCollection { snapshots: vec![status.clone()], source_health_snapshot: status, codex_scan_homes: Vec::new(), codex_home_bindings: Vec::new() })),
-            attribution_context: None, upload_policy: SnapshotUploadPolicy::default(),
-            upload_destination_namespace: destination.clone(), receipt_client: client.clone(),
-            index_path: path.clone(), upload_progress_path: progress_path.clone(),
-            upload_progress: progress, committed_index: index.clone(),
-            backfill_state: load_backfill_state(&support), backfill_pending: true,
-            legacy_reconciliation_pending: BTreeSet::new(), active_legacy_reconciliation: BTreeSet::new(), scan: None,
-        };
+        account_witness: daemon.snapshot_scan_account_witness().unwrap(),
+        scan_started_at: scan.census_window_end.clone(),
+        activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,
+            "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
+            "backfill_window_days":7,"recommended_scan_after":"2026-10-07T12:00:00Z"})).unwrap(),
+        receipt_window_days: 7,
+        upload_destination_namespace: destination.clone(),
+        receipt_client: client.clone(),
+        upload_progress: progress,
+        committed_index: index.clone(),
+        backfill_state: load_backfill_state(&support),
+        backfill_pending: true,
+        ..fixture.preparation(false)
+    };
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     finish_sync_source(
