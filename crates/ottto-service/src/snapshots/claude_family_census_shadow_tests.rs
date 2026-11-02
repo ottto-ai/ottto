@@ -43,7 +43,6 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         oversized_discovery: BTreeMap::new(),
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
-        context_inputs: None,
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
     }

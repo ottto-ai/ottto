@@ -146,10 +146,9 @@ pub(crate) fn encode(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let source =
-        crate::durable_tail_store::DurableSource::from_snapshot(reduction.accumulator.source)
-            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
-    (source.properties().encode)(reduction, limit, line_cap)
+    crate::durable_tail_store::DurableSource::from_snapshot(reduction.accumulator.source)
+        .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
+    encode_body(reduction, limit, line_cap)
 }
 
 #[cfg(test)]
@@ -300,8 +299,7 @@ pub(crate) struct Decoded {
 #[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
-    let row = source.properties();
-    (row.decode)(body, row.snapshot)
+    decode_body(body, source.properties().snapshot)
 }
 
 #[cfg(test)]
