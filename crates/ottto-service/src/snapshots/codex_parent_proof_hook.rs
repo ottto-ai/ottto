@@ -278,16 +278,17 @@ pub(super) fn codex_parent_proof_step(
                 )
             }
         };
-    // Memory (R2-B1, rev 5/6 §5.1): every step must fit the proof's room
-    // less the rest of the job (`run` re-checks the readers before each).
-    let room = codex_proof_readers_room(context, lease.job());
     let mut budget = page.singleton_remaining(Limits::current());
-    let before = budget;
-    let run = match lease.job().readers.as_deref_mut() {
-        Some(readers) => readers.run(&mut budget, room),
-        None => CodexProofRun::Done,
+    let (run, read) = match lease.job().readers.as_deref_mut() {
+        Some(readers) => {
+            let before = readers.consumed;
+            let run = readers.run(&mut budget);
+            (run, readers.consumed.saturating_sub(before))
+        }
+        None => (CodexProofRun::Done, 0),
     };
-    page.charge(false, before.saturating_sub(budget));
+    // Charge the entire completed record, including bytes past the yield target.
+    page.charge(false, read);
     // R2-B2: a job dropped for memory or the holder backs every entry off
     // (`after_attempt` paces the restart).
     let entries = lease.job().entries.clone();
@@ -306,11 +307,6 @@ pub(super) fn codex_parent_proof_step(
         }
     };
     match run {
-        CodexProofRun::Memory => {
-            count(Event::ProofDrop);
-            lease.finish();
-            back_off(index, ProofOutcome::StepRefusedMemory);
-        }
         CodexProofRun::Done if census_valid && side_allowed => {
             // R2-L3: P's side fence and the commit's samples.
             page.charge(false, PROOF_FENCE_READ_BYTES);
@@ -351,19 +347,6 @@ fn forget_proven_hold_memos<'a>(
                 ));
         }
     }
-}
-
-/// R2-B1: the room `run` checks the readers against: `proof_room` less the
-/// job's walk outside its readers. None fits: 0 (no step).
-fn codex_proof_readers_room(context: &sampled_scan::Context, job: &ProofJob) -> usize {
-    let walked = crate::heap_layout_bound::bound(job, usize::MAX);
-    let readers = job.readers.as_deref().map_or(Some(0), |readers| {
-        crate::heap_layout_bound::bound(readers, usize::MAX)
-    });
-    sampled_scan::codex_cursor::proof_room(context)
-        .zip(walked.zip(readers))
-        .and_then(|(room, (walked, readers))| room.checked_sub(walked.saturating_sub(readers)))
-        .unwrap_or(0)
 }
 
 /// The outcome a P side fence that did not admit gives every entry.

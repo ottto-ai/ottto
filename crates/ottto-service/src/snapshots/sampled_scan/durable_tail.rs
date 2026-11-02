@@ -5023,7 +5023,6 @@ impl SharedCache {
                 match codec::encode_permitted(
                     &retained.state,
                     budget.min(store::BODY_BYTES),
-                    jsonl_line_cap() as u64,
                     skill_labels_enabled,
                 ) {
                     Ok(body) => {

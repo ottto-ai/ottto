@@ -192,7 +192,6 @@ fn each_source_admits_its_exact_file_cap_and_refuses_one_more_byte() {
             }
         }
     }
-    assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
 }
 
 #[test]

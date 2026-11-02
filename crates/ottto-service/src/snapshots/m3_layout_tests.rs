@@ -352,7 +352,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    with_test_line_cap(64 * 1024, || {
+    {
         with_unsupported_layout_for_test(|| {
             let f = Fixture::new();
             let mut initial = f.scan(ScanIndex::default(), None).index;
@@ -361,12 +361,15 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             let record = f.seed_record_with_debt(&initial, Some(due));
             let original = fs::read(&record).unwrap();
             use std::io::Write;
-            // Retryable malformed JSON quarantines the whole entity. Use the
-            // existing terminal over-cap case, which settles healthy siblings but
-            // cannot verify their source history. Charges retain the production cap.
+            // A current valid read followed by a historical persisted loss marker.
+            // GC must preserve the saved carrier independently of the old refusal.
             let mut transcript = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
             transcript
-                .write_all(&vec![b'x'; jsonl_line_cap() + 1])
+                .write_all(
+                    json!({"type":"ignored", "padding":"x".repeat(65537)})
+                        .to_string()
+                        .as_bytes(),
+                )
                 .unwrap();
             transcript.write_all(b"\n").unwrap();
             transcript.write_all(Fixture::line(2).as_bytes()).unwrap();
@@ -376,8 +379,8 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             let mut read = f.scan(initial, Some(cache.clone()));
             assert_eq!(read.modes, (1, 0, 0));
             assert_eq!(read.bytes, fs::metadata(&f.path).unwrap().len());
-            assert_eq!(read.scan.over_line_cap_count, 1);
-            assert_eq!(read.scan.terminal_over_line_cap_count, 1);
+            assert_eq!(read.scan.over_line_cap_count, 0);
+            assert_eq!(read.scan.terminal_over_line_cap_count, 0);
             assert_eq!(read.scan.malformed_json_line_count, 0);
             assert_eq!(read.scan.snapshots.len(), 1);
             assert_eq!(read.scan.snapshots[0].input_tokens, 300);
@@ -392,6 +395,19 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
                 snapshot_upload_body_witness(&cold.scan.snapshots[0])
             );
             let key = f.key();
+            // Checked historical completed-loss marker, independent of current parsing.
+            read.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .scan_identity_version = Some(
+                serde_json::from_str(r#""semantic_sync:v2+sampled_unverified:v2:1:c""#).unwrap(),
+            );
+            read.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .set_unverified_deadline(due);
             let carrier = read.index.files[&key]
                 .unverified_deadline()
                 .expect("lossy selection cannot discharge A's audit debt");
@@ -399,8 +415,12 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
             let (counts, _) = cache.durable_counters(SOURCE).unwrap();
             assert_eq!(counts.ineligible["restore_unavailable.layout"], 1);
             assert_eq!(
-                counts.ineligible["restore_unavailable.layout.read_failed"],
-                1
+                counts
+                    .ineligible
+                    .get("restore_unavailable.layout.read_failed")
+                    .copied()
+                    .unwrap_or(0),
+                0
             );
 
             // Without a persisted carrier, even an actual lossy read is not
@@ -505,7 +525,7 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
                 Some(carrier)
             );
         })
-    });
+    };
 }
 
 /// Retryable JSON corruption withholds a replacement; it may neither emit $0

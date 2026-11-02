@@ -115,12 +115,8 @@ fn restart_over(name: &str, stale: Option<bool>) -> Restarted {
                     acquisition: super::tests::fixture_acquisition(SOURCE),
                     binding,
                     certificate,
-                    body: codec::encode(
-                        &native_record(&path, &scope).0,
-                        store::BODY_BYTES,
-                        jsonl_line_cap() as u64,
-                    )
-                    .unwrap(),
+                    body: codec::encode(&native_record(&path, &scope).0, store::BODY_BYTES)
+                        .unwrap(),
                     allowlist: codec::allowlist_digest(SOURCE),
                 }],
             )
@@ -365,7 +361,7 @@ fn failed_write_case(fail: bool) {
         while !parser.step().unwrap() {}
         let bytes = parser.reader.consumed_bytes();
         let reduction = parser.durable_test_reduction_copy();
-        let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+        let body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
         let sampled_jsonl::SideCertificate::Certified { mut completed, .. } = parser
             .certify_without_retention(&scope, 1_800_000_000)
             .unwrap()

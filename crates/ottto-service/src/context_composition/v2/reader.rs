@@ -1,10 +1,9 @@
-//! Bounded line reader.
+//! Whole-line reader with a frozen file extent.
 //!
 //! Reads a transcript from a saved offset up to the length the file had when
 //! the read started, so bytes appended during the read wait for the next run.
 //! Only lines that end in `\n` are handed out; a partial last line stays
-//! unread. A line longer than the guard is skipped to its end and counted,
-//! even across runs (the checkpoint keeps the skipping flag).
+//! unread. Size alone never skips a record.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -23,15 +22,11 @@ impl Read for ReaderFile {
     }
 }
 
-/// Lines longer than this are skipped, never buffered.
-pub(super) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const READ_BUFFER_BYTES: usize = 256 * 1024;
 
 pub(super) enum LineEvent<'a> {
     /// A complete line, without its `\n`.
     Line(&'a [u8]),
-    /// A line over the guard started here; it is skipped to its end.
-    TooLong,
 }
 
 pub(super) struct LineReader {
@@ -41,23 +36,17 @@ pub(super) struct LineReader {
     /// The length at open: nothing past it is read.
     end: u64,
     line: Vec<u8>,
-    skipping: bool,
-    max_line: usize,
+    parse_file: Option<[u8; 32]>,
 }
 
 impl LineReader {
-    pub(super) fn open(file: File, offset: u64, end: u64, skipping: bool) -> std::io::Result<Self> {
-        Self::with_guard(file, offset, end, skipping, MAX_LINE_BYTES)
-    }
-
-    pub(super) fn with_guard(
+    pub(super) fn open(
         file: File,
         offset: u64,
         end: u64,
-        skipping: bool,
-        max_line: usize,
+        _skipping: bool,
     ) -> std::io::Result<Self> {
-        Self::with_buffer(file, offset, end, skipping, max_line, READ_BUFFER_BYTES)
+        Self::with_buffer(file, offset, end, READ_BUFFER_BYTES)
     }
 
     /// Small head probes should not prefetch the daily reader's large buffer.
@@ -65,10 +54,19 @@ impl LineReader {
         mut file: File,
         offset: u64,
         end: u64,
-        skipping: bool,
-        max_line: usize,
         capacity: usize,
     ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let parse_file = file.metadata().ok().map(|metadata| {
+            use sha2::{Digest, Sha256};
+            use std::os::unix::fs::MetadataExt;
+            let mut hash = Sha256::new();
+            hash.update(metadata.dev().to_le_bytes());
+            hash.update(metadata.ino().to_le_bytes());
+            hash.finalize().into()
+        });
+        #[cfg(not(unix))]
+        let parse_file = None;
         file.seek(SeekFrom::Start(offset))?;
         // Bound prefetch too: a file may grow after the length was pinned.
         let file = file.take(end.saturating_sub(offset));
@@ -79,8 +77,7 @@ impl LineReader {
             pos: offset,
             end: end.max(offset),
             line: Vec::new(),
-            skipping,
-            max_line,
+            parse_file,
         })
     }
 
@@ -91,7 +88,7 @@ impl LineReader {
 
     /// Whether the reader stopped inside an over-long line.
     pub(super) fn skipping(&self) -> bool {
-        self.skipping
+        false
     }
 
     /// Bytes held for the current line (for memory accounting).
@@ -99,61 +96,39 @@ impl LineReader {
         self.line.capacity() + self.reader.capacity()
     }
 
+    pub(super) fn record_parse_result(&self, failed: bool) {
+        if let Some(file) = self.parse_file {
+            crate::local_resource_diagnostics::jsonl::parse_result(
+                file,
+                self.pos.saturating_sub(self.line.len() as u64 + 1),
+                failed,
+            );
+        }
+    }
+
     /// The next event, or `None` when no complete line remains before the
     /// length at open.
     pub(super) fn next_event(&mut self) -> std::io::Result<Option<LineEvent<'_>>> {
-        if self.skipping && !self.skip_to_line_end()? {
-            return Ok(None);
-        }
         self.line.clear();
+        if self.line.capacity() > 64 * 1024 {
+            self.line.shrink_to(64 * 1024);
+        }
         let remaining = self.end - self.pos;
         if remaining == 0 {
             return Ok(None);
         }
-        let limit = remaining.min(self.max_line as u64 + 1);
         let read = (&mut self.reader)
-            .take(limit)
+            .take(remaining)
             .read_until(b'\n', &mut self.line)?;
+        // Composition decodes borrowed views, rather than owning a full JSON DOM.
+        crate::local_resource_diagnostics::jsonl::parse_peak(self.buffer_bytes(), None);
         if self.line.last() == Some(&b'\n') {
             self.pos += read as u64;
             self.line.pop();
+            crate::local_resource_diagnostics::jsonl::line(self.line.len());
             return Ok(Some(LineEvent::Line(&self.line)));
-        }
-        if read as u64 == limit && limit > self.max_line as u64 {
-            // Over the guard: consume what was read and skip the rest of the
-            // line, now or in a later run.
-            self.pos += read as u64;
-            self.line.clear();
-            self.line.shrink_to(64 * 1024);
-            self.skipping = true;
-            return Ok(Some(LineEvent::TooLong));
         }
         // A partial last line (or the file shrank under us): leave it.
         Ok(None)
-    }
-
-    /// Consume bytes up to and including the next `\n`. Returns false when
-    /// the length at open is reached first.
-    fn skip_to_line_end(&mut self) -> std::io::Result<bool> {
-        while self.pos < self.end {
-            let available = self.reader.fill_buf()?;
-            if available.is_empty() {
-                return Ok(false);
-            }
-            let window = available.len().min((self.end - self.pos) as usize);
-            match available[..window].iter().position(|byte| *byte == b'\n') {
-                Some(index) => {
-                    self.reader.consume(index + 1);
-                    self.pos += index as u64 + 1;
-                    self.skipping = false;
-                    return Ok(true);
-                }
-                None => {
-                    self.reader.consume(window);
-                    self.pos += window as u64;
-                }
-            }
-        }
-        Ok(false)
     }
 }

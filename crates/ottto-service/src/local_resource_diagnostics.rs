@@ -6,6 +6,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod jsonl;
+
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
 /// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
 /// test-only `observe` seam.
@@ -1045,6 +1047,7 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
+        jsonl::emit_page(source, self);
     }
 }
 
