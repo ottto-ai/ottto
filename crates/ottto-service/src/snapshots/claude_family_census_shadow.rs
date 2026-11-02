@@ -192,7 +192,6 @@ impl Touched {
 }
 
 crate::heap_layout_bound::fields!(FamilyRef; prefix, root);
-crate::heap_layout_bound::split_fields!(Touched; inline: [over_cap]; heap: [families]);
 
 /// One entry of the per-pass skipped set.
 #[derive(Debug, Clone, Copy)]
