@@ -56,9 +56,12 @@ fn live_keys(index_path: &Path) -> Result<LiveKeys> {
     else {
         return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
-    // A source without a durable_sources row (Pi until Pi-ON) never vouches
-    // for an empty set: a sweep would erase every record it later gains.
-    let Some(source) = DurableSource::from_snapshot(binding.source.snapshot()) else {
+    // A source the store does not serve (no row, or a row without `state_v2`)
+    // never vouches for an empty set: a sweep would erase every record it
+    // later gains.
+    let Some(source) = DurableSource::from_snapshot(binding.source.snapshot())
+        .filter(|source| source.properties().state_v2)
+    else {
         return Ok(LiveKeys::incomplete(IncompleteReason::Off));
     };
     let route = {

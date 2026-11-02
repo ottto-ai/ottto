@@ -17,12 +17,10 @@ pub(super) fn binding(source: Source) -> super::super::scan_index_persistence::B
 
 /// Synthetic v1 file name that `scan_index_storage_binding` binds to `source`.
 pub(super) fn synthetic_file(source: Source, suffix: &str) -> String {
-    let slug = match source {
-        Source::Claude => "claude_code",
-        Source::Codex => "codex",
-        Source::Pi => "pi",
-    };
-    format!("{slug}-synthetic-scan-index{suffix}")
+    format!(
+        "{}-synthetic-scan-index{suffix}",
+        source.snapshot().api_slug()
+    )
 }
 
 pub(super) fn populate(
