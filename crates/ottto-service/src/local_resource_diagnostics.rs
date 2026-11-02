@@ -1183,6 +1183,37 @@ pub(crate) fn source_finish<T>(
     });
     result
 }
+/// Best-effort all-arena purge, measured separately and within source_finish.
+#[cfg(target_os = "macos")]
+pub(crate) fn purge_allocator(source: &str) {
+    if !crate::uses_jemalloc() {
+        return;
+    }
+    let probe = Probe::start();
+    let mut mib = [0; 3];
+    // ctl resolves the command; sys invokes it with no input/output buffers.
+    // raw::write(..., ()) supplies a non-null newp, which purge rejects.
+    // SAFETY: this resolved command takes no input/output buffers.
+    let failed = tikv_jemalloc_ctl::raw::name_to_mib(b"arena.4096.purge\0", &mut mib).is_err()
+        || unsafe {
+            tikv_jemalloc_sys::mallctlbymib(
+                mib.as_ptr(),
+                mib.len(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+        };
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "allocator_purge",
+        source: Source::from_slug(source),
+        observation: probe.stage_observation(None),
+        counts: serde_json::json!({"purge_errors": u64::from(failed)}),
+    });
+}
 /// Named footprint window inside a source stage. One record with empty counts
 /// when dropped normally; unwinding emits nothing, like `source_finish`.
 pub(crate) struct StageWindow {

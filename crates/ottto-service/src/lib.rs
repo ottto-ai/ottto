@@ -82,6 +82,26 @@ pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_
 #[cfg(unix)]
 pub use ottto_core::state_dir_lock;
 
+
+// Library consumers retain System unless their binary explicitly opts in.
+#[cfg(target_os = "macos")]
+static JEMALLOC_SIZE_QUERIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(test));
+
+/// Enable size queries for the service binary's allocator.
+///
+/// # Safety
+/// The process global allocator must delegate all Rust allocations to Jemalloc.
+#[cfg(target_os = "macos")]
+pub unsafe fn enable_jemalloc_size_queries() {
+    JEMALLOC_SIZE_QUERIES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn uses_jemalloc() -> bool {
+    JEMALLOC_SIZE_QUERIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
 use ottto_core::{

@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
+#[cfg(all(target_os = "macos", not(test)))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(unix)]
 mod service_bootstrap;
 
@@ -206,6 +210,11 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    // SAFETY: this binary installs Jemalloc for every Rust allocation.
+    unsafe {
+        ottto_service::enable_jemalloc_size_queries()
+    };
     let cli = Cli::parse();
     // Administrative planning exits before Keychain or daemon initialization.
     if let Some(Command::ClaudeCopyPrefixReread {

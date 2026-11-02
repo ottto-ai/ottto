@@ -1,6 +1,10 @@
 // Test-only requested/usable allocator probe, per test thread.
-use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(not(target_os = "macos"))]
+use std::alloc::System as Delegate;
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
+use tikv_jemallocator::Jemalloc as Delegate;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Stats {
@@ -22,16 +26,10 @@ thread_local! {
     static PHASE_PEAK: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn malloc_size(ptr: *const std::ffi::c_void) -> usize;
-}
-
 unsafe fn usable(ptr: *const std::ffi::c_void, requested: usize) -> usize {
     #[cfg(target_os = "macos")]
     {
-        let _ = requested;
-        malloc_size(ptr)
+        tikv_jemalloc_sys::sallocx(ptr, 0).max(requested)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -100,7 +98,7 @@ fn record_reallocation(old: usize, old_usable: usize, new: Option<(usize, usize)
 
 unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
+        let ptr = Delegate.alloc(layout);
         if !ptr.is_null() {
             process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
             record(
@@ -118,7 +116,7 @@ unsafe impl GlobalAlloc for Probe {
             -(usable(ptr.cast(), layout.size()) as isize),
             false,
         );
-        System.dealloc(ptr, layout);
+        Delegate.dealloc(ptr, layout);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let old_usable = usable(ptr.cast(), layout.size());
@@ -401,14 +399,14 @@ mod process {
         layout: std::alloc::Layout,
         requested: usize,
     ) -> *mut u8 {
-        // Keep the table locks (always process, then caller) across System's
+        // Keep the table locks (always process, then caller) across the delegate's
         // native realloc: another thread may immediately reuse the old address
-        // after System frees it.
+        // after the delegate frees it.
         let (mut process, mut caller) = (PROCESS.active(), CALLER.active());
         if process.is_none() && caller.is_none() {
-            return System.realloc(old, layout, requested);
+            return super::Delegate.realloc(old, layout, requested);
         }
-        let new = System.realloc(old, layout, requested);
+        let new = super::Delegate.realloc(old, layout, requested);
         if !new.is_null() {
             let usable = super::usable(new.cast(), requested);
             if let Some(audit) = process.as_deref_mut() {

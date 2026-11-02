@@ -1,5 +1,5 @@
-//! Native decoder allocations spend the already admitted credit. Darwin's
-//! allocator size classes, rather than ZSTD_sizeof_DCtx, determine the charge.
+//! Native decoder allocations spend the already admitted credit. The active
+//! allocator's size classes, rather than ZSTD_sizeof_DCtx, determine the charge.
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -31,8 +31,12 @@ impl Charge {
 unsafe fn allocated_size(ptr: *const u8, requested: usize) -> usize {
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: every pointer queried here is a live Rust system allocation.
-        unsafe { malloc_size(ptr.cast()) }.max(requested)
+        // SAFETY: the binary opt-in (or test delegate) identifies this Rust allocation.
+        if crate::uses_jemalloc() {
+            unsafe { tikv_jemalloc_sys::sallocx(ptr.cast(), 0) }.max(requested)
+        } else {
+            unsafe { malloc_size(ptr.cast()) }.max(requested)
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -51,8 +55,13 @@ unsafe extern "C" fn allocate(opaque: *mut c_void, size: usize) -> *mut c_void {
         return charge.refuse();
     };
     #[cfg(target_os = "macos")]
-    // Preflight the native size class before allocating; confirm with malloc_size.
-    let predicted = unsafe { malloc_good_size(total) }.max(total);
+    // Preflight the size class with the same alignment used by alloc below.
+    let predicted = if crate::uses_jemalloc() {
+        unsafe { tikv_jemalloc_sys::nallocx(total, tikv_jemalloc_sys::MALLOCX_ALIGN(HEADER)) }
+    } else {
+        unsafe { malloc_good_size(total) }
+    }
+    .max(total);
     #[cfg(not(target_os = "macos"))]
     let predicted = total;
     if charge.live.get().saturating_add(predicted) > charge.limit {

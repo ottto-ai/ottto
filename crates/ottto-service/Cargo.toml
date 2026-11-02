@@ -47,6 +47,11 @@ webpki-roots.workspace = true
 zeroize.workspace = true
 zstd.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tikv-jemallocator.workspace = true
+tikv-jemalloc-sys.workspace = true
+tikv-jemalloc-ctl.workspace = true
+
 [dev-dependencies]
 # Route bundled zstd allocations through the test counting allocator.
 zstd = { workspace = true, features = ["with-rust-allocator"] }

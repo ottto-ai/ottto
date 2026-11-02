@@ -5308,7 +5308,11 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         let v2_active = crate::snapshots::state_v2_growth_retention_active(&completed.1);
         let finished =
             crate::local_resource_diagnostics::source_finish(source.api_slug(), v2_active, || {
-                self.finish_completed(completed)
+                let finished = self.finish_completed(completed);
+                // Finish-owned frames have dropped, including on a returned error.
+                #[cfg(target_os = "macos")]
+                crate::local_resource_diagnostics::purge_allocator(source.api_slug());
+                finished
             });
         if let Some(ticket) = continuation_ticket {
             continuation::after_ordinary_codex_page(ticket, self.codex_started, finished.is_ok());
