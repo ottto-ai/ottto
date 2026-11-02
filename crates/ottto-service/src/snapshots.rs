@@ -255,6 +255,8 @@ mod claude_response_compaction_tests;
 mod claude_response_records;
 #[cfg(test)]
 mod claude_thinking_tokens_tests;
+#[cfg(test)]
+mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
@@ -41513,17 +41515,13 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // Defer the whole response. Sidechain content-block rows progressively
     // increase cumulative output and may add selectors late; neither the first
     // nor an arbitrary line is an authoritative complete response.
-    if let Some(usage) = claude_code_delta_usage(value) {
+    if let Some((usage, root)) = claude_code_delta_usage(value).zip(claude_code_usage_root(value)) {
         // Reconciled against `usage.iterations[]`: on a resumed session's first
         // response the top-level prompt fields read all-zero while the real
         // prompt sits in the iterations, and the small non-zero remainder would
         // otherwise be accepted as this session's baseline.
-        let effective_input_context = claude_code_effective_input_context(value, &usage);
-        if claude_code_usage_root(value)
-            .and_then(|root| root.get("iterations"))
-            .and_then(Value::as_array)
-            .is_some_and(|iterations| iterations.len() > 1)
-        {
+        let effective_input_context = claude_code_effective_input_context(root);
+        if claude_code_usage_iterations(root).len() > 1 {
             // Each iteration is a distinct model request, but the containing
             // response exposes only one stable request id and one terminal
             // timestamp. Keep the response-level peak watermarks, but never
@@ -42897,6 +42895,52 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
     ) {
         return None;
     }
+    // Claude Code can state part of a response's usage only in
+    // `usage.iterations[]`, one entry per API call: an all-zero top level
+    // beside a carrying iteration, or a top level restating only the last of
+    // several calls. The top level never exceeds the iterations' sum and
+    // equals it on almost every line, so each billed kind takes the larger of
+    // the two, never both. Cache writes are normalized per entry first and
+    // keep their 5m and 1h buckets apart.
+    let mut usage = claude_code_usage_fields(root);
+    let mut summed = UsageTotals::default();
+    for iteration in claude_code_usage_iterations(root)
+        .iter()
+        .map(claude_code_usage_fields)
+    {
+        summed.input_tokens = summed.input_tokens.saturating_add(iteration.input_tokens);
+        summed.output_tokens = summed.output_tokens.saturating_add(iteration.output_tokens);
+        summed.cache_read_tokens = summed
+            .cache_read_tokens
+            .saturating_add(iteration.cache_read_tokens);
+        summed.cache_creation_5m_tokens = summed
+            .cache_creation_5m_tokens
+            .saturating_add(iteration.cache_creation_5m_tokens);
+        summed.cache_creation_1h_tokens = summed
+            .cache_creation_1h_tokens
+            .saturating_add(iteration.cache_creation_1h_tokens);
+    }
+    usage.input_tokens = usage.input_tokens.max(summed.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(summed.output_tokens);
+    usage.cache_read_tokens = usage.cache_read_tokens.max(summed.cache_read_tokens);
+    usage.cache_creation_5m_tokens = usage
+        .cache_creation_5m_tokens
+        .max(summed.cache_creation_5m_tokens);
+    usage.cache_creation_1h_tokens = usage
+        .cache_creation_1h_tokens
+        .max(summed.cache_creation_1h_tokens);
+    Some(usage)
+}
+
+fn claude_code_usage_iterations(root: &Value) -> &[Value] {
+    root.get("iterations")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// One usage object's own counters: a response's top level or one of its
+/// `iterations[]` entries.
+fn claude_code_usage_fields(root: &Value) -> UsageTotals {
     let (cache_5m, cache_1h) = claude_code_cache_creation_split(root);
     let output_tokens = u64_at(root, &["output_tokens"])
         .or_else(|| u64_at(root, &["outputTokens"]))
@@ -42909,7 +42953,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| u64_at(root, &["output_tokens_details", "thinking_tokens"]))
         .unwrap_or_default()
         .min(output_tokens);
-    let usage = UsageTotals {
+    UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
             .or_else(|| u64_at(root, &["inputTokens"]))
             .unwrap_or_default(),
@@ -42923,8 +42967,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         unattributed_total_tokens: 0,
         request_count: 1,
         costs: UsageCosts::default(),
-    };
-    Some(usage)
+    }
 }
 
 fn usage_object_has_numeric_field(root: &Value, fields: &[&str]) -> bool {
@@ -42999,32 +43042,17 @@ fn claude_code_cache_creation_split(root: &Value) -> (u64, u64) {
 /// 104,266 top-level over iterations of 82,241 and 82,222, and the larger figure
 /// is the one to keep.
 ///
-/// Billing is deliberately untouched: `claude_code_delta_usage` still totals the
-/// top-level fields, which are the aggregate the cost path is priced from.
-fn claude_code_effective_input_context(value: &Value, usage: &UsageTotals) -> u64 {
-    let top_level = usage.effective_input_context();
-    let Some(iterations) = claude_code_usage_root(value)
-        .and_then(|root| root.get("iterations"))
-        .and_then(Value::as_array)
-    else {
-        return top_level;
-    };
-    iterations
+/// Billing differs on purpose: `claude_code_delta_usage` takes, per kind, the
+/// larger of the top level and the iterations' sum. This watermark reads the
+/// raw top level and single iterations, never that billing fold.
+fn claude_code_effective_input_context(root: &Value) -> u64 {
+    claude_code_usage_iterations(root)
         .iter()
-        .map(|iteration| {
-            let (cache_5m, cache_1h) = claude_code_cache_creation_split(iteration);
-            u64_at(iteration, &["input_tokens"])
-                .or_else(|| u64_at(iteration, &["inputTokens"]))
-                .unwrap_or_default()
-                .saturating_add(
-                    u64_at(iteration, &["cache_read_input_tokens"])
-                        .or_else(|| u64_at(iteration, &["cache_read_tokens"]))
-                        .unwrap_or_default(),
-                )
-                .saturating_add(cache_5m)
-                .saturating_add(cache_1h)
-        })
-        .fold(top_level, u64::max)
+        .map(|iteration| claude_code_usage_fields(iteration).effective_input_context())
+        .fold(
+            claude_code_usage_fields(root).effective_input_context(),
+            u64::max,
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -71107,14 +71135,13 @@ mod tests {
         assert_ne!(item.first_turn_context_tokens, Some(1_684));
         assert_eq!(item.peak_context_fill_tokens, Some(902_004));
 
-        // Billing is read from the top-level fields only and must be untouched
-        // by the reconciliation above: the zeroed record contributes its 1,684
-        // cache write and nothing else, NOT the 894,911 cache read that only
-        // `iterations[]` states.
-        assert_eq!(item.input_tokens, 4);
-        assert_eq!(item.cache_read_tokens, 900_000);
+        // Billing takes, per kind, the larger of the top level and the
+        // iterations' sum: the zeroed record counts what only `iterations[]`
+        // states, and its 1,684 cache write once, not twice.
+        assert_eq!(item.input_tokens, 6);
+        assert_eq!(item.cache_read_tokens, 1_794_911);
         assert_eq!(item.cache_creation_1h_tokens, 3_684);
-        assert_eq!(item.output_tokens, 90);
+        assert_eq!(item.output_tokens, 402);
         assert_eq!(item.request_count, 2);
 
         let _ = fs::remove_file(path);
@@ -71153,10 +71180,11 @@ mod tests {
         assert_ne!(item.peak_context_fill_tokens, Some(1_588_417));
         assert_ne!(item.peak_context_fill_tokens, Some(708_733));
 
-        // One API response, so billing counts the top level once.
-        assert_eq!(item.input_tokens, 3);
-        assert_eq!(item.cache_read_tokens, 706_730);
-        assert_eq!(item.cache_creation_5m_tokens, 2_000);
+        // Billing counts both calls (the iterations' sum beats the top level),
+        // still as one response.
+        assert_eq!(item.input_tokens, 8);
+        assert_eq!(item.cache_read_tokens, 1_582_409);
+        assert_eq!(item.cache_creation_5m_tokens, 6_000);
         assert_eq!(item.request_count, 1);
 
         let _ = fs::remove_file(path);
