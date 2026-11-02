@@ -5160,10 +5160,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         assert_eq!(initial.snapshots[0].input_tokens, 100);
         let stamped = EvidenceContract::current(&index);
         assert!(stamped.is_some());
-        assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            stamped
-        );
+        // The complete census retires the family pending (main's completion;
+        // the removed switch kept unproven pending). The stamp written on
+        // accumulation is pinned by
+        // `evidence_owed::tests::contract_stamp_is_written_on_accumulation_and_never_laundered`.
+        assert!(index.claude_usage_family_pending.get(SESSION).is_none());
         finalize_scan_after_policy(source, &mut initial, &mut index);
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
@@ -5227,9 +5228,11 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
             &scan_money(source, &index, &restored),
         );
         let current = EvidenceContract::current(&index);
+        // The owed route's family pending (and its contract stamp) is the
+        // cold Full's.
         assert_eq!(
-            index.claude_usage_family_pending[SESSION].identity_contract,
-            current
+            index.claude_usage_family_pending.get(SESSION),
+            cold_index.claude_usage_family_pending.get(SESSION)
         );
         assert!(!index.files[&key].evidence_owed);
         assert!(!index.files[&key].observed_fingerprint().is_empty());
