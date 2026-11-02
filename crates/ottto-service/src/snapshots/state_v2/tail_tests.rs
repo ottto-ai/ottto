@@ -1,8 +1,8 @@
 //! The Tail store over the real route: published fixtures, real saves and the
 //! real exit guard. Claude and Codex share every path here; none is per source.
 use super::super::tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, Observation,
-    Representation, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
+    Observation, Representation, SetAsideCause, Shape, StagedFile, TailHead,
 };
 use super::tail_route::{
     dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
@@ -870,7 +870,7 @@ fn debt_survives_reset_and_retire_until_disposed() {
     };
     let encoded = tail::encode_head(REVISION, &Default::default(), &common, None).unwrap();
     assert!(tail::decode_head(&encoded).is_ok());
-    for (at, value) in [(5, 2), (6, 4), (24, 3)] {
+    for (at, value) in [(5, 2), (6, 4), (24, 3), (30, 4)] {
         let mut newer = encoded.clone();
         newer[at] = value;
         let error = tail::decode_head(&newer).err().unwrap();
@@ -935,6 +935,62 @@ fn reduction_requires_tail_representation() {
         BTreeMap::from([(0, b"r0".to_vec())])
     );
     assert_eq!(all_tail_rows(&index, SIBLING), 0, "no reduction, no debt");
+}
+
+/// [format] A file with no reduction keeps its header facts in the head, and the
+/// stored stamp still proves the same object and content. Envelope 1 written
+/// before the member existed is the same bytes, and decodes to none.
+#[test]
+fn inventory_facts_need_no_reduction_and_old_envelope_has_none() {
+    let mut old = vec![0, 0, 0, REVISION as u8, 0, 1, Representation::Tail as u8];
+    old.extend_from_slice(&[0; 24]);
+    assert_eq!(
+        tail::encode_head(REVISION, &Default::default(), &Common::default(), None).unwrap(),
+        old
+    );
+    assert_eq!(tail::decode_head(&old).unwrap().common.inventory, None);
+
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let file = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+    let facts = InventoryFacts {
+        owner: "owner-id".into(),
+        created_unix_ms: Some(-5),
+        stamp: crate::snapshots::sampled_scan::codex_cursor::OpenStamp::of(&file).content_stamp(),
+        read_bytes: 412,
+    };
+    let with_facts = |added: &[&[u8]]| Observation {
+        inventory: Some(facts.clone()),
+        ..observation(added)
+    };
+    observe_tail(&f.path, FILE, with_facts(&[])).unwrap();
+    observe_tail(&f.path, SIBLING, with_facts(&[b"r0"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only && head.body.is_empty());
+    let stored = head.common.inventory.unwrap();
+    assert_eq!(stored, facts);
+    let now = crate::transcript_acquisition::FileStamp::capture(file).unwrap();
+    assert!(stored.stamp.matches_acquisition(&now));
+
+    // A reduction stage keeps them; only the source's bytes change.
+    stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(head.body, b"head");
+    assert_eq!(head.common.inventory.as_ref(), Some(&facts));
+
+    // Retiring keeps them under kept debt; absence and plain retirement end them.
+    retire_tail(&f.path, [FILE.to_string(), SIBLING.to_string()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, FILE), 0, "no debt");
+    let head = load_head(&index, SIBLING, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(head.common.inventory.as_ref(), Some(&facts));
+    dispose_tail(&f.path, SIBLING, Disposition::Absence).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, SIBLING), 0, "absent");
 }
 
 /// [behaviour] Scope erasure is not a reset: every row and the marker go, and

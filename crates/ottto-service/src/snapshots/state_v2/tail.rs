@@ -5,6 +5,7 @@
 //! module writes, replaces and retires them inside an existing save's write
 //! transaction, or in one Tail-only commit at cycle exit. Rows convey custody
 //! only: a head never grants acceptance, census or Full-verification credit.
+use super::super::sampled_scan::codex_cursor::ContentStamp;
 use super::*;
 use anyhow::{bail, ensure, Context};
 use sha2::{Digest, Sha256};
@@ -188,13 +189,26 @@ pub(in crate::snapshots) struct DebtSummary {
     pub(in crate::snapshots) reason_bits: u32,
     pub(in crate::snapshots) disposition: Option<NoUploadRequired>,
 }
+/// A file's validated header facts, replacing a header read while `stamp` still
+/// matches; no header bytes. `stamp` is the object the header was read from:
+/// `ContentStamp::matches_acquisition` is `same_object` and `same_content`.
+/// Independent of any reduction, so group members and header-only files have it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct InventoryFacts {
+    pub(in crate::snapshots) owner: String,
+    pub(in crate::snapshots) created_unix_ms: Option<i64>,
+    pub(in crate::snapshots) stamp: ContentStamp,
+    /// Diagnostic: what a reuse of these facts avoids reading.
+    pub(in crate::snapshots) read_bytes: u64,
+}
 /// The versioned common head body; the source's reduction follows it, if any.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct Common {
     pub(in crate::snapshots) representation: Representation,
     pub(in crate::snapshots) debt: DebtSummary,
     /// The next revision id; ids are never reused, even after deletion.
     pub(in crate::snapshots) next_revision_id: u64,
+    pub(in crate::snapshots) inventory: Option<InventoryFacts>,
 }
 /// A debt-only mutation: never touches the file's graph rows (so no PRE or
 /// progress publishes) or its set-aside marker, and touches its reduction only
@@ -211,12 +225,15 @@ pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) replaced: BTreeMap<u64, Vec<u8>>,
     /// Committed revisions settled by their owner; an unknown id is ignored.
     pub(in crate::snapshots) resolved: BTreeSet<u64>,
+    /// Replaces the head's facts; `None` keeps them.
+    pub(in crate::snapshots) inventory: Option<InventoryFacts>,
 }
 impl Observation {
     fn absorb(&mut self, later: Self) {
         self.representation = later.representation;
         self.summary = later.summary;
         self.added.extend(later.added);
+        self.inventory = later.inventory.or(self.inventory.take());
         for id in later.resolved {
             self.replaced.remove(&id);
             self.resolved.insert(id);
@@ -231,12 +248,19 @@ impl Observation {
             .iter()
             .chain(self.replaced.values())
             .fold(0, |sum, value| sum + value.len() as u64)
+            + self
+                .inventory
+                .as_ref()
+                .map_or(0, |facts| facts.owner.len() as u64)
     }
 }
 /// An authorised final disposition of a file's whole debt: recorded (counted),
 /// and never reported as an ACK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(dead_code, reason = "no production caller stages a disposition yet")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no production caller stages a disposition yet")
+)]
 pub(in crate::snapshots) enum Disposition {
     /// A complete census proved the file absent.
     Absence,
@@ -511,6 +535,9 @@ fn delete_fragments(
 /// The common body's own version, separate from the source's (`revision`) and
 /// from the store's physical and DB generations.
 const ENVELOPE: u8 = 1;
+/// The envelope's last code, before the optional parts it announces.
+const HAS_REDUCTION: u8 = 1;
+const HAS_INVENTORY: u8 = 2;
 /// Only a Tail head holds a reduction, whichever way the head is crossing.
 fn check_shape(representation: Representation, has_reduction: bool) -> Result<()> {
     ensure!(
@@ -518,6 +545,43 @@ fn check_shape(representation: Representation, has_reduction: bool) -> Result<()
         "state_v2_tail_value_shape"
     );
     Ok(())
+}
+fn encode_inventory(out: &mut Vec<u8>, facts: &InventoryFacts) -> Result<()> {
+    let (device, inode, length, (seconds, nanos)) = facts.stamp.parts();
+    out.push(u8::from(facts.created_unix_ms.is_some()));
+    out.extend_from_slice(&facts.created_unix_ms.unwrap_or(0).to_be_bytes());
+    for number in [device, inode, length] {
+        out.extend_from_slice(&number.to_be_bytes());
+    }
+    for number in [seconds, nanos] {
+        out.extend_from_slice(&number.to_be_bytes());
+    }
+    out.extend_from_slice(&facts.read_bytes.to_be_bytes());
+    out.extend_from_slice(&u32::try_from(facts.owner.len())?.to_be_bytes());
+    out.extend_from_slice(facts.owner.as_bytes());
+    Ok(())
+}
+fn decode_inventory(input: &mut Reader<'_>) -> Result<InventoryFacts> {
+    let created = code(input, 1)? == 1;
+    let at = i64::from_be_bytes(input.take()?);
+    let device = u64::from_be_bytes(input.take()?);
+    let inode = u64::from_be_bytes(input.take()?);
+    let length = u64::from_be_bytes(input.take()?);
+    let seconds = i64::from_be_bytes(input.take()?);
+    let nanos = i64::from_be_bytes(input.take()?);
+    let read_bytes = u64::from_be_bytes(input.take()?);
+    let len = u32::from_be_bytes(input.take()?) as usize;
+    let bytes = input.0;
+    let owner = bytes.get(..len).context("state_v2_tail_value_shape")?;
+    input.0 = &bytes[len..];
+    Ok(InventoryFacts {
+        owner: std::str::from_utf8(owner)
+            .context("state_v2_tail_value_shape")?
+            .to_owned(),
+        created_unix_ms: created.then_some(at),
+        stamp: ContentStamp::from_parts(device, inode, length, (seconds, nanos)),
+        read_bytes,
+    })
 }
 pub(super) fn encode_head(
     revision: u32,
@@ -546,7 +610,12 @@ pub(super) fn encode_head(
     out.push(u8::from(debt.lower_bound));
     out.extend_from_slice(&debt.reason_bits.to_be_bytes());
     out.push(debt.disposition.map_or(0, |d| d as u8));
-    out.push(u8::from(reduction.is_some()));
+    let parts = u8::from(reduction.is_some()) * HAS_REDUCTION
+        + u8::from(common.inventory.is_some()) * HAS_INVENTORY;
+    out.push(parts);
+    if let Some(facts) = &common.inventory {
+        encode_inventory(&mut out, facts)?;
+    }
     out.extend_from_slice(body);
     Ok(out)
 }
@@ -568,7 +637,7 @@ pub(in crate::snapshots) struct TailHead {
 pub(super) struct Decoded {
     revision: u32,
     table: MembershipTable,
-    common: Common,
+    pub(super) common: Common,
     reduction: Option<Vec<u8>>,
 }
 /// A code above `max` was written by a newer build: hold, never default.
@@ -627,7 +696,11 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
             _ => Some(NoUploadRequired::ZeroTokens),
         },
     };
-    let has_reduction = code(&mut input, 1)? == 1;
+    let parts = code(&mut input, HAS_REDUCTION | HAS_INVENTORY)?;
+    let inventory = (parts & HAS_INVENTORY != 0)
+        .then(|| decode_inventory(&mut input))
+        .transpose()?;
+    let has_reduction = parts & HAS_REDUCTION != 0;
     check_shape(representation, has_reduction)?;
     let reduction = has_reduction.then(|| input.0.to_vec());
     ensure!(
@@ -641,6 +714,7 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
             representation,
             debt,
             next_revision_id,
+            inventory,
         },
         reduction,
     })
@@ -934,11 +1008,14 @@ fn observe(
     entry.meta.elements = entry.pages;
     common.representation = observation.representation;
     common.debt = observation.summary;
+    if let Some(facts) = &observation.inventory {
+        common.inventory = Some(facts.clone());
+    }
     Ok(observation.added.len() as u64)
 }
 /// Replace one file's reduction and apply its debt changes, adjusting membership
-/// from row headers alone: no other page is read. A head with neither a
-/// reduction nor debt goes. Only a reduction replacement or a disposal clears
+/// from row headers alone: no other page is read. A head with no reduction, debt
+/// or inventory goes. Only a reduction replacement or a disposal clears
 /// the set-aside marker.
 fn write_file(
     tx: &mut dyn Transaction,
@@ -1037,7 +1114,11 @@ fn write_file(
         table.remove(&Collection::Revisions);
         common.debt = DebtSummary::default();
         match disposition {
-            Disposition::Absence => applied.disposed_absence += 1,
+            // The file is gone, so its header facts are too.
+            Disposition::Absence => {
+                common.inventory = None;
+                applied.disposed_absence += 1;
+            }
             Disposition::Settled => applied.disposed_settled += 1,
         }
     }
@@ -1059,7 +1140,10 @@ fn write_file(
     {
         table.remove(&Collection::Revisions);
     }
-    if reduction.is_none() && !table.contains_key(&Collection::Revisions) {
+    if reduction.is_none()
+        && !table.contains_key(&Collection::Revisions)
+        && common.inventory.is_none()
+    {
         delete_rows(tx, file, false)?;
         return Ok(applied);
     }
