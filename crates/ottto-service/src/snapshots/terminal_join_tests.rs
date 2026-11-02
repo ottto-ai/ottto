@@ -116,7 +116,8 @@ fn streamed_terminal_equals_one_whole_visit() {
     let mut arms = Vec::new();
     for (name, budget) in [("whole", SliceBudget::WHOLE), ("sliced", ONE_FAMILY)] {
         let scratch = crate::test_scratch::canonical_private_dir(&format!("terminal-join-{name}"));
-        let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+        let (custody, mut cold) =
+            v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
         assert!(v2::usage_head_only(&cold, LEGACY_PARENT));
         let (page, disposition) = terminal(&mut cold, &child, &api, &trace, budget);
         assert_eq!(
@@ -155,7 +156,8 @@ fn streamed_terminal_equals_one_whole_visit() {
 fn streamed_terminal_installs_only_the_page_families() {
     let (dir, child, api, trace, index) = accumulated();
     let scratch = crate::test_scratch::canonical_private_dir("terminal-join-installs");
-    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let (custody, mut cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
     assert_eq!(v2::cold_usage_families(&cold), Some(2));
     let (_, disposition) = terminal(&mut cold, &child, &api, &trace, ONE_FAMILY);
     assert_eq!(disposition.terminal, ClaudeTerminalOutcome::Complete);
@@ -201,7 +203,8 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_completes() {
     };
 
     let scratch = crate::test_scratch::canonical_private_dir("terminal-join-refused");
-    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let (custody, mut cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
     let before = decided(&cold);
     v2::delete_usage_row_in_session(&cold, LEGACY_PARENT);
     let unknown = v2::usage_unknown_count();
@@ -224,7 +227,8 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_completes() {
     let _ = fs::remove_dir_all(scratch);
 
     let scratch = crate::test_scratch::canonical_private_dir("terminal-join-retry");
-    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let (custody, mut cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
     let mut retry = scan();
     let disposition = fold(&mut retry, &mut cold, ONE_FAMILY);
     assert_eq!(disposition.terminal, ClaudeTerminalOutcome::Complete);
@@ -242,7 +246,8 @@ fn a_refused_terminal_keeps_its_traversal_and_the_retry_completes() {
 fn a_patched_head_is_read_and_saved_with_its_flag() {
     let (dir, _, _, _, index) = accumulated();
     let scratch = crate::test_scratch::canonical_private_dir("terminal-join-patched");
-    let (custody, mut cold) = v2::ColdSession::publish(&index, &scratch);
+    let (custody, mut cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
     let mut expected = v2::resident(&cold);
     assert!(!expected.claude_usage_family_pending[LEGACY_PARENT].contract_unproven);
     cold.claude_usage_family_pending

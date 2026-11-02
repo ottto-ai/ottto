@@ -169,12 +169,6 @@ impl<'a> UsageView<'a> {
             Self::Head(h) => h.identity_contract,
         }
     }
-    pub(super) fn contract_unproven(self) -> bool {
-        match self {
-            Self::Full(f) => f.contract_unproven,
-            Self::Head(h) => h.contract_unproven,
-        }
-    }
     /// Members with a request-hash entry.
     pub(super) fn hash_members(self) -> Box<dyn Iterator<Item = &'a String> + 'a> {
         match self {
