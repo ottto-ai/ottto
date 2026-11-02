@@ -37263,6 +37263,7 @@ impl OwnedJsonlParser {
     /// Native failure still explicitly discards staging and preserves its debt.
     #[cfg(unix)]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn finish_with_repository_identity_prepared(
         mut self: Box<Self>,
         request: FinishRequest<'_>,
