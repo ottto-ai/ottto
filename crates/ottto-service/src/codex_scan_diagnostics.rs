@@ -156,7 +156,7 @@ pub(crate) enum UnreadableCause {
 #[serde(default)]
 pub(crate) struct UnreadableCauses {
     counts: [u64; 8],
-    /// E2 B2: which sites and files the counts came from. Additive; omitted
+    /// Which sites and files the counts came from. Additive; omitted
     /// while empty, so a traversal without unreadable paths keeps its bytes.
     #[serde(skip_serializing_if = "UnreadableSamples::is_empty")]
     samples: UnreadableSamples,
@@ -942,7 +942,7 @@ pub(crate) struct CodexScanDiagnostics {
     pub spawn_edges: LoaderEvidence,
     pub rollout_extents: LoaderEvidence,
     pub session_index: LoaderEvidence,
-    /// E2 B3b: rollouts kept out of a failing home's created-thread hold
+    /// Rollouts kept out of a failing home's created-thread hold
     /// because their proof comes from exactly one other, complete home.
     pub created_thread_scoped_rollouts: u32,
     pub identity_conflict_taxonomy: IdentityConflictTaxonomy,
@@ -1087,7 +1087,7 @@ mod tests {
             assert!(!text.contains(forbidden));
         }
     }
-    /// [format] E2 B2: the unreadable sample keeps at most
+    /// [format] The unreadable sample keeps at most
     /// `UNREADABLE_SAMPLES` distinct events per cause, holds digests and
     /// enums only, survives the persisted round trip and merge, and an empty
     /// sample keeps the pre-sample bytes.

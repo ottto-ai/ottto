@@ -1,11 +1,11 @@
-//! M1 durable warm-cache reuse: the record body for one retained
-//! `CachedJsonlReduction` (CONTRACT.md M1; SOURCE field ruling and Amendment
-//! 1), and the re-derivation of the content fields the body never carries.
+//! Durable warm-cache reuse: the record body for one retained
+//! `CachedJsonlReduction`, and the re-derivation of the content fields the
+//! body never carries.
 //!
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`/`PL`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Growth-only M3 restore prepays a
+//! where in the file each was last assigned. Growth-only restart restore prepays a
 //! bounded native content replay and fences every X field before adoption.
 //! Empty obligations move the paid decoded graph.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -23,7 +23,7 @@ pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;
 /// Runtime bound only: outside the persisted allowlist digest.
 pub(crate) const TITLE_LINE_BOUND: u64 = 1024 * 1024;
 
-/// At most this many named lines are pread per entry (Amendment 1). M1 uses
+/// At most this many named lines are pread per entry; durable reuse uses
 /// one: the title.
 pub(crate) const NAMED_LINES: usize = 4;
 
@@ -146,7 +146,7 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
 }
 
 /// The record body for a retained reduction, or why it is not persisted.
-/// Only Claude Code and Codex entries are persisted in M1.
+/// Only Claude Code and Codex entries are persisted.
 #[cfg(test)]
 pub(crate) fn encode(
     reduction: &CachedJsonlReduction,

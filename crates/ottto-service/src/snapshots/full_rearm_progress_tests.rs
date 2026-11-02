@@ -356,7 +356,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     }
 }
 
-/// COST: any change to a recorded member's revision re-arms exactly once;
+/// Any change to a recorded member's revision re-arms exactly once;
 /// that window records the new set and the skip resumes, counted afresh.
 #[test]
 fn changed_member_revision_rearms_once_then_skips_again() {
@@ -440,7 +440,7 @@ fn non_structural_invalidation_rearms() {
 
 /// F1a: an unrecorded contract never skips. A set contract-5 latch still
 /// re-reads every family file once through its identity contract re-arm,
-/// which clears the latch; since the contract-5 cutover (Lead B) the latch
+/// which clears the latch; since the contract-5 cutover the latch
 /// alone no longer also takes the due liveness re-arm, so the same terminal
 /// counts as a skip.
 #[test]
@@ -547,7 +547,7 @@ fn malformed_persisted_progress_loads_and_rearms() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// COST ruling #3: a rebuilt index (the #700 seen marker beside a fresh
+/// A rebuilt index (the #700 seen marker beside a fresh
 /// index) starts no backoff ramp. Its first close still re-arms once, but the
 /// next due re-arm waits the capped delay; without the marker a fresh index
 /// ramps from the base delay as before.
@@ -1261,10 +1261,10 @@ fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]
     )
 }
 
-/// SOURCE condition (2026-10-28 review of #840): the permitted shape with
-/// real tagged bodies. The index records E2 and the structural baseline is
+/// The permitted shape (2026-10-28 review of #840) with
+/// real tagged bodies. The index records `e2` and the structural baseline is
 /// built with evidence. Every request of the family has a paired row with
-/// complete request identity; `req_1`'s also carries D1's account-checked
+/// complete request identity; `req_1`'s also carries the request census's account-checked
 /// login, so contract 5 tags the parent's body, and the other rows are
 /// unchecked, so the legacy account path neither binds nor withholds the
 /// session account (full checked coverage binds it and keeps the legacy
@@ -1339,7 +1339,7 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
     });
 }
 
-/// Lead B condition D with Lead A ruling (a). A never-permitted install
+/// A never-permitted install
 /// recorded `""` and its structural baseline under it (no evidence); the
 /// always-on build observes its contract. That cutover's latch re-arms at
 /// the first complete terminal only (`contract_cutover_rearm`), and its
@@ -1347,8 +1347,8 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
 /// whole index for it. A real contract-to-contract change (a recorded
 /// collector baseline) still re-arms every family file once and records the
 /// new contract. Every later due terminal skips, also while an unsettled
-/// sweep holds the latch. The index is a released E2 Mac's (active revision
-/// 3, every file stamped 3), where the latch's own re-read is E2's paced
+/// sweep holds the latch. The index is from a released `e2` build (active revision
+/// 3, every file stamped 3), where the latch's own re-read is `e2`'s paced
 /// debt; below revision 3 see `a_never_permitted_cutover_rearms_once_and_is_counted`.
 #[test]
 fn a_contract_change_rearms_at_most_once_then_skips() {
@@ -2619,7 +2619,7 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
             .contains_key(OTHER_ROOT),
         "selection never settles the held authority"
     );
-    // E2-077 transfer: exercise the same candidate-selection and reread
+    // Exercise the same candidate-selection and reread
     // model as Rearm::reread, across repeated pages in this window. The
     // due retry above is a positive control; unrelated suppression must
     // never turn it into a held-family reread storm.

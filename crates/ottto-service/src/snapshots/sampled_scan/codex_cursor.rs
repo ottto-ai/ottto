@@ -35,11 +35,11 @@ const SINGLETON_PASS_BYTES: u64 = CURSOR_PASS_BYTES;
 /// A cursor read's overlong-line skip yields after this many skipped bytes.
 const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
 /// A live cursor job's copy-budget charge is walked again after this many
-/// consumed bytes (E3): at most 16 walks per page (B / 4 MiB), plus the
+/// consumed bytes: at most 16 walks per page (B / 4 MiB), plus the
 /// pause and completion walks, against one per line before.
 pub(in crate::snapshots) const CHARGE_REFRESH_BYTES: u64 = 4 * 1024 * 1024;
 /// Consecutive invalidated attempts of one file after which its attempt ends
-/// as strict `MemberChanged` debt (D2). Growth never invalidates: appended
+/// as strict `MemberChanged` debt. Growth never invalidates: appended
 /// bytes belong to the next tail; unavailable evidence never counts (K9).
 const MEMBER_CHANGED_AFTER: u32 = 3;
 const INVALIDATION_KEYS: usize = 64;
@@ -48,7 +48,7 @@ const PARKED_KEYS: usize = 64;
 const PAUSED_BUFFER_BYTES: usize = 64 * 1024;
 const MEMO_ENTRIES: usize = 256;
 /// Bytes one memo lookup or record reads from the held file (head and
-/// boundary samples). Charged to the page's singleton budget (M3).
+/// boundary samples). Charged to the page's singleton budget.
 pub(in crate::snapshots) const SAMPLE_READ_BYTES: u64 = 2 * SAMPLE_BYTES as u64;
 /// A paused job is stale, and another namespace may evict it, once this many
 /// cursor pages passed without its own namespace resuming it (K10).
@@ -56,7 +56,7 @@ const NAMESPACE_STALE_PAGES: u64 = 16;
 /// U1a-2a (cc row 4, rev 6 §5.1): free room a proof step needs beyond the
 /// scan's walked state and the running job's last walked charge.
 pub(in crate::snapshots) const PROOF_STEP_HEADROOM_BYTES: usize = 1 << 20;
-/// E2: a paused job whose revalidation evidence stays unavailable for this
+/// A paused job whose revalidation evidence stays unavailable for this
 /// many consecutive resume pages ends (slot freed, path processed for the
 /// generation with a retryable cause, prior body kept). Small, like
 /// `MEMBER_CHANGED_AFTER`: ending costs only the job's progress, while a
@@ -72,7 +72,7 @@ const ROTATION_KEYS: usize = 64;
 const JOIN_OWNERS: usize = 64;
 /// Bumped when a join or singleton proof rule changes; it is part of every
 /// memo key, so a bump wakes every memoized hold without a timed retry.
-/// U1a-2a (D6(a)): also part of `codex_parent_proof_scope`.
+/// Also part of `codex_parent_proof_scope`.
 pub(in crate::snapshots) const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proof:v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,7 +396,7 @@ impl PageBudget {
         }
     }
 
-    /// At most one resume attempt per scan object (E2): true only the first
+    /// At most one resume attempt per scan object: true only the first
     /// time. A deferred job is never resumed again in the same page.
     pub(in crate::snapshots) fn claim_resume(&mut self) -> bool {
         !std::mem::replace(&mut self.resume_claimed, true)
@@ -606,11 +606,11 @@ impl OpenStamp {
     /// whose content inputs and birth still match already carries the
     /// stored ctime, and a birth or evidence mismatch keeps the live ctime,
     /// so ctime is the birth witness here and stays compared. Not
-    /// `append_compatible`, which never compares ctime (E1 S3). Codex
+    /// `append_compatible`, which never compares ctime. Codex
     /// parent-proof authority (the side record's parsed-stamp guard and the
     /// proof wakes, on raw path stamps) keeps this rule too: there ctime is
     /// the only witness of a same-inode replacement or an mtime-restored
-    /// rewrite until a birth fence exists (E1 S3b).
+    /// rewrite until a birth fence exists.
     pub(in crate::snapshots) fn wake_compatible(&self, now: &Self) -> bool {
         self.same_object(now) && (now.extent > self.extent || self == now)
     }
@@ -931,7 +931,7 @@ impl JobMeta {
     }
 }
 
-/// E3 from a walked `(charge, consumed, buffer)`; see `charge_estimate`.
+/// The charge estimate from a walked `(charge, consumed, buffer)`; see `charge_estimate`.
 /// `feeds` accumulators take every consumed byte (a group's legacy tee is
 /// the second, R2-N5).
 fn estimate_charge(
@@ -952,8 +952,8 @@ fn estimate_charge(
     })
 }
 
-/// A job charged by bytes like a cursor job (E3): any cursor job, and a
-/// group job read in one page (R2-M2). Its state is walked with
+/// A job charged by bytes like a cursor job: any cursor job, and a
+/// group job read in one page. Its state is walked with
 /// `completed_bound` at most once per `CHARGE_REFRESH_BYTES` of input, never
 /// with the visit-limited `bound` per line, so a large group cannot refuse
 /// the copy budget by visits alone and clear every retained singleton copy.
@@ -965,7 +965,7 @@ pub(in crate::snapshots) fn byte_charged(job: &OwnedActiveFile) -> bool {
     job.cursor.is_some() || job.group.is_some()
 }
 
-/// The E3 estimate of a byte-charged job, if its last walk is recent.
+/// The charge estimate of a byte-charged job, if its last walk is recent.
 pub(in crate::snapshots) fn job_charge_estimate(
     job: &OwnedActiveFile,
     consumed: u64,
@@ -987,7 +987,7 @@ pub(in crate::snapshots) fn job_charge_estimate(
 /// against the layout.
 pub(in crate::snapshots) const MEMBER_SWAP_CHARGE: u64 = 4 * 1024;
 
-/// The E3 position charge of one member swap: `MEMBER_SWAP_CHARGE` plus the
+/// The position charge of one member swap: `MEMBER_SWAP_CHARGE` plus the
 /// walked bound of the variable records the swap retains (the applied
 /// receipt, its key and the legacy baseline). An unbounded or overlong
 /// record charges a whole refresh window, so the next step walks.
@@ -1002,7 +1002,7 @@ pub(in crate::snapshots) fn swap_charge(records: &[Option<usize>]) -> u64 {
         })
 }
 
-/// The job's input position for E3: the reader's `consumed`, plus the bytes
+/// The job's input position for the estimate: the reader's `consumed`, plus the bytes
 /// a group's completed member readers consumed and their swap charges
 /// (R2-N4, R2-L3).
 fn job_position(job: &OwnedActiveFile, consumed: u64) -> u64 {
@@ -1040,7 +1040,7 @@ impl SealedPrefix {
 pub(in crate::snapshots) enum FinishGrant {
     /// A passed prefix certificate (S12): `Certified` only.
     Certified(SealedPrefix),
-    /// Parent ruling 2: the certificate refused as `Lossy` alone, after a
+    /// The certificate refused as `Lossy` alone, after a
     /// completed traversal of the frozen extent with parse/salvage loss
     /// only. It permits nothing but an UNCERTIFIED publication of a grown
     /// object; it is not a sealed-prefix certificate and mints no checkpoint,
@@ -1097,12 +1097,12 @@ pub(in crate::snapshots) struct JobMeta {
     /// job (N1) keeps no checkpoint, copy or verification at completion.
     census_trusted: bool,
     pages: u32,
-    /// Consecutive resume pages whose evidence was unavailable (E2).
+    /// Consecutive resume pages whose evidence was unavailable.
     unavailable_resumes: u32,
     /// The last walked copy-budget charge, the reader position and the
-    /// reader buffer capacity it was taken at (E3; see `charge_estimate`).
+    /// reader buffer capacity it was taken at (see `charge_estimate`).
     charge: Option<(usize, u64, usize)>,
-    /// E1: this read's withheld final record was applied at a genuine
+    /// This read's withheld final record was applied at a genuine
     /// unchanged EOF on its completion step (`apply_eof_record`).
     eof_applied: bool,
     /// Stage 1 guard (§6): this attempt's pacing facts, inline.
@@ -1167,7 +1167,7 @@ pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &Sca
     crate::snapshots::codex_counting_version::singleton_view(candidate, index)
 }
 
-/// A group's counting view (§k.4, §5.2 rule 3; R1-M2; #603): what
+/// A group's counting view (#603): what
 /// `configure_group_once` would configure now from every member's index
 /// entry (`codex_counting_version::group_view`, the same evidence as
 /// `group_evidence` at boot). A counting change on any member, not only the
@@ -1189,7 +1189,7 @@ pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &Sca
     }
 }
 
-/// A group job's `scope_job` (§a.6, §p; R1-M1): the receipt scope (upload
+/// A group job's `scope_job`: the receipt scope (upload
 /// context), the historical replay generation, and the parser, identity and
 /// proof versions. Recorded at job start; a change at any resume or at
 /// emission invalidates the job (receipts must not mix scopes).
@@ -1617,10 +1617,10 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) jobs_deferred_inputs: u64,
     /// Start refused because the held file's stamp could not be read.
     pub(in crate::snapshots) jobs_start_unstartable: u64,
-    /// A tail reached its audit deadline before commit (M1): restarted as
+    /// A tail reached its audit deadline before commit: restarted as
     /// the full audit, uncounted.
     pub(in crate::snapshots) jobs_audit_restarted: u64,
-    /// Committed, then the native finish refused publication (M4).
+    /// Committed, then the native finish refused publication.
     pub(in crate::snapshots) jobs_finish_failed: u64,
     /// A dropped scan frame returned its intact job to the slot (K12).
     pub(in crate::snapshots) jobs_frame_returned: u64,
@@ -1640,11 +1640,11 @@ pub(in crate::snapshots) struct Counters {
     /// A completion on a file that did not grow withheld an unterminated
     /// final record (N2): debt staged, the record left to main's EOF path.
     pub(in crate::snapshots) sealed_fragment_withheld: u64,
-    /// E1: a completion at genuine unchanged EOF applied its withheld final
+    /// A completion at genuine unchanged EOF applied its withheld final
     /// record with main's trailing-line rule (strict finish identity).
     /// Counted only once its `finish` succeeded.
     pub(in crate::snapshots) eof_record_applied: u64,
-    /// E2: a paused job ended because its path no longer named the held
+    /// A paused job ended because its path no longer named the held
     /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`.
     pub(in crate::snapshots) jobs_unavailable_ended: u64,
     pub(in crate::snapshots) memo_hits: u64,
@@ -2552,18 +2552,18 @@ pub(in crate::snapshots) enum PauseEnd {
     StateBound(Box<OwnedActiveFile>, Disclosure),
 }
 
-/// A committed attempt awaiting the native finish (M4). It counts as
+/// A committed attempt awaiting the native finish. It counts as
 /// certified or uncertified only once `finish` succeeded.
 #[must_use]
 pub(in crate::snapshots) struct Publication {
     certified: bool,
     /// `now - due` when it certified at or after its audit deadline.
     overdue_age: Option<u64>,
-    /// E1 applied this read's withheld final record.
+    /// This read's withheld final record was applied at genuine EOF.
     eof_applied: bool,
 }
 impl Publication {
-    /// Whether E1 applied the withheld final record, so the reduction is not
+    /// Whether the withheld final record was applied at EOF, so the reduction is not
     /// the reduction through the certified prefix. Read before
     /// `cursor_published` consumes the publication; `eof_applied(job)` is not
     /// valid after `finish_job`.
@@ -2595,7 +2595,7 @@ pub(in crate::snapshots) enum JobEnd {
     },
     /// Every object check held but the read was lossy: publish uncertified
     /// with debt staged, exactly like today's lossy full read. A grown file
-    /// publishes only through ruling 2's same-object identity proof
+    /// publishes only through the same-object identity proof
     /// (`FinishGrant::LossySameObject`), revalidated in `finish`.
     Uncertified {
         grown: bool,
@@ -2605,7 +2605,7 @@ pub(in crate::snapshots) enum JobEnd {
     /// Nothing from this attempt is published or committed and its path
     /// stays pending: a necessary invalidation (replacement, shrink,
     /// same-size edit, held-FD sample mismatch, unknown witness, dependency
-    /// or counting change; counted), a tail past its audit deadline (M1), or
+    /// or counting change; counted), a tail past its audit deadline, or
     /// unavailable evidence (K9); the last two are uncounted.
     Restart,
     /// The attempt was invalidated `MEMBER_CHANGED_AFTER` times in a row:
@@ -2629,7 +2629,7 @@ pub(in crate::snapshots) fn paused_charge(job: &OwnedActiveFile) -> Option<usize
     crate::heap_layout_bound::completed_bound(job, state_bytes())
 }
 
-/// The pause walk is the resumed page's starting copy-budget charge (E3):
+/// The pause walk is the resumed page's starting copy-budget charge:
 /// both exclude the live source-wide inputs.
 fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
     let consumed = job_position(job, job.parser.reader.consumed_bytes());
@@ -2641,7 +2641,7 @@ fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
 
 /// Request `max(len, 64 KiB)` reader-buffer capacity before a slot charge
 /// (parent shrink ACK). Every live byte is kept (a paused skip holds none:
-/// E4 took its salvage); the charge then walks the actual resulting capacity, which the
+/// its salvage was already taken); the charge then walks the actual resulting capacity, which the
 /// allocator may leave larger. Shrinking never certifies, publishes, clears
 /// debt or grants read budget.
 pub(in crate::snapshots) fn shrink_paused_buffer(buf: &mut Vec<u8>) {
@@ -2737,7 +2737,7 @@ fn accelerated(meta: &JobMeta) -> bool {
     meta.pace.accelerate
 }
 
-/// Stage 1 (§6, E2): add one resumed page's ordinary-equivalent time to its
+/// Stage 1: add one resumed page's ordinary-equivalent time to its
 /// attempt and return it: the elapsed time since the job's last page, or on
 /// a continuation page `max(elapsed, ordinary)`, where `ordinary` is the
 /// interval the ordinary cadence would have used for that gap (StateMissing's
@@ -2824,7 +2824,7 @@ impl SharedCache {
     /// a file without a cursor job, a budget not exhausted, or an attempt not
     /// accelerated.
     ///
-    /// Lock order (S1-b): the pause site holds no lock here. The lease is a
+    /// Lock order: the pause site holds no lock here. The lease is a
     /// slot token, not a lock; `accelerated` reads the job's own flag; the one
     /// `with_cursor` below takes only the cursor lock, with neither the
     /// retained nor the side lock held, and calls no locking helper inside
@@ -3200,7 +3200,7 @@ pub(in crate::snapshots) fn finish_job(
     let grown = held
         .as_ref()
         .is_some_and(|held| held.extent > meta.stamp_open.extent);
-    // E1: applied on the completion step, before the protected-tier gate
+    // The EOF record is applied on the completion step, before the protected-tier gate
     // (`apply_eof_record`). Such a job gets no S12 grant below.
     let eof_applied = meta.eof_applied;
     let parser = &mut job.parser;
@@ -3213,7 +3213,7 @@ pub(in crate::snapshots) fn finish_job(
         );
     let consumed = parser.reader.consumed_bytes();
     let now = super::now_seconds();
-    // A group's receipts and replay are bound to its start scope (R1-M1).
+    // A group's receipts and replay are bound to its start scope.
     let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now)
         && job
             .group
@@ -3249,7 +3249,7 @@ pub(in crate::snapshots) fn finish_job(
             FullReason::InvalidCheckpoint,
         ))),
     };
-    // R1-M1: under an untrusted census the scope follows census completeness,
+    // Under an untrusted census the scope follows census completeness,
     // so a dependency mismatch is unavailable evidence, not a member change.
     let result = match result {
         Err(Some(PrefixRefusal::Dependency)) if !census_trusted => Err(None),
@@ -3272,7 +3272,7 @@ pub(in crate::snapshots) fn finish_job(
     {
         job.hold_offset = job.hold_offset.or(Some(fragment.offset));
     }
-    // R1-H1 (#630 review): a hold an append may cure is memoized on the held
+    // #630 review: a hold an append may cure is memoized on the held
     // file's exact stamp, which must not cover bytes this read never
     // consumed: they may already cure it. Such a hold records no entry, so
     // its next attempt reads them.
@@ -3310,11 +3310,11 @@ pub(in crate::snapshots) fn finish_job(
             cache.with_cursor(update);
         }
     }
-    // Parent ruling 2: a lossy job's identity proof covers only a completed
+    // A lossy job's identity proof covers only a completed
     // traversal of the frozen extent, ending on a record boundary, whose loss
     // is parse/salvage loss main publishes. A read failure, an unfinished
     // read or a withheld record gets no proof, and an EOF-applied record
-    // keeps strict finish identity (E1).
+    // keeps strict finish identity.
     let completed_traversal = job.parser.reader.finished
         && job.parser.reader.failure.is_none()
         && !job.parser.reader.sealed_fragment()
@@ -3327,7 +3327,7 @@ pub(in crate::snapshots) fn finish_job(
         job.parser.reader.sealed_prefix = frozen_end
             .map(|extent| FinishGrant::certified(meta.stamp_open.dev, meta.stamp_open.ino, extent));
     } else if let Some(identity) = lossy_identity {
-        // An uncertified job grants it only through ruling 2's proof,
+        // An uncertified job grants it only through the same-object proof,
         // revalidated in `finish`; otherwise it keeps main's strict finish
         // identity (a grown file fails publication and restarts).
         job.parser.reader.sealed_prefix = Some(FinishGrant::LossySameObject(identity));
@@ -3412,13 +3412,13 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
         .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
     meta.stamp_open = stamp_open;
     meta.started = super::now_seconds();
-    // The replay's own completion step decides E1 again.
+    // The replay's own completion step decides the EOF record again.
     meta.eof_applied = false;
     true
 }
 
-/// E1 (K4 amendment, parent ACK), on the cursor job's completion step and
-/// before the protected-tier replay gate (R1-H1), as main applies its
+/// On the cursor job's completion step and
+/// before the protected-tier replay gate, as main applies its
 /// trailing line inside the read: at a genuine unchanged physical EOF (the
 /// held FD is exactly the opened object: dev, ino, length, mtime, ctime;
 /// and this read reached that length), the withheld final record is applied
@@ -3437,15 +3437,15 @@ pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
     }
 }
 
-/// E1's predicate: a withheld record not yet applied, the held FD exactly
+/// The EOF-apply predicate: a withheld record not yet applied, the held FD exactly
 /// the opened object (dev, ino, length, mtime, ctime) and the read at that
 /// length.
 ///
-/// ctime stays here on purpose (E1 S3): an applied record gives up the S12
+/// ctime stays here on purpose: an applied record gives up the S12
 /// grant for main's strict finish identity, whose opened-object digest
 /// still hashes ctime. Comparing content only would turn a ctime-only
 /// change into a finish refusal and a restart instead of a withheld record.
-/// It moves with that digest (the S3 follow-up).
+/// It moves with that digest.
 fn eof_record_due(job: &OwnedActiveFile) -> bool {
     let Some(meta) = job.cursor.as_ref().filter(|meta| !meta.eof_applied) else {
         return false;
@@ -3458,11 +3458,11 @@ fn eof_record_due(job: &OwnedActiveFile) -> bool {
             == Some(&meta.stamp_open)
 }
 
-/// E1 for a group job's live member (R2-N1): `eof_record_due`, the member
+/// The EOF apply for a group job's live member: `eof_record_due`, the member
 /// still exactly its `boot` object (so strict finish identity holds against
 /// its boot identity), and a record main's trailing-line rule applies
 /// without loss (`apply_physical_line`: within the line cap, UTF-8, blank
-/// or one JSON value). A group refuses any line loss (R1-B1), so a
+/// or one JSON value). A group refuses any line loss, so a
 /// malformed final record stays withheld, as before.
 pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &OpenStamp) -> bool {
     let reader = &job.parser.reader;
@@ -3481,7 +3481,7 @@ pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &O
         })
 }
 
-/// The withheld record was applied (E1): the job gets no S12 grant.
+/// The withheld record was applied: the job gets no S12 grant.
 pub(in crate::snapshots) fn mark_eof_applied(job: &mut OwnedActiveFile) {
     if let Some(meta) = job.cursor.as_mut() {
         meta.eof_applied = true;
@@ -4107,7 +4107,7 @@ fn admission_feasible(cursor: &CursorState, charge: usize, mandatory: bool) -> b
 /// room that way. Once no provenance is left, a mandatory charge then forgets
 /// parent witnesses in bounded batches sized by the checked shortfall
 /// (`evict_lru_parent_witnesses`, PR-P). Nothing is evicted unless the
-/// admission is first proved feasible (`admission_feasible`, R2-M1): a
+/// admission is first proved feasible (`admission_feasible`): a
 /// hopeless charge (a `JoinStateBound` pause, an optional claim inside the
 /// empty-retained floor) keeps every retained copy, provenance entry and
 /// witness. Unsupported accounting, overflow or no room: false, nothing
@@ -4376,8 +4376,8 @@ impl SharedCache {
     /// Everything the cursor state holds (paused job, memo, parked, rotation
     /// and invalidation records, a suspended proof). An unbounded state reads
     /// as the whole budget. Main's measures leave the suspended proof out:
-    /// the retained insert (U1a-2a ss-6) and M1's `release_to_fit` and
-    /// `release_older_to_fit` (D6(e), `release_room_for_main`) reserve
+    /// the retained insert and `release_to_fit` and
+    /// `release_older_to_fit` (`release_room_for_main`) reserve
     /// `cursor_resident_for_main` and retire the proof under their lock;
     /// this whole-state measure is for tests.
     #[cfg(test)]
@@ -4461,7 +4461,7 @@ impl SharedCache {
         });
     }
 
-    /// U1a-2a D6(e): M1's release room, under the caller's retained lock, in
+    /// The release room, under the caller's retained lock, in
     /// one cursor critical section (retained, then cursor; nothing relocks).
     /// The room is main's: `state_bytes()` less `state_for_main` (no suspended
     /// proof) and `pinned`, which carries the side ledger's fixed charge
@@ -5223,7 +5223,7 @@ impl SharedCache {
     }
 
     /// A memo entry or parked record exists for the group: its boot reaches
-    /// that lookup before the cursor-slot check (round 3, R2-M1).
+    /// that lookup before the cursor-slot check.
     pub(in crate::snapshots) fn group_recorded(&self, namespace: &Scope, key: &str) -> bool {
         let memo_key = memo_key(namespace, key);
         self.with_cursor(|cursor| {
@@ -5233,8 +5233,7 @@ impl SharedCache {
     }
 
     /// A group that read nothing for a job (unchanged, memo hit, parked)
-    /// stops waiting for the slot, with no fence and no served update
-    /// (round 3, R2-M1).
+    /// stops waiting for the slot, with no fence and no served update.
     pub(in crate::snapshots) fn cursor_unwait(&self, namespace: &Scope, key: &str) {
         let key = rotation_key(&namespace.0, key);
         self.with_cursor(|cursor| cursor.rotation.waiting.remove(&key));
@@ -5393,7 +5392,7 @@ impl SharedCache {
         .unwrap_or(plan)
     }
 
-    /// Count a committed attempt once the native finish ran (M4).
+    /// Count a committed attempt once the native finish ran.
     pub(in crate::snapshots) fn cursor_published(&self, publication: Publication, finished: bool) {
         self.with_cursor(|cursor| {
             let counters = &mut cursor.counters;
@@ -5632,7 +5631,7 @@ impl SharedCache {
     /// files wait their rotation turn. Only a stale job (not paused or
     /// resumed for `NAMESPACE_STALE_PAGES` cursor pages, so its namespace
     /// stopped scanning) is evicted; its path restarts in its namespace.
-    /// A continuation page (Stage 1, E2) never evicts: it only resumes its
+    /// A continuation page never evicts: it only resumes its
     /// own namespace's job.
     pub(in crate::snapshots) fn cursor_resume(
         self: &Arc<Self>,
@@ -5976,9 +5975,9 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) scope: Option<Scope>,
     /// `counting_view` recomputed from the resuming scan's index (K8).
     pub(in crate::snapshots) counting: String,
-    /// `group_scope` recomputed from the resuming scan's index (R1-M1).
+    /// `group_scope` recomputed from the resuming scan's index.
     pub(in crate::snapshots) group_scope: String,
-    /// The state and sidecar census are complete now (R1-M1).
+    /// The state and sidecar census are complete now.
     pub(in crate::snapshots) census_complete: bool,
 }
 
@@ -5995,9 +5994,9 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
     /// Selection flags of this page's Codex candidates (`requeue`).
     pub(in crate::snapshots) flags: &'a BTreeMap<String, (bool, bool)>,
-    /// The state and sidecar census are complete this page (R1-M1).
+    /// The state and sidecar census are complete this page.
     pub(in crate::snapshots) census_complete: bool,
-    /// Stage 1 (E2): this is a continuation page; it never counts toward
+    /// Stage 1: this is a continuation page; it never counts toward
     /// `UNAVAILABLE_RESUMES` and never evicts another namespace's job.
     pub(in crate::snapshots) continuation: bool,
     /// Stage 1 (§6): the ordinary interval a continuation page stands for
@@ -6032,7 +6031,7 @@ pub(in crate::snapshots) fn resume_paused_job(
     else {
         return Resumed::Idle;
     };
-    // E2: a path that no longer names the held object (archived, renamed,
+    // A path that no longer names the held object (archived, renamed,
     // deleted or replaced) can never revalidate; end the job now.
     if !path_names_held_object(&job) {
         return end_unavailable(job, lease, index, targets);
@@ -6049,7 +6048,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             sampling.file_scope(context.source, &job.candidate, &dependency, true, index)
         })
     });
-    // A group's counting view is built over every member (R1-M2).
+    // A group's counting view is built over every member.
     let counting = job_counting_view(&job, index);
     let verdict = revalidate(
         &mut job,
@@ -6087,7 +6086,7 @@ pub(in crate::snapshots) fn resume_paused_job(
         }
         // Unavailable evidence is not a member change: the job waits in the
         // slot, its path pending (K9), for at most `UNAVAILABLE_RESUMES`
-        // consecutive ordinary pages (E2). A continuation page only defers:
+        // consecutive ordinary pages. A continuation page only defers:
         // it never counts, so it cannot end the job early (Stage 1).
         Resume::Unavailable if context.continuation => match lease.defer(job) {
             PauseEnd::Paused => None,
@@ -6138,7 +6137,7 @@ fn path_names_object(file: &File, path: &Path) -> bool {
     })
 }
 
-/// E2: end a resumed job whose evidence cannot become available: free the
+/// End a resumed job whose evidence cannot become available: free the
 /// slot, count the file's attempt for this generation (K7) and process its
 /// path with a retryable `Reduction` cause. Nothing publishes; the prior
 /// body is kept, and the next generation restarts the read.
@@ -6216,7 +6215,7 @@ pub(in crate::snapshots) fn revalidate(
     ) else {
         return Resume::Unavailable;
     };
-    // R1-M1: under an untrusted census (at start or now) the dependency
+    // Under an untrusted census (at start or now) the dependency
     // fingerprint follows census completeness, so a mismatch is not proof of
     // a member change: unavailable evidence.
     let changed = if meta.census_trusted && inputs.census_complete {
@@ -6406,13 +6405,13 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
 /// hits only on the exact recorded stamp, and any growth re-reads it.
 ///
 /// `NativeCreatedThread` is set only inside that branch, so this covers the
-/// parentless missing-projection hold (R1-H1) and #635's unbound
+/// parentless missing-projection hold and #635's unbound
 /// `AmbiguousFork` hold. Memo eligibility only; admission is unchanged.
 pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
     accumulator.codex_created_thread_native_only
 }
 
-/// Memo key: namespace and path, like rotation keys (R1-M1).
+/// Memo key: namespace and path, like rotation keys.
 pub(in crate::snapshots) fn memo_key(namespace: &Scope, key: &str) -> String {
     rotation_key(&namespace.0, key)
 }
@@ -6444,7 +6443,7 @@ pub(in crate::snapshots) fn sidecar_fingerprint(codex: &CodexTitleMetadata, path
 
 /// The path's candidate ids that are identity conflicts, resolved, sorted
 /// and newline-joined. The set, not its size: a conflict moving from one
-/// candidate to another at an equal count also wakes (R1-L1). A path with no
+/// candidate to another at an equal count also wakes. A path with no
 /// rollout id is identity-ambiguous exactly while the state census holds
 /// any created thread (`seed_codex_sidecar_parent`), so that bit stands in.
 fn conflicted_identities(codex: &CodexTitleMetadata, path: &Path) -> String {
@@ -6497,8 +6496,8 @@ impl LiveWitness {
     }
 }
 
-/// Which census rule a terminal Codex disclosure follows (K2, the parent's
-/// H-3 ruling). The one classification for fresh refusals, memo hits,
+/// Which census rule a terminal Codex disclosure follows (K2). The one
+/// classification for fresh refusals, memo hits,
 /// parked records and any future durable memo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum DebtReason {
@@ -6683,7 +6682,7 @@ impl MemoEntry {
         }
     }
 
-    /// R1-H1: a hold an append can cure never matches a grown file.
+    /// A hold an append can cure never matches a grown file.
     pub(in crate::snapshots) fn growth_may_cure(mut self, growth_may_cure: bool) -> Self {
         self.exact_stamp = growth_may_cure;
         self
@@ -6932,7 +6931,7 @@ pub(in crate::snapshots) fn memo_digest(
 /// counts, and an incomplete finalization entry. A strict disclosure
 /// (`JoinStateBound`, `MemberChanged`) blocks its owner and keeps the prior
 /// body, but is never residue: it keeps the census red as a retryable
-/// unreadable file. A different census ruling changes this function only.
+/// unreadable file. A different census rule changes this function only.
 pub(in crate::snapshots) struct DisclosureTargets<'a> {
     pub(in crate::snapshots) census: &'a mut ScanCensus,
     pub(in crate::snapshots) residue_index_keys: &'a mut BTreeSet<String>,

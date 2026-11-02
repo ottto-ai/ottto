@@ -415,7 +415,7 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
     // native grains, so the family reads ordinary money (paused list).
 
     let f = Fixture::new(2);
@@ -563,7 +563,7 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
     // native grains, so the family reads ordinary money (paused list).
 
     let f = Fixture::new(2);
@@ -650,7 +650,7 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
     // native grains, so the family reads ordinary money (paused list).
 
     let f = Fixture::new(2);
@@ -765,7 +765,7 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to
+    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
     // native grains, so the family reads ordinary money (paused list).
 
     for conflict in [false, true] {
@@ -853,7 +853,7 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
 
 /// Contract 5 is always on, so capture is a function of the source and a
 /// retained reduction always continues in the capture mode its markers were
-/// built in (E1 S2: the retained capture-mode refusal is gone, not merely
+/// built in (the retained capture-mode refusal is gone, not merely
 /// unreached). Appends tail, and the tailed body keeps the prefix's marker;
 /// `durable_restart` covers a restart.
 #[test]
@@ -907,7 +907,7 @@ fn capture_markers_trusted(run: &Run, f: &Fixture) -> bool {
     })
 }
 
-/// M1: a restart (a new process cache) continues from the durable store
+/// A restart (a new process cache) continues from the durable store
 /// instead of a Full read, and matches the unsampled oracle. Reuse needs the
 /// retained copy, so unsupported layouts write nothing and read Full.
 #[cfg(unix)]
@@ -1198,7 +1198,7 @@ mod durable_restart {
         assert_fresh_restart_matches_full(&f, &state, saved);
     }
 
-    /// E1 S2: a restart under the same (constant) capture restores the
+    /// A restart under the same (constant) capture restores the
     /// durable record and tails; nothing reads Full for a capture-mode
     /// mismatch, and the tailed body keeps the prefix's marker.
     #[test]
@@ -1250,7 +1250,7 @@ mod durable_restart {
 
     /// The production evidence pipeline runs attach, side calls, account
     /// reconciliation and finish before we serialize the upload request.
-    /// A nonempty E2 literal and reported price prevent vacuous equality of
+    /// A nonempty `e2` literal and reported price prevent vacuous equality of
     /// held pages or pre-finalization accumulators.
     fn enriched_e2(f: &Fixture, run: Run) -> Run {
         enriched_e2_with(f, run, None)
@@ -1395,7 +1395,7 @@ mod durable_restart {
         });
     }
 
-    /// [behaviour] SOURCE Q2: after a restart that restores and tails, the
+    /// [behaviour] After a restart that restores and tails, the
     /// carry seeds from the restored requests, reading no earlier bytes, and
     /// equals a cold full read.
     #[test]

@@ -1,7 +1,7 @@
 //! Codex prelude footprint: what every new Codex session loads before its
 //! first model request (the AGENTS.md chain and the skills listing).
 //!
-//! [`CodexPreludeParser`] is the one Codex prelude parser (CROSS-LANE R1): it
+//! [`CodexPreludeParser`] is the one Codex prelude parser: it
 //! takes rollout rows already decoded, so the session sink can share it. This
 //! uploader consumes bounded RAM from main line delivery, uploading each scope's
 //! newest owned fresh start as a context-footprint snapshot with
@@ -211,7 +211,7 @@ pub(crate) enum PreludeStep {
     Done,
 }
 
-/// The one Codex prelude parser (CROSS-LANE R1). Feed rollout rows in order,
+/// The one Codex prelude parser. Feed rollout rows in order,
 /// already decoded, until it says [`PreludeStep::Done`]; callers that decode
 /// rows for another purpose share this instead of parsing the prelude again.
 /// Requires `world_state` (cli >= 0.159); older rollouts are not supported.

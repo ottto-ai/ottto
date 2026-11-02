@@ -65,7 +65,7 @@ impl Budget {
         if keys.iter().all(|key| self.admitted.contains(key)) {
             return true;
         }
-        // Lead B Q1 (2026-10-31): a file's context ACKs may split across
+        // A file's context ACKs may split across
         // passes, so reserve real bytes only (this page's parsed bodies). A
         // file's own bodies are unknown before its parse: admit it while one
         // more legal body (sent once) still fits. A tail the pass allowance
@@ -198,7 +198,7 @@ impl Budget {
     }
 }
 impl ScanIndex {
-    /// Lead B Q1: return split files read on this page to their generation's
+    /// Return split files read on this page to their generation's
     /// queue in one pending pass; each next read resends only unACKed bodies.
     pub(super) fn requeue_split_context_reads<'a>(&mut self, keys: impl Iterator<Item = &'a str>) {
         let Some(traversal) = self.traversal.as_mut() else {

@@ -1,4 +1,4 @@
-//! M1 codec controls on real parses of synthetic transcripts, per source:
+//! Durable codec controls on real parses of synthetic transcripts, per source:
 //! the privacy canary, restore equality, Restore+Tail against a cold Full,
 //! and the crash matrix after a checkpoint. No layout gate: these run on
 //! every platform.
@@ -198,7 +198,7 @@ fn assert_v1_mutation_refused(
 }
 
 /// [money] Opaque serializer-header tokens inside an archived payload, even
-/// with a valid checksum, never grant restored money authority under M3.
+/// with a valid checksum, never grant restored money authority under restart restore.
 #[test]
 fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
     for golden in crate::snapshots::sampled_scan::transition_fixture::load_v1_goldens().unwrap() {
@@ -347,14 +347,14 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 }
 
 /// The finished upload items of a parser that read to completion. Claude
-/// finishes with the money context the scan passes (the E2 fold's read
+/// finishes with the money context the scan passes (the `e2` fold's read
 /// context over an index holding the file), so the money fold is compared
 /// too.
 pub(super) fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
     items_at(parser, path, source, None)
 }
 
-/// `items`, through the shared native body with an M3 PRE-finalization hook
+/// `items`, through the shared native body with a PRE-finalization hook
 /// (`None`: the legacy wrapper itself).
 fn items_at(
     parser: OwnedJsonlParser,
@@ -616,7 +616,7 @@ fn codex_append() -> Vec<String> {
 /// Private instruction text (Claude instructions attachment and its
 /// request-1 blob), around a plain session. The request-shape and blob keys
 /// depend on the secret too, so a raw key reaching the body would show as
-/// the secret (SOURCE P2-5).
+/// the secret.
 fn claude_instruction_lines(secret: &str) -> Vec<String> {
     let mut lines = vec![
         json!({"type":"attachment","sessionId":CLAUDE_SESSION,"uuid":"a-1",
@@ -1064,7 +1064,7 @@ fn request_shape_and_blob_keys_are_stored_only_as_domain_separated_digests() {
     assert_eq!(full_digest(&restored), full_digest(&reduction));
 }
 
-/// SOURCE P2-5: an open Codex call is `{L id, U name}`. The encoded map's
+/// An open Codex call is `{L id, U name}`. The encoded map's
 /// only `L` span is the id, so an id copied into the name half would sit
 /// outside every `L` span and fail the canary.
 #[test]
@@ -1092,7 +1092,7 @@ fn open_call_l_span_is_the_id_alone() {
     assert!(name >= end || name + "call_NAMEHALFcx".len() <= start);
 }
 
-/// P2-1 (SOURCE): a selector context holding any attribution capture key
+/// A selector context holding any attribution capture key
 /// (raw skill, plugin, MCP or subagent names) is `E`: the record is refused
 /// under its own counted class and the entry reads Full. Any other context
 /// key persists (`U`).
@@ -1543,7 +1543,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
 }
 
 /// The allowlist digests, pinned: any field, class or type change in a
-/// persisted type moves them. Review the classes with SOURCE, then repin.
+/// persisted type moves them. Review the classes, then repin.
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
@@ -1768,7 +1768,7 @@ fn h_fields_are_audited() {
         .iter()
         .map(|(path, _)| path.to_string())
         .collect::<BTreeSet<_>>();
-    // The body's `H` fields and the envelope's digests (SOURCE P2-5).
+    // The body's `H` fields and the envelope's digests.
     let mut paths = h_paths(&shape_text());
     for path in crate::durable_tail_store::ENVELOPE_H {
         assert!(paths.insert(path.to_string()), "{path} listed twice");

@@ -1148,7 +1148,7 @@ fn pi_retry_index_representation_transition_refuses_before_post() {
     let mut owner = f.capture(Duration::ZERO);
     let mut representation: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&f.index_path).unwrap()).unwrap();
-    // E1's existing V-row contract: a changed index schema is a new
+    // The existing V-row contract: a changed index schema is a new
     // representation even with unchanged checkpoint generation and Pi bytes.
     representation["schema_version"] = serde_json::json!(f.baseline.schema_version + 1);
     std::fs::write(&f.index_path, serde_json::to_vec(&representation).unwrap()).unwrap();

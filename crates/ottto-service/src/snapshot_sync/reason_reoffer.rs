@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) const ORIGINAL_PAIR_CANDIDATE_UNPROVED: &str = "original_pair_candidate_unproved";
 /// One logical offer per record per day.
 pub(super) const REOFFER_INTERVAL_SECONDS: u64 = 86_400;
-/// SI clock tolerance: a deadline past now + 24 h + 600 s is skipped and
+/// Clock tolerance: a deadline past now + 24 h + 600 s is skipped and
 /// re-clamped to now + 24 h, keeping suppression until the next due cycle.
 pub(super) const REOFFER_CLOCK_TOLERANCE_SECONDS: u64 = 600;
 

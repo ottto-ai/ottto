@@ -267,8 +267,8 @@ fn blob_bytes() -> usize {
 
 /// A Claude `api-request-shape` or `api-request-blob` key (`shapeHash`, blob
 /// `hash`): a client-minted content hash of instruction or system text, not a
-/// provider id. Held only as its domain-separated SHA-256 (M1, SOURCE P2-5:
-/// `H`, never `L`); every incoming key is hashed before any lookup.
+/// provider id. Held only as its domain-separated SHA-256 (`H`,
+/// never `L`); every incoming key is hashed before any lookup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct ClaudeRequestKey([u8; 32]);
 
@@ -300,8 +300,7 @@ impl ClaudeRequestKey {
 crate::heap_layout_bound::no_heap!(true; ClaudeRequestKey);
 
 /// An opening call's provider call or tool-use id, apart from the tool name
-/// its `OpeningCall` holds, so a record's `L` span is the id alone (M1,
-/// SOURCE P2-5).
+/// its `OpeningCall` holds, so a record's `L` span is the id alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct OpeningCallId {
     id: String,
@@ -422,7 +421,7 @@ struct OpeningRequest {
     cache_read_tokens: u64,
     cache_write_5m_tokens: Option<u64>,
     cache_write_1h_tokens: Option<u64>,
-    /// The parts above add up to `context_tokens` (D6 is exact).
+    /// The parts above add up to `context_tokens` (the first-request breakdown is exact).
     parts_reconcile: bool,
     output_tokens: u64,
 }
@@ -511,7 +510,7 @@ pub(super) struct SessionStartState {
     collapsed_requests: bool,
     /// End offset of the last line applied while the window was open (the
     /// line that froze it, once frozen), when the reader knew it. The opening
-    /// content (M1 durable warm-cache) equals a re-parse of the file through
+    /// content (durable warm-cache) equals a re-parse of the file through
     /// it; `None` after any line at an unknown position.
     content_end: Option<u64>,
 }
@@ -635,7 +634,7 @@ impl SessionStartState {
         self.recount_held();
     }
 
-    /// M1: after each applied line, while the window is open, the end of
+    /// After each applied line, while the window is open, the end of
     /// that line: the opening content is final through it.
     pub(super) fn note_line_applied(&mut self) {
         if !self.frozen {
@@ -644,7 +643,7 @@ impl SessionStartState {
         }
     }
 
-    /// M1 durable warm-cache reuse: the digest of the opening content a
+    /// Durable warm-cache reuse: the digest of the opening content a
     /// record never carries (instruction text, the Codex prelude with its cwd
     /// and AGENTS.md, opening file paths), or `None` when there is none. It
     /// is re-derived by re-parsing the file head through `content_end`, which
@@ -1037,7 +1036,7 @@ impl SessionStartState {
             cache_write_5m_tokens: Some(usage.cache_creation_5m_tokens),
             cache_write_1h_tokens: Some(usage.cache_creation_1h_tokens),
             // The item's first turn takes the larger of the billing counters
-            // and any single `usage.iterations[]` entry; D6 must equal it.
+            // and any single `usage.iterations[]` entry; the breakdown must equal it.
             parts_reconcile: usage.effective_input_context() == context_tokens,
             output_tokens: usage.output_tokens,
         });
@@ -1060,7 +1059,7 @@ impl SessionStartState {
         self.feed_codex_prelude(row);
     }
 
-    /// Feeds the one Codex prelude parser (CROSS-LANE R1) and folds the
+    /// Feeds the one Codex prelude parser and folds the
     /// configuration blocks it counts into the start fingerprint.
     fn feed_codex_prelude(&mut self, row: &Value) {
         let parser = self.codex_prelude.get_or_insert_with(|| {
@@ -1388,7 +1387,7 @@ impl SessionStartState {
     /// The wire value. `fresh_start` is false for forks and copied prefixes,
     /// which keep only `client_version`; so is a Codex prelude the shared
     /// parser found copied. `first_turn_context_tokens` is the item's own
-    /// first-turn context, which D6 must add up to. Path hashes need the
+    /// first-turn context, which the breakdown must add up to. Path hashes need the
     /// tenant attribution key; the configuration fingerprint uses the device
     /// salt.
     ///
@@ -1433,8 +1432,8 @@ impl SessionStartState {
             .iter()
             .take_while(|request| request.is_some())
             .count();
-        // D6 only when its parts add up to the item's first-turn context: the
-        // first request must reconcile exactly and be that turn. Codex takes
+        // The first-request breakdown only when its parts add up to the item's
+        // first-turn context: the first request must reconcile exactly and be that turn. Codex takes
         // the first turn from a response the request count may not admit.
         if let Some(first) = requests[0].filter(|r| {
             r.parts_reconcile
@@ -2120,7 +2119,7 @@ mod tests {
                 "start_chars_other": 6
             })
         );
-        // Request-1 parts reconcile with the first request's usage (D6).
+        // Request-1 parts reconcile with the first request's usage.
         assert_eq!(items[0].first_turn_context_tokens, Some(10 + 100 + 20 + 30));
         // Labels off: every entry travels hashed, no plain path.
         let mut hashed = (*parsed).clone();
@@ -2688,7 +2687,7 @@ mod tests {
     }
 
     /// The item's first turn can come from a response the request count does
-    /// not admit (no cumulative usage); D6 then describes another request.
+    /// not admit (no cumulative usage); the breakdown then describes another request.
     #[test]
     fn codex_first_turn_without_cumulative_usage_omits_first_request_parts() {
         let dir = crate::test_scratch::ScratchDir::new("session-start-codex-first-turn");
@@ -3147,7 +3146,7 @@ mod tests {
             } else {
                 CODEX_PARTS_METHOD
             };
-            // Upper bound on the wire: D6 is kept whenever request 1 reconciles.
+            // Upper bound on the wire: the breakdown is kept whenever request 1 reconciles.
             let first_turn = shadow.requests[0].map(|request| request.context_tokens);
             let finished = shadow.finish(true, first_turn, method, None, Some(&SALT));
             total.shadow += started.elapsed();
@@ -3195,7 +3194,7 @@ mod tests {
         }
     }
 
-    /// M1, SOURCE P2-5: an opening call's `L` span is its id alone, apart
+    /// An opening call's `L` span is its id alone, apart
     /// from the tool name its `OpeningCall` holds (`U`); request-shape and
     /// blob keys are held only as their domain-separated digests, and an
     /// incoming raw key still finds its entry.

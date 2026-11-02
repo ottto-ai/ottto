@@ -30,7 +30,7 @@ const STATE_BYTES: usize = CACHE_BYTES
     - KEY_RESERVE_BYTES
     - STALE_PREDECESSOR_RESERVE_BYTES;
 
-/// M3's custody/pacing reserve cannot reduce main's OFF admission budget.
+/// The restart-restore custody/pacing reserve cannot reduce main's OFF admission budget.
 fn state_bytes() -> usize {
     if restart_restore::enabled() {
         STATE_BYTES
@@ -102,7 +102,7 @@ thread_local! {
     static BLOCKING_RESIDENT_MEASURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// P1-RETAIN R0: while held, this thread's resident walk waits on the
+/// While held, this thread's resident walk waits on the
 /// retained and cursor locks, one at a time, instead of reading contention as
 /// an unbounded resident. Used only for the measure of a releasing completion
 /// (`releases_at_completion`); every other walk keeps `try_lock`. Restored on drop.
@@ -190,7 +190,7 @@ pub(crate) struct SharedCache {
     /// lock (retained, then cursor, then side; nothing is locked under it).
     /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
     side: Mutex<side_ledger::SideLedger>,
-    /// M1 durable warm-cache stores and write candidates. A leaf lock, never
+    /// Durable warm-cache stores and write candidates. A leaf lock, never
     /// held while taking another. Not part of the state budget: bounded by
     /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
     #[cfg(unix)]
@@ -224,7 +224,7 @@ impl HeapLayoutBound for SharedCache {
         // Its optional entries are priced separately by the rotation owner.
         self.withheld_memo.heap_bound(c)?;
         if BLOCKING_RESIDENT_MEASURE.with(std::cell::Cell::get) {
-            // P1-RETAIN R0's completion measure: wait for each lock, one at a
+            // A releasing completion's measure: wait for each lock, one at a
             // time and in lock order (`retained` checks this thread holds
             // neither; `with_cursor` marks the cursor lock held, as every
             // cursor critical section does), so contention is never read as
@@ -238,7 +238,7 @@ impl HeapLayoutBound for SharedCache {
         // Never `side`'s lock: a busy lock would read as unbounded and zero
         // every copy budget. The ledger's whole heap is this proved constant;
         // its inline tables are inside `size_of::<SharedCache>()`, which the
-        // caller's `bound` (or `Arc`) charges once (D5′ size test).
+        // caller's `bound` (or `Arc`) charges once (size test).
         c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.durable_root_charge())?)
     }
 }
@@ -255,7 +255,7 @@ impl SharedCache {
 // The memo handle fits the root's existing padding; its owned header is
 // charged separately above. The touched-family
 // view remains behind the already boxed cursor job.
-// Keep its reservation while OFF, even though optional M3 owners now allocate
+// Keep its reservation while OFF, even though optional restart-restore owners now allocate
 // only for ON or the approved erasure/invalidation actions.
 const OFF_MAIN_SHARED_BYTES: usize = 40_784;
 #[cfg(target_pointer_width = "64")]
@@ -324,14 +324,14 @@ impl SharedCache {
         }
         self.with_cursor(|cursor| cursor.headers.clear());
     }
-    /// M1: evict retained copies in victim order until they fit the state
+    /// Evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
     /// blocking locks in the one order (retained, then cursor). Usually it
     /// evicts nothing. False, with nothing evicted: the retained lock is
     /// poisoned, the cursor state is unbounded or poisoned, or even an empty
     /// cache would not fit. Evicted copies drop under the retained lock, as
     /// `clear` drops them; no guard or credit drops there, so nothing relocks.
-    /// U1a-2a D6(e): the cursor state is main's, without a suspended proof;
+    /// The cursor state is main's, without a suspended proof;
     /// where the fit is reachable, that proof is retired first, under these
     /// same locks, if the copies overflow beside it, so its bytes count
     /// toward the fit before any copy is evicted (`release_room_for_main`).
@@ -347,7 +347,7 @@ impl SharedCache {
         };
         retained.release_until_for(limit, Release::CopyRefusal)
     }
-    /// M1 Path A: `release_to_fit`, evicting only retained copies ranked
+    /// Path A: `release_to_fit`, evicting only retained copies ranked
     /// strictly below `rank`, and only where evicting them makes room;
     /// otherwise nothing, the suspended proof included
     /// (`TranscriptCache::release_older_until`, `older_release_fits`).
@@ -395,7 +395,7 @@ impl SharedCache {
             }
         }
     }
-    /// Capture after E2 finish_page, before identity/policy changes fingerprints.
+    /// Capture after `e2` finish_page, before identity/policy changes fingerprints.
     /// The committed index is the pre-scan authority: new held keys remain
     /// absent there and in settlement. Each flag shares its reduction's scope
     /// and is useful only after the ordinary checkpoint/scope validation.
@@ -492,7 +492,7 @@ impl SharedCache {
         self.insert_with_custody(key, completed, live_bytes, false, true, false)
             .is_ok()
     }
-    /// A completion whose durable record the M3 native route already
+    /// A completion whose durable record the native route already
     /// settled. A receipted record keeps its post-save audit-carrier offer;
     /// a no-record disposition must not retry the failed write after effects.
     #[cfg(unix)]
@@ -637,7 +637,7 @@ pub(super) struct Active {
     pub(super) audit_due: Option<u64>,
     /// The taken copy's admitted victim-order hint while this read continues
     /// it (Tail or Unchanged); `None` otherwise. Only a continued copy may
-    /// release residents for its own copy (P1-RETAIN R0), and it ranks them
+    /// release residents for its own copy, and it ranks them
     /// by its re-admission rank (`tail_completion_budget`), not by this hint.
     pub(super) retained_hint: Option<(i64, i64)>,
     /// The finalization charge reserved beside the continued copy at its last
@@ -849,7 +849,7 @@ fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
             .map_or(true, |replay| replay.join.is_none())
 }
 
-/// P1-RETAIN R0, shape F: a sampled Tail/Unchanged singleton that borrows
+/// Shape F: a sampled Tail/Unchanged singleton that borrows
 /// only its own retained reduction (moved into the parser at prepare) and its
 /// plan. Each conjunct is checked even where another implies it today.
 pub(super) fn borrows_only_retained_reduction(active: &OwnedActiveFile) -> bool {
@@ -923,7 +923,7 @@ pub(super) struct StepMeasure {
 }
 impl StepMeasure {
     /// The active's per-step walk hit the visit cap, so its optional charge
-    /// came from the byte walk and the copy budget stays zero (M1 F1).
+    /// came from the byte walk and the copy budget stays zero.
     fn visit_limited(&self) -> bool {
         self.active.is_some() && self.used.is_none()
     }
@@ -933,7 +933,7 @@ impl StepMeasure {
     /// copy and finish/output: `state_bytes() - resident - used`, or
     /// `state_bytes() - resident` with no active. The same arithmetic
     /// `copy_budget_step` halves, on this walk's own fields (no second
-    /// walk; a field would edit M1's unedited test literals). `None`:
+    /// walk; a field would edit unrelated test literals). `None`:
     /// unknown. Read only beside this walk's own non-zero budget, which
     /// implies a known room, where that budget is allocated against
     /// (`retire_proof_beside_copy`).
@@ -970,7 +970,7 @@ pub(super) fn release_cache_for_copy_refusal(
     );
 }
 
-/// M1: the copy-refusal release for `sampling` beside `active`, decided on
+/// The copy-refusal release for `sampling` beside `active`, decided on
 /// this step's own walk (`step`).
 pub(super) fn release_cache_to_fit(
     sampling: Option<&Context>,
@@ -982,15 +982,15 @@ pub(super) fn release_cache_to_fit(
 
 /// A zero copy budget forbids an optional copy beside the active. It does
 /// not by itself mean the residents overflow: the budget is half of what is
-/// left, so it is zero whenever the cache is merely full. M1 releases
-/// retained copies only where optional memory (residents, cursor state and
+/// left, so it is zero whenever the cache is merely full. Retained copies are
+/// released only where optional memory (residents, cursor state and
 /// the active's optional charge) really exceeds the state budget, and then
 /// only as many as the overflow needs, in victim order. The whole cache is
 /// cleared only where the charge to fit is unknown or cannot fit beside an
 /// empty cache; each such clear is counted by its cause. A sampled tail then
 /// makes room for its own copy from older entries only (`admit_tail_copy`),
 /// except a shape-F singleton (`borrows_only_retained_reduction`), which is
-/// released for only at its completion (P1-RETAIN R0, Q-PR14). `step` `None`
+/// released for only at its completion. `step` `None`
 /// is a caller with no step measurement: the conservative release.
 fn release_for_copy_refusal(
     sampling: Option<&Context>,
@@ -1038,7 +1038,7 @@ fn release_for_copy_refusal(
             record(Event::CopyRefusalWalkVisitLimit);
         }
         if active.is_some_and(borrows_only_retained_reduction) {
-            // P1-RETAIN R0 (Q-PR14): a sampled Tail/Unchanged singleton
+            // A sampled Tail/Unchanged singleton
             // (shape F) gets neither `fit_residents` nor Path A here. Its
             // retained reduction was moved into the parser by the destructive
             // take; its copy's only release is at completion, sized exactly,
@@ -1087,7 +1087,7 @@ fn fit_residents(context: &Context, resident: Option<usize>, charge: usize) -> b
         .is_some_and(|pinned| context.cache.release_to_fit(pinned))
 }
 
-/// M1 Path A (review §3c, owner-accepted): at a zero-budget step of a
+/// Path A: at a zero-budget step of a
 /// sampled tail, make room for its own copy by evicting, in victim order,
 /// only entries ranked strictly older than the tailed file, and only where
 /// that makes the copy fit; otherwise nothing. Main's wipe evicted every such
@@ -1199,7 +1199,7 @@ pub(super) fn context_overhead_covers(context: &Context) -> bool {
         .is_some_and(|parts| parts >= whole)
 }
 
-/// A completing cursor job's exact copy budget (E3), with the same
+/// A completing cursor job's exact copy budget, with the same
 /// refusal release the step start applies to an ordinary file, and the
 /// walk it came from (for `retire_proof_beside_copy`).
 pub(super) fn completion_copy_budget(
@@ -1213,8 +1213,7 @@ pub(super) fn completion_copy_budget(
     (budget, step)
 }
 
-/// U1a-2a (R2-B3, fix round 2 DB1, c22 ruling (b); fix round 3 DM3): main's
-/// copy budget funds two shares at once, a retained copy and finish/output
+/// Main's copy budget funds two shares at once, a retained copy and finish/output
 /// (`ClaudeResponses::finish_copy_budget`), so before main allocates
 /// against `budget` (its completion's clone and finish), a suspended proof
 /// larger than what both shares leave of `step`'s room is retired:
@@ -1226,7 +1225,7 @@ pub(super) fn completion_copy_budget(
 /// caller passes 0 where its completion cannot retain a copy. Where no copy
 /// can be allocated (`budget == 0`, which an unknown room always gives)
 /// nothing is retired: no proof drops on unavailable inputs. Non-allocating
-/// steps never call this, and M1 Path A (`admit_tail_copy`) clones nothing
+/// steps never call this, and Path A (`admit_tail_copy`) clones nothing
 /// at its zero-budget step.
 pub(super) fn retire_proof_beside_copy(
     sampling: Option<&Context>,
@@ -1308,7 +1307,7 @@ pub(super) fn copy_retire_probe() -> Option<CopyRetireProbe> {
 
 /// The copy budget left beside the active file. A cursor job's state grows
 /// past the ordinary walk's visit limit (usage hours, witnesses), so it is
-/// charged by bytes like its pause (N3), but never walked per line (E3):
+/// charged by bytes like its pause, but never walked per line:
 /// mid-job it uses the last walk plus the bytes consumed and the reader
 /// buffer growth since (`JobMeta::charge_estimate`, bounded slack corrected
 /// at the next walk, at most every `CHARGE_REFRESH_BYTES`); `completing`
@@ -1349,8 +1348,8 @@ pub(super) fn copy_budget_step(
         .flatten();
     let byte_charged = codex_cursor::byte_charged(active);
     // Every active is walked to the whole state budget, a non-byte-charged
-    // one past its line buffer, so a refusal knows its real optional charge
-    // (M1; F2 for a byte-charged job). The budget below is unchanged: it
+    // one past its line buffer, so a refusal knows its real optional charge.
+    // The budget below is unchanged: it
     // still charges the walk against the measured remainder.
     let limit = if byte_charged {
         state_bytes()
@@ -1359,7 +1358,7 @@ pub(super) fn copy_budget_step(
     };
     // (the budget's charge, the refusal's optional charge)
     let (used, optional) = if let Some(estimate) = estimate {
-        // The E3 estimate is charged whole, its buffer growth included.
+        // The charge estimate is charged whole, its buffer growth included.
         (Some(estimate), Some(estimate))
     } else {
         // These native source-wide inputs predate the optimization, are
@@ -1393,7 +1392,7 @@ pub(super) fn copy_budget_step(
             group.restore_tee_inputs(tee_inputs);
         }
         if byte_charged {
-            // The real walk, so the E3 estimate stays usable for the next
+            // The real walk, so the charge estimate stays usable for the next
             // refusal (F2); `usize::MAX` only where the job alone exceeds
             // the state budget.
             codex_cursor::record_job_charge(active, bound.unwrap_or(usize::MAX), consumed, buffer);
@@ -1424,7 +1423,7 @@ pub(super) fn copy_budget_step(
     )
 }
 
-/// The copy budget a completion hands to retention (P1-RETAIN R0 and its
+/// The copy budget a completion hands to retention (and to its
 /// diagnostic packet). No production counter reads the variant.
 pub(super) enum RetainBudget {
     /// Admit against `budget` now. The flags say whether the walk behind it
@@ -1594,8 +1593,8 @@ pub(super) struct DeferredRelease {
     max_victims: Option<usize>,
 }
 impl DeferredRelease {
-    /// Release through M1's one mechanism (`SharedCache::release_older_to_fit`,
-    /// U1a-2a D6(e)): under the retained and cursor locks, a suspended proof
+    /// Release through the one mechanism (`SharedCache::release_older_to_fit`):
+    /// under the retained and cursor locks, a suspended proof
     /// is retired first where the fit is reachable, then the shortest
     /// victim-order prefix ranked strictly below `rank` is evicted
     /// (`Release::CopyAdmission`), fit-or-nothing. Already fitting evicts
@@ -1627,7 +1626,7 @@ impl DeferredRelease {
     }
 }
 
-/// P1-RETAIN R0 at a completion that may release (`releases_at_completion`):
+/// A completion that may release (`releases_at_completion`):
 /// one exact measure, the budget this copy is admitted against without a
 /// release, and the facts a release proof needs (`ReleaseProof`). Nothing is decided or mutated here: the
 /// release is proven only at the retention site, after main's proof
@@ -1800,9 +1799,9 @@ pub(super) struct ReleaseProof {
     entry_limit: usize,
 }
 
-/// The finish-output bound a release proof may use (B1 ruling 3; X_out
+/// The finish-output bound a release proof may use (X_out
 /// hunk map). `Legacy` keeps `K = max(C, F_prev)` and the Q-PR15 guard:
-/// Codex's explicit residual (ruling 5). `Refused`: no owned bound, so zero
+/// Codex's explicit residual. `Refused`: no owned bound, so zero
 /// victims. `Bound`: Claude's X_out, without the guard (S-c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum XOut {
@@ -2290,7 +2289,7 @@ pub(super) fn compatible_reduction(accumulator: &SnapshotAccumulator) -> bool {
             && lineage_retainable(accumulator))
 }
 
-/// Which ownership lineages a retained copy may continue (P1-RETAIN-3).
+/// Which ownership lineages a retained copy may continue.
 fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     // (1) Today's class, unchanged: no fork, no header parent, no sidecar parent.
     let today = !accumulator.codex_is_fork

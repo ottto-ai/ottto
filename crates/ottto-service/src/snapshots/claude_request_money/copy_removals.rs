@@ -1,9 +1,9 @@
-//! Stored copy removals (copy-family fix, Lead B Addendum 1): per Claude
+//! Stored copy removals (copy-family fix): per Claude
 //! file, the request hashes it once removed as copies on an earlier holder's
 //! CURRENT census proof, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
 //! restoring the prefix. A holder no longer indexed cannot disprove anything:
-//! its group stands, counted (`copy_removal_holder_absent_kept`, Lead B F5);
+//! its group stands, counted (`copy_removal_holder_absent_kept`);
 //! only an indexed holder whose census lacks a hash reverts it. Local state
 //! (class L): never uploaded, never a wire field.
 //!
@@ -74,7 +74,7 @@ impl CopyRemovals {
     }
 
     /// Damaged metadata is uncertainty, never fresh ownership; it is written
-    /// back even when empty. An absent field is an empty store (Lead B F4).
+    /// back even when empty. An absent field is an empty store.
     pub(crate) fn missing() -> Self {
         Self {
             metadata_lost: true,

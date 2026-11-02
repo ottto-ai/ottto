@@ -214,7 +214,7 @@ impl CodexPreludeFeed {
         }
         f.trim(0);
     }
-    // TODO(E4): remove this exact-file migration after two stable releases.
+    // TODO: remove this exact-file migration after two stable releases.
     pub(super) fn cleanup_index(&self, support: &Path) {
         self.1
             .get_or_init(|| fs::remove_file(support.join(STATE_DIR).join("index.json")));

@@ -1312,7 +1312,7 @@ impl SelectedFallback {
                     index.terminal_jsonl_dispositions.remove(key);
                 }
             }
-            // Slice D1: fail closed, never a record of either revision. The
+            // Fail closed, never a record of either revision. The
             // first-seen birth of the same physical object stays (an in-place
             // stub every reader treats as no record; nothing is allocated).
             index.claude_request_census.invalidate_keeping_birth(key);

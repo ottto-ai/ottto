@@ -2,9 +2,9 @@
 //! (body-witness adoption) must not re-emit until their own recovery settles
 //! them.
 //!
-//! This is the one protected-session list on the Mac. SESSION (01a0f6e0) owns
-//! its content and the Mac's runtime owner installs it; the daemon only reads
-//! it. MONEY P2 reuses this reader and file; there is no second list. Each
+//! This is the one protected-session list on the Mac. The Mac's runtime
+//! owner installs it; the daemon only reads
+//! it. Another consumer reuses this reader and file; there is no second list. Each
 //! line is the lowercase hex SHA-256 of one exact, full `source_session_id`.
 //! Families are listed by their ROOT digest. A member-only line still
 //! excludes its whole family: the caller closes the list over the indexed
@@ -54,7 +54,7 @@ const MAX_CLOSED_DIGESTS: usize = 2 * MAX_LINES;
 /// revision 2 row's cutoff; each revision carries its own in the history
 /// policy table (F4b).
 pub(super) const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
-/// Family roots one pass remembers as walked (StateMissing M1). Past it, a
+/// Family roots one pass remembers as walked. Past it, a
 /// family is walked again for each of its candidates: slower, never skipped.
 const MAX_WALKED_ROOTS: usize = 4_096;
 
@@ -95,8 +95,8 @@ impl ListState {
 
 crate::heap_layout_bound::no_heap!(true; ListState);
 
-/// Why a list with no file reads `MissingAfterInstall` (addendum 3, SOURCE
-/// (a)): the seen-marker is present, or the backfill state's durable intent
+/// Why a list with no file reads `MissingAfterInstall`:
+/// the seen-marker is present, or the backfill state's durable intent
 /// is Set, or that intent could not be read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum MissingCause {
@@ -520,7 +520,7 @@ mod tests {
         );
     }
 
-    /// Addendum 3 (SOURCE (a)): with the list file gone, the missing pause
+    /// With the list file gone, the missing pause
     /// names its cause, and the status reason names unreadable intent.
     #[test]
     fn missing_after_install_names_unreadable_intent_as_its_cause() {

@@ -1,4 +1,4 @@
-//! D3 per-key hold and G3 owed-marker regression controls (RAM state only).
+//! Per-key hold and owed-marker regression controls (RAM state only).
 use super::super::owed::OwedMark;
 use super::*;
 use crate::durable_tail_store::DurableSource;

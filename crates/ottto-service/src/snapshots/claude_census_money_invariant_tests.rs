@@ -1,5 +1,5 @@
 // Live census, persisted-format and opened-birth invariants retained from
-// the retired P1 suite. Run with E2 on; no shadow or ledger writer exists.
+// a retired suite. Run with `e2` on; no shadow or ledger writer exists.
 use super::*;
 use crate::snapshots::claude_request_census::{
     claude_census_disjointness_complete, claude_census_member_status, decode_ledger_shard,
@@ -222,7 +222,7 @@ fn money_ledger_records_are_invisible_to_d1() {
         .claude_request_census_mut_for_test()
         .invalidate_keeping_birth_for_test(stub_key);
     // Ledger records live in the ledger's own store: an index holding one
-    // (a pre-release build) drops it on load, so D1 never sees it.
+    // (a pre-release build) drops it on load, so the census never sees it.
     let scratch = crate::test_scratch::ScratchDir::new("money-d1-ledger-key");
     let path = scratch.join("index.json");
     index.save(&path).expect("save index");
@@ -455,7 +455,7 @@ fn fill_census_to(index: &mut ScanIndex, total: usize) {
     );
 }
 
-/// E7 stopgap, demo shape: the holder `h` (ids A and B) and its resumed copy
+/// Stopgap, demo shape: the holder `h` (ids A and B) and its resumed copy
 /// `c` (A plus its own) are both past the cutoff. Each shares A with the
 /// other, so both keep their ids; a lone aged record still retires.
 #[test]
@@ -707,7 +707,7 @@ fn census_admission_releases_kept_records_oldest_first() {
     );
 }
 
-/// M3 with census admission: a paced residue still owns unread growth, so admission may
+/// With census admission: a paced residue still owns unread growth, so admission may
 /// not spend a record the terminal would keep. Each source of the held set
 /// spares the oldest record; the next kept record pays instead. The negative
 /// control is `census_admission_releases_kept_records_oldest_first`.
@@ -794,10 +794,10 @@ fn census_admission_release_is_deterministic() {
     assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
-/// The round 3 invariant: every record the pre-stopgap terminal (which
+/// The invariant: every record the pre-stopgap terminal (which
 /// retired every aged record) would admit whole, the stopgap admits whole
 /// too, and nothing else. `h` and `c` hold 4 hashes; `y` grows by 1 to 5.
-/// Round 7: at growth 5 not even releasing both admits `y`, so neither is
+/// At growth 5 not even releasing both admits `y`, so neither is
 /// released (sum first) and `y` is tombstoned as before.
 #[test]
 fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
@@ -848,7 +848,7 @@ fn census_admission_admits_what_pre_stopgap_retirement_admitted() {
     }
 }
 
-/// Lead B condition 4: with room available, an insert releases nothing
+/// With room available, an insert releases nothing
 /// kept: no row, and both kept records keep their ids.
 #[test]
 fn census_admission_with_room_releases_nothing() {
@@ -900,7 +900,7 @@ fn serialized_pair() -> (ScanIndex, String, String) {
     (index, holder, copy)
 }
 
-/// Round 7, Lead B condition 3: admission release driven by the serialized
+/// Admission release driven by the serialized
 /// budget alone. After a terminal keeps the pair, the census is filled to
 /// 50 bytes short of the full-record limit with almost all hashes free; a
 /// young record 20 ids long would be tombstoned by a plain insert, and
@@ -942,7 +942,7 @@ fn census_admission_release_driven_by_the_serialized_budget() {
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
 }
 
-/// Round 5 condition 3: the release needs no state from the terminal's
+/// The release needs no state from the terminal's
 /// page. The index is saved after the terminal and loaded back from disk
 /// as a restarted daemon does (the source-aware load); the holder is still
 /// released at admission and the grown record fits.
@@ -980,7 +980,7 @@ fn census_admission_release_survives_reload_and_restart() {
     assert_eq!(record(&young).request_hashes_for_test(), &[100, 101]);
 }
 
-/// E1 round 6: a full census where nothing can be released. `dirty` is aged
+/// A full census where nothing can be released. `dirty` is aged
 /// by its own mtime but its index entry has moved on (a suspect); five young
 /// records each grow past the room. Five failing inserts run one derive
 /// scan, not five, and are tombstoned exactly as before.
@@ -1040,7 +1040,7 @@ fn census_admission_release_memo_rescans_when_the_cutoff_advances() {
         .is_some());
 }
 
-/// Lead B NO-GO item 6: kept stock is bounded by occupancy, not by a fixed
+/// Kept stock is bounded by occupancy, not by a fixed
 /// share. Two terminals with the census at 90% keep a pair holding 600,000
 /// hashes (more than the former 524,288 cap); the holder survives both and
 /// is released only when an insert would otherwise be tombstoned.
@@ -1089,7 +1089,7 @@ fn census_retirement_keeps_overlap_under_pressure_until_admission() {
     assert_eq!(record(&young).request_hashes_for_test(), &[Y, Y + 1]);
 }
 
-/// Lead B NO-GO item 7: the decoder's 65,536-record bound holds on live
+/// The decoder's 65,536-record bound holds on live
 /// transcript inserts too. A new key past it gets no record (read as
 /// missing, as a decode drops it); a key already held is still replaced.
 #[test]

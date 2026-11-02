@@ -307,7 +307,7 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
     working.activate_effective_upload_body_witness_revision(
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
     );
-    // Ordinary transcripts: each file exists before its records (E2).
+    // Ordinary transcripts: each file exists before its records (`e2`).
     let mut scan = crate::snapshots::claude_request_money::e2::with_fixture_birth(
         start.unix_timestamp_nanos() as u64,
         || {
@@ -328,7 +328,7 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         item.cache_observations_state = None;
         item.session_account_evidence = None;
     }
-    // Production order: the local-evidence stage finishes the E2 bodies
+    // Production order: the local-evidence stage finishes the `e2` bodies
     // (gate on, they carry the hours) before policy finalization.
     let withheld = crate::snapshots::claude_request_money::e2::finish_page(
         &mut scan.snapshots,

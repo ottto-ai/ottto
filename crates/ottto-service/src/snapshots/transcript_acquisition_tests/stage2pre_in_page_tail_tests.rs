@@ -2,7 +2,7 @@
 //! Codex Stage2-pre RED rows remain in their independent draft PR.
 //!
 //! Every test asserts the behavior the ACKed seam (H1 reader-relative extent
-//! limit, H2 in-page E1, H3 grown-Tail sealed-prefix commit) must produce.
+//! limit, H2 in-page genuine-EOF apply, H3 grown-Tail sealed-prefix commit) must produce.
 //! Tests marked RED fail on main today, for the reason in their doc comment;
 //! tests marked PARITY assert main's behavior, which the seam must keep, and
 //! pass on main. Production code is unchanged here.
@@ -353,7 +353,7 @@ fn assert_refused(
 
 /// SP-11, updated for FE: Claude's in-page Tail with an append publishes
 /// its sealed prefix uncertified and drops the copy. Codex Stage2-pre is
-/// independent; FE changes the formerly pinned Claude D1 failure.
+/// independent; FE changes the formerly pinned Claude "acquisition exceeds stable source" failure.
 #[test]
 fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
     if !crate::heap_layout_bound::layout_supported() {

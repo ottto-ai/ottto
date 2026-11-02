@@ -2130,7 +2130,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if bypass == "owed" {
                     index.activate_effective_upload_body_witness_revision(2);
                 }
-                // Distinct, asserted M1 veto states.
+                // Distinct, asserted veto states.
                 assert_eq!(
                     index.effective_upload_body_witness_revision_requires_adoption(&key),
                     bypass == "owed"
@@ -4711,7 +4711,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
     }
 }
 
-/// M3 writes before effects/save. Verify the native receipt and its actual v3
+/// The native engine writes before effects/save. Verify the native receipt and its actual v3
 /// record, then require the post-save hook to leave that exact record intact.
 fn assert_native_write_before_save(
     cache: &SharedCache,
@@ -6264,7 +6264,7 @@ impl ContinuationDurableState {
             record.binding.key = *key;
             pending.push(record);
         }
-        // Native v3 class retirement replaces M1's scope-only deletion.
+        // Native v3 class retirement replaces the old writer's scope-only deletion.
         cache.durable_exclude_native_class(&key);
         let mut stores = cache.durable().unwrap();
         let slot = stores.slot(ds).as_mut().unwrap();
@@ -8028,7 +8028,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             assert!(next.reuse_evictions > 0);
             assert!(next.read_bytes <= paths.len() * (64 * 1024 + 1));
         } else {
-            // M3 reports this grown, structurally unfundable admission through
+            // The native engine reports this grown, structurally unfundable admission through
             // its existing paced resource path; restore itself performs no Full.
             assert!(matches!(
                 restored,

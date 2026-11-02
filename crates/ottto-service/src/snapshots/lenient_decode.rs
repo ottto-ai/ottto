@@ -80,7 +80,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
-    // S1 MISC: exact immutable custody access, without serializing HeldRaw.
+    // Exact immutable custody access, without serializing HeldRaw.
     pub(super) fn v2_provenance(&self) -> (u128, u64) {
         (self.1.sum, self.1.count)
     }
@@ -590,7 +590,7 @@ fn header_field(name: &str) -> bool {
             | "codex_proof_index_incarnation"
     )
 }
-/// SI-718-O1: the session-identity state a user Repair override rebuild
+/// The session-identity state a user Repair override rebuild
 /// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
 /// replay generations without which the rebuild would arm a replay the
 /// damaged index had completed (that replay clears carried state). Each uses
@@ -1436,7 +1436,7 @@ pub(super) fn read_file(
     }
     result
 }
-/// SI-718-O1: decode only the headers and `IDENTITY_CARRY_FIELDS` of an
+/// Decode only the headers and `IDENTITY_CARRY_FIELDS` of an
 /// index that cannot load whole (syntax, hold budget or a Codex key
 /// collision), with the same per-field decoders as a load. File records,
 /// holds and every other field are skipped unread, so damaged records spend
@@ -2576,7 +2576,7 @@ impl<R: BufRead + Seek> Decoder<R> {
 
         if pass == Pass::Full {
             // An empty undamaged store is never written: absence is an empty
-            // store, not lost metadata (Lead B F4). Damage is `missing`.
+            // store, not lost metadata. Damage is `missing`.
             if !seen.contains("claude_copy_removals") {
                 index.claude_copy_removals = Default::default();
             }

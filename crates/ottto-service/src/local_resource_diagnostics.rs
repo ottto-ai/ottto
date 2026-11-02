@@ -523,7 +523,7 @@ const UNACKED_LOST: [(&str, usize); 4] = [
     ("totals_unknown_files", UNACKED_LOST_START + 3),
 ];
 
-/// E3: Claude withheld-account hold events, in the slots after the reasons.
+/// Claude withheld-account hold events, in the slots after the reasons.
 #[derive(Clone, Copy)]
 pub(crate) enum WithheldEvent {
     /// A held key's file was proved absent and its hold released.
@@ -682,7 +682,7 @@ pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
 }
 
 /// Local alarm, once per process: a Claude context fold first withheld
-/// session scalars for a resource limit (SOURCE Amendment 7). Counts only.
+/// session scalars for a resource limit. Counts only.
 pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
 }
@@ -1239,7 +1239,7 @@ pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) 
         counts,
     );
 }
-/// E7-8a shadow, once per Claude page: per-family census completion counts
+/// Shadow, once per Claude page: per-family census completion counts
 /// (`family_census_complete`, `family_census_incomplete{reason}`,
 /// `family_complete_deferred{quantum}`), `pending_census_members`, the
 /// skipped-set digest and predicate cost. Counts only; never an authority
@@ -1256,7 +1256,7 @@ struct HistoryProofCorrectionDeferred {
     history_proof_correction_deferred_total: u64,
 }
 
-/// Local counter (StateMissing M2, SOURCE h695 N6): proof-correction members
+/// Local counter: proof-correction members
 /// the history gate holds, deferred instead of blocking settlement. This
 /// settlement's count and a saturating process total. Counts only; no path,
 /// id or wire event.
@@ -1304,7 +1304,7 @@ struct ReemissionFamilyClosureRootAbsentExcluded {
     claude_reemission_family_closure_root_absent_excluded_total: u64,
 }
 
-/// Local counter (StateMissing M1, SOURCE d680b524): subagent members the
+/// Local counter: subagent members the
 /// history gate held only through their listed family root while the root
 /// file is absent. This page's count and a saturating process total. Counts
 /// only; no path, id or wire event.
@@ -1335,7 +1335,7 @@ static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// One `claude_census_retire_kept_overlap` row (E7 stopgap): a complete
+/// One `claude_census_retire_kept_overlap` row (stopgap): a complete
 /// terminal's kept records, their hashes and those retired because the
 /// census was above 90% occupancy, with the terminal's census-full tombstone
 /// count; or the records an insert retired so it fits (admission overflow,
@@ -1370,7 +1370,7 @@ struct CensusRetireKeptOverlap {
     census_record_limit_refused_total: u64,
 }
 
-/// Local counter (E7 stopgap): aged Claude transcript census records kept
+/// Local counter (stopgap): aged Claude transcript census records kept
 /// because they share a request id with another unretired record, and those
 /// retired anyway: above 90% census occupancy at a terminal, or so an insert
 /// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
@@ -1418,7 +1418,7 @@ pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapC
     }
 }
 /// Local alarm: the one-time Claude history re-read latched its stop until
-/// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
+/// the daemon restarts, once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
 pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Serialize) {
     let stage = if reminder {

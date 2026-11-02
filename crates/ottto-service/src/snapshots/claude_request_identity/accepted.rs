@@ -23,7 +23,7 @@ pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
 /// Tombstone for a proof superseded before upload: a keyed digest is never zero.
 const REPLACED_PROOF: [u8; 16] = [0; 16];
 /// Definite "never accepted" tombstone for proof a copied marker lent
-/// (SOURCE 2026-10-31, #944 xPR F5): never a marker, refusal or replacement.
+/// (#944): never a marker, refusal or replacement.
 const INVALIDATED_PROOF: [u8; 16] = [0xff; 16];
 /// Pending `retained_proof_missing` buckets feed one diagnostic only.
 const MAX_PENDING_MISSING: usize = 64;
@@ -1031,7 +1031,7 @@ impl AcceptedBuckets {
             });
         }
     }
-    /// Copy-prefix ENABLE guard (Lead B F3): whether a stored-body ACK
+    /// Copy-prefix ENABLE guard: whether a stored-body ACK
     /// may have frozen `session`'s bucket at `bucket_start`. Known hints
     /// answer exactly; incomplete hints (whole buckets evicted) or an
     /// unparsable start answer yes. Without hints for the session the answer
