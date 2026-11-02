@@ -11,9 +11,13 @@ provenance and partial-settlement observations. Existing codec refusals remain
 unknown measurements. Head sums include known fields only. Process footprint
 is an instrumented pass upper bound rather than a per-file isolated peak.
 
-Validation: changed-file formatting and whitespace checks passed. Compilation
-and copied-corpus execution are pending the serialized harness measurement slot.
-No production behavior, persistence format or policy is changed.
+Validation: changed-file formatting and whitespace checks passed. The release
+test build passed after correcting a proxy macro identifier error. The three
+serialized copied-corpus arms completed with no harness failures; their oracle
+differences and measurement limits are retained in the private aggregate report.
+All three hybrid resume experiments selected Tail. This records a completed
+measurement, not oracle equivalence for every arm. No production behavior,
+persistence format or policy is changed.
 
 The expanded measurement plan also records collection element counts,
 finish-only and empty-field checks, candidate stable page geometries, estimated
