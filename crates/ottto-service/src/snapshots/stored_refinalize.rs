@@ -50,7 +50,15 @@ pub(super) fn withhold_for_native(
     index: &mut ScanIndex,
     pending: &PendingIndexFinalization,
     reason: CandidateParseReason,
+    hold_expired: bool,
 ) {
+    // The withheld body carried a copy hold's expiry; the owed native read
+    // decides it again, or the hold restarts and the body never goes.
+    if hold_expired {
+        index
+            .claude_copy_removals
+            .owe_last_hold(claude_money_birth_store::location_key(&pending.index_key));
+    }
     if let Some(entry) = index.files.get_mut(&pending.index_key) {
         entry.last_snapshot_fingerprint = pending.previous_snapshot_fingerprint.clone();
         entry.last_upload_body_witness = pending.previous_upload_body_witness.clone();

@@ -650,6 +650,28 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
     }
 }
 
+fn g3_page_facts(rows: &[Value]) -> String {
+    rows.iter()
+        .filter(|row| {
+            row["stage"] == "native_collection_page"
+                || row["stage"] == "tail_db_loads"
+                || row["stage"] == "tail_reconstruct"
+        })
+        .map(|row| {
+            let counts = &row["counts"];
+            format!(
+                "{}:{}/scanned={}/parse={}/adm={}",
+                row["stage"],
+                counts["cause"],
+                counts["scanned_files"],
+                counts["sampled_acquisition"]["full_by_parse_reason"],
+                counts["sampled_acquisition"]["acquisition_admission"]["attempts"],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[test]
 fn cap_delayed_growth_survives_age_and_replacement_traversal() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -699,13 +721,8 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
             assert_eq!(
                 delays.len() as u64,
                 delay,
-                "{source:?} full={full} stages={:?}",
-                rows.iter()
-                    .filter(|row| row["stage"] == "tail_db_loads"
-                        || row["stage"] == "tail_reconstruct"
-                        || row["stage"].as_str().is_some_and(|s| s.contains("growth")))
-                    .map(|row| (row["stage"].clone(), row["counts"].clone()))
-                    .collect::<Vec<_>>()
+                "{source:?} full={full} {}",
+                g3_page_facts(rows),
             );
             if delay > 0 {
                 assert_eq!(delays[0]["counts"]["audit_cap_delay"], delay);
@@ -913,7 +930,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         let ((working, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet")
         });
-        assert_eq!(modes, (0, 0, 1));
+        assert_eq!(modes, (0, 0, 1), "{}", g3_page_facts(&diagnostics));
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(working.files[&key].has_unverified_source());
         // Exercise the actual partial-save/held-body reconciliation. An
@@ -1017,8 +1034,10 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
             production_scan(&fixture, source, index, Some(cache.clone()), "held-cap")
         });
         assert_eq!(
-            modes, expected,
-            "neither cap decision may preempt a held retry"
+            modes,
+            expected,
+            "neither cap decision may preempt a held retry {}",
+            g3_page_facts(&diagnostics)
         );
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(next.claude_account_deferred_holds.contains_key(&key));

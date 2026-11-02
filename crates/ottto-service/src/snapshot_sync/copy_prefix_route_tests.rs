@@ -93,9 +93,13 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         );
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
         eprintln!(
-            "G3DIAG copy_prefix {} first_modes={:?}",
+            "G3DIAG copy_prefix {} first_modes={:?} copy_owed={} copy_earned={} holder_owed={} acks={}",
             crate::snapshots::e2_pipeline_scan_fixture::head_facts_for_test(&prior),
             first.modes,
+            upload_context_owed_for_test(&prior, &path),
+            crate::snapshots::e2_pipeline_scan_fixture::upload_context_receipt_earned_for_test(&prior, &path),
+            upload_context_owed_for_test(&prior, &holder),
+            first.scan.snapshots.len(),
         );
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();

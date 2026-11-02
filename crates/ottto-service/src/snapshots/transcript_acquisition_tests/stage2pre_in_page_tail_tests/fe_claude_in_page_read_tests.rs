@@ -1135,12 +1135,18 @@ fn fe_claude_census_reread_in_window_gives_member_changed() {
         grown.seen.causes
     );
     let _ = record_claude_native_observations(&grown.result, &mut grown.index);
-    let (mut index, next) = next_full(
+    // Past the growth pace, so the re-read lands in this census window.
+    sampled_scan::set_test_now(Some(
+        sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+    ));
+    let (mut index, next) = next_read(
         "census member_changed",
         &grown.base,
         grown.index,
-        STATE_MISSING,
+        (1, 0, 0),
+        Some(STATE_MISSING),
     );
+    sampled_scan::set_test_now(None);
     assert_eq!(
         next.census_window_end, grown.result.census_window_end,
         "precondition: one census window"

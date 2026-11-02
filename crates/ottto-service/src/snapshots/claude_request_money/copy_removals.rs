@@ -115,6 +115,19 @@ impl CopyRemovals {
             Err(_) => false,
         }
     }
+    /// The body that expired this file's hold was withheld, so its expiry must
+    /// be decided again: the next pass is the hold's last, not a new first.
+    pub(crate) fn owe_last_hold(&mut self, file: LocationKey) {
+        match self.files.binary_search_by_key(&file, |f| f.0) {
+            Ok(i) => self.files[i].1 = HOLD_PASSES - 1,
+            Err(i) if self.bytes + FILE_BYTES <= MAX_BYTES => {
+                self.files.insert(i, (file, HOLD_PASSES - 1, Box::new([])));
+                self.bytes += FILE_BYTES;
+            }
+            // A full debt store expires immediately.
+            Err(_) => {}
+        }
+    }
     pub(crate) fn clear_hold(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
             if self.files[i].2.is_empty() {

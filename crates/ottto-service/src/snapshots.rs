@@ -8599,7 +8599,11 @@ pub fn finalize_scan_after_policy_with_body_witness(
             final_group_fingerprint != pending.previous_snapshot_fingerprint
                 || final_upload_body_witness != pending.previous_upload_body_witness
         }) {
-            stored_refinalize::withhold_for_native(index, pending, reason);
+            let hold_expired = result.snapshots.iter().any(|snapshot| {
+                snapshot.source_file_fingerprint.as_ref() == Some(&pending.source_file_fingerprint)
+                    && claude_request_money::e2::copy_hold_expired(snapshot)
+            });
+            stored_refinalize::withhold_for_native(index, pending, reason, hold_expired);
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             continue;
         }

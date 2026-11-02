@@ -112,6 +112,11 @@ pub(crate) fn head_facts_for_test(index: &ScanIndex) -> String {
     )
 }
 
+/// `settled` (a settlement saved beside its own files) back on `from`'s route.
+pub(crate) fn onto_route_for_test(settled: &mut ScanIndex, from: &ScanIndex) {
+    settled.retain_persistence_baseline_from(from);
+}
+
 /// A restarted owner `cache` continues from `route`'s committed heads.
 pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: &Path) {
     *cache.test_route.lock().unwrap() = Some(FixtureRoute {
@@ -143,6 +148,7 @@ fn save_on_route(index: &mut ScanIndex, route: &Path) -> Result<()> {
     let current = ScanIndex::load(route)?;
     index.retain_persistence_baseline_from(&current);
     index.generation = current.generation;
+    index.decode_holds = current.decode_holds.clone();
     index.save(route)
 }
 

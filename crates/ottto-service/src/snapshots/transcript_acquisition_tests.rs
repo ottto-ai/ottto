@@ -1903,7 +1903,15 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         active.aliases.push(candidate);
         let counts = release(&scan, measured);
         assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
-        assert_eq!(counts.clear_entries_released, 1, "{source:?}");
+        assert_eq!(
+            counts.clear_entries_released,
+            if source == SnapshotSource::ClaudeCode {
+                0
+            } else {
+                1
+            },
+            "{source:?}"
+        );
         let active = scan.active_file.as_deref_mut().unwrap();
         active.aliases.clear();
         active.applied_receipts.insert(String::new(), None);

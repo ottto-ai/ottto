@@ -3827,12 +3827,12 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
-            assert_eq!(prior.claude_copy_removals, Default::default());
             let mut quiet = ready(&c, &scanner, prior, 100, sampled);
             if sampled {
                 // The expired hold's stored re-finalization differs from the
                 // accepted body, so it was withheld unsent (D142). Its owed native
-                // read is that body's one delivery, and nothing selects afterwards.
+                // read decides the expiry again and is that body's one delivery;
+                // nothing selects afterwards.
                 assert_eq!(quiet.modes, (1, 0, 0), "the read D142 owes");
                 let copy = body(&quiet, COPY).expect("the withheld body is delivered");
                 assert_eq!(

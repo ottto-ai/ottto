@@ -2550,11 +2550,13 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let withhold = |committed: &mut ScanIndex, parsed: ScanIndex, result: &SourceScanResult| {
         // Exercise classify -> Completed settlement -> durable save/reload;
         // copying the hold map misses the real fingerprint restore seam.
+        let route = parsed.clone();
         *committed = crate::snapshot_sync::withheld_support::settle_withheld(
             committed,
             parsed,
             result.clone(),
         );
+        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(committed, &route);
         assert!(committed.claude_account_deferred_holds.contains_key(&key));
         assert!(!committed.files[&key].source_file_fingerprint.is_empty());
         *committed = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(

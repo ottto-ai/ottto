@@ -2079,6 +2079,13 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
 
 /// Removal decisions of one page for the index's stored copy removals.
 #[derive(Debug, Default)]
+/// This item's finished fold expired a copy-prefix hold.
+pub(crate) fn copy_hold_expired(item: &SnapshotItem) -> bool {
+    item.claude_money
+        .as_deref()
+        .is_some_and(|fold| fold.prefix.hold_expired > 0)
+}
+
 pub(crate) struct CopyRemovalUpdates {
     state: Option<super::copy_removals::CopyRemovals>,
     added: u64,
