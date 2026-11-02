@@ -1102,17 +1102,19 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         let committed = index.clone();
         let order = Arc::new(Mutex::new(Vec::new()));
         let observed_order = order.clone();
-        let observed_cache = cache.clone();
+        // Each file's head stages after this point: an unstaged quiet head
+        // means the quiet file is the one retaining.
+        let observed_route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
         let observed_quiet = quiet_key.clone();
         let observed_held = held_key.clone();
         sampled_scan::test_hooks::set(sampled_scan::test_hooks::Point::AfterRetain, move || {
-            let who = if observed_cache
-                .retained_checkpoint(&observed_quiet)
-                .is_none()
-            {
+            let route = observed_route.as_deref().unwrap();
+            let staged =
+                |key: &str| crate::snapshots::state_v2::staged_head_for_test(route, key).is_some();
+            let who = if !staged(&observed_quiet) {
                 "quiet"
             } else {
-                assert!(observed_cache.retained_checkpoint(&observed_held).is_none());
+                assert!(!staged(&observed_held));
                 "held"
             };
             observed_order.lock().unwrap().push(who);
@@ -1305,27 +1307,19 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             .format(&Rfc3339)
             .unwrap();
         sampled_scan::set_test_now(Some(due + 1));
-        let loaded = ScanIndex::load(&path).unwrap();
+        let restart = Arc::new(sampled_scan::SharedCache::default());
+        // A quiet read from the committed head performs counted retirement
+        // instead of Full; the restart continues from that head.
+        let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&accepted)
+            .filter(|_| marked < crate::transcript_cache::CACHE_ENTRIES);
+        let loaded = ScanIndex::load(route.as_deref().unwrap_or(&path)).unwrap();
+        if let Some(route) = &route {
+            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(&restart, route);
+        }
         // Force a traversal reset too: the durable reparse/marker witness
         // must survive loss of the optional queue's old context.
         let mut loaded = loaded;
         loaded.traversal = None;
-        let restart = Arc::new(sampled_scan::SharedCache::default());
-        if marked < crate::transcript_cache::CACHE_ENTRIES {
-            // A record-backed/retained quiet read can perform counted
-            // retirement instead of Full; retain this positive sample control.
-            let copy = cache.take(&key).unwrap();
-            restart.insert(
-                key.clone(),
-                sampled_jsonl::CompletedNativeAcquisition {
-                    checkpoint: copy.retained.checkpoint,
-                    reduction: Some(copy.retained.state),
-                    released: None,
-                    unsealed: false,
-                },
-                0,
-            );
-        }
         drop(cache);
         let ((mut serviced, _, modes, _), diagnostics) =
             crate::local_resource_diagnostics::capture(|| {

@@ -2472,11 +2472,17 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
             .clear();
         let (mut index, _, mode) = run(index);
         assert_eq!(mode, Some(ReadMode::Unchanged));
-        assert!(cache
-            .retained_checkpoint(&key)
-            .expect("the quiet member's Unchanged read must retain its native reduction")
+        assert!(
+            crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+                SnapshotSource::ClaudeCode,
+                &cache,
+                &index,
+                &key,
+            )
+            .expect("the quiet member's Unchanged read must keep its committed head")
             .audit_debt()
-            .is_none());
+            .is_none()
+        );
         assert!(!index
             .claude_request_census
             .get(&key)

@@ -276,10 +276,6 @@ impl SharedCache {
             record(Event::ClearPoisonedLock);
         }
         self.with_cursor(|cursor| cursor.headers.clear());
-        #[cfg(test)]
-        if let Ok(mut route) = self.test_route.lock() {
-            *route = None;
-        }
     }
     /// Evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under

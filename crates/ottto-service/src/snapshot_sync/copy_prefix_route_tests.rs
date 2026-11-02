@@ -92,6 +92,11 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
             first.modes
         );
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+        eprintln!(
+            "G3DIAG copy_prefix {} first_modes={:?}",
+            crate::snapshots::e2_pipeline_scan_fixture::head_facts_for_test(&prior),
+            first.modes,
+        );
         let mut priors = [prior.clone(), prior.clone(), prior];
         let mut bodies = Vec::new();
         for (request, at) in [("d", D.1), ("e", "2026-08-02T07:09:10Z")] {

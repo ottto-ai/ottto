@@ -1075,7 +1075,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         );
         assert_eq!(total(&unchanged), 1);
         assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(1));
-        scanner.evict();
+        scanner.evict(&prior);
         let evicted = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(evicted.modes, (1, 0, 0));
         assert_eq!(
@@ -3180,10 +3180,10 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         );
         let restarted = E2ScanFixture::default();
         if loss == 1 {
-            scanner.evict();
+            scanner.evict(&prior);
         } else if loss == 2 {
             // Actual capacity eviction through the existing victim mechanism.
-            scanner.evict_for_pressure();
+            scanner.evict_for_pressure(&prior);
         }
         let scanner = if loss == 3 { &restarted } else { &scanner };
         let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
@@ -3827,10 +3827,12 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
+            let pending = prior.claude_copy_removals.clone();
             let quiet = ready(&c, &scanner, prior, 100, sampled);
             assert!(
                 body(&quiet, COPY).is_none(),
-                "expired retry debt never selects forever"
+                "expired retry debt never selects forever; sampled={sampled} modes={:?} removals={pending:?}",
+                quiet.modes,
             );
         });
     }

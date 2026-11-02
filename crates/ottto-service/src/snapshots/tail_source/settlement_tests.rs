@@ -406,6 +406,7 @@ fn a_proven_change_names_its_full() {
 fn the_shipped_selections_reuse_stored_state() {
     for reason in [
         CandidateParseReason::TranscriptChanged,
+        CandidateParseReason::Audit,
         CandidateParseReason::SourceChanged,
         CandidateParseReason::Rearmed,
         CandidateParseReason::ForcedFamily,
@@ -415,8 +416,8 @@ fn the_shipped_selections_reuse_stored_state() {
         assert!(reuses_stored(Some(reason)), "{reason:?}");
     }
     assert!(reuse_label(CandidateParseReason::TranscriptChanged).is_none());
+    assert!(reuse_label(CandidateParseReason::Audit).is_none());
     for reason in [
-        CandidateParseReason::Audit,
         CandidateParseReason::NewFile,
         CandidateParseReason::UploadContext,
         CandidateParseReason::BodyWitnessAdoption,

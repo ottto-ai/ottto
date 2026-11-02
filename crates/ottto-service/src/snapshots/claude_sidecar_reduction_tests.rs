@@ -618,7 +618,9 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
                 test_route: Default::default(),
             })
         } else {
-            cache.clear();
+            crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+                &cache, &prior,
+            );
             cache
         };
         f.evidence(1);

@@ -25,11 +25,13 @@ pub(super) fn reuse_label(reason: CandidateParseReason) -> Option<&'static str> 
     }
 }
 
-/// Whether this selection loads the committed Tail. `Audit`, `NewFile`, the
-/// D138 held reasons and every legacy reason stay native.
+/// Whether this selection loads the committed Tail. A due `Audit` certifies
+/// against the committed head, as main's against its RAM copy: an unchanged
+/// file retires quietly, and only what the file proves changed reads Full.
+/// `NewFile`, the D138 held reasons and every legacy reason stay native.
 pub(super) fn reuses_stored(reason: Option<CandidateParseReason>) -> bool {
     match reason {
-        None | Some(CandidateParseReason::TranscriptChanged) => true,
+        None | Some(CandidateParseReason::TranscriptChanged | CandidateParseReason::Audit) => true,
         Some(reason) => reuse_label(reason).is_some(),
     }
 }

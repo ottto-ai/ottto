@@ -2026,7 +2026,7 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
             Some(cache.as_ref()),
             index,
         );
-        let ((index, result, _), _) = capture(|| {
+        let ((index, result, _), rows) = capture(|| {
             finish(
                 OwnedSourceScan::new(
                     SnapshotSource::ClaudeCode,
@@ -2047,6 +2047,12 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
                 .with_line_observer("test", Box::new(recorder.clone())),
             )
         });
+        eprintln!(
+            "G3DIAG held_growth loads={:?}",
+            rows.iter()
+                .filter(|row| row["stage"] == "tail_db_loads" || row["stage"] == "tail_reconstruct")
+                .collect::<Vec<_>>()
+        );
         (index, result, recorder)
     };
     let today = days_from_now(0);

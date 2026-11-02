@@ -1497,7 +1497,16 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
         );
         fixture.file.append(&usage(source, 140, 1, "fixture-model"));
         let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "account-b");
-        assert_eq!(modes, (1, 0, 0));
+        // Claude's head is bound by its destination route, not the account
+        // scope (D131/D134): it continues, with the same body.
+        assert_eq!(
+            modes,
+            if source == SnapshotSource::ClaudeCode {
+                (0, 1, 0)
+            } else {
+                (1, 0, 0)
+            }
+        );
         let (_, full, _) =
             production_scan(&fixture, source, ScanIndex::default(), None, "account-b");
         assert_eq!(production_body(source, scan), production_body(source, full));

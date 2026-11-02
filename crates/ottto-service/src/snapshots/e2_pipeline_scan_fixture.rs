@@ -17,6 +17,9 @@ pub(crate) struct FixtureRoute {
     path: PathBuf,
     /// The caller saves through `Disk`; a page never commits on its own.
     caller_commits: bool,
+    /// The routes this owner made for its other indexes: one source has one
+    /// route per index, so another index's scan never orphans this one's heads.
+    others: Vec<PathBuf>,
 }
 
 /// Routes fixtures made. Any other route belongs to the caller's session.
@@ -44,17 +47,25 @@ pub(crate) fn routed_for_test(
         loaded
     };
     let mut own = cache.test_route.lock().unwrap();
-    if let Some(route) = own.as_ref() {
+    if let Some(route) = own.as_mut() {
         if route.caller_commits {
             return match on {
                 Some(_) => index,
                 None => carry(ScanIndex::load(&route.path).unwrap()),
             };
         }
-        if on.as_deref() == Some(route.path.as_path()) {
+        if let Some(mine) = on
+            .as_ref()
+            .filter(|on| **on == route.path || route.others.contains(on))
+        {
+            if *mine != route.path {
+                route.others.retain(|other| other != mine);
+                let left = std::mem::replace(&mut route.path, mine.clone());
+                route.others.push(left);
+            }
             let mut page = index.clone();
-            if page.save(&route.path).is_ok() {
-                return carry(ScanIndex::load(&route.path).unwrap());
+            if page.save(mine).is_ok() {
+                return carry(ScanIndex::load(mine).unwrap());
             }
         }
     }
@@ -70,11 +81,54 @@ pub(crate) fn routed_for_test(
         index
     };
     let (path, cold) = publish_route(&prior, dir);
+    let others = own.take().map_or_else(Vec::new, |route| {
+        let mut others = route.others;
+        others.push(route.path);
+        others
+    });
     *own = Some(FixtureRoute {
         path,
         caller_commits: false,
+        others,
     });
     carry(cold)
+}
+
+/// Which keys have a committed head on `index`'s route, and each set-aside mark.
+pub(crate) fn head_facts_for_test(index: &ScanIndex) -> String {
+    let keys = index.files.keys().map(|key| {
+        (
+            key.rsplit('/').next().unwrap_or_default().to_owned(),
+            state_v2::tail_set_aside(index, key)
+                .ok()
+                .flatten()
+                .is_some(),
+        )
+    });
+    format!(
+        "heads={:?} entries(set_aside)={:?}",
+        state_v2::tail_head_keys(index).map(|heads| heads.len()),
+        keys.collect::<Vec<_>>()
+    )
+}
+
+/// A restarted owner `cache` continues from `route`'s committed heads.
+pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: &Path) {
+    *cache.test_route.lock().unwrap() = Some(FixtureRoute {
+        path: route.to_owned(),
+        caller_commits: true,
+        others: Vec::new(),
+    });
+}
+
+/// `index`'s files with no continuation, on their own route: RAM is released
+/// and each head retired, so the next read of each is a Full as a first read
+/// is. A released cache alone keeps the heads, as in production.
+pub(crate) fn forget_continuations_for_test(cache: &sampled_scan::SharedCache, index: &ScanIndex) {
+    cache.clear();
+    if let Some(route) = route_of(index) {
+        state_v2::retire_tail(&route, index.files.keys().cloned()).unwrap();
+    }
 }
 
 /// An in-memory prior keeps every runtime-only (`serde(skip)`) field across
@@ -300,10 +354,7 @@ impl E2ScanFixture {
 
     /// This owner continues from `path`'s committed heads.
     pub(crate) fn on_committed_route(&self, path: &Path) {
-        *self.cache.test_route.lock().unwrap() = Some(FixtureRoute {
-            path: path.to_owned(),
-            caller_commits: true,
-        });
+        continue_route_for_test(&self.cache, path);
     }
 
     pub(crate) fn routed(&self, index: ScanIndex, dir: &Path) -> ScanIndex {
@@ -322,16 +373,18 @@ impl E2ScanFixture {
         begin_source_pass(&self.cache, state_dir, source, index_path, &scope, capture);
     }
 
-    pub(crate) fn evict(&self) {
-        self.cache.clear();
+    /// `index`'s files lose their continuation.
+    pub(crate) fn evict(&self, index: &ScanIndex) {
+        forget_continuations_for_test(&self.cache, index);
     }
 
-    pub(crate) fn evict_for_pressure(&self) {
+    pub(crate) fn evict_for_pressure(&self, index: &ScanIndex) {
         let mut retained = self.cache.retained().unwrap();
         let empty = sampled_scan::RetainedCache::default();
         let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
         assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
-        *self.cache.test_route.lock().unwrap() = None;
+        drop(retained);
+        forget_continuations_for_test(&self.cache, index);
     }
 
     #[allow(clippy::too_many_arguments)]
