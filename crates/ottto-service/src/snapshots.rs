@@ -7,7 +7,9 @@ use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::rearm_cause;
-use crate::local_resource_diagnostics::{line_delivery_unselected, CapCounts, UnselectedReason};
+use crate::local_resource_diagnostics::{
+    line_delivery_unselected, page_selection, CapCounts, PageSelection, UnselectedReason,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -27607,6 +27609,22 @@ impl OwnedSourceScan {
         } else {
             BTreeSet::new()
         };
+        // Counts only, never a gate input.
+        let owed_selected = pending_paths
+            .iter()
+            .filter(|pending| {
+                index
+                    .files
+                    .get(&local_index_key(&pending.path))
+                    .is_some_and(ScanIndexEntry::rearmed)
+            })
+            .count();
+        for (event, amount) in [
+            (PageSelection::Selected, pending_paths.len()),
+            (PageSelection::OwedSelected, owed_selected),
+        ] {
+            page_selection(source.api_slug(), event, amount as u64);
+        }
         index.resume_census_window_end = Some(census_window_end.clone());
         let mut census = ScanCensus {
             causes,
@@ -34142,6 +34160,7 @@ impl OwnedSourceScan {
             };
             match decision {
                 CandidateDecision::Skip => {
+                    page_selection(source.api_slug(), PageSelection::Skipped, 1);
                     if let Some(phase) = native_comparison.as_mut() {
                         if let Some(credit) = capture_credit.as_deref_mut() {
                             phase.record_actual_skip_paid(
