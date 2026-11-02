@@ -930,7 +930,7 @@ fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_lo
     let accepted = f.progress.accepted_fingerprints.len();
     let index = std::fs::read(&f.index_path).unwrap();
     let progress = std::fs::read(&f.progress_path).unwrap();
-    let result = checkpoint_partial_snapshot_index_with_read_limit(
+    let result = checkpoint_partial_snapshot_index_with_audit_release(
         &f.working,
         &f.baseline,
         &f.progress,
@@ -941,6 +941,10 @@ fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_lo
         &f.progress_path,
         || Ok(()),
         Some(crate::snapshot_retry::RESPONSE_BYTES),
+        None,
+        None,
+        None,
+        Default::default(),
     );
     assert!(result.is_err());
     assert_eq!(std::fs::read(&f.index_path).unwrap(), index);
