@@ -138,6 +138,8 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// lets the receipt prove, and later pages neither read nor POST anything.
 #[test]
 fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
+    // As every owner of this harness: commits persist durable records.
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("never_delivered_holder_reread_bound") {
         return;
     }
