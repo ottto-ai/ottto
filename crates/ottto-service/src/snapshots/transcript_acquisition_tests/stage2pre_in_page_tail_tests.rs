@@ -134,19 +134,7 @@ fn page(
             } => {
                 // As `production_scan_at_with_setup`: existing post-policy
                 // finalization and acceptance.
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    source,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(source, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(source, &scan, &mut index);
                 return (index, scan, seen);
             }
         }

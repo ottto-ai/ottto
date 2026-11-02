@@ -252,11 +252,7 @@ impl ReofferServer {
 
 impl Drop for ReofferServer {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+        stop_server(&self.stop, &mut self.worker);
     }
 }
 

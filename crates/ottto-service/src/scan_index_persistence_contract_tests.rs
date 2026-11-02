@@ -13,10 +13,10 @@ const MOVED: [&str; 3] = [
     "claude_usage_family_pending",
     "claude_request_census",
 ];
-struct Scratch(PathBuf);
+struct Scratch(crate::test_scratch::ScratchDir);
 impl Scratch {
     fn new() -> Self {
-        Self(crate::test_scratch::private_dir(
+        Self(crate::test_scratch::ScratchDir::new(
             "scanindex-storage-contract",
         ))
     }
@@ -64,11 +64,6 @@ impl Scratch {
         fs::write(self.root(), fixture["root"].as_str().unwrap()).unwrap();
         fs::set_permissions(self.root(), fs::Permissions::from_mode(0o600)).unwrap();
         fixture["logical"].clone()
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 fn decode(store: &LockedStore) -> (ScanIndex, LoadedRoot) {

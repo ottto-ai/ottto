@@ -2,6 +2,7 @@
 //! Every fixture is synthetic; no provider account content.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold;
+use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
@@ -942,19 +943,7 @@ fn page_selections(
                 mut scan,
                 ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 carry(&fixture.root, &mut scan);
                 return (index, scan, selections);
             }
@@ -3073,19 +3062,7 @@ fn hinted_page_limited(
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
@@ -5438,19 +5415,7 @@ fn page_between(
             OwnedSourceScanStep::Complete {
                 mut index, scan, ..
             } => {
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
@@ -6837,29 +6802,11 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
-                codex_fragment: None,
                 size_bytes: 8,
-                modified_unix_seconds: 0,
-                modified_unix_nanos: None,
                 source_file_fingerprint: "revision".into(),
-                last_snapshot_fingerprint: None,
-                last_upload_body_witness: None,
-                effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
-                codex_joined_member_set: None,
-                codex_captured_joined_member_set: None,
-                codex_protected_owner: None,
                 codex_applied_tier_receipt: Some(receipt),
-                codex_applied_tier_receipt_required: false,
-                codex_captured_tier_receipt: None,
-                codex_captured_tier_receipt_required: false,
-                codex_captured_uncommitted: false,
-                codex_counting_v2: false,
-                codex_counting_owner: None,
-                opened_changed_nanos: 0,
-                opened_birth_nanos: 0,
-                upload_context_receipt: None,
-                evidence_owed: false,
+                ..ScanIndexEntry::default()
             },
         );
         index
@@ -9808,28 +9755,7 @@ fn proof_room_keeps_the_headroom() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let context = super::super::Context {
-        cache: Arc::new(SharedCache::default()),
-        namespace: Scope("ns-a".to_owned()),
-        audit_metadata_supported: true,
-        audit_slots: 0,
-        full_files: 0,
-        tail_files: 0,
-        unchanged_files: 0,
-        native_bytes: 0,
-        sample_bytes: 0,
-        full_reasons: [0; 11],
-        priority_replays: 0,
-        audits_started: 0,
-        audits_completed: 0,
-        audit_quiet_retired: 0,
-        audit_cap_full: 0,
-        audit_cap_delay: 0,
-        pace_evicted: 0,
-        start_overdue_seconds: 0,
-        completion_overdue_seconds: 0,
-        admission: Default::default(),
-    };
+    let context = zero_context(&Arc::new(SharedCache::default()), "ns-a");
     let resident = crate::heap_layout_bound::bound(&context, state_bytes()).unwrap();
     let exact = state_bytes() - resident - PROOF_STEP_HEADROOM_BYTES;
     assert_eq!(proof_room(&context), Some(exact));
@@ -9966,7 +9892,7 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
     assert!(cache.proof_suspended_for_test().is_none());
     let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
     assert_eq!(refreshed.reuse_evictions, 2);
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
     assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
     let headers = cache
@@ -10043,10 +9969,14 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
     }
 }
 
-fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
+/// A sampled context in `namespace` whose every counter is zero.
+pub(in crate::snapshots) fn zero_context(
+    cache: &Arc<SharedCache>,
+    namespace: &str,
+) -> super::super::Context {
     super::super::Context {
         cache: Arc::clone(cache),
-        namespace: Scope("ns-main".to_owned()),
+        namespace: Scope(namespace.to_owned()),
         audit_metadata_supported: true,
         audit_slots: 0,
         full_files: 0,
@@ -10109,7 +10039,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         let copy = cache.take(&key).expect("retained").retained;
         let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
         let proof = proof_charge(&job);
-        let context = main_context(&cache);
+        let context = zero_context(&cache, "ns-main");
         let budget = || super::super::copy_budget_step(Some(&context), None, false);
         let (without, measured_without) = budget();
         assert!(without > proof, "precondition: a visible difference");
@@ -10149,7 +10079,7 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let budget = || super::super::copy_budget_step(Some(&context), None, false);
     let (without, measured) = budget();
     let room = measured.room().expect("a measured room");
@@ -10263,7 +10193,7 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let context = main_context(&cache);
+    let context = zero_context(&cache, "ns-main");
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
     let room = step.room().expect("a measured room");
     assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
@@ -10308,7 +10238,7 @@ fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     }
     let room = {
         let cache = Arc::new(SharedCache::default());
-        let context = main_context(&cache);
+        let context = zero_context(&cache, "ns-main");
         let (_, step) = super::super::copy_budget_step(Some(&context), None, false);
         step.room().expect("a measured room")
     };
@@ -10702,19 +10632,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
                 if continuation {
                     return (index, scan);
                 }
-                let mut projected = scan.clone();
-                apply_upload_policy(
-                    SnapshotSource::Codex,
-                    &mut projected.snapshots,
-                    SnapshotUploadPolicy::default(),
-                );
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
-                let accepted = projected
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect();
-                index.record_accepted_snapshot_fingerprints(&accepted);
+                accept_after_policy(SnapshotSource::Codex, &scan, &mut index);
                 return (index, scan);
             }
         }
