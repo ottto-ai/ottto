@@ -143,6 +143,11 @@ impl PendingTail {
     pub(in crate::snapshots::tail_source) fn key_for_test(&self) -> &str {
         &self.key
     }
+    /// What PRE encoded, `None` when nothing differs from the committed head.
+    pub(in crate::snapshots::tail_source) fn staged_for_test(&self) -> Option<&StagedFile> {
+        let encoded = self.encoded.as_ref().expect("PRE encoded");
+        encoded.staged.as_ref().ok()?.as_ref()
+    }
     /// The encoded stage, for a test that commits a damaged copy.
     pub(in crate::snapshots::tail_source) fn take_staged_for_test(&mut self) -> StagedFile {
         let encoded = self.encoded.take().expect("PRE encoded");
@@ -263,7 +268,7 @@ fn an_append_restates_only_the_open_pages() {
     tail.publish(&native);
     route.save(false);
     let head = route.head(&key).unwrap();
-    let mut base = TailBase::new(&head.body);
+    let mut base = TailBase::new(&head.body, false);
     state_v2::load_tail(&route.index, &key, &head, |collection, page, bytes| {
         base.observe::<Claude>(collection, page, &bytes).unwrap();
         Ok(())

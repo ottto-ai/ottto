@@ -924,33 +924,7 @@ fn layout_skipped_key(source: DurableSource) -> &'static str {
     }
 }
 
-/// S2: freeze accepted facts before working-index mutation. Unknown object
-/// identity keeps this floor; only independently proved replacement may skip it.
-#[derive(Clone, Copy)]
-pub(crate) struct AcceptedFloor {
-    pub(crate) end: u64,
-    revision: u64,
-    strict: bool,
-    /// A lossy read's raw extent is not a verified accepted-body prefix.
-    verified_extent: bool,
-}
-impl AcceptedFloor {
-    pub(crate) fn of(index: &ScanIndex, key: &str) -> Option<Self> {
-        let e = index.files.get(key)?;
-        Some(Self {
-            end: e.size_bytes,
-            revision: e.effective_upload_body_witness_revision,
-            strict: !e.source_file_fingerprint.is_empty(),
-            verified_extent: !e.has_unverified_source(),
-        })
-    }
-    pub(crate) fn behind(self, length: u64) -> bool {
-        (self.verified_extent && length < self.end) || !self.permits_real_edit()
-    }
-    pub(crate) fn permits_real_edit(self) -> bool {
-        effective_revision(SnapshotSource::ClaudeCode) >= self.revision
-    }
-}
+pub(crate) use crate::snapshots::tail_source::floor::AcceptedFloor;
 
 /// The interpretation inputs a record binds to beyond the file scope.
 pub(crate) struct Interpretation<'a> {
@@ -3491,7 +3465,10 @@ impl SharedCache {
                 return Err(MissClass::AcceptedFloor.into());
             }
             if source == DurableSource::ClaudeCode
-                && a.strict
+                && index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| !entry.source_file_fingerprint.is_empty())
                 && a.verified_extent
                 && record.record.binding.context == expected.binding.context
                 && record.record.certificate.sealed_offset < a.end

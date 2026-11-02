@@ -941,6 +941,14 @@ impl ReadPlan {
     pub(crate) fn mode(&self) -> ReadMode {
         self.mode
     }
+    /// A Full with no checkpoint whose stored state already proved the file
+    /// changed: the read is the same, its reason is the proven one.
+    pub(crate) fn name_proven_full(&mut self, reason: FullReason) -> ReadMode {
+        if self.mode == ReadMode::Full(FullReason::StateMissing) {
+            self.mode = ReadMode::Full(reason);
+        }
+        self.mode
+    }
     /// Length frozen when this acquisition opened. A multi-page reader never
     /// consumes past it; later appends belong to the next tail.
     pub(crate) fn frozen_length(&self) -> u64 {

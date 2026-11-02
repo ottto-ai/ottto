@@ -260,6 +260,8 @@ mod context_curve;
 mod session_start;
 /// Tail state codecs: each source's head and pages in the state database.
 #[cfg(unix)]
+mod stored_refinalize;
+#[cfg(unix)]
 mod tail_source;
 pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
@@ -8519,6 +8521,9 @@ struct PendingIndexFinalization {
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
     restored_behind_accepted: bool,
+    /// This read continued from stored state for a selection other than a
+    /// transcript change: a body that is not the ACKed one must not be sent.
+    stored_reuse: Option<CandidateParseReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -8799,6 +8804,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
             .map(snapshot_file_upload_body_set_hex);
+        #[cfg(unix)]
+        if let Some(reason) = pending.stored_reuse.filter(|_| {
+            final_group_fingerprint != pending.previous_snapshot_fingerprint
+                || final_upload_body_witness != pending.previous_upload_body_witness
+        }) {
+            stored_refinalize::withhold_for_native(index, pending, reason);
+            noop_source_files.insert(pending.source_file_fingerprint.clone());
+            continue;
+        }
         if pending.sampled_audit_verified {
             crate::local_resource_diagnostics::sampled_audit_comparison(
                 source.api_slug(),
@@ -9114,6 +9128,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
     index
         .snapshot_activity_at
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
+    #[cfg(unix)]
+    if source == SnapshotSource::ClaudeCode {
+        tail_source::counters::emit(source.api_slug());
+    }
 }
 
 /// Observe only offers that survived policy, holds and semantic no-op removal.
@@ -10788,6 +10806,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
         let full_rearm = would_full_rearm;
+        // Disclosed repeat: a stored pass cannot seal a complete rebuild read.
+        #[cfg(unix)]
+        if full_rearm
+            && !complete_rebuild_read
+            && index.claude_duplicate_request_witness_overflowed
+            && tail_source::load::route(SnapshotSource::ClaudeCode, index).is_some()
+        {
+            tail_source::counters::bump("full_rearm_stored_repeat", "claude_code");
+        }
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -30429,7 +30456,7 @@ impl OwnedSourceScan {
                     recovered_audit_due,
                     candidate,
                     decision,
-                    parse_reason: _,
+                    parse_reason,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -31001,6 +31028,22 @@ impl OwnedSourceScan {
                 // local buffer, published only on the native finish's verdict.
                 #[cfg(unix)]
                 let tail_base = parser.take_tail_base();
+                #[cfg(unix)]
+                let stored_reuse = parser
+                    .take_stored_read()
+                    .then_some(parse_reason)
+                    .flatten()
+                    .filter(|reason| stored_refinalize::reuse_label(*reason).is_some())
+                    .filter(|_| {
+                        file_sampling.as_ref().is_some_and(|active| {
+                            !matches!(
+                                active.mode,
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            )
+                        })
+                    });
+                #[cfg(not(unix))]
+                let stored_reuse = None;
                 #[cfg(unix)]
                 let mut tail = completed_acquisition
                     .as_ref()
@@ -32083,6 +32126,7 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
+                            stored_reuse: None,
                         });
                         let alias_items = parsed
                             .iter()
@@ -32156,6 +32200,7 @@ impl OwnedSourceScan {
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
                         .active_effective_upload_body_witness_revision,
+                    stored_reuse,
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -33727,15 +33772,17 @@ impl OwnedSourceScan {
             }
             // S2: preserve accepted facts before candidate/working-entry changes.
             #[cfg(unix)]
-            let accepted_floor = (restart_restore::enabled()
-                && durable_sources::below_accepted(source) == durable_sources::BelowAccepted::Held)
-                .then(|| {
-                    sampled_scan::durable_tail::AcceptedFloor::of(
-                        index,
-                        &local_index_key(&candidate.path),
-                    )
-                })
-                .flatten();
+            let accepted_floor = ((restart_restore::enabled()
+                && durable_sources::below_accepted(source)
+                    == durable_sources::BelowAccepted::Held)
+                || tail_source::load::route(source, index).is_some())
+            .then(|| {
+                sampled_scan::durable_tail::AcceptedFloor::of(
+                    index,
+                    &local_index_key(&candidate.path),
+                )
+            })
+            .flatten();
             // This floor also covers warm and unsampled returned-original paths.
             #[cfg(unix)]
             let mut restore_floor = accepted_floor;
@@ -35053,9 +35100,14 @@ impl OwnedSourceScan {
                         // restore. The legacy prefix/proof paths retain their
                         // own rules. A same-process `e2`-held read may
                         // reuse only its own certificate, without authority.
+                        // On Claude's database route a forced member reads natively
+                        // only for evidence stored state cannot supply.
+                        let forced_native = forced_family
+                            && (tail_route.is_none()
+                                || claude_request_census::forced_member_needs_native(index, &key));
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
-                            && !forced_family
+                            && !forced_native
                             && !comparison_target
                             && !parent_proof_required;
                         context
@@ -35116,15 +35168,28 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut restored_durable = false;
                         // On Claude's database route a RAM miss loads the
-                        // committed Tail (D142: transcript changes only).
+                        // committed Tail, unless this file owes a native read.
+                        #[cfg(unix)]
+                        let native_owed = tail_route
+                            .as_deref()
+                            .is_some_and(|route| state_v2::take_native_read(route, &key));
                         #[cfg(unix)]
                         let tail_load = tail_route.as_deref().filter(|_| {
                             retained.is_none()
                                 && allow_sample
+                                && !native_owed
                                 && !native_edit_proven
-                                && tail_source::load::reuses_stored(parse_reason)
+                                && stored_refinalize::reuses_stored(parse_reason)
                                 && !parser.reader.reader.is_compressed()
                         });
+                        #[cfg(unix)]
+                        if tail_route.is_some()
+                            && parse_reason == Some(CandidateParseReason::NewFile)
+                        {
+                            tail_source::counters::bump("tail_bootstrap_full", "new_file");
+                        }
+                        #[cfg(unix)]
+                        let mut tail_proven_full = None;
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match (retained, tail_load) {
                             (None, Some(route)) => {
@@ -35140,6 +35205,7 @@ impl OwnedSourceScan {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
+                                        parser.set_stored_read();
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -35154,7 +35220,10 @@ impl OwnedSourceScan {
                                         residue_index_keys.insert(key.clone());
                                         pending!();
                                     }
-                                    tail_source::load::Load::Cold => (None, taken_admission, debt),
+                                    tail_source::load::Load::Cold(proven) => {
+                                        tail_proven_full = proven;
+                                        (None, taken_admission, debt)
+                                    }
                                 }
                             }
                             (None, None)
@@ -35552,6 +35621,11 @@ impl OwnedSourceScan {
                             }
                             pending!();
                         }
+                        #[cfg(unix)]
+                        let mode = match (tail_proven_full, parser.reader.acquisition.as_mut()) {
+                            (Some(reason), Some(plan)) => plan.name_proven_full(reason),
+                            _ => mode,
+                        };
                         // S2 again against the actual native plan, after preparation
                         // but before body I/O/output. Preparing may race a truncate.
                         #[cfg(unix)]
@@ -36983,9 +37057,13 @@ struct ParserPending {
     /// PRE seam's encode.
     #[cfg(unix)]
     tail_base: Option<tail_source::seam::TailBase>,
+    /// This read continues from a loaded head, with or without a base.
+    #[cfg(unix)]
+    stored_read: bool,
 }
 crate::heap_layout_bound::fields!(ParserPending; owed_full_after_lossy_shrink,
-    pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(unix)] tail_base);
+    pending_taken, pending_returns, #[cfg(unix)] pending_funding, #[cfg(unix)] tail_base,
+    #[cfg(unix)] stored_read);
 
 struct OwnedJsonlParser {
     #[cfg(test)]
@@ -37019,6 +37097,18 @@ impl OwnedJsonlParser {
     #[cfg(unix)]
     fn take_tail_base(&mut self) -> Option<tail_source::seam::TailBase> {
         self.pending.as_mut()?.tail_base.take()
+    }
+    #[cfg(unix)]
+    fn set_stored_read(&mut self) {
+        self.pending
+            .get_or_insert_with(Default::default)
+            .stored_read = true;
+    }
+    #[cfg(unix)]
+    fn take_stored_read(&mut self) -> bool {
+        self.pending
+            .as_mut()
+            .is_some_and(|pending| std::mem::take(&mut pending.stored_read))
     }
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -85866,7 +85956,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision; inline restored_behind_accepted);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, stored_reuse; inline restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 // Hand-written so an absent fork costs no visit: every Claude and Codex
 // accumulator carries an empty ledger, and their frames must keep the visit

@@ -141,6 +141,8 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 /// heap is one bounded charge.
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
+    /// The head is from a lower revision: an unchanged read still restates it.
+    migrate: bool,
     /// In load order: by collection, then page.
     pages: Vec<((Collection, u64), [u8; 32])>,
     logs: Vec<(Collection, LogBase)>,
@@ -164,10 +166,12 @@ fn page_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 impl TailBase {
-    /// The base of a committed head whose source body is `head`.
-    pub(in crate::snapshots) fn new(head: &[u8]) -> Self {
+    /// The base of a committed head whose source body is `head`; `migrate`
+    /// when that head was written at a lower revision.
+    pub(in crate::snapshots) fn new(head: &[u8], migrate: bool) -> Self {
         Self {
             head: page_digest(head),
+            migrate,
             pages: Vec::new(),
             logs: Vec::new(),
         }
@@ -212,7 +216,9 @@ impl TailBase {
 
     /// The new head, every collection's metadata, and only the pages whose
     /// bytes differ from the committed ones; `None` when neither the head
-    /// nor any page differs.
+    /// nor any page differs. A lower-revision head with nothing else to write
+    /// is restated alone: same stamp, verification and debt, so it earns no
+    /// acquisition or Full credit and touches no ACK or receipt.
     fn stage<S: TailSource>(
         &self,
         view: &PreFinalization<'_>,
@@ -253,7 +259,11 @@ impl TailBase {
                 }
             }
         }
-        Ok((!staged.pages.is_empty() || page_digest(&staged.head) != self.head).then_some(staged))
+        let changed = !staged.pages.is_empty() || page_digest(&staged.head) != self.head;
+        if self.migrate && !changed {
+            super::counters::bump("tail_head_migrated", S::SOURCE.api_slug());
+        }
+        Ok((changed || self.migrate).then_some(staged))
     }
 }
 

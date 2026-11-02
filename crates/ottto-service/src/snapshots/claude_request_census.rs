@@ -3032,6 +3032,15 @@ fn insert_transcript_record(
 /// version the record describes (the server's stale body), on the same
 /// physical object; the file itself may have grown. A cleared (reparse-debt)
 /// fingerprint leaves the committed modification time to decide.
+/// A forced family member reads natively only for evidence stored state cannot
+/// supply: no census record, or an unverified or twin record that cannot bind
+/// a recomposed body (an identity-incomplete hold waits for its Full audit).
+pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
+    index.claude_request_census.get(key).map_or(true, |record| {
+        record.unverified_or_twin() && !record.can_bind_recomposed_body()
+    })
+}
+
 pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFile) -> bool {
     let key = super::local_index_key(&candidate.path);
     let kept = match (index.claude_request_census.get(&key), index.files.get(&key)) {

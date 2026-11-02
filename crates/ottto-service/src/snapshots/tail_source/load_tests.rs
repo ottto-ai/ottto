@@ -13,7 +13,7 @@ use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
 /// A first completion of `responses` committed as `name`.
-fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, String) {
+pub(super) fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, String) {
     let (tail, native) = route.complete(name, &lines(responses), None, |_| {});
     let key = tail.key_for_test().to_owned();
     assert!(tail.publish(&native));
@@ -25,7 +25,7 @@ fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, Strin
 }
 
 /// Appends the next response of a `responses` file (and its compaction).
-fn append(path: &Path, responses: usize) {
+pub(super) fn append(path: &Path, responses: usize) {
     let (before, after) = (lines(responses), lines(responses + 1));
     let grown = &after[before.len() - 1..after.len() - 1];
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -33,7 +33,7 @@ fn append(path: &Path, responses: usize) {
         .unwrap();
 }
 
-fn len(path: &Path) -> u64 {
+pub(super) fn len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
@@ -49,7 +49,7 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, V
     capture(|| load::<Claude>(&route.index, &route.path, key, &id, &mut held, &scope()))
 }
 
-fn loaded(route: &Route, path: &Path, key: &str) -> (Load, Vec<Value>) {
+pub(super) fn loaded(route: &Route, path: &Path, key: &str) -> (Load, Vec<Value>) {
     load_as(route, path, key, &route.path)
 }
 
@@ -62,7 +62,7 @@ fn points<'a>(records: &'a [Value], stage: &str) -> Vec<&'a Value> {
 }
 
 /// The single `tail_db_loads` point's outcome and the reconstruction causes.
-fn counted(records: &[Value]) -> (String, Vec<String>) {
+pub(super) fn counted(records: &[Value]) -> (String, Vec<String>) {
     let [load] = points(records, "tail_db_loads")[..] else {
         panic!("one load point: {records:?}");
     };
@@ -74,7 +74,7 @@ fn counted(records: &[Value]) -> (String, Vec<String>) {
 }
 
 /// A prepared read of `path` over `taken`, its start, and its consumed bytes.
-fn read(
+pub(super) fn read(
     route: &Route,
     path: &Path,
     taken: Option<Box<Taken<CachedJsonlReduction>>>,
@@ -95,7 +95,7 @@ fn read(
 }
 
 /// The unsampled native oracle: an independently admitted cold Full.
-fn cold(route: &Route, path: &Path) -> Value {
+pub(super) fn cold(route: &Route, path: &Path) -> Value {
     let (parser, mode, start) = read(route, path, None);
     assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
     test_finish_items(parser, path, SnapshotSource::ClaudeCode)
@@ -178,7 +178,7 @@ fn damaged_or_missing_state_is_a_counted_reconstruction() {
         route.save(false);
         let path = route.dir.join(name);
         let (load, records) = loaded(&route, &path, &key);
-        assert!(matches!(load, Load::Cold), "{name}");
+        assert!(matches!(load, Load::Cold(_)), "{name}");
         assert_eq!(
             counted(&records),
             ("error".into(), vec![cause.into()]),
@@ -190,7 +190,7 @@ fn damaged_or_missing_state_is_a_counted_reconstruction() {
     let path = route.dir.join("new.jsonl");
     std::fs::write(&path, lines(3).join("\n") + "\n").unwrap();
     let (load, records) = loaded(&route, &path, &local_index_key(&path));
-    assert!(matches!(load, Load::Cold));
+    assert!(matches!(load, Load::Cold(_)));
     assert_eq!(counted(&records), ("miss".into(), vec!["no_head".into()]));
 }
 
@@ -282,7 +282,7 @@ fn an_identity_mismatch_retires_before_reuse() {
     let (path, key) = committed(&mut route, "a.jsonl", 3);
     let other = route.dir.join("other-destination").join("state.db");
     let (load, records) = load_as(&route, &path, &key, &other);
-    assert!(matches!(load, Load::Cold));
+    assert!(matches!(load, Load::Cold(_)));
     assert_eq!(counted(&records), ("error".into(), vec!["identity".into()]));
     assert_eq!(points(&records, "tail_identity_failure").len(), 1);
     route.save(false);

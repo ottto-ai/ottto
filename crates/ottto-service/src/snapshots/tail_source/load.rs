@@ -12,6 +12,7 @@
 //! retired before anything else in it is read (C′), whatever the Full that
 //! follows achieves.
 use super::claude::Claude;
+use super::counters;
 use super::seam::TailBase;
 use super::{HeadIdentity, ReconstructCause, TailSource};
 use crate::snapshots::sampled_jsonl::durable::Decoded;
@@ -28,8 +29,8 @@ pub(in crate::snapshots) enum Load {
     Reused(Box<Taken<CachedJsonlReduction>>, Option<TailBase>),
     /// A newer build's head: the file waits for that build.
     Held,
-    /// Start a Full read now.
-    Cold,
+    /// Start a Full read now, with the reason the file proved, if any.
+    Cold(Option<FullReason>),
 }
 
 /// The route Claude's Tail lives on: the state database, unless the record
@@ -38,13 +39,6 @@ pub(in crate::snapshots) fn route(source: SnapshotSource, index: &ScanIndex) -> 
     (source == SnapshotSource::ClaudeCode && !restart_restore::enabled())
         .then(|| state_v2::runtime_path(index).ok().flatten())
         .flatten()
-}
-
-/// D142: until the stored-recomposition basis exists, stored state is reused
-/// only where the new body differs from the ACKed one by transcript bytes
-/// alone. Every other selection keeps its native Full.
-pub(in crate::snapshots) fn reuses_stored(reason: Option<CandidateParseReason>) -> bool {
-    matches!(reason, None | Some(CandidateParseReason::TranscriptChanged))
 }
 
 /// The per-candidate marker check, before an ordinary Skip: a file whose
@@ -112,7 +106,7 @@ enum Miss {
     Reconstruct(ReconstructCause),
 }
 
-fn load<S: TailSource>(
+pub(super) fn load<S: TailSource>(
     index: &ScanIndex,
     route: &Path,
     key: &str,
@@ -132,13 +126,27 @@ fn load<S: TailSource>(
                 "tail_db_loads",
                 serde_json::json!({"outcome": "hit", "rederive_bytes": rederive_bytes}),
             );
+            counters::bump("tail_db_loads", "hit");
             return Load::Reused(taken, base);
         }
-        Err(Miss::Future) => ("held", "future_revision".into(), false, Load::Held),
+        Err(Miss::Future) => ("held", "future_revision".into(), None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full.
-        Err(Miss::Changed(reason)) => ("miss", serde_json::json!(reason), false, Load::Cold),
-        Err(Miss::NoHead) => ("miss", "no_head".into(), true, Load::Cold),
-        Err(Miss::Unreadable) => ("error", "unreadable".into(), true, Load::Cold),
+        Err(Miss::Changed(reason)) => (
+            "miss",
+            serde_json::json!(reason),
+            None,
+            Load::Cold(Some(reason)),
+        ),
+        Err(Miss::NoHead) => {
+            counters::bump("tail_bootstrap_full", "no_head");
+            ("miss", "no_head".into(), Some("no_head"), Load::Cold(None))
+        }
+        Err(Miss::Unreadable) => (
+            "error",
+            "unreadable".into(),
+            Some("unreadable"),
+            Load::Cold(None),
+        ),
         Err(Miss::Reconstruct(cause)) => {
             if cause == ReconstructCause::Identity {
                 // C′: void before any reuse; a fresh `Reset` stage of this
@@ -146,16 +154,23 @@ fn load<S: TailSource>(
                 let _ = state_v2::retire_tail(route, [key.to_owned()]);
                 point("tail_identity_failure", serde_json::json!({"files": 1}));
             }
-            ("error", cause.label().into(), true, Load::Cold)
+            (
+                "error",
+                cause.label().into(),
+                Some(cause.label()),
+                Load::Cold(None),
+            )
         }
     };
-    if reconstruct {
+    if let Some(cause) = reconstruct {
         point("tail_reconstruct", serde_json::json!({ "cause": cause }));
+        counters::bump("tail_reconstruct", cause);
     }
     point(
         "tail_db_loads",
         serde_json::json!({"outcome": outcome, "cause": cause}),
     );
+    counters::bump("tail_db_loads", outcome);
     load
 }
 
@@ -188,7 +203,7 @@ fn stored<S: TailSource>(
         Err(CertificateRefusal::Changed(reason)) => return Err(Miss::Changed(reason)),
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
-    let mut base = TailBase::new(&head.body);
+    let mut base = TailBase::new(&head.body, head.revision < S::REDUCTION_REVISION);
     let mut failed = None;
     let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
         S::decode_page(collection, page, &bytes, &mut acc)
@@ -230,6 +245,9 @@ fn stored<S: TailSource>(
     ))
 }
 
+#[cfg(test)]
+#[path = "settlement_tests.rs"]
+mod settlement_tests;
 #[cfg(test)]
 #[path = "load_tests.rs"]
 mod tests;

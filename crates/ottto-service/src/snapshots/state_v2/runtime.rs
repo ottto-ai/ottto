@@ -161,6 +161,9 @@ struct RouteState {
     custody_retry_at: Option<Instant>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
+    // Files whose stored re-finalization differed from the ACKed body: each
+    // one's next read is native. Losing this costs one more 0-byte try.
+    tail_native_owed: std::collections::BTreeSet<String>,
 }
 impl RouteState {
     fn custody_held(&self) -> bool {
@@ -231,6 +234,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     pass_written_start: None,
                     custody_retry_at: None,
                     tail: Default::default(),
+                    tail_native_owed: Default::default(),
                 }))
             })
             .clone()

@@ -13,6 +13,8 @@ use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod counters;
+pub(in crate::snapshots) mod floor;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
 
