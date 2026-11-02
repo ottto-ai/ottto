@@ -5245,9 +5245,14 @@ fn collect_claude_status_snapshots(
 ///   keeps running, and the failed-verification re-verify backoff clears them
 ///   without the operator doing anything. Their approved copy names no action
 ///   ("Ottto could not read current limits", "Staged"), unlike `NeedsLogin`,
-///   `StaleAccessToken`, `ReloginApproaching`, `IdentityMismatch` and
-///   `ConcurrentMutation`, which all tell the operator to sign in again and so
-///   stay actionable here.
+///   `StaleAccessToken`, `ReloginApproaching` and `IdentityMismatch`, which
+///   all tell the operator to sign in again and so stay actionable here.
+/// - `ConcurrentMutation` is a race: Claude Code rewrote the login's account
+///   metadata between two reads of one pass. The slot keeps its last verified
+///   account (`retain_verified_claude_binding`), the quota projection is
+///   `TemporarilyUnavailable`, and the next pass retries from a stable read.
+///   It is not proof of another account or of a lost login, so it never asks
+///   the operator to act.
 fn claude_custom_slot_needs_attention(state: &ClaudeConfigSlotCollectionStateV1) -> bool {
     !matches!(
         state,
@@ -5256,6 +5261,7 @@ fn claude_custom_slot_needs_attention(state: &ClaudeConfigSlotCollectionStateV1)
             | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
             | ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
             | ClaudeConfigSlotCollectionStateV1::ProbeFailed
+            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
             | ClaudeConfigSlotCollectionStateV1::CollectionInProgress
             | ClaudeConfigSlotCollectionStateV1::RefreshDue
     )
@@ -19513,8 +19519,10 @@ mod tests {
     /// `projected_claude_quota_access_state`, the credential is untouched, and
     /// the app's own approved copy for them names no user action ("Ottto could
     /// not read current limits", "Staged") - unlike `NeedsLogin`,
-    /// `StaleAccessToken`, `ReloginApproaching`, `IdentityMismatch` and
-    /// `ConcurrentMutation`, which all tell the operator to sign in again.
+    /// `StaleAccessToken`, `ReloginApproaching` and `IdentityMismatch`, which
+    /// all tell the operator to sign in again. `ConcurrentMutation` is a
+    /// same-pass race that keeps the last verified account and retries, so it
+    /// is benign as well.
     /// Counting them as actionable raised `secret_expired` - "Claude Code
     /// durable connections need attention" - with a Verify button, for an
     /// outage at Anthropic that Verify cannot fix and that the daemon's own
@@ -19533,12 +19541,12 @@ mod tests {
                 | State::DuplicateAccount
                 | State::ProviderUnavailable
                 | State::ProbeFailed
+                | State::ConcurrentMutation
                 | State::CollectionInProgress
                 | State::RefreshDue => false,
                 State::IdentityUnknown
                 | State::CredentialUnavailable
                 | State::IdentityMismatch
-                | State::ConcurrentMutation
                 | State::CollectionPaused
                 | State::CapacityExceeded
                 | State::UpkeepNotConsented
@@ -19554,6 +19562,7 @@ mod tests {
             State::DuplicateAccount,
             State::ProviderUnavailable,
             State::ProbeFailed,
+            State::ConcurrentMutation,
             State::CollectionInProgress,
             State::RefreshDue,
         ] {
@@ -19568,7 +19577,6 @@ mod tests {
             State::IdentityUnknown,
             State::CredentialUnavailable,
             State::IdentityMismatch,
-            State::ConcurrentMutation,
             State::CollectionPaused,
             State::CapacityExceeded,
             State::UpkeepNotConsented,
@@ -33700,6 +33708,134 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
         assert_eq!(default_failed.account_identifier_hash, None);
         assert_eq!(default_failed.organization_identifier_hash, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Claude Code rewriting the same account's metadata between the two
+    /// reads of one pass is a race, not another owner and not a lost login:
+    /// the slot keeps its last verified account and label, reads as
+    /// temporarily unavailable, and never asks the operator to act. A proven
+    /// different account in the same race still drops the old account.
+    #[test]
+    #[serial]
+    fn claude_concurrent_mutation_keeps_last_known_account_and_only_retries() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-concurrent-mutation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config_dir = root.join("raced-config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let write_identity = |account: &str| {
+            fs::write(
+                config_dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "organizationUuid": "organization-raced",
+                        "emailAddress": "person@example.invalid"
+                    }
+                }))
+                .expect("identity json"),
+            )
+            .expect("write identity");
+        };
+        write_identity("account-raced");
+        let account_hash =
+            billing_identity_hash("anthropic", "account", "account-raced").expect("account hash");
+        let organization_hash =
+            billing_identity_hash("anthropic", "organization", "organization-raced")
+                .expect("organization hash");
+        let slot = ClaudeConfigDirSlot::registered(config_dir.to_string_lossy().into_owned())
+            .expect("registered slot");
+        let slot_id = "claude_slot_concurrent_mutation";
+        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::from([(
+                slot_id.to_string(),
+                ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account_hash.clone()),
+                    organization_identifier_hash: Some(organization_hash.clone()),
+                    account_profile: Some(ClaudeConfigSlotAccountProfileV1 {
+                        account_identifier_hash: account_hash.clone(),
+                        organization_identifier_hash: organization_hash.clone(),
+                        captured_at: "2026-08-12T09:00:00Z".to_string(),
+                        email: Some("person@example.invalid".to_string()),
+                        organization_label: None,
+                        plan_type: Some("max".to_string()),
+                        subscription_product: None,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            unresolved_accounts: Vec::new(),
+            anchor_transitions: Vec::new(),
+        })
+        .expect("seed last verified account");
+
+        let mut raced = ClaudeSlotProbeFailure::ConcurrentMutation.status("2026-08-12T10:00:00Z");
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut raced);
+        assert_eq!(
+            raced.state,
+            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        );
+        assert_eq!(
+            raced
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.code.clone()),
+            Some(ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation)
+        );
+        assert_eq!(
+            raced.account_identifier_hash.as_deref(),
+            Some(account_hash.as_str()),
+            "a race keeps the last verified account"
+        );
+        assert_eq!(
+            raced.organization_identifier_hash.as_deref(),
+            Some(organization_hash.as_str())
+        );
+        assert_eq!(
+            raced.display_label.as_deref(),
+            Some(format!("Claude account {}", &account_hash[..8]).as_str())
+        );
+        assert_eq!(
+            raced
+                .account_profile
+                .as_ref()
+                .and_then(|profile| profile.email.as_deref()),
+            Some("person@example.invalid"),
+            "a race keeps the last known account label"
+        );
+        assert_eq!(
+            projected_claude_quota_access_state(&raced),
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+        );
+        assert_eq!(
+            projected_claude_anchor_health(&raced),
+            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
+        );
+        assert!(
+            !claude_custom_slot_needs_attention(&raced.state),
+            "a race never asks the operator to act"
+        );
+        assert!(!claude_default_full_meter_needs_attention(
+            true,
+            &raced.state
+        ));
+
+        write_identity("account-other");
+        let mut other = ClaudeSlotProbeFailure::ConcurrentMutation.status("2026-08-12T10:01:00Z");
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut other);
+        assert_eq!(other.account_identifier_hash, None);
+        assert_eq!(other.organization_identifier_hash, None);
+        assert_eq!(other.display_label, None);
+        assert_eq!(other.account_profile, None);
         let _ = fs::remove_dir_all(root);
     }
 

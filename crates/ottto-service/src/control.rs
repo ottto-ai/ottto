@@ -2723,11 +2723,11 @@ where
         .setup_operation
         .expected_organization_identifier_hash
         .as_deref();
-    if matches!(
-        direct_slot_status.state,
-        ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-    ) || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
+    // `ConcurrentMutation` is a same-pass race (Claude Code rewrote the
+    // account file between two reads), not proof of another account: a real
+    // different owner is still caught by the binding comparisons below.
+    if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
         || matches!((bound_organization_hash, observed_organization_hash), (Some(bound), Some(observed)) if bound != observed)
     {
         return store
@@ -2815,6 +2815,19 @@ where
             historical_account_hash.as_deref(),
             historical_organization_hash.as_deref(),
             Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
+        )
+    } else if direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation {
+        // No verified account yet and the account file was mid-write (often
+        // `/login` itself): keep waiting and re-check, never "wrong account".
+        store.transition_setup_operation_with_binding(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
+            ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            None,
+            None,
+            Some("Claude Code was still updating this login; Ottto will check it again."),
         )
     } else if matches!(
         direct_slot_status.state,
@@ -20865,11 +20878,19 @@ for line in sys.stdin:
                 Some("e".repeat(64)),
                 ClaudeAccountSetupOperationState::Reading,
             ),
+            // A race is never "wrong account": without a verified account it
+            // keeps waiting, and with the expected one it keeps reading.
             (
                 "claude_setup_66666666666666666666666666666666",
                 ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
                 None,
-                ClaudeAccountSetupOperationState::IdentityMismatch,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            ),
+            (
+                "claude_setup_77777777777777777777777777777777",
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                Some("7".repeat(64)),
+                ClaudeAccountSetupOperationState::Reading,
             ),
         ];
         for (operation_id, collection_state, account_hash, expected_state) in cases {
