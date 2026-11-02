@@ -46447,7 +46447,7 @@ fn refresh_retained_codex_roster(
             crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
             traversal.counts.max_unread_bytes = traversal.counts.max_unread_bytes.max(
                 metadata.len().saturating_sub(
-                    index
+                    retention
                         .files
                         .get(&local_index_key(&path))
                         .map_or(0, |entry| entry.size_bytes),

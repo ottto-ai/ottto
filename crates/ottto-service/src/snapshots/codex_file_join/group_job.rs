@@ -661,7 +661,7 @@ impl GroupBoot {
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
             first_read: crate::local_resource_diagnostics::StageWindow::first_read(
-                "codex",
+                SnapshotSource::Codex,
                 first.size_bytes,
                 !index.files.contains_key(&local_index_key(&first.path)),
             ),
