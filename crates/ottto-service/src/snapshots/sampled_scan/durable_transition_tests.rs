@@ -1240,6 +1240,20 @@ struct Codex24b {
     disk: Disk,
     prior: ScanIndex,
     pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
+    v2: bool,
+}
+
+/// A restarted owner. A published v2 index stays at its bound custody path:
+/// M3's fork moves it to an unbound path whose save is refused as foreign.
+/// Each 24b commit has one durable arm, so the committed store is already
+/// every arm's predecessor.
+fn owner_24b(disk: &mut Disk, source: SnapshotSource, v2: bool) -> E2ScanFixture {
+    if !v2 {
+        return disk.owner(source);
+    }
+    let owner = E2ScanFixture::default();
+    disk.begin(&owner, source);
+    owner
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1270,7 +1284,7 @@ impl TransitionDriver for Codex24b {
         let mut scanner = if mode == Mode::ColdFull {
             E2ScanFixture::default()
         } else {
-            self.disk.owner(source)
+            owner_24b(&mut self.disk, source, self.v2)
         };
         if mode != Mode::ColdFull
             && self
@@ -1350,8 +1364,17 @@ impl TransitionDriver for Codex24b {
     }
 }
 
-fn codex_24b_old_writer_row() {
-    let mut c = corpus("transition-codex-24b");
+fn codex_24b_old_writer_row(v2: bool) {
+    let mut c = corpus(if v2 {
+        "transition-codex-24b-state-v2"
+    } else {
+        "transition-codex-24b"
+    });
+    if v2 {
+        // Custody, record store and writer lock share one canonical prefix.
+        c.base = c.base.canonicalize().unwrap();
+        c.support = c.base.join("support");
+    }
     c.root = c.base.join(".codex/sessions");
     std::fs::create_dir_all(&c.root).unwrap();
     let path = c.root.join("rollout.jsonl");
@@ -1362,10 +1385,23 @@ fn codex_24b_old_writer_row() {
     std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
     input_clock(&path);
     let mut disk = Disk::new(&c);
+    // Codex-ON: on a published state v2 route every save and reload below
+    // goes through the store; dropping the custody erases it.
+    let (custody, start) = if v2 {
+        let (custody, start) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Codex,
+            &ScanIndex::default(),
+            &disk.dir,
+        );
+        disk.index = custody.path().to_owned();
+        (Some(custody), start)
+    } else {
+        (None, ScanIndex::default())
+    };
     let source = SnapshotSource::Codex;
     let _cutover = crate::snapshots::TestCutover::set(0);
-    let writer = disk.owner(source);
-    let (mut index, scan, modes) = other_page(&c, &writer, source, ScanIndex::default());
+    let writer = owner_24b(&mut disk, source, v2);
+    let (mut index, scan, modes) = other_page(&c, &writer, source, start);
     assert_eq!(modes, (1, 0, 0));
     assert!(scan.snapshots[0].request_count > 0);
     index.record_accepted_snapshot_fingerprints(
@@ -1389,6 +1425,7 @@ fn codex_24b_old_writer_row() {
         disk,
         prior,
         pages: BTreeMap::new(),
+        v2,
     };
     append(&path, &codex_rows("golden-rebuild", 5));
     input_clock(&path);
@@ -1444,10 +1481,14 @@ fn codex_24b_old_writer_row() {
         assert!(!committed.accepted.is_empty(), "native ACK baseline exists");
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
+        assert_eq!(
+            crate::snapshots::state_v2_growth_retention_active(&driver.prior),
+            v2
+        );
         assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
         // M3's unchanged restart performs no acquisition/body decode. The
         // M1 raw-restored-EOF/version-observation subarm has no M3 equivalent.
-        let owner = driver.disk.owner(source);
+        let owner = owner_24b(&mut driver.disk, source, v2);
         let (quiet_index, quiet, modes) =
             other_page(&driver.c, &owner, source, driver.prior.clone());
         assert_eq!(modes.0, 0);
@@ -1471,6 +1512,7 @@ fn codex_24b_old_writer_row() {
             0
         );
     }
+    drop(custody);
 }
 
 /// [format] shared 24b old writer restored version tail and unchanged restart twice.
@@ -1482,7 +1524,16 @@ fn codex_24b_old_writer_row() {
 fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     assert!(supported("shared_24b"));
-    codex_24b_old_writer_row();
+    codex_24b_old_writer_row(false);
+}
+
+/// [money] Codex-ON: the same 24b row with its index published to state v2.
+/// Cold Full, restored Tail and restarted arms emit equal money and placement.
+#[test]
+fn shared_24b_old_writer_on_published_state_v2_matches_money() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    assert!(supported("shared_24b_state_v2"));
+    codex_24b_old_writer_row(true);
 }
 
 /// M3 uses the shared native pipeline and its single money oracle. Each

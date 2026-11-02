@@ -5128,7 +5128,11 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
     let dir = crate::test_scratch::canonical_private_dir("stale-carry-cold");
     let mut fixture = carry_shared_index(true);
     carry_hex_bodies(&mut fixture);
-    let (custody, cold) = v2::ColdSession::publish(&fixture, &dir);
+    let (custody, cold) = v2::ColdSession::publish(
+        crate::snapshots::scan_index_persistence::Source::Claude,
+        &fixture,
+        &dir,
+    );
     assert_eq!(
         cold.accepted_snapshot_fingerprints, fixture.accepted_snapshot_fingerprints,
         "the load keeps every accepted body"

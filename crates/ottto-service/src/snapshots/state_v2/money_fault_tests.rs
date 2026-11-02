@@ -105,6 +105,7 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
             ("accepted_snapshot_fingerprints".into(), true),
         ]);
         let mut db = money_test_support::populate(
+            Source::Claude,
             &scratch.join(format!("presence-{n}.v2.sqlite.import")),
             &index,
             presence.clone(),
@@ -139,6 +140,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
     ] {
         let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-owner");
         let mut db = money_test_support::populate(
+            Source::Claude,
             &scratch.join("missing.v2.sqlite.import"),
             &fixture(),
             BTreeMap::new(),
@@ -166,6 +168,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
 fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_membership() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-ref-diff");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("refs.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -219,6 +222,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
 fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-ref");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("missing-ref.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -306,6 +310,7 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
 fn money_unknown_registered_marks_refuse_even_with_zero_length_payload() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-unknown-kind");
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("unknown.v2.sqlite.import"),
         &fixture(),
         BTreeMap::new(),
@@ -343,6 +348,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     raw["upload_context_fingerprint"] = json!(hashes.join(""));
     let index: ScanIndex = serde_json::from_value(raw).unwrap();
     let mut db = money_test_support::populate(
+        Source::Claude,
         &scratch.join("segments.v2.sqlite.import"),
         &index,
         BTreeMap::new(),
