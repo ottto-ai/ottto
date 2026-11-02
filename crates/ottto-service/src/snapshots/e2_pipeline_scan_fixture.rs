@@ -36,10 +36,11 @@ pub(crate) fn routed_for_test(
     dir: &Path,
 ) -> ScanIndex {
     let on = route_of(&index);
-    // The runtime-only paused list a sync cycle reloads onto every index.
-    let exclusions = index.claude_reemission_exclusions.clone();
+    // A save and reload drops the runtime-only fields; the RAM-era fixture
+    // passed every prior in memory, so each page keeps them.
+    let runtime = runtime_only(&index);
     let carry = |mut loaded: ScanIndex| {
-        loaded.claude_reemission_exclusions = exclusions.clone();
+        carry_runtime(&runtime, &mut loaded);
         loaded
     };
     let mut own = cache.test_route.lock().unwrap();
@@ -76,6 +77,42 @@ pub(crate) fn routed_for_test(
     carry(cold)
 }
 
+/// An in-memory prior keeps every runtime-only (`serde(skip)`) field across
+/// the fixture's save and reload, as the RAM-era fixture's index did; a sync
+/// cycle also re-applies the paused list and copy capabilities to each index.
+fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
+    into.claude_reemission_exclusions = from.claude_reemission_exclusions.clone();
+    into.copy_unproven_enabled = from.copy_unproven_enabled;
+    into.copy_prefix_base_upload_context = from.copy_prefix_base_upload_context.clone();
+    into.codex_counting_moved_evidence = from.codex_counting_moved_evidence.clone();
+    into.active_quarantine_witness = from.active_quarantine_witness.clone();
+    into.active_upload_context_fingerprint = from.active_upload_context_fingerprint.clone();
+    into.context_read_counts = from.context_read_counts.clone();
+    into.active_effective_upload_body_witness_revision =
+        from.active_effective_upload_body_witness_revision;
+    into.active_effective_upload_body_witness_revision_monotone =
+        from.active_effective_upload_body_witness_revision_monotone;
+    into.effective_upload_body_witness_revision_excluded_source_files = from
+        .effective_upload_body_witness_revision_excluded_source_files
+        .clone();
+    into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
+    into.terminal_contract_retries = from.terminal_contract_retries.clone();
+    into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
+    into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
+    into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
+    into.codex_counting_evictions = from.codex_counting_evictions;
+    into.claude_no_list_policy = from.claude_no_list_policy;
+    into.claude_history_emission = from.claude_history_emission.clone();
+    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
+}
+
+/// An empty graph holding only `index`'s runtime-only fields.
+fn runtime_only(index: &ScanIndex) -> ScanIndex {
+    let mut runtime = ScanIndex::default();
+    carry_runtime(index, &mut runtime);
+    runtime
+}
+
 /// `prior` published on a new fixture route under `dir`: (route, cold graph).
 fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -99,9 +136,8 @@ pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
     if route_of(index).is_none() {
         return index.clone();
     }
-    let (_, mut cold) = publish_route(&state_v2::money_test_support::resident(index), dir);
-    cold.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
-    cold
+    // A restart from disk: runtime-only fields are gone, as through a file.
+    publish_route(&state_v2::money_test_support::resident(index), dir).1
 }
 
 /// The certified checkpoint a key continues from, read back for assertions.
@@ -189,7 +225,7 @@ pub(crate) fn route_claude_for_test(
         }
         let mut copy = state_v2::money_test_support::resident(&index);
         copy.v2_mut().persistence_v2 = None;
-        copy.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+        carry_runtime(&index, &mut copy);
         return copy;
     };
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
@@ -229,7 +265,7 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
     };
     index.save(&route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
-    loaded.claude_reemission_exclusions = index.claude_reemission_exclusions.clone();
+    carry_runtime(index, &mut loaded);
     loaded
 }
 
