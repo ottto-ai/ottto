@@ -78,6 +78,8 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
   checkpoints can run.
 - Durability stays at `FULL`. Erasing data leaves nothing readable in the database, WAL or SHM
   files.
+- Complete valid saves commit above aggregate charged-work targets. The 32 MiB target sizes the
+  next collection page; crossing 256 MiB emits a counts-only alarm without refusing the save.
 
 ## One generic path per source
 

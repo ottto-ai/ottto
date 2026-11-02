@@ -624,13 +624,16 @@ fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
 }
 
 /// [regress] claim-only saves undid page halving and page-one oversize retries stormed
-/// (charged ceiling or an over-cap value).
+/// after value-admission failures.
 #[test]
 fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     let f = Fixture::new();
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        f.key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -638,14 +641,17 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     assert_eq!(collection_page_limit(&index, 250), 125);
     assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
 
-    // Simulate successive ceiling reductions reaching a page of one.
+    // Simulate successive value-admission reductions reaching a page of one.
     with_state(&f.path, |state| {
         state.page_limit = 1;
         Ok(())
     })
     .unwrap();
     assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        f.key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert!(save_oversize_active(&index).unwrap());
@@ -707,8 +713,8 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     );
     crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
 
-    // [money] A native value over its 1 MiB cap at save (not the charged
-    // ceiling) takes the same page-one SaveOversize hold, alarm and pacing.
+    // [money] A native value over its 1 MiB cap at save retains the
+    // page-one SaveOversize hold, alarm and pacing.
     let mut index = f.load();
     let before = index.clone();
     with_state(&f.path, |state| {
@@ -790,7 +796,10 @@ fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
         .expect("the scan's fence names its page-one file");
 
     let mut index = f.load();
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut held = f.load();
     assert!(save_oversize_active(&held).unwrap());
