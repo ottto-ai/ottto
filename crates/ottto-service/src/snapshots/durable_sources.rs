@@ -86,6 +86,17 @@ pub(crate) const SOURCES: &[Properties] = &[
     },
 ];
 
+impl scan_index_persistence::Source {
+    // Lives here, not beside the enum: the integration tests compile that file alone.
+    pub(crate) fn snapshot(self) -> SnapshotSource {
+        match self {
+            Self::Claude => SnapshotSource::ClaudeCode,
+            Self::Codex => SnapshotSource::Codex,
+            Self::Pi => SnapshotSource::Pi,
+        }
+    }
+}
+
 impl DurableSource {
     pub(crate) fn slot(self) -> usize {
         self as usize
