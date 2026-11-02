@@ -263,6 +263,8 @@ pub(crate) fn bounded_restore_tail_items_for_test(source: SnapshotSource) -> Vec
 
 #[cfg(test)]
 pub(crate) use restart_restore::RestartRestoreForTest;
+#[cfg(unix)]
+pub(crate) mod read_budget;
 mod sampled_audit;
 mod sampled_jsonl;
 #[cfg(test)]

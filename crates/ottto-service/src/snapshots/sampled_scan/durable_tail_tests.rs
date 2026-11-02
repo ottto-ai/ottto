@@ -566,7 +566,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                     Err(RetailHold::Exhausted)
                 ));
                 // A recovery Full was granted but interrupted before settlement.
-                // This row exercises its bounded pace hold; expiry is covered below.
+                // This row exercises its one-pass budget hold.
+                cache.durable().unwrap().set_full_pass_bytes_for_test(1);
                 assert!(cache.retail_full(
                     &key,
                     &File::open(&path).unwrap(),
@@ -937,7 +938,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             let mut old = cache.take(&key).expect("returned original");
             old.durable.take_retail().expect("one grant").finish();
             drop(old); // Model cancellation: never reinsert an explicitly ended guard.
-                       // Keep the five passes inside a granted recovery's pacing window.
+                       // Keep the five attempts inside a granted recovery's spent pass.
+            cache.durable().unwrap().set_full_pass_bytes_for_test(1);
             assert!(cache.retail_full(
                 &key,
                 &File::open(&path).unwrap(),
@@ -5295,7 +5297,7 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     );
     let now = std::time::Instant::now();
     cache.durable().unwrap().retail_full_now = Some(pace_time(now));
-    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+    cache.durable().unwrap().set_full_pass_bytes_for_test(1);
     assert!(cache.no_match_full(&key, &file, Some(floor)).is_some());
     assert!(cache.no_match_full(&key, &file, Some(floor)).is_none());
     assert!(!cache.stale_full(&key, &file, Some(floor), "context"));
@@ -5411,7 +5413,7 @@ fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() 
     assert!(!cache.stale_full("k", &file, None, "context"));
     let now = std::time::Instant::now();
     cache.durable().unwrap().retail_full_now = Some(pace_time(now));
-    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+    cache.durable().unwrap().set_full_pass_bytes_for_test(1);
     assert!(cache.stale_full("k", &file, Some(floor), "context"));
     assert!(
         !cache.stale_full("k", &file, Some(floor), "restore_semantics"),
@@ -5597,7 +5599,11 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             .unwrap()
             .write_all(a0h_row("growth", 200).as_bytes())
             .unwrap();
-        owner.cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+        owner
+            .cache
+            .durable()
+            .unwrap()
+            .set_full_pass_bytes_for_test(1);
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         // An undecodable body is a store-level T14 rebuild, not a stale cause:
@@ -6862,7 +6868,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let file = File::open(&path).unwrap();
     let mut counts = crate::local_resource_diagnostics::RestoreCounts::default();
-    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+    cache.durable().unwrap().set_full_pass_bytes_for_test(1);
     for growth in [false, true] {
         if growth {
             std::fs::OpenOptions::new()
@@ -6926,57 +6932,9 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
 /// Start only the Full budget's next pass; never clear a restore grant.
 fn next_full_budget_pass(cache: &SharedCache) {
     let mut stores = cache.durable().unwrap();
-    let limit = stores.full_pass_bytes();
-    for budget in &mut stores.full_budget {
-        budget.begin_pass(limit);
+    for slot in 0..crate::snapshots::durable_sources::SOURCES.len() {
+        stores.begin_full_pass(slot);
     }
-}
-
-/// [money] The Full budget defers past its bytes, drains oldest first and
-/// drops a waiter that left the path, so no file waits behind a departed one.
-#[test]
-fn full_budget_defers_drains_oldest_first_and_drops_departed_waiters() {
-    let key = |n: u8| [n; 32];
-    let mut budget = FullBudget::default();
-    budget.begin_pass(10);
-    assert!(budget.admit(key(1), 25, false, true, 10), "alone past it");
-    assert!(!budget.admit(key(2), 6, false, true, 10));
-    assert!(!budget.admit(key(3), 6, false, true, 10));
-    budget.begin_pass(10);
-    assert!(
-        !budget.admit(key(4), 5, false, true, 10),
-        "behind the oldest"
-    );
-    assert!(
-        budget.admit(key(5), 4, false, true, 10),
-        "fits what remains"
-    );
-    assert!(
-        !budget.admit(key(3), 6, false, true, 10),
-        "not yet its turn"
-    );
-    assert!(budget.admit(key(2), 6, false, true, 10));
-    budget.begin_pass(10);
-    assert!(budget.admit(key(3), 6, false, false, 10), "probe");
-    assert_eq!(budget.spent, 0, "a probe spends nothing");
-    assert!(budget.admit(key(3), 6, false, true, 10));
-    assert!(!budget.admit(key(4), 5, false, false, 10));
-    assert!(budget.admit(key(6), 100, true, true, 10), "near-cap bypass");
-    assert_eq!(budget.spent, 106, "a bypass is still charged");
-    budget.begin_pass(10);
-    assert_eq!(budget.reserved, 1);
-    budget.begin_pass(10);
-    assert!(
-        budget.waiting.is_empty(),
-        "the departed waiter holds nothing"
-    );
-    budget.charge(key(7), 1);
-    for n in 0..=store::MAX_RECORDS {
-        let mut digest = [0xff; 32];
-        digest[..8].copy_from_slice(&(n as u64).to_le_bytes());
-        assert!(!budget.admit(digest, 11, false, true, 10));
-    }
-    assert_eq!(budget.waiting.len(), store::MAX_RECORDS, "bounded queue");
 }
 
 pub(super) fn before_warm_transfer() {
@@ -7319,7 +7277,7 @@ fn b4_structural_transition(near_cap: bool) {
     let end = std::fs::metadata(&path).unwrap().len();
     let now = std::time::SystemTime::now();
     cache.durable().unwrap().retail_full_now = Some(now);
-    cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+    cache.durable().unwrap().set_full_pass_bytes_for_test(1);
     // Exactly enough for input + transferred graph reserve, but not typed
     // decode. This is structural even when the global FIFO is idle.
     let limit = store::RESTORE_INPUT_BYTES
@@ -8564,7 +8522,7 @@ fn rederive_failure_full_uses_pass_budget_and_head_custody_survives_real_evictio
         let key = path.to_str().unwrap();
         let digest = full_pace_key(source, key);
         let cache = SharedCache::default();
-        cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+        cache.durable().unwrap().set_full_pass_bytes_for_test(1);
         let deferred = full_pace_key(source, "deferred-head");
         for _ in 0..REDERIVE_DEFER_PASSES {
             cache
@@ -9054,7 +9012,7 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
                 &mut HistoryPage::default()
             ));
         }
-        cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+        cache.durable().unwrap().set_full_pass_bytes_for_test(1);
         let mut page = HistoryPage::default();
         assert!(cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
         assert!(!cache.upgrade_full_allowed(
@@ -10394,7 +10352,11 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     owner.begin_durable(source, &root, &index_path);
     let now = std::time::Instant::now();
     owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
-    owner.cache.durable().unwrap().full_pass_bytes_for_test = Some(1);
+    owner
+        .cache
+        .durable()
+        .unwrap()
+        .set_full_pass_bytes_for_test(1);
     let append = |id, input| {
         std::fs::OpenOptions::new()
             .append(true)

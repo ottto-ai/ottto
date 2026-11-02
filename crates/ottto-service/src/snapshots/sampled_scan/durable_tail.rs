@@ -50,6 +50,7 @@ use crate::durable_tail_store::{
     SingleWriter,
 };
 use crate::snapshot_sync::effective_upload_body_witness_revision as effective_revision;
+use crate::snapshots::read_budget::{ReadBudget, ReadWaitQueue};
 use crate::transcript_acquisition::{
     birth_unix_nanos, CertificateRefusal, Checkpoint, DurableCertificate, FullReason, Scope,
 };
@@ -289,114 +290,10 @@ const FULL_PASS_BYTES: u64 = 256 * 1024 * 1024;
 /// Passes a budget-deferred restored head waits before its counted Full path.
 const REDERIVE_DEFER_PASSES: u32 = 4;
 
-#[derive(Clone, Copy)]
-struct FullWait {
-    key: store::Digest32,
-    bytes: u64,
-    seen_pass: u32,
-}
 #[cfg(test)]
 const FULL_WAIT_RESERVE_BYTES: usize =
     crate::snapshots::durable_sources::SOURCES.len() * store::MAX_RECORDS * 48;
-const _: () = assert!(size_of::<FullWait>() <= 48);
-
-/// One source's per-pass Full budget and its bounded oldest-first queue. A
-/// file past the queue's capacity keeps retrying and enrols when space frees.
-#[derive(Default)]
-struct FullBudget {
-    spent: u64,
-    pass: u32,
-    /// The queue's front entries covered by this pass's budget.
-    reserved: usize,
-    reserved_bytes: u64,
-    waiting: std::collections::VecDeque<FullWait>,
-}
-
-impl FullBudget {
-    fn begin_pass(&mut self, limit: u64) {
-        // A front entry that did not come back during its reserved pass has
-        // left this path; it cannot hold the budget. It re-enrols if it returns.
-        let (pass, reserved) = (self.pass, self.reserved);
-        let mut position = 0;
-        self.waiting.retain(|wait| {
-            let keep = position >= reserved || wait.seen_pass == pass;
-            position += 1;
-            keep
-        });
-        self.pass = pass.wrapping_add(1);
-        self.spent = 0;
-        self.reserved = 0;
-        self.reserved_bytes = 0;
-        for wait in &self.waiting {
-            if self.reserved > 0 && self.reserved_bytes.saturating_add(wait.bytes) > limit {
-                break;
-            }
-            self.reserved += 1;
-            self.reserved_bytes = self.reserved_bytes.saturating_add(wait.bytes);
-        }
-    }
-
-    /// `bypass` reads now and is still charged. Only `start` spends budget.
-    fn admit(
-        &mut self,
-        key: store::Digest32,
-        bytes: u64,
-        bypass: bool,
-        start: bool,
-        limit: u64,
-    ) -> bool {
-        let position = self.waiting.iter().position(|wait| wait.key == key);
-        let admitted = bypass
-            || match position {
-                Some(position) => position < self.reserved,
-                None => {
-                    (self.reserved == 0 && self.spent == 0)
-                        || self
-                            .spent
-                            .saturating_add(self.reserved_bytes)
-                            .saturating_add(bytes)
-                            <= limit
-                }
-            };
-        if admitted && start {
-            self.charge(key, bytes);
-            return true;
-        }
-        match position {
-            Some(position) => {
-                let pass = self.pass;
-                let wait = &mut self.waiting[position];
-                wait.seen_pass = pass;
-                if !admitted {
-                    wait.bytes = bytes;
-                }
-            }
-            None if !admitted && self.waiting.len() < store::MAX_RECORDS => {
-                self.waiting.push_back(FullWait {
-                    key,
-                    bytes,
-                    seen_pass: self.pass,
-                });
-            }
-            None => {}
-        }
-        admitted
-    }
-
-    /// Spends `bytes` and leaves the queue.
-    fn charge(&mut self, key: store::Digest32, bytes: u64) {
-        if let Some(position) = self.waiting.iter().position(|wait| wait.key == key) {
-            if position < self.reserved {
-                self.reserved -= 1;
-                self.reserved_bytes = self
-                    .reserved_bytes
-                    .saturating_sub(self.waiting[position].bytes);
-            }
-            self.waiting.remove(position);
-        }
-        self.spent = self.spent.saturating_add(bytes);
-    }
-}
+const _: () = assert!(ReadWaitQueue::<store::Digest32>::entry_bytes() <= 48);
 
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
@@ -667,6 +564,19 @@ impl Stores {
         }
         FULL_PASS_BYTES
     }
+
+    /// A fresh budget for `slot`'s pass, reserved for its oldest waiters.
+    fn begin_full_pass(&mut self, slot: usize) {
+        self.full_pass_seq[slot] = self.full_pass_seq[slot].wrapping_add(1);
+        self.full_read_budget[slot] = ReadBudget::new(self.full_pass_bytes());
+        self.full_wait[slot].begin_pass(&self.full_read_budget[slot]);
+    }
+
+    #[cfg(test)]
+    fn set_full_pass_bytes_for_test(&mut self, limit: u64) {
+        self.full_pass_bytes_for_test = Some(limit);
+        self.full_read_budget = std::array::from_fn(|_| ReadBudget::new(limit));
+    }
 }
 
 fn near_source_cap(source: SnapshotSource, length: u64) -> bool {
@@ -762,7 +672,11 @@ pub(crate) struct Stores {
     key_debt: BTreeMap<store::Digest32, Box<owed::KeyDebt>>,
     /// P2 restored head bytes reserved this pass, per durable source.
     rederive_spent: [u64; crate::snapshots::durable_sources::SOURCES.len()],
-    full_budget: [FullBudget; crate::snapshots::durable_sources::SOURCES.len()],
+    /// This pass's Full bytes, per durable source.
+    full_read_budget: [ReadBudget; crate::snapshots::durable_sources::SOURCES.len()],
+    /// Fulls waiting across passes, per durable source.
+    full_wait: [ReadWaitQueue<store::Digest32>; crate::snapshots::durable_sources::SOURCES.len()],
+    full_pass_seq: [u32; crate::snapshots::durable_sources::SOURCES.len()],
     retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
     retail_full_now: Option<std::time::SystemTime>,
@@ -821,7 +735,9 @@ impl Default for Stores {
             restore_pending: BTreeMap::new(),
             key_debt: BTreeMap::new(),
             rederive_spent: Default::default(),
-            full_budget: Default::default(),
+            full_read_budget: std::array::from_fn(|_| ReadBudget::new(FULL_PASS_BYTES)),
+            full_wait: std::array::from_fn(|_| ReadWaitQueue::new(store::MAX_RECORDS)),
+            full_pass_seq: Default::default(),
             retail_full_at: BTreeMap::new(),
             #[cfg(test)]
             retail_full_now: None,
@@ -1849,10 +1765,16 @@ impl SharedCache {
             SnapshotSource::Codex => 1,
             SnapshotSource::Pi => 2,
         };
-        let limit = stores.full_pass_bytes();
         // Rotation can remove discovery near the source cap: read now, charged.
         let delayed = durable_source(source).is_some_and(|ds| {
-            !stores.full_budget[ds.slot()].admit(key, bytes, near_cap, start, limit)
+            let stores = &mut *stores;
+            !stores.full_wait[ds.slot()].admit(
+                &mut stores.full_read_budget[ds.slot()],
+                key,
+                bytes,
+                near_cap,
+                start,
+            )
         });
         if delayed {
             stores.counters.full_budget_deferred += 1;
@@ -2227,8 +2149,7 @@ impl SharedCache {
         if restart_restore::enabled() {
             // P2 head and Full budgets are per pass; authorityless custody nodes are freed.
             stores.rederive_spent[source.slot()] = 0;
-            let limit = stores.full_pass_bytes();
-            stores.full_budget[source.slot()].begin_pass(limit);
+            stores.begin_full_pass(source.slot());
             // A native error may discard staging without a publication. Its empty
             // reservation carries no authority and cannot pin next-pass capacity.
             stores.key_debt.retain(|_, debt| !debt.is_empty());
@@ -2790,7 +2711,14 @@ impl SharedCache {
                 return false;
             }
             if let Some(ds) = durable_source(source).filter(|_| group_admitted) {
-                stores.full_budget[ds.slot()].charge(digest, bytes);
+                let stores = &mut *stores;
+                stores.full_wait[ds.slot()].admit(
+                    &mut stores.full_read_budget[ds.slot()],
+                    digest,
+                    bytes,
+                    true,
+                    true,
+                );
                 stores.counters.full_budget_bytes[diagnostic_source_slot(source)][0] += bytes;
             }
         } else {
@@ -3510,7 +3438,7 @@ impl SharedCache {
         let now = stores.retail_full_now.unwrap_or(now);
         let extent =
             u32::try_from(extent).map_err(|_| Failure::Resource("rederive_unsupported"))?;
-        let pass = stores.full_budget[ds.slot()].pass;
+        let pass = stores.full_pass_seq[ds.slot()];
         let absent = !stores.retail_full_at.contains_key(&digest);
         if absent && stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
             if let Some(oldest) = stores
