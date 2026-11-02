@@ -12776,6 +12776,14 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
             Some(CodexZstCause::AdmissionRefused)
         );
         assert!(index.archives[&archive_key].header().is_none());
+        let spent = |index: &ScanIndex| {
+            index.archives[&archive_key]
+                .work
+                .as_ref()
+                .unwrap()
+                .header_attempts
+        };
+        assert_eq!(spent(&index), 0);
         assert!(cache.retained_checkpoint(&key).is_some());
         index.disclose_archive_debt();
         let recovered = with_test_state_budget(budget, || {
@@ -12783,6 +12791,7 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
         });
         assert!(matches!(recovered, HeaderRead::Validated(_)));
         assert!(index.archives[&archive_key].header().is_some());
+        assert_eq!(spent(&index), 1);
         assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     });

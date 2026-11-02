@@ -209,3 +209,38 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
         serde_json::to_vec(&opened).unwrap()
     );
 }
+
+/// [regress] 0.1.213: refused passes rewrote every archive row, so each save was
+/// over target and halved the page limit (`saved_page`). A save whose archive
+/// rows are unchanged stays under target, so the limit grows. The same rows
+/// rewritten are the over-target control.
+#[test]
+fn a_save_with_unchanged_archive_rows_does_not_reduce_the_page_limit() {
+    let mut index = ScanIndex::default();
+    for n in 0..5_001 {
+        index.archives.insert(
+            format!("/synthetic/archived/{n}.jsonl.zst"),
+            ArchiveEvidence::unknown(),
+        );
+    }
+    let (_scratch, mut db) = codex_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let mut cx = KindCx {
+        binding: Some(codex_binding()),
+        ..Default::default()
+    };
+    populate(&index, &mut tx, &mut cx).unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let identity = db.read_control("identity").unwrap().unwrap();
+    let (mut restored, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
+    let previous = restored.clone();
+    save_graph(&mut db, &identity, &previous, &mut restored, &mut cx).unwrap();
+    assert!(!db.save_over_target(), "unchanged archive rows");
+    let (mut restored, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
+    let previous = restored.clone();
+    for archive in restored.archives.values_mut() {
+        archive.work.as_mut().unwrap().header_attempts += 1;
+    }
+    save_graph(&mut db, &identity, &previous, &mut restored, &mut cx).unwrap();
+    assert!(db.save_over_target(), "every archive row rewritten");
+}
