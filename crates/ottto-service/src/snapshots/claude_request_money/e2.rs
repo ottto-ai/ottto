@@ -1802,7 +1802,7 @@ fn membership_hash(request_id: &str) -> u64 {
 
 /// One item's request ids: its request set, then the occurrence keys outside
 /// it. Both are sorted, so one merge walk replaces a set lookup per key.
-fn item_request_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> {
+pub(crate) fn item_request_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> {
     let mut ids = item.claude_usage_request_ids.iter().peekable();
     item.claude_usage_request_ids
         .iter()
