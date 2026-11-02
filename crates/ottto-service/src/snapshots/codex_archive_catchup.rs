@@ -2,12 +2,17 @@
 use super::*;
 use codex_compressed_input::{archive_alarm, ArchiveEvidence};
 
-pub(super) enum Admission {
-    Read,
-    Quiet,
-    Held,
-}
 impl ScanIndex {
+    pub(super) fn archive_io_error(&mut self, path: &Path, error: Option<&std::io::Error>) {
+        self.archive_transition(
+            path,
+            if error.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                ArchiveTransition::Gone
+            } else {
+                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
+            },
+        );
+    }
     pub(super) fn archive_size_refused(&mut self, path: &Path, bytes: u64) -> bool {
         if bytes <= max_jsonl_file_bytes(SnapshotSource::Codex) {
             return false;
@@ -188,6 +193,28 @@ impl ScanIndex {
                     })
             })
     }
+    fn archive_gate(
+        &self,
+        key: &str,
+        inventory: Option<&codex_file_join::HeaderInventory>,
+        budget: &sampled_scan::codex_cursor::PageBudget,
+        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    ) -> Result<(), ArchiveTransition> {
+        if !budget.archive_ready(&self.archive_pass) {
+            return Err(ArchiveTransition::Transient(
+                CodexZstCause::AdmissionRefused,
+            ));
+        }
+        if !self.archive_parent_ready(key, validated) {
+            return Err(ArchiveTransition::Correctness(
+                CodexZstCause::ParentLedgerUnbound,
+            ));
+        }
+        inventory
+            .ok_or(CodexZstCause::OwnerUnproven)
+            .and_then(|inventory| self.archive_fence(key, inventory))
+            .map_err(ArchiveTransition::Correctness)
+    }
     /// Save one reservation batch for the admitted page, before constructing
     /// any Full reader. Refused resource work remains eligible next pass.
     pub(super) fn prepare_archive_reservations(
@@ -210,20 +237,9 @@ impl ScanIndex {
             if self.archive_quiet(&key) {
                 continue;
             }
-            if !budget.archive_ready(&self.archive_pass) {
-                continue;
-            }
-            if !self.archive_parent_ready(&key, validated) {
-                self.archive_transition(
-                    &c.path,
-                    ArchiveTransition::Correctness(CodexZstCause::ParentLedgerUnbound),
-                );
-                continue;
-            }
-            match self.archive_fence(&key, inventory) {
-                Err(cause) => {
-                    self.archive_transition(&c.path, ArchiveTransition::Correctness(cause))
-                }
+            match self.archive_gate(&key, Some(inventory), budget, validated) {
+                Err(ArchiveTransition::Transient(_)) => continue,
+                Err(change) => self.archive_transition(&c.path, change),
                 Ok(()) => {
                     let a = self.archives.get_mut(&key).unwrap();
                     if a.work
@@ -246,44 +262,24 @@ impl ScanIndex {
         inventory: Option<&codex_file_join::HeaderInventory>,
         budget: &sampled_scan::codex_cursor::PageBudget,
         validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    ) -> Admission {
+    ) -> bool {
         let key = local_index_key(&c.path);
         let Some(a) = self.archives.get(&key).filter(|a| a.matches(file)) else {
             self.archive_transition(
                 &c.path,
                 ArchiveTransition::Correctness(CodexZstCause::OwnerUnproven),
             );
-            return Admission::Held;
+            return false;
         };
         if !a.ready_full() {
-            if a.owed_cause().is_some() {
-                return Admission::Held;
-            }
-            return Admission::Quiet;
+            return false;
         }
-        if !budget.archive_ready(&self.archive_pass) {
-            // No Full bytes spent: cancel the unconsumed reservation.
-            self.archive_transition(
-                &c.path,
-                ArchiveTransition::Transient(CodexZstCause::AdmissionRefused),
-            );
-            return Admission::Held;
+        if let Err(change) = self.archive_gate(&key, inventory, budget, validated) {
+            // A budget refusal cancels the unconsumed Full reservation.
+            self.archive_transition(&c.path, change);
+            return false;
         }
-        if !self.archive_parent_ready(&key, validated) {
-            self.archive_transition(
-                &c.path,
-                ArchiveTransition::Correctness(CodexZstCause::ParentLedgerUnbound),
-            );
-            return Admission::Held;
-        }
-        if let Err(cause) = inventory
-            .ok_or(CodexZstCause::OwnerUnproven)
-            .and_then(|i| self.archive_fence(&key, i))
-        {
-            self.archive_transition(&c.path, ArchiveTransition::Correctness(cause));
-            return Admission::Held;
-        }
-        Admission::Read
+        true
     }
     pub(super) fn archive_finish(
         &mut self,

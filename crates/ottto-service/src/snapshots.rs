@@ -714,24 +714,17 @@ pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
-const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
-/// (raw CC key, canonical selector key). Subagent first (priority dimension).
-const CLAUDE_ATTRIBUTION_FIELDS: [(&str, &str); 5] = [
-    ("attributionAgent", "attribution_subagent"),
-    ("attributionSkill", "attribution_skill"),
-    ("attributionPlugin", "attribution_plugin"),
-    ("attributionMcpServer", "attribution_mcp_server"),
-    ("attributionMcpTool", CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD),
-];
-/// The selector keys attribution capture writes: raw names, never persisted.
+/// Retired attribution selector keys, kept only for the pinned
+/// `SelectorCapture` shape and its refusal.
 const CLAUDE_ATTRIBUTION_SELECTOR_KEYS: [&str; 5] = [
-    CLAUDE_ATTRIBUTION_FIELDS[0].1,
-    CLAUDE_ATTRIBUTION_FIELDS[1].1,
-    CLAUDE_ATTRIBUTION_FIELDS[2].1,
-    CLAUDE_ATTRIBUTION_FIELDS[3].1,
-    CLAUDE_ATTRIBUTION_FIELDS[4].1,
+    "attribution_subagent",
+    "attribution_skill",
+    "attribution_plugin",
+    "attribution_mcp_server",
+    "attribution_mcp_tool",
 ];
-const MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS: usize = 100;
+/// The backend's admission bound on `model_usage` rows per item and per bucket.
+const MAX_MODEL_USAGE_ROWS: usize = 100;
 
 /// Hash epoch of the policy-neutral `content_hash`.
 ///
@@ -2535,8 +2528,8 @@ struct ClaudeFullRearmProgress {
     /// The `""` cutover's latch re-arms at one terminal.
     #[serde(skip_serializing_if = "is_zero_u8")]
     contract_cutover: u8,
-    /// Evidence owed ON: census window (unix seconds) of the first traversal
-    /// started under the recorded identity contract. A change inside a
+    /// Census window (unix seconds) of the first traversal started under the
+    /// recorded identity contract (read by an owed member's re-stamp). A change inside a
     /// window records a placeholder, so this is the next window: a census
     /// record of this window or later was parsed under the recorded contract.
     /// Cleared by a contract change; absent, only this window's records count.
@@ -2899,15 +2892,6 @@ struct ScanTraversalCheckpoint {
     /// counts name their files instead of silently folding them into totals.
     #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
     residue: ScanTraversalResidue,
-    /// Claude with evidence owed ON: what this traversal started under (no
-    /// root paths), so the next start can tell a context change that owes
-    /// evidence from one that must clear. Read only by evidence owed.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_default"
-    )]
-    context_inputs: Option<evidence_owed::TraversalContextInputs>,
     /// When this generation's latest walk started. An older checkpoint
     /// without it starts the re-listing clock at its next page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4789,15 +4773,12 @@ pub struct ScanIndexEntry {
     /// Local-only exact current-context acceptance. Appended for old readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upload_context_receipt: Option<upload_context_receipt::Receipt>,
-    /// Evidence owed ON: a census re-arm kept `source_file_fingerprint` and
-    /// owes this file's request evidence to the current census window. Only
-    /// census-window debt is kept this way; a read the file really needs
-    /// clears the fingerprint as main does. Never set while the switch is OFF.
+    /// The terminal-retry re-arm kept `source_file_fingerprint` and owes this
+    /// file's request evidence to the current census window. Every other
+    /// re-arm, and a read the file really needs, clears the fingerprint.
     /// An older v1 binary drops the bit and treats such entries as observed;
-    /// debt that keeps main's clear stays visible to it as an empty
-    /// fingerprint, owed debt (the identity-contract re-arm included) does
-    /// not. After a downgrade from ON, start a fresh walk. A state-v2 store
-    /// refuses the bit instead (see `identity_contract`).
+    /// cleared debt stays visible to it as an empty fingerprint. A state-v2
+    /// store refuses the bit instead (see `identity_contract`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) evidence_owed: bool,
 }
@@ -4807,13 +4788,13 @@ pub struct ScanIndexEntry {
 const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 560);
 
 impl ScanIndexEntry {
-    /// Re-armed: the fingerprint was cleared (main) or kept with its evidence
-    /// owed (`evidence_owed` ON). Every "cleared = owes a census observation"
+    /// Re-armed: the fingerprint was cleared, or kept with its evidence owed
+    /// (`evidence_owed`, the terminal-retry re-arm). Every "cleared = owes a census observation"
     /// reader asks this, never `source_file_fingerprint.is_empty()` alone.
     pub(crate) fn rearmed(&self) -> bool {
         self.source_file_fingerprint.is_empty() || self.evidence_owed
     }
-    /// The fingerprint as main's re-arm leaves it: empty while evidence is
+    /// The fingerprint as a clearing re-arm leaves it: empty while evidence is
     /// owed. Readers where equality means "observed" or feeds a proof or
     /// credit ask this, so an owed revision proves nothing until resolved.
     pub(crate) fn observed_fingerprint(&self) -> &str {
@@ -5297,7 +5278,7 @@ struct ClaudeUsageFamilyPending {
     idless_revision: Option<[u8; 32]>,
     /// The request-identity contract (and body-witness revision) this WHOLE
     /// pending was built under; `None` = mixed, legacy or unknown, never
-    /// provable. Written on accumulation (switch OFF too); read only by the
+    /// provable. Written on accumulation; read only by the
     /// evidence-owed re-stamp. An old v1 decoder drops it. A state-v2 store
     /// refuses keys from a newer build by design: a build without this field
     /// holds the Claude source at load until that store is reset.
@@ -5307,9 +5288,9 @@ struct ClaudeUsageFamilyPending {
         deserialize_with = "deserialize_lenient_default"
     )]
     identity_contract: Option<evidence_owed::EvidenceContract>,
-    /// Evidence owed ON: the identity-contract latch cleared while this family
-    /// was held in authority quarantine, which keeps its older-contract pending
-    /// on purpose. It may re-stamp only through its own contract stamp, never
+    /// The identity-contract latch cleared while this family was held in
+    /// authority quarantine, which keeps its older-contract pending on
+    /// purpose. It may re-stamp only through its own contract stamp, never
     /// through the cleared latch; cleared when its pending is rebuilt. Bounded
     /// by the quarantined family count.
     #[serde(
@@ -10018,9 +9999,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         })
         .collect::<BTreeMap<_, _>>();
     if let Some(join) = terminal.as_mut().filter(|_| reports_healthy) {
-        // Evidence owed ON: owed evidence, including a re-stamp under the
-        // identity-contract latch, proves nothing until it resolves (the
-        // sweep skipped owed and uncertified roots).
+        // Owed evidence (a terminal-retry re-arm) proves nothing until it
+        // resolves (the sweep skipped owed and uncertified roots).
         proven = std::mem::take(&mut join.proven);
         ignored_vetoes |= join.ignored_vetoes;
         reconstructed = index
@@ -10740,29 +10720,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let contract = claude_request_identity::cycle_contract(identity.is_some());
         let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
             && index.claude_request_identity_contract.as_deref() == Some(contract);
-        // Evidence owed ON: a mid-walk contract change records
-        // a placeholder, so a recorded current contract means this window's
-        // evidence was parsed under it. With no older evidence left there is
-        // nothing to mix; the latch clears before its full re-arm. Counted.
-        if let Some(exempt) = (evidence_owed::enabled()
-            && index.claude_request_identity_contract_changed
-            && index.claude_request_identity_contract.as_deref() == Some(contract))
-        .then(|| {
-            evidence_owed::latch_clearable(index, census_window_end, &indexed_claude_family_ids)
-        })
-        .flatten()
-        {
-            claude_contract::note(|counts| {
-                let latch = &mut counts.identity_contract_latch;
-                latch.cleared += 1;
-                latch.cleared_with_quarantine_exempt += u64::from(!exempt.is_empty());
-                latch.quarantine_exempt_families += exempt.len() as u64;
-            });
-            for root in &exempt {
-                index.claude_usage_family_pending.mark_unproven(root);
-            }
-            index.claude_request_identity_contract_changed = false;
-        }
         let latch_rearms = index.claude_request_identity_contract_changed
             && cutover != CLAUDE_CONTRACT_CUTOVER_SPENT;
         if let Some(record) = (index.claude_full_rearm_progress.structural_record.as_mut())
@@ -11016,9 +10973,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ..Default::default()
         };
         let mut preserved = 0;
-        let guard = evidence_owed::enabled();
-        let census_window = rfc3339_unix_seconds(census_window_end);
-        let contract_window = index.claude_full_rearm_progress.identity_contract_window;
         let changed_duplicate_request_keys = terminal_join::keys(&changed_duplicate_request_hashes);
         for (index_key, entry) in index.files.slots_mut() {
             let Some((root_session_id, source_session_id)) =
@@ -11048,24 +11002,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     &source_session_id,
                     &changed_duplicate_request_keys,
                 );
-            // Evidence owed ON: a revision read in this window, or in any
-            // window from the first one started under the recorded contract,
-            // was read under that contract (a change within a walk leaves it
-            // unrecorded and this re-arm off). The identity-contract re-arm
-            // does not owe it again, so one read clears that debt even when
-            // its family stays invalid.
-            let record = index.claude_request_census.get(index_key);
-            let identity_contract_rearm = identity_contract_rearm
-                && !(guard
-                    && census_window.is_some_and(|window| {
-                        record.is_some_and(|record| {
-                            record.reproduces_since(
-                                &entry.source_file_fingerprint,
-                                window,
-                                contract_window,
-                            )
-                        })
-                    }));
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
@@ -11107,32 +11043,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 // once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
-                // Evidence owed ON: a census-only re-arm owes instead of
-                // clearing and is resolved by a bound re-stamp. A changed
-                // witness or duplicate owner must be read: main's clear, so an
-                // older reader still sees the debt. The identity-contract
-                // re-arm is owed and paced too: older-contract pending is
-                // marked `contract_unproven` at the latch clear (or stays
-                // under the latch), so it never re-stamps and is read.
-                if (identity_contract_rearm && !guard)
-                    || invalidated_witness_roots.contains(&root_session_id)
-                    || changed_duplicate_owner
-                    || current_member_owns_changed_request
-                {
-                    if !entry.source_file_fingerprint.is_empty() {
-                        entry.make_mut().source_file_fingerprint.clear();
-                    }
-                } else {
-                    if identity_contract_rearm && !entry.rearmed() {
-                        let reowed =
-                            record.is_some_and(|record| record.written_since(contract_window));
-                        claude_contract::note(|counts| {
-                            let owed = &mut counts.evidence_owed;
-                            owed.identity_contract_owed += 1;
-                            owed.reowed_after_current_contract_read += u64::from(reowed);
-                        });
-                    }
-                    evidence_owed::clear(entry.make_mut());
+                if !entry.source_file_fingerprint.is_empty() {
+                    entry.make_mut().source_file_fingerprint.clear();
                 }
                 rearmed_bytes = rearmed_bytes.saturating_add(entry.size_bytes);
             } else if proof_candidate && negative {
@@ -11163,22 +11075,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
-        // Evidence owed ON: completion retires only families
-        // with a completed family proof; every other indexed family stays owed.
+        // Completion retires every family pending outside authority
+        // quarantine.
         let retired = index
             .claude_usage_family_pending
             .views()
-            .filter(|(root_session_id, pending)| {
-                !((guard
-                    && evidence_owed::owed_at_completion(
-                        root_session_id,
-                        *pending,
-                        proven.contains_key(*root_session_id),
-                        &indexed_claude_family_ids,
-                    ))
-                    || index
-                        .claude_usage_authority_quarantine
-                        .contains_key(*root_session_id))
+            .filter(|(root_session_id, _)| {
+                !index
+                    .claude_usage_authority_quarantine
+                    .contains_key(*root_session_id)
             })
             .map(|(root_session_id, _)| root_session_id.clone())
             .collect::<Vec<_>>();
@@ -16430,9 +16335,9 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
 }
 
 fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), String> {
-    if item.model_usage.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS {
+    if item.model_usage.len() > MAX_MODEL_USAGE_ROWS {
         return Err(format!(
-            "snapshot[{index}] has more than {MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS} model_usage rows"
+            "snapshot[{index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
         ));
     }
     if item.compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
@@ -16471,9 +16376,9 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
     let mut bucket_totals = UsageTotals::default();
     let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
     for (bucket_index, bucket) in item.usage_buckets.iter().enumerate() {
-        if bucket.model_usage.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS {
+        if bucket.model_usage.len() > MAX_MODEL_USAGE_ROWS {
             return Err(format!(
-                "snapshot[{index}].usage_buckets[{bucket_index}] has more than {MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS} model_usage rows"
+                "snapshot[{index}].usage_buckets[{bucket_index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
             ));
         }
         if bucket.model_usage.is_empty() {
@@ -18346,34 +18251,6 @@ impl CodexTurnTraceMap {
 
     fn is_incomplete(&self) -> bool {
         self.incomplete
-    }
-}
-
-/// Local opt-IN for capturing Claude Code per-turn work-attribution
-/// (`attributionAgent`/`Skill`/`Plugin`/`McpServer`/`McpTool`) off each
-/// assistant+usage line into the per-turn `SelectorCapture`. Subagent
-/// attribution (`attributionAgent`) is the priority dimension.
-///
-/// Defaults OFF: only `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` set to one of
-/// `on`/`1`/`true`/`yes`/`enabled` turns capture on. Approved attribution keys
-/// on `SELECTOR_CONTEXT_ALLOWED` reach `reduced_context`/`selector_hash` and
-/// cross the wire. MCP tool attribution is included whenever this capture is
-/// enabled; there is no second opt-in.
-fn claude_attribution_capture_enabled() -> bool {
-    claude_attribution_capture_enabled_from(
-        std::env::var("OTTTO_CLAUDE_ATTRIBUTION_CAPTURE")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn claude_attribution_capture_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "on" | "1" | "true" | "yes" | "enabled"
-        ),
-        None => false,
     }
 }
 
@@ -21753,9 +21630,6 @@ impl SnapshotAccumulator {
             }
             SnapshotSource::Pi => (None, false),
         };
-        if self.source == SnapshotSource::ClaudeCode {
-            bound_claude_attribution_mcp_tool_cardinality(&mut self.usage_buckets);
-        }
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
@@ -25196,17 +25070,22 @@ impl ScanIndex {
             return false;
         }
 
+        // D62: a state v2 load never reuses the memo's nonce; first load and
+        // high-water still read the unfiltered memo.
+        let v2 = state_v2::state_v2_growth_retention_active(self);
         let mut minted = minted_proof_incarnations();
         let memo = minted.get(path);
         let first_load_in_process = memo.is_none();
         let high_water = memo.map_or(0, |memo| memo.seq_high_water);
-        let reused = memo.and_then(|memo| match (&origin, &memo.identity) {
-            (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
-                Some(memo.nonce.clone())
-            }
-            (LoadOrigin::Missing, MintedIdentity::Missing) => Some(memo.nonce.clone()),
-            _ => None,
-        });
+        let reused = memo
+            .filter(|_| !v2)
+            .and_then(|memo| match (&origin, &memo.identity) {
+                (LoadOrigin::Loaded(now), MintedIdentity::Loaded(before)) if now == before => {
+                    Some(memo.nonce.clone())
+                }
+                (LoadOrigin::Missing, MintedIdentity::Missing) => Some(memo.nonce.clone()),
+                _ => None,
+            });
         let (identity, nonce) = match origin {
             LoadOrigin::Loaded(stamp) if !self.codex_proof_index_incarnation.is_empty() => (
                 MintedIdentity::Loaded(stamp),
@@ -28286,40 +28165,17 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         self.index.archive_pass.started = false;
-        let archive_cpu = (!self.index.archives.is_empty())
-            .then(crate::context_composition::thread_cpu_micros)
-            .flatten();
-        let archive_wall = archive_cpu.map(|_| std::time::Instant::now());
+        let archive_wall = (!self.index.archives.is_empty()).then(std::time::Instant::now);
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
-        if let Some(cpu) = archive_cpu
-            .and_then(|start| {
-                crate::context_composition::thread_cpu_micros().map(|end| (start, end))
-            })
-            .map(|(a, b)| b.saturating_sub(a))
-        {
-            match &mut result {
-                Ok(OwnedSourceScanStep::Pending(s)) if s.index.archive_pass.started => {
-                    s.index.archive_pass.cpu = s.index.archive_pass.cpu.saturating_add(cpu);
-                    s.index.archive_pass.work =
-                        s.index
-                            .archive_pass
-                            .work
-                            .saturating_add(archive_wall.map_or(0, |t| {
-                                t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
-                            }));
-                }
-                Ok(OwnedSourceScanStep::Complete { index, .. }) if index.archive_pass.started => {
-                    index.archive_pass.cpu = index.archive_pass.cpu.saturating_add(cpu);
-                    index.archive_pass.work =
-                        index
-                            .archive_pass
-                            .work
-                            .saturating_add(archive_wall.map_or(0, |t| {
-                                t.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
-                            }));
-                }
-                _ => {}
-            }
+        let pass = match &mut result {
+            Ok(OwnedSourceScanStep::Pending(scan)) => Some(&mut scan.index.archive_pass),
+            Ok(OwnedSourceScanStep::Complete { index, .. }) => Some(&mut index.archive_pass),
+            Err(_) => None,
+        };
+        if let Some(pass) = pass.filter(|pass| pass.started) {
+            pass.work = pass.work.saturating_add(archive_wall.map_or(0, |start| {
+                start.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+            }));
         }
         match &result {
             Ok(OwnedSourceScanStep::Pending(scan)) => state_v2::telemetry::acquired(&scan.index),
@@ -28489,7 +28345,6 @@ impl OwnedSourceScan {
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
         let index = &mut index_storage;
         let mut evidence_owed_page = evidence_owed::Page::default();
-        evidence_owed::note_page_start(index, source);
         // L-5: a resumed step re-probes everything it needs.
         codex_parent_identities.begin_step();
         // PR-P: once per page, on a selecting page (discovery done), before any
@@ -33236,7 +33091,7 @@ impl OwnedSourceScan {
                             .origin
                             .as_ref()
                             .and_then(|origin| origin.admission.as_ref())
-                            .map_or(true, |state| state.complete && evidence_owed::enabled()));
+                            .is_none());
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // E7-8a: count-only per-family completion, from the page's
                 // settled state before any terminal effect. Acts on nothing.
@@ -33937,7 +33792,6 @@ impl OwnedSourceScan {
                                 a.stamp.as_ref().is_some_and(|old| old.same_content(&stamp))
                             })
                 }) {
-                    index.archive_transition(&candidate.path, ArchiveTransition::Quiet);
                     pending!();
                 }
                 // Identity samples are archive reads too: only the funded,
@@ -34041,14 +33895,7 @@ impl OwnedSourceScan {
             else {
                 if archive_candidate {
                     let path = Path::new(&rescue_key);
-                    let change = if fs::symlink_metadata(path)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        ArchiveTransition::Gone
-                    } else {
-                        ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                    };
-                    index.archive_transition(path, change);
+                    index.archive_io_error(path, fs::symlink_metadata(path).err().as_ref());
                 }
                 if verification_rescue {
                     sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
@@ -34460,16 +34307,14 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
                 index.archive_pass.started = true;
-                match index.archive_admit(
+                if !index.archive_admit(
                     &candidate,
                     &opened_file,
                     codex_join_inventory.as_ref(),
                     &codex_page,
                     codex_parent_ownership_ledgers.as_ref(),
                 ) {
-                    codex_archive_catchup::Admission::Read => {}
-                    codex_archive_catchup::Admission::Quiet => pending!(),
-                    codex_archive_catchup::Admission::Held => pending!(),
+                    pending!();
                 }
             }
             let decision = if codex_archive_path(&candidate.path) {
@@ -39882,170 +39727,7 @@ fn claude_code_selector_from_line(value: &Value) -> SelectorCapture {
             &Value::String("anthropic".to_string()),
         );
     }
-    capture_claude_attribution(value, &mut selector, claude_attribution_capture_enabled());
     selector
-}
-
-/// Lift Claude Code's per-turn work-attribution off this assistant+usage line
-/// into the per-turn `SelectorCapture`. Claude Code writes the five attribution
-/// markers as TOP-LEVEL string siblings of `message` on each `type=assistant`
-/// line that also carries `message.usage` — i.e. exactly the line the usage
-/// selector is already built from — so this attributes the same turn's usage.
-///
-/// Done in `claude_code_selector_from_line` (the per-LINE selector, not the
-/// accumulator-merged `current_selector`) so one turn's subagent/skill cannot
-/// leak onto later turns, mirroring the per-turn `context_bucket` stamp in
-/// `apply_claude_code_line` and the Codex per-turn `service_tier` discipline.
-///
-/// CONTRACT BOUNDARY: gated OFF by default via
-/// `claude_attribution_capture_enabled`. When enabled, all five canonical
-/// snake_case keys below ride inside selector_context after the mirrored
-/// backend `SELECTOR_FIELDS`/`SELECTOR_SOURCE_KEYS` contract is in place.
-/// `attribution_mcp_tool` has no separate opt-in: it ships on with the other
-/// four dimensions. Its values retain Claude tool-usage's identifier filtering,
-/// then mirror the backend selector normalization before the normalized
-/// 128-character and 100-row bounds are applied.
-///
-/// `enabled` is threaded in (read from `claude_attribution_capture_enabled` at
-/// the call site) so the capture logic is unit-testable without process-global
-/// env mutation.
-fn capture_claude_attribution(value: &Value, selector: &mut SelectorCapture, enabled: bool) {
-    if !enabled {
-        return;
-    }
-    for (raw_key, canonical_key) in &CLAUDE_ATTRIBUTION_FIELDS {
-        let attribution = string_at(value, &[raw_key]).and_then(|attribution| {
-            if *canonical_key == CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD {
-                normalized_claude_attribution_mcp_tool_name(&attribution)
-            } else {
-                Some(attribution)
-            }
-        });
-        if let Some(attribution) = attribution {
-            selector.insert(canonical_key, attribution, "claude_code_attribution_field");
-        }
-    }
-}
-
-/// Return the receiver row produced when MCP-tool attribution overflows. The
-/// rest of the complete selector identity is retained; only the MCP-tool
-/// context/source pair becomes unselected.
-fn claude_attribution_mcp_tool_fallback_row(
-    row_key: &RowKey,
-    row: &BucketRowAccumulator,
-) -> (RowKey, BucketRowAccumulator) {
-    let mut fallback_key = row_key.clone();
-    let mut fallback_row = row.clone();
-    fallback_row
-        .selector_context
-        .remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
-    fallback_row
-        .selector_sources
-        .remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
-    fallback_key.selector_hash = if fallback_row.selector_context.is_empty() {
-        "base".to_string()
-    } else {
-        let payload = serde_json::to_string(&fallback_row.selector_context)
-            .unwrap_or_else(|_| "{}".to_string());
-        sha256_hex(&[payload.as_str()])[..16].to_string()
-    };
-    (fallback_key, fallback_row)
-}
-
-/// Bound the receiver's complete post-normalization selector-row identities,
-/// not MCP-tool names in isolation. The same global mapping is applied to every
-/// hourly bucket, so both each bucket and their session-wide union stay within
-/// the backend's 100-row admission limit while every usage counter is merged
-/// into an emitted row.
-///
-/// Each distinct identity with the MCP-tool pair removed reserves its own
-/// unselected fallback row. Named identities use only the remaining capacity.
-/// In the pathological case where the pre-tool identities alone exceed the
-/// receiver limit, 99 are retained and the rest merge into one fully
-/// unselected `unknown` row rather than making the entire batch inadmissible.
-fn bound_claude_attribution_mcp_tool_cardinality(
-    usage_buckets: &mut BTreeMap<String, UsageBucketState>,
-) {
-    let mut distinct_rows = BTreeMap::<RowKey, BucketRowAccumulator>::new();
-    for bucket in usage_buckets.values() {
-        for (row_key, row) in &bucket.rows {
-            distinct_rows
-                .entry(row_key.clone())
-                .or_insert_with(|| row.clone());
-        }
-    }
-    if distinct_rows.len() <= MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS
-        || !distinct_rows.values().any(|row| {
-            row.selector_context
-                .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-        })
-    {
-        return;
-    }
-
-    let fallback_keys = distinct_rows
-        .iter()
-        .map(|(row_key, row)| claude_attribution_mcp_tool_fallback_row(row_key, row).0)
-        .collect::<BTreeSet<_>>();
-    let collapse_excess_fallbacks = fallback_keys.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS;
-    let (retained_named_keys, retained_fallback_keys) = if collapse_excess_fallbacks {
-        // Reserve the hundredth identity for a single universal overflow row.
-        // This branch is reached only when the other selector fields already
-        // produce more rows than the receiver admits.
-        let fallback = fallback_keys
-            .into_iter()
-            .take(MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - 1)
-            .collect();
-        (BTreeSet::new(), fallback)
-    } else {
-        let named_capacity = MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - fallback_keys.len();
-        let named = distinct_rows
-            .iter()
-            .filter(|(_, row)| {
-                row.selector_context
-                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-            })
-            .map(|(row_key, _)| row_key.clone())
-            .take(named_capacity)
-            .collect();
-        (named, fallback_keys)
-    };
-
-    for bucket in usage_buckets.values_mut() {
-        let rows = std::mem::take(&mut bucket.rows);
-        for (row_key, row) in rows {
-            let (fallback_key, fallback_row) =
-                claude_attribution_mcp_tool_fallback_row(&row_key, &row);
-            let (target_key, target_row) = if retained_named_keys.contains(&row_key) {
-                (row_key, row)
-            } else if retained_fallback_keys.contains(&fallback_key) {
-                (fallback_key, fallback_row)
-            } else if collapse_excess_fallbacks {
-                let mut overflow_row = fallback_row;
-                overflow_row.selector_context.clear();
-                overflow_row.selector_sources.clear();
-                overflow_row.reasoning_effort = None;
-                (
-                    RowKey {
-                        model: "unknown".to_string(),
-                        selector_hash: "base".to_string(),
-                        reasoning_effort: None,
-                        auth_mode: None,
-                        billing_channel: None,
-                        billing_provider: None,
-                        gateway_provider: None,
-                        model_provider: None,
-                        subscription_product: None,
-                    },
-                    overflow_row,
-                )
-            } else {
-                (fallback_key, fallback_row)
-            };
-            merge_session_row(&mut bucket.rows, target_key, target_row);
-        }
-        debug_assert!(bucket.rows.len() <= MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS);
-    }
 }
 
 fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
@@ -42082,129 +41764,6 @@ fn bounded_tool_usage_name(value: &str) -> Option<String> {
         return None;
     }
     Some(value.chars().take(MAX_TOOL_USAGE_NAME_LENGTH).collect())
-}
-
-/// Python's Unicode `str.isspace()` / regular-expression `\s` set. CPython adds
-/// the four information separators U+001C..U+001F to the Unicode White_Space
-/// property, so Rust's `char::is_whitespace` is not sufficient for byte parity.
-/// The complete contract is U+0009..U+000D, U+001C..U+001F, U+0020, U+0085,
-/// U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000.
-fn python_regex_unicode_whitespace(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0009}'..='\u{000d}'
-            | '\u{001c}'..='\u{001f}'
-            | '\u{0020}'
-            | '\u{0085}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-    )
-}
-
-/// Characters that CPython 3.13's Unicode 15.1 tables treat as unassigned but
-/// Rust 1.88's Unicode 16 tables treat as cased. Protecting both sides of each
-/// newly assigned pair also keeps their Cased property from changing Python's
-/// contextual Final_Sigma result. The older U+0264 and U+019B lowercase peers
-/// of U+A7CB and U+A7DC stay unprotected because Python 3.13 already cases them.
-fn python_3_13_unicode_15_1_unassigned_cased(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{1c89}'
-            | '\u{1c8a}'
-            | '\u{a7cb}'
-            | '\u{a7cc}'
-            | '\u{a7cd}'
-            | '\u{a7da}'
-            | '\u{a7db}'
-            | '\u{a7dc}'
-            | '\u{10d50}'..='\u{10d65}'
-            | '\u{10d70}'..='\u{10d85}'
-    )
-}
-
-/// Apply Rust's whole-string Unicode lowercase while pinning the backend's
-/// CPython 3.13 / Unicode 15.1 behavior for characters assigned casing later.
-fn python_3_13_lowercase(value: &str) -> String {
-    let mut protected = String::with_capacity(value.len());
-    let mut restores = Vec::with_capacity(value.chars().count());
-    for ch in value.chars() {
-        if python_3_13_unicode_15_1_unassigned_cased(ch) {
-            // NUL is uncased and not Case_Ignorable, matching an unassigned
-            // Unicode 15.1 scalar's effect on Final_Sigma context.
-            protected.push('\0');
-            restores.push(Some(ch));
-        } else {
-            protected.push(ch);
-            restores.push(None);
-        }
-    }
-
-    let lowered = protected.to_lowercase();
-    let mut lowered_chars = lowered.chars();
-    let mut compatible = String::with_capacity(lowered.len());
-    for (protected_ch, restore) in protected.chars().zip(restores) {
-        let lowered_ch = lowered_chars
-            .next()
-            .expect("whole-string lowercase preserves at least one scalar per input scalar");
-        if let Some(original) = restore {
-            debug_assert_eq!(lowered_ch, '\0');
-            compatible.push(original);
-        } else {
-            compatible.push(lowered_ch);
-            // U+0130 is the sole default lowercase expansion in these tables.
-            if protected_ch == '\u{0130}' {
-                compatible.push(
-                    lowered_chars
-                        .next()
-                        .expect("U+0130 lowercase includes COMBINING DOT ABOVE"),
-                );
-            }
-        }
-    }
-    debug_assert!(lowered_chars.next().is_none());
-    compatible
-}
-
-/// Match the backend selector identity exactly: Python `strip().lower()`, then
-/// replace each run matching Unicode-aware `[\s\-]+` with one underscore, then
-/// enforce the normalized 128-code-point bound. There is deliberately no
-/// narrower daemon-only identifier gate: every string the backend normalizes
-/// must reach it under the same normalized bytes.
-fn normalized_claude_attribution_mcp_tool_name(value: &str) -> Option<String> {
-    let value = value.trim_matches(python_regex_unicode_whitespace);
-    if value.is_empty() {
-        return None;
-    }
-
-    // Lowercase the whole stripped string before separator substitution, exactly
-    // like the backend's `value.strip().lower()`. Whole-string conversion is
-    // required for contextual Unicode mappings such as Greek Final_Sigma.
-    let value = python_3_13_lowercase(value);
-    let mut normalized = String::with_capacity(value.len());
-    let mut in_separator_run = false;
-    for ch in value.chars() {
-        if python_regex_unicode_whitespace(ch) || ch == '-' {
-            if !in_separator_run {
-                normalized.push('_');
-                in_separator_run = true;
-            }
-        } else {
-            normalized.push(ch);
-            in_separator_run = false;
-        }
-    }
-    Some(
-        normalized
-            .chars()
-            .take(MAX_TOOL_USAGE_NAME_LENGTH)
-            .collect(),
-    )
 }
 
 fn claude_response_tool_uses(value: &Value) -> BTreeMap<String, String> {
@@ -46169,10 +45728,6 @@ fn ensure_bounded_traversal(
         prior_traversal_context_matches,
         retry_attempt,
     );
-    transition.context_change_owed = usize::from(
-        !prior_traversal_context_matches
-            && evidence_owed::context_change_owes(source, roots, index, backfill_window_days),
-    );
 
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation
@@ -46288,16 +45843,12 @@ fn ensure_bounded_traversal(
         let mut admission = None;
         let mut covered_roots = None;
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
-        let owed_route = evidence_owed::enabled();
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
-            // Evidence owed ON: an unfinished admission no longer forces the
-            // batch path. The owed resolver pages the stale set instead.
             let whole = if prior_admission
                 .as_ref()
                 .is_some_and(|state| !state.complete)
-                && !owed_route
             {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
@@ -46310,16 +45861,6 @@ fn ensure_bounded_traversal(
             };
             Ok(match whole {
                 Ok(carry) => carry,
-                Err(refusal) if owed_route => {
-                    // No new batch admission: every stale root returns to the
-                    // re-arm below and the resolver; carry credits nothing.
-                    let accounted = stale_carry_rejection_counts.rejected() as usize;
-                    stale_carry_rejection_counts.reject(
-                        refusal.into(),
-                        stale_pending_roots.len().saturating_sub(accounted),
-                    );
-                    ClaudeStaleFamilyCarry::default()
-                }
                 Err(refusal) => {
                     let due = claude_retry_due_family_exists(index, collected_at);
                     if matches!(refusal, ClaudeRetryAdmissionRefusal::Structure)
@@ -46569,18 +46110,6 @@ fn ensure_bounded_traversal(
         transition.rearmed_index_files = rearmed_file_count;
         transition.carried_pending_families = carried_roots.len();
         transition.carried_index_files = carried_file_count;
-        if owed_route {
-            // An unfinished admission keeps only its unoffered due cursor
-            // (its existing owner serves it); otherwise it is dropped.
-            if let Some(state) = prior_admission.as_ref().filter(|state| !state.complete) {
-                if evidence_owed::due_unoffered(index, state, collected_at) {
-                    admission = Some(evidence_owed::due_only(state));
-                    transition.due_retained = 1;
-                } else {
-                    transition.admissions_dropped = 1;
-                }
-            }
-        }
         index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
             origin: Some(ClaudeStaleFamilyCarryOrigin {
                 context_fingerprint: context_fingerprint.clone(),
@@ -46753,9 +46282,6 @@ fn ensure_bounded_traversal(
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
         residue: ScanTraversalResidue::default(),
-        context_inputs: (source == SnapshotSource::ClaudeCode && evidence_owed::enabled()).then(
-            || evidence_owed::TraversalContextInputs::capture(index, roots, backfill_window_days),
-        ),
         listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
         listing_owed_requeued_unix_seconds: Default::default(),
     });
@@ -46831,7 +46357,7 @@ fn codex_fresh_data_pending(
 }
 
 // One boundary for fresh, persisted and held work. Admission is scheduling only:
-// archive decoding still requires live power, CPU/byte budget and a funded reader.
+// archive decoding still requires live power, work/byte budget and a funded reader.
 fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("jsonl")
         || (source == SnapshotSource::Codex && codex_archive_path(path))
@@ -47640,14 +47166,7 @@ fn advance_bounded_directory_traversal_with_budget(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    index.archive_transition(
-                        &path,
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            ArchiveTransition::Gone
-                        } else {
-                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                        },
-                    );
+                    index.archive_io_error(&path, Some(&error));
                     continue;
                 }
                 Err(_) => {
@@ -47686,14 +47205,7 @@ fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    index.archive_transition(
-                        &path,
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            ArchiveTransition::Gone
-                        } else {
-                            ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                        },
-                    );
+                    index.archive_io_error(&path, Some(&error));
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -47998,14 +47510,9 @@ fn candidate_from_traversal_path_at(
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if source == SnapshotSource::Codex && codex_archive_path(&pending.path) => {
-            discovery.index.archive_transition(
-                &pending.path,
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ArchiveTransition::Gone
-                } else {
-                    ArchiveTransition::Transient(CodexZstCause::AdmissionRefused)
-                },
-            );
+            discovery
+                .index
+                .archive_io_error(&pending.path, Some(&error));
             return None;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -52626,7 +52133,6 @@ impl ScanIndex {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
-            context_inputs: None,
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
         });
@@ -56154,7 +55660,8 @@ impl ScanIndex {
         if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
             && !entry.has_unverified_source()
         {
-            return if entry.source_file_fingerprint == candidate.legacy_source_file_fingerprint {
+            // An owed revision is not observed: it parses, never migrates.
+            return if entry.observed_fingerprint() == candidate.legacy_source_file_fingerprint {
                 if candidate.legacy_config_reconciliation_required {
                     (CandidateDecision::ReconcileLegacy, None)
                 } else {
@@ -57786,7 +57293,6 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
-            context_inputs: None,
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
         }
@@ -60508,7 +60014,6 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
-            context_inputs: None,
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
         });
@@ -61022,7 +60527,6 @@ mod tests {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
-                context_inputs: None,
                 listing_started_unix_seconds: None,
                 listing_owed_requeued_unix_seconds: Default::default(),
             }),
@@ -61838,7 +61342,6 @@ mod tests {
                     ..ScanTraversalCounts::default()
                 },
                 residue: ScanTraversalResidue::default(),
-                context_inputs: None,
                 listing_started_unix_seconds: None,
                 listing_owed_requeued_unix_seconds: Default::default(),
             };
@@ -65503,375 +65006,6 @@ mod tests {
              {{\"type\":\"response.create\",\"service_tier\":\"priority\",\
              \"model\":\"gpt-5.5\",\"instructions\":\"REDACTED PROMPT\"}}"
         )
-    }
-
-    #[test]
-    fn claude_attribution_capture_opt_in_defaults_off() {
-        // Default OFF: absent env, and any unrecognized/explicit-off value.
-        assert!(!claude_attribution_capture_enabled_from(None));
-        for off in ["", "off", "0", "false", "no", "disabled", "nonsense"] {
-            assert!(
-                !claude_attribution_capture_enabled_from(Some(off)),
-                "expected {off:?} to leave attribution capture off"
-            );
-        }
-        // Explicit opt-in tokens (case/whitespace tolerant).
-        for on in ["on", "1", "true", "yes", "enabled", "ON", " True ", "Yes"] {
-            assert!(
-                claude_attribution_capture_enabled_from(Some(on)),
-                "expected {on:?} to enable attribution capture"
-            );
-        }
-    }
-
-    #[test]
-    fn claude_attribution_capture_respects_opt_in_and_present_markers() {
-        for (line, enabled, expected) in [
-(serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"sessionId\":\"attr-session\",",
-            "\"attributionAgent\":\"general-purpose\",",
-            "\"attributionSkill\":\"design-sync\",",
-            "\"attributionPlugin\":\"anthropic-skills\",",
-            "\"attributionMcpServer\":\"claude-in-chrome\",",
-            "\"attributionMcpTool\":\"tabs_context_mcp\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":30}}}"
-        ))
-        .expect("parse line"), true, vec![("attribution_subagent", "general-purpose"), ("attribution_skill", "design-sync"), ("attribution_plugin", "anthropic-skills"), ("attribution_mcp_server", "claude-in-chrome"), ("attribution_mcp_tool", "tabs_context_mcp")]),
-(serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
-            "\"attributionMcpServer\":\"claude-in-chrome\",",
-            "\"attributionMcpTool\":\"tabs_context_mcp\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
-        ))
-        .expect("parse line"), false, vec![]),
-(serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"attributionAgent\":\"   \",",
-            "\"attributionSkill\":42,",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
-        ))
-        .expect("parse line"), true, vec![]),
-(serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"sessionId\":\"attr-top-level\",",
-            "\"attributionSkill\":\"design-sync\",",
-            "\"attributionMcpServer\":\"claude-in-chrome\",",
-            "\"attributionMcpTool\":\"tabs_context_mcp\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":48}}}"
-        ))
-        .expect("parse line"), true, vec![("attribution_skill", "design-sync"), ("attribution_mcp_server", "claude-in-chrome"), ("attribution_mcp_tool", "tabs_context_mcp")])
-        ] {
-            let mut selector = SelectorCapture::default();
-            capture_claude_attribution(&line, &mut selector, enabled);
-            let expected: BTreeMap<_, _> = expected.into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
-            assert_eq!(selector.context, expected);
-            assert_eq!(selector.sources, expected.keys().map(|key| (key.clone(), "claude_code_attribution_field".into())).collect());
-        }
-    }
-
-    #[test]
-    fn claude_attribution_mcp_tool_matches_backend_normalization() {
-        let long_name = "x".repeat(MAX_TOOL_USAGE_NAME_LENGTH + 20);
-        let line = json!({"attributionMcpTool": long_name});
-        let mut truncated = SelectorCapture::default();
-        capture_claude_attribution(&line, &mut truncated, true);
-        assert_eq!(
-            truncated.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD]
-                .chars()
-                .count(),
-            MAX_TOOL_USAGE_NAME_LENGTH
-        );
-
-        // The backend normalizes before enforcing its 128-character bound.
-        // Although this raw value has 129 characters, its hyphen run collapses
-        // to one underscore and the admitted identity is only two characters.
-        let normalizing_below_limit = format!("A{}", "-".repeat(128));
-        let mut normalized = SelectorCapture::default();
-        capture_claude_attribution(
-            &json!({"attributionMcpTool": normalizing_below_limit}),
-            &mut normalized,
-            true,
-        );
-        assert_eq!(normalized.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD], "a_");
-
-        // Exact ten-row R2 cross-language corpus. These expected values are
-        // direct outputs from backend normalize_selector_value.
-        let parity_rows = vec![
-            ("foo-bar".to_string(), "foo_bar"),
-            ("foo---bar".to_string(), "foo_bar"),
-            ("---Foo---".to_string(), "_foo_"),
-            ("Read-File_V2".to_string(), "read_file_v2"),
-            ("  MIXED-case  ".to_string(), "mixed_case"),
-            ("alpha beta".to_string(), "alpha_beta"),
-            ("\tTabs-\nBreak\t".to_string(), "tabs_break"),
-            ("alpha\u{00a0}-\u{2003}beta".to_string(), "alpha_beta"),
-            ("__A---B__".to_string(), "__a_b__"),
-            (format!("A{}", "-".repeat(128)), "a_"),
-        ];
-        for (raw, expected) in parity_rows {
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(&raw).as_deref(),
-                Some(expected),
-                "backend parity failed for {raw:?}"
-            );
-            let mut selector = SelectorCapture::default();
-            capture_claude_attribution(&json!({"attributionMcpTool": raw}), &mut selector, true);
-            assert_eq!(
-                selector.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD],
-                expected
-            );
-        }
-
-        // Exhaust the documented Python `\s` set, including IDEOGRAPHIC SPACE.
-        let python_whitespace = [
-            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{001c}', '\u{001d}',
-            '\u{001e}', '\u{001f}', '\u{0020}', '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}',
-            '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
-            '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}',
-            '\u{3000}',
-        ];
-        for whitespace in python_whitespace {
-            assert!(python_regex_unicode_whitespace(whitespace));
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(&format!(
-                    "alpha{whitespace}-{whitespace}beta"
-                ))
-                .as_deref(),
-                Some("alpha_beta")
-            );
-        }
-        assert!(!python_regex_unicode_whitespace('\u{200b}'));
-        assert_eq!(
-            normalized_claude_attribution_mcp_tool_name("tool/name").as_deref(),
-            Some("tool/name"),
-            "the daemon must not impose a narrower gate than the backend"
-        );
-
-        // Backend-equivalent selector identities must merge before row hashing
-        // and aggregation, not collide later during request admission.
-        for (first, second, expected) in [
-            ("foo-bar", "foo_bar", "foo_bar"),
-            ("ReadFile", "readfile", "readfile"),
-            ("foo--bar", "foo-bar", "foo_bar"),
-        ] {
-            let mut selectors = Vec::new();
-            for raw in [first, second] {
-                let mut selector = SelectorCapture::default();
-                capture_claude_attribution(
-                    &json!({"attributionMcpTool": raw}),
-                    &mut selector,
-                    true,
-                );
-                assert_eq!(
-                    selector.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD],
-                    expected
-                );
-                selectors.push(selector);
-            }
-
-            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-            for selector in selectors {
-                accumulator.add_usage_with_selector(
-                    Some("claude-opus-4-8".to_string()),
-                    UsageTotals {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                        request_count: 1,
-                        ..UsageTotals::default()
-                    },
-                    selector,
-                    Some("2026-08-31T10:00:00Z"),
-                    None,
-                );
-            }
-            let bucket = accumulator
-                .usage_buckets
-                .values()
-                .next()
-                .expect("one usage bucket");
-            assert_eq!(bucket.rows.len(), 1, "{first} and {second} must merge");
-            assert_eq!(
-                bucket
-                    .rows
-                    .values()
-                    .next()
-                    .expect("merged row")
-                    .usage
-                    .request_count,
-                2
-            );
-        }
-    }
-
-    #[test]
-    fn claude_attribution_mcp_tool_pins_python_lowercase_compatibility() {
-        // CPython applies Unicode SpecialCasing to the whole string. These are
-        // pinned outputs from backend normalize_selector_value under Python
-        // 3.13.5 / Unicode 15.1, including Final_Sigma and the sole default
-        // multi-scalar lowercase expansion (U+0130).
-        for (raw, expected) in [
-            ("ΟΣ", "ος"),
-            ("ΟΣ ", "ος"),
-            ("ΣΑΣ", "σας"),
-            ("Σ", "σ"),
-            ("AΣ-A", "aς_a"),
-            ("AΣ_A", "aς_a"),
-            ("AΣ A", "aς_a"),
-            ("İ", "i\u{0307}"),
-            ("ß", "ß"),
-        ] {
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(raw).as_deref(),
-                Some(expected),
-                "Python lowercase parity failed for {raw:?}"
-            );
-        }
-
-        // Rust 1.88 uses Unicode 16 while CPython 3.13 uses Unicode 15.1.
-        // Pin every newly mapped Unicode 16 uppercase scalar that the backend
-        // still treats as unassigned and therefore leaves byte-identical.
-        let unicode_16_uppercase_additions =
-            ['\u{1c89}', '\u{a7cb}', '\u{a7cc}', '\u{a7da}', '\u{a7dc}']
-                .into_iter()
-                .chain('\u{10d50}'..='\u{10d65}');
-        for ch in unicode_16_uppercase_additions {
-            let raw = ch.to_string();
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(&raw).as_deref(),
-                Some(raw.as_str()),
-                "Python 3.13 leaves Unicode 16 addition U+{:04X} unassigned",
-                ch as u32
-            );
-        }
-
-        // Pin all Unicode 16 additions whose newly assigned Cased property can
-        // otherwise change a neighboring sigma's contextual lowercase result.
-        let unicode_16_cased_additions = [
-            '\u{1c89}', '\u{1c8a}', '\u{a7cb}', '\u{a7cc}', '\u{a7cd}', '\u{a7da}', '\u{a7db}',
-            '\u{a7dc}',
-        ]
-        .into_iter()
-        .chain('\u{10d50}'..='\u{10d65}')
-        .chain('\u{10d70}'..='\u{10d85}');
-        for ch in unicode_16_cased_additions {
-            let raw_before = format!("{ch}ΣA");
-            let expected_before = format!("{ch}σa");
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(&raw_before).as_deref(),
-                Some(expected_before.as_str()),
-                "U+{:04X} must be uncased before sigma under Unicode 15.1",
-                ch as u32
-            );
-
-            let raw_after = format!("AΣ{ch}A");
-            let expected_after = format!("aς{ch}a");
-            assert_eq!(
-                normalized_claude_attribution_mcp_tool_name(&raw_after).as_deref(),
-                Some(expected_after.as_str()),
-                "U+{:04X} must be uncased after sigma under Unicode 15.1",
-                ch as u32
-            );
-        }
-    }
-
-    #[test]
-    fn claude_attribution_mcp_tool_caps_complete_selector_identities() {
-        // Exact R2 blocker: 101 normalized tool labels alternate between two
-        // independently varying subagent selectors. A name-only budget emitted
-        // 101 complete rows after its two unselected fallbacks split by agent.
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        accumulator.source_session_id = Some("claude-mcp-tool-cardinality".to_string());
-        for ordinal in 1..=101_u64 {
-            let mut selector = SelectorCapture::default();
-            capture_claude_attribution(
-                &json!({"attributionMcpTool": format!("tool_{ordinal}")}),
-                &mut selector,
-                true,
-            );
-            selector.insert(
-                "attribution_subagent",
-                format!("agent_{}", (ordinal - 1) % 2),
-                "claude_code_attribution_field",
-            );
-            accumulator.add_usage_with_selector(
-                Some("claude-opus-4-8".to_string()),
-                UsageTotals {
-                    input_tokens: ordinal,
-                    output_tokens: 2 * ordinal,
-                    cache_read_tokens: 3 * ordinal,
-                    cache_creation_5m_tokens: 4 * ordinal,
-                    cache_creation_1h_tokens: 5 * ordinal,
-                    reasoning_output_tokens: 6 * ordinal,
-                    unattributed_total_tokens: 7 * ordinal,
-                    request_count: 1,
-                    ..UsageTotals::default()
-                },
-                selector,
-                Some("2026-08-31T10:00:00Z"),
-                None,
-            );
-        }
-        assert_eq!(
-            accumulator
-                .usage_buckets
-                .values()
-                .next()
-                .expect("one pre-bound bucket")
-                .rows
-                .len(),
-            101,
-            "the alternating subagent dimension makes every input a distinct full identity"
-        );
-
-        let path = temp_file("claude-mcp-tool-cardinality");
-        let item = accumulator
-            .into_items(&path, "2026-08-31T10:01:00Z", "fp".to_string(), None)
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.model_usage.len(), MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS);
-        assert_eq!(item.usage_buckets.len(), 1);
-        assert_eq!(
-            item.usage_buckets[0].model_usage.len(),
-            MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS
-        );
-        validate_snapshot_item(0, &item).expect("bounded rows satisfy wire admission shape");
-
-        let overflow_rows = item
-            .model_usage
-            .iter()
-            .filter(|row| {
-                !row.selector_context
-                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(overflow_rows.len(), 2);
-        assert_eq!(
-            overflow_rows
-                .iter()
-                .map(|row| row.request_count)
-                .sum::<u64>(),
-            3
-        );
-        let expected = UsageTotals {
-            input_tokens: 5_151,
-            output_tokens: 10_302,
-            cache_read_tokens: 15_453,
-            cache_creation_5m_tokens: 20_604,
-            cache_creation_1h_tokens: 25_755,
-            reasoning_output_tokens: 30_906,
-            unattributed_total_tokens: 36_057,
-            request_count: 101,
-            ..UsageTotals::default()
-        };
-        for rows in [
-            item.model_usage.as_slice(),
-            item.usage_buckets[0].model_usage.as_slice(),
-        ] {
-            let mut observed = UsageTotals::default();
-            for row in rows {
-                assert!(observed.add(&usage_totals_from_model_usage(row)));
-            }
-            assert!(usage_totals_equal(&observed, &expected));
-        }
     }
 
     #[test]
@@ -69895,7 +69029,6 @@ mod tests {
                     unhealthy_retry_not_before_unix_seconds: None,
                     counts: ScanTraversalCounts::default(),
                     residue: ScanTraversalResidue::default(),
-                    context_inputs: None,
                     listing_started_unix_seconds: None,
                     listing_owed_requeued_unix_seconds: Default::default(),
                 });
@@ -81594,7 +80727,6 @@ mod tests {
                     // Reproduce the permitting macOS gate on every platform;
                     // no cache or reservation-save owner exists on this route.
                     state.index.archive_pass.power = true;
-                    state.index.archive_pass.cpu = 0;
                     match state.step(None) {
                         OwnedSourceScanStep::Pending(next) => state = next,
                         OwnedSourceScanStep::Complete {
@@ -81705,7 +80837,6 @@ mod tests {
                 let mut completed = None;
                 for _ in 0..256 {
                     state.index.archive_pass.power = true;
-                    state.index.archive_pass.cpu = 0;
                     match state.step(None) {
                         OwnedSourceScanStep::Pending(next) => state = next,
                         OwnedSourceScanStep::Complete { index: next, .. } => {
@@ -85098,6 +84229,7 @@ mod tests {
         let mut removed = accepted_retry.clone();
         removed.files.remove("accepted.jsonl");
         state_v2::money_test_support::assert_selected_saves(
+            scan_index_persistence::Source::Claude,
             &committed,
             &[committable.clone(), retry, accepted_retry, removed],
         );
@@ -85326,7 +84458,6 @@ mod tests {
     /// with today's values, and copies no entry its carry leaves equal.
     #[test]
     fn held_page_subset_applies_debt_and_audit_carries() {
-        let _on = evidence_owed::EvidenceOwedForTest::on();
         let mut previous = ScanIndex::default();
         let mut add = |key: &str, version: String| {
             let mut entry = manifest_index_entry(Some(format!("{key}-entity").as_str()));
@@ -85799,6 +84930,7 @@ mod tests {
             &BTreeMap::new(),
         );
         state_v2::money_test_support::assert_selected_saves(
+            scan_index_persistence::Source::Claude,
             &ScanIndex::default(),
             &[committable, retry],
         );
@@ -86002,7 +85134,6 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts,
             residue: ScanTraversalResidue::default(),
-            context_inputs: None,
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
         }
@@ -86574,7 +85705,6 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, claude_family_shadow, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; optional native_publication; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision; inline restored_behind_accepted);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -86594,7 +85724,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, context_inputs);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
@@ -86611,8 +85741,9 @@ crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
 crate::heap_layout_bound::fields!(ActivityCallTool; name);
 crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
-// P2-1 (SOURCE): Claude attribution capture (`OTTTO_CLAUDE_ATTRIBUTION_CAPTURE`)
-// puts raw skill, plugin, MCP and subagent names into `context`. A context
+// P2-1 (SOURCE): the retired Claude attribution capture put raw skill, plugin,
+// MCP and subagent names into `context`; no source emits them now, but the
+// shape below is bound into the pinned allowlist digest, so it stays. A context
 // holding any attribution key is class `E`: the record is refused (counted as
 // `not_persisted{SelectorCapture.context.attribution}`) and the entry reads
 // Full after a restart, so raw names never reach the store. Any other
