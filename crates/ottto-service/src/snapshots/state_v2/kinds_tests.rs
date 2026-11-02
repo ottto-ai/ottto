@@ -1212,7 +1212,8 @@ fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
     let mut prior_id = 0;
     for boundary in ["A", "B", "A", "gone", "A"] {
         let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-        let (mut cold, mut cold_cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+        let (mut cold, mut cold_cx) =
+            hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
         drop(tx);
         let (stored, _) = hydrate(&mut cold_db, Scratch::binding()).unwrap();
         for (root, family) in &cold.claude_account_family_pending {
@@ -1299,7 +1300,8 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     let mut saved = Vec::new();
     for (db, cold) in [(&mut resident_db, false), (&mut cold_db, true)] {
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+        let (mut graph, mut cx) =
+            hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
         if !cold {
             kinds_accounts::materialize(&mut tx, &mut graph).unwrap();
         }
@@ -1339,7 +1341,8 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     // Both queued replay and compaction refuse a row changed under baseline.
     for compact in [false, true] {
         let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-        let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+        let (mut graph, mut cx) =
+            hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
         drop(tx);
         let previous = baseline(&graph, &mut cx).unwrap();
         graph.generation += 1;
@@ -1369,7 +1372,8 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     // Lineage miss: a graph whose base predates a commit it shares no
     // rollover with refuses, counted apart from row damage.
     let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-    let (mut stale, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+    let (mut stale, mut cx) =
+        hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
     drop(tx);
     let previous = baseline(&stale, &mut cx).unwrap();
     stale.generation += 1;
@@ -1378,7 +1382,8 @@ fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
     delta(previous, &stale, &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
     let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-    let (current, mut fresh) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+    let (current, mut fresh) =
+        hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
     drop(tx);
     let previous = baseline(&current, &mut fresh).unwrap();
     roll(&mut stale, &at(8));
@@ -1410,7 +1415,8 @@ fn cold_archive_heap_does_not_grow_with_history() {
             .collect();
         commit_populate(&mut db, &index);
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        let (hydrated, _) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
+        let (hydrated, _) =
+            hydrate_txn(&mut tx, Scratch::binding(), &mut Default::default()).unwrap();
         let archive = &hydrated.claude_account_family_pending["synthetic-family"].previous_windows;
         assert!(matches!(archive, ArchivedWindows::Cold(_)));
         crate::heap_layout_bound::completed_bound(

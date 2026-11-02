@@ -8,7 +8,7 @@ fn hydrate(path: &Path) -> (ScanIndex, u64) {
     (index, telemetry::decoded_rows_for_test())
 }
 
-/// [regress] Unchanged families skip decoding, changed families refold, and
+/// [behaviour] Unchanged families skip decoding, changed families refold, and
 /// deletion/reopen discard old memo entries without changing the stored graph.
 #[test]
 fn reused_session_refolds_only_changed_usage_families() {
@@ -20,14 +20,30 @@ fn reused_session_refolds_only_changed_usage_families() {
     }
     f.import_graph(Some(&pre));
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let initial = load_with(&f.path, false).unwrap().unwrap();
+    let runtime = initial.v2().persistence_v2.clone().unwrap();
+    runtime
+        .session
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .usage_memo
+        .clear();
     let (first, first_rows) = hydrate(&f.path);
-    let runtime = first.v2().persistence_v2.clone().unwrap();
+    let per_family = 1 + pre.claude_usage_family_pending["changed"]
+        .member_request_id_hashes
+        .len() as u64;
     let (mut second, second_rows) = hydrate(&f.path);
     assert!(Arc::ptr_eq(
         &runtime,
         second.v2().persistence_v2.as_ref().unwrap()
     ));
-    assert_eq!(first_rows - second_rows, 3, "one decode saved per family");
+    assert_eq!(
+        first_rows - second_rows,
+        3 * per_family,
+        "each unchanged family skips its row and interned request sets"
+    );
     let mut expected = materialized(&first);
     assert_eq!(
         serde_json::to_vec(&expected).unwrap(),
@@ -46,7 +62,11 @@ fn reused_session_refolds_only_changed_usage_families() {
         &runtime,
         third.v2().persistence_v2.as_ref().unwrap()
     ));
-    assert_eq!(third_rows, second_rows + 1, "only changed family refolds");
+    assert_eq!(
+        third_rows,
+        second_rows + per_family,
+        "only changed family refolds"
+    );
     expected.generation = third.generation;
     expected
         .claude_usage_family_pending
@@ -77,7 +97,7 @@ fn reused_session_refolds_only_changed_usage_families() {
         &runtime,
         reopened.v2().persistence_v2.as_ref().unwrap()
     ));
-    assert!(reopened_rows >= second_rows + 2);
+    assert!(reopened_rows >= second_rows + 2 * per_family);
     assert_eq!(
         serde_json::to_vec(&expected).unwrap(),
         serde_json::to_vec(&materialized(&reopened)).unwrap()
