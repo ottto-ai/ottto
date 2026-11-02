@@ -2020,10 +2020,17 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
         own.copied_marker_lent = lent;
     }
     if let Some(own) = rebuilt.as_ref() {
-        // Restored identified prefix grains were placed with the original
-        // native policy. Own/id-less marker-dependent grains are still staged.
+        // Restored identified prefix grains and unstaged own requests were
+        // placed with the original native policy; an own marker accepted only
+        // after a copied one can flip here. Marker-dependent grains are still
+        // staged, and a request whose account held still returns early.
         for occurrence in claude_usage_occurrences.values() {
-            if !fold.unproven_copy(occurrence) {
+            let unstaged_own = !fold.is_skipped(occurrence.sequence)
+                && !occurrence.usage.is_zero()
+                && accounts
+                    .copied_marker_position(occurrence.sequence)
+                    .is_none();
+            if !unstaged_own && !fold.unproven_copy(occurrence) {
                 continue;
             }
             place_request_identity(
@@ -4364,6 +4371,10 @@ crate::heap_layout_bound::no_heap!(true; ClaudeMoneyTokens {
 #[cfg(test)]
 #[path = "e2_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "e2_holder_redrift_tests.rs"]
+mod holder_redrift_tests;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.
