@@ -22221,6 +22221,7 @@ const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
     "attribution_mcp_tool",
 ];
 
+#[cfg(test)]
 pub fn scan_source_roots(
     source: SnapshotSource,
     roots: &[PathBuf],

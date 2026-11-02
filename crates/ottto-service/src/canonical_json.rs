@@ -49,6 +49,7 @@ pub fn canonicalize(value: &serde_json::Value) -> Result<Vec<u8>, CanonicalJsonE
 /// True when every number reachable from `value` is an exact integer, i.e.
 /// when [`canonicalize`] can succeed. Used by contract tests that assert a
 /// body shape stays canonicalizable as it evolves.
+#[cfg(test)]
 pub fn is_canonicalizable(value: &serde_json::Value) -> bool {
     canonicalize(value).is_ok()
 }
