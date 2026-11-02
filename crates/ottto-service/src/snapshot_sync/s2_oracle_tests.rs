@@ -173,6 +173,10 @@ fn append_after_restart_and_eviction_preserves_placement() {
         seed.enrich(&c);
         let prior = commit(&session, seed);
         append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "agent-later", "2026-08-02T07:04:00Z", 3),
+        );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         assert!(
             accounts(&cold).len() >= 2,
@@ -337,6 +341,14 @@ fn scan_below_floor_holds_without_a_smaller_reemit() {
         let mut prior = commit(&session, initial);
         let key = path.to_str().unwrap();
         prior.files.get_mut(key).unwrap().size_bytes += 128;
+        // An evidence-only clear removes the current-census shrink proof,
+        // without relaxing the accepted extent we are testing.
+        prior
+            .files
+            .get_mut(key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
         let current = page(&c, prior, 100, true);
         let mut held = result(&current, Mode::Restart);
         held.accepted = prior_body.accepted.clone();
@@ -355,29 +367,36 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
     with_e2(|| {
         let mut c = corpus("s2-lossy-prefix");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
+        let sibling = c.root(COPY, &line(COPY, "sibling", AT, 5));
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let prior = commit(&session, page(&c, index, 100, true));
+        let initial = page(&c, index, 100, true);
+        let mut previous = result(&initial, Mode::ColdFull);
+        accepted(&mut previous, &initial.scan.snapshots);
+        let prior = commit(&session, initial);
         append(
             &path,
             &(String::from("{broken\n") + &line(ROOT, "b", "2026-08-02T07:01:00Z", 20)),
+        );
+        append(
+            &sibling,
+            &line(COPY, "sibling-later", "2026-08-02T07:01:00Z", 7),
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let current = page(&c, prior, 100, true);
         assert_eq!(current.modes.0, 0);
         assert!(current.modes.1 > 0);
-        money_oracle::assert_equivalent(&cold, &result(&current, Mode::Restart));
+        let mut held = result(&current, Mode::Restart);
+        held.accepted = previous.accepted.clone();
+        money_oracle::assert_held(ROOT, &previous, &held, &cold);
         let mut prior = commit(&session, current);
         // Evidence debt keeps the lossy file eligible on the next walk.
-        prior
-            .files
-            .get_mut(path.to_str().unwrap())
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
+        for entry in prior.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
         let replay = page(&c, prior, 100, true);
         assert_eq!(
             replay.modes.0, 0,
@@ -387,7 +406,9 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             replay.modes.1 > 0,
             "the old seal must replay the lossy suffix"
         );
-        money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
+        let mut held = result(&replay, Mode::Restart);
+        held.accepted = previous.accepted.clone();
+        money_oracle::assert_held(ROOT, &previous, &held, &cold);
     });
 }
 
@@ -415,6 +436,7 @@ fn assert_family_converges(c: &Corpus, session: &StateV2ColdSession, mut index: 
     );
 }
 
+/// [money] Resolved path twins stop selecting with evidence fixed.
 #[test]
 fn forced_family_converges_after_resolve() {
     with_e2(|| {
@@ -443,7 +465,7 @@ fn forced_family_converges_after_resolve() {
 #[test]
 fn changed_account_evidence_matches_cold_placement() {
     with_e2(|| {
-        let (c, path) = placement_corpus("s2-changed-account");
+        let (c, _) = placement_corpus("s2-changed-account");
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
@@ -451,7 +473,7 @@ fn changed_account_evidence_matches_cold_placement() {
         );
         let first = page(&c, index, 100, true);
         let before = result(&first, Mode::ColdFull);
-        let mut prior = commit(&session, first);
+        let prior = commit(&session, first);
         c.evidence(
             &[
                 api_login(ROOT, "a", 10, '3', Some('9')),
@@ -466,14 +488,8 @@ fn changed_account_evidence_matches_cold_placement() {
                 trace("side", ""),
             ],
         );
-        // The existing evidence-only clear selects a quiet record, without
-        // changing its accepted body or the Tail's physical identity.
-        prior
-            .files
-            .get_mut(path.to_str().unwrap())
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
+        // Root and child depend on this sidecar: select SourceChanged while
+        // keeping each file's previous exact upload-context receipt valid.
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         assert_ne!(
             accounts(&before),
