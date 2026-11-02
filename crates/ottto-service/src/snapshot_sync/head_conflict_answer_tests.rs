@@ -653,7 +653,13 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
 /// can change without a local change. A changed body is offered at once.
 #[test]
 fn plain_conflict_is_probed_within_an_hour_and_a_changed_body_goes_at_once() {
-    let item = item();
+    // A body without a cache patch sends no head-CAS contract, so its
+    // conflict carries no challenge.
+    let mut item = item();
+    item.cache_observations = None;
+    item.cache_observations_state = None;
+    item.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
     let mut progress = SnapshotUploadProgress::new(
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
