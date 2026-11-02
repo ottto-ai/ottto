@@ -242,6 +242,14 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
+    let owed_stale = matches!(
+        outcome,
+        FinishOutcome::Dominated {
+            reason: "accepted_log_stale_older_upload",
+            ..
+        }
+    );
+    let expected_valid = expected_valid && !owed_stale;
     let cycles = if outcome.retains_refusal_across_quiet_cycles() {
         3
     } else {
@@ -266,7 +274,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         })
         .unwrap()
         .expect("real due native preparation");
-        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
+        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2 && !owed_stale,
         "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
@@ -306,7 +314,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         });
         assert_eq!(
             result.is_ok(),
-            !matches!(outcome, FinishOutcome::Retryable),
+            !matches!(outcome, FinishOutcome::Retryable) && !owed_stale,
             "{outcome:?}: {result:?}"
         );
         // A held entity has its own quarantine clock: no finished cycle,
@@ -352,12 +360,11 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             terminal[cycle]["last_error_code"],
             match outcome {
                 FinishOutcome::Retryable => "server_error",
-                // The refused body is settled unproven-terminal residue; the
-                // server already owns a better or newer record for it.
+                // A timestamp-only refusal is owed and keeps the retryable status.
                 FinishOutcome::Dominated {
                     reason: "accepted_log_stale_older_upload",
                     ..
-                } => "backend_validation_error",
+                } => "server_error",
                 FinishOutcome::Dominated {
                     admit_residue: true,
                     ..

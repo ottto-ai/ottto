@@ -52093,13 +52093,17 @@ impl ScanIndex {
         let mut unbound = self
             .claude_usage_authority_quarantine
             .iter()
-            .flat_map(|(root, record)| {
-                record
-                    .member_source_file_fingerprints
-                    .keys()
-                    .map(move |member| (root.as_str(), member.as_str()))
+            .map(|(root, record)| {
+                (
+                    root.as_str(),
+                    record
+                        .member_source_file_fingerprints
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>(),
+                )
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeMap<_, _>>();
         for (key, fingerprints) in &self.file_snapshot_fingerprints {
             if unbound.is_empty() {
                 break;
@@ -52107,11 +52111,21 @@ impl ScanIndex {
             let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
                 continue;
             };
-            if !fingerprints.is_empty() && unbound.remove(&(root.as_str(), member.as_str())) {
+            if !fingerprints.is_empty()
+                && unbound
+                    .get_mut::<str>(root.as_str())
+                    .is_some_and(|members| members.remove::<str>(member.as_str()))
+            {
                 entities.extend(fingerprints.iter().map(String::as_str));
+                if unbound
+                    .get::<str>(root.as_str())
+                    .is_some_and(BTreeSet::is_empty)
+                {
+                    unbound.remove::<str>(root.as_str());
+                }
             }
         }
-        (entities, unbound.len())
+        (entities, unbound.values().map(BTreeSet::len).sum())
     }
 
     pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {
