@@ -86408,6 +86408,11 @@ pub(crate) use state_v2::money_test_support::{
 
 #[cfg(test)]
 pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_test;
+#[cfg(test)]
+pub(crate) use state_v2::{
+    seed_tail_literals_for_test, stage_tail_for_test as state_v2_stage_tail_for_test,
+    tail_published_for_test as state_v2_tail_published_for_test,
+};
 
 /// Local-only recovery bypasses a save-pressure hold, never custody fencing.
 /// OFF returns before allocating a guard or consulting any route state.

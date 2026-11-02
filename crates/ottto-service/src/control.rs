@@ -24486,6 +24486,7 @@ for line in sys.stdin:
             &support.join("telemetry-keys"),
         );
         let canary = seed_private_literal_canary(&support);
+        let _tail_literals = crate::snapshots::seed_tail_literals_for_test(&support, canary);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -24583,6 +24584,7 @@ for line in sys.stdin:
             &support.join("telemetry-keys"),
         );
         let canary = seed_private_literal_canary(&support);
+        let _tail_literals = crate::snapshots::seed_tail_literals_for_test(&support, canary);
         let captured = Arc::new(Mutex::new(None));
         let api_base_url = diagnostics_upload_server(captured.clone());
         let response = handle_request(

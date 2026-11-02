@@ -42,6 +42,9 @@ pub(in super::super) fn orphan_part_for_test(db: &mut Sqlite) {
         )
         .unwrap();
 }
+pub(in super::super) fn erasure_marks_for_test(db: &Sqlite) -> u64 {
+    db.stats.erasure_pending_marks
+}
 pub(in super::super) fn wal_bytes_for_test(db: &Sqlite) -> Option<u64> {
     db.wal_bytes()
 }
