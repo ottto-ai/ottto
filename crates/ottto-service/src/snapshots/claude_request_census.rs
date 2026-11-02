@@ -477,6 +477,16 @@ impl ClaudeRequestCensusRecord {
         self.unverified || self.twin
     }
 
+    /// Neither a path twin nor retired.
+    fn not_twin_or_retired(&self) -> bool {
+        !self.twin && self.retired.is_none()
+    }
+
+    /// Source-verified, neither a path twin nor retired.
+    fn verified_not_twin_or_retired(&self) -> bool {
+        !self.unverified && self.not_twin_or_retired()
+    }
+
     /// A current native body can supersede an unverified census record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
@@ -484,8 +494,7 @@ impl ClaudeRequestCensusRecord {
     /// reconstruction does not itself refuse their bodies.
     pub(crate) fn can_bind_recomposed_body(&self) -> bool {
         self.current_derivation()
-            && !self.twin
-            && self.retired.is_none()
+            && self.not_twin_or_retired()
             && matches!(
                 self.shape,
                 ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
@@ -497,8 +506,7 @@ impl ClaudeRequestCensusRecord {
     pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
-            && !self.twin
-            && self.retired.is_none()
+            && self.not_twin_or_retired()
             && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
     }
 
@@ -516,8 +524,7 @@ impl ClaudeRequestCensusRecord {
     /// budget). The caller binds it to the file.
     pub(crate) fn proves_scan(&self) -> bool {
         self.current_derivation()
-            && !self.twin
-            && self.retired.is_none()
+            && self.not_twin_or_retired()
             && self.shape != ClaudeRequestCensusShape::OverBudget
     }
 
@@ -620,16 +627,13 @@ impl ClaudeRequestCensusRecord {
     /// incomplete, unverified, over-budget, retired or other-derivation
     /// records are unknown, never current.
     pub(crate) fn current_for(&self, entry_fingerprint: &str) -> bool {
-        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+        self.current_derivation()
             && matches!(
                 self.shape,
                 ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
             )
-            && !self.unverified
-            && !self.twin
-            && self.retired.is_none()
-            && decode_fingerprint(entry_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+            && self.verified_not_twin_or_retired()
+            && fingerprint_matches(self, entry_fingerprint)
     }
 
     /// Negative provenance check for the narrow id-less pending exception,
@@ -639,13 +643,10 @@ impl ClaudeRequestCensusRecord {
     /// derivation, decode invalidation, twins and retirement. It never
     /// supplies a body ACK, coverage or a duplicate proof.
     pub(super) fn idless_native_for(&self, entry_fingerprint: &str) -> bool {
-        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+        self.current_derivation()
             && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
-            && !self.unverified
-            && !self.twin
-            && self.retired.is_none()
-            && decode_fingerprint(entry_fingerprint)
-                .is_some_and(|fp| fp == self.source_file_fingerprint)
+            && self.verified_not_twin_or_retired()
+            && fingerprint_matches(self, entry_fingerprint)
     }
 
     /// `reproduces` in `window`, or in any window from `since` on.
@@ -663,11 +664,9 @@ impl ClaudeRequestCensusRecord {
     /// parsed in `window` under the current derivation, whatever its shape,
     /// so a re-read reproduces it. Never proof, coverage or an ACK.
     pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {
-        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+        self.current_derivation()
             && self.window == window
-            && !self.unverified
-            && !self.twin
-            && self.retired.is_none()
+            && self.verified_not_twin_or_retired()
             && fingerprint_matches(self, entry_fingerprint)
     }
 
@@ -680,12 +679,9 @@ impl ClaudeRequestCensusRecord {
         self.current_for(entry_fingerprint)
             || (self.shape == ClaudeRequestCensusShape::IdentityIncomplete
                 && message_known
-                && self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
-                && !self.unverified
-                && !self.twin
-                && self.retired.is_none()
-                && decode_fingerprint(entry_fingerprint)
-                    .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint))
+                && self.current_derivation()
+                && self.verified_not_twin_or_retired()
+                && fingerprint_matches(self, entry_fingerprint))
     }
 
     /// A telemetry record (`otel:` key): exact hashes with one fact each, a
