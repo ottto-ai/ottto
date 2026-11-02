@@ -4,10 +4,12 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 const ERASURE_DEADLINE: Duration = Duration::from_secs(86400);
+const ERASURE_WORK_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
+    pub(in super::super) work: Duration,
     pub(super) space: fn(&Path) -> Option<u64>,
     /// Hard charged-work ceiling for one save.
     pub(super) save_ceiling: u64,
@@ -19,6 +21,7 @@ impl Default for PurgePolicy {
     fn default() -> Self {
         Self {
             deadline: ERASURE_DEADLINE,
+            work: ERASURE_WORK_BUDGET,
             space: free_space,
             save_ceiling: SAVE_CEILING_BYTES,
             path_diff_budget: PATH_DIFF_BUDGET_BYTES,
@@ -26,8 +29,8 @@ impl Default for PurgePolicy {
     }
 }
 
-/// Thresholds scale with allocated bytes, rounded up to a MiB. Required work
-/// completes with a slow alarm; advisory sampling may interrupt and defer.
+/// Budgets scale with allocated bytes, rounded up to a MiB. VM interruption
+/// bounds CPU work; SQLite's busy handler separately bounds lock waits.
 pub(super) fn size_budget(bytes: u64, ms_per_mib: u64) -> Duration {
     Duration::from_millis(
         2_000_u64.saturating_add(bytes.div_ceil(1024 * 1024).saturating_mul(ms_per_mib)),
@@ -213,8 +216,8 @@ unsafe extern "C" fn progress(raw: *mut std::ffi::c_void) -> std::ffi::c_int {
     (Instant::now() >= *deadline) as std::ffi::c_int
 }
 
-/// Interrupt advisory work at VM progress points. Its caller defers failures;
-/// required integrity checks and erasure work must never use this deadline.
+/// Interrupt work at VM progress points. Busy waits have their separate 100 ms
+/// bound. This is a finite work budget, not a hard wall-clock latency promise.
 fn limited<T>(conn: &Connection, work: Duration, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let mut deadline = Instant::now()
         .checked_add(work)
@@ -257,13 +260,18 @@ fn free_space(path: &Path) -> Option<u64> {
 
 impl Sqlite {
     #[cfg(test)]
-    pub(in super::super) fn set_purge_policy(&mut self, deadline: Duration) -> Result<()> {
+    pub(in super::super) fn set_purge_policy(
+        &mut self,
+        deadline: Duration,
+        work: Duration,
+    ) -> Result<()> {
         ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600),
+            !deadline.is_zero() && deadline <= Duration::from_secs(72 * 3600) && !work.is_zero(),
             "state_v2_purge_policy"
         );
         self.purge_policy = PurgePolicy {
             deadline,
+            work,
             ..self.purge_policy
         };
         Ok(())
@@ -292,6 +300,7 @@ impl Sqlite {
                     rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
                         "busy"
                     }
+                    rusqlite::ErrorCode::OperationInterrupted => "timeout",
                     rusqlite::ErrorCode::DiskFull => "disk_full",
                     _ => "engine",
                 })
@@ -329,13 +338,17 @@ impl Sqlite {
         let started = Instant::now();
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
 
-        // Interrupted VACUUM restarts from scratch and can block recovery on
-        // every pass. Use the size threshold only for a slow alarm.
-        let budget = size_budget(logical.unwrap_or(0), 20);
-        let result = self.conn()?.execute_batch("VACUUM").map_err(Into::into);
-        let elapsed = started.elapsed();
-        super::super::telemetry::event("vacuum_slow_alarm", &(elapsed > budget));
-        self.stats.vacuum_latency_ms = u64::try_from(elapsed.as_millis()).ok();
+        // Interrupted VACUUM restarts from scratch. Increase its work allowance
+        // after failures, with a hard pause bound; never loop until it succeeds.
+        let failures = self.read_control::<u64>("erasure_failures")?.unwrap_or(0);
+        let budget = size_budget(logical.unwrap_or(0), 20)
+            .max(self.purge_policy.work)
+            .saturating_mul(1_u32 << failures.saturating_sub(1).min(5))
+            .min(Duration::from_secs(60));
+        let result = limited(self.conn()?, budget, || {
+            Ok(self.conn()?.execute_batch("VACUUM")?)
+        });
+        self.stats.vacuum_latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
         if let Some(bytes) = bytes {
@@ -460,14 +473,7 @@ impl Sqlite {
         }
         let recovering = self.recovery_attempts_left > 0;
         self.recovery_attempts_left = self.recovery_attempts_left.saturating_sub(1);
-        let busy_before = self.stats.erasure_vacuum_failed.get("busy").copied();
         self.maintain(Some(false), recovering)?;
-        if busy_before != self.stats.erasure_vacuum_failed.get("busy").copied() {
-            // A bounded checkpoint lock wait defers erasure, never collection.
-            // The persisted obligation and deadline breach remain visible.
-            super::super::telemetry::event("erasure_busy_deferred_alarm", &true);
-            return Ok(());
-        }
         if recovering && self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0 {
             self.stats.erasure_resume_refusals =
                 self.stats.erasure_resume_refusals.saturating_add(1);
@@ -500,11 +506,8 @@ impl Sqlite {
                 super::super::telemetry::event("erasure_deadline_breach", &1);
             }
             self.stats.erasure_overdue = true;
-            // Contention defers maintenance; other lock errors still refuse.
-            if reason == "lock_io" {
-                self.stats.erasure_resume_refusals =
-                    self.stats.erasure_resume_refusals.saturating_add(1);
-            }
+            self.stats.erasure_resume_refusals =
+                self.stats.erasure_resume_refusals.saturating_add(1);
             self.erasure_failed(reason);
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         }
@@ -690,12 +693,12 @@ impl Sqlite {
             }
         }
         let max_wal = self.logical_bytes()?.max(256 * 1024 * 1024);
-        let wal_debt_alarm = self.debt
-            && !(pending && self.read_control::<u64>("erasure_attempt")?.is_some())
-            && !self.wal_bytes().is_some_and(|b| b < max_wal);
-        if wal_debt_alarm {
-            super::super::telemetry::event("wal_debt_alarm", &true);
-        }
+        ensure!(
+            !self.debt
+                || pending && self.read_control::<u64>("erasure_attempt")?.is_some()
+                || self.wal_bytes().is_some_and(|b| b < max_wal),
+            "state_v2_wal_debt"
+        );
         Ok(())
     }
 }

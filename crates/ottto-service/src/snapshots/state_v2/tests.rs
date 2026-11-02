@@ -520,8 +520,11 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     fs::rename(tmp.path(), &database).unwrap();
     let mut db = sqlite::Sqlite::open(&database, &tmp.identity()).unwrap();
     db.path_extractor(test_paths);
-    db.set_purge_policy(std::time::Duration::from_secs(86400))
-        .unwrap();
+    db.set_purge_policy(
+        std::time::Duration::from_secs(86400),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
     let markers: Vec<String> = (0..512)
         .map(|i| format!("synthetic-purge-marker-{i:06}-{}", "x".repeat(80 + i % 63)))
         .collect();
@@ -1652,9 +1655,9 @@ fn key_admission_rejects_invalid_keys_before_sqlite_reads() {
     assert!(tx.get(&RowKey::Meta("unregistered".into())).is_err());
 }
 
-/// [format] overdue external reader alarms and defers erasure without holding collection.
+/// [format] overdue external reader is a breach and recovery precedes collection.
 #[test]
-fn overdue_external_reader_alarms_and_defers_erasure_without_holding_collection() {
+fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("private".into());
@@ -1666,14 +1669,10 @@ fn overdue_external_reader_alarms_and_defers_erasure_without_holding_collection(
     put(&mut tx, &key, b"replacement");
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     age_erasure(&mut db, 25 * 3600);
-    db.before_collection().unwrap();
+    assert!(db.before_collection().is_err());
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_breaches"], 1);
-    assert_eq!(stats["erasure_resume_refusals"], 0);
-    assert_eq!(
-        telemetry::take_thread_event_for_test("erasure_busy_deferred_alarm"),
-        Some(serde_json::json!(true))
-    );
+    assert_eq!(stats["erasure_resume_refusals"], 1);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
     drop(reader);
     // Recovery does not wait for the failed attempt's one-hour backoff.
@@ -1734,7 +1733,6 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_breaches"], 1);
     assert_eq!(stats["erasure_vacuum_failed"]["external_lock"], 1);
-    assert_eq!(stats["erasure_resume_refusals"], 0);
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(1));
 }
 

@@ -65,18 +65,10 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
     }
     if let Ok(mut stats) = stats().lock() {
         if let Ok(value) = serde_json::to_value(value) {
-            if name == "hold" && stats.latest.get(name) == Some(&value) {
-                return;
-            }
             stats.latest.insert(name, value);
         }
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
-}
-/// Clear a resolved store hold explicitly; absence of a new error is not an
-/// event and otherwise leaves an old process-lifetime value behind.
-pub(super) fn clear_hold() {
-    event("hold", &"none");
 }
 /// Test evidence only: the latest value of a content-free event.
 #[cfg(test)]

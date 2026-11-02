@@ -45,19 +45,6 @@ impl std::fmt::Display for Hold {
     }
 }
 impl std::error::Error for Hold {}
-/// Sanitized engine/I/O cause retained through repeated storage wrapping.
-/// Health owns the single policy deciding which causes are retryable.
-#[derive(Clone, Copy, Debug)]
-pub(in super::super) enum StorageCause {
-    Sqlite(rusqlite::ErrorCode),
-    Io(std::io::ErrorKind),
-}
-impl std::fmt::Display for StorageCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&Hold::DbUnavailable, f)
-    }
-}
-
 impl Hold {
     pub(super) fn storage(error: anyhow::Error) -> anyhow::Error {
         // Keep only the content-free typed cause, including through SQLite's
@@ -69,11 +56,7 @@ impl Hold {
             return Self::UnknownRecordKind.into();
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
-            let sanitized = anyhow::Error::new(*hold);
-            return match error.downcast_ref::<StorageCause>() {
-                Some(cause) => sanitized.context(*cause),
-                None => sanitized,
-            };
+            return (*hold).into();
         }
         let integrity_repair = error
             .chain()
@@ -83,17 +66,6 @@ impl Hold {
             // the preceding successful open's cleared hold.
             telemetry::event("hold", &"integrity_repair");
         }
-        let storage_cause = error.chain().find_map(|cause| {
-            cause
-                .downcast_ref::<rusqlite::Error>()
-                .and_then(|error| error.sqlite_error_code())
-                .map(StorageCause::Sqlite)
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .map(|error| StorageCause::Io(error.kind()))
-                })
-        });
         let reason = error
             .downcast_ref::<rusqlite::Error>()
             .and_then(|e| e.sqlite_error_code())
@@ -156,12 +128,8 @@ impl Hold {
         } else {
             Self::DbUnavailable
         };
-        // Keep only primitive cause codes, never engine messages or paths.
-        let sanitized = anyhow::Error::new(hold);
-        match (hold, storage_cause) {
-            (Self::DbUnavailable, Some(cause)) => sanitized.context(cause),
-            _ => sanitized,
-        }
+        // Do not retain arbitrary engine messages/paths in public health output.
+        hold.into()
     }
     /// Content-free cause of save pressure: the charged-work ceiling or one
     /// logical row over its value cap. Both hold as `SaveCeiling`.
@@ -202,7 +170,7 @@ impl RouteState {
         } else if let Some(hold) = self.save_hold {
             telemetry::event("hold", &hold);
         } else {
-            telemetry::clear_hold();
+            telemetry::event("hold", &"none");
         }
     }
     fn reduce_page(&mut self) {

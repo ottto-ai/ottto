@@ -47,6 +47,14 @@ resolving a string reads directly into the final owned string without loading a
 whole dictionary. Semantic caller mapping and reference-closure checks across
 owners remain prerequisites for routing this backend.
 
+On an unclean state v2 open, `PRAGMA quick_check(1)` runs to completion without
+an interrupt deadline. The former size budget (2 seconds plus 10 ms per allocated
+MiB) is a slow-alarm threshold: `quick_check_ms` records duration and
+`quick_check_slow_alarm` records whether it was exceeded. A non-ok result still
+refuses the store with `state_v2_integrity_requires_explicit_repair`.
+SQLite busy waits, maintenance-lock refusals, erasure recovery attempts, WAL-debt
+limits and VACUUM work budgets retain their existing bounds and refusal behavior.
+
 ### Deferred erasure maintenance
 
 Removing potentially private keys or values marks the first pending generation
@@ -57,13 +65,6 @@ TRUNCATE with a measured zero-length WAL, and a durable metadata-only clear.
 
 SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
 
-This approved wording remains the policy target. The current implementation can
-resume collection before erasure when a maintenance lock or external reader
-prevents completion; debt and the overdue breach remain visible. This ordering
-exception requires explicit policy acknowledgement (and SOURCE approval where
-required); the quoted wording is not amended here. Previously, two failed
-recovery attempts could already allow collection to resume with overdue debt.
-
 The default deadline is 24 hours; shorter deadlines are allowed. A longer
 policy requires SOURCE approval and is capped at 72 hours; erasure is never
 disabled. That cap is a policy limit, never a grace period for overdue debt.
@@ -71,36 +72,30 @@ Idle attempts start around 12 hours. At 20 hours (scaled down for shorter
 policies), a maintenance pause takes precedence over Ottto's own acquisition
 work and locks. The pause reserves the next checkpoint-lock turn before waiting
 up to two seconds for an existing Ottto owner; new normal work yields to it.
-A maintenance-lock conflict defers the attempt with an alarm and lets collection
-continue. An overdue conflict still records the breach and failed erasure attempt,
-but does not increment the collection-refusal counter. Another process's lock is
-a counted breach if it prevents completion within the deadline. Failed attempts
-retain debt and back off within the remaining deadline. Successful runs normally have a 24-hour cadence, which
+Own-lock failure remains a failure and an overdue breach. Another process's lock is a counted breach if it prevents
+completion within the deadline. Failed attempts retain debt and back off within
+the remaining deadline. Successful runs normally have a 24-hour cadence, which
 yields to the forced maintenance pause and overdue recovery.
 
 Preparation and every acquisition continuation check maintenance before normal
-collection. After sleep or space recovery, overdue VACUUM and a verified TRUNCATE
-attempt run at the recovery boundary, overriding retry and successful-run
-cooldowns. A busy TRUNCATE defers erasure with an alarm while collection continues;
-it cannot clear the erasure obligation. Other recovery failures can refuse at
-most two consecutive collection attempts, after which collection continues with
-debt and the overdue alarm retained and retries resume with pacing. An ordinary
-failed idle attempt does not arm this recovery boundary. Previously committed
-data remains committed. A missing or regressed deletion clock uses the same
-conservative overdue posture, rather than postponing purge.
+collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE,
+run at the recovery boundary before collection resumes, overriding retry and
+successful-run cooldowns. Recovery has at most two consecutive bounded attempts;
+if they fail, collection continues with debt and the overdue alarm retained,
+and retries resume with pacing. An ordinary failed idle attempt does not arm this
+recovery boundary. Previously committed data remains committed. A missing or regressed deletion
+clock uses the same conservative overdue posture, rather than postponing purge.
 Privacy work precedes optional daily reference verification.
 
 Admission requires available space of at least twice the larger of the main
 file length and the logical database size, including pages still in WAL.
-An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM runs
-to completion without a VM work deadline. Duration beyond 2 seconds plus 20 ms
-per allocated MiB emits a slow alarm; failures do not raise this threshold.
-Required SQLite lock waits have no deadline, so an external writer that never
-releases its lock can stall the load/save thread indefinitely. The subsequent
-checkpoint retains a bounded 100 ms busy wait and may defer as described above.
-Real failures back off inside the remaining deadline; overdue retries back off
-up to five minutes. Debt clears only after success. Its WAL may grow approximately
-with database size; the 64 MiB WAL alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
+An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM has a
+configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
+plus the existing bounded busy wait. Failed attempts increase the next work
+allowance geometrically, capped at 60 seconds per attempt. This is interruptible
+work, not a hard latency guarantee. Failures back off inside the remaining deadline;
+overdue retries back off up to five minutes. Debt clears only after success. Its WAL may grow approximately with database size; the 64 MiB WAL
+alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
 still require platform qualification before routing or enabling conversion.
 
 Verified completion covers the current DB/WAL/SHM and the removed migration

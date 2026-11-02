@@ -33,7 +33,7 @@ pub(super) use runtime::{
     guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
     save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
 };
-pub(super) use runtime::{BaselineRelease, Hold, StorageCause};
+pub(super) use runtime::{BaselineRelease, Hold};
 mod catalogue;
 mod codec;
 mod ignored;

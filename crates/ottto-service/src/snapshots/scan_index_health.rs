@@ -64,21 +64,15 @@ pub(crate) const REASONS: [Reason; 3] =
 
 /// One exhaustive classification for both log wording and status projection.
 pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
-    use super::state_v2::{Hold, StorageCause, INTEGRITY_REPAIR};
+    use super::state_v2::{Hold, INTEGRITY_REPAIR};
     for cause in error.chain() {
         if let Some(hold) = cause.downcast_ref::<Hold>() {
             return Some(match hold {
                 Hold::Future | Hold::UnknownRecordKind | Hold::NewerSchema => Reason::NewerApp,
-                Hold::ForeignBinding | Hold::FenceLost | Hold::ReferenceDrift => {
-                    Reason::ShardUnavailable
-                }
-                Hold::DbUnavailable => match error.downcast_ref::<StorageCause>() {
-                    Some(StorageCause::Sqlite(
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
-                    ))
-                    | Some(StorageCause::Io(std::io::ErrorKind::WouldBlock)) => Reason::Retrying,
-                    _ => Reason::ShardUnavailable,
-                },
+                Hold::DbUnavailable
+                | Hold::ForeignBinding
+                | Hold::FenceLost
+                | Hold::ReferenceDrift => Reason::ShardUnavailable,
                 Hold::MigrationFailed
                 | Hold::ReloadRequired
                 | Hold::SaveCeiling
