@@ -369,18 +369,6 @@ impl Drop for SaveTiming {
     }
 }
 
-/// The nickname request body; the nickname is the only user-chosen text in it.
-pub(crate) fn save_body(
-    machine_id: &str,
-    pair: &Pair,
-    nickname: Option<&str>,
-) -> serde_json::Value {
-    serde_json::json!({ "machine_id":machine_id, "source":pair.source,
-        "account_identifier_hash":pair.account_identifier_hash,
-        "organization_identifier_hash":pair.organization_identifier_hash,
-        "nickname":nickname })
-}
-
 pub(crate) fn set(
     pair: Pair,
     nickname: Option<SecretString>,
@@ -466,7 +454,10 @@ pub(crate) fn set(
         return finish(Outcome::NotConnected);
     }
     timing.mark("binding_again");
-    let mut payload = save_body(&machine_id, &pair, nickname.as_deref());
+    let mut payload = serde_json::json!({ "machine_id":machine_id, "source":pair.source,
+        "account_identifier_hash":pair.account_identifier_hash,
+        "organization_identifier_hash":pair.organization_identifier_hash,
+        "nickname":nickname });
     if let Some(revision) = base_revision {
         payload["base_revision"] = serde_json::json!(revision);
     }

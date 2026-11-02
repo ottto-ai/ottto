@@ -283,9 +283,7 @@ fn money_placement_and_totals_are_equal_under_every_policy() {
     }
 }
 
-/// `AgentSessionSnapshotActivityCount.name` and `AgentSessionSnapshotToolUsage.name`
-/// in backend/app/schemas/agent_session_snapshots.py:1957-1966 and
-/// `parse_mcp_tool_name` in backend/app/domain/mcp_footprint/names.py:35-46.
+/// The server's rules for a snapshot activity or tool name, and its MCP name split.
 #[test]
 fn the_merged_mcp_name_passes_the_server_snapshot_grammar() {
     assert!(HIDDEN_MCP_NAME.len() <= 96);

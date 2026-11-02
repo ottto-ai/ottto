@@ -59,7 +59,7 @@ use super::{
 use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
-use crate::upload_policy::{names_withheld_accepted, remembered_policy};
+use crate::upload_policy::FootprintRules;
 use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -599,9 +599,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             .issue_relay_token(&device, &device_secret, snapshot_source)
             .ok();
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
-        let mut hint_policy = None;
-        let mut details_enabled = false;
-        let mut names_withheld = false;
+        let mut fetched = None;
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
@@ -611,11 +609,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
-                    hint_policy = Some(remembered_policy(support_dir, &destination, Some(&hint)));
-                    details_enabled = super::upload::details_enabled(
-                        hint.context_composition_details_contract.as_deref(),
-                    );
-                    names_withheld = names_withheld_accepted(Some(&hint));
+                    fetched = Some(hint);
                 }
                 Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
                     health.remove(agent_source_label(snapshot_source));
@@ -627,8 +621,10 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             health.remove(agent_source_label(snapshot_source));
             continue;
         }
-        let policy =
-            hint_policy.unwrap_or_else(|| remembered_policy(support_dir, &destination, None));
+        let rules = FootprintRules::for_pass(support_dir, &destination, fetched.as_ref());
+        let details_enabled = fetched.as_ref().is_some_and(|hint| {
+            super::upload::details_enabled(hint.context_composition_details_contract.as_deref())
+        });
         let mut uploader = relay_token.map(|token| ClientUploader {
             client: &client,
             relay_token: token,
@@ -637,9 +633,9 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             uploader: uploader as &mut dyn Uploader,
             machine_id: &machine_id,
             destination: &destination,
-            policy,
+            policy: rules.policy,
             details_enabled,
-            names_withheld,
+            names_withheld: rules.names_withheld,
         });
         let agent = agent_source_label(snapshot_source);
         health.set(HealthEntry::started(agent, OffsetDateTime::now_utc()));

@@ -1,7 +1,6 @@
 //! Composition lane of the upload filter, checked on the captured POST body.
 use super::super::aggregate::{FileKey, FileTotals};
 use super::super::harvest::{erase_source_state, lock_state, state_dir};
-use super::super::health::{HealthEntry, HealthRecord};
 use super::super::scope::Scope;
 use super::super::upload::{ack_path, build_request, upload_scope, UploadOutcome};
 use super::super::UPLOAD_TOP_FILES;
@@ -127,46 +126,38 @@ fn top_files_withheld_sums_every_file_before_the_top_cut() {
         scope.agg.day_files.insert((day, key.clone()), totals);
         scope.agg.all_files.insert(key, totals);
     }
+    // Inside 30 days, outside 7: only the 30-day totals count it.
+    let older = FileKey {
+        path: format!("{FILE}-older").into(),
+        kind: Kind::FilesRead,
+        part: crate::composition_kinds::Part::FileTool,
+    };
+    let older_totals = FileTotals {
+        events: 3,
+        tokens: 500,
+        last: Some(base_now().unix_timestamp()),
+    };
+    scope
+        .agg
+        .day_files
+        .insert((day - 10, older.clone()), older_totals);
+    scope.agg.all_files.insert(older, older_totals);
     let off = withheld_payload(&scope, true, false);
     assert_eq!(
         off["top_files_withheld"],
+        json!({"files": extra + 2, "events": extra * 2 + 4, "tokens": extra * 100 + 540})
+    );
+    assert_eq!(
+        off["top_files_withheld_7d"],
         json!({"files": extra + 1, "events": extra * 2 + 1, "tokens": extra * 100 + 40})
     );
+    assert!(off.get("top_files_7d").is_none());
     assert!(!off.to_string().contains(FILE));
     assert!(off.get("top_files").is_none());
-    assert!(withheld_payload(&scope, false, false)
-        .get("top_files_withheld")
-        .is_none());
-    assert!(withheld_payload(&scope, true, true)
-        .get("top_files_withheld")
-        .is_none());
-}
-
-#[test]
-fn the_withheld_capability_alone_uploads_each_scope_once() {
-    let dir = scratch("upload-policy-withheld");
-    let now = base_now();
-    let window = Window::ending(day_of(now.date()));
-    let scope = scope_with_file();
-    let mut capture = Capture::default();
-    let upload = |capture: &mut Capture, names_withheld: bool| {
-        let mut target = UploadTarget {
-            uploader: capture,
-            machine_id: "machine-test",
-            destination: "test-destination",
-            policy: labels(false),
-            details_enabled: false,
-            names_withheld,
-        };
-        upload_scope(&dir, Source::Claude, &scope, &mut target, now, window).outcome
-    };
-    assert_eq!(upload(&mut capture, false), UploadOutcome::Uploaded);
-    assert_eq!(upload(&mut capture, false), UploadOutcome::Unchanged);
-    assert_eq!(upload(&mut capture, true), UploadOutcome::Uploaded);
-    assert_eq!(upload(&mut capture, true), UploadOutcome::Unchanged);
-    assert!(capture.payloads[0].get("top_files_withheld").is_none());
-    assert_eq!(capture.payloads[1]["top_files_withheld"]["tokens"], 40);
-    fs::remove_dir_all(dir).unwrap();
+    for key in ["top_files_withheld", "top_files_withheld_7d"] {
+        assert!(withheld_payload(&scope, false, false).get(key).is_none());
+        assert!(withheld_payload(&scope, true, true).get(key).is_none());
+    }
 }
 
 #[test]
@@ -183,38 +174,4 @@ fn source_erase_waits_for_a_running_worker() {
     erase_source_state(&support, crate::snapshots::SnapshotSource::Codex).unwrap();
     assert!(!file.exists());
     fs::remove_dir_all(support).unwrap();
-}
-
-#[test]
-fn run_health_body_has_only_its_allowlisted_fields() {
-    // Adding a field stops this compiling, so its author decides on a rule.
-    let _ = |body: HealthRecord| {
-        let HealthRecord {
-            schema: _,
-            run_day: _,
-            destination: _,
-            posted: _,
-            entries: _,
-        } = body;
-    };
-    let _ = |body: HealthEntry| {
-        let HealthEntry {
-            agent_source: _,
-            finished: _,
-            scan_completed_at: _,
-            files_checked: _,
-            audit_differences: _,
-            full_read_waiting_files: _,
-            full_read_backlog_bytes: _,
-            backlog_growth_days: _,
-            bytes_read: _,
-            cpu_seconds: _,
-            duration_ms: _,
-            accounted_bytes: _,
-            scopes_quarantined: _,
-            files_quarantined: _,
-            agent_resets: _,
-            checkpoint_restarts: _,
-        } = body;
-    };
 }

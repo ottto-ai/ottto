@@ -1792,11 +1792,7 @@ pub struct SnapshotActivityCount {
 /// One privacy-safe transcript-observed tool-name aggregate. Only the bounded
 /// name and count cross the wire; tool ids, arguments, results, and paths stay
 /// local to the parser.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotToolUsage {
-    pub name: String,
-    pub count: u64,
-}
+pub type SnapshotToolUsage = SnapshotActivityCount;
 
 /// One privacy-safe agent capability count. The identifiers are collector-owned
 /// constants; raw tool arguments, results, URLs, browser ids, and screenshots
@@ -85951,7 +85947,6 @@ crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
 crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
-crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);

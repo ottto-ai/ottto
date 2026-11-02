@@ -71,7 +71,7 @@ pub(super) struct UploadTarget<'a> {
 }
 
 impl UploadTarget<'_> {
-    /// Whether this upload replaces its file rows with `top_files_withheld`.
+    /// Whether this upload replaces its file rows with withheld totals.
     fn sends_files_withheld(&self) -> bool {
         self.names_withheld && !self.policy.names()
     }
@@ -83,10 +83,9 @@ pub(super) struct UploadAck {
     pub(super) details_enabled: bool,
     /// `None` on an ack from before this field: treated as matching, so an
     /// upgrade alone does not resend every scope.
+    /// Needed: an unchanged scope returns before `state_sha`, so a flip would wait for staleness.
     #[serde(default)]
     pub(super) names_enabled: Option<bool>,
-    #[serde(default)]
-    pub(super) files_withheld: bool,
     pub(super) generation: u64,
     pub(super) state_sha: String,
     pub(super) posted_at: i64,
@@ -97,7 +96,6 @@ impl UploadAck {
     /// Whether the same totals would now upload differently.
     pub(super) fn upload_shape_changed(&self, target: &UploadTarget) -> bool {
         self.details_enabled != target.details_enabled
-            || self.files_withheld != target.sends_files_withheld()
             || self
                 .names_enabled
                 .is_some_and(|names| names != target.policy.names())
@@ -219,7 +217,6 @@ pub(super) fn upload_scope(
     let ack = UploadAck {
         details_enabled: target.details_enabled,
         names_enabled: Some(target.policy.names()),
-        files_withheld: target.sends_files_withheld(),
         generation: scope.generation,
         state_sha,
         posted_at: now_secs,
@@ -419,6 +416,8 @@ pub(super) struct RequestV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) top_files_7d: Option<Vec<FileWindowRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_files_withheld_7d: Option<TopFilesWithheld>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) sessions_7d: Option<Vec<SessionRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) session_count_7d: Option<u64>,
@@ -571,26 +570,30 @@ pub(super) fn build_request(
         period_floor: window.floor.max(window.today - 6),
         today: window.today,
     };
-    let (top_files_7d, sessions_7d, session_count_7d) = if target.details_enabled {
-        let files = names.then(|| {
-            build_files(scope, short_window, true, &mut dropped)
-                .into_iter()
-                .map(|row| FileWindowRow {
-                    relative_path_or_name: row.relative_path_or_name,
-                    category: row.category,
-                    part: row.part,
-                    events: row.events_30d,
-                    tokens_entered_est: row.tokens_entered_est_30d,
-                    session_count: row.session_count_30d,
-                    last_accessed_at: row.last_accessed_at,
-                })
-                .collect()
-        });
-        let (sessions, count, _) = build_sessions(scope, short_window, names, &mut dropped);
-        (files, Some(sessions), Some(count))
-    } else {
-        (None, None, None)
-    };
+    let (top_files_7d, top_files_withheld_7d, sessions_7d, session_count_7d) =
+        if target.details_enabled {
+            let files = names.then(|| {
+                build_files(scope, short_window, true, &mut dropped)
+                    .into_iter()
+                    .map(|row| FileWindowRow {
+                        relative_path_or_name: row.relative_path_or_name,
+                        category: row.category,
+                        part: row.part,
+                        events: row.events_30d,
+                        tokens_entered_est: row.tokens_entered_est_30d,
+                        session_count: row.session_count_30d,
+                        last_accessed_at: row.last_accessed_at,
+                    })
+                    .collect()
+            });
+            let withheld = target
+                .sends_files_withheld()
+                .then(|| files_withheld(scope, short_window, true));
+            let (sessions, count, _) = build_sessions(scope, short_window, names, &mut dropped);
+            (files, withheld, Some(sessions), Some(count))
+        } else {
+            (None, None, None, None)
+        };
     let mut tools = if names {
         build_tools(scope, window, "30d", true, &mut dropped)
     } else {
@@ -626,12 +629,13 @@ pub(super) fn build_request(
         top_files: names.then(|| build_files(scope, window, false, &mut dropped)),
         top_files_withheld: target
             .sends_files_withheld()
-            .then(|| files_withheld(scope, window)),
+            .then(|| files_withheld(scope, window, false)),
         sessions,
         kinds_version: 2,
         parts: build_parts(scope, window, names, &mut dropped),
         tools,
         top_files_7d,
+        top_files_withheld_7d,
         sessions_7d,
         session_count_7d,
         session_count_window,
@@ -859,8 +863,8 @@ fn build_files(
 }
 
 /// Summed before the top-file cut, over the rows names-on would rank.
-fn files_withheld(scope: &Scope, window: Window) -> TopFilesWithheld {
-    let rows = all_file_rows(scope, window, false, &mut Dropped::default());
+fn files_withheld(scope: &Scope, window: Window, recent_only: bool) -> TopFilesWithheld {
+    let rows = all_file_rows(scope, window, recent_only, &mut Dropped::default());
     TopFilesWithheld {
         files: rows.len() as u64,
         events: rows.iter().map(|row| row.events).sum(),

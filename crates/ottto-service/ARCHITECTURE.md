@@ -121,7 +121,8 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 Transcripts never leave the machine. Logs, diagnostics and status carry counts, never transcript
 text, paths or raw identifiers; types holding local-only text don't derive `Debug`. Identity is
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
-Every rule for what a privacy setting removes from an upload lives in `upload_policy.rs`; it never
-refuses a body, and hashes are computed afterwards from what is sent.
+What a privacy setting removes from an upload is decided in `upload_policy.rs`, or by the builders
+that read its settings; it never refuses a body, and hashes are computed afterwards from what is
+sent.
 Erasure (consent off, retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
