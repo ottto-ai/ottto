@@ -1122,7 +1122,7 @@ pending!(
     "E3: family commit vector with per-member account evidence not on main"
 );
 
-// Pi uses the same scanner and committed index; durable Pi is unsupported.
+// Pi uses the same scanner, committed index and durable store as the others.
 // Its lines intentionally contain only synthetic text and identifiers.
 fn pi_json(value: Value) -> String {
     value.to_string() + "\n"

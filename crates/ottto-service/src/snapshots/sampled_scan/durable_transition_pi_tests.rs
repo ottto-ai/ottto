@@ -577,8 +577,8 @@ fn pi_smaller_extent_routes_publish_the_cold_body() {
     }
 }
 
-// Stale survivor (D-N1-HOLD, source=pi): a real write + cleanup double fault at
-// the native rename leaves the predecessor in place. Pi has no D3 key hold, so
+// Pi stale survivor: a real write + cleanup double fault at the native
+// rename leaves the predecessor in place. Pi has no strict-rebind key hold, so
 // the store's `stale_survivor` settles FailedHeld(ReceiptPending): no body, the
 // accepted state kept, the survivor byte-identical, the faults counted. Once
 // writes work the next pass is one Tail equal to cold Full and replaces the
@@ -666,7 +666,7 @@ fn pi_stale_survivor_holds_then_resolves_with_a_counted_tail() {
 }
 
 /// [money] A same-inode version rewrite reads one real-edit Full, then Tails.
-/// [format] An index-only downgrade preserves the record for re-upgrade.
+/// An index-only downgrade preserves the record for re-upgrade.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),

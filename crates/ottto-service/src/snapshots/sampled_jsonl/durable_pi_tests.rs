@@ -459,7 +459,7 @@ fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
-/// [regress] Fork usage of every entry kind stamped before the header is skipped
+/// [money] Fork usage of every entry kind stamped before the header is skipped
 /// and counted; usage at or after the header counts.
 #[test]
 fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {

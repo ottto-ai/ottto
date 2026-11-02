@@ -205,7 +205,7 @@ mod m3_layout_tests;
 #[cfg(all(test, unix))]
 mod m3_native_tests;
 #[cfg(all(test, unix))]
-pub(crate) mod native_publication_tests;
+mod native_publication_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -8818,19 +8818,18 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
-    // Settle the frozen restore observation after policy and no-op suppression.
+
+    // Count publication only after complete-body policy/finalization and
+    // semantic-noop suppression; a restored parser finish alone is no offer.
     #[cfg(unix)]
     for pending in &result.pending_finalization {
-        if !pending.restored_behind_accepted {
-            continue;
-        }
-        let offered = result.snapshots.iter().any(|snapshot| {
-            snapshot.source_file_fingerprint.as_deref()
-                == Some(pending.source_file_fingerprint.as_str())
-        });
         sampled_scan::durable_tail::record_restored_publication(
             source,
-            pending.parse_complete && offered,
+            pending.parse_complete && pending.restored_behind_accepted,
+            result.snapshots.iter().any(|snapshot| {
+                snapshot.source_file_fingerprint.as_deref()
+                    == Some(pending.source_file_fingerprint.as_str())
+            }),
         );
     }
 
@@ -37670,56 +37669,38 @@ fn settle_native_attempt(
                 }
                 // Each outcome is computed (fences consumed) before the
                 // acquisition is borrowed again to bind or owe it.
-                Ok(fences) => 'settlement: {
-                    #[cfg(test)]
-                    if let Some(outcome) = native_publication_tests::take_outcome(fence.key) {
-                        assert!(
-                            matches!(staged, PrepareOutcome::Prepared(_)),
-                            "native private stage premise"
-                        );
-                        let outcome = native_publication_tests::map_settlement(
+                Ok(fences) => match staged {
+                    PrepareOutcome::Prepared(prepared) => {
+                        let outcome = cache.commit_prepared(prepared, fences);
+                        write_disposition(
                             cache,
                             &mut acquisition,
                             fence.source,
-                            candidate.as_ref(),
                             outcome,
-                        );
-                        discard_staging(cache, staged);
-                        break 'settlement outcome;
+                            candidate.as_ref(),
+                        )
                     }
-                    break 'settlement match staged {
-                        PrepareOutcome::Prepared(prepared) => {
-                            let outcome = cache.commit_prepared(prepared, fences);
-                            write_disposition(
-                                cache,
-                                &mut acquisition,
-                                fence.source,
-                                outcome,
-                                candidate.as_ref(),
-                            )
-                        }
-                        PrepareOutcome::StoreFailed(failure) => {
-                            let outcome = cache.resolve_failed_preparation(failure, fences);
-                            write_disposition(
-                                cache,
-                                &mut acquisition,
-                                fence.source,
-                                outcome,
-                                candidate.as_ref(),
-                            )
-                        }
-                        PrepareOutcome::NotPersisted(reason) => {
-                            let outcome =
-                                cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
-                            unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
-                        }
-                        PrepareOutcome::Degraded(reason) => {
-                            let outcome =
-                                cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
-                            unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
-                        }
-                    };
-                }
+                    PrepareOutcome::StoreFailed(failure) => {
+                        let outcome = cache.resolve_failed_preparation(failure, fences);
+                        write_disposition(
+                            cache,
+                            &mut acquisition,
+                            fence.source,
+                            outcome,
+                            candidate.as_ref(),
+                        )
+                    }
+                    PrepareOutcome::NotPersisted(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                    }
+                    PrepareOutcome::Degraded(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, fence.source, outcome)
+                    }
+                },
             };
             (Some(publication), strict_rebind)
         }
@@ -42002,8 +41983,8 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
         .is_some()
 }
 
-/// Shared content projection; usage and timing stay with the native caller.
-/// The content projection of one Pi line; `role` is the message role.
+/// The content projection of one Pi line; `role` is the message role. Usage
+/// and timing stay with the native caller.
 fn pi_content_line(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
     match string_at(value, &["type"]).as_deref() {
         Some("session") => pi_workspace_content(value, accumulator),

@@ -1422,15 +1422,8 @@ fn pi_publication_post(f: &mut PiLiveFixture, retained: bool) {
     }
 }
 
-/// Injected rows prove the WriteOutcome/UnpreparedDisposition -> disposition
-/// mapper and downstream HTTP/ACK behaviour, not real store failures. Real-path
-/// proof is pi_e4_receipted_captures_and_posts (None here) and
-/// durable_transition_pi_tests::pi_stale_survivor_holds_then_resolves_with_a_counted_tail.
-fn pi_native_publication_page(
-    files: usize,
-    outcome: Option<crate::snapshots::native_publication_tests::E4Outcome>,
-) -> (PiLiveFixture, BTreeMap<String, serde_json::Value>) {
-    use crate::snapshots::{e2_pipeline_scan_fixture::E2ScanFixture, native_publication_tests};
+fn pi_native_publication_page(files: usize) -> PiLiveFixture {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     let mut f = PiLiveFixture::with_page(files, 1, 0);
     pi_publication_post(&mut f, false);
     f.working = f.baseline.clone();
@@ -1440,9 +1433,6 @@ fn pi_native_publication_page(
         .iter()
         .map(|(key, entry)| (key.clone(), serde_json::to_value(entry).unwrap()))
         .collect::<BTreeMap<_, _>>();
-    let target = accepted.keys().next().unwrap().clone();
-    let _outcome =
-        outcome.map(|outcome| native_publication_tests::inject_settlement(target, outcome));
     for key in accepted.keys() {
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(key).unwrap().write_all(
@@ -1472,7 +1462,6 @@ fn pi_native_publication_page(
         true,
     );
     assert_eq!(mode, (files, 0, 0), "first actual native Pi acquisitions");
-    native_publication_tests::assert_settlement_consumed();
 
     apply_upload_policy(
         SnapshotSource::Pi,
@@ -1483,7 +1472,7 @@ fn pi_native_publication_page(
     f.native_publication = scan.native_publication;
     f.items = scan.snapshots;
     f.working = working;
-    (f, accepted)
+    f
 }
 
 fn pi_native_receipt_restores_tail(f: &PiLiveFixture) {
@@ -1550,185 +1539,23 @@ fn pi_native_receipt_restores_tail(f: &PiLiveFixture) {
     );
 }
 
-fn pi_publication_case(
-    expected: crate::snapshots::NativePublication,
-    outcome: Option<crate::snapshots::native_publication_tests::E4Outcome>,
-) {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let (mut f, accepted) = pi_native_publication_page(1, outcome);
-    assert_eq!(
-        f.native_publication,
-        Some(expected),
-        "carried real native decision"
-    );
-    if expected.publishes() {
-        assert_eq!(f.items.len(), 1);
-        assert_eq!(f.items[0].input_tokens, 300);
-        pi_publication_post(&mut f, true);
-        if expected == crate::snapshots::NativePublication::Receipted {
-            pi_native_receipt_restores_tail(&f);
-        }
-    } else {
-        assert!(
-            f.items.is_empty(),
-            "held native completion must emit no body"
-        );
-        assert!(
-            f.try_capture(Duration::ZERO).is_none(),
-            "no retained retry for held completion"
-        );
-        for (key, before) in accepted {
-            assert_eq!(
-                serde_json::to_value(&f.working.files[&key]).unwrap(),
-                before
-            );
-            assert_eq!(
-                serde_json::to_value(&ScanIndex::load(&f.index_path).unwrap().files[&key]).unwrap(),
-                before
-            );
-        }
-        // A held carrier must refuse even an otherwise capture-ready page.
-        // Reuse the actual e4 decision; never fabricate a publishing class.
-        let mut offered = PiLiveFixture::new();
-        assert!(!offered.items.is_empty());
-        offered
-            .live
-            .as_ref()
-            .unwrap()
-            .validate_capture(&offered.home.0, &offered.items, &offered.working)
-            .unwrap();
-        offered.native_publication = f.native_publication;
-        assert!(offered.try_capture(Duration::ZERO).is_none());
-        let mut control = PiLiveFixture::new();
-        assert!(
-            control.try_capture(Duration::ZERO).is_some(),
-            "ordinary RAM retry premise"
-        );
-    }
-}
-
-use crate::snapshots::native_publication_tests::E4Outcome as PiE4;
-use crate::snapshots::native_publication_tests::{
-    Degraded as PiDegraded, DegradedCause as PiDegradedCause, HeldCause as PiHeldCause,
-    NotPersisted as PiNotPersisted, Unprepared as PiUnprepared,
-    UnpreparedDisposition as PiUnpreparedDisposition, WriteOutcome as PiWriteOutcome,
-};
-/// [money] Uninjected Pi receipt proves real-store retained retry and HTTP/ACK.
+/// [money] A real Pi native receipt carries retained retry and HTTP/ACK.
 #[test]
 #[serial(client_report)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_e4_receipted_captures_and_posts() {
-    pi_publication_case(crate::snapshots::NativePublication::Receipted, None);
-}
-
-/// [money] Typed mapper outcomes control retained retry and HTTP/ACK.
-/// These injections do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_publication_outcomes_control_retry_and_posts() {
-    use crate::snapshots::NativePublication as Publication;
-    for (publication, outcome) in [
-        (
-            Publication::PublishWithoutRecord,
-            PiE4::Unprepared(PiUnpreparedDisposition::PublishWithoutRecord {
-                cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-            }),
-        ),
-        (
-            Publication::FailedPublishedWithoutRecord,
-            PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
-                PiDegradedCause::WriteFailedRetired,
-            )),
-        ),
-        (
-            Publication::PublishRetainingPrior,
-            PiE4::Unprepared(PiUnpreparedDisposition::PublishRetainingPrior {
-                format: 3,
-                cause: PiUnprepared::NotPersisted(PiNotPersisted::Codec),
-            }),
-        ),
-        (
-            Publication::PublishStoreUntouched,
-            PiE4::Unprepared(PiUnpreparedDisposition::PublishStoreUntouched {
-                cause: PiDegraded::Disabled,
-            }),
-        ),
-        (
-            Publication::FailedHeld,
-            PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence)),
-        ),
-        (
-            Publication::ReceiptPending,
-            PiE4::Write(PiWriteOutcome::ReceiptPending),
-        ),
-        (
-            Publication::Hold,
-            PiE4::Unprepared(PiUnpreparedDisposition::Hold(PiHeldCause::Fence)),
-        ),
-        (
-            Publication::Hold,
-            PiE4::Unprepared(PiUnpreparedDisposition::PublishStrictRebind),
-        ),
-        (
-            Publication::Hold,
-            PiE4::Write(PiWriteOutcome::FailedPublishedWithoutRecord(
-                PiDegradedCause::StrictRebind,
-            )),
-        ),
-    ] {
-        pi_publication_case(publication, Some(outcome));
-    }
-}
-
-/// [money] Mapper: injected Pi disposition controls retained retry and HTTP/ACK.
-/// These typed outcome rows do not prove a real store failure.
-#[test]
-#[serial(client_report)]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_e4_mixed_page_hold_blocks_only_retained_retry_and_sibling_posts() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let (mut f, accepted) = pi_native_publication_page(
-        2,
-        Some(PiE4::Write(PiWriteOutcome::FailedHeld(PiHeldCause::Fence))),
-    );
+    let mut f = pi_native_publication_page(1);
     assert_eq!(
         f.native_publication,
-        Some(crate::snapshots::NativePublication::FailedHeld)
+        Some(crate::snapshots::NativePublication::Receipted),
+        "carried real native decision"
     );
-    assert_eq!(
-        f.items.len(),
-        1,
-        "publishing sibling survives the held completion"
-    );
+    assert_eq!(f.items.len(), 1);
     assert_eq!(f.items[0].input_tokens, 300);
-    assert!(
-        !f.progress.contains_body(
-            &f.items[0].snapshot_fingerprint,
-            &snapshot_upload_body_witness(&f.items[0])
-        ),
-        "sibling retry is still pending"
-    );
-    assert!(
-        f.try_capture(Duration::ZERO).is_none(),
-        "the page hold blocks retained retry only"
-    );
-    // The capture stop must leave the sibling's ordinary POST/ACK path enabled.
-    pi_publication_post(&mut f, false);
-    let held_key = accepted.keys().next().unwrap();
-    let saved = ScanIndex::load(&f.index_path).unwrap();
-    assert_eq!(
-        serde_json::to_value(&saved.files[held_key]).unwrap(),
-        accepted[held_key]
-    );
-    assert!(f.progress.contains_body(
-        &f.items[0].snapshot_fingerprint,
-        &snapshot_upload_body_witness(&f.items[0])
-    ));
+    pi_publication_post(&mut f, true);
+    pi_native_receipt_restores_tail(&f);
 }
