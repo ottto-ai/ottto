@@ -300,12 +300,24 @@ fn accept_page(page: &mut Page) {
 
 /// The warm owner's first page, Full, accepted and committed.
 fn warm_claude(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
+    warm_claude_page(c, disk, true)
+}
+
+/// The warm owner's first page, Full and committed but never delivered: its
+/// files hold no receipt and owe their upload-context proof.
+fn warm_claude_undelivered(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
+    warm_claude_page(c, disk, false)
+}
+
+fn warm_claude_page(c: &Corpus, disk: &Disk, delivered: bool) -> (E2ScanFixture, ScanIndex) {
     let scanner = E2ScanFixture::default();
     disk.begin(&scanner, SnapshotSource::ClaudeCode);
     let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
     warm.enrich(c);
     warm.finish();
-    accept_page(&mut warm);
+    if delivered {
+        accept_page(&mut warm);
+    }
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
     (scanner, prior)
 }

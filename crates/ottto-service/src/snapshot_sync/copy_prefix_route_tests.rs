@@ -22,6 +22,10 @@ fn deliver_counting(page: &mut Page) -> usize {
     let mut progress = e2_progress();
     let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    // The exact ACKs land as the service records them before it saves; the
+    // committed Tail heads continue only from accepted bodies.
+    page.index
+        .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     let acks = std::mem::take(&mut progress.fresh_context_body_acks);
     accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
     sent.len()
@@ -139,7 +143,7 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         input_clock(&holder);
         let disk = Disk::new(&c);
         // Committed, never delivered: no receipt.
-        let (scanner, mut prior) = warm_claude(&c, &disk);
+        let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),
