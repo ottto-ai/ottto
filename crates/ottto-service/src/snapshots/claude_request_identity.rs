@@ -38,8 +38,11 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::AcceptedBuckets;
+#[cfg(test)]
+pub(crate) use accepted::{session_context_digest, set_test_session_context_key};
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -2854,8 +2857,8 @@ pub(crate) struct OrgMarker {
 }
 
 /// Owned, line-ordered marker state for one file. Only the organization hash
-/// and a local change detector for `session_context` are kept; no email or raw
-/// text is retained or sent.
+/// and a keyed local change detector for `session_context` are kept; no email
+/// or raw text is retained or sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
@@ -2892,21 +2895,28 @@ pub(crate) fn note_marker_line(
                 .and_then(Value::as_str)
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            // Domain-separated SHA-256 (an H value in the durable store).
-            let digest = format!(
-                "{:x}",
-                sha2::Sha256::new()
-                    .chain_update(b"ottto-claude-org-marker-context:v1\0")
-                    .chain_update(text.as_bytes())
-                    .finalize()
-            );
             let state = markers.get_or_insert_with(Box::default);
-            if state.context_digest.as_deref() != Some(digest.as_str()) {
-                if state.context_digest.is_some() && state.context_flip_position.is_none() {
-                    state.context_flip_position = Some(response_position);
+            // No key, no field: a sentence that cannot be compared explains no
+            // organization change and qualifies no email.
+            let Some(digest) = accepted::session_context_digest(&text) else {
+                state.context_digest = None;
+                return;
+            };
+            let tag = &digest[..accepted::SESSION_CONTEXT_TAG_HEX];
+            match state.context_digest.as_deref() {
+                Some(previous) if previous == digest => {}
+                Some(previous) if previous.starts_with(tag) => {
+                    state.context_flip_position.get_or_insert(response_position);
+                    state.context_changed = true;
+                    state.context_digest = Some(digest);
                 }
-                state.context_changed = state.context_digest.is_some() || !state.entries.is_empty();
-                state.context_digest = Some(digest);
+                // Another key or the earlier scheme says nothing about this
+                // sentence: start over from it, as neither a change nor a first.
+                Some(_) => state.context_digest = Some(digest),
+                None => {
+                    state.context_changed = !state.entries.is_empty();
+                    state.context_digest = Some(digest);
+                }
             }
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
@@ -2978,6 +2988,14 @@ impl OrgMarkers {
         (precedes && !self.overflowed)
             .then_some(self.home.as_ref())
             .flatten()
+    }
+
+    /// False for a stored digest from another key or the earlier scheme, or any
+    /// without a key: such a record is read again, never resumed.
+    pub(crate) fn context_digest_is_current(&self) -> bool {
+        self.context_digest
+            .as_deref()
+            .map_or(true, accepted::session_context_digest_is_current)
     }
 
     /// The marker governing the response with `sequence`, by line order only.
@@ -6039,6 +6057,9 @@ crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_second
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
 crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);
+
+#[cfg(test)]
+mod context_digest_tests;
 
 #[cfg(test)]
 mod request_owned_contract_tests {

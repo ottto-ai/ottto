@@ -6645,6 +6645,13 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
+    if source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_identity::bind_session_context_key(
+            attribution_context.as_ref(),
+        )
+    {
+        daemon.transcript_cache.forget_retained_transcripts();
+    }
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: activity_hint.session_titles_enabled,
         workspace_labels_enabled: activity_hint.workspace_labels_enabled,
