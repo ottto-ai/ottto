@@ -1,7 +1,6 @@
 //! Offline shared-reader, native-reducer and production-scanner regression tests.
 //! No fixture content comes from a provider account.
 use super::*;
-use crate::snapshots::sampled_scan::transition_fixture::native_cold;
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Retained, TranscriptCache};
 use std::fs::OpenOptions;

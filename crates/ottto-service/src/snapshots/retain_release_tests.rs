@@ -600,7 +600,6 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
         cache.insert(
             key(&fixture),
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 released: None,

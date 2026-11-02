@@ -677,7 +677,6 @@ fn native_recovery_priority_scan(
         false,
         false,
         paths,
-        None,
     )
 }
 

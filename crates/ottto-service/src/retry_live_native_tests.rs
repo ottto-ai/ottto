@@ -998,7 +998,6 @@ fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settleme
         f.live.take().unwrap(),
         &f.home.0,
         SnapshotSource::Pi,
-        None,
         &"a".repeat(64),
         SnapshotUploadPolicy::default(),
         f.daemon.snapshot_scan_account_witness().unwrap(),

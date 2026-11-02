@@ -1,7 +1,6 @@
 //! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
-use crate::snapshots::sampled_scan::transition_fixture::native_cold;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
@@ -7445,7 +7444,6 @@ fn hopeless_admission_evicts_nothing() {
         cache.insert(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -7527,7 +7525,6 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -7928,7 +7925,6 @@ fn witness_admission() -> WitnessAdmission {
     cache.insert(
         key.clone(),
         sampled_jsonl::CompletedNativeAcquisition {
-            durable: Default::default(),
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
             released: None,
@@ -9593,7 +9589,6 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -9832,7 +9827,6 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -12605,7 +12599,6 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
                     panic!("real paused job")
                 };
                 let acquisition = job.sampling.as_mut().expect("resume scope metadata");
-                acquisition.no_record = true;
                 assert!(!acquisition.scope.0.is_empty(), "real file scope retained");
             })
             .unwrap();

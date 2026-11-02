@@ -24579,9 +24579,6 @@ for line in sys.stdin:
         std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
             "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
         )).unwrap();
-        let canaries =
-            crate::snapshots::test_replay_privacy_artifacts(&support.join("bounded-replay-input"));
-        assert_eq!(canaries[0], CANARY);
         CANARY
     }
 

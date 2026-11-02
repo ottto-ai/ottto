@@ -1332,7 +1332,6 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
             restart.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
-                    durable: copy.durable,
                     checkpoint: copy.retained.checkpoint,
                     reduction: Some(copy.retained.state),
                     released: None,

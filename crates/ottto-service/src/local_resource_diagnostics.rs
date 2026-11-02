@@ -268,41 +268,41 @@ pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedParentSideUnsupported")]
     ParentSideUnsupported = 3,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
-    GroupProbeUnsupported = 5,
+    GroupProbeUnsupported = 4,
     #[serde(rename = "CompressedGroupReadUnsupported")]
-    GroupReadUnsupported = 6,
+    GroupReadUnsupported = 5,
     #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound = 7,
+    ParentLedgerUnbound = 6,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
-    PhysicalOffsetUnsupported = 8,
+    PhysicalOffsetUnsupported = 7,
     #[serde(rename = "CompressedAdmissionRefused")]
-    AdmissionRefused = 9,
+    AdmissionRefused = 8,
     #[serde(rename = "CompressedDecodeFailed")]
-    DecodeFailed = 10,
+    DecodeFailed = 9,
     #[serde(rename = "CompressedOwnerUnproven")]
-    OwnerUnproven = 11,
+    OwnerUnproven = 10,
     #[serde(rename = "CompressedOutputHeld")]
-    OutputHeld = 12,
+    OutputHeld = 11,
     #[serde(rename = "CompressedDecodedOverLimit")]
-    DecodedOverLimit = 13,
+    DecodedOverLimit = 12,
     #[serde(rename = "CompressedHeaderInvalid")]
-    HeaderInvalid = 14,
+    HeaderInvalid = 13,
     #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 15,
+    CorrectionUnapplied = 14,
     #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded = 16,
+    HeaderUnfunded = 15,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded = 17,
+    CompatibilityUnfunded = 16,
     // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 18,
+    DecoderRefusedHeaderOccupancy = 17,
     #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 19,
+    FamilyUnproven = 18,
     #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 20,
+    ArchiveEquivalenceUnproven = 19,
     #[doc(hidden)]
     #[serde(skip)]
-    __Count = 21,
+    __Count = 20,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

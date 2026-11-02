@@ -9,7 +9,6 @@ use crate::snapshots::{
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 /// Emitted-body comparison for native scan fixtures without a transport driver.
 pub(crate) fn scan_money(
@@ -967,9 +966,9 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
 /// Native cold-store setup shared by transition tests. Scans stop before
 /// policy finalization, ACK and save; each driver chooses its settlement.
 pub(crate) mod native_cold {
+    use super::super::SharedCache;
     #[cfg(target_os = "macos")]
     use super::super::SharedCache;
-    use crate::locked_state_dir::test_locks;
     use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
     #[cfg(target_os = "macos")]

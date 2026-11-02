@@ -84365,10 +84365,6 @@ impl ScanIndex {
 }
 
 #[cfg(all(test, unix))]
-pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
-    sampled_jsonl::durable::test_replay_privacy_artifacts(root)
-}
-
 // Static receipts from the qualified 64-bit production layout. These keep
 // the parser-box allocation honest; no runtime test executes. These are upper
 // bounds until a qualified build re-pins them after the record store's removal.
@@ -84380,7 +84376,7 @@ const _: () = {
     // to the 856-byte active frame; parser/custody boxing is unchanged.
     assert!(size_of::<OwnedActiveFile>() <= 880);
     assert!(
-        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() == 4880
+        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4880
     );
 };
 /// Explicit privacy erasure hooks. Source-disable and Repair must not call this.

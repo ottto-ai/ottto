@@ -660,11 +660,11 @@ mod tests {
                 let key = String::from("new");
                 if reserved == 0 {
                     assert!(
-                        cache.insertion_fits(&key, &incoming, 0, reserved, rank, false),
+                        cache.insertion_fits(&key, &incoming, reserved, rank, false),
                         "count pressure alone must not evict optional headers"
                     );
                 }
-                let predicted = cache.insertion_fits(&key, &incoming, 0, reserved, rank, true);
+                let predicted = cache.insertion_fits(&key, &incoming, reserved, rank, true);
                 assert_eq!(
                     predicted,
                     cache.insert_reserving_at_rank(key, incoming, reserved, 0, Some(rank)),
