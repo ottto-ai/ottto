@@ -86,7 +86,27 @@ pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize
     value.heap_bound(&mut c)?;
     Some(c.bytes)
 }
+#[cfg(test)]
+thread_local! { static FORCE_UNSUPPORTED_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Test only, downward override: an unqualified Linux layout is never promoted.
+#[cfg(test)]
+pub(crate) fn with_unsupported_layout_for_test<R>(run: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_UNSUPPORTED_LAYOUT.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(FORCE_UNSUPPORTED_LAYOUT.with(|v| v.replace(true)));
+    run()
+}
+
 pub(crate) fn layout_supported() -> bool {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED_LAYOUT.with(std::cell::Cell::get) {
+        return false;
+    }
     // Linux unit-test builds use the same std container layouts on the same
     // 64-bit toolchain, so PR checks run the shipped macOS path. Non-test
     // Linux builds keep refusing.
@@ -384,15 +404,22 @@ impl<A: HeapLayoutBound, B: HeapLayoutBound, D: HeapLayoutBound, E: HeapLayoutBo
         self.3.completed_heap_bound(c)
     }
 }
+// `inline` fields own no heap: they need INLINE_ONLY and add no visit (as in
+// `split_fields!`). An `optional` field adds no visit while `None` and walks
+// as `Option` while `Some`. Restart-restore fields use these clauses, so an
+// OFF walk takes the same visits as the walk without those fields.
 macro_rules! fields {
-    ($t:ty; $($(#[$field_attr:meta])* $f:ident),* $(,)? $(; shared $($shared:ident),+)? ) => {
+    ($t:ty; $($(#[$field_attr:meta])* $f:ident),* $(,)? $(; inline $($inline:ident),+)?
+        $(; optional $($optional:ident),+)? $(; shared $($shared:ident),+)? ) => {
         impl crate::heap_layout_bound::HeapLayoutBound for $t {
             fn stable_heap(&self)->bool {
                 // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
                 // Their pointer is already included in the enclosing inline size.
-                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
+                let Self { $($(#[$field_attr])* $f,)* $($($inline,)+)? $($($optional,)+)? $($($shared: _,)+)? } = self;
                 let stable = true;
                 $( $(#[$field_attr])* let stable = stable && crate::heap_layout_bound::HeapLayoutBound::stable_heap($f);)*
+                $($(let stable = stable && crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline);)+)?
+                $($(let stable = stable && crate::heap_layout_bound::HeapLayoutBound::stable_heap($optional);)+)?
                 stable
             }
             fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
@@ -400,15 +427,19 @@ macro_rules! fields {
                 // compile error until admission accounts for it.
                 // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
                 // Their pointer is already included in the enclosing inline size.
-                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
+                let Self { $($(#[$field_attr])* $f,)* $($($inline,)+)? $($($optional,)+)? $($($shared: _,)+)? } = self;
                 $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::heap_bound($f,c)?;)*
+                $($(crate::heap_layout_bound::require_inline($inline)?;)+)?
+                $($(if $optional.is_some() { crate::heap_layout_bound::HeapLayoutBound::heap_bound($optional,c)?; })+)?
                 Some(())
             }
             fn completed_heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
                 // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
                 // Their pointer is already included in the enclosing inline size.
-                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
+                let Self { $($(#[$field_attr])* $f,)* $($($inline,)+)? $($($optional,)+)? $($($shared: _,)+)? } = self;
                 $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($f,c)?;)*
+                $($(crate::heap_layout_bound::require_inline($inline)?;)+)?
+                $($(if $optional.is_some() { crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($optional,c)?; })+)?
                 Some(())
             }
         }

@@ -29,7 +29,7 @@ pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
     guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
-    save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
+    save_oversize_active, save_read_admitted, save_read_completed, settle_usage, visit_usage,
 };
 pub(super) use runtime::{BaselineRelease, Hold};
 mod catalogue;

@@ -18,6 +18,7 @@ fn route(mode: Mode, page: &Page) -> RouteResult {
 /// restart between pages.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
@@ -25,7 +26,7 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
         let mut c = corpus("resumed_copy_prefix_dedupe");
         let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
         input_clock(&holder);
-        let disk = Disk::new(&c);
+        let mut disk = Disk::new(&c);
         let (scanner, prior) = warm_claude(&c, &disk);
         let path = c.write_at(
             &file(COPY),

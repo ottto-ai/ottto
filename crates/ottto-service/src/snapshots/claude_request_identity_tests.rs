@@ -2535,6 +2535,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         record_claude_request_census(
             &mut index,
             ClaudeRequestCensusParse {
+                    held_index_keys: &BTreeSet::new(),
                 path: &quiet_path,
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,
