@@ -1916,7 +1916,7 @@ impl SnapshotUploadProgress {
             if !self
                 .permanent_rejections
                 .get(fingerprint)
-                .is_some_and(PermanentSnapshotRejection::is_stale)
+                .is_some_and(PermanentSnapshotRejection::has_stale_debt)
             {
                 contract_retry_changed |=
                     crate::snapshots::terminal_contract_retry::exhaust(record);
@@ -1935,7 +1935,7 @@ impl SnapshotUploadProgress {
                 .permanent_rejections
                 .get(fingerprint)
                 .is_some_and(|permanent| {
-                    !permanent.is_stale()
+                    !permanent.owed()
                         && record.upload_body_witness.as_deref()
                             == Some(permanent.body_witness.as_str())
                 })
@@ -2162,7 +2162,7 @@ impl SnapshotUploadProgress {
             .filter_map(|(fingerprint, owner)| {
                 let stale = std::iter::once(owner)
                     .chain(owner.revisions.values())
-                    .find(|r| r.is_stale());
+                    .find(|r| r.owed());
                 if let Some(refusal) = stale {
                     return Some((
                         fingerprint.clone(),
@@ -2424,7 +2424,7 @@ impl SnapshotUploadProgress {
             .is_some_and(|record| record.refused_body(body_witness))
         {
             // Only this exact body's own re-offer lease passes suppression.
-            return self.stale_body(fingerprint, body_witness)
+            return self.owed_stale_body(fingerprint, body_witness)
                 || self
                     .active_reason_reoffers
                     .get(fingerprint)
@@ -2495,7 +2495,7 @@ impl SnapshotUploadProgress {
                     self.permanent_rejections
                         .insert(fingerprint.into(), remaining);
                 }
-            } else if refusal.is_stale() || !refusal.revisions.is_empty() {
+            } else if refusal.owed() || !refusal.revisions.is_empty() {
                 self.permanent_rejections
                     .insert(fingerprint.into(), refusal);
             }
@@ -2660,7 +2660,7 @@ impl SnapshotUploadProgress {
                     .max(crate::snapshots::terminal_contract_retry::current_contract())
             },
         );
-        let stale_owed = self.stale_body(fingerprint, body_witness);
+        let stale_owed = self.owed_stale_body(fingerprint, body_witness);
         // A refused stale body owes an answer; it spends no reconstruction
         // exhaustion budget. Keep the existing RetryPending decoder contract.
         let failed_reconstruction_count = if stale_owed {
@@ -2723,16 +2723,12 @@ impl SnapshotUploadProgress {
         }
         self.quarantine_body(fingerprint, body_witness);
         let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
-        let stale = stale_owed::is_stale_reason(reason);
-        if !stale {
-            record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-            record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-            record.retry_after_unix_seconds = 0;
-        } else {
-            record.disposition = SnapshotQuarantineDisposition::RetryPending;
-            record.failed_reconstruction_count = 1;
-            record.contract_retry_claims = None;
-        }
+        // Current servers prove coverage before issuing a permanent stale
+        // refusal. Fresh exposure records its recording generation; no legacy
+        // record receives that marker without a new server answer.
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
         let persisted_reason = crate::upload_receipts::RejectedUsageReason::from_wire(reason);
         // Each same-reason refusal restarts the 24 h clock. Any other `other`
         // answer is the server's classification of this body: done, never
@@ -2780,7 +2776,7 @@ impl SnapshotUploadProgress {
         // A validated unchanged answer for a re-offered refused body replaces
         // that refusal's verdict. Retire it, so its reason schedules no more
         // offers; the hold below keeps the no-body-stored disclosure.
-        let stale_owed = self.stale_body(fingerprint, body_witness);
+        let stale_owed = self.owed_stale_body(fingerprint, body_witness);
         if !stale_owed
             && self
                 .permanent_rejections
@@ -4427,7 +4423,7 @@ impl PermanentRefusalCounts {
         fingerprint: &str,
         refusal: &PermanentSnapshotRejection,
     ) -> bool {
-        refusal.reason.is_dominated()
+        (refusal.reason.is_dominated() || (refusal.is_stale() && refusal.exposure.is_some()))
             && !refusal
                 .revisions
                 .values()
@@ -9277,7 +9273,7 @@ fn save_terminal_contract_claims_for_scan(
         if record
             .upload_body_witness
             .as_deref()
-            .is_some_and(|body| progress.stale_body(fingerprint, body))
+            .is_some_and(|body| progress.owed_stale_body(fingerprint, body))
             && index.quarantined_snapshot_fingerprints.get(fingerprint) != Some(record)
         {
             index
@@ -11204,8 +11200,8 @@ where
                     );
                     progress.note_refused_exposure(item_fingerprint, item);
                 } else {
-                    // A validated money-decrease hold: the backend kept the
-                    // old head. Retry this or a newer body like a conflict.
+                    // Any validated non-permanent answer keeps only this
+                    // entity owed. Accepted siblings settle independently.
                     progress.quarantine_retryable_body(
                         item_fingerprint,
                         &body_witness(item),
@@ -11438,7 +11434,7 @@ where
             progress
                 .permanent_rejections
                 .get(*fingerprint)
-                .is_some_and(|record| record.body_witness == **body && !record.is_stale())
+                .is_some_and(|record| record.body_witness == **body && !record.owed())
                 && !progress
                     .quarantined_fingerprints
                     .get(*fingerprint)

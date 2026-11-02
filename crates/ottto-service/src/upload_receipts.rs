@@ -120,7 +120,8 @@ pub(crate) enum RejectedUsageReason {
 }
 
 impl RejectedUsageReason {
-    /// An authority refusal is distinct from timestamp order, which proves no coverage.
+    /// Stale refusals additionally need their retained recording metadata;
+    /// the wire reason alone cannot distinguish legacy owed records.
     pub(crate) fn is_dominated(self) -> bool {
         matches!(self, RejectedUsageReason::UsageAccountingAuthorityDowngrade)
     }

@@ -878,7 +878,7 @@ pub struct SnapshotEntityRejection {
 
 impl SnapshotEntityRejection {
     /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
-    /// this body for review. Only these reasons may be non-permanent.
+    /// this body for review. These known holds require their declared contract.
     pub(crate) fn usage_decrease_hold(&self) -> bool {
         matches!(
             self.safe_reason(),
@@ -887,7 +887,10 @@ impl SnapshotEntityRejection {
     }
 
     pub(crate) fn ordinary_retryable(&self) -> bool {
-        self.safe_reason() == "accepted_log_stale_older_mixed"
+        matches!(
+            self.safe_reason(),
+            "accepted_log_stale_older_mixed" | "other"
+        )
     }
 
     pub(crate) fn safe_reason(&self) -> &'static str {

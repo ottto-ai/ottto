@@ -64,8 +64,8 @@ fn offer(
     .unwrap();
     calls
 }
-/// [regress] The observed timestamp refusal remains owed through exhaustion;
-/// exact revisions stay suppressed, while a changed body receives one offer.
+/// [regress] Legacy timestamp refusals stay owed through exhaustion; exact
+/// revisions stay suppressed while a changed body receives one offer.
 #[test]
 #[serial_test::serial(client_report)]
 fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
@@ -76,6 +76,12 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     item.snapshot_fingerprint = fp(1);
     let mut progress = ledger(source);
     assert_eq!(offer(&item, source, STALE, &mut progress), 1);
+    // Represent the retained pre-exposure record, not a fresh server answer.
+    progress
+        .permanent_rejections
+        .get_mut(&item.snapshot_fingerprint)
+        .unwrap()
+        .exposure = None;
     let old_body = snapshot_upload_body_witness(&item);
     assert!(!RejectedUsageReason::AcceptedLogStaleOlderUpload.is_dominated());
     assert_eq!(PermanentRefusalCounts::of(&progress).dominated, 0);
@@ -106,9 +112,9 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     assert!(restored.accepted_fingerprints.is_empty());
     let new_body = snapshot_upload_body_witness(&item);
     restored.record_body(&item.snapshot_fingerprint, &new_body);
-    assert!(restored.stale_body(&item.snapshot_fingerprint, &old_body));
+    assert!(restored.owed_stale_body(&item.snapshot_fingerprint, &old_body));
     restored.record_body(&item.snapshot_fingerprint, &old_body);
-    assert!(!restored.stale_body(&item.snapshot_fingerprint, &old_body));
+    assert!(!restored.owed_stale_body(&item.snapshot_fingerprint, &old_body));
     // Mixed uses ordinary non-permanent custody, never permanent Other.
     let mut mixed = ledger(source);
     assert_eq!(offer(&item, source, MIXED, &mut mixed), 1);
@@ -126,6 +132,7 @@ fn old_state_decode_keeps_canonical_bytes_and_legacy_unknowns() {
     let refusal: PermanentSnapshotRejection = serde_json::from_value(old.clone()).unwrap();
     assert_eq!(serde_json::to_value(&refusal).unwrap(), old);
     assert!(refusal.exposure.is_none());
+    assert!(refusal.owed());
     let progress = ledger(SnapshotSource::ClaudeCode);
     let old_progress = serde_json::to_value(&progress).unwrap();
     let decoded: SnapshotUploadProgress = serde_json::from_value(old_progress.clone()).unwrap();
@@ -133,6 +140,7 @@ fn old_state_decode_keeps_canonical_bytes_and_legacy_unknowns() {
     let mut invalid = old.clone();
     invalid["exposure"] = serde_json::json!({"requests": "invalid"});
     let decoded: PermanentSnapshotRejection = serde_json::from_value(invalid).unwrap();
+    assert!(decoded.owed());
     assert_eq!(serde_json::to_value(decoded).unwrap(), old);
 }
 
@@ -182,6 +190,10 @@ fn unchanged_stale_debt_never_reads_on_automatic_retry_passes() {
     let body = snapshot_upload_body_witness(item);
     let mut progress = ledger(source);
     assert_eq!(offer(item, source, STALE, &mut progress), 1);
+    progress.permanent_rejections.get_mut(&fp).unwrap().exposure = None;
+    let legacy = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
+    legacy.disposition = SnapshotQuarantineDisposition::RetryPending;
+    legacy.failed_reconstruction_count = 1;
     for pass in 0..3 {
         let record = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
         record.retry_after_unix_seconds = 0;

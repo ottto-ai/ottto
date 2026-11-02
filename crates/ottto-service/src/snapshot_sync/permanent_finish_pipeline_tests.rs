@@ -336,6 +336,21 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         )
         .unwrap();
         assert!(!progress.accepted_fingerprints.contains(fingerprint));
+        if let FinishOutcome::Dominated {
+            reason: "accepted_log_stale_older_upload",
+            ..
+        } = outcome
+        {
+            assert!(progress.permanent_rejections[fingerprint]
+                .exposure
+                .is_some());
+            let refusals = PermanentRefusalCounts::of(&progress);
+            assert_eq!(
+                refusals.dominated, 1,
+                "fresh server coverage survives reload"
+            );
+            assert_eq!(refusals.exposure.owed_entities, 0);
+        }
         if !matches!(outcome, FinishOutcome::Retryable) {
             assert!(
                 progress.permanent_rejections.contains_key(fingerprint),
@@ -467,18 +482,41 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
-    permanent_finish_pipeline(
-        FinishOutcome::Dominated {
-            reason: "usage_accounting_authority_downgrade",
-            admit_residue: true,
-        },
-        true,
-    );
+    for reason in [
+        "usage_accounting_authority_downgrade",
+        "accepted_log_stale_older_upload",
+    ] {
+        permanent_finish_pipeline(
+            FinishOutcome::Dominated {
+                reason,
+                admit_residue: true,
+            },
+            true,
+        );
+    }
     let _source_manifests = SourceManifestTestGuard::new();
     let mut progress = test_upload_progress();
     let fingerprint = "a".repeat(64);
     let body = "b".repeat(64);
     progress.quarantine_permanent_body(&fingerprint, &body, "accepted_log_stale_older_upload");
+    let current = PermanentRefusalCounts::of(&progress);
+    assert_eq!(current.dominated, 1);
+    assert_eq!(current.exposure.owed_entities, 0);
+    assert!(matches!(
+        refused_entity_state(true, current, true),
+        CollectorState::Success
+    ));
+    assert_eq!(
+        progress.quarantined_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    // A retained refusal predating exposure remains owed, with its existing
+    // terminal disposition unchanged; no migration or fresh read grants proof.
+    progress
+        .permanent_rejections
+        .get_mut(&fingerprint)
+        .unwrap()
+        .exposure = None;
     let refusals = PermanentRefusalCounts::of(&progress);
     assert_eq!(refusals.dominated, 0);
     assert_eq!(refusals.exposure.owed_entities, 1);
@@ -488,7 +526,7 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
     ));
     assert_eq!(
         progress.quarantined_fingerprints[&fingerprint].disposition,
-        SnapshotQuarantineDisposition::RetryPending
+        SnapshotQuarantineDisposition::UnprovenTerminal
     );
     // Existing terminal records keep their disposition, their owed custody
     // and the same admitted successful-residue receipt across an upgrade.
@@ -518,7 +556,7 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
         PermanentRefusalCounts::of(&progress).exposure.owed_entities,
         1
     );
-    assert!(progress.stale_body(&fingerprint, &body));
+    assert!(progress.owed_stale_body(&fingerprint, &body));
     assert!(progress.accepted_fingerprints.is_empty());
 }
 

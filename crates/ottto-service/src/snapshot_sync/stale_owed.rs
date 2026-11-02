@@ -2,10 +2,6 @@
 use super::*;
 use crate::upload_receipts::RejectedUsageReason;
 
-pub(super) fn is_stale_reason(reason: &str) -> bool {
-    reason == "accepted_log_stale_older_upload"
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Exposure {
     first_held_unix: Option<u64>,
@@ -35,13 +31,15 @@ impl PermanentSnapshotRejection {
         self.reason == RejectedUsageReason::AcceptedLogStaleOlderUpload
     }
     pub(super) fn has_stale_debt(&self) -> bool {
-        self.is_stale() || self.revisions.values().any(Self::is_stale)
+        self.owed() || self.revisions.values().any(Self::owed)
     }
     pub(super) fn refused_body(&self, body: &str) -> bool {
         self.body_witness == body || self.revisions.contains_key(body)
     }
     pub(super) fn owed(&self) -> bool {
-        self.is_stale()
+        // Only fresh refusals acquire exposure; legacy records are never
+        // backfilled. Missing or invalid observations conservatively stay owed.
+        self.is_stale() && self.exposure.is_none()
     }
 }
 impl SnapshotUploadProgress {
@@ -50,12 +48,12 @@ impl SnapshotUploadProgress {
             .get(fp)
             .is_some_and(|r| r.refused_body(body))
     }
-    pub(super) fn stale_body(&self, fp: &str, body: &str) -> bool {
+    pub(super) fn owed_stale_body(&self, fp: &str, body: &str) -> bool {
         self.permanent_rejections.get(fp).is_some_and(|r| {
-            (r.is_stale() && r.body_witness == body)
+            (r.owed() && r.body_witness == body)
                 || r.revisions
                     .get(body)
-                    .is_some_and(PermanentSnapshotRejection::is_stale)
+                    .is_some_and(PermanentSnapshotRejection::owed)
         })
     }
     pub(super) fn retained_revisions(
@@ -67,7 +65,7 @@ impl SnapshotUploadProgress {
             return BTreeMap::new();
         };
         let mut revisions = std::mem::take(&mut old.revisions);
-        if old.is_stale() && old.body_witness != next {
+        if old.owed() && old.body_witness != next {
             revisions.insert(old.body_witness.clone(), old);
         }
         revisions.remove(next);
