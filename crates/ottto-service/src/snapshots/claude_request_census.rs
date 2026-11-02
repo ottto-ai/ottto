@@ -659,12 +659,7 @@ impl ClaudeRequestCensusRecord {
             && self.reproduces(entry_fingerprint, self.window)
     }
 
-    /// Written by a parse in `since` or later.
-    pub(super) fn written_since(&self, since: Option<u64>) -> bool {
-        since.is_some_and(|since| self.window >= since)
-    }
-
-    /// Owed-evidence keep (`evidence_owed` ON only): this exact revision was
+    /// Owed-evidence keep (`evidence_owed`): this exact revision was
     /// parsed in `window` under the current derivation, whatever its shape,
     /// so a re-read reproduces it. Never proof, coverage or an ACK.
     pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {

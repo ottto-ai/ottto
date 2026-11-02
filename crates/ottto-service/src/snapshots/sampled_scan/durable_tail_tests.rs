@@ -5057,11 +5057,11 @@ fn a1a_scan_at(
 #[test]
 #[cfg(target_os = "macos")]
 fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
-    use crate::snapshots::evidence_owed::{EvidenceContract, EvidenceOwedForTest};
+    use crate::local_resource_diagnostics::rearm_cause;
+    use crate::snapshots::evidence_owed::EvidenceContract;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
 
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    let _owed = EvidenceOwedForTest::on();
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -5182,7 +5182,12 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
         // Keep the physical file and its revision unchanged across the re-arm.
         prior.claude_usage_family_pending.clear();
         prior.traversal = None;
-        evidence_owed::clear(prior.files.get_mut(&key).unwrap());
+        // The terminal-retry re-arm owes it.
+        rearm_cause::clear(
+            &key,
+            prior.files.get_mut(&key).unwrap(),
+            rearm_cause::Cause::TerminalUnhealthyRetry,
+        );
         assert!(prior.files[&key].evidence_owed && prior.files[&key].rearmed());
         assert!(prior.files[&key].observed_fingerprint().is_empty());
         prior.save(&disk.index_path).unwrap();
