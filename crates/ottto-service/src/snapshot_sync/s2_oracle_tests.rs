@@ -250,8 +250,15 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let mut current = page(&c, index, 100, true);
-        current.finish();
+        let mut first = page(&c, index, 100, true);
+        first.finish();
+        let mut prior = session.save_reload(&mut first.index).0;
+        for entry in prior.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
+        let current = page(&c, prior, 100, true);
+        assert_eq!(current.modes.0, 0, "partial ACK uses a restored body");
+        assert!(current.modes.2 > 0);
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let mut progress = e2_progress();
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
@@ -291,7 +298,9 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             restored.quarantined_fingerprints,
             progress.quarantined_fingerprints
         );
-        let _index = session.save_reload(&mut current.index).0;
+        assert!(current.scan.snapshots.iter().any(|item| !progress
+            .accepted_fingerprints
+            .contains(&item.snapshot_fingerprint)));
     });
 }
 
@@ -371,8 +380,12 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
 /// + database reload. A settled family is never selected on later walks.
 fn assert_family_converges(c: &Corpus, session: &StateV2ColdSession, mut index: ScanIndex) {
     let mut counts = Vec::new();
-    for _ in 0..6 {
+    let cold = result(&page(c, ScanIndex::default(), 100, false), Mode::ColdFull);
+    for pass in 0..6 {
         let current = page(c, index, 100, true);
+        if pass == 0 {
+            money_oracle::assert_equivalent(&cold, &result(&current, Mode::Restart));
+        }
         counts.push((
             current.scan.scanned_file_count,
             current.scan.snapshots.len(),
