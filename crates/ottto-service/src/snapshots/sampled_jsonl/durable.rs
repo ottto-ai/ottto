@@ -561,12 +561,7 @@ pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -
         positive_recognized_usage_count: sum as usize,
         positive_usage_evidence: false,
     };
-    encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        1024 * 1024,
-    )
-    .unwrap()
+    encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
 }
 
 #[cfg(test)]
@@ -581,10 +576,5 @@ pub(crate) fn store_skill_fixture_body_for_source(source: SnapshotSource) -> Vec
         .reduction
         .accumulator
         .note_provider_skill(Some("SyntheticPurgeLabel".into()));
-    encode(
-        &decoded.reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        1024 * 1024,
-    )
-    .unwrap()
+    encode(&decoded.reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
 }

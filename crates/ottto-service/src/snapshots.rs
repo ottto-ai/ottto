@@ -85497,7 +85497,7 @@ pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
 // the listed OFF parser-box allocation delta honest; no runtime test executes.
 #[cfg(all(unix, target_pointer_width = "64", not(test)))]
 const _: () = {
-    assert!(size_of::<OwnedJsonlParser>() == 5312);
+    assert!(size_of::<OwnedJsonlParser>() == 5232);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
     // to the 856-byte active frame; parser/custody boxing is unchanged.

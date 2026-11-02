@@ -5388,7 +5388,6 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        let limits = Limits::current();
         job.parser.accumulator.codex_priority_witnesses_uncapped = true;
         // The reader counts from the acquisition start (`s` for a tail).
         job.parser
@@ -5478,7 +5477,6 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        let limits = Limits::current();
         let accumulator = &mut job.parser.accumulator;
         accumulator.codex_priority_witnesses_uncapped = true;
         // Resume revalidates every priority decision against the witnesses.
