@@ -16417,7 +16417,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [format] for every state v2 source, damaged custody or a stat error holds before progress
+    /// [regress] for every state v2 source, damaged custody or a stat error holds before progress
     /// containment or transcript reads.
     #[test]
     fn published_custody_authenticates_before_damaged_progress_containment() {
