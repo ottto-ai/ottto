@@ -6829,6 +6829,16 @@ fn memo_digest_fences_receipt_contents_census_flags_and_members() {
         digest(&with_receipt(receipt("flex")), &codex, 1),
         "T19: receipt contents"
     );
+    let other_scope: AppliedTierReceipt =
+        serde_json::from_value(json!({"version": 1, "derivation": "fixture",
+            "scope": "another-upload-context", "records": 3, "prefix_digest": "prefix",
+            "tiers": {"turn-1": "priority"}}))
+        .unwrap();
+    assert_eq!(
+        reference,
+        digest(&with_receipt(other_scope), &codex, 1),
+        "the context a receipt was written under wakes nothing"
+    );
     let mut context = with_receipt(receipt("priority"));
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
     assert_eq!(

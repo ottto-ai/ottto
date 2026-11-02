@@ -9,12 +9,11 @@ checkpoints). Delivery proofs keep the full upload context, whose formula is unc
 
 A file whose receipt proves its exact bytes and bodies at the current epoch owes delivery, not a
 read, when only the context differs. The debt is paid when the file is next acquired for an
-ordinary reason, and the new body is sent in the new form. Every entity the receipt covers must
-still be stamped in the receipt's own mode family; a missing entity set or stamp selects. A receipt
-is current only while no entity it covers was sent since under another context, so after A -> B ->
-A an untouched alias of an entity sent under B, or a file partly acknowledged under B, selects and
-resends. A receipt of the active base in another copy mode is the operator's scoped copy-prefix
-re-read and still selects.
+ordinary reason, and the new body is sent in the new form. The bodies stamped for every entity the
+receipt covers must equal the body set it delivered, whatever context they were sent under; a
+missing entity set or stamp, or an entity sent since with another body, selects. A receipt of the
+active base in another copy mode is the operator's scoped copy-prefix re-read and still selects, so
+a Claude file back under its own base after a partial ACK under another context reads once.
 
 Upgrade: a traversal or carry origin saved in the earlier form is rewritten when that form,
 recomputed under the active delivery context and replay generation, equals it; otherwise the walk

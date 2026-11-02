@@ -991,6 +991,15 @@ impl AppliedTierReceipt {
         }
         bytes.0
     }
+    /// What a parse reads of this receipt: everything but the delivery context
+    /// it was written under.
+    pub(in crate::snapshots) fn parse_input(&self) -> String {
+        serde_json::to_string(&Self {
+            scope: String::new(),
+            ..self.clone()
+        })
+        .unwrap_or_else(|_| "unserializable".to_owned())
+    }
     pub(super) fn covered_by(&self, previous: &Self) -> bool {
         self.version == previous.version
             && self.derivation == previous.derivation

@@ -630,19 +630,21 @@ pub(super) fn otel_rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &
 #[cfg(unix)]
 pub(super) fn routed(
     page: &Page,
+    policy: SnapshotUploadPolicy,
 ) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
     use crate::snapshots::sampled_scan::transition_fixture::{Mode, RouteResult};
     let mut progress = e2_progress();
     progress
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
-    let (result, bodies, _) = upload(&page.scan.snapshots, &mut progress, ack);
+    let (result, bodies, _) = upload_under(policy, &page.scan.snapshots, &mut progress, ack);
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    let mut route = RouteResult::emitted(
+    let mut route = RouteResult::emitted_under(
         Mode::ColdFull,
         SnapshotSource::ClaudeCode,
         bodies,
         &page.scan.snapshots,
+        policy,
     );
     route.accepted_identity_buckets = Some(
         serde_json::to_value(
@@ -739,7 +741,9 @@ fn cold_row(name: &str) {
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert!(accounts.len() >= 2, "positive control: two accounts placed");
-        let [resident, cold] = pages.each_ref().map(routed);
+        let [resident, cold] = pages
+            .each_ref()
+            .map(|page| routed(page, SnapshotUploadPolicy::default()));
         crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent(
             &resident, &cold,
         );

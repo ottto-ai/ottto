@@ -167,6 +167,7 @@ impl Corpus {
             unhealthy: Default::default(),
             stats: Default::default(),
             delivered: None,
+            upload_policy: SnapshotUploadPolicy::default(),
         }
     }
 
@@ -198,6 +199,8 @@ struct Page {
     /// Exact ACKs of this page's final bodies, when `ready` delivered them:
     /// `finish` then earns the file receipts as the service finish does.
     delivered: Option<BTreeMap<String, String>>,
+    /// What this pass's upload filter keeps.
+    upload_policy: SnapshotUploadPolicy,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -270,7 +273,7 @@ impl Page {
         crate::snapshots::apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
-            SnapshotUploadPolicy::default(),
+            self.upload_policy,
         );
         let backfill = crate::backfill::load_backfill_state(&corpus.support);
         apply_backfill_cutoff_with_claude_corrections(
@@ -299,6 +302,9 @@ impl Page {
         disposition
     }
     fn finish(&mut self) -> LocalHoldSettlement {
+        self.finish_with(snapshot_upload_body_witness)
+    }
+    fn finish_with(&mut self, witness: impl FnMut(&SnapshotItem) -> String) -> LocalHoldSettlement {
         exclude_held_effective_body_witness_revision(
             &mut self.index,
             &self.scan.snapshots,
@@ -308,7 +314,7 @@ impl Page {
             SnapshotSource::ClaudeCode,
             &mut self.scan,
             &mut self.index,
-            snapshot_upload_body_witness,
+            witness,
         );
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
@@ -713,6 +719,7 @@ fn twin(p: &Page) -> Page {
         stats: p.stats.clone(),
         // A twin is an undelivered copy: only `ready`'s original earns receipts.
         delivered: None,
+        upload_policy: p.upload_policy,
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -781,17 +788,35 @@ fn e2_progress() -> SnapshotUploadProgress {
     )
 }
 fn request(items: &[SnapshotItem]) -> SnapshotBatchRequest {
+    request_under(SnapshotUploadPolicy::default(), items)
+}
+fn request_under(
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+) -> SnapshotBatchRequest {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: SnapshotSource::ClaudeCode.api_slug().into(),
         machine_id: "a".repeat(64),
         collector_version: Some("0.1.synthetic".into()),
         snapshots: items.to_vec(),
-        upload_policy: SnapshotUploadPolicy::default(),
+        upload_policy,
         client_report: crate::client_report::ClientReport::empty(),
     }
 }
 fn upload(
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_under(SnapshotUploadPolicy::default(), items, progress, respond)
+}
+fn upload_under(
+    upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
@@ -815,7 +840,7 @@ fn upload(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let wire = request(&batch);
+            let wire = request_under(upload_policy, &batch);
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");
             sent.push(canonical(&wire));

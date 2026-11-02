@@ -324,9 +324,7 @@ impl ScanIndex {
             .is_some_and(|receipt| {
                 self.receipt_proves(key, entry, receipt)
                     && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
-                    && self
-                        .unstamped_covered_entities(key, &receipt.context_fingerprint)
-                        .is_some()
+                    && !self.covered_entity_sent_elsewhere(key, &receipt.context_fingerprint)
             })
     }
 
@@ -360,35 +358,54 @@ impl ScanIndex {
         self.file_upload_context_requires_adoption(key) && !self.context_only_debt(key)
     }
 
-    /// How many entities this file covers carry no stamp, or `None` when one
-    /// was sent since under a context outside `context`'s mode family.
-    fn unstamped_covered_entities(&self, key: &str, context: &str) -> Option<usize> {
-        let mut unstamped = 0;
-        for entity in self
-            .file_snapshot_fingerprints
+    /// An entity this file covers was sent since under a context outside
+    /// `context`'s mode family.
+    fn covered_entity_sent_elsewhere(&self, key: &str, context: &str) -> bool {
+        self.file_snapshot_fingerprints
             .get(key)
             .into_iter()
             .flatten()
-        {
-            match self.upload_context_proof.entity_stamps.get(entity) {
-                None => unstamped += 1,
-                Some(stamp) if !same_mode_family(&stamp.context_fingerprint, context) => {
-                    return None
-                }
-                Some(_) => {}
-            }
-        }
-        Some(unstamped)
+            .any(|entity| {
+                self.upload_context_proof
+                    .entity_stamps
+                    .get(entity)
+                    .is_some_and(|stamp| !same_mode_family(&stamp.context_fingerprint, context))
+            })
     }
 
-    /// The file's receipt proves these exact bytes and bodies at this replay
-    /// epoch, and every entity it covers is stamped in the receipt's own family:
-    /// none was sent since under another context. Which settings or
-    /// capabilities the receipt was sent under is never asked: they apply from
-    /// the next body on. A receipt of the active base in another money mode is
-    /// the operator's scoped copy-prefix re-read, not context debt. A file
-    /// without its entity set, or with an unstamped entity, selects as before;
-    /// only a confirmed-empty file covers nothing.
+    /// The delivered bodies of the entities this file covers, from their durable
+    /// stamps. `None` when one carries no stamp.
+    fn covered_stamp_bodies(&self, key: &str) -> Option<BTreeSet<&str>> {
+        self.file_snapshot_fingerprints
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|entity| {
+                self.upload_context_proof
+                    .entity_stamps
+                    .get(entity)
+                    .map(|stamp| stamp.body_witness.as_str())
+            })
+            .collect()
+    }
+
+    /// The stamp set belongs to this index's destination and replay generation.
+    /// An index lives in one destination's directory; a stamp from another clears
+    /// the set when it is written.
+    fn entity_stamps_fenced(&self) -> bool {
+        let proof = &self.upload_context_proof;
+        proof.destination_namespace_hash.is_some()
+            && proof.replay_generation == self.historical_replay_generation
+    }
+
+    /// The file's receipt proves these exact bytes at this replay epoch, and the
+    /// bodies stamped for every entity it covers are the body set it delivered.
+    /// A delivery context is never asked: settings and capabilities apply from
+    /// the next body on. An entity sent since with another body selects, under
+    /// any context. A receipt of the active base in another money mode is the
+    /// operator's scoped copy-prefix re-read, not context debt. A file without
+    /// its entity set, or with an unstamped entity, selects as before; only a
+    /// confirmed-empty file covers nothing.
     fn context_only_debt(&self, key: &str) -> bool {
         let Some(entry) = self.files.get(key) else {
             return false;
@@ -396,18 +413,17 @@ impl ScanIndex {
         let Some(receipt) = entry.upload_context_receipt.as_ref() else {
             return false;
         };
-        let context = receipt.context_fingerprint.as_str();
-        let empty = self.confirmed_empty_files.contains(key);
+        let Some(bodies) = self.covered_stamp_bodies(key) else {
+            return false;
+        };
         receipt.replay_generation == RECEIPT_REPLAY_EPOCH
             && receipt.source_witness == entry.source_file_fingerprint
-            && (empty
+            && !self.same_copy_prefix_base(&receipt.context_fingerprint)
+            && (self.confirmed_empty_files.contains(key)
                 || (entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
-                    && self
-                        .file_snapshot_fingerprints
-                        .get(key)
-                        .is_some_and(|entities| !entities.is_empty())))
-            && !self.same_copy_prefix_base(context)
-            && self.unstamped_covered_entities(key, context) == Some(0)
+                    && !bodies.is_empty()
+                    && self.entity_stamps_fenced()
+                    && snapshot_file_upload_body_set_hex(bodies) == receipt.body_witness))
     }
 
     /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries

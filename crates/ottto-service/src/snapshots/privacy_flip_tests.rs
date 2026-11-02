@@ -493,11 +493,13 @@ fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
     assert!(!f.debt());
 }
 
-/// [behaviour] T4: one entity shared by two files, through A -> B -> A. The
-/// alias read under B earns B; the untouched file keeps A's receipt, which is
-/// no current proof of the shared entity once back under A.
+/// [money] T4: one entity shared by two files. A read of the untouched file
+/// depends on the body delivered for it, not on the context: the same body
+/// acknowledged through the alias under B selects nothing in A -> B -> A, and
+/// other additive evidence, which keeps the entity's hash, selects it at the
+/// next flip.
 #[test]
-fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
+fn shared_entity_body_not_context_decides_the_untouched_alias() {
     let mut f = Fixture::new(SnapshotSource::Pi);
     f.flip(all(false));
     let a = f.index.active_upload_context_fingerprint.clone().unwrap();
@@ -555,7 +557,7 @@ fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
     });
     finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
     let alias_items = scan.snapshots;
-    f.uploader.activate(f.source, a, &mut f.index);
+    f.uploader.activate(f.source, a.clone(), &mut f.index);
     f.uploader
         .send(f.source, &mut f.index, &committed, &alias_items)
         .unwrap();
@@ -575,8 +577,8 @@ fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
         .unwrap();
     assert!(!f.index.file_upload_context_requires_adoption(&alias));
     assert!(
-        f.index.file_context_read_owed(&untouched),
-        "the shared entity was sent under B"
+        !f.index.file_context_read_owed(&untouched),
+        "the shared entity was sent under B with the same body"
     );
 
     f.flip(all(false));
@@ -586,8 +588,36 @@ fn shared_entity_acked_under_flip_is_no_proof_for_the_untouched_alias() {
     );
     assert!(
         f.index.file_upload_context_requires_adoption(&untouched)
-            && f.index.file_context_read_owed(&untouched),
-        "A's receipt is no current proof of the entity acknowledged under B"
+            && !f.index.file_context_read_owed(&untouched),
+        "B's stamp owes delivery, and the body it proves is the delivered one"
+    );
+
+    // Under A again, the alias delivers additive evidence that keeps the
+    // entity's hash. The untouched file's receipt describes another body.
+    let mut grown = alias_items.clone();
+    let carrier = grown
+        .iter_mut()
+        .find(|item| item.snapshot_fingerprint == shared_entity)
+        .unwrap();
+    carrier.tool_usage_truncated = true;
+    let witness = snapshot_upload_body_witness(carrier);
+    let before = f.index.upload_context_proof.entity_stamps[&shared_entity]
+        .body_witness
+        .clone();
+    assert_ne!(before, witness, "the evidence moves the body witness");
+    let committed = f.index.clone();
+    f.uploader.activate(f.source, a, &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &grown)
+        .unwrap();
+    assert_eq!(
+        f.index.upload_context_proof.entity_stamps[&shared_entity].body_witness,
+        witness
+    );
+    f.flip(flipped(mode(false), &FLIPS[0]).policy);
+    assert!(
+        f.index.file_context_read_owed(&untouched),
+        "the same flip that was quiet above selects: the delivered body moved"
     );
 }
 
@@ -698,7 +728,9 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
 }
 
 /// [money] T7: context-only debt leaves a member independently accepted for
-/// every flip; an entity sent since under another context does not.
+/// every flip, under whichever context its entities were sent; an entity sent
+/// since with another body does not. A file still under its own base has no
+/// context-only debt: that is the scoped copy-prefix read.
 #[test]
 fn context_only_debt_keeps_consumers_current() {
     for bit in &FLIPS {
@@ -708,12 +740,18 @@ fn context_only_debt_keeps_consumers_current() {
             claude_stale_member_independently_accepted(&f.index, &key, &f.index.files[&key])
         };
         assert!(accepted(&f), "{}: positive control, exact ACK", bit.0);
+        let base = f.index.copy_prefix_base_upload_context.clone();
         f.flip_to(flipped(mode(false), bit));
         assert!(accepted(&f), "{}", bit.0);
+        let base_moved = f.index.copy_prefix_base_upload_context != base;
         for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
             stamp.context_fingerprint = "f".repeat(64);
         }
-        assert!(!accepted(&f), "{}: sent since under another context", bit.0);
+        assert_eq!(accepted(&f), base_moved, "{}: another context", bit.0);
+        for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
+            stamp.body_witness = "f".repeat(64);
+        }
+        assert!(!accepted(&f), "{}: sent since with another body", bit.0);
     }
 }
 

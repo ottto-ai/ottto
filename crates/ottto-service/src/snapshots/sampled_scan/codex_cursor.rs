@@ -1187,7 +1187,7 @@ pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &Sca
     }
 }
 
-/// A group job's `scope_job`: the join-proof, parser and identity versions.
+/// A group job's `scope_job`: the join-proof and identity versions.
 /// Recorded at job start; a change at any resume or at emission invalidates
 /// the job (a paused group never mixes proofs). Settings, capabilities and the
 /// replay directive are no input: they apply after the scan.
@@ -1195,7 +1195,6 @@ pub(in crate::snapshots) fn group_scope() -> String {
     sha256_hex(&[
         "codex_group_scope:v2",
         CODEX_JOIN_PROOF_VERSION,
-        SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
     ])
 }
@@ -3591,8 +3590,8 @@ pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
     lease.end(|cursor| cursor.counters.jobs_deferred_inputs += 1);
 }
 
-/// M-1 `scope_job` of a group, with its wake dependencies (§d.4): parser,
-/// identity and proof versions, owner, canonical member keys, every sealed
+/// M-1 `scope_job` of a group, with its wake dependencies (§d.4): identity
+/// and proof versions, owner, canonical member keys, every sealed
 /// member's opened identity and the live member's `{dev, ino}` (never its
 /// growing length), header digests, counting view, each
 /// member's path reduction facts and the census flags.
@@ -3609,7 +3608,6 @@ pub(in crate::snapshots) fn group_memo_digest(
     let mut parts = vec![
         "codex_group_memo:v2".to_owned(),
         CODEX_JOIN_PROOF_VERSION.to_owned(),
-        SnapshotSource::Codex.parser_version().to_owned(),
         SnapshotSource::Codex.scan_identity_version().to_owned(),
         owner.to_owned(),
         group_counting_view(members.iter().copied(), index),
@@ -6749,7 +6747,7 @@ impl SingletonMemo {
     }
 }
 
-/// The memo key for a singleton: parser, identity and proof versions, the
+/// The memo key for a singleton: identity and proof versions, the
 /// file's logical key and opened `{dev, ino}` (never its growing length),
 /// the counting view, and the wake dependencies (path-scoped reduction facts
 /// and header witness, the path's conflicted candidate ids, the global sidecar
@@ -6771,7 +6769,6 @@ pub(in crate::snapshots) fn memo_digest(
     Some(sha256_hex(&[
         "codex_singleton_memo:v4",
         CODEX_JOIN_PROOF_VERSION,
-        SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
         &local_index_key(&candidate.path),
         &stamp.dev.to_string(),
@@ -6783,12 +6780,8 @@ pub(in crate::snapshots) fn memo_digest(
             let (receipt, required) = crate::snapshots::codex_file_join::receipt_state(
                 index.files.get(&local_index_key(&candidate.path)),
             );
-            let receipt = receipt.map_or_else(
-                || "none".to_owned(),
-                |receipt| {
-                    serde_json::to_string(&receipt).unwrap_or_else(|_| "unserializable".to_owned())
-                },
-            );
+            let receipt =
+                receipt.map_or_else(|| "none".to_owned(), |receipt| receipt.parse_input());
             format!("receipt:{required}:{receipt}")
         },
         dependencies,
