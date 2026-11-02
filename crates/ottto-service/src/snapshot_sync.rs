@@ -7657,6 +7657,21 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
+    if source == SnapshotSource::ClaudeCode {
+        let sole_login = activity_hint
+            .session_request_sole_login_witness_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+        upload_progress
+            .accepted_identity_buckets
+            .set_sole_login_enabled(sole_login);
+        crate::snapshots::claude_folder_login::begin_page(
+            &mut index,
+            &committed_index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            sole_login,
+        );
+    }
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10273,6 +10288,26 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
+    if let Some(accepted) =
+        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
+    {
+        let census_clean = scan_result.census_complete
+            && scan_result.census_residue_index_key_count == 0
+            && scan_result.census_residue_blocked_session_count == 0;
+        crate::snapshots::claude_folder_login::note_page(
+            index,
+            &scan_result.snapshots,
+            &api_report,
+            &originals,
+            census_clean,
+        );
+        crate::snapshots::claude_folder_login::stamp_page(
+            &mut scan_result.snapshots,
+            index,
+            &api_report,
+            accepted,
+        );
+    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {

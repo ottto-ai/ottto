@@ -178,6 +178,7 @@ fn typed_item(value: &Value) -> SnapshotItem {
                     identity_basis: opt_string(entry, "identity_basis").unwrap(),
                     provider_workspace_hash: opt_string(entry, "provider_workspace_hash"),
                     account_source: None,
+                    sole_login_witness: None,
                 })
                 .collect()
         })
@@ -357,7 +358,7 @@ fn basis_token(token: &str) -> Option<&'static str> {
     [
         identity::TELEMETRY,
         identity::TELEMETRY_LOGIN,
-        identity::LEGACY_TRANSCRIPT_SOLE_LOGIN,
+        identity::TRANSCRIPT_SOLE_LOGIN,
         identity::TRANSCRIPT_ORG,
         "transcript_email",
     ]
@@ -1010,6 +1011,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         desktop: false,
         scan_unix_seconds: Some(1_000_000),
         email_home: None,
+        sole_login: None,
         session_start_unix_seconds: None,
         duplicated_elsewhere: false,
     }
@@ -5137,3 +5139,94 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
+
+fn sole_folder() -> crate::snapshots::claude_folder_login::QualifiedFolder {
+    crate::snapshots::claude_folder_login::QualifiedFolder {
+        login: "a".repeat(64),
+        org: "d".repeat(64),
+        witness: crate::snapshots::SoleLoginWitness {
+            v: 1,
+            folder: "0a1b2c3d".to_string(),
+            covered_from: "2026-08-02T07:00:00Z".to_string(),
+        },
+    }
+}
+
+/// A forked session's file is never stamped, so it stays untagged while a
+/// sibling in the same qualified folder is named.
+#[test]
+fn sole_login_names_an_own_session_request_and_nothing_stronger() {
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new());
+    let sole = sole_folder();
+    let at = Some(900_000);
+    let named = RequestIdentity::Tagged(AuthorityKey {
+        login: Some(sole.login.clone()),
+        org: Some(sole.org.clone()),
+        basis: identity::TRANSCRIPT_SOLE_LOGIN,
+        account_source: None,
+    });
+    fn stamped<'a>(
+        sole: &'a crate::snapshots::claude_folder_login::QualifiedFolder,
+        at: Option<u64>,
+        marker: MarkerVerdict<'a>,
+    ) -> RequestFacts<'a> {
+        RequestFacts {
+            sole_login: Some(sole),
+            ..facts("req_own", at, marker)
+        }
+    }
+    assert_eq!(
+        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::None)),
+        named
+    );
+    assert_eq!(
+        identity::classify(&evidence, &facts("req_fork", at, MarkerVerdict::None)),
+        RequestIdentity::Missing,
+        "a forked session stays wholly untagged"
+    );
+    let org = sole.org.clone();
+    assert_eq!(
+        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::Trusted(&org))),
+        named,
+        "its own marker confirms the folder's pair"
+    );
+    let other = "e".repeat(64);
+    assert_eq!(
+        identity::classify(
+            &evidence,
+            &stamped(&sole, at, MarkerVerdict::Trusted(&other))
+        ),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(other.clone()),
+            basis: identity::TRANSCRIPT_ORG,
+            account_source: None,
+        }),
+        "another org is never given this login"
+    );
+    assert_eq!(
+        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::Overflow)),
+        RequestIdentity::Refused(Refusal::MarkerOverflow)
+    );
+    assert_eq!(
+        identity::classify(&evidence, &stamped(&sole, at, MarkerVerdict::BadOrg)),
+        RequestIdentity::Refused(Refusal::ContradictoryOrg)
+    );
+    let unclocked = RequestFacts {
+        sole_login: Some(&sole),
+        ..facts("req_own", None, MarkerVerdict::None)
+    };
+    assert_eq!(
+        identity::classify(&evidence, &unclocked),
+        RequestIdentity::Refused(Refusal::BadClock)
+    );
+    let duplicated = RequestFacts {
+        duplicated_elsewhere: true,
+        ..stamped(&sole, at, MarkerVerdict::None)
+    };
+    assert_eq!(
+        identity::classify(&evidence, &duplicated),
+        RequestIdentity::Refused(Refusal::ConflictingDuplicate)
+    );
+}

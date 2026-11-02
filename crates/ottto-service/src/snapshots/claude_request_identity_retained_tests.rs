@@ -346,7 +346,12 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
     let (mut window, mut proof) = retained_session(576);
     sticky_price_fixture(&mut window, &mut proof);
     let mut baseline = window.clone();
-    sticky_apply(&mut baseline, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
+    sticky_apply(
+        &mut baseline,
+        &proof,
+        &identity::AcceptedBuckets::for_test(),
+    )
+    .unwrap();
     sticky_apply(&mut window, &proof, &retained_state()).unwrap();
     assert_eq!(sticky_wire(window), sticky_wire(baseline));
 }
@@ -437,8 +442,14 @@ fn retained_golden_cases() -> Value {
     sticky_assert_reconciled(&marked);
     assert_eq!(retained_marked(&marked), vec![true, true, true, false]);
     assert!(sticky_tagged(&marked.usage_buckets[3].model_usage[0]));
-    cases.insert("marker_closed_rows_open_hour_fresh_proving", sticky_wire(first.clone()));
-    cases.insert("marker_with_changed_proof_fresh_proving", sticky_wire(first.clone()));
+    cases.insert(
+        "marker_closed_rows_open_hour_fresh_proving",
+        sticky_wire(first.clone()),
+    );
+    cases.insert(
+        "marker_with_changed_proof_fresh_proving",
+        sticky_wire(first.clone()),
+    );
     cases.insert("marker_closed_rows_open_hour_fresh", sticky_wire(marked));
     let mut changed_proof = proof.clone();
     changed_proof[3].identity = login_key(D64);
@@ -470,7 +481,10 @@ fn retained_golden_cases() -> Value {
     retained_ack(&mut two_state, &second, &[&hour_zero]);
     let (mut unfit, unfit_proof) = retained_wide_open_hour(&two, &two_proof, 16);
     sticky_apply(&mut unfit, &unfit_proof, &two_state).unwrap();
-    cases.insert("missing_proof_retag_unfit_proving", sticky_wire(first.clone()));
+    cases.insert(
+        "missing_proof_retag_unfit_proving",
+        sticky_wire(first.clone()),
+    );
     cases.insert("missing_proof_retag_fit_proving", sticky_wire(first));
     cases.insert("missing_proof_retag_unfit", sticky_wire(unfit));
     let mut retag = two.clone();
@@ -484,8 +498,16 @@ fn retained_golden_cases() -> Value {
     let mut login_marked = login.clone();
     sticky_apply(&mut login_marked, &login_proof, &login_state).unwrap();
     assert!(login_marked.usage_buckets[0].model_usage[0].identity_retained);
-    assert_eq!(login_marked.usage_buckets[0].model_usage[0].account_identifier_hash.as_deref(), Some(OWNER_A));
-    cases.insert("login_marker_with_hash_proving", sticky_wire(login_first.clone()));
+    assert_eq!(
+        login_marked.usage_buckets[0].model_usage[0]
+            .account_identifier_hash
+            .as_deref(),
+        Some(OWNER_A)
+    );
+    cases.insert(
+        "login_marker_with_hash_proving",
+        sticky_wire(login_first.clone()),
+    );
     cases.insert("login_marker_with_hash", sticky_wire(login_marked));
     let mut contract5 = login.clone();
     contract5.usage_accounting_contract = None;
@@ -493,18 +515,33 @@ fn retained_golden_cases() -> Value {
     contract5.removed_usage = None;
     contract5.telemetry_owned_complete = None;
     sticky_apply(&mut contract5, &login_proof, &login_state).unwrap();
-    assert!(contract5.usage_buckets.iter().all(|b| b.model_usage.iter().all(|r| !r.identity_retained && sticky_tagged(r))));
+    assert!(contract5.usage_buckets.iter().all(|b| b
+        .model_usage
+        .iter()
+        .all(|r| !r.identity_retained && sticky_tagged(r))));
     cases.insert("contract5_fresh_proving", sticky_wire(contract5.clone()));
     cases.insert("contract5_fresh", sticky_wire(contract5));
     // Force a capacity refusal after witnessed proof; the marker is excluded.
     let mut refusal = login.clone();
     let mut changed = login_proof.clone();
-    for contribution in &mut changed[..3] { contribution.identity = login_key(D64); }
-    identity::apply_with_reserved_bytes_for_test(&mut refusal, &changed, &login_state, identity::MAX_ITEM_BYTES, None).unwrap();
+    for contribution in &mut changed[..3] {
+        contribution.identity = login_key(D64);
+    }
+    identity::apply_with_reserved_bytes_for_test(
+        &mut refusal,
+        &changed,
+        &login_state,
+        identity::MAX_ITEM_BYTES,
+        None,
+    )
+    .unwrap();
     assert!(!refusal.usage_buckets[0].model_usage[0].identity_retained);
     assert!(!sticky_tagged(&refusal.usage_buckets[0].model_usage[0]));
     assert!(refusal.request_identity_refusals > 0);
-    cases.insert("counted_refusal_after_proof_proving", sticky_wire(login_first));
+    cases.insert(
+        "counted_refusal_after_proof_proving",
+        sticky_wire(login_first),
+    );
     cases.insert("counted_refusal_after_proof", sticky_wire(refusal));
     // r7's strip wins over proof: refused and counted, never marked.
     let (mut unpriced, mut unpriced_proof) = retained_session(4);
@@ -516,10 +553,19 @@ fn retained_golden_cases() -> Value {
     identity::take_identity_counts();
     sticky_apply(&mut unpriced, &unpriced_proof, &unpriced_state).unwrap();
     assert_eq!(retained_marked(&unpriced), vec![false; 4]);
-    assert!(unpriced.usage_buckets.iter().all(|b| !sticky_tagged(&b.model_usage[0])));
-    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 1);
+    assert!(unpriced
+        .usage_buckets
+        .iter()
+        .all(|b| !sticky_tagged(&b.model_usage[0])));
+    assert_eq!(
+        retained_count(&retained_counts(), "unpriced_part_untagged"),
+        1
+    );
     assert_eq!(unpriced.request_identity_refusals, 4);
-    cases.insert("unpriced_strip_after_proof_proving", sticky_wire(unpriced_first));
+    cases.insert(
+        "unpriced_strip_after_proof_proving",
+        sticky_wire(unpriced_first),
+    );
     cases.insert("unpriced_strip_after_proof", sticky_wire(unpriced));
     serde_json::to_value(cases).unwrap()
 }
@@ -628,9 +674,18 @@ fn copy_invalidated_row_wire_golden_for_the_receiver_contract() {
     row.copy_invalidated = false;
     let unflagged = serde_json::to_value(&row).unwrap().to_string();
     assert_eq!(unflagged, plain);
-    assert!(!unflagged.contains("copy_invalidated"), "omitted when false");
-    assert_eq!(flagged.replacen(r#""copy_invalidated":true,"#, "", 1), plain);
-    assert_eq!(flagged.len() - plain.len(), r#","copy_invalidated":true"#.len());
+    assert!(
+        !unflagged.contains("copy_invalidated"),
+        "omitted when false"
+    );
+    assert_eq!(
+        flagged.replacen(r#""copy_invalidated":true,"#, "", 1),
+        plain
+    );
+    assert_eq!(
+        flagged.len() - plain.len(),
+        r#","copy_invalidated":true"#.len()
+    );
 }
 
 /// [money] X-B1: a fallback body refuses its lost rows, and the flagged row
@@ -654,15 +709,24 @@ fn copy_invalidated_survives_a_refusal_bearing_fallback_and_reaches_the_fingerpr
         (item, retained_counts())
     };
     let flags = |item: &SnapshotItem| {
-        item.usage_buckets.iter().map(|bucket| bucket.model_usage[0].copy_invalidated).collect::<Vec<_>>()
+        item.usage_buckets
+            .iter()
+            .map(|bucket| bucket.model_usage[0].copy_invalidated)
+            .collect::<Vec<_>>()
     };
     let (plain, _) = run(&[], 0);
     let (flagged, counts) = run(&[first.as_str()], 0);
-    assert!(flagged.request_identity_refusals > 0, "a refusal-bearing body");
+    assert!(
+        flagged.request_identity_refusals > 0,
+        "a refusal-bearing body"
+    );
     assert_eq!(flags(&flagged), [true, false]);
     assert_eq!(counts["copy_invalidated_rows"], 1);
     assert_ne!(flagged.snapshot_fingerprint, plain.snapshot_fingerprint);
-    assert_eq!(flagged.request_identity_refusals, plain.request_identity_refusals);
+    assert_eq!(
+        flagged.request_identity_refusals,
+        plain.request_identity_refusals
+    );
     let (unfit, counts) = run(&[first.as_str()], identity::MAX_ITEM_BYTES);
     assert_eq!(flags(&unfit), [false, false]);
     assert_eq!(counts["copy_invalidated_unfit"], 1);
@@ -670,7 +734,9 @@ fn copy_invalidated_survives_a_refusal_bearing_fallback_and_reaches_the_fingerpr
 
 fn retained_login_session() -> (SnapshotItem, Vec<Contribution>) {
     let (item, mut proof) = retained_session(2);
-    for c in &mut proof { c.identity = login_key(OWNER_A); }
+    for c in &mut proof {
+        c.identity = login_key(OWNER_A);
+    }
     (item, proof)
 }
 
@@ -680,12 +746,20 @@ fn retained_login_hash_is_ack_bound_even_when_transcript_proof_disappears() {
     let mut state = retained_state();
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
-    assert_eq!(first.usage_buckets[0].model_usage[0].account_identifier_hash.as_deref(), Some(OWNER_A));
+    assert_eq!(
+        first.usage_buckets[0].model_usage[0]
+            .account_identifier_hash
+            .as_deref(),
+        Some(OWNER_A)
+    );
     retained_ack(&mut state, &first, &[]);
-    let mut restored = identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
+    let mut restored =
+        identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
     restored.set_retained_enabled(true);
     let mut missing = proof.clone();
-    for c in &mut missing { c.identity = RequestIdentity::Missing; }
+    for c in &mut missing {
+        c.identity = RequestIdentity::Missing;
+    }
     let mut marked = original.clone();
     sticky_apply(&mut marked, &missing, &restored).unwrap();
     for bucket in &marked.usage_buckets {
@@ -701,7 +775,10 @@ fn retained_login_hash_is_ack_bound_even_when_transcript_proof_disappears() {
     legacy.removed_usage = None;
     legacy.telemetry_owned_complete = None;
     sticky_apply(&mut legacy, &proof, &restored).unwrap();
-    assert!(legacy.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && sticky_tagged(&b.model_usage[0])));
+    assert!(legacy
+        .usage_buckets
+        .iter()
+        .all(|b| !b.model_usage[0].identity_retained && sticky_tagged(&b.model_usage[0])));
     sticky_assert_reconciled(&legacy);
 }
 
@@ -720,14 +797,20 @@ fn retained_marker_and_unpriced_strip_compose_at_both_grains() {
     retained_assert_exclusive(&next);
     let counts = retained_counts();
     assert!(retained_count(&counts, "unpriced_part_untagged") > 0);
-    assert!(next.usage_buckets.iter().all(|b| !b.model_usage[0].identity_retained && !sticky_tagged(&b.model_usage[0])));
+    assert!(next
+        .usage_buckets
+        .iter()
+        .all(|b| !b.model_usage[0].identity_retained && !sticky_tagged(&b.model_usage[0])));
     // Marker rows themselves have no parts; a fully deferred closed body is safe.
     let mut closed = original.clone();
     closed.collected_at = "2026-09-02T00:00:00Z".into();
     identity::take_identity_counts();
     sticky_apply(&mut closed, &proof, &state).unwrap();
     assert!(retained_marked(&closed).iter().all(|marked| *marked));
-    assert_eq!(retained_count(&retained_counts(), "unpriced_part_untagged"), 0);
+    assert_eq!(
+        retained_count(&retained_counts(), "unpriced_part_untagged"),
+        0
+    );
     sticky_assert_reconciled(&closed);
 }
 
@@ -738,17 +821,32 @@ fn retained_capped_rows_send_fresh_tags_through_the_normal_caps() {
     let mut body = original.clone();
     // Smaller model spelling + a single login makes this maximum-row body fit.
     let model = "claude-synthetic";
-    for row in body.model_usage.iter_mut().chain(body.usage_buckets.iter_mut().flat_map(|b| &mut b.model_usage)) { row.model = model.into(); }
+    for row in body.model_usage.iter_mut().chain(
+        body.usage_buckets
+            .iter_mut()
+            .flat_map(|b| &mut b.model_usage),
+    ) {
+        row.model = model.into();
+    }
     original = body.clone();
     let mut proof = proof;
-    for c in &mut proof { c.row_key.model = model.into(); c.identity = login_key(OWNER_A); }
+    for c in &mut proof {
+        c.row_key.model = model.into();
+        c.identity = login_key(OWNER_A);
+    }
     sticky_apply(&mut body, &proof, &state).unwrap();
     // The entire source can exceed the wire cap, so prove compact fixture rows
     // directly only for rows the emitted body's ACK actually carried.
     identity::take_identity_counts();
     retained_ack(&mut state, &body, &[]);
     assert_eq!(retained_count(&retained_counts(), "proved_rows_capped"), 2);
-    assert!(state.proved_rows_for_test(&body.source_session_id).unwrap().0 <= 1_024);
+    assert!(
+        state
+            .proved_rows_for_test(&body.source_session_id)
+            .unwrap()
+            .0
+            <= 1_024
+    );
     let mut next = original;
     sticky_apply(&mut next, &proof, &state).unwrap();
     assert!(sticky_tagged(&next.usage_buckets[0].model_usage[0]));
@@ -765,13 +863,17 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
     sticky_apply(&mut first, &proof, &state).unwrap();
     retained_ack(&mut state, &first, &[]);
     let mut changed = proof.clone();
-    for c in &mut changed[..3] { c.identity = login_key(D64); }
+    for c in &mut changed[..3] {
+        c.identity = login_key(D64);
+    }
     let mut replacement = original.clone();
     sticky_apply(&mut replacement, &changed, &state).unwrap();
     assert!(state.invalidate_replaced(&serde_json::to_value(replacement).unwrap()));
     // Share hints evict independently; the unsettled replacement must not.
     state.forget_share_hints_for_test(&original.source_session_id);
-    for c in &mut changed[..3] { c.identity = RequestIdentity::Missing; }
+    for c in &mut changed[..3] {
+        c.identity = RequestIdentity::Missing;
+    }
     let mut missing = original;
     sticky_apply(&mut missing, &changed, &state).unwrap();
     let row = &missing.usage_buckets[0].model_usage[0];
@@ -824,11 +926,18 @@ fn copy_unproven_twin_rows_freeze_and_prove_separately() {
         let mut again = item.clone();
         sticky_apply(&mut again, &proof(&[(&copy, 1), (&own, 2)]), &state).unwrap();
         let counts = retained_counts();
-        assert_eq!(retained_count(&counts, "accepted_share_changed"), 0, "no false refusal");
+        assert_eq!(
+            retained_count(&counts, "accepted_share_changed"),
+            0,
+            "no false refusal"
+        );
         assert_eq!(again.request_identity_refusals, 0);
         if retained {
             assert!(
-                again.usage_buckets[0].model_usage.iter().all(|row| row.identity_retained),
+                again.usage_buckets[0]
+                    .model_usage
+                    .iter()
+                    .all(|row| row.identity_retained),
                 "each row carries its own witnessed proof"
             );
             assert_eq!(retained_count(&counts, "retained_marker_rows"), 2);
@@ -853,4 +962,77 @@ fn copy_unproven_twin_rows_freeze_and_prove_separately() {
         assert_eq!(retained_count(&counts, "accepted_row_vanished"), 1);
         assert_eq!(own_only.request_identity_refusals, 0);
     }
+}
+
+fn sole_login_proof(proof: &[Contribution]) -> Vec<Contribution> {
+    proof
+        .iter()
+        .map(|share| Contribution {
+            bucket_start: share.bucket_start.clone(),
+            row_key: share.row_key.clone(),
+            usage: share.usage.clone(),
+            identity: RequestIdentity::Tagged(AuthorityKey {
+                login: Some("a".repeat(64)),
+                org: Some("d".repeat(64)),
+                basis: identity::TRANSCRIPT_SOLE_LOGIN,
+                account_source: None,
+            }),
+        })
+        .collect()
+}
+
+#[test]
+fn sole_login_rows_stay_unfrozen_so_real_evidence_replaces_them() {
+    let (original, proof) = retained_session(2);
+    let sole = sole_login_proof(&proof);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &sole, &state).unwrap();
+    assert!(first
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis == identity::TRANSCRIPT_SOLE_LOGIN));
+    assert!(!first.request_evidence.is_empty());
+    retained_ack(&mut state, &first, &[]);
+
+    // The same names again never become a retained marker: they prove nothing.
+    let mut again = original.clone();
+    sticky_apply(&mut again, &sole, &state).unwrap();
+    assert_eq!(retained_marked(&again), vec![false; 2]);
+
+    // A later own row names the session through the normal path.
+    let mut real = original.clone();
+    sticky_apply(&mut real, &proof, &state).unwrap();
+    assert_eq!(retained_marked(&real), vec![false; 2]);
+    assert!(real
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis == identity::TELEMETRY));
+}
+
+#[test]
+fn sole_login_later_bodies_after_a_second_login_carry_no_tag_and_no_marker() {
+    let (original, proof) = retained_session(2);
+    let sole = sole_login_proof(&proof);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &sole, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+
+    let untagged: Vec<Contribution> = sole
+        .iter()
+        .map(|share| Contribution {
+            bucket_start: share.bucket_start.clone(),
+            row_key: share.row_key.clone(),
+            usage: share.usage.clone(),
+            identity: RequestIdentity::Missing,
+        })
+        .collect();
+    let mut later = original.clone();
+    let _ = sticky_apply(&mut later, &untagged, &state);
+    assert_eq!(retained_marked(&later), vec![false; 2]);
+    assert!(later
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis != identity::TRANSCRIPT_SOLE_LOGIN));
 }

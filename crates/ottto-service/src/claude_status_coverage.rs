@@ -165,7 +165,7 @@ pub(crate) fn transcript_home_key(transcript: &Path) -> Option<HomeKey> {
         .map(home_key)
 }
 
-fn slot_digest(slot_id: &str) -> [u8; 32] {
+pub(crate) fn slot_digest(slot_id: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"claude_status_coverage:slot:v1\0");
     digest.update(slot_id.as_bytes());

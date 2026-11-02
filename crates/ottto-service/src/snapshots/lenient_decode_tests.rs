@@ -1581,6 +1581,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "historical_replay_generation"
             | "copy_prefix_last_accepted_nonce"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
+            "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
         value[field] = replacement;
@@ -1659,6 +1660,10 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_folder_login_ledger");
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
@@ -1786,6 +1791,10 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_folder_login_ledger");
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
@@ -1832,7 +1841,8 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[89], "archives");
     assert_eq!(fields[90], "archive_deferred_alarm_count");
     assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
-    assert_eq!(fields.len(), 92);
+    assert_eq!(fields[92], "claude_folder_login_ledger");
+    assert_eq!(fields.len(), 93);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1861,6 +1871,10 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    current
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_folder_login_ledger");
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -3894,6 +3908,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
             account_source: None,
+            sole_login_witness: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
@@ -4251,6 +4266,26 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "archives",
             "archive_deferred_alarm_count",
             "copy_prefix_last_accepted_nonce",
+            "claude_folder_login_ledger",
         ]
     );
+}
+
+#[test]
+fn folder_login_ledger_old_state_loads_empty_and_damage_never_refuses() {
+    let read = |bytes: &[u8]| {
+        lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap()
+    };
+    assert!(read(br#"{"files":{}}"#)
+        .claude_folder_login_ledger
+        .is_empty());
+    assert!(
+        read(br#"{"files":{},"claude_folder_login_ledger":17}"#)
+            .claude_folder_login_ledger
+            .is_empty(),
+        "damage only loses the ledger, so the folder stays owed"
+    );
+    let kept = read(br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"disqualified":32768}}}"#);
+    assert_eq!(kept.claude_folder_login_ledger.len(), 1);
+    assert!(kept.claude_folder_login_ledger.contains_key("folder"));
 }

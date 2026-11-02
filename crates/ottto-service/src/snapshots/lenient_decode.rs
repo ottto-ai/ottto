@@ -444,6 +444,7 @@ impl Serialize for ScanIndex {
             upload_context_receipt::ProofState::is_empty
         );
         field!(copy_prefix_last_accepted_nonce, Option::is_none);
+        field!(claude_folder_login_ledger, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -541,6 +542,7 @@ pub(super) const FIELDS: &[&str] = &[
     "archives",
     "archive_deferred_alarm_count",
     "copy_prefix_last_accepted_nonce",
+    "claude_folder_login_ledger",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2431,6 +2433,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "copy_prefix_last_accepted_nonce" => {
                             index.copy_prefix_last_accepted_nonce = self.typed(value)?
+                        }
+                        "claude_folder_login_ledger" => {
+                            // Damage only means owed: a re-created record has
+                            // no census, so it never qualifies.
+                            index.claude_folder_login_ledger =
+                                self.history_scalar(value, BTreeMap::new())?
                         }
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never

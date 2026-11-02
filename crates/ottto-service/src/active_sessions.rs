@@ -2100,6 +2100,7 @@ mod tests {
             identity_basis: "telemetry".to_string(),
             provider_workspace_hash: Some("organization_hash".to_string()),
             account_source: None,
+            sole_login_witness: None,
         }];
         let mut later = tagged.usage_buckets[0].clone();
         later.bucket_start = "2026-07-19T11:00:00Z".to_string();
