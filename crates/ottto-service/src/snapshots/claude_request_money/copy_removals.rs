@@ -4,7 +4,9 @@
 //! proof list has since retired rebuilds the same deduped body instead of
 //! restoring the prefix. A holder no longer indexed cannot disprove anything:
 //! its group stands, counted (`copy_removal_holder_absent_kept`);
-//! only an indexed holder whose census lacks a hash reverts it. Local state
+//! only an indexed holder whose census lacks a hash reverts it. A group of an
+//! indexed holder with no accepted body stays recorded but removes nothing
+//! until that holder is accepted (`origin_accepted`). Local state
 //! (class L): never uploaded, never a wire field.
 //!
 //! Bounded by `MAX_BYTES` of charged state: 40 bytes per file, 32 per holder

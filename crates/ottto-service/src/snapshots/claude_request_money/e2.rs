@@ -40,6 +40,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::heap_layout_bound::split_fields as money_heap_fields;
 
+// Fixtures that predate the accepted-origin rule model an origin the server
+// already holds, like `FIXTURE_BIRTH` models an ordinary transcript. A test of
+// that rule turns the real evidence check on.
+#[cfg(test)]
+thread_local! {
+    static ORIGIN_ACCEPTANCE_REQUIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test seam: the real accepted-origin check, until dropped.
+#[cfg(test)]
+pub(crate) struct OriginAcceptanceRequired(bool);
+#[cfg(test)]
+impl OriginAcceptanceRequired {
+    pub(crate) fn on() -> Self {
+        Self(ORIGIN_ACCEPTANCE_REQUIRED.with(|v| v.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for OriginAcceptanceRequired {
+    fn drop(&mut self) {
+        ORIGIN_ACCEPTANCE_REQUIRED.with(|v| v.set(self.0));
+    }
+}
+
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
@@ -2326,6 +2349,16 @@ fn holder_order(
     Some((birth, location_key(key)))
 }
 
+/// A copied prefix leaves the copy only when the origin's own body can hold it
+/// on the server. Without that, removing it would count those requests nowhere.
+fn origin_accepted(index: &ScanIndex, holder: &str) -> bool {
+    #[cfg(test)]
+    if !ORIGIN_ACCEPTANCE_REQUIRED.with(std::cell::Cell::get) {
+        return true;
+    }
+    index.origin_body_accepted(holder)
+}
+
 /// Owner direction (PR C (a)): a /branch names its original in a
 /// `fork-context-ref` line. When that original is still indexed but its
 /// census cannot answer (retired after 35 idle days, over budget, older
@@ -2344,6 +2377,7 @@ fn parent_proves(
     member.subagent_stem.is_none()
         && member.root != session
         && index.files.contains_key(parent)
+        && origin_accepted(index, parent)
         && !index
             .claude_request_census
             .get(parent)
@@ -2356,7 +2390,8 @@ fn parent_proves(
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
 /// The walk deadline, a queued size change, a holder modified since its
-/// census read, and an unscanned other-session main file delay a decision.
+/// census read, an unscanned other-session main file, and a holder with no
+/// accepted body delay a decision.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2389,6 +2424,8 @@ fn decide_holders(
         waiting: bool,
         /// Hashes held only by an earlier file modified since its census read.
         stale: BTreeSet<u64>,
+        /// Hashes whose only proof is a holder with no accepted body.
+        unaccepted: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
     }
@@ -2417,6 +2454,7 @@ fn decide_holders(
             // removals stand, counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
+            let mut unaccepted = BTreeSet::new();
             for (holder, held) in index.claude_copy_removals.get(order.1) {
                 let key = live
                     .get_or_init(|| indexed_main_files(index))
@@ -2426,6 +2464,13 @@ fn decide_holders(
                     if hashes.binary_search(&hash).is_err()
                         || stored_holder_answer(index, key, hash) == Some(false)
                     {
+                        continue;
+                    }
+                    // The saved removal stays recorded and applies again once
+                    // the indexed holder has an accepted body. A holder no
+                    // longer indexed was checked when its removal was stored.
+                    if key.is_some_and(|key| !origin_accepted(index, key)) {
+                        unaccepted.insert(hash);
                         continue;
                     }
                     stored.insert(hash);
@@ -2446,6 +2491,7 @@ fn decide_holders(
                 resumed,
                 waiting: false,
                 stale: BTreeSet::new(),
+                unaccepted,
                 parent,
             })
         })
@@ -2467,7 +2513,7 @@ fn decide_holders(
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey))>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2480,13 +2526,18 @@ fn decide_holders(
                         if evidence == Evidence::None {
                             return None;
                         }
-                        Some((evidence, holder_order(store, root, key)?))
+                        let accepted = origin_accepted(index, key);
+                        Some((evidence, holder_order(store, root, key)?, accepted))
                     });
                     match holder {
-                        Some((evidence, holder)) if holder < file.order => match evidence {
+                        Some((evidence, holder, accepted)) if holder < file.order => match evidence
+                        {
                             Evidence::Queued => file.waiting = true,
                             Evidence::Stale => {
                                 file.stale.insert(hash);
+                            }
+                            Evidence::Current if !accepted => {
+                                file.unaccepted.insert(hash);
                             }
                             Evidence::Current => {
                                 let earliest = file.covered.entry(hash).or_insert(holder);
@@ -2532,6 +2583,19 @@ fn decide_holders(
             diag("copy_removal_holder_absent_kept", absent_kept);
             record_counts(Counts::one(25, absent_kept));
         }
+        // A copy that settled with this prefix counted now loses it: until
+        // this read, its origin's later acceptance had counted it twice.
+        if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
+            let late = wanted
+                .covered
+                .keys()
+                .filter(|hash| !wanted.stored.contains(hash))
+                .count() as u64;
+            if late > 0 {
+                diag("copy_prefix_late_origin_removed", late);
+                record_counts(Counts::one(26, late));
+            }
+        }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
             let stored = state.store(wanted.order.1, groups);
@@ -2560,6 +2624,20 @@ fn decide_holders(
                 &mut updates.state,
                 wanted.order.1,
                 "held_copy_stale_holder",
+                accepted,
+            );
+            continue;
+        }
+        if uncovered
+            .iter()
+            .any(|hash| wanted.unaccepted.contains(hash))
+        {
+            defer_prefix(
+                &mut items[wanted.at],
+                &uncovered,
+                &mut updates.state,
+                wanted.order.1,
+                "held_copy_origin_unaccepted",
                 accepted,
             );
             continue;
@@ -4271,8 +4349,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
+    // A prefix kept for an unaccepted origin, removed by the first read after
+    // that origin's late acceptance.
+    "copy_prefix_late_origin_removed",
 ];
-const COUNT_LEN: usize = 26;
+const COUNT_LEN: usize = 27;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(

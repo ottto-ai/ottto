@@ -333,6 +333,32 @@ impl ScanIndex {
         body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
     }
 
+    /// `key` has a body the server accepted for this destination, in any
+    /// context: a receipt of a real body, an entity stamp, or a settled
+    /// revision 3. It proves an accepted body, not each request id, and a
+    /// protected family's old evidence proves nothing: its bodies stay frozen.
+    pub(super) fn origin_body_accepted(&self, key: &str) -> bool {
+        let Some(entry) = self.files.get(key) else {
+            return false;
+        };
+        let proof = &self.upload_context_proof;
+        !self.claude_family_listed(key)
+            && (entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| !receipt.body_witness.is_empty())
+                || entry.effective_upload_body_witness_revision >= 3
+                || (proof.replay_generation == self.historical_replay_generation
+                    && self
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .is_some_and(|entities| {
+                            entities
+                                .iter()
+                                .any(|entity| proof.entity_stamps.contains_key(entity))
+                        })))
+    }
+
     /// An entity's durable stamp proves this body under THIS file's context in
     /// the stamp set's destination and replay generation. The context carries
     /// the destination namespace, so a destination change is a context change.

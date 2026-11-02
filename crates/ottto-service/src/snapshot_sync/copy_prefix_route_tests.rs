@@ -52,10 +52,13 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// file whose uncertified writer copied an earlier session's requests, with
 /// own turns after them. RAM Tail, cold Full and a restored owner remove the
 /// same copied prefix and emit the same bodies, totals and placement, with a
-/// restart between pages.
+/// restart between pages. The real accepted-origin check is on: the delivered
+/// holder's accepted body is what lets the prefix go.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    let _origin_required =
+        crate::snapshots::claude_request_money::e2::OriginAcceptanceRequired::on();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
