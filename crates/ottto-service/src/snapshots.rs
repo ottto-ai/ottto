@@ -8174,8 +8174,8 @@ struct ClaudeTerminalCustody {
 }
 
 impl ClaudeTerminalCustody {
-    /// A terminal that did not complete keeps its traversal: the next pass
-    /// re-enters it. Nothing starts a traversal between the scan and its fold.
+    /// A refused terminal keeps its traversal: the next pass re-enters it.
+    /// Nothing starts a traversal between the scan and its fold.
     fn restore(self, index: &mut ScanIndex) {
         index.traversal = self.traversal;
         index.resume_after_path = self.resume_after_path;
@@ -9531,6 +9531,13 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
         disposition
     } else {
+        // The whole page quarantined: a complete census is refused, as a fold
+        // refuses a page it cannot read.
+        let terminal = if scan.census_complete {
+            ClaudeTerminalOutcome::Refused
+        } else {
+            ClaudeTerminalOutcome::NotTerminal
+        };
         scan.census_complete = false;
         ClaudeUsageAuthorityDisposition {
             quarantined_source_session_ids: scan
@@ -9538,17 +9545,20 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
                 .iter()
                 .map(|s| s.source_session_id.clone())
                 .collect(),
+            terminal,
             ..Default::default()
         }
     };
-    // Cursor custody: the scan retired its traversal before this fold; only
-    // a Complete terminal keeps it retired. Any other outcome (refused, or
-    // the whole page quarantined) leaves the census incomplete and puts the
-    // traversal back, so the next pass re-enters it.
-    if disposition.terminal != ClaudeTerminalOutcome::Complete {
-        if let Some(custody) = scan.claude_terminal_custody.take() {
-            scan.census_complete = false;
-            scan.scan_cap_hit = true;
+    // Cursor custody: the scan retired its traversal before this fold. A
+    // refused terminal (an unreadable family, or the whole page quarantined)
+    // leaves the census incomplete and puts the traversal back, so the next
+    // pass re-enters it. Every fold takes the custody: a fold that did not
+    // run a terminal leaves the traversal retired, as before.
+    let custody = scan.claude_terminal_custody.take();
+    if disposition.terminal == ClaudeTerminalOutcome::Refused {
+        scan.census_complete = false;
+        scan.scan_cap_hit = true;
+        if let Some(custody) = custody {
             custody.restore(index);
         }
     }
