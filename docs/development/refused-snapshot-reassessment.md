@@ -5,7 +5,8 @@ snapshot. `accepted_log_stale_older_upload` remains owed and its exact refused
 bytes stay suppressed. Input changes can produce a new body and one new offer.
 `accepted_log_stale_older_mixed` uses ordinary non-permanent retry custody.
 These reply paths are shared by Claude, Codex and Pi; the observed timestamp
-refusal and the head-comparison operator action currently concern Claude.
+refusal is observed in Claude today. The operator input uses the same source
+slug and machine/session binding for every source.
 
 Existing terminal records retain their disposition without an operator action.
 They remain counted as owed. To apply a server head comparison, place a regular
@@ -32,7 +33,11 @@ source slug, machine identifier and source session identifier, separated by byte
 comparison; activity order is never coverage proof. Use `owed` when any portion
 has no coverage proof, including unknown hour/model grains. Unlisted records
 retain their disposition and debt. Symlinks, invalid bindings and a body that
-has since changed grant no action. The list is validated before it is applied.
+has since changed grant no action. Supply an `acquisition_path` for each `owed`
+entry: an absolute source path already present in the scan index. It is an
+explicit operator scope, not a filename-derived entity identity. This also
+works when an older refusal has left current fingerprint incidence or the
+source is a copied file whose filename differs from its native session id. The list is validated before it is applied.
 
 A `covered` verdict marks the exact retained revision `superseded_terminal`
 without reading a source or creating an ACK. An `owed` verdict sets the existing
@@ -41,6 +46,7 @@ pacing and the existing shared per-cycle retry limit. It does not resend
 identical refused bytes. The claim remains pending until an owning acquisition
 lease is recorded; a failed save prevents acquisition. The last nonce and
 pending claims are durable, so leaving the file present does not renew them.
+Only the last action nonce is remembered; use a unique nonce per explicit action.
 A later explicit action uses a new nonce. There is no timer, new cap or ongoing
 OFF switch. The action records an attempt, never discharges the remaining debt.
 Input changes and subsequent server answers retain their ordinary behavior.
@@ -62,3 +68,6 @@ Diagnostics gate and retire nothing.
 State extensions default absent and are omitted when empty. Existing reason and
 disposition vocabulary, schema and parser versions are unchanged. A malformed
 optional exposure observation cannot discard its owning refusal.
+
+Unknown request/token counters count entities whose amounts are unavailable;
+they are not estimated missing requests or tokens.

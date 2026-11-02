@@ -2661,11 +2661,17 @@ impl SnapshotUploadProgress {
                     .max(crate::snapshots::terminal_contract_retry::current_contract())
             },
         );
-        let failed_reconstruction_count = existing
-            .map(|record| record.failed_reconstruction_count.saturating_add(1))
-            .unwrap_or(1)
-            .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
         let stale_owed = self.stale_body(fingerprint, body_witness);
+        // A refused stale body owes an answer; it spends no reconstruction
+        // exhaustion budget. Keep the existing RetryPending decoder contract.
+        let failed_reconstruction_count = if stale_owed {
+            1
+        } else {
+            existing
+                .map(|record| record.failed_reconstruction_count.saturating_add(1))
+                .unwrap_or(1)
+                .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES)
+        };
         let disposition = if !stale_owed
             && failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
         {
@@ -2725,6 +2731,7 @@ impl SnapshotUploadProgress {
             record.retry_after_unix_seconds = 0;
         } else {
             record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            record.failed_reconstruction_count = 1;
             record.contract_retry_claims = None;
         }
         let persisted_reason = crate::upload_receipts::RejectedUsageReason::from_wire(reason);
@@ -4475,15 +4482,11 @@ fn log_retained_permanent_refusals(
     }) {
         eprintln!("ottto-service: refusal exposure alarm source={} reason=accepted_log_stale_older_upload owed_entities={} oldest_age_seconds={}", source.api_slug(), retained.exposure.owed_entities, retained.exposure.oldest_age_seconds);
     }
-    eprintln!("ottto-service: refusal exposure source={} reason=accepted_log_stale_older_upload owed_entities={} known_requests={} known_tokens={} unknown_requests={} unknown_tokens={} unknown_age={} oldest_age_seconds={}",
-        source.api_slug(), retained.exposure.owed_entities, retained.exposure.known_requests, retained.exposure.known_tokens,
-        retained.exposure.unknown_requests, retained.exposure.unknown_tokens, retained.exposure.unknown_age, retained.exposure.oldest_age_seconds);
-    if retained.dominated == 0 {
-        return;
-    }
     eprintln!(
         "local snapshot sync retains {} dominated ({} usage_accounting_authority_downgrade) \
-         and {} other permanent refusal(s) for {}{}",
+         and {} other permanent refusal(s) for {}{}; reason=accepted_log_stale_older_upload \
+         owed_entities={} known_requests={} known_tokens={} unknown_request_entities={} \
+         unknown_token_entities={} unknown_age_entities={} oldest_age_seconds={}",
         retained.dominated,
         authority_downgrades,
         retained.total - retained.dominated,
@@ -4492,7 +4495,14 @@ fn log_retained_permanent_refusals(
             "; reported as settled residue the backend already owns"
         } else {
             ""
-        }
+        },
+        retained.exposure.owed_entities,
+        retained.exposure.known_requests,
+        retained.exposure.known_tokens,
+        retained.exposure.unknown_request_entities,
+        retained.exposure.unknown_token_entities,
+        retained.exposure.unknown_age_entities,
+        retained.exposure.oldest_age_seconds,
     );
 }
 
@@ -6915,8 +6925,9 @@ fn prepare_sync_source_inner(
         }
     }
     if upload_progress.reopen_stale_once(&upload_progress_path, source, machine_id, &mut index)? {
-        index.save(&index_path)?;
+        // The refusal/proof owner is durable before its index-facing mirror.
         upload_progress.save(&upload_progress_path)?;
+        index.save(&index_path)?;
     }
     // Due exact refusal re-offers are reserved from the loaded, committed
     // index and saved below before any lease reaches the scan or uploader.
@@ -9302,8 +9313,11 @@ fn save_terminal_contract_claims_for_scan(
     let fresh_full = progress
         .active_quarantine_retries
         .iter()
-        .filter(|fp| progress.stale_reopen_pending(fp))
-        .cloned()
+        .filter_map(|fp| {
+            progress
+                .stale_reopen_file(fp)
+                .map(|file| (fp.clone(), file.clone()))
+        })
         .collect();
     let paths = index.activate_terminal_contract_retries_with_mode(
         progress.active_quarantine_retries.clone(),

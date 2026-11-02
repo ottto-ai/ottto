@@ -27239,7 +27239,8 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
-        resource_probe.refusal_exposure = Some(owned_index.refusal_exposure);
+        resource_probe.refusal_exposure = (owned_index.refusal_exposure != Default::default())
+            .then_some(owned_index.refusal_exposure);
         let index = &mut owned_index;
         if source == SnapshotSource::ClaudeCode {
             // Restore population disclosure even before a restarted/evicted
@@ -34961,7 +34962,7 @@ impl OwnedSourceScan {
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
                             && !forced_family
-                            && !index.reason_reoffer_leased(&key)
+                            && !index.reason_reoffer_leased(&key, true)
                             && !comparison_target
                             && !parent_proof_required;
                         context
@@ -46489,7 +46490,7 @@ fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<Pat
     hinted_paths
         .iter()
         .filter(|path| {
-            index.reason_reoffer_leased(&local_index_key(path))
+            index.reason_reoffer_leased(&local_index_key(path), false)
                 || !fs::symlink_metadata(path)
                     .is_ok_and(|metadata| metadata.is_file() && index.hint_settled(path, &metadata))
         })
@@ -52341,25 +52342,42 @@ impl ScanIndex {
         &mut self,
         leases: BTreeSet<String>,
     ) -> Vec<PathBuf> {
-        self.activate_terminal_contract_retries_with_mode(leases, &BTreeSet::new())
+        self.activate_terminal_contract_retries_with_mode(leases, &BTreeMap::new())
     }
 
     pub(crate) fn activate_terminal_contract_retries_with_mode(
         &mut self,
         leases: BTreeSet<String>,
-        fresh_full: &BTreeSet<String>,
+        fresh_full: &BTreeMap<String, String>,
     ) -> Vec<PathBuf> {
         self.terminal_contract_retries.clear();
         // A fingerprint can have more than one indexed incidence. One claim
         // selects one owning file, never every duplicate incidence.
         for (key, fingerprints) in &self.file_snapshot_fingerprints {
             for fingerprint in fingerprints.intersection(&leases) {
+                if fresh_full.contains_key(fingerprint) {
+                    continue;
+                }
                 self.terminal_contract_retries
                     .entry(fingerprint.clone())
                     .or_insert_with(|| QuarantineRetryLease {
                         file: key.clone(),
-                        fresh_full: fresh_full.contains(fingerprint),
+                        fresh_full: false,
                     });
+            }
+        }
+        // An explicit operator scope can name an old refusal whose fingerprint
+        // has left current incidence. Its file comes from the trusted input,
+        // never from filename identity or activity order.
+        for (fp, file) in fresh_full {
+            if leases.contains(fp) && self.files.contains_key(file) {
+                self.terminal_contract_retries.insert(
+                    fp.clone(),
+                    QuarantineRetryLease {
+                        file: file.clone(),
+                        fresh_full: true,
+                    },
+                );
             }
         }
         // Use the same revalidated candidate admission as exact refusal re-offers.
@@ -52371,17 +52389,6 @@ impl ScanIndex {
             .into_iter()
             .map(PathBuf::from)
             .collect()
-    }
-
-    /// Canonical local entity incidence binds a supplied head comparison.
-    pub(crate) fn stale_comparison_binds_entity(&self, session: &str, fp: &str) -> bool {
-        self.file_snapshot_fingerprints
-            .iter()
-            .any(|(path, entities)| {
-                entities.contains(fp)
-                    && claude_index_path_member_ref(Path::new(path))
-                        .is_some_and(|m| m.matches_member(session))
-            })
     }
 
     pub(crate) fn quarantine_retry_has_owner(&self, fingerprint: &str) -> bool {
@@ -52416,13 +52423,13 @@ impl ScanIndex {
         }
         self.file_snapshot_fingerprints
             .keys()
-            .filter(|key| self.reason_reoffer_leased(key))
+            .filter(|key| self.reason_reoffer_leased(key, false))
             .map(PathBuf::from)
             .collect()
     }
 
     /// This cycle leased the file's snapshot for a reason re-offer.
-    fn reason_reoffer_leased(&self, key: &str) -> bool {
+    fn reason_reoffer_leased(&self, key: &str, full_only: bool) -> bool {
         if self
             .terminal_contract_retries
             .values()
@@ -52431,7 +52438,8 @@ impl ScanIndex {
             return true;
         }
 
-        !self.reason_reoffer_retries.is_empty()
+        !full_only
+            && !self.reason_reoffer_retries.is_empty()
             && self
                 .file_snapshot_fingerprints
                 .get(key)
@@ -55619,22 +55627,23 @@ impl ScanIndex {
                 Some(CandidateParseReason::UploadContext),
             );
         }
-        if self
-            .file_snapshot_fingerprints
-            .get(&key)
-            .is_some_and(|fingerprints| {
-                fingerprints.iter().any(|fingerprint| {
-                    // Missing activity on the restored tuple cannot settle an
-                    // account hold either. An actual quarantine retry remains
-                    // independent authority to re-read, even with CONTENT.
-                    (!withheld_unchanged
-                        && !self
-                            .snapshot_activity_at
-                            .get(fingerprint)
-                            .is_some_and(valid_snapshot_activity))
-                        || self.quarantine_retry_selects_file(fingerprint, &key)
+        if self.reason_reoffer_leased(&key, false)
+            || self
+                .file_snapshot_fingerprints
+                .get(&key)
+                .is_some_and(|fingerprints| {
+                    fingerprints.iter().any(|fingerprint| {
+                        // Missing activity on the restored tuple cannot settle an
+                        // account hold either. An actual quarantine retry remains
+                        // independent authority to re-read, even with CONTENT.
+                        (!withheld_unchanged
+                            && !self
+                                .snapshot_activity_at
+                                .get(fingerprint)
+                                .is_some_and(valid_snapshot_activity))
+                            || self.quarantine_retry_selects_file(fingerprint, &key)
+                    })
                 })
-            })
         {
             return (
                 CandidateDecision::Parse,

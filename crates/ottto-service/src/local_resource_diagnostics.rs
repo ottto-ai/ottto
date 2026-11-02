@@ -857,12 +857,12 @@ pub(crate) struct RefusalExposure {
     pub(crate) held_terminal_entities: usize,
     pub(crate) known_requests: u64,
     pub(crate) known_tokens: u64,
-    pub(crate) unknown_requests: usize,
-    pub(crate) unknown_tokens: usize,
-    pub(crate) unknown_age: usize,
+    pub(crate) unknown_request_entities: usize,
+    pub(crate) unknown_token_entities: usize,
+    pub(crate) unknown_age_entities: usize,
     pub(crate) oldest_age_seconds: u64,
 }
-crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_entities, known_requests, known_tokens, unknown_requests, unknown_tokens, unknown_age, oldest_age_seconds);
+crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_entities, known_requests, known_tokens, unknown_request_entities, unknown_token_entities, unknown_age_entities, oldest_age_seconds);
 
 #[derive(Debug)]
 pub(crate) struct Probe {
@@ -1224,7 +1224,7 @@ pub(crate) struct StageWindow {
 }
 impl StageWindow {
     pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
-        self.probe.refusal_exposure = Some(counts);
+        self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         Self {

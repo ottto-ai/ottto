@@ -467,15 +467,13 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
-    for reason in ["usage_accounting_authority_downgrade"] {
-        permanent_finish_pipeline(
-            FinishOutcome::Dominated {
-                reason,
-                admit_residue: true,
-            },
-            true,
-        );
-    }
+    permanent_finish_pipeline(
+        FinishOutcome::Dominated {
+            reason: "usage_accounting_authority_downgrade",
+            admit_residue: true,
+        },
+        true,
+    );
 }
 
 /// T4: a backend that does not admit `census_residue_status:v1` never

@@ -91,9 +91,15 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     );
     assert!(progress.active_quarantine_retries.is_empty());
     assert_eq!(offer(&item, source, STALE, &mut progress), 0);
-    let mut restored: SnapshotUploadProgress =
-        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
-    restored.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
+    let scratch = crate::test_scratch::ScratchDir::new("stale-refusal-restart");
+    let path = scratch.join("progress.json");
+    progress.save(&path).unwrap();
+    let mut restored =
+        SnapshotUploadProgress::load(&path, &"a".repeat(64), snapshot_quarantine_witness(source))
+            .unwrap();
+    assert!(restored
+        .permanent_rejections
+        .contains_key(&item.snapshot_fingerprint));
     item.tool_usage_truncated = !item.tool_usage_truncated;
     assert_eq!(offer(&item, source, STALE, &mut restored), 1);
     assert_eq!(offer(&item, source, STALE, &mut restored), 0);
@@ -151,7 +157,12 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
     let collected = "2026-10-25T07:01:00Z";
     for n in 0..67 {
         let session = format!("session-{n:02}");
-        std::fs::write(root.join(format!("{session}.jsonl")), format!("{}\n", serde_json::json!({
+        let filename = if n == 64 {
+            "copied-physical-file.jsonl".into()
+        } else {
+            format!("{session}.jsonl")
+        };
+        std::fs::write(root.join(filename), format!("{}\n", serde_json::json!({
             "timestamp":"2026-10-25T07:00:00Z", "type":"assistant", "sessionId":session,
             "requestId":format!("req-{n}"), "message":{"id":format!("msg-{n}"), "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}
         }))).unwrap();
@@ -159,7 +170,7 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
     let mut index = ScanIndex::default();
     let mut first = crate::snapshots::scan_source_roots(
         source,
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &mut index,
         collected,
         crate::snapshots::BACKFILL_WINDOW_DAYS,
@@ -181,11 +192,10 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
         let body = snapshot_upload_body_witness(item);
         progress.quarantine_permanent_body(fp, &body, STALE);
         progress.permanent_rejections.get_mut(fp).unwrap().exposure = None;
-        progress
-            .quarantined_fingerprints
-            .get_mut(fp)
-            .unwrap()
-            .disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        let legacy = progress.quarantined_fingerprints.get_mut(fp).unwrap();
+        legacy.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        legacy.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        legacy.retry_after_unix_seconds = 0;
         if n == 66 {
             continue;
         }
@@ -194,9 +204,20 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
         }
         entries.push(serde_json::json!({"entity_hash":entity_hash(source.api_slug(), "synthetic", &item.source_session_id),
             "source_session_id":item.source_session_id, "snapshot_fingerprint":fp, "body_witness":body,
-            "verdict":if n < 63 {"covered"} else {"owed"}}));
+            "verdict":if n < 63 {"covered"} else {"owed"},
+            "acquisition_path":if n >= 63 { Some(root.join(if n == 64 { "copied-physical-file.jsonl".into() } else { format!("session-{n:02}.jsonl") })) } else { None }
+        }));
     }
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    // Observed legacy custody: the refusal survives after current incidence
+    // moves on. Explicit scope must still grant one acquisition of this file.
+    index.file_snapshot_fingerprints.insert(
+        root.join("session-63.jsonl").to_string_lossy().into_owned(),
+        BTreeSet::from([fp(9999)]),
+    );
+    index
+        .snapshot_activity_at
+        .insert(fp(9999), Some(collected.into()));
     let before = serde_json::to_value(&progress).unwrap();
     assert!(!progress
         .reopen_stale_once(&path, source, "synthetic", &mut index)
@@ -240,7 +261,7 @@ fn receipt_covered_supersedes_without_read_and_only_owed_acquires() {
     let (mut fresh, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
         crate::snapshots::scan_source_roots_with_test_limit_and_hints(
             source,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &mut index,
             collected,
             crate::snapshots::BACKFILL_WINDOW_DAYS,

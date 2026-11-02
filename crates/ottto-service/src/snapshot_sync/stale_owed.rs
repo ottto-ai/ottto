@@ -13,8 +13,9 @@ pub(super) struct Exposure {
     tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) covered: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(super) reopen_pending: bool,
+    /// Pending explicit acquisition scope, consumed only with its saved lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reopen_file: Option<String>,
 }
 impl Exposure {
     pub(super) fn new(now: u64) -> Self {
@@ -23,7 +24,7 @@ impl Exposure {
             requests: None,
             tokens: None,
             covered: false,
-            reopen_pending: false,
+            reopen_file: None,
         }
     }
     fn legacy() -> Self {
@@ -40,7 +41,7 @@ pub(super) fn decode_exposure<'de, D: serde::Deserializer<'de>>(
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).ok())
 }
-crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens, covered, reopen_pending);
+crate::heap_layout_bound::fields!(Exposure; first_held_unix, requests, tokens, covered, reopen_file);
 
 impl PermanentSnapshotRejection {
     pub(super) fn is_stale(&self) -> bool {
@@ -82,10 +83,16 @@ impl SnapshotUploadProgress {
         revisions.remove(next);
         revisions
     }
-    pub(super) fn stale_reopen_pending(&self, fp: &str) -> bool {
+    pub(super) fn stale_reopen_file(&self, fp: &str) -> Option<&String> {
         self.permanent_rejections
-            .get(fp)
-            .is_some_and(|r| r.exposure.as_ref().is_some_and(|e| e.reopen_pending))
+            .get(fp)?
+            .exposure
+            .as_ref()?
+            .reopen_file
+            .as_ref()
+    }
+    pub(super) fn stale_reopen_pending(&self, fp: &str) -> bool {
+        self.stale_reopen_file(fp).is_some()
     }
     pub(super) fn note_refused_exposure<T: Serialize>(&mut self, fp: &str, item: &T) {
         let Some(e) = self
@@ -153,14 +160,22 @@ impl SnapshotUploadProgress {
                 e.entity_hash == entity_hash(source.api_slug(), machine, &e.source_session_id)
                     && is_snapshot_fingerprint(&e.snapshot_fingerprint)
                     && is_snapshot_fingerprint(&e.body_witness)
-                    && source == SnapshotSource::ClaudeCode
-                    && index.stale_comparison_binds_entity(
-                        &e.source_session_id,
-                        &e.snapshot_fingerprint
-                    )
                     && seen.insert(&e.snapshot_fingerprint),
                 "invalid or duplicate one-shot entity binding"
             );
+            if e.verdict == Verdict::Owed {
+                let acquisition = e
+                    .acquisition_path
+                    .as_ref()
+                    .context("owed verdict requires an acquisition path")?;
+                anyhow::ensure!(
+                    acquisition.is_absolute()
+                        && acquisition
+                            .to_str()
+                            .is_some_and(|key| index.files.contains_key(key)),
+                    "one-shot acquisition path is not indexed"
+                );
+            }
             let body_matches = self.refused_body(&e.snapshot_fingerprint, &e.body_witness)
                 || index
                     .quarantined_snapshot_fingerprints
@@ -174,7 +189,8 @@ impl SnapshotUploadProgress {
                         .or_else(|| index
                             .quarantined_snapshot_fingerprints
                             .get(&e.snapshot_fingerprint))
-                        .is_none_or(|r| r.upload_body_witness.as_ref() == Some(&e.body_witness)),
+                        .map_or(true, |r| r.upload_body_witness.as_ref()
+                            == Some(&e.body_witness)),
                 "one-shot revision is no longer current"
             );
         }
@@ -210,7 +226,11 @@ impl SnapshotUploadProgress {
             };
             record.contract_retry_claims = None;
             record.failed_reconstruction_count = 1;
-            record.retry_after_unix_seconds = quarantine_retry_after(&e.snapshot_fingerprint);
+            record.retry_after_unix_seconds = if e.verdict == Verdict::Owed {
+                quarantine_retry_after(&e.snapshot_fingerprint)
+            } else {
+                0
+            };
             record.witness = self
                 .active_quarantine_witness
                 .clone()
@@ -235,7 +255,11 @@ impl SnapshotUploadProgress {
             };
             let exposure = refusal.exposure.get_or_insert_with(Exposure::legacy);
             exposure.covered = e.verdict == Verdict::Covered;
-            exposure.reopen_pending = e.verdict == Verdict::Owed;
+            exposure.reopen_file = if e.verdict == Verdict::Owed {
+                e.acquisition_path.map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            };
             index
                 .quarantined_snapshot_fingerprints
                 .insert(e.snapshot_fingerprint, record.clone());
@@ -255,8 +279,7 @@ impl SnapshotUploadProgress {
                     .get_mut(fp)
                     .and_then(|r| r.exposure.as_mut())
                 {
-                    changed |= e.reopen_pending;
-                    e.reopen_pending = false;
+                    changed |= e.reopen_file.take().is_some();
                 }
             }
         }
@@ -282,12 +305,12 @@ impl SnapshotUploadProgress {
             if let Some(n) = e.and_then(|e| e.requests) {
                 counts.known_requests = counts.known_requests.saturating_add(n);
             } else {
-                counts.unknown_requests += 1;
+                counts.unknown_request_entities += 1;
             }
             if let Some(n) = e.and_then(|e| e.tokens) {
                 counts.known_tokens = counts.known_tokens.saturating_add(n);
             } else {
-                counts.unknown_tokens += 1;
+                counts.unknown_token_entities += 1;
             }
             let first = std::iter::once(first_owed)
                 .chain(owed)
@@ -297,7 +320,7 @@ impl SnapshotUploadProgress {
                 counts.oldest_age_seconds =
                     counts.oldest_age_seconds.max(now.saturating_sub(first));
             } else {
-                counts.unknown_age += 1;
+                counts.unknown_age_entities += 1;
             }
         }
         counts
@@ -316,6 +339,8 @@ struct Entity {
     snapshot_fingerprint: String,
     body_witness: String,
     verdict: Verdict,
+    #[serde(default)]
+    acquisition_path: Option<PathBuf>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
