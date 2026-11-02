@@ -2485,7 +2485,9 @@ impl HeapLayoutBound for std::sync::Weak<SharedCache> {
     }
 }
 
-/// A RAM miss classified solely from committed index state and pass registration.
+/// A RAM miss classified solely from committed index state and pass
+/// registration. A cleared fingerprint is owed evidence, not a class: the file
+/// misses for the same reason as one whose fingerprint survived.
 #[cfg(unix)]
 pub(in crate::snapshots) fn ram_miss_class(
     index: &ScanIndex,
@@ -2495,8 +2497,6 @@ pub(in crate::snapshots) fn ram_miss_class(
     let entry = index.files.get(key);
     if entry.is_none() && !has_slot {
         MissClass::NoEntry
-    } else if entry.is_some_and(|entry| entry.source_file_fingerprint.is_empty()) {
-        MissClass::SelectionCleared
     } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
         MissClass::HistoryOwed
     } else if entry.is_none() {

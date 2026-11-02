@@ -3347,7 +3347,9 @@ impl SharedCache {
             }
             stores.counters.restore_attempts += 1;
             stores.note_indexed(source, index);
-            // Codex keeps its predecessor selection gate; Claude first proves the original binding.
+            // This enforces Codex's strict rebind and fault barrier, whose only
+            // carrier is the cleared fingerprint: it leaves with them. Every
+            // other clear reaches Claude's binding and certificate checks below.
             if source == DurableSource::Codex && selection_cleared(index, key) {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
                 // A record surviving behind a cleared selection
@@ -4318,11 +4320,14 @@ impl SharedCache {
                     continue;
                 }
                 // Selection provenance: only a reduction acquired for the
-                // committed entry's own fingerprint binds to it. A held or
-                // reverted entry (local-hold settlement restored the prior
-                // entry or cleared its fingerprint), or a RAM reduction ahead
-                // of the saved selection, refuses. Claude preserves the
-                // predecessor; Codex keeps its existing invalidation.
+                // committed entry's own fingerprint binds to it. A reverted
+                // entry (local-hold settlement restored the prior one), or a
+                // RAM reduction ahead of the saved selection, refuses: Claude
+                // preserves the predecessor; Codex keeps its invalidation. A
+                // cleared fingerprint names no revision, so it refuses nothing
+                // by itself: the saved extent must still cover this reduction,
+                // and the certificate below still proves the object. Codex's
+                // strict rebind is carried by that clear and stays refused.
                 let acquired_for = selected.remove(&key);
                 match index.files.get(&key) {
                     None => continue,
@@ -4330,6 +4335,11 @@ impl SharedCache {
                         if !entry.source_file_fingerprint.is_empty()
                             && acquired_for.as_deref()
                                 == Some(entry.source_file_fingerprint.as_str()) => {}
+                    Some(entry)
+                        if source != DurableSource::Codex
+                            && entry.source_file_fingerprint.is_empty()
+                            && acquired_for.is_some()
+                            && retained.checkpoint.sealed_offset() <= entry.size_bytes => {}
                     Some(_) => {
                         if source == DurableSource::Codex {
                             invalidate.insert(store::key_digest(source, &key));

@@ -3143,6 +3143,39 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// [regress] The RAM miss class called every cleared fingerprint ineligible.
+/// A clear now misses as an observed entry does, and a missing or history-owed
+/// entry keeps its own class.
+#[test]
+fn ram_miss_class_ignores_an_evidence_clear() {
+    let mut index = ScanIndex::default();
+    let class = |index: &ScanIndex, has_slot| super::super::ram_miss_class(index, "k", has_slot);
+    assert_eq!(class(&index, false).label(), "no_entry");
+    index.active_effective_upload_body_witness_revision = 3;
+    for (fingerprint, revision, slot, unregistered) in [
+        ("fp", 3, "missing", "unavailable"),
+        ("", 3, "missing", "unavailable"),
+        (
+            "fp",
+            2,
+            "ineligible.history_owed",
+            "ineligible.history_owed",
+        ),
+        ("", 2, "ineligible.history_owed", "ineligible.history_owed"),
+    ] {
+        index.files.insert(
+            "k".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,
+                "effective_upload_body_witness_revision":revision
+            }))
+            .unwrap(),
+        );
+        assert_eq!(class(&index, true).label(), slot);
+        assert_eq!(class(&index, false).label(), unregistered);
+    }
+}
+
 /// [format] typed restore misses preserve ON counts and main's no-record decisions OFF.
 #[test]
 fn restore_reports_each_early_exit_without_changing_old_totals() {
@@ -3199,16 +3232,8 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
             .unwrap()
             .source_file_fingerprint
             .clear();
-        // Claude's selection-clear veto is disabled ON. OFF retains main's
-        // pre-I/O reparse-debt label without opening a store.
-        assert_eq!(
-            label(attempt(&index)),
-            if enabled {
-                "missing"
-            } else {
-                "ineligible.selection_cleared"
-            }
-        );
+        // A clear is no miss class, ON or OFF; OFF opens no store to say so.
+        assert_eq!(label(attempt(&index)), "missing");
         index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
         index
             .files
@@ -11131,12 +11156,14 @@ pub(super) fn native_v3_completion(
     }
 }
 
-/// [money] a1a strict writer preserves cleared and reverted predecessors after restore permission.
+/// [money] a1a strict writer preserves a held predecessor (reverted, or cleared
+/// with the reduction ahead of its extent) after restore permission; a clear
+/// over the reduction's own extent is no selection refusal.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
-fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_permission() {
+fn a1a_strict_writer_preserves_held_predecessors_after_restore_permission() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    for arm in ["cleared", "reverted"] {
+    for arm in ["cleared", "cleared_held", "reverted"] {
         let root = crate::test_scratch::private_dir("ottto-a1a-writer");
         let lock = test_locks::hold(&root);
         let path = root.join("t.jsonl");
@@ -11227,19 +11254,22 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
         ));
         lease.release(); // The funded graph has transferred into the bounded cache.
         cache.durable_note_selection(&key, "new-working-selection");
-        if arm == "cleared" {
-            index
-                .files
-                .get_mut(&key)
-                .unwrap()
-                .source_file_fingerprint
-                .clear();
+        if arm != "reverted" {
+            let entry = index.files.get_mut(&key).unwrap();
+            entry.source_file_fingerprint.clear();
+            if arm == "cleared_held" {
+                entry.size_bytes -= 1;
+            }
         }
         index.save(&index_path).unwrap();
-        let receipt = cache
-            .durable_write_after_save(lock, source, &index)
-            .unwrap();
-        assert_eq!(receipt.written, 0);
+        let receipt = cache.durable_write_after_save(lock, source, &index);
+        if arm == "cleared" {
+            let (counts, _) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.not_persisted.get("selection"), None);
+            let _ = std::fs::remove_dir_all(root);
+            continue;
+        }
+        assert_eq!(receipt.unwrap().written, 0);
         let (counts, store) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.not_persisted.get("selection"), Some(&1));
         assert_eq!(store.records_invalidated, 0);

@@ -510,3 +510,72 @@ fn failed_write_case(fail: bool) {
     assert_eq!(body, cold_body, "actual restart reduction equals cold Full");
     drop(cold);
 }
+
+/// [regress] An evidence-only re-arm cleared the fingerprint and that alone
+/// refused the post-save write. The clear now keeps a reduction over its own
+/// extent writable; a held extent, a changed revision and a replaced object
+/// still refuse.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires native cache admission layout"
+)]
+fn post_save_write_takes_an_evidence_clear_and_refuses_real_changes() {
+    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    for (arm, written, refused) in [
+        ("observed", 1, None),
+        ("evidence_clear", 1, None),
+        ("held_extent", 0, Some("selection")),
+        ("revision_changed", 0, Some("selection")),
+        ("object_replaced", 0, Some("certificate")),
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("ottto-dt-evidence-clear-write");
+        let lock = test_locks::hold(&root);
+        let path = root.join("source.jsonl");
+        let source = SnapshotSource::ClaudeCode;
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let scope = Scope("evidence-clear-file".into());
+        let index_path = root.join("index.json");
+        let cache = fixture::cache(source, &index_path, &Scope("evidence-clear".into()), false);
+        let (reduction, checkpoint) = native_record(&path, &scope);
+        let completed = native_v3_completion(&cache, &path, source, reduction, checkpoint);
+        assert!(cache.insert_admitted(key.clone(), completed, 0));
+        cache.durable_note_selection(&key, "fp-a");
+        cache.durable_note_scope(source, &key, &scope);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                "modified_unix_seconds":1,"source_file_fingerprint":"fp-a"
+            }))
+            .unwrap(),
+        );
+        let entry = index.files.get_mut(&key).unwrap();
+        match arm {
+            "evidence_clear" => entry.source_file_fingerprint.clear(),
+            "held_extent" => {
+                entry.source_file_fingerprint.clear();
+                entry.size_bytes -= 1;
+            }
+            "revision_changed" => entry.source_file_fingerprint = "fp-b".into(),
+            "object_replaced" => {
+                let copy = root.join("copy.jsonl");
+                std::fs::copy(&path, &copy).unwrap();
+                std::fs::rename(&copy, &path).unwrap();
+            }
+            _ => {}
+        }
+        index.save(&index_path).unwrap();
+        let receipt = cache.durable_write_after_save(lock, source, &index);
+        assert_eq!(receipt.unwrap().written, written, "{arm}");
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        if let Some(class) = refused {
+            assert_eq!(counts.not_persisted.get(class), Some(&1), "{arm}");
+        }
+    }
+}
