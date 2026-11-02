@@ -410,12 +410,9 @@ pub(crate) fn retained_refusal_settles_for_test(
     )
 }
 
-// Local index projection producer revision; independent of semantic/wire identity.
-// Each indexed file whose stored revision differs is re-read once; the stamp is
-// written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in; 3 (`e2`)
-// re-reads it once more for request-owned money, paced. Bump a
-// source at most once per release; Codex and Pi stay unchanged.
+// Pinned with the replay strings in `backfill.rs`: a compiled history revision never
+// triggers a re-read of existing history; new meaning ships forward via a rule epoch.
+// Changing a pinned value needs owner approval (pin test: `history_revisions_are_pinned`).
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::ClaudeCode => 3,
@@ -13294,6 +13291,22 @@ mod tests {
         include!("snapshot_sync/ack_retention_tests.rs");
     }
     use crate::snapshots::finalize_scan_after_policy;
+    /// [behaviour] Pinned: changing a history revision or replay string re-reads all history.
+    #[test]
+    fn history_revisions_are_pinned() {
+        for (source, revision, replay) in [
+            (
+                SnapshotSource::ClaudeCode,
+                3,
+                "claude_reported_usage_union:v4",
+            ),
+            (SnapshotSource::Codex, 1, "codex_session_exclusive_usage:v7"),
+            (SnapshotSource::Pi, 1, "pi_founder_backfill_leg_a:v1"),
+        ] {
+            assert_eq!(effective_upload_body_witness_revision(source), revision);
+            assert_eq!(current_historical_replay(source).revision, replay);
+        }
+    }
     #[test]
     fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
         let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
