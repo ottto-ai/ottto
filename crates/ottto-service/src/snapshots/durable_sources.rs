@@ -99,7 +99,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         snapshot: SnapshotSource::Pi,
         tag: 3,
         below_accepted: BelowAccepted::Tail,
-        state_v2: false,
+        state_v2: true,
         write_format: 3,
         representations: &representations(
             "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
