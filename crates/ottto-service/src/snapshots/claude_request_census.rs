@@ -679,9 +679,12 @@ impl ClaudeRequestCensusRecord {
         self.current_for(entry_fingerprint)
             || (self.shape == ClaudeRequestCensusShape::IdentityIncomplete
                 && message_known
-                && self.current_derivation()
-                && self.verified_not_twin_or_retired()
-                && fingerprint_matches(self, entry_fingerprint))
+                && self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+                && !self.unverified
+                && !self.twin
+                && self.retired.is_none()
+                && decode_fingerprint(entry_fingerprint)
+                    .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint))
     }
 
     /// A telemetry record (`otel:` key): exact hashes with one fact each, a
