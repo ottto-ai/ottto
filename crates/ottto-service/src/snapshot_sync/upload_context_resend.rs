@@ -18,8 +18,10 @@ pub(super) struct ResendCounts {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(super) struct Cycle {
     pub active: Option<String>,
-    source_matches: bool,
     candidates: BTreeSet<String>,
+    /// Candidate entities whose durable stamp proves their current body under
+    /// this context after the ledger ACK retired.
+    stamped: BTreeSet<String>,
     resends: BTreeMap<String, bool>,
     attempted: BTreeSet<String>,
     files: Vec<(BTreeSet<String>, u64)>,
@@ -35,10 +37,9 @@ pub(super) struct Cycle {
     pub bootstrap_blocks_catchup: bool,
 }
 impl Cycle {
-    pub(super) fn new(context: String, source_matches: bool) -> Self {
+    pub(super) fn new(context: String) -> Self {
         Self {
             active: Some(context),
-            source_matches,
             remaining_bytes: SNAPSHOT_BATCH_MAX_BYTES,
             ..Self::default()
         }
@@ -46,13 +47,15 @@ impl Cycle {
     pub(super) fn is_candidate(&self, entity: &str) -> bool {
         self.candidates.contains(entity)
     }
+    /// A missing or other-context stamp means owed for THIS entity; no
+    /// source-wide state stands in for it.
     pub(super) fn requires_resend(&self, entity: &str, stamps: &BTreeMap<String, String>) -> bool {
         self.is_candidate(entity)
-            && self.active.as_ref().is_some_and(|active| {
-                stamps
-                    .get(entity)
-                    .map_or(!self.source_matches, |stamp| stamp != active)
-            })
+            && !self.stamped.contains(entity)
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|active| stamps.get(entity) != Some(active))
     }
     // Changed bodies are ordinary new revisions and share new-usage priority.
     pub(super) fn is_catchup(&self, entity: &str) -> bool {
@@ -90,16 +93,12 @@ impl Cycle {
         &mut self,
         candidates: &[crate::snapshots::UploadContextReceiptCandidate],
     ) {
-        // A cycle with no active context (Pi until readers switch) decides
-        // nothing from receipts; its candidates only write them.
-        if self.active.is_none() {
-            return;
-        }
         self.candidates = candidates
             .iter()
             .flat_map(|c| c.entities().map(|(fp, _)| fp.clone()))
             .collect();
         self.resends.retain(|fp, _| self.candidates.contains(fp));
+        self.stamped.retain(|fp| self.candidates.contains(fp));
     }
     pub(super) fn note_attempt(&mut self, entity: &str, bytes: u64) {
         if !self.is_catchup(entity) {
@@ -150,8 +149,9 @@ impl Cycle {
 }
 impl SnapshotUploadProgress {
     /// Lead B Q1 (2026-10-31): one file's context ACKs may split across
-    /// passes. An earlier pass's ACK counts only by its durable stamp of the
-    /// same mode context and exact body; an unstamped ACK stays unknown.
+    /// passes. An earlier pass's ACK counts only by its stamp of the same mode
+    /// context and exact body, in the ledger or durably in the index; an
+    /// unstamped ACK stays unknown.
     pub(super) fn split_context_receipt_candidates(
         &self,
     ) -> Vec<crate::snapshots::UploadContextReceiptCandidate> {
@@ -161,14 +161,18 @@ impl SnapshotUploadProgress {
             .map(|candidate| {
                 candidate.with_split_evidence(
                     |entity, body, context| {
-                        self.accepted_body_contexts.get(entity).map(String::as_str) == Some(context)
-                            && self.accepted_body_witnesses.get(entity).map(String::as_str)
-                                == Some(body)
+                        self.ledger_context_stamped(entity, body, context)
+                            || (self.context_resend.active.as_deref() == Some(context)
+                                && self.context_resend.stamped.contains(entity))
                     },
                     &self.context_resend.deferred,
                 )
             })
             .collect()
+    }
+    fn ledger_context_stamped(&self, entity: &str, body: &str, context: &str) -> bool {
+        self.accepted_body_contexts.get(entity).map(String::as_str) == Some(context)
+            && self.accepted_body_witnesses.get(entity).map(String::as_str) == Some(body)
     }
     pub(super) fn prepare_context_receipt_candidates(
         &mut self,
@@ -181,6 +185,25 @@ impl SnapshotUploadProgress {
         self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
         self.context_resend
             .retain_candidates(&self.context_receipt_candidates);
+        // P1: a retired ACK still proves THIS entity's exact body under this
+        // context, destination and replay generation by its durable stamp.
+        if let Some(active) = self.context_resend.active.as_deref() {
+            self.context_resend.stamped = self
+                .context_receipt_candidates
+                .iter()
+                .flat_map(|candidate| candidate.entities())
+                .filter(|(entity, body)| {
+                    !self.ledger_context_stamped(entity, body, active)
+                        && index.entity_upload_context_proven(
+                            &self.destination_namespace_hash,
+                            entity,
+                            body,
+                            active,
+                        )
+                })
+                .map(|(entity, _)| entity.clone())
+                .collect();
+        }
         self.context_resend.files = self
             .context_receipt_candidates
             .iter()
@@ -224,4 +247,4 @@ impl SnapshotUploadProgress {
     }
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed, budget_deferred, server_conflicts);
-crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
+crate::heap_layout_bound::fields!(Cycle; active, candidates, stamped, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);

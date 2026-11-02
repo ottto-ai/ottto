@@ -24,7 +24,7 @@ fn fixture() -> ScanIndex {
     raw["claude_retired_family_tombstones"] = json!({"a".repeat(64):u64::MAX});
     raw["claude_retired_family_tombstones_initialized"] = json!(true);
     // MISC multi-segment scalar alongside FILES, ACCOUNTS and CENSUS owners.
-    raw["upload_context_fingerprint"] = json!("x".repeat(3 * 64 * 1024 + 17));
+    raw["historical_replay_generation"] = json!("x".repeat(3 * 64 * 1024 + 17));
     serde_json::from_value(raw).unwrap()
 }
 
@@ -134,7 +134,7 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         "usage.pending",
         "family.requests",
         "file.entities",
-        "setting.upload_context_fingerprint",
+        "setting.historical_replay_generation",
         "accepted.entity",
     ] {
         let scratch = crate::test_scratch::ScratchDir::canonical("money-missing-owner");
@@ -340,7 +340,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
         ["synthetic-file"] = json!(hashes);
     raw["file_snapshot_fingerprints"]["synthetic-file"] = json!(hashes);
-    raw["upload_context_fingerprint"] = json!(hashes.join(""));
+    raw["historical_replay_generation"] = json!(hashes.join(""));
     let index: ScanIndex = serde_json::from_value(raw).unwrap();
     let mut db = money_test_support::populate(
         &scratch.join("segments.v2.sqlite.import"),
@@ -360,7 +360,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     for kind in [
         "account_window",
         "file.entities",
-        "setting.upload_context_fingerprint",
+        "setting.historical_replay_generation",
     ] {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let rows = tx

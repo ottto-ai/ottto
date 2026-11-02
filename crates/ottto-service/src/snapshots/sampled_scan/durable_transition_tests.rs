@@ -40,7 +40,8 @@ impl M1 {
         assert_eq!(warm.modes, (1, 0, 0));
         warm.enrich(&c);
         warm.finish();
-        let (status, bodies, _) = upload(&warm.scan.snapshots, &mut e2_progress(), ack);
+        let mut progress = e2_progress();
+        let (status, bodies, _) = upload(&warm.scan.snapshots, &mut progress, ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
         let result = RouteResult::emitted(Mode::ColdFull, SOURCE, bodies, &warm.scan.snapshots);
         let accepted = warm
@@ -65,6 +66,13 @@ impl M1 {
                 .iter()
                 .map(|s| s.snapshot_fingerprint.clone())
                 .collect(),
+        );
+        // Settlement also records each file's upload-context receipt from
+        // the exact ACKs, as the service does after every delivered page.
+        accept_upload_context_acks_for_test(
+            &mut warm.index,
+            &warm.scan.snapshots,
+            &progress.fresh_context_body_acks,
         );
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
@@ -219,6 +227,13 @@ impl TransitionDriver for M1 {
                     .iter()
                     .map(|s| s.snapshot_fingerprint.clone())
                     .collect(),
+            );
+            // The exact ACKs earn per-file upload-context receipts, as the
+            // service's settlement records them.
+            accept_upload_context_acks_for_test(
+                &mut page.index,
+                &page.scan.snapshots,
+                &progress.fresh_context_body_acks,
             );
             bodies
         };
@@ -738,6 +753,13 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         // Native partial settlement keeps the old root, never an unACKed r4.
         // The sibling's real native rename failed before either POST; partial
         // index settlement still grants no acceptance to the failed root POST.
+        // The partial checkpoint records the ACKed sibling's upload-context
+        // receipt, as the service does; the unACKed root earns none.
+        accept_upload_context_acks_for_test(
+            &mut attempt.index,
+            &attempt.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         let mut partial = attempt.index.committable_subset(
             &attempt.committed,
             &progress.accepted_fingerprints,
@@ -793,6 +815,11 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         cold_page
             .index
             .record_accepted_snapshot_fingerprints(&cold_progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut cold_page.index,
+            &cold_page.scan.snapshots,
+            &cold_progress.fresh_context_body_acks,
+        );
         let cold = RouteResult::emitted(Mode::ColdFull, SOURCE, batches, &cold_page.scan.snapshots);
 
         // Native RAM re-scan starts at the actual saved partial generation;
@@ -826,6 +853,11 @@ fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
         retry_page
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut retry_page.index,
+            &retry_page.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
         f.prior = f
             .disk
             .commit(&retry_page.cache, SOURCE, &mut retry_page.index);

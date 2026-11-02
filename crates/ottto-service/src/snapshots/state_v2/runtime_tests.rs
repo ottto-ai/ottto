@@ -1010,9 +1010,8 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
-    index.upload_context_fingerprint = Some("synthetic-policy".into());
+    index.historical_replay_generation = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
-    index.file_upload_context_enabled = true;
     assert!(save_locked(
         &f.path,
         &mut index,
@@ -1054,11 +1053,11 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         index.active_upload_context_fingerprint.as_deref(),
         Some("active-synthetic-policy")
     );
-    assert!(index.file_upload_context_enabled && index.v2().persistence_v2.is_some());
+    assert!(index.v2().persistence_v2.is_some());
     let current = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
-        current.upload_context_fingerprint,
-        index.upload_context_fingerprint
+        current.historical_replay_generation,
+        index.historical_replay_generation
     );
     assert_eq!(current.generation, index.generation);
 }
@@ -1811,8 +1810,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     // Loads keep account archives cold; compare the bytes the store holds.
     let committed_view = materialized(&committed);
     let committed_generation = current.generation;
-    let committed_context = current.upload_context_fingerprint.clone();
-    current.upload_context_fingerprint = Some("uncommitted-context".into());
+    let committed_context = current.historical_replay_generation.clone();
+    current.historical_replay_generation = Some("uncommitted-context".into());
     fill_session(&mut current);
     assert!(save_locked(
         &f.path,
@@ -1849,7 +1848,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         committed.v2().growth_retention
     );
     assert_eq!(restored.generation, committed_generation);
-    assert_eq!(restored.upload_context_fingerprint, committed_context);
+    assert_eq!(restored.historical_replay_generation, committed_context);
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 
     let path = seed.files.keys().next().unwrap();
