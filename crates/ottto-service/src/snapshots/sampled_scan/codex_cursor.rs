@@ -1591,102 +1591,52 @@ fn retire_suspended_proof_over(
     !fits
 }
 
-/// Content-free RAM counters. They reach the scan's one completion log
-/// record through `SharedCache::cursor_diagnostics`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::snapshots) struct Counters {
-    pub(in crate::snapshots) jobs_started: u64,
-    pub(in crate::snapshots) jobs_paused: u64,
-    pub(in crate::snapshots) jobs_resumed: u64,
-    /// Published with a sealed-prefix certificate (after `finish`).
-    pub(in crate::snapshots) jobs_certified: u64,
-    /// Lossy with intact samples, finished uncertified (after `finish`).
-    /// Publication then follows main's completeness rule: retryable loss
-    /// (a malformed or invalid line) publishes nothing and is not indexed.
-    pub(in crate::snapshots) jobs_uncertified: u64,
-    /// Restarted after a necessary invalidation; nothing committed.
-    pub(in crate::snapshots) jobs_invalidated: u64,
-    /// Ended as strict `MemberChanged` debt after repeated invalidations.
-    pub(in crate::snapshots) jobs_member_changed: u64,
-    /// Ended as strict `JoinStateBound` debt: the job did not fit the state
-    /// budget even after releasing retained copies.
-    pub(in crate::snapshots) jobs_state_bound: u64,
-    pub(in crate::snapshots) jobs_lost: u64,
-    /// Evidence unavailable at start, resume or emission (K9): deferred as
-    /// `InProgress`, never counted as a member change.
-    pub(in crate::snapshots) jobs_deferred_inputs: u64,
-    /// Start refused because the held file's stamp could not be read.
-    pub(in crate::snapshots) jobs_start_unstartable: u64,
-    /// A tail reached its audit deadline before commit: restarted as
-    /// the full audit, uncounted.
-    pub(in crate::snapshots) jobs_audit_restarted: u64,
-    /// Committed, then the native finish refused publication.
-    pub(in crate::snapshots) jobs_finish_failed: u64,
-    /// A dropped scan frame returned its intact job to the slot (K12).
-    pub(in crate::snapshots) jobs_frame_returned: u64,
-    pub(in crate::snapshots) deferred: u64,
-    /// A large file waited because another is ahead in rotation (K7).
-    pub(in crate::snapshots) deferred_rotation: u64,
-    /// A large read after this generation's completed attempt, left for the
-    /// next generation (K7 fence).
-    pub(in crate::snapshots) deferred_next_generation: u64,
-    /// A resume found a live job of another namespace in the slot (K10).
-    pub(in crate::snapshots) namespace_busy: u64,
-    pub(in crate::snapshots) cursor_disabled_unsupported_layout: u64,
-    /// Certified at or after its audit deadline: the debt stays staged.
-    pub(in crate::snapshots) audit_overdue: u64,
-    /// Largest `now - due` of such a completion, in seconds.
-    pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
-    /// A completion on a file that did not grow withheld an unterminated
-    /// final record (N2): debt staged, the record left to main's EOF path.
-    pub(in crate::snapshots) sealed_fragment_withheld: u64,
-    /// A completion at genuine unchanged EOF applied its withheld final
-    /// record with main's trailing-line rule (strict finish identity).
-    /// Counted only once its `finish` succeeded.
-    pub(in crate::snapshots) eof_record_applied: u64,
-    /// A paused job ended because its path no longer named the held
-    /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`.
-    pub(in crate::snapshots) jobs_unavailable_ended: u64,
-    pub(in crate::snapshots) memo_hits: u64,
-    pub(in crate::snapshots) memo_records: u64,
-    pub(in crate::snapshots) parked_hits: u64,
-    /// P2 (RAM only; not yet in the diagnostics projection): group cursor
-    /// jobs started, group memo hits, group attempts skipped by the generation fence, groups
-    /// whose probe hit `PROBE_BYTES` or the boot's probe allowance
-    /// (chronological order kept), and group refusals by `JoinRefusal` slot
-    /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
-    pub(in crate::snapshots) groups_started: u64,
-    pub(in crate::snapshots) group_memo_hits: u64,
-    pub(in crate::snapshots) groups_fenced: u64,
-    pub(in crate::snapshots) probe_bound: u64,
-    pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
-    /// PR-P (RAM/test only; not in the diagnostics projection, no export):
-    /// parent witnesses refused at admission, forgotten by a feasible
-    /// mandatory admission (one per witness), new namespaces refused past
-    /// `ROTATION_KEYS`, restart slots evicted past `ROTATION_KEYS`, and match
-    /// marks refused. Production sees their effects only through the census
-    /// `parent_unresolvable` counts and `parent_restarts_in_scope`.
-    pub(in crate::snapshots) parent_witness_refused: u64,
-    pub(in crate::snapshots) parent_witness_evicted: u64,
-    pub(in crate::snapshots) parent_namespace_refused: u64,
-    pub(in crate::snapshots) parent_restart_slot_evicted: u64,
-    pub(in crate::snapshots) parent_match_unmarked: u64,
-    /// Stage 1 guard (RAM/test only; not in the diagnostics projection): a
-    /// large ordinary start deferred before its last attempt's ordinary
-    /// equivalent (§6). Owed, like any deferral: never a waiter, a skip, a
-    /// loss or a completion, and no completeness meaning.
-    pub(in crate::snapshots) deferred_paced: u64,
+/// Declares `Counters`: the logged events (`codex_cursor_events!`, in log key
+/// order), then the RAM-only counters.
+macro_rules! cursor_counters {
+    ($($(#[$doc:meta])* $event:ident,)+) => {
+        /// Content-free RAM counters. They reach the scan's one completion log
+        /// record through `SharedCache::cursor_diagnostics`.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub(in crate::snapshots) struct Counters {
+            $($(#[$doc])* pub(in crate::snapshots) $event: u64,)+
+            /// Largest `now - due` of an `audit_overdue` completion, in seconds.
+            pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
+            /// P2 (RAM only; not yet in the diagnostics projection): group cursor
+            /// jobs started, group memo hits, group attempts skipped by the
+            /// generation fence, groups whose probe hit `PROBE_BYTES` or the
+            /// boot's probe allowance
+            /// (chronological order kept), and group refusals by `JoinRefusal` slot
+            /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
+            pub(in crate::snapshots) groups_started: u64,
+            pub(in crate::snapshots) group_memo_hits: u64,
+            pub(in crate::snapshots) groups_fenced: u64,
+            pub(in crate::snapshots) probe_bound: u64,
+            pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
+            /// PR-P (RAM/test only; not in the diagnostics projection, no export):
+            /// parent witnesses refused at admission, forgotten by a feasible
+            /// mandatory admission (one per witness), new namespaces refused past
+            /// `ROTATION_KEYS`, restart slots evicted past `ROTATION_KEYS`, and match
+            /// marks refused. Production sees their effects only through the census
+            /// `parent_unresolvable` counts and `parent_restarts_in_scope`.
+            pub(in crate::snapshots) parent_witness_refused: u64,
+            pub(in crate::snapshots) parent_witness_evicted: u64,
+            pub(in crate::snapshots) parent_namespace_refused: u64,
+            pub(in crate::snapshots) parent_restart_slot_evicted: u64,
+            pub(in crate::snapshots) parent_match_unmarked: u64,
+            /// Stage 1 guard (RAM/test only; not in the diagnostics projection): a
+            /// large ordinary start deferred before its last attempt's ordinary
+            /// equivalent (§6). Owed, like any deferral: never a waiter, a skip, a
+            /// loss or a completion, and no completeness meaning.
+            pub(in crate::snapshots) deferred_paced: u64,
+        }
+        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds,
+            groups_started, group_memo_hits, groups_fenced, probe_bound, join_terminal_debt,
+            parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
+            parent_restart_slot_evicted, parent_match_unmarked, deferred_paced);
+    };
 }
-crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resumed,
-    jobs_certified, jobs_uncertified, jobs_invalidated, jobs_member_changed, jobs_state_bound,
-    jobs_lost, jobs_deferred_inputs, jobs_start_unstartable, jobs_audit_restarted,
-    jobs_finish_failed, jobs_frame_returned, deferred, deferred_rotation,
-    deferred_next_generation, namespace_busy, cursor_disabled_unsupported_layout, audit_overdue,
-    audit_overdue_max_age_seconds, sealed_fragment_withheld, eof_record_applied,
-    jobs_unavailable_ended, memo_hits, memo_records, parked_hits, groups_started,
-    group_memo_hits, groups_fenced, probe_bound, join_terminal_debt,
-    parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
-    parent_restart_slot_evicted, parent_match_unmarked, deferred_paced);
+crate::local_resource_diagnostics::codex_cursor_events!(cursor_counters);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -4624,35 +4574,15 @@ impl SharedCache {
         let fixed = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
         let now = &cursor.counters;
         let d = |pick: fn(&Counters) -> u64| fixed(pick(now).saturating_sub(pick(start)));
+        macro_rules! window_deltas {
+            ($($(#[$doc:meta])* $event:ident,)+) => {
+                CodexCursorEvents { $($event: d(|c| c.$event)),+ }
+            };
+        }
         Some(Box::new(CodexCursorCounts {
-            during_scan_window: CodexCursorEvents {
-                jobs_started: d(|c| c.jobs_started),
-                jobs_paused: d(|c| c.jobs_paused),
-                jobs_resumed: d(|c| c.jobs_resumed),
-                jobs_certified: d(|c| c.jobs_certified),
-                jobs_uncertified: d(|c| c.jobs_uncertified),
-                jobs_invalidated: d(|c| c.jobs_invalidated),
-                jobs_member_changed: d(|c| c.jobs_member_changed),
-                jobs_state_bound: d(|c| c.jobs_state_bound),
-                jobs_lost: d(|c| c.jobs_lost),
-                jobs_deferred_inputs: d(|c| c.jobs_deferred_inputs),
-                jobs_start_unstartable: d(|c| c.jobs_start_unstartable),
-                jobs_audit_restarted: d(|c| c.jobs_audit_restarted),
-                jobs_finish_failed: d(|c| c.jobs_finish_failed),
-                jobs_frame_returned: d(|c| c.jobs_frame_returned),
-                deferred: d(|c| c.deferred),
-                deferred_rotation: d(|c| c.deferred_rotation),
-                deferred_next_generation: d(|c| c.deferred_next_generation),
-                namespace_busy: d(|c| c.namespace_busy),
-                cursor_disabled_unsupported_layout: d(|c| c.cursor_disabled_unsupported_layout),
-                audit_overdue: d(|c| c.audit_overdue),
-                sealed_fragment_withheld: d(|c| c.sealed_fragment_withheld),
-                eof_record_applied: d(|c| c.eof_record_applied),
-                jobs_unavailable_ended: d(|c| c.jobs_unavailable_ended),
-                memo_hits: d(|c| c.memo_hits),
-                memo_records: d(|c| c.memo_records),
-                parked_hits: d(|c| c.parked_hits),
-            },
+            during_scan_window: crate::local_resource_diagnostics::codex_cursor_events!(
+                window_deltas
+            ),
             retained: CodexCursorRetained {
                 paused_job: matches!(cursor.slot, Slot::Paused(_)),
                 paused_job_charged_bytes: fixed(cursor.slot_charge as u64),
@@ -5801,26 +5731,7 @@ pub(in crate::snapshots) fn requeue(
     flags: &BTreeMap<String, (bool, bool)>,
     candidate: &CandidateFile,
 ) {
-    let Some(traversal) = index.traversal.as_mut() else {
-        return;
-    };
-    if traversal
-        .pending_candidates
-        .iter()
-        .any(|pending| pending.path == candidate.path)
-    {
-        return;
-    }
-    let (census_member, watcher_hint) = flags
-        .get(&local_index_key(&candidate.path))
-        .copied()
-        .unwrap_or((true, false));
-    traversal.pending_candidates.push_back(ScanTraversalPath {
-        scan_root: candidate.scan_root.clone(),
-        path: candidate.path.clone(),
-        census_member,
-        watcher_hint,
-    });
+    requeue_members(index, flags, [candidate]);
 }
 
 /// The cursor attempt for this file ended in this page: remove the path that
