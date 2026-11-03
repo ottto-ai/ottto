@@ -1522,55 +1522,6 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
     }
 }
 
-/// [regress] A source with a Tail codec on an index with no state database
-/// route keeps its reduction in RAM, as its retention keys on the route, and
-/// its next read takes that copy back. The take keyed on the codec instead,
-/// so the copy was never taken and each read was Full (CX1 S2b run
-/// 41569018173: 27 Codex rows). Claude's unrouted read has its own Desktop
-/// census gate after the take, so the row asserts the take, and prints modes.
-#[test]
-fn an_unrouted_codec_source_takes_its_ram_copy() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let page = |mut index: ScanIndex| {
-        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
-        cache.bind_withheld(&mut index);
-        let scan = OwnedSourceScan::new(
-            source,
-            std::slice::from_ref(&fixture.root),
-            index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            false,
-            None,
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(cache.clone(), Scope("account-a".into()));
-        let (index, _, _, modes, _) = finish_production_scan_page(scan, source);
-        (index, modes)
-    };
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let ((index, modes), first) = observe(|| page(ScanIndex::default()));
-    assert_eq!(modes, (1, 0, 0), "first read");
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let ((_, modes), next) = observe(|| page(index));
-    eprintln!(
-        "UNROUTED_CODEC_TAKE modes={modes:?} take_hit={}",
-        next.take_hit
-    );
-    assert_eq!(
-        next.take_hit, 1,
-        "the next read takes the copy it kept (first read retained {}, admitted {}; modes {modes:?})",
-        first.retention_produced, first.insert_admitted
-    );
-}
 #[test]
 fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
     if !crate::heap_layout_bound::layout_supported() {

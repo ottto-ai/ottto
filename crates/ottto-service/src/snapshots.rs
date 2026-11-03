@@ -30246,7 +30246,7 @@ impl OwnedSourceScan {
                         // RAM: its Tail is its continuation.
                         #[cfg(unix)]
                         let cache_compatible =
-                            cache_compatible && tail_source::tail_route(source, index).is_none();
+                            cache_compatible && tail_source::keeps_ram(source, index);
                         match parser.retain_reduction(
                             &acquisition.scope,
                             sampled_scan::now_seconds(),
@@ -33921,15 +33921,14 @@ impl OwnedSourceScan {
             {
                 let key = local_index_key(&candidate.path);
                 // On a Tail route the continuation is the committed Tail,
-                // never a RAM copy. Off one, a codec source keeps and takes
-                // its RAM copy, as its retention does.
+                // never a RAM copy; off one, the RAM copy is taken back, by
+                // the rule its retention keys on.
                 #[cfg(unix)]
                 let tail_route = tail_source::tail_route(source, index);
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
-                let taken = tail_route
-                    .is_none()
+                let taken = tail_source::keeps_ram(source, index)
                     .then(|| context.cache.take(&key).map(Box::new))
                     .flatten();
                 #[cfg(not(unix))]

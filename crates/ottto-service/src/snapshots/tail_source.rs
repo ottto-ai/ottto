@@ -54,6 +54,13 @@ pub(in crate::snapshots) fn tail_route(
         .flatten()
 }
 
+/// Whether `source`'s reduction is kept in RAM between reads: exactly when it
+/// has no Tail route. Retention and the take both key on this one rule, so a
+/// copy is kept only where the next read takes it back.
+pub(in crate::snapshots) fn keeps_ram(source: SnapshotSource, index: &ScanIndex) -> bool {
+    tail_route(source, index).is_none()
+}
+
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.
 #[allow(clippy::too_many_arguments)]

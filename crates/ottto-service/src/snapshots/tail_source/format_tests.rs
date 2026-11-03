@@ -11,7 +11,9 @@ use super::tests::{append, cold, committed, committed_lines, counted, len, loade
 use super::*;
 use crate::local_resource_diagnostics::capture;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
-use crate::snapshots::tail_source::{counters, has_codec, hour_pages, read_hour_page, tail_route};
+use crate::snapshots::tail_source::{
+    counters, has_codec, hour_pages, keeps_ram, read_hour_page, tail_route,
+};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
@@ -237,6 +239,18 @@ fn codec_list_gives_routes_and_counters_stay_per_source() {
     }
     let ((), claude) = capture(|| counters::emit(SnapshotSource::ClaudeCode));
     assert_eq!(claude.len(), 1);
+}
+
+/// [regress] Retention and the RAM take share one rule, keyed on the Tail
+/// route: a source off a route keeps and takes its RAM copy, one on a route
+/// neither. The take keyed on the codec, so a codec source off a route kept a
+/// copy it never took and read Full every time (CX1 S2b run 41569018173).
+#[test]
+fn the_ram_copy_is_kept_and_taken_only_off_a_tail_route() {
+    let route = route();
+    assert!(!keeps_ram(SnapshotSource::ClaudeCode, &route.index));
+    assert!(keeps_ram(SnapshotSource::ClaudeCode, &ScanIndex::default()));
+    assert!(keeps_ram(SnapshotSource::Codex, &route.index));
 }
 
 /// [format] The one hourly page codec carries usage buckets (`UsageHours`,
