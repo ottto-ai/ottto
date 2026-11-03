@@ -1934,7 +1934,6 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                             2
                         );
                     }
-                    RearmUpload::Shed => unreachable!(),
                 }
             },
         );

@@ -545,9 +545,6 @@ impl HeaderInventory {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
                     if let Ok(meta) = fs::symlink_metadata(path) {
-                        if index.archive_size_refused(path, meta.len()) {
-                            continue;
-                        }
                         if let Ok(stamp) = FileStamp::capture(meta.clone()) {
                             if index.archives.get(&key).map_or(true, |old| {
                                 old.stamp
