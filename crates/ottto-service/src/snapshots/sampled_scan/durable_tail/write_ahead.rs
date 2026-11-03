@@ -45,7 +45,10 @@ impl<'a> LiveFinishView<'a> {
     }
 }
 
-#[allow(clippy::large_enum_variant)] // Moves the already-funded native frame; boxing would allocate before its lease.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "moves the funded native frame; boxing would allocate before its lease"
+)]
 pub(in crate::snapshots) enum FinishAcquisition {
     Certified(sampled_jsonl::CompletedNativeAcquisition),
     Uncertified(DurableCustody),
@@ -341,7 +344,10 @@ impl SharedCache {
 
     /// Native capture of a fresh acquisition chain. The caller proved the real
     /// held O and, for `write_ahead_eligible`, a byte-zero native origin.
-    #[allow(clippy::too_many_arguments)] // Every input is one proved native fact.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every input is one proved native fact"
+    )]
     pub(in crate::snapshots) fn durable_capture_chain(
         &self,
         lease: &mut store::ActiveLease,
@@ -390,7 +396,10 @@ impl SharedCache {
 
     /// A later pass reuses a retained or restored chain: r_a, protocol and
     /// eligibility are inherited, never restamped; O/binding/generation move.
-    #[allow(clippy::too_many_arguments)] // Each argument is a frozen native proof input; ownership stays with the caller.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a frozen native proof input"
+    )]
     pub(in crate::snapshots) fn durable_rebind_chain(
         &self,
         lease: &mut store::ActiveLease,
@@ -559,7 +568,10 @@ impl SharedCache {
 
     /// The v3 binding the existing reader expects: the current pass's context
     /// and scope formula with format 3 and r_a; the entry digest is reserved.
-    #[allow(clippy::too_many_arguments)] // Frozen binding inputs, including body-derived immutable C.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "frozen binding inputs, including body-derived immutable fields"
+    )]
     pub(super) fn live_binding(
         &self,
         ds: DurableSource,

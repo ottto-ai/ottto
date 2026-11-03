@@ -11,7 +11,6 @@ pub(super) const UNREADABLE_STYLE: u8 = 255;
 const MAX_STYLE_BYTES: usize = 192;
 const MAX_SESSION_BYTES: usize = 128;
 /// One request's money as its row states it.
-#[allow(dead_code)] // Decoded for strict validation of the legacy census format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClaudeFact {
     pub(super) tokens: ClaudeMoneyTokens,
@@ -22,7 +21,6 @@ pub(super) struct ClaudeFact {
 
 /// A record's header: its root session, the base of the clock deltas, the
 /// conflicting and refused lines seen, and the style table.
-#[allow(dead_code)] // The unchanged header decoder validates every field.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ClaudeFactsHeader {
     pub(super) session: String,

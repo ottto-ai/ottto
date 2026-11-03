@@ -545,7 +545,7 @@ pub fn append_success_with_context(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(crate) fn append_success_with_evidence_context(
     state_dir: &Path,
     source: SourceKind,
@@ -569,7 +569,7 @@ pub(crate) fn append_success_with_evidence_context(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(crate) fn append_success_with_evidence_context_bounded(
     state_dir: &Path,
     source: SourceKind,
@@ -593,7 +593,7 @@ pub(crate) fn append_success_with_evidence_context_bounded(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn append_success_with_evidence_context_limit(
     state_dir: &Path,
     source: SourceKind,
@@ -701,7 +701,7 @@ pub fn append_http_failure(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub fn append_http_failure_with_context(
     state_dir: &Path,
     source: SourceKind,
@@ -727,7 +727,7 @@ pub fn append_http_failure_with_context(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(crate) fn append_http_failure_with_context_bounded(
     state_dir: &Path,
     source: SourceKind,
@@ -788,7 +788,6 @@ pub fn append_transport_error_with_context(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_transport_error_with_context_bounded(
     state_dir: &Path,
     source: SourceKind,

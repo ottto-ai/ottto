@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 /// The variant names are the reader's wire values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names, reason = "names are the wire values")]
 pub(crate) enum ClaudeRequestUsageOrigin {
     /// A transcript unit with its API row's own `cost_usd`.
     TelemetryMatched,

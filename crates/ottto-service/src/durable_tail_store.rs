@@ -30,7 +30,13 @@
 //!   uploaded.
 //! - Writes and GC require the state-directory single-writer lock
 //!   (`SingleWriter`); this layer adds no lock of its own.
-#![cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "some temp-file and record-identity helpers are reached only from tests"
+    )
+)]
 
 #[cfg(test)]
 use crate::snapshots::sampled_scan::transition_fixture::{reach, CrashPoint};
@@ -3066,7 +3072,10 @@ fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
     // SAFETY: statvfs succeeded and initialized the structure.
     let stat = unsafe { stat.assume_init() };
     // libc typedef widths vary by target; keep the checked product in u64.
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "libc typedef widths vary by target"
+    )]
     let (fragment_bytes, available_blocks, volume_blocks) = (
         stat.f_frsize as u64,
         stat.f_bavail as u64,
