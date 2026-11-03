@@ -32,7 +32,6 @@ impl Fixture {
             &format!("2026-10-27T{hour:02}:00:00Z"),
             BACKFILL_WINDOW_DAYS,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            false,
         )
         .expect("native scan")
     }

@@ -1930,7 +1930,6 @@ fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
         "2026-10-30T12:00:00Z",
         30,
         10,
-        false,
     );
     assert!(result.is_err());
     assert_eq!(before, serde_json::to_vec(&index).unwrap());

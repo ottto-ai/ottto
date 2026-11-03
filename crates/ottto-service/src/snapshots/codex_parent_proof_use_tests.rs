@@ -220,7 +220,6 @@ fn parse_forged(
         Some(&metadata),
         None,
         Some(Arc::new(Mutex::new(ledgers))),
-        true,
     )
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
@@ -556,7 +555,6 @@ impl Scene {
             None,
             None,
             None,
-            true,
         )
         .unwrap();
         let opened = install_codex_parent_proof(

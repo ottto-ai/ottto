@@ -1165,7 +1165,6 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
             "2026-08-02T07:10:00Z",
             7,
             1,
-            false,
         )
         .unwrap()
     });
@@ -1814,7 +1813,6 @@ fn production_page(dir: &Path, index: &mut ScanIndex, finalize: bool) -> Value {
             PAGE_WINDOW,
             7,
             1,
-            false,
         )
         .unwrap()
     });

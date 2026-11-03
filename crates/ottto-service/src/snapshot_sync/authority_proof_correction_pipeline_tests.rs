@@ -449,7 +449,6 @@ impl ApcFixture {
                 collected_at,
                 183,
                 self.page_files.get(),
-                true,
                 Some(&self.support),
                 &[],
                 false,
@@ -858,7 +857,6 @@ impl ApcFixture {
         }
     }
 
-
     /// One bounded traversal generation. `upload` picks each page's upload
     /// outcome by page number; a crashed page is retried by the next page.
     fn generation(&self, hour: u32, upload: impl Fn(usize) -> ApcUpload) -> Vec<ApcPage> {
@@ -877,7 +875,6 @@ impl ApcFixture {
         }
         panic!("the generation ends within {APC_MAX_PAGES} bounded pages");
     }
-
 
     /// Every save reloads with the family intact: never a quarantined index.
     fn assert_durable(&self, page: &ApcPage, hour: u32) {
@@ -1020,7 +1017,6 @@ impl ApcFixture {
         self.list_family();
         ApcEstablished { proven, heads }
     }
-
 
     /// Natural regression: repeated subagent requests until the first complete
     /// census after the terminal hold. That census proves a changed witness,
@@ -2063,7 +2059,6 @@ fn apc_m2_scan(census_complete: bool) -> crate::snapshots::SourceScanResult {
         APC_WINDOW_END,
         183,
         APC_PAGE_FILES,
-        false,
     )
     .expect("empty synthetic scan");
     scan.census_complete = census_complete;
@@ -3003,7 +2998,6 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         );
     }
 }
-
 
 /// The R2 invariant, strictly: every member this page drained certifies the
 /// exact revision its saved file entry has, the re-arm marker included (which

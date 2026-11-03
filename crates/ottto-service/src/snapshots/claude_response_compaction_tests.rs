@@ -217,7 +217,6 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
         Some(&CodexTitleMetadata::default()),
         None,
         None,
-        false,
     )
     .unwrap();
     (parser, expected)
@@ -272,9 +271,7 @@ fn acquire(
 }
 
 fn oracle(path: &Path) -> Value {
-    let mut items =
-        parse_claude_code_jsonl_file_with_artifacts(path, NOW, "native-fixture".into(), false)
-            .unwrap();
+    let mut items = parse_claude_code_jsonl_file(path, NOW, "native-fixture".into()).unwrap();
     apply_upload_policy(
         SnapshotSource::ClaudeCode,
         &mut items,

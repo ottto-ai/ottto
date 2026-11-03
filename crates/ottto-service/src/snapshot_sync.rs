@@ -7057,7 +7057,6 @@ fn prepare_sync_source_inner(
         &scan_started_at,
         scan_window_days,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        upload_policy.session_artifacts_enabled,
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
         &watcher_hints.paths,
         watcher_hints.overflowed,
@@ -7066,6 +7065,7 @@ fn prepare_sync_source_inner(
         &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
+    .with_launch_events(home)
     .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
@@ -7467,12 +7467,12 @@ fn prepare_continuation_source(
         &scan_started_at,
         scan_request_window_days(inputs.receipt_window_days, false),
         MAX_BACKFILL_FILES_PER_SOURCE,
-        inputs.upload_policy.session_artifacts_enabled,
         ordinary_equivalent,
         inputs.evidence.take(),
     )
     .with_continuation_deadline(deadline)
     .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
+    .with_launch_events(home)
     .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
@@ -12909,10 +12909,10 @@ fn snapshot_upload_context_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-/// One destination-scoped index is shared by every privacy policy. The durable
-/// upload-context witness inside the index forces a complete correction pass
-/// whenever policy changes, including A→B→A. Keeping one file per policy made
-/// the second transition reuse an old settled checkpoint and skip correction.
+/// One destination-scoped index is shared by every privacy policy. A policy
+/// change reads nothing: it applies to bodies acquired from then on, and the
+/// per-entity proofs inside the index keep each delivery bound to the context
+/// it was sent under.
 fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("snapshots")
@@ -14093,7 +14093,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14214,7 +14213,6 @@ mod tests {
             "2026-09-30T10:05:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
         )
         .unwrap();
         assert_eq!(raw.snapshots.len(), 1);
@@ -14394,7 +14392,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14666,7 +14663,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_effective_wire_unchanged_capability_enable_survives_finalization() {
+    fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
@@ -14681,7 +14678,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14894,38 +14890,10 @@ mod tests {
             scan(&mut index).snapshots.is_empty(),
             "next unchanged source is settled"
         );
+        // A capability flip reads nothing on an unchanged file: it applies
+        // from the next body on.
         index.activate_upload_context("cache-on-same-effective-projection".into());
-        let mut repeated = scan(&mut index);
-        assert_eq!(repeated.snapshots.len(), 1);
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut repeated.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::Codex,
-            &mut repeated,
-            &mut index,
-            |item| {
-                effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
-            },
-        );
-        // A new context owes even an equal effective body once: finalization
-        // keeps it; its exact ACK earns the receipt and the file is quiet.
-        assert_eq!(
-            repeated.snapshots.len(),
-            1,
-            "owed once under the new context"
-        );
-        for item in &mut repeated.snapshots {
-            prepare_snapshot_cache_for_upload(item, &progress, true, false, &legacy);
-        }
-        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
-            &mut index,
-            &repeated.snapshots,
-            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&repeated.snapshots),
-        );
-        assert!(scan(&mut index).snapshots.is_empty(), "then quiet");
+        assert!(scan(&mut index).snapshots.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -15383,7 +15351,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap();
             assert_eq!(scan.snapshots.len(), 1);
@@ -15846,7 +15813,6 @@ mod tests {
             "2026-08-29T12:30:00Z",
             183,
             10,
-            true,
         )
         .expect("scan collision upload fixture");
         assert_eq!(scan.discovered_file_count, 1);
@@ -15916,7 +15882,6 @@ mod tests {
             "2026-08-30T12:05:00Z",
             183,
             10,
-            true,
         )
         .expect("scan snapshot fixture");
         assert_eq!(scan.snapshots.len(), 1);
@@ -17133,7 +17098,6 @@ mod tests {
             "2026-07-31T00:00:00Z",
             183,
             2,
-            true,
         )
         .expect("scan first bounded page");
         assert!(!first.census_complete);
@@ -17274,7 +17238,6 @@ mod tests {
             "2026-07-31T00:05:00Z",
             183,
             2,
-            true,
         )
         .expect("scan later bounded page");
         assert!(second.census_complete);
@@ -18399,7 +18362,6 @@ mod tests {
                     collected_at,
                     crate::snapshots::BACKFILL_WINDOW_DAYS,
                     0,
-                    true,
                     &hints,
                 )
                 .unwrap()
@@ -18425,7 +18387,6 @@ mod tests {
                     collected_at,
                     crate::snapshots::BACKFILL_WINDOW_DAYS,
                     1,
-                    true,
                     &hints,
                 )
                 .unwrap()
@@ -18531,7 +18492,6 @@ mod tests {
                 collected_at,
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 1,
-                true,
                 &hints,
             )
             .unwrap()
@@ -19191,6 +19151,40 @@ mod tests {
         assert_ne!(
             stable,
             snapshot_upload_context_fingerprint(SnapshotUploadPolicy::default(), None)
+        );
+    }
+
+    /// [money] The delivery context stays byte-identical while receipts,
+    /// stamps and ACK contexts still bind it: a changed formula would owe every
+    /// proven file again. Values computed independently of this code.
+    #[test]
+    fn upload_context_formula_is_pinned() {
+        let off = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            workspace_labels_enabled: false,
+            session_artifacts_enabled: false,
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        };
+        let on = SnapshotUploadPolicy {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            session_artifacts_enabled: true,
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+        };
+        assert_eq!(
+            cycle_upload_context(off, None, false),
+            "e69b3670ac30103faba7f9dadcff9acc5138dad509fb7ed49b52dff1668cbd4e"
+        );
+        let cached = cycle_upload_context(on, Some("stable-key-epoch"), true);
+        assert_eq!(
+            cached,
+            "ee323545020e97a574089c2e4e03176ad17917d6d78658abb9f39494487581df"
+        );
+        assert_eq!(
+            copy_unproven_upload_context(resumed_prefix_upload_context(cached, true), true),
+            "ca93839676f7beb9078f01550cb3f0b77fca81c318f222f39ffabda0095302d7"
         );
     }
 
@@ -22953,6 +22947,10 @@ mod tests {
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        #[cfg(unix)]
+        mod privacy_flip_money_tests {
+            include!("snapshot_sync/privacy_flip_money_tests.rs");
+        }
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
@@ -23205,7 +23203,6 @@ mod tests {
             "2026-10-06T23:00:00Z",
             7,
             3,
-            false,
         )
         .unwrap();
         index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut scan.snapshots, &[]);
@@ -23801,7 +23798,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap();
             for item in &mut scan.snapshots {
@@ -24650,7 +24646,6 @@ mod tests {
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         scan.snapshots = vec![raw.clone()];

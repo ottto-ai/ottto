@@ -176,7 +176,6 @@ fn unchanged_stale_debt_never_reads_on_automatic_retry_passes() {
             collected,
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             8,
-            true,
             std::slice::from_ref(&path),
         )
         .unwrap()

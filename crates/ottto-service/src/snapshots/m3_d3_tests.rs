@@ -118,7 +118,6 @@ fn scan_with_window(
         COLLECTED,
         backfill_window_days,
         100,
-        false,
         None,
         &[],
         false,

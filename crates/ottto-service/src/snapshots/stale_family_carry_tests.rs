@@ -1103,7 +1103,6 @@ fn window_index() -> ScanIndex {
         context_fingerprint: scan_traversal_context_fingerprint(
             SnapshotSource::ClaudeCode,
             &[],
-            &index,
             BACKFILL_WINDOW_DAYS,
         ),
         process: claude_full_rearm_process(),
@@ -1808,7 +1807,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
                 Some(&CodexTitleMetadata::default()),
                 None,
                 None,
-                false,
             )
             .unwrap();
             assert_eq!(
@@ -2007,7 +2005,6 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
                 Some(&CodexTitleMetadata::default()),
                 None,
                 None,
-                false,
             )
             .unwrap();
             assert_eq!(
@@ -3516,12 +3513,7 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         return;
     }
     for case in [
-        "ledger",
-        "upload_context",
-        "content",
-        "sidecar",
-        "account",
-        "scratch",
+        "ledger", "window", "content", "sidecar", "account", "scratch",
     ] {
         let mut fixture = contract_debt_fixture(2);
         let changed_member = matches!(case, "content" | "sidecar" | "account");
@@ -3541,14 +3533,12 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         }
         let before = fixture.index.accepted_snapshot_fingerprints.clone();
         let _scratch = (case == "scratch").then(RefuseClaudeStaleFamilyCarryBudgetForTest::new);
-        match case {
-            "ledger" => fixture.index.accepted_snapshot_fingerprint_ledger_version = 0,
-            "upload_context" => {
-                fixture.index.active_upload_context_fingerprint = Some("changed".into())
-            }
-            _ => (),
+        if case == "ledger" {
+            fixture.index.accepted_snapshot_fingerprint_ledger_version = 0;
         }
-        carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        // A window change is a walk change; a delivery context is not.
+        let window = BACKFILL_WINDOW_DAYS + u64::from(case == "window");
+        carry_start(&mut fixture.index, CARRY_RETRY, window);
         if changed_member {
             assert!(
                 fixture.index.claude_stale_family_carry.contains(CARRY_ROOT),
@@ -3868,7 +3858,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         CARRY_RETRY,
         BACKFILL_WINDOW_DAYS,
         1,
-        false,
         None,
         &[],
         false,
@@ -3901,7 +3890,6 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         CARRY_SECOND_RETRY,
         BACKFILL_WINDOW_DAYS,
         1,
-        false,
         None,
         &[],
         false,
@@ -4445,7 +4433,10 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
             reads.push(candidate.path.clone());
         }
     }
-    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| reads.contains(&candidate.path))
+    {
         index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
     }
     reads

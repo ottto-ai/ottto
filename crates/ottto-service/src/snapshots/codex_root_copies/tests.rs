@@ -92,7 +92,6 @@ impl Fixture {
             "2026-10-25T08:00:00Z",
             BACKFILL_WINDOW_DAYS,
             10_000,
-            false,
             None,
             &[],
             false,

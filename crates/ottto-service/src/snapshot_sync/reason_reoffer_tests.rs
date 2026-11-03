@@ -563,7 +563,6 @@ fn materialized_cache_probe_matches_only_its_own_refusal_witness() {
         "2026-09-30T10:05:00Z",
         crate::snapshots::BACKFILL_WINDOW_DAYS,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        true,
     )
     .unwrap();
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);

@@ -2406,7 +2406,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
             native.accumulator.source_session_id.as_deref(),
             &path,
         );
-        while !context.prepare_launch_step(&workers).unwrap() {}
+        while !context.launch_events().prepare_step(&workers).unwrap() {}
         let identity =
             opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(&path).unwrap())
                 .unwrap();

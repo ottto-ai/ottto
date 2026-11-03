@@ -19,6 +19,7 @@ pub(crate) struct E2ScanFixture {
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
+    attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
 }
 impl E2ScanFixture {
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
@@ -32,6 +33,14 @@ impl E2ScanFixture {
             capture_claude_identity,
             ..Self::default()
         }
+    }
+
+    /// The key this scanner's next pass finishes under, as the service's scan.
+    pub(crate) fn set_attribution(
+        &self,
+        attribution: Option<crate::session_attribution::SessionAttributionContext>,
+    ) {
+        *self.attribution.lock().unwrap() = attribution;
     }
 
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
@@ -95,7 +104,6 @@ impl E2ScanFixture {
             "2026-08-02T08:00:00Z",
             183,
             limit,
-            false,
             Some(support),
             hints,
             false,
@@ -137,7 +145,6 @@ impl E2ScanFixture {
             "2026-10-27T08:00:00Z",
             183,
             100,
-            false,
             Some(support),
             &[],
             false,
@@ -186,7 +193,10 @@ impl E2ScanFixture {
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |s| {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
-            match scan.step(None) {
+            let attribution = self.attribution.lock().unwrap();
+            let step = scan.step(attribution.as_ref());
+            drop(attribution);
+            match step {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
             }
@@ -342,7 +352,7 @@ pub(crate) fn parse_ordinary(
     at: &str,
     fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
-    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default(), true)
+    parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default())
 }
 
 pub(super) fn parse_ordinary_with_metadata(
@@ -350,7 +360,6 @@ pub(super) fn parse_ordinary_with_metadata(
     at: &str,
     fingerprint: String,
     metadata: &ClaudeTitleMetadata,
-    artifacts: bool,
 ) -> Result<Vec<SnapshotItem>> {
     let mut file = File::open(path)?;
     let opened = opened_object_identity(SnapshotSource::ClaudeCode, &mut file)?;
@@ -362,7 +371,6 @@ pub(super) fn parse_ordinary_with_metadata(
         None,
         None,
         None,
-        artifacts,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

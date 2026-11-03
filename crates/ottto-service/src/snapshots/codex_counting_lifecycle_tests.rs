@@ -51,7 +51,6 @@ fn scan_at(root: &Path, index: &mut ScanIndex, collected_at: &str) -> SourceScan
         collected_at,
         7,
         10,
-        false,
     )
     .unwrap()
 }
@@ -198,7 +197,6 @@ fn pruned_moved_session(v2: bool, old_binding: bool) {
         &mut working,
         "2026-10-06T23:00:00Z",
         7,
-        false,
         None,
         std::slice::from_ref(&acked.original),
         false,
