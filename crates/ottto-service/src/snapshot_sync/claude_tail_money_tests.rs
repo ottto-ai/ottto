@@ -736,6 +736,13 @@ fn other_page_observing_raw(
     prior: ScanIndex,
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // A source with a Tail codec (Codex) continues from its owner's route,
+    // as `Corpus::raw` does for Claude; Pi keeps its RAM path.
+    let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+        source,
+        Some(scanner.cache.as_ref()),
+        prior,
+    );
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
