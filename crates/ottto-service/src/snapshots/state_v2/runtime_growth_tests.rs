@@ -630,10 +630,9 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     let f = Fixture::new();
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    index.file_snapshot_fingerprints.insert(
-        f.key.clone(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert(f.key.clone(), tests::over_row_limit());
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -648,10 +647,9 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     })
     .unwrap();
     assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
-    index.file_snapshot_fingerprints.insert(
-        f.key.clone(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert(f.key.clone(), tests::over_row_limit());
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert!(save_oversize_active(&index).unwrap());
@@ -713,7 +711,7 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     );
     crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
 
-    // [money] A native value over its 1 MiB cap at save retains the
+    // [money] A native value over the physical row limit at save retains the
     // page-one SaveOversize hold, alarm and pacing.
     let mut index = f.load();
     let before = index.clone();
@@ -724,10 +722,9 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     .unwrap();
     let held_at = NOW + 3 * INTERVAL;
     assert!(save_read_admitted(&index, &f.key, held_at).unwrap());
-    index.file_snapshot_fingerprints.insert(
-        f.key.clone(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert(f.key.clone(), tests::over_row_limit());
     telemetry::event("save_oversize_alarm", &0);
     let (error, records) =
         crate::local_resource_diagnostics::capture(|| index.save(&f.path).unwrap_err());
@@ -795,10 +792,9 @@ fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
         .expect("the scan's fence names its page-one file");
 
     let mut index = f.load();
-    index.file_snapshot_fingerprints.insert(
-        key.clone(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), tests::over_row_limit());
     assert!(index.save(&f.path).is_err());
     let mut held = f.load();
     assert!(save_oversize_active(&held).unwrap());
