@@ -231,7 +231,7 @@ fn assert_wire(route: &RouteResult, mode: Mode, label: &str) {
     );
     assert_eq!(
         carried(&root["activity_summary"]["skills"]),
-        policy.session_attribution_labels_enabled,
+        policy.private_labels(),
         "{label}: skill names"
     );
     let empty = Vec::new();
@@ -251,9 +251,15 @@ fn assert_wire(route: &RouteResult, mode: Mode, label: &str) {
             vec![opaque_hmac_id(&key, "template_group", &template).unwrap()],
             "{label}: template under the key at send"
         );
+        // One opaque id per skill is a name: it goes only with names on.
+        let skill_ids = if policy.names() {
+            vec![opaque_hmac_id(&key, "skill", SKILL).unwrap()]
+        } else {
+            Vec::new()
+        };
         assert_eq!(
             keyed("skill_id"),
-            vec![opaque_hmac_id(&key, "skill", SKILL).unwrap()],
+            skill_ids,
             "{label}: skill under the key at send"
         );
     } else {
