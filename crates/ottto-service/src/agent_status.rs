@@ -17712,6 +17712,50 @@ pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTr
     .any(|key| value.get(key).is_some_and(|value| !value.is_null()))
 }
 
+/// Accepted registered Codex slots (never a process-only home), login cause.
+pub(crate) fn registered_codex_creator_slots() -> Vec<(String, String, usize)> {
+    let Ok(status) = FileCodexAccountSlotSettingsStore::default().load() else {
+        return Vec::new();
+    };
+    let env_api_key = ["OPENAI_API_KEY", "CODEX_API_KEY"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    let slots = codex_home_slots(&status).into_iter();
+    slots
+        .filter_map(|slot| {
+            let (account, workspace) = slot.registered_binding?;
+            let cause = codex_slot_login_cause(&slot.home, env_api_key);
+            Some((account, workspace, cause))
+        })
+        .collect()
+}
+
+/// Named only with forced ChatGPT config, `chatgpt` auth mode and no API key
+/// there or in the env; unreadable refuses. Only these fields are decoded.
+pub(crate) fn codex_slot_login_cause(home: &Path, env_api_key: bool) -> usize {
+    use crate::codex_scan_diagnostics::*;
+    #[derive(Deserialize)]
+    struct SavedLogin {
+        auth_mode: Option<String>,
+        #[serde(rename = "OPENAI_API_KEY", default)]
+        api_key: Option<serde::de::IgnoredAny>,
+    }
+    let config = ottto_core::read_codex_config_file_secure(home, CodexHomeTrust::Managed);
+    let forced = config.ok().flatten().and_then(|body| {
+        let config: toml_edit::DocumentMut = String::from_utf8(body).ok()?.parse().ok()?;
+        Some(config.get("forced_login_method")?.as_str()? == "chatgpt")
+    });
+    let auth = ottto_core::read_codex_auth_file_secure(home, CodexHomeTrust::Managed);
+    let saved = auth.ok().flatten();
+    let saved = saved.and_then(|auth| serde_json::from_slice::<SavedLogin>(&auth).ok());
+    match saved.filter(|saved| saved.auth_mode.as_deref() == Some("chatgpt")) {
+        _ if forced != Some(true) => CREATOR_NOT_FORCED_CHATGPT,
+        None => CREATOR_MODE_UNREADABLE,
+        Some(saved) if saved.api_key.is_some() || env_api_key => CREATOR_API_KEY,
+        Some(_) => CREATOR_NAMED,
+    }
+}
+
 pub(crate) fn session_launch_codex_identity(
     home: &Path,
     trust: CodexHomeTrust,

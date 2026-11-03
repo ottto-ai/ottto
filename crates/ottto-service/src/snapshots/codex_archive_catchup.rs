@@ -1,6 +1,6 @@
 //! Standalone archive admission over the ordinary complete-scope inventory.
 use super::*;
-use codex_compressed_input::{archive_alarm, ArchiveEvidence};
+use codex_compressed_input::archive_alarm;
 
 impl ScanIndex {
     pub(super) fn archive_io_error(&mut self, path: &Path, error: Option<&std::io::Error>) {
@@ -158,40 +158,15 @@ impl ScanIndex {
         }
         Ok(())
     }
-    fn archive_parent_ready(
-        &self,
-        key: &str,
-        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    ) -> bool {
-        self.archives
-            .get(key)
-            .and_then(ArchiveEvidence::header)
-            .and_then(|h| h.parent.as_ref())
-            .map_or(true, |parent| {
-                validated
-                    .and_then(|map| map.lock().ok())
-                    .is_some_and(|map| {
-                        map.get(parent).is_some_and(|ledger| {
-                            ledger.scan_complete && !ledger.signatures.is_empty()
-                        })
-                    })
-            })
-    }
     fn archive_gate(
         &self,
         key: &str,
         inventory: Option<&codex_file_join::HeaderInventory>,
         budget: &sampled_scan::codex_cursor::PageBudget,
-        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) -> Result<(), ArchiveTransition> {
         if !budget.archive_ready(&self.archive_pass) {
             return Err(ArchiveTransition::Transient(
                 CodexZstCause::AdmissionRefused,
-            ));
-        }
-        if !self.archive_parent_ready(key, validated) {
-            return Err(ArchiveTransition::Correctness(
-                CodexZstCause::ParentLedgerUnbound,
             ));
         }
         inventory
@@ -206,7 +181,6 @@ impl ScanIndex {
         candidates: &VecDeque<CandidateFile>,
         inventory: &codex_file_join::HeaderInventory,
         budget: &sampled_scan::codex_cursor::PageBudget,
-        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) {
         if self.archive_pass.prepared {
             return;
@@ -221,7 +195,7 @@ impl ScanIndex {
             if self.archive_quiet(&key) {
                 continue;
             }
-            match self.archive_gate(&key, Some(inventory), budget, validated) {
+            match self.archive_gate(&key, Some(inventory), budget) {
                 Err(ArchiveTransition::Transient(_)) => continue,
                 Err(change) => self.archive_transition(&c.path, change),
                 Ok(()) => {
@@ -242,7 +216,6 @@ impl ScanIndex {
         file: &File,
         inventory: Option<&codex_file_join::HeaderInventory>,
         budget: &sampled_scan::codex_cursor::PageBudget,
-        validated: Option<&Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) -> bool {
         let key = local_index_key(&c.path);
         let Some(a) = self.archives.get(&key).filter(|a| a.matches(file)) else {
@@ -255,7 +228,7 @@ impl ScanIndex {
         if !a.ready_full() {
             return false;
         }
-        if let Err(change) = self.archive_gate(&key, inventory, budget, validated) {
+        if let Err(change) = self.archive_gate(&key, inventory, budget) {
             // A budget refusal cancels the unconsumed Full reservation.
             self.archive_transition(&c.path, change);
             return false;

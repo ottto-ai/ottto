@@ -7978,11 +7978,19 @@ fn finish_sync_source(
         crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
     let cached_codex_login_changed = source == SnapshotSource::Codex
         && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
+    let creator_slots = (source == SnapshotSource::Codex)
+        .then(crate::agent_status::registered_codex_creator_slots)
+        .unwrap_or_default();
+    let codex_diagnostics = scan_result.local_codex_diagnostics.as_mut();
     let deferred_accounts = index.bind_session_accounts_with_mixed(
         source,
         machine_id,
         &mut scan_result.snapshots,
         &current_codex_bindings,
+        (
+            &creator_slots,
+            codex_diagnostics.map_or(&mut [0; 9], |d| &mut d.creator_slot_naming),
+        ),
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
@@ -24987,6 +24995,7 @@ mod tests {
                         "machine",
                         std::slice::from_mut(item),
                         &[],
+                        (&[], &mut [0; 9]),
                         &proof.mixed_uploads
                     )
                     .is_empty());
@@ -25035,6 +25044,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut candidate),
                 &[],
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());
@@ -25113,6 +25123,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut retry),
                 &[],
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());

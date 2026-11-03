@@ -4,13 +4,17 @@ Codex discovery and watcher hints include exact `.jsonl.zst` suffixes by default
 Claude and Pi retain their existing readers. All sources retain the ordinary
 parser, reducer, line delivery, upload policy and destination receipt owners.
 
-An archive can publish only when its own header names a standalone native
-session. Every configured root and relevant home must have complete absence
-coverage through the existing census owner. Any plain or archive claimant of
-the same session is held before Full decoding. Unknown or damaged headers,
-unresolved parents and conflicting creators are also held. V1 does not use
-response signatures, cumulative totals or accepted plain bodies to establish
-archive domination or replacement.
+An archive can publish only when its own header identifies one native session
+and the shared ownership parser proves complete local usage. Every configured
+root and relevant home must have complete absence coverage through the existing
+census owner. Any plain or archive claimant of the same session is held before
+Full decoding, as are unknown or damaged headers. Subagent lineage, ordinal
+boundaries and external `history_base` references use the same ownership rules
+as plain files; lineage alone does not require a parent ledger. Ordinary forks
+still need proven parent-prefix evidence in the parser and are held after a
+funded Full when that evidence is missing. Conflicting creators also remain held.
+V1 does not use response signatures, cumulative totals or accepted plain bodies
+to establish archive domination or replacement.
 
 Archive debt blocks only archive-dependent decisions. It is counted and alarmed
 separately from ordinary unreadable-file errors. Unaccepted reservations remain
@@ -28,8 +32,9 @@ pages to EOF; a process restart loses that checkpoint.
 
 Power, contention and byte-budget refusal before a Full remain eligible on
 the next pass. A spent Full keeps its saved six-hour retry deadline. An unchanged
-structural cause does not trigger another Full. Parent support and same-session
-union bodies are follow-up work. The archive wall-work allowance gates admission
+structural cause does not trigger another Full. An ordinary fork missing parent
+proof remains owed and uses the existing six-hour parent retry. Binding an
+archive-only parent ledger and same-session union bodies are follow-up work. The archive wall-work allowance gates admission
 of the next archive; a started Full retains its RAM parser to EOF. Unconsumed
 reservations cancel without a Full penalty. Power is sampled once per page.
 Caps retain owed discovery and disclose refusal.
@@ -43,7 +48,7 @@ validating each directory home once within a check. Archive work restores the na
 Archive state uses the existing index save and state-store owners, with no slot added to ordinary file entries.
 
 Release note: context or replay changes retain accepted archive money and mark
-`CorrectionUnapplied` once per transition. No automatic archive reread is granted;
+`CorrectionUnapplied` once per transition. These changes grant no automatic archive reread;
 generic correction/evidence debt remains a named follow-up.
 
 Other follow-ups are same-session union bodies, retained resend, durable

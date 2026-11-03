@@ -1,7 +1,8 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     ParentUnresolvableCauses, RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs,
-    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    UnreadableCause, UnreadableCauses, CREATOR_DIFFERENT_OWNER, CREATOR_MULTI_MATCH, CREATOR_NAMED,
+    CREATOR_NO_MATCH, CREATOR_NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -167,6 +168,8 @@ pub(crate) use claude_context_file_birth::{
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
+#[cfg(test)]
+mod codex_creator_slot_tests;
 mod codex_root_copies;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
@@ -28605,7 +28608,6 @@ impl OwnedSourceScan {
                             &identified_candidates,
                             inventory,
                             &codex_page,
-                            codex_parent_ownership_ledgers.as_ref(),
                         );
                         pending!();
                     }
@@ -33958,7 +33960,6 @@ impl OwnedSourceScan {
                     &opened_file,
                     codex_join_inventory.as_ref(),
                     &codex_page,
-                    codex_parent_ownership_ledgers.as_ref(),
                 ) {
                     pending!();
                 }
@@ -48868,16 +48869,19 @@ impl ScanIndex {
             machine_id,
             snapshots,
             codex_homes,
+            (&[], &mut [0; 9]),
             &claude_request_accounts::MixedUploads::default(),
         )
     }
 
+    /// `codex_slots`: (account, workspace, login cause) a Codex creator may name.
     pub(crate) fn bind_session_accounts_with_mixed(
         &mut self,
         source: SnapshotSource,
         machine_id: &str,
         snapshots: &mut [SnapshotItem],
         codex_homes: &[crate::agent_status::CodexHomeBinding],
+        (codex_slots, creator_counts): (&[(String, String, usize)], &mut [u64; 9]),
         mixed: &claude_request_accounts::MixedUploads,
     ) -> BTreeSet<String> {
         let mut deferred = BTreeSet::new();
@@ -48887,9 +48891,40 @@ impl ScanIndex {
             let existing = self.session_account_bindings.get(&key);
             match source {
                 SnapshotSource::Codex => {
-                    if !codex_rows_prove_oauth(item) {
-                        set_session_account_hash(item, None);
-                        continue;
+                    let mut creator_slot = None;
+                    if !codex_rows_all(item, |mode| matches!(mode, Some("oauth" | "chatgpt"))) {
+                        // No recorded mode: only the creator's slot names a session
+                        // never emitted before, never the home (forward only).
+                        if !codex_rows_all(item, |mode| mode.is_none()) {
+                            set_session_account_hash(item, None);
+                            continue;
+                        }
+                        let decided = match (codex_creator_pair(item), existing) {
+                            (None, _) => Err(CREATOR_NO_PAIR),
+                            (Some((account, _)), Some(owner))
+                                if owner.account_identifier_hash == account =>
+                            {
+                                Ok(None)
+                            }
+                            (Some(_), Some(_)) => Err(CREATOR_DIFFERENT_OWNER),
+                            (Some(_), None) if !self.codex_file_never_emitted(item) => {
+                                Err(CREATOR_PREVIOUSLY_UPLOADED)
+                            }
+                            (Some((account, workspace)), None) => {
+                                codex_creator_slot(account, workspace, codex_slots).map(Some)
+                            }
+                        };
+                        match decided {
+                            Ok(owner) => {
+                                creator_counts[CREATOR_NAMED] += u64::from(owner.is_some());
+                                creator_slot = owner;
+                            }
+                            Err(cause) => {
+                                creator_counts[cause] += 1;
+                                set_session_account_hash(item, None);
+                                continue;
+                            }
+                        }
                     }
                     // An explicit creator-negative is a source decision, not
                     // the legacy absence of an optional witness. Neither a
@@ -48910,6 +48945,7 @@ impl ScanIndex {
                     }
                     let owner = existing
                         .cloned()
+                        .or(creator_slot)
                         .or_else(|| self.codex_owner_for_item(item, codex_homes));
                     if let Some(owner) = owner {
                         self.session_account_bindings
@@ -48990,6 +49026,20 @@ impl ScanIndex {
             }
         }
         deferred
+    }
+
+    /// `item`'s one file has emitted no snapshot before this scan.
+    fn codex_file_never_emitted(&self, item: &SnapshotItem) -> bool {
+        let fingerprint = item.source_file_fingerprint.as_deref();
+        let mut keys = self
+            .files
+            .iter()
+            .filter(|(_, entry)| Some(entry.source_file_fingerprint.as_str()) == fingerprint);
+        let (Some((key, _)), None) = (keys.next(), keys.next()) else {
+            return false;
+        };
+        let emitted = self.file_snapshot_fingerprints.get(key);
+        emitted.map_or(true, BTreeSet::is_empty)
     }
 
     fn codex_owner_for_item(
@@ -55456,15 +55506,45 @@ impl ScanIndex {
     }
 }
 
-fn codex_rows_prove_oauth(item: &SnapshotItem) -> bool {
+fn codex_rows_all(item: &SnapshotItem, mode: impl Fn(Option<&str>) -> bool) -> bool {
     let mut rows = item.model_usage.iter().chain(
         item.usage_buckets
             .iter()
             .flat_map(|bucket| bucket.model_usage.iter()),
     );
     rows.next()
-        .is_some_and(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
-        && rows.all(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
+        .is_some_and(|row| mode(row.auth_mode.as_deref()))
+        && rows.all(|row| mode(row.auth_mode.as_deref()))
+}
+
+/// A Codex item's complete positive creator pair: (account, workspace).
+pub(crate) fn codex_creator_pair(item: &SnapshotItem) -> Option<(&str, &str)> {
+    let evidence = item.session_account_evidence.as_ref().filter(|evidence| {
+        evidence.evidence_source == "codex_creator_header:v1"
+            && !matches!(evidence.identity_disposition, Some("missing" | "conflict"))
+    })?;
+    Some((
+        evidence.account_identifier_hash.as_deref()?,
+        evidence.provider_workspace_hash.as_deref()?,
+    ))
+}
+
+/// Only exactly one slot matching the pair names it, by its login cause.
+fn codex_creator_slot(
+    account: &str,
+    workspace: &str,
+    slots: &[(String, String, usize)],
+) -> Result<SessionAccountBinding, usize> {
+    let mut matches = slots.iter().filter(|s| s.0 == account && s.1 == workspace);
+    match (matches.next(), matches.next()) {
+        (None, _) => Err(CREATOR_NO_MATCH),
+        (Some(_), Some(_)) => Err(CREATOR_MULTI_MATCH),
+        (Some(slot), None) if slot.2 != CREATOR_NAMED => Err(slot.2),
+        (Some(_), None) => Ok(SessionAccountBinding {
+            account_identifier_hash: account.to_string(),
+            workspace_identifier_hash: Some(workspace.to_string()),
+        }),
+    }
 }
 
 pub fn source_file_fingerprint(
