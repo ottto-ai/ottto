@@ -9627,14 +9627,13 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
     assert_eq!(budget().1.resident, measured.resident);
 }
 
-/// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
-/// nothing keep a suspended proof of a third of the state budget; the page
-/// whose completion clones the certified prefix retires it before the clone:
-/// the walk's resident + the proof left there (none) + the active + both
-/// shares fit `state_bytes()`. On its route the prefix is the file's head;
-/// a codec source keeps no RAM copy.
+/// Fix round 2 DB1, the completion site, on its route: a cursor job's pages
+/// that allocate nothing keep a suspended proof of a third of the state
+/// budget. A codec source keeps no RAM copy (`keeps_ram`), so its certified
+/// completion clones nothing either: the proof is kept and no copy budget is
+/// reserved, while the certified prefix is staged as the file's head.
 #[test]
-fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
+fn a_completing_cursor_job_on_its_route_keeps_the_proof_and_stages_its_head() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -9663,16 +9662,15 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
                 )
             });
             index = next;
+            assert!(
+                cache.proof_suspended_for_test().is_some(),
+                "no page of a codec source clones, so the proof is kept"
+            );
+            assert_eq!(proof_drops(counts), 0);
             if counter(&cache, |c| c.jobs_certified) == 1 {
-                assert_eq!(cache.proof_suspended_for_test(), None);
-                assert_eq!(proof_drops(counts), 1);
                 certified = true;
                 break;
             }
-            assert!(
-                cache.proof_suspended_for_test().is_some(),
-                "a page with no clone keeps the proof"
-            );
         }
         assert!(certified, "precondition: the job certified");
         assert!(
@@ -9683,10 +9681,67 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
             cache.take(&key).is_none(),
             "a codec source keeps no RAM copy"
         );
-        let probe = super::super::copy_retire_probe().expect("probed");
-        assert!(probe.budget > 0);
-        assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
-        assert!(probe.fits(), "{probe:?}");
+        assert!(
+            super::super::copy_retire_probe().is_none(),
+            "no copy budget is reserved for a copy that is never kept"
+        );
+    });
+}
+
+/// A codec source keeps no RAM copy, so the page budget sizes an append to a
+/// routed file from its committed head's sealed offset: a small append to a
+/// file larger than the singleton budget is a singleton Tail of the append,
+/// never a cursor job over the whole file.
+#[test]
+fn a_small_append_to_a_routed_large_file_is_budgeted_as_the_append() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    // Room for the whole file: one singleton Full, committed as the head.
+    let index = with_test_limits(1 << 20, 1 << 20, 64, || {
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(ScanIndex::default(), &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
+        assert_eq!(modes, (1, 0), "precondition: a singleton Full");
+        assert!(!scan.snapshots.is_empty());
+        next
+    });
+    let committed = head(&index, &key)
+        .expect("precondition: the Full's head")
+        .sealed_offset;
+    assert_eq!(committed, fixture.len(SESSION));
+    assert!(
+        cache.take(&key).is_none(),
+        "precondition: no RAM copy to size from"
+    );
+    fixture.append(SESSION, &token_line(41));
+    let append = fixture.len(SESSION) - committed;
+    // The file is now over the singleton budget; its append is not.
+    let singleton = committed;
+    assert!(append < singleton && fixture.len(SESSION) > singleton);
+    with_test_limits(2048, singleton, 64, || {
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
+        assert_eq!(
+            modes,
+            (0, 1),
+            "a singleton Tail of the append: {}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 0, "never a cursor job");
+        assert!(!scan.snapshots.is_empty());
+        let tailed = head(&next, &key).expect("the Tail's head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
     });
 }
 

@@ -131,6 +131,41 @@ pub(in crate::snapshots) fn pending(
     )
 }
 
+/// A certified cursor job's Tail write, handed to the same staging path as an
+/// ordinary completion (`pending`, then the PRE encode and native verdict).
+/// A cursor certificate reports its completion unsealed (fail-closed,
+/// `CompletedNativeAcquisition::unsealed`); the job's own bit is whether the
+/// native EOF applied an unterminated final record past its sealed offset,
+/// so only that bit drops the publish. A withheld fragment is not applied:
+/// the reduction is the reduction through the sealed offset, and the next
+/// read tails from there.
+pub(in crate::snapshots) fn certified_job(
+    tail: seam::PendingTail,
+    eof_applied: bool,
+) -> seam::PendingTail {
+    tail.sealed_by_job(eof_applied)
+}
+
+/// `key`'s committed sealed offset on `source`'s Tail route: where its next
+/// read continues, read from the head's certificate without decoding the
+/// reduction. `None`: no codec, no route, no readable head, or a route that
+/// cannot be read now; the caller then plans the whole file.
+pub(in crate::snapshots) fn committed_sealed_offset(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<u64> {
+    let revision = reduction_revision(source)?;
+    tail_route(source, index).ok()??;
+    let head = state_v2::load_head(index, key, revision).ok()??;
+    if head.metadata_only {
+        return None;
+    }
+    let mut d = Dec::new(&head.body);
+    HeadIdentity::take(&mut d).ok()?;
+    Some(DurableCertificate::take(&mut d).ok()?.sealed_offset)
+}
+
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum LiveLoadError {
