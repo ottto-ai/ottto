@@ -132,6 +132,7 @@ mod shared_value;
 #[cfg(test)]
 mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
+pub(crate) mod claude_folder_login;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
@@ -1400,6 +1401,8 @@ fn with_test_line_cap<T>(cap: usize, run: impl FnOnce() -> T) -> T {
 // content-free ordered turn/usage proof required by a referenced parent, and
 // fail closed when either bound is exceeded.
 const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
+/// Past this a Codex file's cache observations are incomplete; usage is unaffected.
+const MAX_CODEX_CACHE_REQUESTS_PER_FILE: usize = 65_536;
 const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2789,6 +2792,25 @@ struct TerminalJsonlDisposition {
     loss: TerminalJsonlLoss,
 }
 
+/// Debt facts kept across traversals and per-file erasure; a traversal
+/// checkpoint is dropped when its walk ends, so they cannot live there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TailDiscovery {
+    /// Unix milliseconds when a discovery walk last covered every root.
+    pub(crate) last_complete_discovery_at: Option<u64>,
+    /// Cumulative files erased while they still held unaccepted usage.
+    pub(crate) deleted_unaccepted_files: u64,
+    /// Oldest known unaccepted change among those erased files, in Unix milliseconds.
+    pub(crate) deleted_unaccepted_oldest_at: Option<u64>,
+}
+crate::heap_layout_bound::fields!(TailDiscovery; last_complete_discovery_at, deleted_unaccepted_files, deleted_unaccepted_oldest_at);
+impl TailDiscovery {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScanTraversalCheckpoint {
     context_fingerprint: String,
@@ -4146,6 +4168,12 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
+    /// Per-folder login evidence (state layout 5); nothing fills it yet.
+    #[serde(default)]
+    pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
+    /// Durable debt facts that outlive any one traversal (state layout 5).
+    #[serde(default)]
+    pub(crate) tail_discovery: TailDiscovery,
     /// Accepted intent members still owing revision debt; rebuilt each prepare.
     #[serde(skip)]
     pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
@@ -4365,6 +4393,8 @@ impl Default for ScanIndex {
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
             copy_prefix_last_accepted_nonce: None,
+            claude_folder_login_ledger: BTreeMap::new(),
+            tail_discovery: TailDiscovery::default(),
             copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
@@ -16325,12 +16355,10 @@ struct ClaudeResponseRecord {
     tool_uses: BTreeMap<String, String>,
 }
 
-// Response-local buffering exists only to repair provider-time ordering. Bound
-// both its pathological single-key amplification and its aggregate per-file
-// heap. Normal local evidence is far below these ceilings (the 91-file Fable
-// canary's affected root has 9,768 usage-bearing physical records total).
-const MAX_CLAUDE_RECORDS_PER_RESPONSE: usize = 4_096;
-const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
+// Response-local buffering repairs provider-time ordering, so it grows with the
+// file's usage-bearing lines and never refuses one. Above this size the
+// finalizer only counts a hit: it gates nothing.
+const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
 
 /// One Claude provider response assembled from its content-block transcript
 /// records. Usage is withheld from the session projection until this response
@@ -16340,6 +16368,9 @@ struct ClaudeResponseObservation {
     sequence: u64,
     preceding_user_timestamp: Option<String>,
     records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    /// Never set any more. A book saved while the record caps existed may
+    /// carry it: that book lost records, so it stays retryable until a cold
+    /// read, which now keeps them all.
     record_limit_exceeded: bool,
     desktop_request: bool,
 }
@@ -16384,9 +16415,8 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
 /// Why a retained Claude response has no resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeResolveFailure {
-    /// The per-file record cap dropped some of its records.
-    Capped,
-    /// A compact record no longer decodes against the file's selector table.
+    /// A compact record no longer decodes against the file's selector table,
+    /// or a restored book already lost records.
     Decode,
     /// Incompatible observations: the native resolver's conflict.
     Conflict,
@@ -16441,18 +16471,10 @@ impl ClaudeResponseObservation {
         computed_effective_input_context: Option<u64>,
         tool_uses: BTreeMap<String, String>,
         cache_slot: RequestSlot,
-    ) -> bool {
-        if self.records.len() >= MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            self.record_limit_exceeded = true;
-            return false;
-        }
-        let Ok(physical_sequence) = u16::try_from(self.records.len()) else {
-            self.record_limit_exceeded = true;
-            return false;
-        };
+    ) {
         let record = CompactClaudeResponseRecord::encode(
             self.records.first(),
-            physical_sequence,
+            self.records.len(),
             usage,
             model,
             selector.into(),
@@ -16464,14 +16486,6 @@ impl ClaudeResponseObservation {
             cache_slot,
         );
         self.records.push(record);
-        true
-    }
-
-    /// Test shim for an observation built without a file's selector table:
-    /// its selectors are inline, so the empty table decodes them exactly.
-    #[cfg(test)]
-    fn resolve(self) -> Option<ResolvedClaudeResponse> {
-        self.resolve_with(&ClaudeSelectorTable::default())
     }
 
     #[cfg(test)]
@@ -16486,7 +16500,7 @@ impl ClaudeResponseObservation {
         selectors: &ClaudeSelectorTable,
     ) -> Result<ResolvedClaudeResponse, ClaudeResolveFailure> {
         if self.record_limit_exceeded {
-            return Err(ClaudeResolveFailure::Capped);
+            return Err(ClaudeResolveFailure::Decode);
         }
         let mut records =
             claude_response_records::decode_records(self.records.into_vec(), selectors)
@@ -18192,8 +18206,8 @@ struct SnapshotAccumulator {
     // schedule, and explicit slash-skill facts. The source text is never copied
     // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
     first_prompt_material: Option<String>,
-    // In-memory only: provider-native skill names. HMACed before facts are
-    // produced; an allowlisted short name may also become a private display
+    // Private local state: provider-native skill names. HMACed before facts
+    // are produced; an allowlisted short name may also become a private display
     // label, which upload policy strips unless title consent is active.
     provider_skills: BTreeSet<String>,
     started_at: Option<String>,
@@ -19796,26 +19810,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn note_pi_time(&mut self, timestamp: Option<String>) {
-        let Some(timestamp) = timestamp else {
-            return;
-        };
-        if self
-            .started_at
-            .as_ref()
-            .map_or(true, |current| timestamp_is_before(&timestamp, current))
-        {
-            self.started_at = Some(timestamp.clone());
-        }
-        if self
-            .last_activity_at
-            .as_ref()
-            .map_or(true, |current| timestamp_is_after(&timestamp, current))
-        {
-            self.last_activity_at = Some(timestamp);
-        }
-    }
-
     /// Retain one Claude usage-bearing record for response-level resolution.
     /// No session-exclusive metric is mutated here; `finalize_claude_responses`
     /// admits exactly one terminal observation after the full file is read.
@@ -19844,21 +19838,7 @@ impl SnapshotAccumulator {
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
         let key = claude_response_key(value, self.claude_response_sequence);
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
-            crate::local_resource_diagnostics::claude_record_cap_hit();
-            if self.claude_responses.contains_key(&key) {
-                self.claude_responses
-                    .get_mut(&key)
-                    .expect("response exists")
-                    .record_limit_exceeded = true;
-            } else {
-                // No response object exists to carry the one-time overflow
-                // marker into finalization. Account for this refused positive
-                // usage row immediately so the enclosing file stays retryable.
-                self.note_dropped_usage();
-            }
-            return;
-        }
+        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let selector = self.claude_responses.selectors.intern(selector);
         // The request's own usage records carry entrypoint. Missing or mixed
         // records fail closed; session-first origin is deliberately irrelevant.
@@ -19866,7 +19846,7 @@ impl SnapshotAccumulator {
             value.get("entrypoint").and_then(Value::as_str) == Some("claude-desktop");
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             existing.desktop_request &= desktop_request;
-            if existing.push(
+            existing.push(
                 usage,
                 model,
                 selector,
@@ -19876,15 +19856,11 @@ impl SnapshotAccumulator {
                 computed_effective_input_context,
                 tool_uses,
                 cache_slot,
-            ) {
-                self.claude_response_record_count =
-                    self.claude_response_record_count.saturating_add(1);
-            }
+            );
             return;
         }
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
-        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let mut response = ClaudeResponseObservation::new(
             sequence,
             usage,
@@ -19943,9 +19919,15 @@ impl SnapshotAccumulator {
                 responses.first().map(|response| response.sequence),
             );
         }
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
-            crate::local_resource_diagnostics::claude_record_cap_half_file();
-        }
+        crate::local_resource_diagnostics::claude_record_counts(
+            self.claude_response_record_count,
+            responses
+                .iter()
+                .map(|response| response.records.len())
+                .max()
+                .unwrap_or(0),
+            CLAUDE_RECORDS_PER_FILE_ALARM,
+        );
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
             let mut response = match response.resolve_classified(&selectors) {
@@ -19963,9 +19945,9 @@ impl SnapshotAccumulator {
                     }
                     continue;
                 }
-                // The record cap and an undecodable compact record are loss
-                // held for retry, never a resolver conflict.
-                Err(ClaudeResolveFailure::Capped | ClaudeResolveFailure::Decode) => {
+                // An undecodable compact record is loss held for retry, never
+                // a resolver conflict.
+                Err(ClaudeResolveFailure::Decode) => {
                     self.note_dropped_usage();
                     continue;
                 }
@@ -20511,11 +20493,7 @@ impl SnapshotAccumulator {
         // R: the book, and what each resolved response's rows take from here.
         let book_bounds = self.claude_responses.completion_bounds(limit)?;
         let responses = book_bounds.output?;
-        let resolved = self
-            .claude_responses
-            .values()
-            .filter(|response| !response.record_limit_exceeded)
-            .count();
+        let resolved = self.claude_responses.values().count();
         // Charged for every Claude file: whether it is itemless (no positive
         // usage evidence) is the parser's to know, not this accumulator's.
         let buffered_records = self
@@ -27154,6 +27132,7 @@ impl OwnedSourceScan {
                 file_limit,
             );
         }
+        let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
@@ -27324,6 +27303,19 @@ impl OwnedSourceScan {
             }
         }
         let retry_service_end = pending_paths.len();
+        // A growth Full deferred by its claim left the queue; once the claim
+        // expires, its queued path rides this page instead of waiting behind
+        // the census FIFO. The claim still admits one Full per interval.
+        if !growth_wake.is_empty() {
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && growth_wake.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
                 index
@@ -37997,8 +37989,10 @@ fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
 }
 
 /// The referenced parent history is external: local ordinals begin exactly
-/// where that parent's paginated base ends. This proves only this header's own
-/// creation claim; the caller must still prove first-record/file/stream ownership.
+/// where that parent's paginated base ends. `history_base.thread_id` may name
+/// the parent's physical segment file rather than its logical id, so it must
+/// only differ from this session. This proves only this header's own creation
+/// claim; the caller must still prove first-record/file/stream ownership.
 fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
     if !string_eq_at(meta, &["history_mode"], "paginated")
         || string_eq_at(meta, &["thread_source"], "subagent")
@@ -38016,9 +38010,10 @@ fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
         return false;
     };
     id != parent
-        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) == Some(id)
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])).as_ref()
+            == Some(&id)
         && resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]))
-            == Some(parent)
+            .is_some_and(|base| base != id)
         && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
             u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
         })
@@ -38709,7 +38704,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             });
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
-        if accumulator.cache_requests.len() < MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
+        if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
             accumulator.cache_requests.push(request);
         } else {
             accumulator.cache_requests_complete = false;
@@ -40104,7 +40099,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(selector) = pi_selector_from_custom(value) {
                 accumulator.set_selector(selector);
             }
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
@@ -40114,7 +40109,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["sessionId"]));
             }
             pi_content_line(value, None, accumulator);
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         Some("message") => {
             // Pi user prompts use both legacy top-level `role` and current
@@ -40141,7 +40136,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             {
                 accumulator.note_dropped_usage();
             }
-            accumulator.note_pi_time(timestamp);
+            accumulator.note_time(timestamp);
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
@@ -40157,19 +40152,19 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
                 accumulator.note_dropped_usage();
             }
-            accumulator.note_pi_time(timestamp);
+            accumulator.note_time(timestamp);
         }
         Some("model_change") => {
             accumulator
                 .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         // Pi 0.81.0+ bills summary generation on these entries and 0.86.0+
         // writes `usage` entries (e.g. cache warming); Pi's session totals add
         // each exactly once and no assistant message repeats them.
         Some("compaction" | "branch_summary" | "usage") => {
             apply_pi_entry_usage(value, accumulator);
-            accumulator.note_pi_time(pi_timestamp_field(value));
+            accumulator.note_time(pi_timestamp_field(value));
         }
         _ => {}
     }
@@ -52685,6 +52680,8 @@ impl ScanIndex {
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
+            claude_folder_login_ledger: self.claude_folder_login_ledger.clone(),
+            tail_discovery: self.tail_discovery,
             copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
@@ -68646,78 +68643,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_response_record_caps_fail_closed_without_unbounded_buffering() {
-        let mut response = ClaudeResponseObservation::new(
-            0,
-            UsageTotals::default(),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        );
-        for _ in 1..MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            assert!(response.push(
-                UsageTotals::default(),
-                None,
-                SelectorCapture::default(),
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-                RequestSlot::default(),
-            ));
-        }
-        assert!(!response.push(
-            UsageTotals::default(),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        ));
-        assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
-        // A capped response is loss held for retry, never a resolver conflict.
-        assert_eq!(
-            response
-                .clone()
-                .resolve_classified(&ClaudeSelectorTable::default())
-                .err(),
-            Some(ClaudeResolveFailure::Capped)
-        );
-        assert!(response.resolve().is_none());
-
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        accumulator.claude_response_record_count = MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE;
-        accumulator.observe_claude_response(
-            &json!({
-                "requestId": "request-at-total-cap",
-                "message": {"id": "message-at-total-cap"},
-            }),
-            UsageTotals {
-                input_tokens: 1,
-                request_count: 1,
-                ..UsageTotals::default()
-            },
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            Some(1),
-        );
-        assert!(accumulator.claude_responses.is_empty());
-        assert_eq!(accumulator.dropped_usage_record_count, 1);
-    }
-
-    #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
         // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
@@ -80761,6 +80686,83 @@ mod tests {
         }
     }
 
+    /// Observed shape: `history_base.thread_id` names the parent's physical
+    /// segment file, not `forked_from_id`. The session's own pair names it;
+    /// usage totals are the same with or without that pair.
+    #[test]
+    fn codex_paginated_fork_names_itself_when_base_is_a_parent_segment() {
+        let mut header = codex_paginated_creator_fixture();
+        header["payload"]["history_base"]["thread_id"] =
+            json!("019e253c-4444-7000-9000-dddddddddddd");
+        let id = header["payload"]["id"].as_str().unwrap().to_string();
+        let parent_id = header["payload"]["forked_from_id"].clone();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+
+        let items = codex_fork_creator_items(&[header.clone(), usage(1362)], &id);
+        assert_eq!(items.len(), 1);
+        let evidence = items[0].session_account_evidence.as_ref().unwrap();
+        assert_eq!(evidence.evidence_source, "codex_creator_header:v1");
+        assert_eq!(
+            evidence.account_identifier_hash,
+            ottto_core::billing_identity_hash("openai", "account", "synthetic-user")
+        );
+
+        // Placement only: every other wire field, totals included, matches the
+        // same transcript without a creator pair.
+        let mut creator_free = header.clone();
+        let meta = creator_free["payload"].as_object_mut().unwrap();
+        meta.remove("creator_user_id");
+        meta.remove("creator_account_id");
+        let creator_free = codex_fork_creator_items(&[creator_free, usage(1362)], &id);
+        assert!(creator_free[0].session_account_evidence.is_none());
+        let mut named = serde_json::to_value(&items).unwrap();
+        named[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("session_account_evidence");
+        assert_eq!(named, serde_json::to_value(&creator_free).unwrap());
+        assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
+
+        // A parent header in this file never names the session: not as the
+        // first record, and not later (with this session's header first).
+        let mut foreign = header.clone();
+        foreign["payload"]["id"] = parent_id.clone();
+        foreign["payload"]["session_id"] = parent_id;
+        foreign["payload"]["forked_from_id"] = json!("019e253c-5555-7000-9000-eeeeeeeeeeee");
+        foreign["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        let foreign_first = codex_fork_creator_items(&[foreign.clone(), usage(1362)], &id);
+        assert!(foreign_first
+            .iter()
+            .all(|item| item.session_account_evidence.is_none()));
+        foreign["ordinal"] = json!(1362);
+        foreign["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        let foreign_later = codex_fork_creator_items(&[header.clone(), foreign, usage(1363)], &id);
+        assert!(foreign_later[0].session_account_evidence.is_none());
+        assert_eq!(
+            (
+                foreign_later[0].input_tokens,
+                foreign_later[0].output_tokens
+            ),
+            (100, 5)
+        );
+
+        // Conflicting own headers still refuse the pair and keep the usage.
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        let conflicted = codex_fork_creator_items(&[header, conflict, usage(1363)], &id);
+        assert!(conflicted[0].session_account_evidence.is_none());
+        assert_eq!(
+            (conflicted[0].input_tokens, conflicted[0].output_tokens),
+            (100, 5)
+        );
+    }
+
     #[test]
     fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
         let header = codex_paginated_creator_fixture();
@@ -80777,9 +80779,9 @@ mod tests {
             ("partial_pair", "/payload/creator_user_id", Value::Null),
             ("missing_pair", "/payload/creator_account_id", json!(" ")),
             (
-                "wrong_parent",
+                "missing_base_thread",
                 "/payload/history_base/thread_id",
-                json!("other-parent"),
+                Value::Null,
             ),
             (
                 "internal_parent",

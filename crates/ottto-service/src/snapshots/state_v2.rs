@@ -45,17 +45,20 @@ mod mapper;
 mod sqlite;
 mod tail;
 use kinds::KindCx;
-#[cfg(test)]
-pub(in crate::snapshots) use runtime::tail_route::{forget_ram_for_test, staged_head_for_test};
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
-    hold_floor, load_head, load_tail, owe_native_read, release_floor, retire_tail, set_aside_tail,
-    stage_tail, tail_head_keys, tail_set_aside, take_native_read,
+    dispose_tail, erase_tail, hold_floor, load_head, load_revisions, load_tail, observe_tail,
+    owe_native_read, release_floor, retire_tail, set_aside_tail, stage_tail, tail_head_keys,
+    tail_set_aside, take_native_read,
 };
+#[cfg(test)]
+pub(in crate::snapshots) use runtime::tail_route::{forget_ram_for_test, staged_head_for_test};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
+    NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile,
+    TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
@@ -516,6 +519,7 @@ fn control_name(name: &str) -> bool {
             | "reference_check_success"
             | "reference_check_attempt"
             | "reference_drift"
+            | "store_growth_success"
             | "minimum_writer_capability"
             | "erasure_pending"
             | "erasure_since"

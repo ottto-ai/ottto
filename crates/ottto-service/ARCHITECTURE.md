@@ -114,5 +114,6 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 Transcripts never leave the machine. Logs, diagnostics and status carry counts, never transcript
 text, paths or raw identifiers; types holding local-only text don't derive `Debug`. Identity is
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
-Erasure (consent off, retirement, source removal, forget installation, uninstall) reaches every
+The Companion session list uses local titles and workspace labels before upload filtering.
+Erasure (retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).

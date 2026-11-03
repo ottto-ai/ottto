@@ -2345,6 +2345,36 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
 }
 
+/// Debt whose claim has expired. Its deferral did not re-queue it, so its
+/// queued path would wait behind the census FIFO; selection wakes it instead.
+pub(super) fn expired_growth_claims(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    now: u64,
+) -> BTreeSet<PathBuf> {
+    if !growth_active(index) {
+        return BTreeSet::new();
+    }
+    let mut oldest = 0_u64;
+    let due: BTreeSet<_> = index
+        .v2()
+        .growth_retention
+        .iter()
+        .filter_map(|(key, state)| {
+            state.predecessor_size?;
+            let claim = state.last_growth_full_unix?;
+            let expired_secs = now.checked_sub(claim.saturating_add(GROWTH_FULL_INTERVAL))?;
+            oldest = oldest.max(expired_secs);
+            Some(PathBuf::from(key))
+        })
+        .collect();
+    if !due.is_empty() {
+        let counts = serde_json::json!({"keys": due.len(), "oldest_expired_secs": oldest});
+        crate::local_resource_diagnostics::traversal_point("hold_wake", source.api_slug(), &counts);
+    }
+    due
+}
+
 /// The claim is one store transaction CAS'd on this lineage's G; no
 /// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {

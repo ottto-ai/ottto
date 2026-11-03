@@ -39,8 +39,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         tag: 3,
-        // Pi joins the v2 store in its own later step.
-        state_v2: false,
+        state_v2: true,
     },
 ];
 

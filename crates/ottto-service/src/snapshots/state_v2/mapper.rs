@@ -72,25 +72,35 @@ pub(super) fn visit(
     };
     let kind = RecordKind::parse(kind)?;
     for root in roots {
-        let mut after = None;
-        loop {
-            let page = tx.scan_record_key(&kind, root.as_bytes(), after, KEY_PAGE)?;
-            let more = page.len() == KEY_PAGE;
-            if let Some(h) = page.last() {
-                let RowKey::Record { position, .. } = &h.key else {
-                    anyhow::bail!("state_v2_record_key")
-                };
-                after = Some(*position);
-            }
-            for h in page {
-                f(tx, h)?;
-            }
-            if !more {
-                break;
-            }
-        }
+        visit_key(tx, &kind, root.as_bytes(), KEY_PAGE, &mut f)?;
     }
     Ok(())
+}
+/// One key's rows of `kind` from position 0, read `page_rows` headers at a time.
+pub(super) fn visit_key(
+    tx: &mut dyn Transaction,
+    kind: &RecordKind,
+    key: &[u8],
+    page_rows: usize,
+    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = tx.scan_record_key(kind, key, after, page_rows)?;
+        let more = page.len() == page_rows;
+        if let Some(h) = page.last() {
+            let RowKey::Record { position, .. } = &h.key else {
+                anyhow::bail!("state_v2_record_key")
+            };
+            after = Some(*position);
+        }
+        for h in page {
+            f(tx, h)?;
+        }
+        if !more {
+            return Ok(());
+        }
+    }
 }
 /// One family's only row (position 1) of `kind`, decoded, with its row
 /// digest as stored. `None`: no row. Another row under the key errs.

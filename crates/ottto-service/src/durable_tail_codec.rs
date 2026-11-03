@@ -12,8 +12,8 @@
 //!   never logged, never in diagnostics or counters, never uploaded from it;
 //! - `PL` private local literal: exactly the uploaded wire value, or the
 //!   explicitly approved bounded native state from which that upload is derived
-//!   (PL-retained). Consent-gated; never stored while consent is off and purged
-//!   at the next save on revocation. Dropped on identity failure and erased with
+//!   (PL-retained). Kept locally independently of upload consent.
+//!   Dropped on identity failure and erased with
 //!   its record. Never exposed in logs, diagnostics, status, support bundles or
 //!   error text; single use, restoring only the same approved upload/state.
 //! - `X` content (text, paths). Never encoded. Restored by re-derivation from
