@@ -14,7 +14,7 @@ use super::super::claude_request_identity::{
     self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
 };
 use super::super::{
-    claude_api_cache_creation, claude_api_matches_transcript_occurrence,
+    claude_api_cache_creation, claude_api_matches_transcript_occurrence, claude_family_root_path,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
     claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
@@ -231,11 +231,15 @@ enum CopyProof {
     /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
     /// With the index key of the original its `fork-context-ref` line names.
     Holders(Option<String>),
+    /// A subagent's family root (its index key): a forked subagent repeats
+    /// the parent's last response as its first line, so that first response
+    /// counts once, at the root, when the root holds its request id.
+    Family(String),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Twin(key) | Self::Holders(Some(key)) => key.heap_bound(c),
+            Self::Twin(key) | Self::Holders(Some(key)) | Self::Family(key) => key.heap_bound(c),
             Self::Holders(None) => c.add(0),
         }
     }
@@ -1394,6 +1398,14 @@ impl FileFold {
     ) {
         let started = Instant::now();
         self.decide_native(context, markers, fork_parent);
+        if self.proof.is_none() {
+            self.proof = context
+                .and_then(|context| {
+                    let member = claude_index_path_member_ref(context.path)?;
+                    claude_family_root_path(context.path, member.root)
+                })
+                .map(|root| CopyProof::Family(local_index_key(&root)));
+        }
         // The fold lives until the page finishes: keep no parse-time slack.
 
         self.skipped.shrink_to_fit();
@@ -1585,6 +1597,30 @@ impl FileFold {
         )
     }
 
+    /// The family root counts this request: move it from its estimated grain
+    /// to the removal and skip it, so attach finds the root alone. A grain
+    /// that cannot give it back leaves it counted.
+    fn drop_family_duplicate(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
+        let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+        let requests = occurrence.usage.request_count;
+        let account = self
+            .accounts
+            .as_ref()
+            .and_then(|accounts| accounts.account(occurrence.sequence));
+        let Some(key) = self.occurrence_key(occurrence) else {
+            return;
+        };
+        if !self
+            .entity
+            .take_estimated(&(key, None, account), &tokens, requests)
+        {
+            return;
+        }
+        self.entity.removed.add(&tokens);
+        self.entity.removed_requests += requests;
+        self.skip(occurrence.sequence);
+    }
+
     /// One held copy whose proof failed counts after all: from the removal
     /// back to its estimated grain, disclosed.
     fn restore_one(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
@@ -1661,6 +1697,12 @@ impl FileFold {
                 .entity
                 .fail_certificate(CertificateFailure::IdlessRestoration),
         }
+    }
+
+    /// Skip one response that is not skipped yet.
+    fn skip(&mut self, sequence: u64) {
+        let at = self.skipped.partition_point(|(_, end)| *end <= sequence);
+        self.skipped.insert(at, (sequence, sequence + 1));
     }
 
     fn unskip(&mut self, sequence: u64) {
@@ -1969,6 +2011,7 @@ pub(crate) fn decide_page_copies(
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
             Some(CopyProof::Holders(_)) => holders.push(at),
+            Some(CopyProof::Family(root)) => decide_family(items, at, &root, index),
             None => {}
         }
     }
@@ -2164,38 +2207,102 @@ fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> O
         })
 }
 
-fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
-    let location = Some(Located(location_key(witness)));
-    let session = &items[at].source_session_id;
-    // The witness's parse on this page is its current revision by construction.
+/// A file's request ids at its current revision: its parse on this page
+/// (current by construction), else its census record while that still
+/// proves the file.
+enum Witness<'a> {
+    Page(&'a BTreeSet<String>),
+    Census(&'a super::super::claude_request_census::ClaudeRequestCensusRecord),
+}
+impl Witness<'_> {
+    fn holds(&self, request_id: &str) -> bool {
+        match self {
+            Self::Page(ids) => ids.contains(request_id),
+            Self::Census(record) => record.holds_hash(claude_request_hash(request_id)),
+        }
+    }
+}
+
+/// `key`'s current witness: `session`'s parse at that path on this page,
+/// else its census record. None: the file is not read at its current
+/// revision (or has no scan state).
+fn current_witness<'a>(
+    items: &'a [SnapshotItem],
+    session: &str,
+    key: &str,
+    index: &'a ScanIndex,
+) -> Option<Witness<'a>> {
+    let location = Some(Located(location_key(key)));
     let on_page = items.iter().find(|item| {
-        &item.source_session_id == session
+        item.source_session_id == session
             && item
                 .claude_money
                 .as_deref()
                 .is_some_and(|fold| fold.location == location)
     });
-    let uncovered = match on_page {
-        Some(original) => Some(
-            skipped_ids(&items[at])
-                .filter(|id| !original.claude_usage_request_ids.contains(*id))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
+    match on_page {
+        Some(item) => Some(Witness::Page(&item.claude_usage_request_ids)),
         None => index
             .claude_request_census
-            .get(witness)
-            .filter(|record| scan_evidence(index, witness, record) == Evidence::Current)
-            .map(|record| {
-                skipped_ids(&items[at])
-                    .filter(|id| !record.holds_hash(claude_request_hash(id)))
-                    .cloned()
-                    .collect()
-            }),
-    };
+            .get(key)
+            .filter(|record| scan_evidence(index, key, record) == Evidence::Current)
+            .map(Witness::Census),
+    }
+}
+
+fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
+    let session = &items[at].source_session_id;
+    let uncovered = current_witness(items, session, witness, index).map(|witness| {
+        skipped_ids(&items[at])
+            .filter(|id| !witness.holds(id))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     match uncovered {
         Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
         None => hold_copies(&mut items[at], "held_twin_unproven"),
+    }
+}
+
+/// A forked subagent's first line repeats the parent's last response: the
+/// subagent's first response counts once, at the root, when the root's
+/// current witness holds its request id. A root not read at its current
+/// revision leaves it counted (no hold, counted as deferred); the
+/// subagent's next page decides again.
+fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &ScanIndex) {
+    let item = &items[at];
+    let first = item
+        .claude_usage_occurrences
+        .iter()
+        .min_by_key(|(_, occurrence)| occurrence.sequence);
+    let Some((id, sequence)) = first.map(|(id, occurrence)| (id.clone(), occurrence.sequence))
+    else {
+        return;
+    };
+    let root = claude_snapshot_family_root_ref(item);
+    let copied = match current_witness(items, root, root_key, index) {
+        Some(witness) => witness.holds(&id),
+        None => {
+            let deferred = index
+                .claude_request_census
+                .get(root_key)
+                .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
+            record_counts(Counts::one(29, u64::from(deferred)));
+            diag("family_copy_deferred", u64::from(deferred));
+            false
+        }
+    };
+    // The proof is this fold's, so the fold is present.
+    let SnapshotItem {
+        claude_money: Some(fold),
+        claude_usage_occurrences,
+        ..
+    } = &mut items[at]
+    else {
+        return;
+    };
+    if copied && !fold.is_skipped(sequence) {
+        fold.drop_family_duplicate(&claude_usage_occurrences[&id]);
     }
 }
 
@@ -4375,8 +4482,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "copy_prefix_late_origin_removed",
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
+    // A forked subagent's first-line copy counted because its root was not
+    // read at its current revision; its next page decides again.
+    "family_copy_deferred",
 ];
-const COUNT_LEN: usize = 29;
+const COUNT_LEN: usize = 30;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4443,7 +4553,7 @@ impl Counts {
         all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..28) by `n`.
+    /// One enable-readiness counter (index 24..29) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;
@@ -4479,6 +4589,10 @@ mod tests;
 #[cfg(test)]
 #[path = "e2_holder_redrift_tests.rs"]
 mod holder_redrift_tests;
+
+#[cfg(test)]
+#[path = "e2_family_duplicate_tests.rs"]
+mod family_duplicate_tests;
 
 #[cfg(test)]
 #[path = "e2_activity_clock_tests.rs"]

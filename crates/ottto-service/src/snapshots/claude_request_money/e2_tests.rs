@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
-const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
+pub(super) const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
 /// Birth of the first file; `complete_api_row` reports this hour.
 const T0: &str = "2026-08-02T07:00:00Z";
 const HOUR: &str = "2026-08-02T07:00:00Z";
@@ -23,7 +23,7 @@ fn at(seconds: i64) -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
 }
-fn line(id: &str, clock: &str, input: u64) -> Value {
+pub(super) fn line(id: &str, clock: &str, input: u64) -> Value {
     json!({"type":"assistant","version":"2.1.309","sessionId":ROOT,"timestamp":clock,
         "requestId":id,"message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
         "usage":{"input_tokens":input,"output_tokens":1}}})
@@ -54,7 +54,12 @@ fn entry() -> ScanIndexEntry {
     )
     .unwrap()
 }
-fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -> SnapshotItem {
+pub(super) fn parse(
+    path: &Path,
+    birth: Option<i128>,
+    index: &ScanIndex,
+    lines: &[Value],
+) -> SnapshotItem {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     let opened = fs::File::open(path).and_then(|file| file.metadata()).ok();
     a.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
