@@ -203,7 +203,7 @@ pub(super) fn resolve(
     candidate: &CandidateFile,
     census_window_end: &str,
     decision: &mut CandidateDecision,
-    reason: &mut Option<CandidateParseReason>,
+    _reason: &mut Option<CandidateParseReason>,
 ) {
     let key = local_index_key(&candidate.path);
     let family = claude_index_path_family_member(&candidate.path);

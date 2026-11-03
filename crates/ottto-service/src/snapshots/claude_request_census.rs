@@ -2994,7 +2994,7 @@ fn insert_transcript_record(
                     .files
                     .get(key)
                     .is_some_and(|entry| entry.evidence_owed)
-                    || claude_index_path_member_ref(Path::new(key))
+                    || super::claude_index_path_member_ref(Path::new(key))
                         .is_some_and(|member| cohort.contains(member.root))
                     || (super::restart_restore::enabled()
                         && (page_held.contains(key)
@@ -3334,7 +3334,7 @@ fn retire_claude_transcript_records_excluding(
             .files
             .get(key)
             .is_some_and(|entry| entry.evidence_owed)
-            || claude_index_path_member_ref(Path::new(key))
+            || super::claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| cohort.contains(member.root))
             || (super::restart_restore::enabled()
                 && terminal_residue.is_some_and(|held| held.contains(key)))
