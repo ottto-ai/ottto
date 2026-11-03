@@ -1824,10 +1824,6 @@ pub(crate) fn claude_state_v2(counts: &impl Serialize) {
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
 }
-/// At most once per 24 h while reconstructions after a head persist.
-pub(crate) fn tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
-    traversal_point("tail_restart_full_alarm", source, counts);
-}
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
         "continuation_pages_run": u8::from(held.is_none()),
