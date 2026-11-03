@@ -674,12 +674,10 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     assert!(!cached.index.claude_usage_authority_quarantine.is_empty());
     let held = settle(cached);
     f.evidence(2);
+    // The quarantine's re-read re-folds the unchanged transcript from stored
+    // state (L02); its body is the cold Full's.
     let recovered = enriched(&f, raw_scan(&f, held.clone(), Some(cache), |_| {}));
-    assert_eq!(
-        recovered.modes,
-        (1, 0, 0),
-        "quarantine still forces native Full"
-    );
+    assert_layout_mode(recovered.modes, (0, 0, 1));
     assert_oracle(&f, &recovered, held);
 }
 
