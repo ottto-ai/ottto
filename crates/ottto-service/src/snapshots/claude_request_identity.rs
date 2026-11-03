@@ -39,9 +39,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 mod accepted;
 mod budget;
 pub(crate) use accepted::bind_session_context_key;
+#[cfg(test)]
+pub(crate) use accepted::bind_test_session_context_key;
 pub(crate) use accepted::digest_hex;
 #[cfg(test)]
 pub(crate) use accepted::session_context_digest;
+pub(crate) use accepted::session_context_key_epoch;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 

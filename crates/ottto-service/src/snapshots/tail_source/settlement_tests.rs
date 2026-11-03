@@ -1,8 +1,9 @@
 //! Settlement on real committed Tail state: a first-read crash leaves nothing
-//! to trust, the accepted floor is replayed through and never relaxed, a load
+//! to trust, a head behind the accepted entry replays through it, a load
 //! earns no credit, lower revisions reconstruct or migrate, and a stored reuse
 //! either finishes the ACKed body with no native byte or owes one native Full.
 use super::super::claude::tests::lines;
+use super::super::claude::Claude;
 use super::super::seam::tests::{route, scope, Route, NOW};
 use super::tests::{append, cold, committed, counted, len, loaded, read};
 use super::*;
@@ -13,7 +14,6 @@ use crate::snapshots::sampled_jsonl::durable::test_finish_items;
 use crate::snapshots::state_v2::BaselineRelease;
 use crate::snapshots::stored_refinalize::{reuse_label, reuses_stored, take_native};
 use crate::snapshots::tail_source::counters;
-use crate::snapshots::tail_source::floor::AcceptedFloor;
 use crate::snapshots::tests::manifest_index_entry;
 use crate::transcript_acquisition::ReadMode;
 
@@ -164,11 +164,10 @@ fn a_head_ahead_of_progress_resumes_from_the_head() {
     assert_eq!(parser.reader.consumed_bytes(), 0);
 }
 
-/// [money] R6: a head behind the floor replays through it to the cold Full's
-/// body; an evidence clear does not relax the floor; a file shorter than the
-/// floor or an entry from a newer body revision stays behind it.
+/// [money] R6: a head behind the accepted entry replays through it to the
+/// cold Full's body (D158: no floor, no hold).
 #[test]
-fn below_the_floor_replays_through_it_and_never_relaxes() {
+fn a_head_behind_the_accepted_entry_replays_through_it() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 3);
     let sealed = len(&path);
@@ -177,42 +176,14 @@ fn below_the_floor_replays_through_it_and_never_relaxes() {
     let mut accepted = manifest_index_entry(None);
     accepted.size_bytes = len(&path) - 1;
     route.index.files.insert(key.clone(), accepted);
-    let floor = AcceptedFloor::of(&route.index, &key).unwrap();
-    assert!(floor.behind(sealed) && !floor.behind(len(&path)));
 
     let (Load::Reused(taken, Some(_)), _) = loaded(&route, &path, &key) else {
-        panic!("a head below the floor is reused");
+        panic!("a head behind the accepted entry is reused");
     };
     let (parser, mode, start) = read(&route, &path, Some(taken));
     assert!(matches!(mode, ReadMode::Tail) && start == sealed);
     let warm = test_finish_items(parser, &path, SnapshotSource::ClaudeCode);
     assert_eq!(warm, cold(&route, &path));
-
-    let entry = route.index.files.get_mut(&key).unwrap();
-    entry.source_file_fingerprint.clear();
-    assert_eq!(
-        AcceptedFloor::of(&route.index, &key)
-            .unwrap()
-            .behind(sealed),
-        floor.behind(sealed),
-    );
-
-    // No smaller re-emit: a shorter file proves its change and stays behind.
-    let short = sealed - 1;
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(short)
-        .unwrap();
-    let (load, _) = loaded(&route, &path, &key);
-    assert!(matches!(load, Load::Cold(Some(FullReason::Shrunk))));
-    assert!(floor.behind(short));
-
-    let entry = route.index.files.get_mut(&key).unwrap();
-    entry.effective_upload_body_witness_revision = u64::MAX;
-    let future = AcceptedFloor::of(&route.index, &key).unwrap();
-    assert!(future.behind(u64::MAX) && !future.permits_real_edit());
 }
 
 /// [money] R8: load plus a zero suffix restates nothing, and load plus an
@@ -305,14 +276,14 @@ fn an_unchanged_lower_revision_migrates_the_head_alone() {
     let (parser, _, _) = read(&route, &path, None);
     let (tail, native) = route.finish(&path, parser, Some(base(&route, false)), |_| {});
     assert!(tail.staged_for_test().is_none());
-    assert_eq!(counters::total("tail_head_migrated", "claude_code"), 0);
+    assert_eq!(counters::total("tail_head_migrated", "heads"), 0);
     drop((tail, native));
 
     let (parser, _, _) = read(&route, &path, None);
     let (tail, native) = route.finish(&path, parser, Some(base(&route, true)), |_| {});
     let staged = tail.staged_for_test().expect("the head is restated");
     assert!(staged.pages.is_empty());
-    assert_eq!(counters::total("tail_head_migrated", "claude_code"), 1);
+    assert_eq!(counters::total("tail_head_migrated", "heads"), 1);
     assert!(tail.publish(&native));
     route.save(false);
     let head = route.head(&key).unwrap();
@@ -357,7 +328,7 @@ fn a_differing_stored_body_falls_back_to_one_native_read() {
         Some("acked-before")
     );
     assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 1);
-    counters::begin_pass();
+    counters::begin_pass(SnapshotSource::ClaudeCode);
     assert!(take_native(&route.path, &key));
     assert!(!take_native(&route.path, &key), "one use");
     assert_eq!(counters::total("tail_reuse_wait", "reads"), 1);
@@ -434,20 +405,6 @@ fn the_shipped_selections_reuse_stored_state() {
     assert!(!reuses_stored(
         Some(CandidateParseReason::BodyWitnessAdoption),
         true
-    ));
-}
-
-/// D138: runs once upload-context and body-witness selections are enabled.
-#[test]
-#[ignore = "D138"]
-fn the_held_selections_reuse_stored_state_when_enabled() {
-    assert!(reuses_stored(
-        Some(CandidateParseReason::UploadContext),
-        false
-    ));
-    assert!(reuses_stored(
-        Some(CandidateParseReason::BodyWitnessAdoption),
-        false
     ));
 }
 

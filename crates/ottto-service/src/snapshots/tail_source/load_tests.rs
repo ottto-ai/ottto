@@ -4,6 +4,7 @@
 //! resumes from the committed head, absence retires, an identity mismatch
 //! retires before reuse, and a newer build's head holds.
 use super::super::claude::tests::lines;
+use super::super::claude::Claude;
 use super::super::seam::tests::{route, scope, Route, NOW};
 use super::*;
 use crate::local_resource_diagnostics::capture;
@@ -46,7 +47,18 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, V
         false,
     );
     let mut held = File::open(path).unwrap();
-    capture(|| load::<Claude>(&route.index, &route.path, key, &id, &mut held, &scope()))
+    let fresh = super::settlement_tests::candidate(path);
+    capture(|| {
+        load::<Claude>(
+            &route.index,
+            &route.path,
+            key,
+            &id,
+            &mut held,
+            &scope(),
+            &fresh,
+        )
+    })
 }
 
 pub(super) fn loaded(route: &Route, path: &Path, key: &str) -> (Load, Vec<Value>) {

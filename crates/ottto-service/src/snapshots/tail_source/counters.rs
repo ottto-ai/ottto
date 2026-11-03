@@ -1,9 +1,11 @@
-//! The Tail counters: `[since last emit, process total]` per name and label,
-//! counts only, carried on the page's `durable_tail_alarm`. They reset at
-//! process start and never decide anything.
+//! The Tail counters: `[since last emit, process total]` per source, name and
+//! label, counts only, carried on that source's `durable_tail_alarm`. They
+//! reset at process start and never decide anything.
+use crate::snapshots::SnapshotSource;
 use std::collections::BTreeMap;
 
-type Counts = BTreeMap<(&'static str, &'static str), [u64; 2]>;
+/// Keyed by the source's slug, then name and label.
+type Counts = BTreeMap<(&'static str, &'static str, &'static str), [u64; 2]>;
 
 #[cfg(not(test))]
 static COUNTS: std::sync::Mutex<Counts> = std::sync::Mutex::new(BTreeMap::new());
@@ -24,84 +26,112 @@ fn with<R>(visit: impl FnOnce(&mut Counts) -> R) -> R {
     COUNTS.with(|counts| visit(&mut counts.borrow_mut()))
 }
 
-pub(in crate::snapshots) fn bump(name: &'static str, label: &'static str) {
-    add(name, label, 1);
+pub(in crate::snapshots) fn bump(source: SnapshotSource, name: &'static str, label: &'static str) {
+    add(source, name, label, 1);
 }
 
-pub(in crate::snapshots) fn add(name: &'static str, label: &'static str, n: u64) {
+pub(in crate::snapshots) fn add(
+    source: SnapshotSource,
+    name: &'static str,
+    label: &'static str,
+    n: u64,
+) {
     with(|counts| {
-        for count in counts.entry((name, label)).or_default() {
+        for count in counts.entry((source.api_slug(), name, label)).or_default() {
             *count = count.saturating_add(n);
         }
     });
 }
 
 /// A maximum: since the last line, and over the process.
-pub(in crate::snapshots) fn max(name: &'static str, label: &'static str, n: u64) {
+pub(in crate::snapshots) fn max(
+    source: SnapshotSource,
+    name: &'static str,
+    label: &'static str,
+    n: u64,
+) {
     with(|counts| {
-        for count in counts.entry((name, label)).or_default() {
+        for count in counts.entry((source.api_slug(), name, label)).or_default() {
             *count = (*count).max(n);
         }
     });
 }
 
-/// At most once per 24 h while reconstructions after a head persist. RAM only:
-/// a restart alarms again.
-pub(in crate::snapshots) fn restart_full_alarm_due() -> bool {
+/// Per source, at most once per 24 h while reconstructions after a head
+/// persist. RAM only: a restart alarms again.
+pub(in crate::snapshots) fn restart_full_alarm_due(source: SnapshotSource) -> bool {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static LAST: std::sync::Mutex<BTreeMap<&'static str, std::time::Instant>> =
+        std::sync::Mutex::new(BTreeMap::new());
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
-    if last.is_some_and(|at| now.duration_since(at) < EVERY) {
+    if last
+        .get(source.api_slug())
+        .is_some_and(|at| now.duration_since(*at) < EVERY)
+    {
         return false;
     }
-    *last = Some(now);
+    last.insert(source.api_slug(), now);
     true
 }
 
+type Passes = BTreeMap<&'static str, u64>;
 #[cfg(not(test))]
-static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASSES: std::sync::Mutex<Passes> = std::sync::Mutex::new(BTreeMap::new());
 #[cfg(test)]
 thread_local! {
-    static PASSES: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+    static PASSES: std::cell::RefCell<Passes> = const { std::cell::RefCell::new(BTreeMap::new()) };
 }
-
-/// Claude's passes this process has begun: the unit a wait is counted in.
-pub(in crate::snapshots) fn begin_pass() {
-    #[cfg(not(test))]
-    PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    PASSES.with(|passes| passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-}
-
-pub(in crate::snapshots) fn pass() -> u64 {
+fn with_passes<R>(visit: impl FnOnce(&mut Passes) -> R) -> R {
     #[cfg(not(test))]
     {
-        PASSES.load(std::sync::atomic::Ordering::Relaxed)
+        visit(
+            &mut PASSES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
     #[cfg(test)]
-    PASSES.with(|passes| passes.load(std::sync::atomic::Ordering::Relaxed))
+    PASSES.with(|passes| visit(&mut passes.borrow_mut()))
 }
 
-/// This page's line, when anything counted since the last one.
-pub(in crate::snapshots) fn emit(source: &str) {
+/// `source`'s passes this process has begun: the unit a wait is counted in.
+pub(in crate::snapshots) fn begin_pass(source: SnapshotSource) {
+    with_passes(|passes| *passes.entry(source.api_slug()).or_default() += 1);
+}
+
+pub(in crate::snapshots) fn pass(source: SnapshotSource) -> u64 {
+    with_passes(|passes| passes.get(source.api_slug()).copied().unwrap_or(0))
+}
+
+/// `source`'s line on this page, when anything of it counted since the last.
+pub(in crate::snapshots) fn emit(source: SnapshotSource) {
     let line = with(|counts| {
-        if counts.values().all(|[since, _]| *since == 0) {
-            return None;
-        }
         let mut line: BTreeMap<&str, BTreeMap<&str, [u64; 2]>> = BTreeMap::new();
-        for ((name, label), count) in counts.iter_mut() {
+        let mut changed = false;
+        for ((owner, name, label), count) in counts.iter_mut() {
+            if *owner != source.api_slug() {
+                continue;
+            }
+            changed |= count[0] != 0;
             line.entry(name).or_default().insert(label, *count);
             count[0] = 0;
         }
-        Some(line)
+        changed.then_some(line)
     });
     if let Some(line) = line {
-        crate::local_resource_diagnostics::durable_tail_alarm(source, &line);
+        crate::local_resource_diagnostics::durable_tail_alarm(source.api_slug(), &line);
     }
 }
 
+/// A process total, summed over sources.
 #[cfg(test)]
 pub(in crate::snapshots) fn total(name: &'static str, label: &'static str) -> u64 {
-    with(|counts| counts.get(&(name, label)).map_or(0, |count| count[1]))
+    with(|counts| {
+        counts
+            .iter()
+            .filter(|((_, n, l), _)| *n == name && *l == label)
+            .map(|(_, count)| count[1])
+            .sum()
+    })
 }

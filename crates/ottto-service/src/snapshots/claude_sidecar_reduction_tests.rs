@@ -537,8 +537,10 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     );
 }
 
+/// [behaviour] L05: child metadata and a Desktop title re-select the file
+/// (its sidecar fingerprint) and never void its reduction.
 #[test]
-fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
+fn child_metadata_and_desktop_identity_reselect_without_invalidating_reduction() {
     let f = Fixture::new(1);
     let child = f
         .dir
@@ -555,7 +557,7 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
     .unwrap();
     let next = f.fingerprints(&child, &metadata);
     assert_ne!(old.0, next.0);
-    assert_ne!(old.1, next.1);
+    assert_eq!(old.1, next.1);
     let old = f.fingerprints(&f.path, &metadata);
     metadata.titles.insert(
         f.session.clone(),
@@ -564,7 +566,9 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
             user_set: true,
         },
     );
-    assert_ne!(old.1, f.fingerprints(&f.path, &metadata).1);
+    let next = f.fingerprints(&f.path, &metadata);
+    assert_ne!(old.0, next.0);
+    assert_eq!(old.1, next.1);
 }
 
 #[test]

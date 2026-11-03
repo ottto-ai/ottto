@@ -3322,9 +3322,7 @@ pub(crate) fn begin_source_pass(
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
 ) {
-    if source == SnapshotSource::ClaudeCode {
-        tail_source::counters::begin_pass();
-    }
+    tail_source::counters::begin_pass(source);
     cache.quiet_begin_pass(source, index_path, namespace, identity_capture);
     if crate::locked_state_dir::held_for(support_dir).is_some() {
         cache.remove_retired_records(source, index_path);
@@ -8909,9 +8907,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .snapshot_activity_at
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
     #[cfg(unix)]
-    if source == SnapshotSource::ClaudeCode {
-        tail_source::counters::emit(source.api_slug());
-    }
+    tail_source::counters::emit(source);
 }
 
 /// Observe only offers that survived policy, holds and semantic no-op removal.
@@ -10591,9 +10587,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         if full_rearm
             && !complete_rebuild_read
             && index.claude_duplicate_request_witness_overflowed
-            && tail_source::load::route(SnapshotSource::ClaudeCode, index).is_some()
+            && tail_source::tail_route(SnapshotSource::ClaudeCode, index).is_some()
         {
-            tail_source::counters::bump("full_rearm_stored_repeat", "claude_code");
+            tail_source::counters::bump(
+                SnapshotSource::ClaudeCode,
+                "full_rearm_stored_repeat",
+                "rearms",
+            );
         }
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
@@ -16347,6 +16347,9 @@ struct ClaudeResponseObservation {
     /// read, which now keeps them all.
     record_limit_exceeded: bool,
     desktop_request: bool,
+    /// `e2::RULE_EPOCH` at the request's first admission; a later record of
+    /// the same request keeps it.
+    rule_epoch: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16430,6 +16433,7 @@ impl ClaudeResponseObservation {
             .into(),
             record_limit_exceeded: false,
             desktop_request: false,
+            rule_epoch: claude_request_money::e2::RULE_EPOCH,
         }
     }
 
@@ -18441,6 +18445,11 @@ struct SnapshotAccumulator {
     // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
     // turn duration is derivable this way, never TTFT.
     claude_last_user_ts: Option<String>,
+    // Desktop-lineage clocks (L04): the earliest and latest top-level
+    // `timestamp` over every whole Claude line, copied history included, in
+    // unix nanoseconds. Stored in the first head format so the lineage window
+    // can come from the head; not read yet.
+    claude_line_clocks: Option<(i128, i128)>,
     // Context posture (see the SnapshotItem field docs). Running max /
     // first-seen watermarks over each counted API response's effective input
     // context, plus a count of compaction records. The Claude Code and Codex
@@ -18648,6 +18657,7 @@ impl SnapshotAccumulator {
             seen_pi_usage_keys: PiLedger::default(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
+            claude_line_clocks: None,
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
             last_turn_context_tokens: None,
@@ -29439,20 +29449,22 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
-                        if source == SnapshotSource::ClaudeCode {
+                        if tail_source::has_codec(source) {
                             let metrics = plan.metrics();
                             let cause = match plan.mode() {
                                 crate::transcript_acquisition::ReadMode::Full(_) => "full",
                                 _ => "tail",
                             };
                             tail_source::counters::add(
+                                source,
                                 "tail_replay_bytes",
                                 cause,
                                 metrics.native_bytes,
                             );
                             tail_source::counters::add(
+                                source,
                                 "tail_validation_bytes",
-                                source.api_slug(),
+                                "sample",
                                 metrics.sample_bytes as u64,
                             );
                         }
@@ -30239,11 +30251,11 @@ impl OwnedSourceScan {
                         sampled_scan::test_hooks::fire(
                             sampled_scan::test_hooks::Point::BeforeRetain,
                         );
-                        // A Claude reduction on a state database route is
-                        // never retained in RAM: its Tail is its continuation.
+                        // A reduction on a Tail route is never retained in
+                        // RAM: its Tail is its continuation.
                         #[cfg(unix)]
                         let cache_compatible =
-                            cache_compatible && tail_source::load::route(source, index).is_none();
+                            cache_compatible && tail_source::tail_route(source, index).is_none();
                         match parser.retain_reduction(
                             &acquisition.scope,
                             sampled_scan::now_seconds(),
@@ -30469,13 +30481,14 @@ impl OwnedSourceScan {
                     .as_ref()
                     .zip(file_sampling.as_ref())
                     .filter(|_| {
-                        source == SnapshotSource::ClaudeCode
+                        tail_source::has_codec(source)
                             && sampling.is_some()
                             && !comparison_target
                             && side_origin.is_none()
                     })
                     .and_then(|(completed, active)| {
-                        tail_source::seam::PendingTail::claude(
+                        tail_source::pending(
+                            source,
                             index,
                             completed,
                             active,
@@ -30497,12 +30510,12 @@ impl OwnedSourceScan {
                     let pre = tailed.then_some(&mut encode as &mut dyn FnMut(PreFinalization<'_>));
                     parser.finish_boxed_native(finish_request, pre)
                 };
-                // On a Claude database route: whether this file's committed
-                // head stays its continuation (staged, or nothing to restate).
+                // On a Tail route: whether this file's committed head stays
+                // its continuation (staged, or nothing to restate).
                 #[cfg(unix)]
                 let tail_reused = tail
                     .map(|tail| tail.publish(&parsed_file))
-                    .filter(|_| tail_source::load::route(source, index).is_some());
+                    .filter(|_| tail_source::tail_route(source, index).is_some());
                 #[cfg(not(unix))]
                 let parsed_file = parser.finish_boxed_native(finish_request, None);
                 #[cfg(test)]
@@ -32970,17 +32983,6 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
-            // S2: preserve accepted facts before candidate/working-entry changes.
-            #[cfg(unix)]
-            let accepted_floor = tail_source::load::route(source, index)
-                .is_some()
-                .then(|| {
-                    tail_source::floor::AcceptedFloor::of(index, &local_index_key(&candidate.path))
-                })
-                .flatten();
-            // This floor also covers warm and unsampled returned-original paths.
-            #[cfg(unix)]
-            let mut restore_floor = accepted_floor;
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -33055,22 +33057,6 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
-            // A current, source-verified census independently proves that
-            // THIS committed object shrank. Read its new body even without a
-            // reusable optional record; unknown/downgrade floors remain holds.
-            #[cfg(unix)]
-            let native_edit_proven = source == SnapshotSource::ClaudeCode
-                && accepted_floor.is_some_and(|a| a.permits_real_edit())
-                && claude_request_census::proves_indexed_shrink(
-                    index,
-                    &local_index_key(&candidate.path),
-                    candidate.size_bytes,
-                    candidate.physical_identity,
-                );
-            #[cfg(unix)]
-            if native_edit_proven {
-                restore_floor = None;
-            }
             if verification_rescue {
                 sampled_audit::progress_opened(index, &rescue_key);
             }
@@ -33297,7 +33283,7 @@ impl OwnedSourceScan {
             // re-reads from its committed head.
             #[cfg(unix)]
             if decision == CandidateDecision::Skip
-                && tail_source::load::route(source, index).is_some()
+                && tail_source::tail_route(source, index).is_some()
                 && tail_source::load::set_aside(index, &local_index_key(&candidate.path))
             {
                 decision = CandidateDecision::Parse;
@@ -33815,8 +33801,6 @@ impl OwnedSourceScan {
                     dev_ino: at.dev_ino,
                 });
             }
-            #[cfg(unix)]
-            let durable_accepted = accepted_floor;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -33938,13 +33922,14 @@ impl OwnedSourceScan {
                 .filter(|_| !parser.reader.reader.is_compressed())
             {
                 let key = local_index_key(&candidate.path);
-                // Claude's continuation is its committed Tail, never a RAM copy.
+                // A codec source's continuation is its committed Tail, never
+                // a RAM copy.
                 #[cfg(unix)]
-                let tail_route = tail_source::load::route(source, index);
+                let tail_route = tail_source::tail_route(source, index);
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
-                let taken = (source != SnapshotSource::ClaudeCode && !native_edit_proven)
+                let taken = (!tail_source::has_codec(source))
                     .then(|| context.cache.take(&key).map(Box::new))
                     .flatten();
                 #[cfg(not(unix))]
@@ -34089,18 +34074,6 @@ impl OwnedSourceScan {
                             .admission
                             .audit_slot_available
                             .observe(context.audit_slots > 0);
-                        // An ineligible cold route cannot prove replacement.
-                        // Keep S2 even when sampling itself is unavailable.
-                        #[cfg(unix)]
-                        if !allow_sample
-                            && restore_floor.is_some_and(|a| {
-                                let held = parser.reader.reader.get_ref().metadata();
-                                a.holds(index, &key, held.ok().map(|m| m.len()))
-                            })
-                        {
-                            claude_request_census::retain_held(index, &candidate);
-                            pending!();
-                        }
                         let scope = context.file_scope(
                             source,
                             &candidate,
@@ -34108,8 +34081,8 @@ impl OwnedSourceScan {
                             source != SnapshotSource::ClaudeCode || artifacts_enabled,
                             index,
                         );
-                        // On Claude's database route a RAM miss loads the
-                        // committed Tail, unless this file owes a native read.
+                        // On a Tail route a RAM miss loads the committed
+                        // Tail, unless this file owes a native read.
                         #[cfg(unix)]
                         let native_owed = tail_route
                             .as_deref()
@@ -34119,7 +34092,6 @@ impl OwnedSourceScan {
                             retained.is_none()
                                 && allow_sample
                                 && !native_owed
-                                && !native_edit_proven
                                 && stored_refinalize::reuses_stored(
                                     parse_reason,
                                     index.files.get(&key).is_some_and(|entry| {
@@ -34132,14 +34104,15 @@ impl OwnedSourceScan {
                         if tail_route.is_some()
                             && parse_reason == Some(CandidateParseReason::NewFile)
                         {
-                            tail_source::counters::bump("tail_bootstrap_full", "new_file");
+                            tail_source::counters::bump(source, "tail_bootstrap_full", "new_file");
                         }
                         #[cfg(unix)]
                         let mut tail_proven_full = None;
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match (retained, tail_load) {
                             (None, Some(route)) => {
-                                match tail_source::load::claude(
+                                match tail_source::load_candidate(
+                                    source,
                                     index,
                                     route,
                                     &candidate,
@@ -34173,9 +34146,7 @@ impl OwnedSourceScan {
                                 }
                             }
                             (None, None)
-                                if allow_sample
-                                    && !native_edit_proven
-                                    && !parser.reader.reader.is_compressed() =>
+                                if allow_sample && !parser.reader.reader.is_compressed() =>
                             {
                                 // A read with no stored continuation: counted by why.
                                 resource_probe.full_causes.restore_outcome.record(
@@ -34261,36 +34232,10 @@ impl OwnedSourceScan {
                             }
                         };
                         #[cfg(unix)]
-                        if source == SnapshotSource::ClaudeCode
-                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
-                            && durable_accepted.is_some_and(|a| {
-                                parser
-                                    .reader
-                                    .acquisition
-                                    .as_ref()
-                                    .map_or(true, |p| p.frozen_length() < a.end)
-                            })
-                        {
-                            claude_request_census::retain_held(index, &candidate);
-                            drop(parser);
-                            pending!();
-                        }
-                        #[cfg(unix)]
                         let mode = match (tail_proven_full, parser.reader.acquisition.as_mut()) {
                             (Some(reason), Some(plan)) => plan.name_proven_full(reason),
                             _ => mode,
                         };
-                        // S2 again against the actual native plan, after preparation
-                        // but before body I/O/output. Preparing may race a truncate.
-                        #[cfg(unix)]
-                        if restore_floor.is_some_and(|a| {
-                            let plan = parser.reader.acquisition.as_ref();
-                            a.holds(index, &key, plan.map(|plan| plan.frozen_length()))
-                        }) {
-                            claude_request_census::retain_held(index, &candidate);
-                            drop(parser);
-                            pending!();
-                        }
                         if !sampled_audit::growth_read_admitted(index, &candidate, mode) {
                             sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
@@ -34424,30 +34369,6 @@ impl OwnedSourceScan {
                         });
                     }
                 }
-            }
-            // S2 is a publication floor, including warm, census/dependency
-            // fallback and unsampled routes. Only the strict cold-record
-            // replacement or independently bound native shrink proof may clear it. No plan means use the
-            // actual held extent, never a fabricated zero or a skipped guard.
-            #[cfg(unix)]
-            if restore_floor.is_some_and(|a| {
-                let length = parser.reader.acquisition.as_ref().map_or_else(
-                    || {
-                        let held = parser.reader.reader.get_ref().metadata();
-                        held.ok().map(|m| m.len())
-                    },
-                    |plan| Some(plan.frozen_length()),
-                );
-                a.holds(index, &local_index_key(&candidate.path), length)
-            }) {
-                claude_request_census::retain_held(index, &candidate);
-                pending!();
-            }
-            // Past every floor check: a held file's hold ends here, by name.
-            #[cfg(unix)]
-            if accepted_floor.is_some() {
-                let key = local_index_key(&candidate.path);
-                tail_source::floor::release(index, &key, native_edit_proven);
             }
             if source == SnapshotSource::ClaudeCode
                 && file_sampling.is_none()
@@ -34627,13 +34548,6 @@ impl OwnedSourceScan {
                     );
                     pending!();
                 }
-            }
-            #[cfg(unix)]
-            if native_edit_proven {
-                crate::local_resource_diagnostics::durable_tail_alarm(
-                    source.api_slug(),
-                    &serde_json::json!({"full_reads": {"real_edit": {"shrunk": 1}}}),
-                );
             }
             if let Some(context) = sampling.as_mut() {
                 if let Some((mode, audit_due)) = planned_mode {
@@ -39345,6 +39259,17 @@ fn note_claude_fork_parent(parent: &mut Option<String>, named: Option<&str>) {
 }
 
 fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    // Before the fork-provenance return: the lineage window includes copied
+    // history.
+    if let Some(at) = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_unix_nanos)
+    {
+        let (first, last) = accumulator.claude_line_clocks.get_or_insert((at, at));
+        *first = (*first).min(at);
+        *last = (*last).max(at);
+    }
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["sessionId"])
             .or_else(|| string_at(value, &["session_id"]))
@@ -83623,13 +83548,14 @@ crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, 
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
 crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
-crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded, desktop_request);
+crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded, desktop_request, rule_epoch);
 crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N sequence: u64,
     N preceding_user_timestamp: Option<String>,
     D records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     N record_limit_exceeded: bool,
     N desktop_request: bool,
+    N rule_epoch: u8,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
@@ -83804,7 +83730,7 @@ crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
     N source_created_at: Option<String>,
 });
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, durable_marks);
 crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
@@ -83943,6 +83869,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     E seen_pi_usage_keys: PiLedger as BTreeMap<String, PiUsageDedupState>,
     N dropped_usage_record_count: u64,
     N claude_last_user_ts: Option<String>,
+    N claude_line_clocks: Option<(i128, i128)>,
     N peak_context_fill_tokens: u64,
     N first_turn_context_tokens: Option<u64>,
     N last_turn_context_tokens: Option<u64>,
@@ -84386,13 +84313,14 @@ impl ScanIndex {
 // bounds until a qualified build re-pins them after the record store's removal.
 #[cfg(all(unix, target_pointer_width = "64", not(test)))]
 const _: () = {
-    assert!(size_of::<OwnedJsonlParser>() <= 5312);
+    // The L04 lineage clocks (`Option<(i128, i128)>`) add at most 48 B.
+    assert!(size_of::<OwnedJsonlParser>() <= 5360);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // CandidateFile.withheld_content_stamp adds 24 B (Option<String>)
     // to the 856-byte active frame; parser/custody boxing is unchanged.
     assert!(size_of::<OwnedActiveFile>() <= 880);
     assert!(
-        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4880
+        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4928
     );
 };
 /// Explicit privacy erasure hooks. Source-disable and Repair must not call this.

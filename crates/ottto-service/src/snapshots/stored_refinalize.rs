@@ -1,16 +1,15 @@
 //! Re-finalization from stored state: which selections continue from the
 //! committed Tail, and what happens when the body they finish is not the
-//! ACKed one.
-//!
-//! D138 holds upload-context and body-witness selections on native Full. To
-//! enable them, add two arms to `reuse_label` and un-ignore their rows; to
-//! drop them, nothing here changes.
+//! ACKed one. Upload-context and body-witness selections stay on native Full.
 //!
 //! D142: a stored reuse never claims a rescan. Its identical body takes the
 //! exact ACK path with 0 native bytes. A differing body is withheld and the
 //! file owes one native Full, the same read and upload as a selection that
 //! never tried: nothing is counted as read, and nothing is sent twice.
 use super::*;
+
+/// D142's withhold is Claude's alone; c9 deletes this file.
+const CLAUDE: SnapshotSource = SnapshotSource::ClaudeCode;
 
 /// The differ-count label of a selection whose file continues from stored
 /// state although its transcript did not change.
@@ -31,8 +30,8 @@ pub(super) fn reuse_label(reason: CandidateParseReason) -> Option<&'static str> 
 /// An `UnknownOutcome` re-read of a file with a head continues as well: main
 /// continued it from RAM. Growth beats an upload-context selection: a file
 /// that `grew` past its committed entry continues as for `TranscriptChanged`
-/// (main continued it from RAM); a context-only one stays native (D138).
-/// `NewFile`, the other D138 held reason and every legacy reason stay native.
+/// (main continued it from RAM); a context-only one stays native.
+/// `NewFile`, `BodyWitnessAdoption` and every legacy reason stay native.
 pub(super) fn reuses_stored(reason: Option<CandidateParseReason>, grew: bool) -> bool {
     match reason {
         None
@@ -66,11 +65,14 @@ pub(super) fn withhold_for_native(
         evidence_owed::keep_or_clear(entry, false);
     }
     if let Ok(Some(route)) = state_v2::runtime_path(index) {
-        let _ =
-            state_v2::owe_native_read(&route, &pending.index_key, tail_source::counters::pass());
+        let _ = state_v2::owe_native_read(
+            &route,
+            &pending.index_key,
+            tail_source::counters::pass(CLAUDE),
+        );
     }
     if let Some(label) = reuse_label(reason) {
-        tail_source::counters::bump("tail_reuse_differs", label);
+        tail_source::counters::bump(CLAUDE, "tail_reuse_differs", label);
     }
 }
 
@@ -80,9 +82,9 @@ pub(super) fn take_native(route: &Path, key: &str) -> bool {
     let Some(owed) = state_v2::take_native_read(route, key) else {
         return false;
     };
-    let waited = tail_source::counters::pass().saturating_sub(owed);
-    tail_source::counters::bump("tail_reuse_wait", "reads");
-    tail_source::counters::add("tail_reuse_wait", "passes", waited);
-    tail_source::counters::max("tail_reuse_wait", "max_passes", waited);
+    let waited = tail_source::counters::pass(CLAUDE).saturating_sub(owed);
+    tail_source::counters::bump(CLAUDE, "tail_reuse_wait", "reads");
+    tail_source::counters::add(CLAUDE, "tail_reuse_wait", "passes", waited);
+    tail_source::counters::max(CLAUDE, "tail_reuse_wait", "max_passes", waited);
     true
 }

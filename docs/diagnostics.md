@@ -365,21 +365,23 @@ calling these measurements installed evidence.
 
 Claude's continuation state lives in the state database. Its counters ride a
 `durable_tail_alarm` record (schema 2 additive, source label) on any page where
-one changed. Each is `[since the last record, process total]`, counts only;
+one changed; each source with a Tail codec (today Claude only) has its own
+record and keys. Each is `[since the last record, process total]`, counts only;
 they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
-| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head; the file waits and census stays red), `error`. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `not_rederivable`. |
-| `tail_reconstruct_after_head{cause}` | The same, only where a head had been read; the release gate. |
+| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, or a live input not available now; the file waits and census stays red), `error`. The traversal point of a hit also carries `head_bytes` and `page_bytes` read from the database. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `not_rederivable`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: its point says `explicit_action`, and it is neither in `tail_reconstruct_after_head` nor alarmed. |
+| `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
+| `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
 | `tail_bootstrap_full{no_head}` | A file's first read, apart from reconstruction. |
 | `tail_rederive_bytes{ok,mismatch}` | Actual bytes re-read to check stored content digests, including failures. |
 | `tail_replay_bytes{full,tail}` | Native reduction bytes. |
-| `tail_validation_bytes{source}` | Sample and guard bytes, apart from native. |
+| `tail_validation_bytes{sample}` | Sample and guard bytes, apart from native. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed and the file was set aside. |
-| `tail_head_migrated{source}` | A head rewritten for a lower revision with no other change. |
+| `tail_head_migrated{heads}` | A head rewritten for a lower revision with no other change. |
 | `quiet_retirement{staged,retired,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. |
 
 `tail_restart_full_alarm` is emitted on the first reconstruction after a head,
@@ -402,7 +404,8 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
 | `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
-| `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing`, `behind_accepted` | `tail_db_loads{held}` and census-red; the floor keeps `accepted_body_floor` custody |
+| `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
+| `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
 | `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | `tail_rederive_bytes` |
 | `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `tail_validation_bytes` |
 | Sampled native bytes | `tail_replay_bytes`, `tail_bootstrap_full` |

@@ -100,6 +100,7 @@ impl Route {
         };
         at_pre(&mut parser.accumulator);
         let mut tail = PendingTail {
+            source: SnapshotSource::ClaudeCode,
             route: self.path.clone(),
             key: local_index_key(path),
             id: HeadIdentity::new(

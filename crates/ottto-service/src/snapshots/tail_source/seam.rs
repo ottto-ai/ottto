@@ -25,6 +25,7 @@ use crate::transcript_acquisition::{DurableCertificate, ReadMode};
 
 /// One completion's Tail write, from its acquisition to the native verdict.
 pub(in crate::snapshots) struct PendingTail {
+    source: SnapshotSource,
     /// The route's index path: where the stage waits for the next full save.
     route: PathBuf,
     key: String,
@@ -47,12 +48,12 @@ pub(in crate::snapshots) struct Encoded {
 }
 
 impl PendingTail {
-    /// A certified Claude completion on a state database route. `None`: no
+    /// A certified `S` completion on a state database route. `None`: no
     /// route or no valid certificate, so nothing is written for this read.
     /// `base` is the committed head the load continued; `quiet` a quiet audit
     /// this completion retires, so the head no longer carries its debt.
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::snapshots) fn claude(
+    pub(in crate::snapshots) fn new<S: TailSource>(
         index: &ScanIndex,
         completed: &CompletedNativeAcquisition,
         active: &sampled_scan::Active,
@@ -69,9 +70,10 @@ impl PendingTail {
             certificate.audit_debt_unix_seconds = None;
         }
         Some(Self {
+            source: S::SOURCE,
             id: HeadIdentity::new(
                 &route,
-                SnapshotSource::ClaudeCode,
+                S::SOURCE,
                 &candidate.scan_root,
                 &candidate.path,
                 capture,
@@ -82,7 +84,7 @@ impl PendingTail {
             unsealed: completed.unsealed,
             full: matches!(active.mode, ReadMode::Full(_)),
             base,
-            encode: tail_encode::<super::claude::Claude>,
+            encode: tail_encode::<S>,
             encoded: None,
         })
     }
@@ -101,13 +103,13 @@ impl PendingTail {
             return false; // PRE never ran: the read failed before it.
         };
         if self.unsealed || !finish_loss_free(native) {
-            super::counters::bump("tail_publish", "dropped");
+            super::counters::bump(self.source, "tail_publish", "dropped");
             return false;
         }
         // Staging only fails on a poisoned route lock; the predecessor stays.
         match (encoded.staged, encoded.finish_field) {
             (Err(_), _) => {
-                super::counters::bump("tail_full_encode", "failed");
+                super::counters::bump(self.source, "tail_full_encode", "failed");
                 let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
                 false
             }
@@ -263,7 +265,7 @@ impl TailBase {
         }
         let changed = !staged.pages.is_empty() || page_digest(&staged.head) != self.head;
         if self.migrate && !changed {
-            super::counters::bump("tail_head_migrated", S::SOURCE.api_slug());
+            super::counters::bump(S::SOURCE, "tail_head_migrated", "heads");
         }
         Ok((changed || self.migrate).then_some(staged))
     }

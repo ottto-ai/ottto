@@ -2914,31 +2914,6 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
-/// Metadata proof for the currently opened object, independent of optional
-/// RAM/disk restore. A verified census must bind the exact committed fingerprint,
-/// mtime and physical object. Missing/stale/unknown evidence grants nothing.
-pub(super) fn proves_indexed_shrink(
-    index: &ScanIndex,
-    key: &str,
-    length: u64,
-    physical: Option<[u64; 2]>,
-) -> bool {
-    let (Some(record), Some(entry)) = (index.claude_request_census.get(key), index.files.get(key))
-    else {
-        return false;
-    };
-    length < entry.size_bytes
-        && !record.unverified
-        && !record.is_birth_stub()
-        && !entry.source_file_fingerprint.is_empty()
-        && decode_fingerprint(&entry.source_file_fingerprint)
-            == Some(record.source_file_fingerprint)
-        && record.modified == Some(entry.modified_unix_seconds)
-        && record
-            .birth
-            .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
-}
-
 /// Stores a transcript parse's record. Stopgap (#920): a record
 /// that does not fit whole first releases what the retirement rule would
 /// retire at this window (`release_aged`), counted as admission overflow.
@@ -3027,10 +3002,6 @@ fn insert_transcript_record(
     outcome
 }
 
-/// A Held key keeps copy proof while its committed entry is still the
-/// version the record describes (the server's stale body), on the same
-/// physical object; the file itself may have grown. A cleared (reparse-debt)
-/// fingerprint leaves the committed modification time to decide.
 /// A forced family member reads natively only for evidence stored state cannot
 /// supply: no census record, or an unverified or twin record that cannot bind
 /// a recomposed body (an identity-incomplete hold waits for its Full audit).
@@ -3038,25 +3009,6 @@ pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     index.claude_request_census.get(key).map_or(true, |record| {
         record.unverified_or_twin() && !record.can_bind_recomposed_body()
     })
-}
-
-pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFile) -> bool {
-    let key = super::local_index_key(&candidate.path);
-    let kept = match (index.claude_request_census.get(&key), index.files.get(&key)) {
-        (Some(record), Some(entry)) => {
-            record.birth.is_some_and(|birth| {
-                candidate.physical_identity == Some([birth.device, birth.inode])
-            }) && record.modified == Some(entry.modified_unix_seconds)
-                && (entry.rearmed()
-                    || decode_fingerprint(&entry.source_file_fingerprint)
-                        == Some(record.source_file_fingerprint))
-        }
-        _ => false,
-    };
-    if !kept {
-        invalidate_claude_request_census(index, &candidate.path);
-    }
-    kept
 }
 
 /// A parse that reaches no record (a failed finish, or a native comparison

@@ -48,17 +48,6 @@ pub(in crate::snapshots) fn take_native_read(path: &Path, key: &str) -> Option<u
         .ok()
         .flatten()
 }
-/// The accepted floor holds this file.
-pub(in crate::snapshots) fn hold_floor(path: &Path, key: &str) -> Result<()> {
-    with_state(path, |state| {
-        state.tail_floor_held.insert(key.to_owned());
-        Ok(())
-    })
-}
-/// Whether the floor held this file until now; the hold ends here.
-pub(in crate::snapshots) fn release_floor(path: &Path, key: &str) -> bool {
-    with_state(path, |state| Ok(state.tail_floor_held.remove(key))).unwrap_or(false)
-}
 /// The head this pass staged on `path` for `key`, not yet committed.
 #[cfg(test)]
 pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Option<(u32, Vec<u8>)> {
@@ -69,7 +58,6 @@ pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Opti
 pub(in crate::snapshots) fn forget_ram_for_test(path: &Path) {
     with_state(path, |state| {
         state.tail_native_owed.clear();
-        state.tail_floor_held.clear();
         Ok(())
     })
     .unwrap();

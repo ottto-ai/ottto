@@ -275,6 +275,15 @@ pub(crate) mod money_mark {
     /// the raw byte), but never set, cleared, acted on or replayed.
     pub(crate) const RETIRED_PERMIT: u8 = 64;
 }
+/// The money-rule epoch stamped on each stored Claude request at its first
+/// admission (`ClaudeResponseObservation.rule_epoch`; L12). A field only: no
+/// reader, no gate and no stored contribution. Its meaning belongs to E2.
+/// A rule acting at parse time is forward under Tail by construction; one
+/// acting in the fold gates on the request's own provider timestamp
+/// (`observed_at >= T`, as `provider_context_bucket` does), so a cold read
+/// equals a stored one; anything else goes through the operator command.
+pub(crate) const RULE_EPOCH: u8 = 1;
+
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
 /// fix appends a row naming the marks it changes, so only those files are

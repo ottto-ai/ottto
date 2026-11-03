@@ -10,7 +10,7 @@
 //! opening call's file paths by call id. Skill labels are stored as they are.
 use super::{
     encode, fixed_pages, page_bytes, read_page, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, ReconstructCause, TailSource,
+    HeadIdentity, LiveLoadError, ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
@@ -217,6 +217,7 @@ head_fields! {
     I seen_pi_usage_keys: PiLedger,
     N dropped_usage_record_count: u64,
     N claude_last_user_ts: Option<String>,
+    N claude_line_clocks: Option<(i128, i128)>,
     N peak_context_fill_tokens: u64,
     N first_turn_context_tokens: Option<u64>,
     N last_turn_context_tokens: Option<u64>,
@@ -515,6 +516,21 @@ impl TailSource for Claude {
         } else {
             Err(ReconstructCause::Corrupt)
         }
+    }
+
+    /// The one keyed field is the org markers' `session_context` digest,
+    /// an HMAC under the attribution key (#1255).
+    fn key_epoch() -> Option<[u8; 32]> {
+        claude_request_identity::session_context_key_epoch()
+    }
+
+    /// Claude's live inputs (Desktop identity and lineage, account, sidecar
+    /// evidence) join at finish, never into the stored state.
+    fn install_live(
+        _stored: &mut SnapshotAccumulator,
+        _fresh: &CandidateFile,
+    ) -> Result<(), LiveLoadError> {
+        Ok(())
     }
 }
 

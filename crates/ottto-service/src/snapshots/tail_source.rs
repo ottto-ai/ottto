@@ -14,9 +14,86 @@ use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
 pub(in crate::snapshots) mod counters;
-pub(in crate::snapshots) mod floor;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
+
+/// The one list of sources with a Tail codec: `$s` names the source's codec
+/// type inside `$arm`; every other source takes `$none`. A source joins by
+/// adding its arm here, never through its `state_v2` registry flag (Codex has
+/// that flag before its codec exists).
+macro_rules! with_codec {
+    ($source:expr, $s:ident => $arm:expr, _ => $none:expr) => {
+        match $source {
+            SnapshotSource::ClaudeCode => {
+                type $s = claude::Claude;
+                $arm
+            }
+            SnapshotSource::Codex | SnapshotSource::Pi => $none,
+        }
+    };
+}
+
+/// Whether `source` has a Tail codec: its reduction is never kept in RAM and
+/// its Tail counters exist.
+pub(in crate::snapshots) fn has_codec(source: SnapshotSource) -> bool {
+    with_codec!(source, S => S::SOURCE == source, _ => false)
+}
+
+/// The state database route `source`'s Tail lives on, when it has a codec.
+pub(in crate::snapshots) fn tail_route(
+    source: SnapshotSource,
+    index: &ScanIndex,
+) -> Option<PathBuf> {
+    has_codec(source)
+        .then(|| state_v2::runtime_path(index).ok().flatten())
+        .flatten()
+}
+
+/// `source`'s load of `candidate` on `route`, through its codec.
+pub(in crate::snapshots) fn load_candidate(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    route: &Path,
+    candidate: &CandidateFile,
+    capture: bool,
+    held: &mut File,
+    scope: &crate::transcript_acquisition::Scope,
+) -> load::Load {
+    with_codec!(
+        source,
+        S => load::entry::<S>(index, route, candidate, capture, held, scope),
+        _ => load::Load::Cold(None)
+    )
+}
+
+/// `source`'s pending Tail write for one completion, through its codec.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::snapshots) fn pending(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    completed: &sampled_jsonl::CompletedNativeAcquisition,
+    active: &sampled_scan::Active,
+    candidate: &CandidateFile,
+    held: &File,
+    capture: bool,
+    base: Option<seam::TailBase>,
+    quiet: bool,
+) -> Option<seam::PendingTail> {
+    with_codec!(
+        source,
+        S => seam::PendingTail::new::<S>(index, completed, active, candidate, held, capture, base, quiet),
+        _ => None
+    )
+}
+
+/// Why a source's live inputs could not be installed into a loaded head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum LiveLoadError {
+    /// The live input is not available now: the file holds with its debt.
+    Unavailable,
+    /// The stored state contradicts the live input: a counted reconstruction.
+    Reconstruct(ReconstructCause),
+}
 
 /// One collection a source stores in pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +124,9 @@ pub(in crate::snapshots) enum ReconstructCause {
     Identity,
     /// A re-derived content field no longer matches its stored digest.
     NotRederivable,
+    /// The head's keyed fields were made under another attribution key: an
+    /// explicit action (a key change), not a failure.
+    KeyEpoch,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -57,6 +137,7 @@ impl ReconstructCause {
             Self::Revision => "revision",
             Self::Identity => "identity",
             Self::NotRederivable => "not_rederivable",
+            Self::KeyEpoch => "key_epoch",
         }
     }
 }
@@ -66,16 +147,19 @@ impl From<Corrupt> for ReconstructCause {
     }
 }
 
-/// What a head binds: the route and file it was reduced for, and the
-/// parse-time capture mode. The route is the destination-scoped index path,
-/// so it names the upload destination namespace. The reduction revision is
-/// the head's stored revision. Upload context, replay generation, the
-/// artifacts flag, the sidecar digest, the account witness and version
-/// strings are not inputs.
+/// What a head binds: the route and file it was reduced for, the
+/// parse-time capture mode, and the epoch of the key its keyed fields were
+/// made under. The route is the destination-scoped index path, so it names
+/// the upload destination namespace. The reduction revision is the head's
+/// stored revision. Upload context, replay generation, the artifacts flag,
+/// the sidecar digest, the account witness and version strings are not
+/// inputs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::snapshots) struct HeadIdentity {
     binding: [u8; 32],
     capture: bool,
+    /// The source's `TailSource::key_epoch` when the head was made.
+    key_epoch: Option<[u8; 32]>,
 }
 impl HeadIdentity {
     pub(in crate::snapshots) fn new(
@@ -104,20 +188,30 @@ impl HeadIdentity {
         Self {
             binding: hash.finalize().into(),
             capture: request_identity_capture,
+            key_epoch: with_codec!(source, S => S::key_epoch(), _ => None),
         }
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
         self.binding.put_h(e, "HeadIdentity.binding")?;
-        self.capture.put(e)
+        self.capture.put(e)?;
+        // No key is all zeros: an HMAC output never is.
+        self.key_epoch
+            .unwrap_or_default()
+            .put_h(e, "HeadIdentity.key_epoch")
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let binding = <[u8; 32]>::take_h(d)?;
+        let capture = bool::take(d)?;
+        let key_epoch = <[u8; 32]>::take_h(d)?;
         Ok(Self {
-            binding: <[u8; 32]>::take_h(d)?,
-            capture: bool::take(d)?,
+            binding,
+            capture,
+            key_epoch: (key_epoch != [0; 32]).then_some(key_epoch),
         })
     }
     /// Decodes only the head's leading identity, before any page or private
-    /// field: another route is `Identity`, another capture mode `Incompatible`.
+    /// field: another route is `Identity`, another capture mode
+    /// `Incompatible`, another key epoch `KeyEpoch`.
     pub(in crate::snapshots) fn check(&self, head: &[u8]) -> Result<(), ReconstructCause> {
         let stored = Self::take(&mut Dec::new(head))?;
         if stored.binding != self.binding {
@@ -125,6 +219,9 @@ impl HeadIdentity {
         }
         if stored.capture != self.capture {
             return Err(ReconstructCause::Incompatible);
+        }
+        if stored.key_epoch != self.key_epoch {
+            return Err(ReconstructCause::KeyEpoch);
         }
         Ok(())
     }
@@ -197,6 +294,15 @@ pub(in crate::snapshots) trait TailSource {
     ) -> Result<(), ReconstructCause>;
     /// Facts the decoded state must satisfy beyond its counts.
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
+    /// The epoch of the key every keyed field this codec stores is made
+    /// under; `None` without a key. A head from another epoch is never reused.
+    fn key_epoch() -> Option<[u8; 32]>;
+    /// Installs the live inputs of this read into a validated stored state,
+    /// before the load publishes it as reused.
+    fn install_live(
+        stored: &mut SnapshotAccumulator,
+        fresh: &CandidateFile,
+    ) -> Result<(), LiveLoadError>;
 
     /// After every page: each declared collection's stored geometry and
     /// element count against the decoded state, then the source's facts.

@@ -99,7 +99,7 @@ impl Decoded {
         let boundary = stored.codex_ownership_boundary;
         let session_end = stored.session_start.durable_content_end().unwrap_or(0);
         let mut head = vec![0; plan.end as usize];
-        read_at(file, &mut head, 0)?;
+        read_at(source, file, &mut head, 0)?;
         let mut window = ClaudeResponseWindow::default();
         let mut offset = 0;
         let mut peak = 0;
@@ -235,7 +235,7 @@ impl Decoded {
         }
         if let Some((offset, len)) = plan.title {
             let mut line = vec![0; len as usize];
-            read_at(file, &mut line, offset)?;
+            read_at(source, file, &mut line, offset)?;
             replay_line(
                 line.strip_suffix(b"\n").unwrap_or(&line),
                 &mut peak,
@@ -282,7 +282,7 @@ impl Decoded {
                 .transpose()?,
         ];
         if matches.contains(&Some(false)) {
-            tail_source::counters::bump("tail_rederive_bytes", "mismatch");
+            tail_source::counters::bump(source, "tail_rederive_bytes", "mismatch");
             return Err(Refuse::NotRederivable("content_fence"));
         }
         let acc = &mut self.reduction.accumulator;
@@ -335,7 +335,7 @@ impl ClaudeResponseWindow {
         }
     }
 }
-fn read_at(file: &File, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
+fn read_at(source: SnapshotSource, file: &File, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
     let mut offset = 0;
     while offset < bytes.len() {
         let n = match file.read_at(&mut bytes[offset..], at + offset as u64) {
@@ -343,7 +343,7 @@ fn read_at(file: &File, bytes: &mut [u8], at: u64) -> Result<(), Refuse> {
             Ok(0) | Err(_) => return Err(Refuse::NotRederivable("content_read")),
             Ok(n) => n,
         };
-        tail_source::counters::add("tail_rederive_bytes", "ok", n as u64);
+        tail_source::counters::add(source, "tail_rederive_bytes", "ok", n as u64);
         offset += n;
     }
     Ok(())

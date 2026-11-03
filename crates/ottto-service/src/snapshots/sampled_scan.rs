@@ -2300,29 +2300,20 @@ pub(super) fn reduction_dependencies(
     if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
         return None;
     }
-    if source == SnapshotSource::Codex {
-        Some(sha256_hex(&[
+    match source {
+        SnapshotSource::Codex => Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
             &codex.path_reduction_fingerprint(&candidate.path),
             &codex_file_join::header_reduction_witness(candidate).ok()?,
-        ]))
-    } else {
-        let mut scoped = candidate.clone();
-        // Claude API/trace evidence is joined freshly after native finish, not
-        // retained in the pre-finish transcript accumulator. Keep Desktop and
-        // child naming dependencies here; keep usage sidecars in selection.
-        let reduction_support = if source == SnapshotSource::ClaudeCode {
-            None
-        } else {
-            support
-        };
-        prepare_owned_scan_candidate(source, &mut scoped, codex, claude, reduction_support);
-        if source == SnapshotSource::ClaudeCode {
-            Some(sha256_hex(&[
-                "claude_reduction_dependencies:v1",
-                &scoped.source_file_fingerprint,
-            ]))
-        } else {
+        ])),
+        // Claude's sidecar evidence and its Desktop and child naming are live
+        // inputs joined at finish, never in the pre-finish reduction: a
+        // rename re-selects the file (its sidecar fingerprint) and never voids
+        // its reduction (L05).
+        SnapshotSource::ClaudeCode => Some("claude_reduction_dependencies:v2".to_owned()),
+        SnapshotSource::Pi => {
+            let mut scoped = candidate.clone();
+            prepare_owned_scan_candidate(source, &mut scoped, codex, claude, support);
             Some(scoped.source_file_fingerprint)
         }
     }

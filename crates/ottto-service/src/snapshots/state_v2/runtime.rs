@@ -165,9 +165,6 @@ struct RouteState {
     // one's next read is native. Losing this costs one more 0-byte try.
     // The value is the pass the read was owed in.
     tail_native_owed: BTreeMap<String, u64>,
-    // Files the accepted floor held in this process, so each exit is named
-    // once. A restart re-learns a file at its next hold.
-    tail_floor_held: BTreeSet<String>,
 }
 impl RouteState {
     fn custody_held(&self) -> bool {
@@ -239,7 +236,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     custody_retry_at: None,
                     tail: Default::default(),
                     tail_native_owed: Default::default(),
-                    tail_floor_held: Default::default(),
                 }))
             })
             .clone()
