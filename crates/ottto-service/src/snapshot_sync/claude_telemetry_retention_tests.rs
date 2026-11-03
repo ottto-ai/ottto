@@ -404,9 +404,17 @@ fn telemetry_retention_keeps_every_dependency() {
             match row {
                 Dependency::NamedByPage => {
                     c.root(HELD, &line(HELD, "x1", AT, 9));
+                    // A real sidechain line: Claude Code writes the agent id
+                    // and the sidechain flag, which the parser turns into
+                    // the parent and root refs.
+                    let agent = "a4d1585d310070d0f";
+                    let mut sidechain: serde_json::Value =
+                        serde_json::from_str(line(HELD, "x2", AT, 8).trim()).unwrap();
+                    sidechain["agentId"] = serde_json::json!(agent);
+                    sidechain["isSidechain"] = serde_json::json!(true);
                     c.write_at(
-                        &format!("{HELD}/subagents/agent-001.jsonl"),
-                        &line(HELD, "x2", AT, 8),
+                        &format!("{HELD}/subagents/agent-{agent}.jsonl"),
+                        &(sidechain.to_string() + "\n"),
                         AT,
                     );
                     let mut page = c.raw(
