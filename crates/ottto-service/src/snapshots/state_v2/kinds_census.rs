@@ -1,7 +1,7 @@
 //! Census records keep the existing v1 JSON; no hand-written census binary.
 use super::catalogue::scan_index_fields;
 use super::*;
-use anyhow::ensure;
+use anyhow::{ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     rows.map("file.census", next.claude_request_census.storage_records())?;
