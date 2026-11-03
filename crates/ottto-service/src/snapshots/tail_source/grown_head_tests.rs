@@ -304,8 +304,10 @@ fn claude_layout() -> String {
 /// SHA-256 of `claude_layout()`. A change here is a layout change: decide
 /// whether old heads still decode (a `G` append does), or bump
 /// `Claude::REDUCTION_REVISION`, then update this pin.
+// The added `I codex_dictionary_slots` shape marker stores no bytes. Removing
+// that marker reproduces the previous pin exactly; Claude's revision stays.
 const CLAUDE_LAYOUT_SHA256: &str =
-    "7b524958b42c394491662b40f42f762bb51526f5c31689be1a130f5008cfb69e";
+    "b0e3891afea2a815e2a6c67c634760952ace2b910ba07f9315ddd967a9ac0ffb";
 
 /// [money] Any drift of the stored Claude head or page layout fails here.
 #[test]

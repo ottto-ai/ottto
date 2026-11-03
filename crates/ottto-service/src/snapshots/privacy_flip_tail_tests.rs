@@ -129,6 +129,7 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
             let mut f = Fixture::new(source);
             f.append(&material(source));
             f.flip_to(before);
+            f.route();
             let committed = f.index.clone();
             let parsed = f.flip_walk(before.policy, f.attribution_for(before).as_ref());
             f.send_all(&committed, &parsed.scan);
@@ -139,6 +140,7 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
             f.flip_to(after);
             assert!(f.debt(), "{label}: delivered, unproven");
             let posted = f.uploader.posts.len();
+            f.route();
             let committed = f.index.clone();
             let quiet = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
             assert_eq!(
@@ -152,6 +154,7 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
             assert!(f.debt(), "{label}: still owed, paid by the next read");
 
             f.append(&growth(source));
+            f.route();
             let committed = f.index.clone();
             let tail = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
             assert_eq!(tail.modes, (0, 1, 0), "{label}");
@@ -166,6 +169,7 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
             f.cache = Arc::default();
             f.uploader = crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source);
             f.flip_to(after);
+            f.route();
             let committed = f.index.clone();
             let cold = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
             assert_eq!(cold.modes.0, 1, "{label}: the control is a Full");
