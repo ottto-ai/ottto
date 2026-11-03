@@ -12915,7 +12915,7 @@ impl ClaudeLegacyRequestOwners {
             let evidence_fingerprint = <[u8; 32]>::from(sha256_digest(&[
                 "claude_legacy_request_owner:v1",
                 root_session_id,
-                claude_request_identity::digest_hex::encode(&request_hash).as_str(),
+                crate::hex::encode(&request_hash).as_str(),
                 row.fingerprint.as_str(),
                 trace.fingerprint.as_str(),
             ]));
@@ -13125,9 +13125,7 @@ fn claude_legacy_exclusion_evidence_fingerprint(
         digest.update(b"\0");
         digest.update(owner.root_session_id.as_bytes());
         digest.update(b"\0");
-        digest.update(
-            claude_request_identity::digest_hex::encode(owner.evidence_fingerprint).as_bytes(),
-        );
+        digest.update(crate::hex::encode(owner.evidence_fingerprint).as_bytes());
         digest.update(b"\0");
     }
     Some(format!("{:x}", digest.finalize()))
@@ -54442,9 +54440,7 @@ fn codex_parent_prefix_chain(previous: &PrefixDigest, signature: &str) -> Prefix
     update_length_prefixed(&mut digest, signature.as_bytes());
     digest.finalize().into()
 }
-fn codex_digest_hex(digest: &PrefixDigest) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+use crate::hex::encode as codex_digest_hex;
 /// U1a: lower-case 64-hex only.
 fn codex_digest_from_hex(hex: &str) -> Option<PrefixDigest> {
     if hex.len() != 64

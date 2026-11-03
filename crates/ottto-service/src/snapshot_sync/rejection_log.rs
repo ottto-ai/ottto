@@ -16,12 +16,7 @@ impl SessionHash {
 impl fmt::Display for SessionHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Some(bytes) => {
-                for byte in bytes {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                Ok(())
-            }
+            Some(bytes) => fmt::Display::fmt(&crate::hex::LowerHex(&bytes), formatter),
             None => formatter.write_str("unavailable"),
         }
     }

@@ -175,9 +175,7 @@ pub(super) struct AcceptedShare {
 }
 pub(crate) mod digest_hex {
     use super::*;
-    pub(crate) fn encode(value: &[u8; 32]) -> String {
-        value.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+    pub(crate) use crate::hex::encode;
     pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
         if !hash_is_valid(value) {
             return Err(E::custom("invalid fingerprint"));
@@ -205,7 +203,9 @@ mod optional_digest_hex {
         value: &Option<[u8; 32]>,
         encoder: S,
     ) -> Result<S::Ok, S::Error> {
-        value.as_ref().map(digest_hex::encode).serialize(encoder)
+        value
+            .map(|digest| crate::hex::encode(&digest))
+            .serialize(encoder)
     }
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         decoder: D,
@@ -317,7 +317,7 @@ fn placement_only_entry(entry: &Value) -> bool {
         || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
-    digest_hex::encode(&digest(
+    crate::hex::encode(&digest(
         key,
         json!(["claude_accepted_identity_buckets:v2", session]),
     ))
@@ -376,7 +376,7 @@ pub(super) fn unbind_test_session_context_key() {
 /// The sentence's HMAC-SHA-256 under the bound key; `None` without one.
 pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
     let key = with_session_context_key(|bound| bound.clone().flatten())?;
-    Some(digest_hex::encode(&digest(
+    Some(crate::hex::encode(&digest(
         &key,
         json!([SESSION_CONTEXT_DOMAIN, sentence]),
     )))
@@ -631,7 +631,8 @@ impl AcceptedSession {
         self.proved
             .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
             .ok()
-            .and_then(|index| self.proved[index].account.as_ref().map(digest_hex::encode))
+            .and_then(|index| self.proved[index].account)
+            .map(|digest| crate::hex::encode(&digest))
     }
     /// Today's proof digest for a row in its fresh-tag wire form.
     pub(super) fn row_proof(&self, row: &Value, evidence: &Value) -> Option<[u8; 16]> {
