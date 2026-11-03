@@ -303,6 +303,7 @@ fn authority_terminal_growth_has_its_own_label_until_settled() {
 }
 
 /// [behaviour] A failed pass ages from the newest acceptance for its source; none is unknown.
+/// A recent acceptance is not freshness: with no walk aggregate yet, the debt is unknown.
 #[test]
 fn failed_pass_reports_the_last_ack_and_unknown_alarms() {
     use crate::upload_receipts::newest_accepted_unix_seconds;
@@ -342,5 +343,6 @@ fn failed_pass_reports_the_last_ack_and_unknown_alarms() {
     let row = alarm_rows(&rows)[0];
     assert!(row["age_s"].as_u64().unwrap() < ALARM_AFTER);
     assert_eq!(row["basis"], "last_ack");
-    assert_eq!(row["alarm"], false);
+    assert!(row["debt"].is_null());
+    assert_eq!(row["alarm"], true);
 }

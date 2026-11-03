@@ -2238,6 +2238,32 @@ reads as fresh until it pauses. Files refused by snapshot quarantine settle
 without acceptance and stay with the terminal counters. The row carries counts
 only.
 
+`debt` is the source's persisted per-file freshness debt (G7), `null` for a graph
+with no state-v2 store or when its store cannot be read. Each listed file's owed
+changes are kept as metadata of its `tail.head` and `tail.revision` rows, so they
+survive restarts: a create, append or rewrite adds a revision timed at the live
+mtime, and only the file's own matched exact upload receipt retires it, and only
+the prefix it covers (a newer suffix keeps its own time and bytes). A stamp match,
+a read, a hold or a newer receipt elsewhere retires nothing. A rewritten file
+folds its old debt into the new object with the earliest time. Files never
+indexed count with a lower-bound age, Claude subagent journals count until
+per-file evidence exists, and Codex archives count by compressed size; outside
+the discovery window no new debt starts. `outstanding_files` counts every owed
+file, `held_files` those whose debt is read or held rather than unread,
+`unread_bytes` the bytes no read reached, `over_6h_files` those whose oldest owed
+change is more than 21,600 seconds old, and `oldest_age_s` the oldest of those
+ages, with `oldest_age_lower_bound` true when that age is a lower bound or some
+debt has no known age. `no_upload_required_files` counts this walk's files with
+per-file evidence of no usage (a confirmed-empty file or an empty archive at its
+stamp). `deleted_unaccepted_files` is the cumulative count of files erased while
+still owed: a complete walk erases the debt of a file it no longer lists and
+whose index entry is gone. `last_complete_discovery_at` is the Unix time a walk
+that covered every root without a listing error last began. `debt.alarm` is true
+when a file is over 6 h, when any debt has no known age, or when there has been
+no complete discovery in 6 h, and the row's `alarm` is also true then. A failed
+pass carries the last walk's `debt` re-aged; before this process's first walk
+end it is `null` and `alarm` is true, whatever the newest receipt says.
+
 ### Money freshness (Claude queue and replay)
 
 The Claude shadow and freshness gauges are always on and share one

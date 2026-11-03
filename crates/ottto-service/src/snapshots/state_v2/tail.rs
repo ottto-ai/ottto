@@ -294,6 +294,17 @@ impl TailStage {
             && self.erase.is_empty()
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
+        self.merge(key, observation);
+        self.report();
+    }
+    /// Many files' debt-only changes, merged as one by one, with one report.
+    pub(super) fn observe_all(&mut self, observations: Vec<(String, Observation)>) {
+        for (key, observation) in observations {
+            self.merge(&key, observation);
+        }
+        self.report();
+    }
+    fn merge(&mut self, key: &str, observation: Observation) {
         let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
         let merged = match debt.observation.take() {
             Some(mut prior) => {
@@ -303,7 +314,6 @@ impl TailStage {
             None => observation,
         };
         debt.observation = Some(merged);
-        self.report();
     }
     /// Staged observations of the key are superseded; later ones apply after.
     pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {

@@ -1,7 +1,9 @@
 //! Freshness diagnostics; none grants a read, alters a hold or adds a read.
 //! `freshness_alarm` is each source's age of the oldest change not yet settled,
-//! derived from stored stamps and live mtimes, so it survives restarts. `Counts`
-//! are count-only Claude gauges over the bounded FirstPending stamps.
+//! derived from stored stamps and live mtimes, so it survives restarts, plus
+//! the persisted per-file debt (`g7_debt`) under `debt`. `Counts` are
+//! count-only Claude gauges over the bounded FirstPending stamps.
+use super::g7_debt::{self, Report};
 use super::SnapshotSource;
 use serde::Serialize;
 
@@ -45,9 +47,9 @@ impl WalkFold {
         }
     }
 
-    pub(super) fn page_end(self, source: SnapshotSource, walk_ended: bool) {
+    pub(super) fn page_end(self, source: SnapshotSource, walk_ended: bool, debt: Option<&Report>) {
         if walk_ended {
-            emit(source, Some(self.age_s), self, "walk");
+            emit(source, Some(self.age_s), self, "walk", debt);
         } else {
             with_walks(|walks| walks[source as usize] = self);
         }
@@ -78,8 +80,16 @@ fn with_walks<T>(body: impl FnOnce(&mut [WalkFold; 3]) -> T) -> T {
 }
 
 /// Unknown age alarms: it never reads as fresh. So does any authority-terminal
-/// file, at any age, until its stamp settles.
-fn emit(source: SnapshotSource, age_s: Option<u64>, fold: WalkFold, basis: &'static str) {
+/// file, at any age, until its stamp settles, and so does the persisted debt's
+/// own alarm. `debt` is `None` only for a graph with no Tail store.
+fn emit(
+    source: SnapshotSource,
+    age_s: Option<u64>,
+    fold: WalkFold,
+    basis: &'static str,
+    debt: Option<&Report>,
+) {
+    let now_ms = super::sampled_scan::now_seconds().saturating_mul(1000);
     crate::local_resource_diagnostics::traversal_point(
         "freshness_alarm",
         source.api_slug(),
@@ -90,17 +100,22 @@ fn emit(source: SnapshotSource, age_s: Option<u64>, fold: WalkFold, basis: &'sta
             "authority_terminal_files": fold.authority_terminal_files,
             "authority_terminal_oldest_age_s": fold.authority_terminal_oldest_age_s,
             "basis": basis,
+            "debt": debt.map_or(serde_json::Value::Null, |debt| debt.fields(now_ms)),
             "alarm": age_s.map_or(true, |age| age > ALARM_AFTER)
-                || fold.authority_terminal_files > 0,
+                || fold.authority_terminal_files > 0
+                || debt.is_some_and(|debt| debt.alarm(now_ms)),
         }),
     );
 }
 
 /// A failed pass may never reach the walk: its age is the newest acceptance.
+/// Its debt is this process's last walk aggregate, re-aged now; with none yet
+/// it is unknown, never fresh, whatever the newest acceptance says.
 pub(crate) fn report_failed_pass(source: SnapshotSource, last_ack_unix_seconds: Option<u64>) {
     let age_s =
         last_ack_unix_seconds.map(|at| super::sampled_scan::now_seconds().saturating_sub(at));
-    emit(source, age_s, WalkFold::EMPTY, "last_ack");
+    let debt = g7_debt::last_report(source).unwrap_or_else(Report::unavailable);
+    emit(source, age_s, WalkFold::EMPTY, "last_ack", Some(&debt));
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]

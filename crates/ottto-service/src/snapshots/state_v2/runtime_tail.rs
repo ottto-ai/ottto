@@ -48,6 +48,16 @@ pub(in crate::snapshots) fn observe_tail(
         Ok(())
     })
 }
+/// `observe_tail` for many files at once: one stage report, not one per file.
+pub(in crate::snapshots) fn observe_tails(
+    path: &Path,
+    observations: Vec<(String, Observation)>,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe_all(observations);
+        Ok(())
+    })
+}
 /// The caller's authorised final disposition of the file's whole debt: its
 /// revisions go and its marker clears; a head left with no reduction goes too.
 pub(in crate::snapshots) fn dispose_tail(
@@ -125,6 +135,13 @@ pub(in crate::snapshots) fn load_revisions(
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_revisions(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })
+}
+/// The route of `index`'s live session, for a caller holding only the graph:
+/// `None` for a v1 graph, which has no Tail store.
+pub(in crate::snapshots) fn tail_route_path(
+    index: &ScanIndex,
+) -> Result<Option<std::path::PathBuf>> {
+    runtime_path(index)
 }
 /// Every key with a committed head, this route's graph generation, keys only.
 pub(in crate::snapshots) fn tail_head_keys(

@@ -184,6 +184,7 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
+mod g7_debt;
 pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
@@ -47085,6 +47086,7 @@ fn advance_bounded_directory_traversal_with_budget(
         .iter()
         .any(|directory| !directory.watcher_hint);
     let mut freshness = money_freshness::WalkFold::resume(source);
+    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk);
     let listed_at = sampled_scan::now_seconds();
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
@@ -47107,6 +47109,7 @@ fn advance_bounded_directory_traversal_with_budget(
         }
     };
     while remaining > 0 {
+        debt.counts(&traversal.counts, relisted_counts.as_ref());
         restore(
             &mut traversal.counts,
             relisted_counts.take(),
@@ -47120,6 +47123,9 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if directory.path == directory.scan_root {
+                    debt.root_missing();
+                }
                 // A queued directory gone below its live parent, in a strictly
                 // later walk too, is a removal; its files settle one by one
                 // through the missing-parent rule.
@@ -47240,6 +47246,23 @@ fn advance_bounded_directory_traversal_with_budget(
             if source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(&path)
             {
+                // Excluded by design, yet owed until per-file evidence exists.
+                if let Ok(metadata) = entry.metadata() {
+                    let modified = metadata.modified().ok().and_then(unix_seconds);
+                    let listing = g7_debt::Listing {
+                        path: &path,
+                        metadata: &metadata,
+                        in_window: census_unix_seconds.map_or(true, |now| {
+                            is_recent_enough_at(
+                                modified.unwrap_or_default(),
+                                now,
+                                backfill_window_days,
+                            )
+                        }),
+                        excluded: true,
+                    };
+                    debt.listed(index, &traversal, listing);
+                }
                 continue;
             }
             if source == SnapshotSource::Codex {
@@ -47307,6 +47330,13 @@ fn advance_bounded_directory_traversal_with_budget(
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
+            let listing = g7_debt::Listing {
+                path: &path,
+                metadata: &metadata,
+                in_window: !aged,
+                excluded: false,
+            };
+            debt.listed(index, &traversal, listing);
             let owes_stamped = aged
                 && retention.owes_stamped(
                     source,
@@ -47415,6 +47445,7 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
+    debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
         &mut traversal.counts,
         relisted_counts,
@@ -47425,8 +47456,10 @@ fn advance_bounded_directory_traversal_with_budget(
             census.invalidate_walk();
         }
     }
+    let walk_ended = traversal.pending_directories.is_empty();
+    let debt = debt.end(index, walk_ended);
     if root_walk {
-        freshness.page_end(source, traversal.pending_directories.is_empty());
+        freshness.page_end(source, walk_ended, debt.as_ref());
     }
     index.traversal = Some(traversal);
 }

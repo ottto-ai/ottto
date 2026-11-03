@@ -53,8 +53,8 @@ mod tail;
 use kinds::KindCx;
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
-    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
+    retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]
