@@ -68,8 +68,8 @@ SKIPPABLE = re.compile(r"^\s*(?:#\[.*\]|//.*)?\s*$")
 # Cargo's start line for one test binary, and for a crate's doc-tests.
 RUNNING = re.compile(r"^\s*Running (?:unittests )?\S+ \((\S+)\)")
 DOC_TESTS = re.compile(r"^\s*Doc-tests (\S+)")
-# Cargo's line for each test binary that exited non-zero (--no-fail-fast keeps going).
-PROCESS_FAILED = re.compile(r"process didn't exit successfully: `(\S+)[^`]*` \(([^)]*)\)")
+# Cargo's lines after a failing test binary; the first two only for an abnormal end.
+PROCESS_FAILED = re.compile(r"process didn't exit successfully")
 DOCTEST_FAILED = re.compile(r"error: doctest failed")
 NOT_EXECUTED = re.compile(r"could not execute process")
 RERUN = re.compile(r"error: test failed, to rerun pass ")
@@ -208,37 +208,43 @@ def never_retry(name: str, required: set[str], modules: frozenset[str] | set[str
 
 
 def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str]]:
-    """Failed test names per test binary file name, plus the binaries whose
-    failures cannot be retried by name.
+    """Failed test names per test binary file name, plus what cannot be retried.
 
-    Retryable means: cargo reported the binary exiting with libtest's failure
-    status 101 (not a signal or another code), it printed FAILED names, and its
-    last summary counts exactly those. Anything else is unretriable: a crash or
-    abort, a failed doc-test, a binary that exited non-zero with no FAILED name
-    (a child probe's summary can look clean), FAILED names in a binary cargo did
-    not report as failing, a count mismatch, any binary without a summary
-    (never ran, or ran into a crash), a binary cargo could not start, or cargo
-    failure lines that do not add up to its exit lines.
+    Cargo (1.95) prints its error for a failing binary right after that
+    binary's output. For libtest's normal failure (exit 101) that is one
+    `error: test failed, to rerun pass ...` line; a signal, another exit code or
+    a binary that never started also gets `process didn't exit successfully` or
+    `could not execute process`. A binary is retriable only with exactly one
+    rerun line, neither of those, FAILED names, and a last summary that counts
+    exactly those names. Everything else blocks the retry: a binary without a
+    summary, a failed doc-test, a crash (a child probe's clean summary is not
+    the binary's own), cargo error lines outside any binary, or a closing
+    `error: N targets failed` that is missing or does not count the rerun lines.
     """
     failed: dict[str, set[str]] = {}
     summary_failed: dict[str, int] = {}
-    exits: dict[str, str] = {}
-    doctest_failed = not_executed = False
-    reruns = 0
+    reruns: dict[str, int] = {}
+    abnormal: set[str] = set()
+    stray: list[str] = []
     targets_failed = None
     current = None
     for raw in lines:
         line = libtest_log.clean(raw)
-        process = PROCESS_FAILED.search(line)
-        if process:
-            exits[Path(process.group(1)).name] = process.group(2)
-            continue
-        doctest_failed = doctest_failed or bool(DOCTEST_FAILED.search(line))
-        not_executed = not_executed or bool(NOT_EXECUTED.search(line))
-        reruns += bool(RERUN.search(line))
         total = TARGETS_FAILED.search(line)
         if total:
             targets_failed = int(total.group(1))
+            current = None  # the closing list names targets; it belongs to no binary
+            continue
+        rerun = bool(RERUN.search(line))
+        bad = bool(PROCESS_FAILED.search(line) or NOT_EXECUTED.search(line) or DOCTEST_FAILED.search(line))
+        if rerun or bad:
+            if current is None:
+                stray.append(line.strip()[:120])
+            else:
+                reruns[current] = reruns.get(current, 0) + rerun
+                if bad:
+                    abnormal.add(current)
+            continue
         running, doc = RUNNING.match(line), DOC_TESTS.match(line)
         if running or doc:
             current = Path(running.group(1)).name if running else f"doc-tests {doc.group(1)}"
@@ -254,24 +260,16 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
             # Tests that re-run their binary print a summary first; the last one wins.
             summary_failed[current] = int(summary.group(2))
     unretriable = {binary for binary in failed if binary not in summary_failed}
-    unretriable |= {
-        binary for binary, names in failed.items()
-        if (names or binary in exits or summary_failed.get(binary)) and (
-            summary_failed.get(binary) != len(names)
-            or not names
-            or exits.get(binary) != "exit status: 101"
-            or binary.startswith("doc-tests ")
-        )
-    }
-    unretriable |= {binary for binary in exits if binary not in failed}
-    if doctest_failed:
-        unretriable.add("doc-tests")
-    if not_executed:
-        unretriable.add("a binary cargo could not execute")
-    if reruns != len(exits) or (targets_failed is not None and targets_failed != len(exits)):
-        unretriable.add("cargo failure lines that do not match its exit lines")
-    unretriable = sorted(unretriable)
-    return {binary: sorted(names) for binary, names in failed.items() if names}, unretriable
+    for binary, names in failed.items():
+        if not (names or reruns.get(binary) or binary in abnormal or summary_failed.get(binary)):
+            continue  # passed
+        if (binary in abnormal or binary.startswith("doc-tests ") or not names
+                or reruns.get(binary) != 1 or summary_failed.get(binary) != len(names)):
+            unretriable.add(binary)
+    unretriable |= {f"cargo error outside a test binary: {line}" for line in stray}
+    if sum(reruns.values()) and targets_failed != sum(reruns.values()):
+        unretriable.add(f"cargo's failed-target total {targets_failed} does not match {sum(reruns.values())} failed binaries")
+    return {binary: sorted(names) for binary, names in failed.items() if names}, sorted(unretriable)
 
 
 def retry_plan(groups, required: set[str], limit: int,
@@ -384,13 +382,12 @@ def retry_failures(cargo: str, groups, args, out_lock: threading.Lock, problems:
             left = min(args.retry_timeout, deadline - time.monotonic())
             if left <= 0:
                 print(f"ci_runtime_tests: retry budget of {args.retry_budget:.0f} s used up; {name} not retried", flush=True)
-                still.append(f"{name}: not retried, retry budget used up")
                 break
             if retry_alone(cargo, name, scope, left, out_lock):
                 attempt = k
                 break
-        if attempt is None and not (still and still[-1].startswith(f"{name}: not retried")):
-            still.append(f"{name}: failed again on retry")
+        if attempt is None:
+            still.append(f"{name}: still failing after retry, or not retried (budget)")
         else:
             flaky.append((name, attempt))
     if flaky:
@@ -573,8 +570,10 @@ def main() -> int:
     last_output = [time.monotonic()]
     serial_run = start(
         "serial group",
-        [cargo, "test", "-p", "ottto-service", "--lib", "--locked", "--", "--exact", "--nocapture",
-         f"--test-threads={args.serial_threads}", *serial],
+        # One target, so --no-fail-fast only adds cargo's closing failed-target
+        # total, which --retry-failed checks.
+        [cargo, "test", *SERVICE_LIB, "--locked", *(["--no-fail-fast"] if args.no_fail_fast else []),
+         "--", "--exact", "--nocapture", f"--test-threads={args.serial_threads}", *serial],
         out_lock,
         last_output,
     )

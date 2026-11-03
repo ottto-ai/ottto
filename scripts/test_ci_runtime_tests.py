@@ -154,11 +154,18 @@ class RetryTests(unittest.TestCase):
         return f'test result: {state}. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n'
 
     @staticmethod
-    def exited(binary, status='exit status: 101'):
-        """Cargo's two lines for a failing test binary."""
-        return (f'error: test failed, to rerun pass `--lib`\nCaused by:\n'
-                f"  process didn't exit successfully: `/w/target/debug/deps/{binary} --nocapture --exact` "
-                f'({status})\n')
+    def exited(binary, status=None):
+        """Cargo 1.95's lines after a failing test binary: the rerun line alone
+        for libtest's exit 101, plus the process line for a signal or other code."""
+        text = '\x1b[1m\x1b[91merror\x1b[0m: test failed, to rerun pass `-p ottto-service --lib`\n'
+        if status:
+            text += (f"Caused by:\n  process didn't exit successfully: `/w/target/debug/deps/{binary} "
+                     f'--nocapture` ({status})\n')
+        return text
+
+    @staticmethod
+    def total(n):
+        return f'\x1b[1m\x1b[91merror\x1b[0m: {n} target{"s" if n > 1 else ""} failed:\n    `--lib`\n'
 
     def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary], status=101):
         return runner.retry_plan([(lines, scope_of, status)], set(required), limit)
@@ -167,17 +174,21 @@ class RetryTests(unittest.TestCase):
         lines = [self.LIB, 'test a::one ... FAILED\n', 'test a::two ... ok\n', self.summary(1, 1),
                  self.exited('ottto_service-89abcdef'),
                  self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'),
-                 '   Doc-tests ottto_service\n', self.summary(2, 0)]
+                 '   Doc-tests ottto_service\n', self.summary(2, 0), self.total(2)]
         self.assertEqual(self.plan(lines), ([('a::one', ['ottto_service-89abcdef']), ('case', ['cli-0123abcd'])], None))
 
     def test_retries_nothing_it_cannot_tie_to_a_name(self):
         lib_fail = [self.LIB, 'test a::one ... FAILED\n']
-        flaky_one = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd')]
+        flaky_one = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'), self.total(2)]
         cases = {
-            'crash': lib_fail + [self.exited('ottto_service-89abcdef')],
-            'count mismatch': lib_fail + [self.summary(0, 2), self.exited('ottto_service-89abcdef')],
-            'signal': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'signal: 11, SIGSEGV')],
-            'no cargo exit line': lib_fail + [self.summary(0, 1)],
+            'crash': lib_fail + [self.exited('ottto_service-89abcdef'), self.total(1)],
+            'count mismatch': lib_fail + [self.summary(0, 2), self.exited('ottto_service-89abcdef'), self.total(1)],
+            'signal': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'signal: 11, SIGSEGV'),
+                                  self.total(1)],
+            'other exit code': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'exit status: 1'),
+                                           self.total(1)],
+            'no cargo error line': lib_fail + [self.summary(0, 1), self.total(1)],
+            'no closing total': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef')],
             # A child probe printed a clean summary, then the binary aborted; a
             # retried flaky test elsewhere must not turn that green.
             'crash after child summary': [self.LIB, 'running 1 test\n', self.summary(1, 0),
@@ -190,21 +201,21 @@ class RetryTests(unittest.TestCase):
             # Cargo could not start the binary: Running line, no summary.
             'never executed': [self.LIB, 'error: test failed, to rerun pass `-p ottto-service --lib`\n',
                                'Caused by:\n', '  could not execute process `/w/x` (never executed)\n'] + flaky_one,
-            'exit line missed': lib_fail + [self.summary(0, 1), 'error: test failed, to rerun pass `--lib`\n',
-                                            'error: test failed, to rerun pass `--test cli`\n'] + flaky_one,
-            'target total off': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'),
-                                            'error: 2 targets failed:\n'],
+            'two rerun lines': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'),
+                                           self.exited('ottto_service-89abcdef'), self.total(2)],
+            'target total off': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(2)],
+            'cargo error before any binary': [self.exited('x')] + flaky_one,
         }
         for label, lines in cases.items():
             with self.subTest(label):
                 plan, reason = self.plan(lines)
                 self.assertEqual(plan, [])
                 self.assertTrue(reason)
-        plan, reason = self.plan(lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef')],
+        plan, reason = self.plan(lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(1)],
                                  scope_of=lambda _b: None)
         self.assertIn('unknown test binary', reason)
         # A failed group with nothing to retry blocks the other group's retry.
-        retried = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd')]
+        retried = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'), self.total(1)]
         plan, reason = runner.retry_plan([(['error: build failed\n'], lambda b: [b], 101),
                                           (retried, lambda b: [b], 101)], set(), 3)
         self.assertEqual(plan, [])
@@ -216,13 +227,14 @@ class RetryTests(unittest.TestCase):
 
     def test_limit_money_and_receipts_are_never_retried(self):
         four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4),
-                self.exited('ottto_service-89abcdef')]
+                self.exited('ottto_service-89abcdef'), self.total(1)]
         self.assertIn('over the retry limit', self.plan(four)[1])
         self.assertEqual(len(self.plan(four, limit=4)[0]), 4)
         for name in ('snapshot_sync::claude_money_e2_pipeline_tests::x', 'snapshots::state_v2_money_tests::y',
                      'a::money_equivalence_tests::m::z', 'layout::receipt'):
             with self.subTest(name):
-                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1), self.exited('ottto_service-89abcdef')]
+                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1), self.exited('ottto_service-89abcdef'),
+                         self.total(1)]
                 plan, reason = self.plan(lines, required=['layout::receipt'])
                 self.assertEqual(plan, [])
                 self.assertIn('never retried', reason)
