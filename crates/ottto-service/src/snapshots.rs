@@ -41531,6 +41531,10 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }) {
             crate::local_resource_diagnostics::claude_usage_iteration_model_differs();
         }
+        // A new numeric field would leave money unseen; count it.
+        crate::local_resource_diagnostics::claude_usage_unknown_numeric_keys(
+            claude_code_unknown_usage_keys(root),
+        );
         // The derived context bucket is attached only after all content-block
         // records for this response are canonically resolved. Early progressive
         // records may still have zero input/cache counters; classifying those
@@ -42930,6 +42934,49 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         .cache_creation_1h_tokens
         .max(summed.cache_creation_1h_tokens);
     Some(usage)
+}
+
+/// Numeric keys a usage object (top level or iteration) may carry that
+/// `claude_code_usage_fields` does not read, plus those in its `cache_creation`
+/// and `output_tokens_details`. Every numeric key seen at these levels in local
+/// transcripts is read, so this reads zero today.
+fn claude_code_unknown_usage_keys(root: &Value) -> u64 {
+    const USAGE: &[&str] = &[
+        "input_tokens",
+        "inputTokens",
+        "output_tokens",
+        "outputTokens",
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_tokens",
+        "reasoning_output_tokens",
+    ];
+    const CACHE_CREATION: &[&str] = &[
+        "ephemeral_5m_input_tokens",
+        "ephemeral5mInputTokens",
+        "ephemeral_1h_input_tokens",
+        "ephemeral1hInputTokens",
+    ];
+    let unknown = |object: Option<&Value>, known: &[&str]| {
+        object.and_then(Value::as_object).map_or(0, |object| {
+            object
+                .iter()
+                .filter(|(key, value)| value.is_number() && !known.contains(&key.as_str()))
+                .count() as u64
+        })
+    };
+    std::iter::once(root)
+        .chain(claude_code_usage_iterations(root))
+        .map(|usage| {
+            let cache_creation = usage
+                .get("cache_creation")
+                .or_else(|| usage.get("cacheCreation"));
+            unknown(Some(usage), USAGE)
+                + unknown(cache_creation, CACHE_CREATION)
+                + unknown(usage.get("output_tokens_details"), &["thinking_tokens"])
+        })
+        .sum()
 }
 
 fn claude_code_usage_iterations(root: &Value) -> &[Value] {
