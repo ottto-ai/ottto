@@ -2,7 +2,7 @@
 // Not a cross-build receipt: it prints no MONEY_EQUIVALENCE line.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::{
-    money_oracle, observe_consumed, IoBytes, Mode, RouteResult,
+    money_oracle, observe_consumed, Mode, RouteResult,
 };
 
 fn route(arm: Settled, mode: Mode, page: &Page) -> RouteResult {
@@ -211,7 +211,7 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// Tail, cold Full and a restored owner remove the same copied prefix and
 /// emit the same bodies, totals and placement, with a restart between pages;
 /// no grown body is smaller than the accepted one, and a restart after the
-/// last delivered page reads and sends nothing. The prefix stays removed when
+/// last delivered page parses and sends nothing. The prefix stays removed when
 /// the delivered holder proves it, when an earlier build's accepted removal
 /// has nothing saved and no holder proves it anew, and when the holder
 /// family of a saved removal is listed.
@@ -328,35 +328,32 @@ fn copy_prefix_routes(arm: Settled) {
     }
     assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
 
-    // A restart after the last delivered page: nothing changed, so the new
-    // owner reads no transcript byte and sends nothing.
+    // A restart after the last delivered page: nothing changed. The new
+    // owner starts a census generation that opens each indexed transcript
+    // once to check its identity, then skips it: no Full read, no parser
+    // byte, nothing sent, and enrichment opens no transcript.
+    // `assert_quiet_restart_zero_bytes` needs a census generation kept
+    // across the restart and measured identity bytes; this harness has
+    // neither, so it asserts the open count instead.
     let restart = disk.owner(SnapshotSource::ClaudeCode);
     let [_, _, prior] = priors;
-    let opens = crate::snapshots::all_transcript_opens_for_test();
+    let before = crate::snapshots::all_transcript_opens_for_test();
     let (mut quiet, consumed) = observe_consumed(|| c.raw(&restart, prior, 100, true, &[]));
+    let scanned = crate::snapshots::all_transcript_opens_for_test() - before;
     quiet.enrich(&c);
     quiet.finish();
-    let measured = (crate::snapshots::all_transcript_opens_for_test() == opens).then_some(0);
-    let wire = if quiet.scan.snapshots.is_empty() {
-        Vec::new()
-    } else {
-        upload(&quiet.scan.snapshots, &mut e2_progress(), ack).1
-    };
-    let mut result = RouteResult::emitted(
-        Mode::Restart,
-        SnapshotSource::ClaudeCode,
-        wire,
-        &quiet.scan.snapshots,
+    let enriched = crate::snapshots::all_transcript_opens_for_test() - before - scanned;
+    assert_eq!(quiet.modes.0, 0, "{arm:?}: the quiet restart read Full");
+    assert_eq!(consumed, 0, "{arm:?}: the quiet restart parsed bytes");
+    assert!(
+        scanned <= 2,
+        "{arm:?}: at most one identity open per indexed transcript, got {scanned}"
     );
-    result.modes = quiet.modes;
-    result.io = IoBytes {
-        consumed,
-        cheap_checks: measured,
-        anchor_reads: measured,
-        other_reads: measured,
-        ..IoBytes::default()
-    };
-    money_oracle::assert_quiet_restart_zero_bytes(&result);
+    assert_eq!(enriched, 0, "{arm:?}: enrichment opened a transcript");
+    assert!(
+        quiet.scan.snapshots.is_empty(),
+        "{arm:?}: the quiet restart sent a body"
+    );
 }
 
 /// [regress] A holder whose page was never delivered owes its upload-context
