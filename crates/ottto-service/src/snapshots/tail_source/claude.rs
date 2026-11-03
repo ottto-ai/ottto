@@ -10,7 +10,7 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
+    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
     read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
     HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
@@ -302,11 +302,6 @@ impl TailSource for Claude {
     ) -> Result<(), LiveLoadError> {
         Ok(())
     }
-}
-
-/// A capability bucket's start: the first part of its key.
-fn capability_hour(key: &(String, String, String)) -> &str {
-    &key.0
 }
 
 #[cfg(test)]
