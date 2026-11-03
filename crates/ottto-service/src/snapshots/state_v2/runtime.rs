@@ -564,7 +564,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             let generation = import::import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
-                db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
+                db_id: crate::hex::encode(&random),
                 binding,
                 fence_generation: generation,
             };

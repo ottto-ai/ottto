@@ -2523,26 +2523,7 @@ impl<'de> Visitor<'de> for LooseVisitor {
     }
 }
 
-struct LowerHex<'a>(&'a [u8]);
-impl fmt::Display for LowerHex<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut text = [0_u8; 64];
-        for chunk in self.0.chunks(32) {
-            for (slot, byte) in text.chunks_exact_mut(2).zip(chunk) {
-                slot[0] = DIGITS[usize::from(byte >> 4)];
-                slot[1] = DIGITS[usize::from(byte & 15)];
-            }
-            f.write_str(std::str::from_utf8(&text[..chunk.len() * 2]).map_err(|_| fmt::Error)?)?;
-        }
-        Ok(())
-    }
-}
-impl Serialize for LowerHex<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
+use crate::hex::LowerHex;
 
 /// Base64 (standard, padded) of the big-endian bytes of each hash, streamed
 /// three hashes (24 bytes, 32 characters) at a time without a whole buffer.
