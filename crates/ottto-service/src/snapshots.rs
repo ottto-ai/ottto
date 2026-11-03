@@ -14531,6 +14531,14 @@ fn claude_family_subagents_dir<'a>(path: &'a Path, root: &str) -> Option<&'a Pat
         })
 }
 
+/// The family root transcript `<project>/<root>.jsonl` of a member path.
+fn claude_family_root_path(path: &Path, root: &str) -> Option<PathBuf> {
+    let project = claude_family_subagents_dir(path, root)?
+        .parent()?
+        .parent()?;
+    Some(project.join(format!("{root}.jsonl")))
+}
+
 fn claude_index_path_member_ref(path: &Path) -> Option<ClaudeIndexPathMemberRef<'_>> {
     if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
         return None;
@@ -50055,15 +50063,12 @@ impl ScanIndex {
         {
             return false;
         }
-        claude_family_subagents_dir(&candidate.path, member.root)
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .is_some_and(|project| {
-                matches!(
-                    fs::symlink_metadata(project.join(format!("{}.jsonl", member.root))),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                )
-            })
+        claude_family_root_path(&candidate.path, member.root).is_some_and(|root| {
+            matches!(
+                fs::symlink_metadata(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
     }
 
     /// A list line may name only a member (`root_stem`). On a
