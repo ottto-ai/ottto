@@ -6728,12 +6728,28 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
-    if source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_request_identity::bind_session_context_key(
+    if source == SnapshotSource::ClaudeCode {
+        // No capability or no key: no address digest, so no verdict.
+        let sole_login = activity_hint
+            .session_request_sole_login_witness_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+        let key = attribution_context
+            .as_ref()
+            .filter(|_| sole_login)
+            .map(SessionAttributionContext::accepted_fingerprint_key);
+        // A key or capability change only scrubs what retained parses compare
+        // under the old key: every parse, cursor and count stays, so a server
+        // hint never causes a re-read.
+        let address = crate::claude_status_coverage::bind_address_key(key);
+        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        )
-    {
-        daemon.transcript_cache.scrub_retained_context_digests();
+        );
+        if context || address {
+            daemon
+                .transcript_cache
+                .scrub_retained_identity(context, address);
+        }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
@@ -7694,6 +7710,21 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
+    if source == SnapshotSource::ClaudeCode {
+        let sole_login = activity_hint
+            .session_request_sole_login_witness_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+        upload_progress
+            .accepted_identity_buckets
+            .set_sole_login_enabled(sole_login);
+        crate::snapshots::claude_folder_login::begin_page(
+            &mut index,
+            &committed_index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            sole_login,
+        );
+    }
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10286,6 +10317,25 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
+    if let Some(accepted) =
+        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
+    {
+        let census_clean = scan_result.census_complete
+            && scan_result.census_residue_index_key_count == 0
+            && scan_result.census_residue_blocked_session_count == 0;
+        crate::snapshots::claude_folder_login::note_page(
+            index,
+            &scan_result.snapshots,
+            &api_report,
+            census_clean,
+        );
+        crate::snapshots::claude_folder_login::stamp_page(
+            &mut scan_result.snapshots,
+            index,
+            &api_report,
+            accepted,
+        );
+    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -10293,7 +10343,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
-            crate::snapshots::claude_request_identity::desktop_census(index),
         );
         let evidence = match &whole_corpus {
             Some(_) => evidence,
@@ -10301,7 +10350,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         };
         evidence
             .with_unhealthy_reasons(unhealthy_reasons)
-            .with_status_coverage(crate::claude_status_coverage::snapshot())
             .with_native_originals(&originals)
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
@@ -12762,6 +12810,7 @@ pub(crate) fn erase_disabled_sources(
     support_dir: &Path,
     cache: &crate::snapshots::sampled_scan::SharedCache,
 ) {
+    erase_owed_login_addresses(support_dir, cache);
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
         let state = source_marker(support_dir, source);
@@ -12771,6 +12820,10 @@ pub(crate) fn erase_disabled_sources(
         // Transcript readers close before the first unlink.
         if source == SnapshotSource::Codex {
             cache.forget_codex_jobs();
+        }
+        if source == SnapshotSource::ClaudeCode {
+            crate::claude_status_coverage::forget_addresses();
+            cache.forget_retained_transcripts();
         }
         let marker = source_marker_path(support_dir, source);
         let erased = erase_source_files(support_dir, source, || {
@@ -12801,6 +12854,89 @@ pub(crate) fn erase_disabled_sources(
 pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
     let marker = source_marker_path(support_dir, source);
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
+}
+
+fn login_address_erase_marker(support_dir: &Path) -> PathBuf {
+    snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
+        .with_file_name("claude-login-addresses.erase-owed")
+}
+
+/// Account removal: the next sync cycle erases what is kept of recorded login
+/// addresses, under the cycle lock and even with no live device.
+pub(crate) fn owe_login_address_erase(support_dir: &Path) -> Result<()> {
+    let marker = login_address_erase_marker(support_dir);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _turn = source_erasure_turn();
+    write_source_marker(&marker, "pending")
+}
+
+/// One attempt per owed erase. Only retained parses and durable-tail records
+/// hold an address digest: the folder ledger holds none, and the rest of the
+/// index stays so the account's history is not replayed.
+fn erase_owed_login_addresses(
+    support_dir: &Path,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+) {
+    let marker = login_address_erase_marker(support_dir);
+    let mut turn = source_erasure_turn();
+    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == ErrorKind::NotFound)
+    {
+        return;
+    }
+    crate::claude_status_coverage::forget_addresses();
+    cache.forget_retained_transcripts();
+    cache.durable_forget_source(SnapshotSource::ClaudeCode);
+    let erased = erase_claude_durable_tails(support_dir).and_then(|()| {
+        std::fs::remove_file(&marker)?;
+        sync_progress_parent(&marker)
+    });
+    let failures = turn.entry(marker).or_default();
+    *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+    if *failures > 3 {
+        crate::snapshots::state_v2::source_erasure_alarm(*failures);
+    }
+}
+
+fn erase_claude_durable_tails(support_dir: &Path) -> Result<()> {
+    let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
+    let family = stable.file_stem().and_then(|stem| stem.to_str());
+    let family = family.context("source_erasure_family")?;
+    let mut parents: Vec<PathBuf> = stable.parent().map(Path::to_path_buf).into_iter().collect();
+    match std::fs::read_dir(support_dir.join("snapshots/destinations")) {
+        Ok(namespaces) => {
+            for namespace in namespaces {
+                let namespace = namespace?.file_name();
+                let scoped =
+                    snapshot_destination_scoped_index_path(&stable, &namespace.to_string_lossy());
+                parents.extend(scoped.parent().map(Path::to_path_buf));
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for parent in parents {
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(family) && name.ends_with(".durable-tail") {
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        sync_progress_parent(&parent.join("erased"))?;
+    }
+    Ok(())
 }
 
 /// A source's caches outside `snapshots`, with their temp copies.

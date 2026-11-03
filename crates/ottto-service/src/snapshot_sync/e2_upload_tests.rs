@@ -342,3 +342,48 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[0], sent[1], "identical bytes on the resend");
 }
+
+/// No exact capability token: nothing new reaches the wire and no ledger is
+/// written, so the persisted index and the body stay byte-identical.
+#[test]
+fn recorded_login_capability_off_keeps_every_byte() {
+    let entry = crate::snapshots::SnapshotRequestEvidence {
+        identity_basis: "transcript_org".to_string(),
+        provider_workspace_hash: Some("d".repeat(64)),
+        account_source: None,
+        sole_login_witness: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&entry).unwrap(),
+        serde_json::json!({
+            "identity_basis": "transcript_org",
+            "provider_workspace_hash": "d".repeat(64),
+        })
+    );
+    let mut index = crate::snapshots::ScanIndex::default();
+    let before = serde_json::to_vec(&index).unwrap();
+    crate::snapshots::claude_folder_login::begin_page(
+        &mut index,
+        &crate::snapshots::ScanIndex::default(),
+        &[std::path::PathBuf::from("/synthetic/cfg/projects")],
+        false,
+    );
+    assert_eq!(serde_json::to_vec(&index).unwrap(), before);
+}
+
+/// [regress] D156: the login-address key and its capability are not in the
+/// acquisition scope, so a flap or a rotation never forces a whole read.
+#[test]
+fn the_login_address_key_never_changes_the_acquisition_scope() {
+    use crate::claude_status_coverage::bind_address_key;
+    let index_path = std::path::Path::new("/synthetic/index.json");
+    let scope = || cycle_sampled_scope(&[7; 32], "namespace", index_path, true).0;
+    bind_address_key(None);
+    let off = scope();
+    bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    assert_eq!(scope(), off);
+    bind_address_key(Some(zeroize::Zeroizing::new([0x43; 32])));
+    assert_eq!(scope(), off);
+    bind_address_key(None);
+    assert_eq!(scope(), off);
+}

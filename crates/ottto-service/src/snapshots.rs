@@ -2289,7 +2289,23 @@ pub struct SnapshotRequestEvidence {
     /// never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
+    /// Present only on `transcript_recorded_login`, under its capability. Outside
+    /// the semantic leaf: a witness-only change causes no upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sole_login_witness: Option<SoleLoginWitness>,
 }
+
+/// Why a recorded-login request was named: the folder's kind, a count key and
+/// how far back the folder's evidence reaches. No path, email, plan or org type.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SoleLoginWitness {
+    pub v: u8,
+    /// `folder` or `slot`.
+    pub kind: String,
+    pub folder: String,
+    pub covered_from: String,
+}
+crate::heap_layout_bound::fields!(SoleLoginWitness; v, kind, folder, covered_from);
 
 /// Exact shared activity-hint capability for carried-account provenance.
 /// Missing/null/unknown keeps existing wire bytes for every source.
@@ -4044,10 +4060,10 @@ pub struct ScanIndex {
     /// the identity census so lineage churn never moves identity evidence.
     #[serde(default)]
     claude_desktop_lineage_census_complete: bool,
-    /// When the last complete, error-free Desktop store sweep finished, bound
-    /// to this process and store inventory. Absent (unknown) for older indexes.
-    #[serde(default)]
-    claude_desktop_census_witness: Option<claude_request_identity::DesktopCensusWitness>,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// The Desktop census completion witness, retired with its only consumer.
+    #[serde(rename = "claude_desktop_census_witness", default)]
+    retired_claude_desktop_census_witness: serde::de::IgnoredAny,
     #[serde(default)]
     claude_desktop_store_retry_attempt: u8,
     #[serde(default)]
@@ -4328,7 +4344,7 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
-    /// Per-folder login evidence (state layout 5); nothing fills it yet.
+    /// Per-config-folder login evidence, written only under its capability.
     #[serde(default)]
     pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
     /// Durable debt facts that outlive any one traversal (state layout 5).
@@ -4561,7 +4577,7 @@ impl Default for ScanIndex {
             claude_desktop_store_sweep_had_errors: false,
             claude_desktop_identity_census_complete: false,
             claude_desktop_lineage_census_complete: false,
-            claude_desktop_census_witness: None,
+            retired_claude_desktop_census_witness: serde::de::IgnoredAny,
             claude_desktop_store_retry_attempt: 0,
             claude_desktop_store_retry_not_before_unix_seconds: None,
             resume_after_path: None,
@@ -14649,12 +14665,12 @@ fn set_claude_account_hash(item: &mut SnapshotItem, target: Option<String>) -> b
 }
 
 fn exact_session_account_hash(item: &SnapshotItem) -> Option<String> {
-    // A carried account is placement, never a session-wide login proof.
-    if item
-        .request_evidence
-        .iter()
-        .any(|entry| entry.account_source.is_some())
-    {
+    // A carried or recorded-login account is placement, never a session-wide
+    // login proof.
+    if item.request_evidence.iter().any(|entry| {
+        entry.account_source.is_some()
+            || entry.identity_basis == claude_request_identity::TRANSCRIPT_RECORDED_LOGIN
+    }) {
         return None;
     }
     uniform_session_account_hash(item)
@@ -17189,16 +17205,13 @@ impl ClaudeTitleMetadata {
     #[cfg(test)]
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut index = ScanIndex::default();
-        Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z", true)
+        Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z")
     }
 
-    /// `identity_capture`: this scan captures (every Claude cycle), so the
-    /// census witness may be kept and set.
     fn load_from_roots_with_index(
         roots: &[PathBuf],
         index: &mut ScanIndex,
         collected_at: &str,
-        identity_capture: bool,
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
         let mut census = ClaudeDesktopStoreCensus::default();
@@ -17218,13 +17231,7 @@ impl ClaudeTitleMetadata {
                     .map(|root| root.join("claude-code-sessions")),
             );
         }
-        Self::load_from_store_dirs_with_census(
-            &store_dirs,
-            index,
-            collected_at,
-            identity_capture,
-            census,
-        )
+        Self::load_from_store_dirs_with_census(&store_dirs, index, collected_at, census)
     }
 
     #[cfg(test)]
@@ -17232,13 +17239,11 @@ impl ClaudeTitleMetadata {
         store_dirs: &BTreeSet<PathBuf>,
         index: &mut ScanIndex,
         collected_at: &str,
-        identity_capture: bool,
     ) -> Self {
         Self::load_from_store_dirs_with_census(
             store_dirs,
             index,
             collected_at,
-            identity_capture,
             ClaudeDesktopStoreCensus::default(),
         )
     }
@@ -17247,7 +17252,6 @@ impl ClaudeTitleMetadata {
         store_dirs: &BTreeSet<PathBuf>,
         index: &mut ScanIndex,
         collected_at: &str,
-        identity_capture: bool,
         mut census: ClaudeDesktopStoreCensus,
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
@@ -17261,44 +17265,25 @@ impl ClaudeTitleMetadata {
             }
             (None, Some(_)) => true,
         };
-        // The witness serves only contract 5; scans without a permit neither
-        // keep nor persist one. Reconciled before the backoff return: a store
-        // inventory that changed during backoff never keeps the old witness.
-        if identity_capture {
-            claude_request_identity::DesktopCensusWitness::retain_for_inventory(
-                &mut index.claude_desktop_census_witness,
-                store_dirs,
-            );
-        } else {
-            index.claude_desktop_census_witness = None;
-        }
         // Keep the existing 64-byte inventory decoder boundary. The non-hex
         // version marker distinguishes this 248-bit cursor fence from #851's
         // legacy SHA-256 digest. This is never account/identity proof.
         let mut inventory = claude_request_identity::inventory_digest(store_dirs);
         inventory.replace_range(..2, "p1");
         if index.claude_desktop_store_inventory.as_ref() != Some(&inventory) {
-            // A retained completion witness already binds a legacy cursor to
-            // these same stores. Preserve that established healthy refresh.
-            let witnessed_inventory = index.claude_desktop_store_inventory.is_none()
-                && index.claude_desktop_census_witness.is_some();
             index.claude_desktop_store_inventory = Some(inventory);
-            if !witnessed_inventory {
-                census.inventory_sweep_restart_count += 1;
-                index.claude_desktop_store_cursor = None;
-                index.claude_desktop_store_upper_bound = None;
-                index.claude_desktop_store_sweep_had_errors = false;
-                index.claude_desktop_identity_census_complete = false;
-                index.claude_desktop_lineage_census_complete = false;
-                index.claude_desktop_census_witness = None;
-            }
+            census.inventory_sweep_restart_count += 1;
+            index.claude_desktop_store_cursor = None;
+            index.claude_desktop_store_upper_bound = None;
+            index.claude_desktop_store_sweep_had_errors = false;
+            index.claude_desktop_identity_census_complete = false;
+            index.claude_desktop_lineage_census_complete = false;
         }
         // A newly discovered profile may hold a conflicting copy. Until the
         // whole inventory is read, an old census cannot prove uniqueness.
         if census.has_errors() {
             index.claude_desktop_identity_census_complete = false;
             index.claude_desktop_lineage_census_complete = false;
-            index.claude_desktop_census_witness = None;
         }
         if !retry_due {
             crate::local_resource_diagnostics::traversal_point(
@@ -17430,12 +17415,8 @@ impl ClaudeTitleMetadata {
         metadata.sidecar_census_incomplete = !sweep_complete || sweep_had_errors;
         if sweep_had_errors || (!sweep_complete && original_identity_changed) {
             index.claude_desktop_identity_census_complete = false;
-            index.claude_desktop_census_witness = None;
         } else if sweep_complete {
             index.claude_desktop_identity_census_complete = true;
-            index.claude_desktop_census_witness = now
-                .filter(|_| identity_capture)
-                .map(|now| claude_request_identity::DesktopCensusWitness::new(now, store_dirs));
         }
         metadata.original_identity_census_incomplete =
             !index.claude_desktop_identity_census_complete;
@@ -21271,8 +21252,12 @@ impl SnapshotAccumulator {
         {
             return Vec::new();
         }
-        if let Some(markers) = self.claude_org_markers.as_deref_mut() {
-            markers.bind_home(path);
+        if let Some(fold) = self.claude_money.as_deref_mut() {
+            let forked =
+                self.claude_fork_parent.is_some() || self.claude_context_curve_owned_start_proven;
+            fold.folder_trace = Some(Box::new(claude_folder_login::FolderTrace::of_file(
+                path, forked,
+            )));
         }
         let Some(source_session_id) = self
             .source_session_id
@@ -27193,12 +27178,7 @@ impl OwnedSourceScan {
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
         let mut claude_title_metadata = if source == SnapshotSource::ClaudeCode {
-            ClaudeTitleMetadata::load_from_roots_with_index(
-                roots,
-                index,
-                collected_at,
-                claude_request_identity_capture,
-            )
+            ClaudeTitleMetadata::load_from_roots_with_index(roots, index, collected_at)
         } else {
             ClaudeTitleMetadata::default()
         };
@@ -54694,7 +54674,7 @@ impl ScanIndex {
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
             claude_desktop_identity_census_complete: self.claude_desktop_identity_census_complete,
             claude_desktop_lineage_census_complete: self.claude_desktop_lineage_census_complete,
-            claude_desktop_census_witness: self.claude_desktop_census_witness.clone(),
+            retired_claude_desktop_census_witness: serde::de::IgnoredAny,
             claude_desktop_store_retry_attempt: self.claude_desktop_store_retry_attempt,
             claude_desktop_store_retry_not_before_unix_seconds: self
                 .claude_desktop_store_retry_not_before_unix_seconds,
@@ -73807,14 +73787,12 @@ mod tests {
             &dirs,
             &mut index,
             "2026-09-30T10:00:00Z",
-            true,
         );
         assert!(first.original_identity_census_incomplete);
         let complete = ClaudeTitleMetadata::load_from_store_dirs_with_index(
             &dirs,
             &mut index,
             "2026-09-30T10:05:00Z",
-            true,
         );
         assert_eq!(
             complete
@@ -73830,7 +73808,6 @@ mod tests {
                 &dirs,
                 &mut restored,
                 &format!("2026-09-30T10:{minute:02}:00Z"),
-                true,
             );
             assert_eq!(
                 refreshed
@@ -73852,7 +73829,6 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:27:00Z",
-            true,
         );
         assert!(
             changed.original_identity_census_incomplete,
@@ -73868,7 +73844,6 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:29:00Z",
-            true,
         );
         assert_eq!(
             settled
@@ -73883,7 +73858,6 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:30:00Z",
-            true,
         );
         assert_eq!(
             lost.session_account_evidence("changed-session")
@@ -73894,7 +73868,6 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:30:01Z",
-            true,
         );
         assert_eq!(
             backed_off
@@ -75238,7 +75211,6 @@ mod tests {
             std::slice::from_ref(&projects),
             &mut index,
             "2026-07-10T10:04:00Z",
-            true,
         );
         for root in crate::claude_desktop::discover_support_roots(&home).roots {
             let session = root.file_name().unwrap().to_str().unwrap();
@@ -75264,7 +75236,6 @@ mod tests {
                 std::slice::from_ref(&projects),
                 &mut index,
                 at,
-                true,
             );
             assert!(deferred.original_identity_census_incomplete);
             assert_eq!(
@@ -75276,11 +75247,10 @@ mod tests {
             assert!(deferred
                 .original_identity_evidence
                 .contains_key("Claude-ALT"));
-            assert!(index.claude_desktop_census_witness.is_none());
         }
     }
 
-    /// [behaviour] A new profile restarts a paged census even before its first witness.
+    /// [behaviour] A new profile restarts a paged census.
     #[test]
     fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
         let home = crate::test_scratch::ScratchDir::new("desktop-profile-pagination");
@@ -75304,10 +75274,8 @@ mod tests {
             std::slice::from_ref(&projects),
             &mut index,
             "2026-07-10T10:04:00Z",
-            true,
         );
         assert!(first.original_identity_census_incomplete);
-        assert!(index.claude_desktop_census_witness.is_none());
         // Exercise the actual bounded production serializer and decoder.
         let index_path = home.join("scan-index.json");
         index.save(&index_path).unwrap();
@@ -75316,7 +75284,6 @@ mod tests {
             std::slice::from_ref(&projects),
             &mut index,
             "2026-07-10T10:05:00Z",
-            true,
         );
         assert!(!complete.original_identity_census_incomplete);
         assert_eq!(
@@ -75329,11 +75296,8 @@ mod tests {
             std::slice::from_ref(&projects),
             &mut index,
             "2026-07-10T10:06:00Z",
-            true,
         );
         assert!(refresh.sidecar_census_incomplete);
-        // A missing completion witness must not disable the inventory fence.
-        index.claude_desktop_census_witness = None;
         index.save(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
         let alt = support.join("Claude-ALT");
@@ -75348,10 +75312,8 @@ mod tests {
             std::slice::from_ref(&projects),
             &mut index,
             "2026-07-10T10:06:01Z",
-            true,
         );
         assert!(deferred.original_identity_census_incomplete);
-        assert!(index.claude_desktop_census_witness.is_none());
         index.save(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
         for at in ["2026-07-10T10:07:00Z", "2026-07-10T10:09:00Z"] {
@@ -75359,7 +75321,6 @@ mod tests {
                 std::slice::from_ref(&projects),
                 &mut index,
                 at,
-                true,
             );
             assert_eq!(
                 metadata
@@ -85898,7 +85859,7 @@ crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, 
 crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
-crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);
+crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source, sole_login_witness);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
     U thread_source: Option<String>,

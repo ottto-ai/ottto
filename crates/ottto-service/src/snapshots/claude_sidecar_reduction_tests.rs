@@ -1619,7 +1619,6 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
         .clear();
     index.claude_desktop_identity_census_complete = false;
     index.claude_desktop_lineage_census_complete = false;
-    index.claude_desktop_census_witness = None;
     let unrelated = f.dir.join("unrelated.jsonl");
     // An indexed held session with no Desktop proof cannot be selected by this recovery.
     let mut unrelated_entry = index.files[&key].clone();

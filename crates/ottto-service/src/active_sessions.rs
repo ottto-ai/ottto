@@ -2117,6 +2117,7 @@ mod tests {
             identity_basis: "telemetry".to_string(),
             provider_workspace_hash: Some("organization_hash".to_string()),
             account_source: None,
+            sole_login_witness: None,
         }];
         let mut later = tagged.usage_buckets[0].clone();
         later.bucket_start = "2026-07-19T11:00:00Z".to_string();
@@ -2135,7 +2136,8 @@ mod tests {
             Some("multiple_accounts")
         );
 
-        // A login from a census basis is not the request's own telemetry.
+        // A login under the retired sole-login basis (never emitted, still
+        // parsed) is not the request's own telemetry.
         let mut census = tagged.clone();
         census.request_evidence[0].identity_basis = "transcript_sole_login".to_string();
         let active =
@@ -2597,7 +2599,7 @@ mod tests {
                 "child-fp".to_string(),
             )
             .unwrap();
-            let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             assert_eq!(
                 identity::apply_scan(&mut items, &evidence, BTreeMap::new()).sent,
                 1
