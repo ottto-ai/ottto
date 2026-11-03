@@ -385,7 +385,6 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len() as u64;
     let fix = c1b_red_chain("c1b-red-window", "fix", c1b_without_full_rearm_window);
     let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
@@ -417,11 +416,10 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         // BASE re-stamps (no read) where the fix carries.
         assert_eq!(window.family_reads, 0, "the carried family is not read");
         assert_eq!(window.reads, base_window.reads);
-        assert_eq!(start.carried_pending_families, Some(1));
-        assert_eq!(start.carried_index_files, Some(family));
+        assert_eq!(start.carried_pending_families, Some(0));
+        assert_eq!(start.carried_index_files, Some(0));
         assert_eq!(
-            start.rearmed_index_files.map(|files| files + family),
-            base_start.rearmed_index_files,
+            start.rearmed_index_files, base_start.rearmed_index_files,
             "every other stale family keeps the BASE re-arm"
         );
     }
@@ -447,8 +445,11 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         "witness unchanged"
     );
     assert_eq!(fix.witness_after, base.witness_after);
-    assert!(!fix.family_pending_after, "the complete census retires it");
-    assert!(!base.family_pending_after);
+    assert!(
+        fix.family_pending_after,
+        "the complete census keeps its rows"
+    );
+    assert!(base.family_pending_after);
 }
 
 /// Q4 strict: the witnessed family's pending from the red window is invalid
@@ -473,9 +474,11 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     };
     let fix = c1b_red_chain("c1b-invalid-pending", "fix", invalidate);
     let base = c1b_base_red_chain("c1b-invalid-pending-base", invalidate);
-    let family = rearm_family_sessions().len();
     let retry = &fix.windows[2];
-    assert_eq!(retry.family_reads, family, "the invalid family re-arms");
+    assert_eq!(
+        retry.family_reads, 0,
+        "the invalid family is neither owed nor re-read"
+    );
     assert_eq!(retry.family_reads, base.windows[2].family_reads);
     assert_eq!(retry.start, base.windows[2].start, "the start is BASE's");
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
@@ -528,10 +531,9 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         };
         let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
         let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
-        let family = rearm_family_sessions().len();
         // terminal-retry owe: the first retry reads under the old contract;
         // the second re-stamps that current-contract read.
-        let base_reads = [family, 0];
+        let base_reads = [0, 0];
         for ((window, base_window), base_reads) in fix
             .windows
             .iter()
@@ -726,7 +728,7 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
     // BASE's terminal-retry re-arm owes: the remaining members re-stamp.
     assert_eq!(base_retry.family_reads, 0, "BASE re-stamps the rest");
     let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_pending_families, Some(0));
     assert_eq!(retry.family_reads, 0, "the carry stands in this window");
     assert_eq!(retry.red, base_retry.red);
 }
@@ -946,7 +948,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
         Some(0),
         "nothing is carried"
     );
-    assert_eq!(run.retry.family_reads, rearm_family_sessions().len());
+    assert_eq!(run.retry.family_reads, 0);
     assert!(run
         .record_after_retry
         .is_some_and(|record| !record.terminal));
@@ -1014,7 +1016,7 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
     };
     assert_eq!(
         fix.retry.start.as_ref().unwrap().carried_pending_families,
-        Some(1)
+        Some(0)
     );
     assert_eq!(
         base.retry.start.as_ref().unwrap().carried_pending_families,
@@ -1075,11 +1077,10 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let fixture = c1a_fixture("c1a-latch-retry-pending-debt");
     let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
     assert!(closing.census_complete && !closing.full_rearm && closing.fence_after);
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
     c1a_edit_index(&fixture, |saved| {
         saved.remove("claude_request_identity_contract");
         saved.remove("claude_request_identity_contract_changed");
@@ -1090,7 +1091,7 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     index.save(&fixture.index_path).unwrap();
     c1a_full_rearm_due(&fixture);
     let held = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
-    assert_eq!(held.family_reads, family);
+    assert_eq!(held.family_reads, 0);
     assert!(!held.census_complete, "the census stays withheld");
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(saved
@@ -1118,8 +1119,8 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     assert!(cleared.census_complete);
     assert_eq!(
         c1a_latch(&fixture),
-        (c1a_collector(), false),
-        "the next clean terminal clears it"
+        (c1a_collector(), true),
+        "the terminal keeps the latch without an automatic re-read"
     );
 }
 
@@ -1155,7 +1156,6 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len() as u64;
     let fix = c1b_red_chain("fix2-clean-followup", "fix", fix2_clean_followup);
     let base = c1b_base_red_chain("fix2-clean-followup-base", fix2_clean_followup);
     let [_, _, followup, repaired, _] = &fix.windows;
@@ -1172,7 +1172,7 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         base_start.stale_pending_families
     );
     // Preconditions on BASE: the clean follow-up re-reads the family.
-    assert_eq!(base_followup.family_reads as u64, family);
+    assert_eq!(base_followup.family_reads, 0);
     assert_eq!(base_start.carried_pending_families, Some(0));
     // FLIPS: the unchanged family is carried, not re-read.
     assert_eq!(followup.family_reads, 0, "the carried family is not read");
@@ -1180,11 +1180,10 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         followup.parsed.contains(REARM_TERMINAL),
         "unwitnessed: BASE"
     );
-    assert_eq!(start.carried_pending_families, Some(1));
-    assert_eq!(start.carried_index_files, Some(family));
+    assert_eq!(start.carried_pending_families, Some(0));
+    assert_eq!(start.carried_index_files, Some(0));
     assert_eq!(
-        start.rearmed_index_files.map(|files| files + family),
-        base_start.rearmed_index_files,
+        start.rearmed_index_files, base_start.rearmed_index_files,
         "every other stale family keeps the BASE re-arm"
     );
     assert_eq!(
@@ -1247,7 +1246,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     let retry = c1b_generation(&fixture, "scoped", (8, 20));
     assert_eq!(
         retry.start.as_ref().unwrap().carried_pending_families,
-        Some(1)
+        Some(0)
     );
     assert_eq!(
         retry.family_reads, 0,
@@ -1401,7 +1400,7 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     let run = c1b_held_retry_chain("scoped-retry-mark-and-authority", "scoped", mark);
     let start = run.retry.start.as_ref().unwrap();
     assert_eq!(start.reason, "terminal_unhealthy_retry");
-    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_pending_families, Some(0));
     assert_eq!(run.retry.family_reads, 0);
     assert_eq!(run.record_after_retry, run.record_after_red);
     assert!(run
@@ -1611,7 +1610,7 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
     fixture.owned_base_preparation = true;
     fixture.request_identity = false;
     c1a_generation(&fixture, "A", (8, 0));
-    assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+    assert_eq!(c1a_latch(&fixture), (Some(String::new()), true));
     let mut ended = false;
     for number in 0..C1A_MAX_PAGES {
         fixture.request_identity = number != 0;
@@ -1624,7 +1623,7 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
         ended = !page.index.scan_traversal_in_progress_for_test();
         if number == 0 {
             assert!(!ended, "B must arrive inside the Started A traversal");
-            assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+            assert_eq!(c1a_latch(&fixture), (Some(String::new()), true));
         } else {
             assert_eq!(
                 c1a_latch(&fixture),

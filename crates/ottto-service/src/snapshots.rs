@@ -27484,6 +27484,40 @@ impl OwnedSourceScan {
         }
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
+        // Reuse the page's twin inventory below. A census slot may select an
+        // unchanged original ahead of its changed twin's queued watcher hint.
+        // Keep that hinted companion in this same family selection; the normal
+        // physical-change decision still determines whether any file is read.
+        let claude_twin_groups = std::cell::OnceCell::new();
+        if source == SnapshotSource::ClaudeCode && !hinted_paths.is_empty() {
+            let members = pending_paths
+                .iter()
+                .filter_map(|pending| claude_index_path_family_member(&pending.path))
+                .map(|(_, member)| member)
+                .collect::<BTreeSet<_>>();
+            let twins = claude_twin_groups
+                .get_or_init(|| claude_history_upgrade::claude_path_twin_groups(index, &members));
+            let selected_twins = members
+                .into_iter()
+                .filter(|member| claude_history_upgrade::path_twins(twins, member).is_some())
+                .collect::<BTreeSet<_>>();
+            if !selected_twins.is_empty() {
+                index
+                    .traversal
+                    .as_mut()
+                    .expect("traversal")
+                    .pending_candidates
+                    .retain(|pending| {
+                        let companion = pending.watcher_hint
+                            && claude_index_path_family_member(&pending.path)
+                                .is_some_and(|(_, member)| selected_twins.contains(&member));
+                        if companion {
+                            pending_paths.push(pending.clone());
+                        }
+                        !companion
+                    });
+            }
+        }
         let claude_queued_family_deferred_paths = if source == SnapshotSource::ClaudeCode {
             // Credit service at this observation, within the admission horizon.
             // The retained census clock stays frozen for proof and completeness.
@@ -27658,7 +27692,6 @@ impl OwnedSourceScan {
         let mut claude_twin_only_family_reparses = BTreeSet::new();
         // `e2`: the page's path-twin groups, built at most once per page and
         // shared with twin staging and the parse-time birth context.
-        let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode {
             let twin_groups = claude_twin_groups.get_or_init(|| {
                 // A page file not known yet (a new copy) keeps its member's
@@ -45759,7 +45792,7 @@ fn ensure_bounded_traversal(
     // this walk's observations and an append invalidates its own old evidence.
     // This advances only the census identity, never a deadline or read cause.
     let fresh_window = (source == SnapshotSource::ClaudeCode)
-        .then(|| index.claude_full_rearm_progress.completed_window)
+        .then_some(index.claude_full_rearm_progress.completed_window)
         .flatten()
         .zip(claude_census_window_stamp(collected_at))
         .filter(|(completed, now)| now <= completed)

@@ -1107,7 +1107,14 @@ impl RearmFixture {
         let last = corrected.last().expect("terminal page");
         assert!(last.scan.census_complete);
         assert!(last.fully_settled);
-        assert_eq!(rearm_parsed(&corrected), family);
+        assert_eq!(
+            rearm_parsed(&corrected),
+            family
+                .iter()
+                .cloned()
+                .chain([REARM_SIBLING.to_owned(), REARM_TERMINAL.to_owned()])
+                .collect()
+        );
         let mut reported = BTreeMap::new();
         for page in &corrected {
             assert!(page.held.is_empty());

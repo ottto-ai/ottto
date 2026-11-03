@@ -1472,37 +1472,21 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
         accepted.borrow()
     );
 
-    // Recovery: past the deadline the liveness full re-arm runs, a whole
-    // covered walk reopens the fence, and the walks settle.
+    // O1 keeps the closed fence and accepted bodies after the old deadline.
+    // No automatic recovery read may be used to correct their representation.
     minute.set(13 * 60);
-    let mut recovery = Vec::new();
-    while index.claude_duplicate_request_witness_overflowed {
-        assert!(recovery.len() < 6, "the fence reopens: {recovery:?}");
-        recovery.extend(walks(&mut index, 1));
-    }
-    assert!(
-        recovery
-            .iter()
-            .any(|walk| walk.reads == 3 && walk.pages > 1),
-        "the full re-arm reads every file across pages: {recovery:?}"
-    );
+    let deadline = index.claude_duplicate_fence_next_full_rearm_unix_seconds;
+    let recovery = walks(&mut index, 2);
+    assert_eq!(reads(&recovery), [0, 0], "{recovery:?}");
+    assert!(index.claude_duplicate_request_witness_overflowed);
     assert_eq!(
         index.claude_duplicate_fence_next_full_rearm_unix_seconds,
-        None
+        deadline
     );
-    let mut after = Vec::new();
-    while after.last().map(|walk: &Walk| walk.reads) != Some(0) {
-        assert!(after.len() < 4, "the open fence settles: {after:?}");
-        after.extend(walks(&mut index, 1));
-    }
-    assert!(
-        !index.claude_duplicate_request_witness_overflowed,
-        "the fence stays open: {after:?}"
-    );
-    assert!(
-        after.last().unwrap().sent.is_empty(),
-        "a settled walk sends nothing: {after:?}"
-    );
+    let after = walks(&mut index, 2);
+    assert_eq!(reads(&after), [0, 0], "{after:?}");
+    assert!(index.claude_duplicate_request_witness_overflowed);
+    assert!(after.iter().all(|walk| walk.sent.is_empty()), "{after:?}");
     assert_eq!(
         accepted_total() / APPENDED_INPUT,
         1,
@@ -1526,7 +1510,7 @@ fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
         reloaded.iter().all(|walk| walk.sent.is_empty()),
         "a reload sends nothing again: {reloaded:?}"
     );
-    assert!(!index.claude_duplicate_request_witness_overflowed);
+    assert!(index.claude_duplicate_request_witness_overflowed);
     assert!(index
         .accepted_snapshot_fingerprints
         .contains(&accepted.borrow()[appended].0));

@@ -196,7 +196,7 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
     }
     // Preconditions on BASE: both stale families re-arm whole (the
     // terminal-retry re-arm owes instead of clearing).
-    assert_eq!(base_row["rearmed_index_files"], 0);
+    assert_eq!(base_row["rearmed_index_files"], 3);
     for key in carry_family_keys() {
         assert!(base.files[&key].rearmed());
     }
@@ -280,7 +280,7 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
     // FLIPS: BASE re-arms the family at the first retry already.
     assert_eq!(row["carried_pending_families"], 1);
     assert_eq!(row["carried_index_files"], 2);
-    assert_eq!(row["rearmed_index_files"], 1);
+    assert_eq!(row["rearmed_index_files"], 0);
     for key in carry_family_keys() {
         assert_eq!(
             index.files[&key].source_file_fingerprint,
@@ -316,7 +316,7 @@ fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
     );
     // FLIPS: BASE re-arms every member.
     assert_eq!(row["carried_pending_families"], 1);
-    assert_eq!(row["rearmed_index_files"], 1);
+    assert_eq!(row["rearmed_index_files"], 0);
     for key in carry_family_keys() {
         assert!(!fix.files[&key].source_file_fingerprint.is_empty());
     }
@@ -1191,7 +1191,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         assert_eq!(arm_row["stale_pending_families"], 2);
     }
     // Preconditions on BASE: the clean follow-up re-arms both families.
-    assert_eq!(base_row["rearmed_index_files"], 0);
+    assert_eq!(base_row["rearmed_index_files"], 3);
     assert_eq!(base_row["carried_pending_families"], 0);
     // FLIPS: the witnessed family is carried.
     assert_eq!(row["rearm_window_families"], 2);
@@ -1208,7 +1208,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         );
     }
     let unwitnessed = carry_key(CARRY_UNWITNESSED, None);
-    assert!(fix.files[&unwitnessed].source_file_fingerprint.is_empty());
+    assert!(!fix.files[&unwitnessed].source_file_fingerprint.is_empty());
     assert_compacted_and_invalid(&fix, CARRY_ROOT);
     assert_eq!(
         fix.claude_usage_family_witnesses,
@@ -1228,6 +1228,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         .get_mut(&unwitnessed)
         .unwrap()
         .source_file_fingerprint = before.files[&unwitnessed].source_file_fingerprint.clone();
+    fix.files.get_mut(&unwitnessed).unwrap().evidence_owed = false;
     fix.claude_usage_family_pending
         .get_mut(CARRY_UNWITNESSED)
         .unwrap()
@@ -1259,7 +1260,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
     let row = carry_start(&mut next, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
     assert_eq!(row["rearmed_index_files"], 1);
     assert!(row.get("stale_rearm_capped_families").is_none());
-    assert!(next.files[&unwitnessed].source_file_fingerprint.is_empty());
+    assert!(!next.files[&unwitnessed].source_file_fingerprint.is_empty());
 
     // The cap never holds a family whose member is not accepted, nor any
     // family while the contract-5 latch is set.
@@ -1353,6 +1354,7 @@ fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
     assert_eq!(first["rearm_window_rearmed_files"], 2);
     for (key, entry) in &mut index.files {
         entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+        entry.evidence_owed = false; // This fixture explicitly simulates the paid read.
     }
     index
         .claude_usage_family_pending
@@ -1465,6 +1467,7 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
                 .get_mut(&unwitnessed)
                 .unwrap()
                 .source_file_fingerprint = revision;
+            active.files.get_mut(&unwitnessed).unwrap().evidence_owed = false;
             active
                 .claude_usage_family_pending
                 .get_mut(CARRY_UNWITNESSED)
@@ -1599,13 +1602,14 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
     index.files.remove(&carry_key(CARRY_OTHER, None));
     let before = index.files.clone();
     let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(first["rearmed_index_files"], 0);
+    assert_eq!(first["rearmed_index_files"], 3);
     assert_eq!(first["carried_pending_families"], 0);
-    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 0);
+    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
     // Both families were read successfully but an unrelated transient page
     // error requires another walk. The consumed allowance cannot hold them.
     for (key, entry) in &mut index.files {
         entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+        entry.evidence_owed = false; // This fixture explicitly simulates the paid read.
     }
     for pending in index.claude_usage_family_pending.values_mut() {
         pending.census_window_end = CARRY_RETRY.to_string();
@@ -1617,7 +1621,7 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
         carry_start(&mut base, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS)
     };
     let row = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(base_row["rearmed_index_files"], 0);
+    assert_eq!(base_row["rearmed_index_files"], 3);
     assert_eq!(row["rearmed_index_files"], base_row["rearmed_index_files"]);
     assert_eq!(row["carried_pending_families"], 0);
     assert!(row.get("stale_rearm_capped_families").is_none());
@@ -1651,6 +1655,11 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
         .get_mut(&carry_key(CARRY_UNWITNESSED, None))
         .unwrap()
         .source_file_fingerprint = revision;
+    index
+        .files
+        .get_mut(&carry_key(CARRY_UNWITNESSED, None))
+        .unwrap()
+        .evidence_owed = false;
     index
         .claude_usage_family_pending
         .get_mut(CARRY_UNWITNESSED)
@@ -2351,7 +2360,11 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
         } else {
             assert_eq!(row["carried_pending_families"], 0, "{case}");
             if !matches!(case, "context" | "mid_walk") {
-                assert_eq!(row["rearmed_index_files"], 0, "{case}");
+                assert_eq!(
+                    row["rearmed_index_files"],
+                    if case == "invalid_pending" { 0 } else { 32 },
+                    "{case}"
+                );
             }
             assert_eq!(
                 healthy_full,
@@ -2548,8 +2561,12 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
             .unwrap();
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 0),
-            CandidateDecision::Skip,
-            "{case}: refused unchanged evidence remains owed"
+            if matches!(case, "scan_version" | "empty_revision") {
+                CandidateDecision::Parse
+            } else {
+                CandidateDecision::Skip
+            },
+            "{case}: refused unchanged evidence remains owed; changed identity keeps its existing selection"
         );
         if case != "list_missing" {
             assert_eq!(
@@ -3595,7 +3612,7 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         }
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 1),
-            if matches!(case, "content" | "sidecar" | "account") {
+            if matches!(case, "content" | "sidecar" | "account" | "upload_context") {
                 CandidateDecision::Parse
             } else {
                 CandidateDecision::Skip

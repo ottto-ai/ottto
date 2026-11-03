@@ -301,8 +301,8 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
         assert!(!run.counts.full_rearm, "{run:?}");
         assert!(run.counts.fence_before && run.counts.fence_after);
         assert!(
-            !run.counts.census_invalid,
-            "completed rows do not invalidate a later fold"
+            run.counts.census_invalid,
+            "fresh observations retain the structural invalidity"
         );
         assert_eq!(run.rearmed_files, 0);
         assert_eq!(
@@ -311,8 +311,8 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
                 full_rearm_suppressed: true,
                 full_rearm_skipped_invalid_unchanged: skipped as u64,
                 full_rearm_post_rebuild_skipped: 0,
-                structural_invalid_family_count: 0,
-                suppressed_since_unix_seconds: Some(CENSUS_CLOCK),
+                structural_invalid_family_count: 1,
+                suppressed_since_unix_seconds: Some(CENSUS_CLOCK + 1),
             }
         );
     }
@@ -1104,8 +1104,8 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 }
             } else {
                 if let Some(record) = &mut record {
-                    record.suppressed_since_unix_seconds = None;
-                    record.skipped_full_rearms = 0;
+                    record.suppressed_since_unix_seconds = Some(CENSUS_CLOCK + 1);
+                    record.skipped_full_rearms += 1;
                 }
                 assert!(!run.suppression.full_rearm_suppressed, "{cause}");
                 assert_eq!(run.rearmed_files, 0, "{cause}");
@@ -1309,7 +1309,7 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
         let mut index = rearm.index();
         index.claude_request_identity_contract = Some(contract.to_string());
         let mut runs = Vec::new();
-        for _ in 0..3 {
+        for observation in 0..3 {
             let (run, parent, state) = always_on_terminal(&rearm, &support, &mut index);
             let tagged = parent
                 .model_usage
@@ -1326,7 +1326,8 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
             assert_eq!(parent.claude_account_withheld_reason, None, "{state}");
             assert_eq!(parent.request_identity_refusals, 0, "{state}");
             assert_eq!(
-                run.counts.page_invalidated_identity_count, 0,
+                run.counts.page_invalidated_identity_count,
+                usize::from(observation == 0),
                 "census identity kept: only the structural child: {run:?} {state}"
             );
             assert_eq!(
@@ -1533,7 +1534,10 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                     !first.counts.full_rearm,
                     "no whole-index re-arm: {first:?} {state}"
                 );
-                assert!(first.suppression.full_rearm_suppressed, "{first:?} {state}");
+                assert!(
+                    !first.suppression.full_rearm_suppressed,
+                    "{first:?} {state}"
+                );
                 assert_eq!(
                     first.rearmed_files, 0,
                     "the latch re-arms the family once: {state}"
@@ -2151,7 +2155,7 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
         let mut paid = scan(&mut index, WINDOW);
         enrich(&mut paid, &mut index);
         let quiet = rearm.terminal(&mut index, &paid.snapshots);
-        assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?}");
+        assert!(!quiet.suppression.full_rearm_suppressed, "{quiet:?}");
         assert_eq!(quiet.rearmed_files, 0);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut paid, &mut index);
         let unchanged = scan(&mut index, WINDOW);
