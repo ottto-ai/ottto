@@ -61,38 +61,17 @@ fn e2_page(
     support: &Path,
     index: &mut ScanIndex,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
-    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index);
-    (items, disposition, failed)
+    e2_page_with(dirs, support, index, None)
 }
 
-/// `e2_page` plus the page identity counters `finish_page` recorded (read
-/// before the emitted folds they derive from are released).
-fn e2_page_counted(
-    dirs: &[PathBuf],
-    support: &Path,
-    index: &mut ScanIndex,
-) -> (
-    Vec<SnapshotItem>,
-    ClaudeUsageAuthorityDisposition,
-    bool,
-    serde_json::Value,
-) {
-    e2_page_counted_with(dirs, support, index, None)
-}
-
-/// `e2_page_counted` under this cycle's accepted-identity state (its
+/// `e2_page` under this cycle's accepted-identity state (its
 /// capabilities); `None` is the plain evidence stage.
-fn e2_page_counted_with(
+fn e2_page_with(
     dirs: &[PathBuf],
     support: &Path,
     index: &mut ScanIndex,
     accepted: Option<&claude_request_identity::AcceptedBuckets>,
-) -> (
-    Vec<SnapshotItem>,
-    ClaudeUsageAuthorityDisposition,
-    bool,
-    serde_json::Value,
-) {
+) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
     {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -108,27 +87,23 @@ fn e2_page_counted_with(
             index,
             "e2-identity-machine",
         );
-        let ((disposition, _, stats), counts) =
-            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                match accepted {
-                    None => crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-                        support, &mut scan, index,
-                    ),
-                    Some(accepted) => {
-                        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                            support,
-                            &mut scan,
-                            index,
-                            Some(accepted),
-                        )
-                    }
-                }
-            });
+        let (disposition, _, stats) = match accepted {
+            None => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+            }
+            Some(accepted) => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                    support,
+                    &mut scan,
+                    index,
+                    Some(accepted),
+                )
+            }
+        };
         (
             scan.snapshots,
             disposition,
             stats.effort_evidence_load_failed,
-            counts,
         )
     }
 }
@@ -426,8 +401,8 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
                 },
             );
         }
-        let (items, disposition, failed, counts) =
-            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index);
+        let (items, disposition, failed) =
+            e2_page(std::slice::from_ref(&dir), &support, &mut index);
         assert!(!failed);
         let item = items
             .iter()
@@ -443,21 +418,6 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some(if partial { "0.0002" } else { "0.0004" })
         );
-        if partial {
-            assert_eq!(
-                counts["claude_inherited_org_requests"], 2,
-                "missing requests inherit A then B, counted"
-            );
-        } else {
-            assert!(
-                counts.get("claude_inherited_org_requests").is_none(),
-                "own evidence needs no fill: {counts}"
-            );
-        }
-        assert!(
-            counts.get("claude_identity_conflict_fallbacks").is_none(),
-            "no conflict: {counts}"
-        );
         assert_eq!(disposition.quarantined_entity_count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -466,7 +426,7 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
 /// The A-to-B family (req_1-2 own A, req_3-4 own B) with the `gaps` API rows
 /// removed and the `no_account` rows naming no account, evidence-staged once
 /// per mode on the same files: `None` the plain stage, `Some(capability)`
-/// this cycle's `session_request_account_source:v1` state. Root item + counts.
+/// this cycle's `session_request_account_source:v1` state. Root items.
 fn e2_carry_pages(
     gaps: &[&str],
     no_account: &[(&str, bool)],
@@ -474,7 +434,7 @@ fn e2_carry_pages(
     acknowledge: bool,
     marker: bool,
     zero_and_side: bool,
-) -> Vec<(SnapshotItem, serde_json::Value)> {
+) -> Vec<SnapshotItem> {
     // These are ordinary session requests, not a newly copied August
     // prefix. Keep the production copy-prefix seed refusal enabled.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
@@ -540,7 +500,7 @@ fn e2_carry_pages(
         .iter()
         .map(|mode| {
             accepted.set_account_source_enabled(*mode == Some(true));
-            let (items, _, failed, counts) = e2_page_counted_with(
+            let (items, _, failed) = e2_page_with(
                 std::slice::from_ref(&dir),
                 &support,
                 &mut ScanIndex::default(),
@@ -558,8 +518,7 @@ fn e2_carry_pages(
                     accepted.record(&serde_json::to_value(item).unwrap());
                 }
             }
-            let item = items.into_iter().find(|item| item.source_session_id == root).unwrap();
-            (item, counts)
+            items.into_iter().find(|item| item.source_session_id == root).unwrap()
         })
         .collect();
     fs::remove_dir_all(dir).unwrap();
@@ -594,10 +553,6 @@ fn e2_source_counts(item: &SnapshotItem) -> BTreeMap<(Option<String>, Option<Acc
     counts
 }
 
-fn e2_count(counts: &serde_json::Value, name: &str) -> u64 {
-    counts.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0)
-}
-
 /// [money] Under `session_request_account_source:v1` a gap's share moves only
 /// between keys of its own item: forward to the latest own account, backward
 /// to the first, each marked. Request, token and cost totals equal the
@@ -607,7 +562,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
     use AccountSource::{CarriedBackward, CarriedForward};
     let a = Some(e2_account());
     let b = Some("b".repeat(64));
-    for (gaps, expected, forward, backward, ambiguous) in [
+    for (gaps, expected) in [
         (
             &["req_2", "req_4"][..],
             vec![
@@ -616,10 +571,6 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
                 ((b.clone(), None), 1),
                 ((b.clone(), Some(CarriedForward)), 1),
             ],
-            2,
-            0,
-            // req_2 was carried from A, then B took over.
-            1,
         ),
         (
             &["req_1", "req_2", "req_4"][..],
@@ -629,13 +580,10 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
                 ((b.clone(), None), 1),
                 ((b.clone(), Some(CarriedForward)), 1),
             ],
-            1,
-            2,
-            0,
         ),
     ] {
         let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true), Some(true)], true, false, true);
-        let [(off, _), (on, counts), (again, _)] = &pages[..] else {
+        let [off, on, again] = &pages[..] else {
             unreachable!()
         };
         assert_eq!(e2_source_counts(on), BTreeMap::from_iter(expected), "{gaps:?}");
@@ -646,9 +594,6 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         assert_eq!(on.request_identity_refusals, 0);
         assert_eq!(again.request_identity_refusals, 0);
         assert_eq!(e2_source_counts(again), e2_source_counts(on));
-        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), forward);
-        assert_eq!(e2_count(counts, "claude_carried_backward_requests"), backward);
-        assert_eq!(e2_count(counts, "claude_carry_ambiguous_gap_requests"), ambiguous);
         let totals = |item: &SnapshotItem| {
             (
                 item.request_count,
@@ -661,13 +606,12 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         };
         assert_eq!(totals(on), totals(off), "{gaps:?}: money never changes");
         assert_eq!(on.request_count, 5, "four non-zero responses plus the side call");
-        assert_eq!(e2_count(counts, "claude_carry_skipped_incomplete_transcripts"), 0);
     }
     // The first ACK is already ON. req_1's native marker and req_4's
     // carried B share the same native row; record stores {marker, None}.
     // Its next body must retain carried B without treating it as proof.
     let pages = e2_carry_pages(&["req_1", "req_4"], &[], &[Some(true), Some(true)], true, true, false);
-    let [(first, _), (again, _)] = &pages[..] else { unreachable!() };
+    let [first, again] = &pages[..] else { unreachable!() };
     assert_eq!(e2_source_counts(first), e2_source_counts(again));
     assert_eq!(first.request_identity_refusals, 0);
     assert_eq!(again.request_identity_refusals, 0);
@@ -683,7 +627,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
 #[test]
 fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
     let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)], false, false, false);
-    let [(plain, _), (off, _), (on, _)] = &pages[..] else {
+    let [plain, off, on] = &pages[..] else {
         unreachable!()
     };
     let bytes = |item: &SnapshotItem| serde_json::to_string(item).unwrap();
@@ -697,14 +641,14 @@ fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
 }
 
 /// [behaviour] A telemetry row naming no account blocks the carry: it stays
-/// Unknown and is counted; the next own account seeds again.
+/// Unknown; the next own account seeds again.
 #[test]
 fn e2_pipeline_no_account_row_blocks_the_carry() {
     for contradictory in [false, true] {
         // req_3 is a gap AFTER the invalid row; neither it nor req_2 may
         // inherit A. req_4's own B restarts the stream.
         let pages = e2_carry_pages(&["req_3"], &[("req_2", contradictory)], &[Some(true)], false, false, false);
-        let [(on, counts)] = &pages[..] else { unreachable!() };
+        let [on] = &pages[..] else { unreachable!() };
         assert_eq!(
             e2_source_counts(on),
             BTreeMap::from([
@@ -713,18 +657,13 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
                 ((Some("b".repeat(64)), None), 1),
             ])
         );
-        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
-        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 0);
-        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 1);
         // A first invalid row also blocks a pre-existing marker. There is
         // no later own root account; the child's A cannot seed the root.
         let pages = e2_carry_pages(&["req_2", "req_3", "req_4"], &[("req_1", contradictory)],
             &[Some(true)], false, true, false);
-        let [(on, counts)] = &pages[..] else { unreachable!() };
+        let [on] = &pages[..] else { unreachable!() };
         assert_eq!(e2_source_counts(on), BTreeMap::from([((None, None), 4)]));
         assert!(on.request_evidence.is_empty(), "old org marker cannot cross invalid telemetry");
-        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
-        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 3);
     }
 }
 
@@ -759,7 +698,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         root,
         &trace,
     );
-    let (items, disposition, failed, counts) = e2_page_counted(
+    let (items, disposition, failed) = e2_page(
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
@@ -786,7 +725,6 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         Some("identity_withheld")
     );
     assert_eq!(item.request_identity_refusals, 1);
-    assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
     // The existing seventeen-request fixture also reaches the cap through
     // a forward twin, a backward twin, and a twin occupying a later own key's
@@ -800,13 +738,13 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &own);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-            let (off, off_disposition, failed, _) = e2_page_counted_with(
+            let (off, off_disposition, failed) = e2_page_with(
                 std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
             );
             assert!(!failed);
             assert_eq!(off_disposition.quarantined_entity_count(), 0);
             accepted.set_account_source_enabled(true);
-            let (on, disposition, failed, _) = e2_page_counted_with(
+            let (on, disposition, failed) = e2_page_with(
                 std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
             );
             assert!(!failed);
@@ -1037,16 +975,10 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
-        let ((disposition, _, stats), counts) =
-            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                    support, &mut scan, index, accepted,
-                )
-            });
-        if unhealthy {
-            assert_eq!(counts.get("claude_inherited_org_requests"), None,
-                "no request is filled from the retained, start or root account: {counts}");
-        }
+        let (disposition, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                support, &mut scan, index, accepted,
+            );
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
             assert_eq!(gated.previous.as_ref(), Some(&previous), "custody is kept");
@@ -1592,7 +1524,7 @@ fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotIt
                 other_account: false,
             },
         );
-        let (items, _, failed, _) = e2_page_counted_with(
+        let (items, _, failed) = e2_page_with(
             &[projects.to_path_buf()],
             &dir.join("support"),
             &mut index,

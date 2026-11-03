@@ -662,10 +662,7 @@
   ],
   "workspace_hash": null
  },
- "identity.held.counts": {
-  "claude_inherited_org_requests": 1,
-  "claude_mixed_login_sessions": 1
- },
+ "identity.held.counts": {},
  "identity.held.index": {
   "accepted_snapshot_fingerprint_ledger_version": 2,
   "accepted_snapshot_fingerprints": [

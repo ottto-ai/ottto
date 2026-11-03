@@ -564,7 +564,6 @@ mod tests {
                 ClaudeTranscriptUsageOccurrence {
                     sequence,
                     telemetry_attached: false,
-                    e2_inherited: None,
                     usage: Default::default(),
                     model: None,
                     selector: Default::default(),

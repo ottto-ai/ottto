@@ -1486,9 +1486,6 @@ impl FileFold {
             self.entity.absorb_grains(&copy);
         }
         self.restore_idless();
-        if let Some(accounts) = self.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
         self.entity.removed = Default::default();
         self.entity.removed_requests = 0;
         self.skipped.clear();
@@ -3077,12 +3074,6 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     }
     fold.restore_idless();
     fold.proof = None;
-    if fold.copied == 0 {
-        // Every copy counts after all: their inherited-marker tally too.
-        if let Some(accounts) = fold.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
-    }
     if !holder_proof {
         fold.absorb_prefix_inherited(false);
     }
@@ -4047,7 +4038,6 @@ pub(crate) fn finish_page(
         .unwrap_or_default();
 
     claude_request_identity::inherit_root_accounts(items, true);
-    claude_request_identity::record_page_identity_counts(items);
 
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<String, Session>::new();

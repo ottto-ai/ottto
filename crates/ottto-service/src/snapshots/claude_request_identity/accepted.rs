@@ -301,17 +301,9 @@ fn wire_row_key(row: &Value) -> Option<RowKey> {
         subscription_product: text("subscription_product"),
     })
 }
-fn basis_token(basis: &str) -> Option<&'static str> {
-    match basis {
-        TELEMETRY => Some(TELEMETRY),
-        TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_RECORDED_LOGIN => Some(TRANSCRIPT_RECORDED_LOGIN),
-        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
-        TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
-        _ => None,
-    }
-}
-/// A carried or recorded-login share: placement, never proof of its row.
+/// A carried or recorded-login share: placement, never proof of its row. The
+/// stored-JSON boundary twin of `AuthorityKey::placement_only`, stricter: any
+/// present `account_source` (even null) counts.
 fn placement_only_entry(entry: &Value) -> bool {
     entry.get("account_source").is_some()
         || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)

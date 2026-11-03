@@ -2556,83 +2556,7 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
 }
 
 #[test]
-fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
-    {
-        let a = root_file("identity-count-a");
-        let b = root_file("identity-count-b");
-        let index = ScanIndex::default();
-        let one = parse(
-            &a,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first", &at(1), 1),
-                line("shared", &at(2), 1),
-            ],
-        );
-        let two = parse(
-            &b,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first", &at(1), 1),
-                line("shared", &at(2), 1),
-                line("new", &at(3), 1),
-            ],
-        );
-        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
-            let counts =
-                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                    .unwrap();
-            assert_eq!(counts, json!({"claude_inherited_org_requests":2}));
-        }
-        cleanup(&[&a, &b]);
-    };
-}
-
-#[test]
-fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
-    {
-        let a = root_file("identity-count-disjoint-a");
-        let b = root_file("identity-count-disjoint-b");
-        let index = ScanIndex::default();
-        let one = parse(
-            &a,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first-a", &at(1), 1),
-                line("a-one", &at(2), 1),
-                line("a-two", &at(3), 1),
-            ],
-        );
-        let two = parse(
-            &b,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first-b", &at(1), 1),
-                line("b-one", &at(2), 1),
-                line("b-two", &at(3), 1),
-            ],
-        );
-        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
-            assert_eq!(
-                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                    .unwrap(),
-                json!({"claude_inherited_org_requests":4})
-            );
-        }
-        cleanup(&[&a, &b]);
-    };
-}
-
-#[test]
-fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
+fn e2_identity_held_copies_leave_and_counted_copies_stay() {
     {
         let path = root_file("identity-count-copy");
         let index = ScanIndex::default();
@@ -2652,13 +2576,6 @@ fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copie
             assert_eq!(
                 fold(&item).entity.removed_requests,
                 if restore { 0 } else { 2 }
-            );
-            let counts =
-                serde_json::to_value(claude_request_identity::page_identity_counts(&[item]))
-                    .unwrap();
-            assert_eq!(
-                counts,
-                json!({"claude_inherited_org_requests":if restore { 2 } else { 1 }})
             );
         }
         cleanup(&[&path]);
@@ -2906,11 +2823,9 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 claude_request_identity::inherit_root_accounts(&mut items, true);
-                let counts =
-                    serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                        .unwrap();
-                assert!(counts.get("claude_identity_conflict_fallbacks").is_none());
-                assert_eq!(counts["claude_inherited_org_requests"], 1);
+                assert!(items
+                    .iter()
+                    .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 let item = tag_owned(items, &index).remove(0);
                 assert_eq!((item.request_count, item.input_tokens), (2, 30));
                 assert_eq!(item.request_evidence.len(), 1);
