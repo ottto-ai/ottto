@@ -114,7 +114,7 @@ fn old_format_usage_row_converts_at_first_save_and_releases_its_set() {
     assert!(!ids.is_empty());
 
     let (previous, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.derivable_usage, [key.clone()]);
+    assert_eq!(cx.derivable_usage, std::slice::from_ref(&key));
     let committed = baseline(&previous, &mut cx).unwrap();
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     let mut next = previous.clone();
