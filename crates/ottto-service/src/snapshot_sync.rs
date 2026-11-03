@@ -14730,7 +14730,12 @@ mod tests {
         assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 0);
         // Missing authority remains explicitly pending; the file stays owed
         // under the new context until its exact ACK.
-        assert_eq!(loaded.upload_context_owed_file_count(), 1);
+        assert_eq!(
+            crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
+                &loaded
+            ),
+            1
+        );
         // Existing exact ordinary CAS transport supplies the actual prerequisite;
         // the marker itself neither schedules this probe nor invents head authority.
         bootstrap_cache_heads(
@@ -24179,7 +24184,9 @@ mod tests {
                 let recovery = f.progress.ack_recovery.take();
                 // Every restart below reloads this exact saved ledger.
                 let saved = std::fs::read(&f.progress_path).unwrap();
-                let adopted = |index: &ScanIndex| index.upload_context_owed_file_count() == 0;
+                let adopted = |index: &ScanIndex| {
+                    crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(index) == 0
+                };
                 for _ in 0..3 {
                     f.restart_preparation();
                     assert!(f.items.is_empty(), "accepted bodies stay suppressed");

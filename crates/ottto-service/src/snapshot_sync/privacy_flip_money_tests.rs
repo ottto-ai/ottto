@@ -418,7 +418,7 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             // Delivered: the server holds the bodies. The index keeps no proof.
             let delivered = routed(&warm, before.policy);
             assert!(!delivered.snapshots.is_empty(), "{label}: delivered");
-            let owed = warm.index.upload_context_owed_file_count();
+            let owed = crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&warm.index);
             assert!(owed > 0, "{label}: positive control, unproven files");
 
             let mut quiet = page_under(&c, &scanner, warm.index.clone(), after);
@@ -442,7 +442,7 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             );
             settle(&c, &mut quiet, after);
             assert_eq!(
-                quiet.index.upload_context_owed_file_count(),
+                crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&quiet.index),
                 owed,
                 "{label}: still owed, paid by the next read"
             );
