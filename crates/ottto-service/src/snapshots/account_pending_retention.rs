@@ -699,25 +699,6 @@ mod tests {
         assert_eq!(fold.finish(Some(7), &current_end).uncollapsed(), 4);
     }
 
-    /// [behaviour] Two archived windows at one boundary: the plan is refused,
-    /// every window stays, and the cold count names no removal.
-    #[test]
-    fn a_boundary_tie_refuses_the_plan_and_deletes_nothing() {
-        let mut archive: Vec<_> = ['a', 'b', 'a']
-            .into_iter()
-            .enumerate()
-            .map(|(minute, account)| members_window(minute as u32, account, &["x"]))
-            .collect();
-        archive[1].census_window_end = archive[0].census_window_end.clone();
-        let current_end = members_window(9, 'a', &["x"]).census_window_end;
-        let mut windows = archive.clone();
-        assert_eq!(checked_collapse(&mut windows, &current_end), None);
-        assert_eq!(windows, archive);
-        let mut fold = ColdFold::default();
-        archive.into_iter().for_each(|window| fold.push(window));
-        assert_eq!(fold.finish(Some(3), &current_end).uncollapsed(), 0);
-    }
-
     #[test]
     fn self_check_refuses_a_plan_that_changes_a_members_winning_boundary() {
         let window = |minute, member: &str| ClaudeAccountFamilyPendingWindow {

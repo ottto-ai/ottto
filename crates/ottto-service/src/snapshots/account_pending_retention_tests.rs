@@ -117,8 +117,8 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// Any evidence change in the middle of the archive: only the newest window
-/// stays, since it names every member.
+/// [behaviour] Any evidence change in the middle of the archive: only the
+/// newest window stays, since it names every member.
 #[test]
 fn account_window_collapse_keeps_the_newest_across_evidence_changes() {
     let (dir, root, base) = retention_fixture();
@@ -259,8 +259,9 @@ fn account_window_collapse_keeps_each_members_newest_across_completion_flips() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] Unsafe archived boundaries: the load walk refuses a resident
-/// family and never walks a cold one; neither changes.
+/// [money] Unsafe archived boundaries (unparsable, at or after current, out
+/// of order, a tie): the load walk refuses a resident family and never walks
+/// a cold one; neither changes.
 #[test]
 fn account_window_unsafe_boundaries_are_untouched() {
     let (dir, root, base) = retention_fixture();
@@ -269,6 +270,8 @@ fn account_window_unsafe_boundaries_are_untouched() {
         "2026-08-02T07:20:00Z",
         "2026-08-02T07:21:00Z",
         "2026-08-02T07:00:00Z",
+        // Ties window 1.
+        "2026-08-02T07:01:00Z",
     ] {
         let mut index = base.clone();
         index
