@@ -1593,6 +1593,204 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
     }
 }
 
+/// Sessions whose body a page handed to the upload.
+fn tur_offered_sessions(pages: &[RearmPage]) -> BTreeSet<String> {
+    pages
+        .iter()
+        .flat_map(|page| {
+            page.scan
+                .snapshots
+                .iter()
+                .filter(|item| page.offered.contains(&item.snapshot_fingerprint))
+                .map(|item| item.source_session_id.clone())
+        })
+        .collect()
+}
+
+/// The terminal-retry start rows of one generation.
+fn tur_starts(rows: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .filter(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        })
+        .map(|row| row["counts"].clone())
+        .collect()
+}
+
+/// One session's body from a cold Full of the same bytes, on an independent
+/// index, at the same clock.
+fn tur_cold_full_body(fixture: &RearmFixture, minute: usize, session: &str) -> serde_json::Value {
+    let cold = native_comparison_independent_history(fixture);
+    let full = latch_contract_generation(&cold, minute);
+    assert!(rearm_parsed(&full).contains(session));
+    let body = cold.body_trace.borrow().finalizer_bodies[session].clone();
+    body
+}
+
+/// Money parity for a same-context terminal retry under the identity-contract
+/// latch whose prior upload left an unknown unsettled scope. Family A is
+/// exact-ACKed and unchanged; family B's new body was offered and not ACKed
+/// (a shed partial checkpoint), and the scope was then lost. The retry carries
+/// A (no read, no upload), reads B again and emits the body a cold Full of the
+/// same bytes emits; the next retry offers nothing for either; a request
+/// appended to A is read once and equals a cold Full.
+#[test]
+#[serial(source_manifests)]
+fn tur_unknown_scope_under_latch_carries_acked_family_and_reemits_unacked_one_like_cold_full() {
+    if !c1a_layout_supported("tur-unknown-scope-money") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let contract = crate::snapshots::claude_request_identity::E2_GROUPING;
+    crate::snapshots::claude_request_identity::with_cycle_contract_for_test(contract, || {
+        let mut fixture = c1a_fixture("tur-unknown-scope-money");
+        latch_contract_drop_unrelated_family(&fixture);
+        fixture.owned_base_preparation = true;
+        fixture.native_file_limit = 100;
+        let a = "e7000000-0000-4000-8000-000000000007";
+        let b = "e8000000-0000-4000-8000-000000000008";
+        let a_path = fixture.root.join(format!("{a}.jsonl"));
+        let b_path = fixture.root.join(format!("{b}.jsonl"));
+        std::fs::write(&a_path, rearm_transcript_line(a, None, "req_a_1", 0)).unwrap();
+        std::fs::write(&b_path, rearm_transcript_line(b, None, "req_b_1", 0)).unwrap();
+        fixture.list_held(&[]);
+        let without_window = |fixture: &RearmFixture, drop_scope: bool| {
+            c1a_edit_index(fixture, |saved| {
+                if let Some(progress) = saved
+                    .get_mut("claude_full_rearm_progress")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    progress.remove("full_rearm_window");
+                    progress.remove("full_rearm_window_next");
+                    if drop_scope {
+                        progress.remove("held_family_roots");
+                    }
+                }
+            });
+        };
+
+        let closing = latch_contract_generation(&fixture, 0);
+        RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+        c1a_edit_index(&fixture, |saved| {
+            for entry in saved["files"].as_object_mut().unwrap().values_mut() {
+                entry["source_file_fingerprint"] = serde_json::json!("");
+            }
+        });
+        let red = latch_contract_generation(&fixture, 10);
+        assert!(!red.last().unwrap().scan.census_complete, "the walk is red");
+        let a_body = fixture.body_trace.borrow().finalizer_bodies[a].clone();
+        let a_fp = a_body["snapshot_fingerprint"].as_str().unwrap().to_owned();
+        assert_eq!(a_body["request_count"], 1);
+        assert!(
+            closing
+                .iter()
+                .chain(&red)
+                .any(|page| page.uploaded.contains(&a_fp)),
+            "A's body is exact-ACKed"
+        );
+
+        // B gains a request whose body is offered and never ACKed.
+        RearmFixture::append(&b_path, &rearm_transcript_line(b, None, "req_b_2", 1));
+        c1a_edit_index(&fixture, |saved| {
+            saved.insert(
+                "claude_request_identity_contract_changed".into(),
+                serde_json::json!(true),
+            );
+        });
+        without_window(&fixture, false);
+        let (failed, _) = source_latch_generation(&fixture, 20, RearmUpload::AckLost, Some(b));
+        let b_failed = fixture.body_trace.borrow().finalizer_bodies[b].clone();
+        let b_failed_fp = b_failed["snapshot_fingerprint"].as_str().unwrap();
+        assert!(failed.iter().any(|page| page.offered.contains(b_failed_fp)));
+        assert!(failed
+            .iter()
+            .all(|page| !page.uploaded.contains(b_failed_fp)));
+        assert!(!failed.last().unwrap().fully_settled);
+        assert!(
+            c1b_traversal_ended(&failed.last().unwrap().index).0,
+            "the shed page ends the red walk, so the next page starts a retry"
+        );
+        assert!(!tur_offered_sessions(&failed).contains(a));
+        // The prior upload's scope becomes unknown, as when the stamp overflows
+        // or names an unplaced entity.
+        without_window(&fixture, true);
+        let marked = c1a_saved(&fixture);
+        assert_eq!(marked["bounded_sweep_had_unsettled_upload"], true);
+        assert!(marked["claude_full_rearm_progress"]
+            .get("held_family_roots")
+            .is_none());
+        assert!(c1a_latch(&fixture).1, "the latch is set");
+
+        let (retry, rows) = source_latch_generation(&fixture, 30, RearmUpload::Accept, None);
+        let starts = tur_starts(&rows);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0]["reason"], "terminal_unhealthy_retry");
+        assert_eq!(starts[0]["prior_unsettled_upload"], true);
+        assert!(
+            starts[0]["carried_pending_families"].as_u64().unwrap_or(0) >= 1,
+            "the unknown scope no longer refuses every family: {starts:?}"
+        );
+        // (1) A: carried, not read, nothing offered.
+        assert!(!rearm_parsed(&retry).contains(a), "A is not read");
+        assert!(
+            !tur_offered_sessions(&retry).contains(a),
+            "A uploads nothing"
+        );
+        assert_eq!(fixture.body_trace.borrow().finalizer_bodies[a], a_body);
+        // (2) B: read again; its new body is ACKed and equals a cold Full.
+        assert!(rearm_parsed(&retry).contains(b), "B is retried");
+        let b_body = fixture.body_trace.borrow().finalizer_bodies[b].clone();
+        let b_fp = b_body["snapshot_fingerprint"].as_str().unwrap().to_owned();
+        assert!(retry.iter().any(|page| page.uploaded.contains(&b_fp)));
+        // (3) No smaller re-emit: B carries both requests.
+        assert_eq!(b_body["request_count"], 2);
+        assert_eq!(b_body["input_tokens"], 20);
+        assert_eq!(b_body["output_tokens"], 20);
+        assert_eq!(
+            b_body["request_count"], b_failed["request_count"],
+            "the retry re-emits the unACKed body whole"
+        );
+        assert_eq!(
+            b_body,
+            tur_cold_full_body(&fixture, 30, b),
+            "B equals a cold Full"
+        );
+        assert_eq!(
+            c1a_saved(&fixture)["claude_request_identity_contract_changed"],
+            true
+        );
+        assert!(retry.iter().all(|page| page.duplicate_census.fence_after));
+
+        // (1) Quiet: the next retry, from the saved index, offers neither.
+        let (quiet, _) = source_latch_generation(&fixture, 40, RearmUpload::Accept, None);
+        let quiet_parsed = rearm_parsed(&quiet);
+        let quiet_offered = tur_offered_sessions(&quiet);
+        for session in [a, b] {
+            assert!(!quiet_parsed.contains(session), "{session}: quiet read");
+            assert!(!quiet_offered.contains(session), "{session}: quiet bytes");
+        }
+
+        // (4) A grows: the new request is read once and equals a cold Full.
+        RearmFixture::append(&a_path, &rearm_transcript_line(a, None, "req_a_2", 1));
+        let grown = latch_contract_generation(&fixture, 50);
+        assert!(rearm_parsed(&grown).contains(a));
+        let grown_body = fixture.body_trace.borrow().finalizer_bodies[a].clone();
+        let grown_fp = grown_body["snapshot_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(grown.iter().any(|page| page.uploaded.contains(&grown_fp)));
+        assert_eq!(grown_body["request_count"], 2);
+        assert_eq!(grown_body["input_tokens"], 20);
+        assert_eq!(grown_body["output_tokens"], 20);
+        assert_eq!(
+            grown_body,
+            tur_cold_full_body(&fixture, 50, a),
+            "grown A equals a cold Full"
+        );
+    });
+}
+
 fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
     rows.iter()
         .filter_map(|row| row["counts"]["identity_contract_latch"]["cleared"].as_u64())

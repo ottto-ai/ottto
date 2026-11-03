@@ -45290,12 +45290,15 @@ fn ensure_bounded_traversal(
     let debt_scope_known = claude_contract_debt_scope(index).is_some();
     let prior_held_family_roots = index.claude_full_rearm_progress.held_family_roots.take();
     let empty_debt_scope = BTreeSet::new();
+    // Unknown scope, same context only: carry still needs every member exact-ACKed and
+    // unheld; it credits no evidence and the fence stays closed.
+    let unknown_debt_scope = prior_traversal_context_matches.then_some(&empty_debt_scope);
     let debt_scope = if !prior_unsettled_upload {
         Some(&empty_debt_scope)
     } else if debt_scope_known {
         prior_held_family_roots.as_ref()
     } else {
-        None
+        unknown_debt_scope
     };
     index.bounded_sweep_had_unsettled_upload = false;
     index.bounded_sweep_unsettled_causes = 0;
