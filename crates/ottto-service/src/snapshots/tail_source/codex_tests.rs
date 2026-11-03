@@ -634,21 +634,53 @@ pub(in crate::snapshots) fn candidate(path: &Path) -> CandidateFile {
     }
 }
 
+/// A rollout whose owning header names `SESSION`, written once.
+fn owned_rollout() -> &'static Path {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-tail-codex-lineage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-10-18T10-00-00-{SESSION}.jsonl"));
+        std::fs::write(&path, lines(1).join("\n") + "\n").unwrap();
+        path
+    })
+}
+
 fn install(
     stored: &mut SnapshotAccumulator,
     live: &SnapshotAccumulator,
 ) -> Result<(), LiveLoadError> {
-    Codex::install_live(
-        stored,
-        &candidate(Path::new("/home/sessions/rollout.jsonl")),
-        live,
-    )
+    Codex::install_live(stored, &candidate(owned_rollout()), live)
 }
 
+/// A stored head of `SESSION`'s lineage that every other check lets continue.
 fn continuable() -> SnapshotAccumulator {
     let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
     stored.codex_observed_priority_turns = Some(BTreeMap::new());
+    stored.codex_creator_header_id = Some(SESSION.into());
     stored
+}
+
+/// [money] The lineage (D131): a head continues only the session its owning
+/// header named. Another id, or none stored, is a counted `Identity`
+/// reconstruction; a header this read cannot read waits.
+#[test]
+fn install_live_continues_only_the_stored_lineage() {
+    let live = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert_eq!(install(&mut continuable(), &live), Ok(()));
+    let identity = Err(LiveLoadError::Reconstruct(ReconstructCause::Identity));
+    let mut other = continuable();
+    other.codex_creator_header_id = Some("019a0c2a-8e11-7222-8333-944445555000".into());
+    assert_eq!(install(&mut other, &live), identity);
+    let mut none = continuable();
+    none.codex_creator_header_id = None;
+    assert_eq!(install(&mut none, &live), identity);
+    let missing = candidate(&owned_rollout().with_file_name("rollout-missing.jsonl"));
+    assert_eq!(
+        Codex::install_live(&mut continuable(), &missing, &live),
+        Err(LiveLoadError::Unavailable)
+    );
 }
 
 const INCOMPATIBLE: Result<(), LiveLoadError> =
