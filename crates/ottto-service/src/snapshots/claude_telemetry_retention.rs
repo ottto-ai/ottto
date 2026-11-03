@@ -47,8 +47,7 @@ pub(crate) fn retire_claude_telemetry(
     let Some((roster, backlog)) = index_current_since_start(SnapshotSource::ClaudeCode) else {
         return;
     };
-    // [retired_roots, retired_bytes, held_roots, read_fault]
-    let mut counts = [0_u64; 4];
+    let mut listing_fault = 0;
     let mut stems = removed
         .iter()
         .filter_map(|key| root_of(key))
@@ -57,10 +56,12 @@ pub(crate) fn retire_claude_telemetry(
     if backlog {
         match crate::claude_local_otel::telemetry_stems(support_dir) {
             Ok(all) => stems.extend(all),
-            Err(_) => counts[3] += 1,
+            Err(_) => listing_fault = 1,
         }
     }
-    if !stems.is_empty() {
+    let mut counts = if stems.is_empty() {
+        [0; 4]
+    } else {
         retire(
             support_dir,
             index,
@@ -69,15 +70,15 @@ pub(crate) fn retire_claude_telemetry(
             named,
             &roster,
             stems,
-            &mut counts,
-        );
-    }
+        )
+    };
+    counts[3] += listing_fault;
     if counts != [0; 4] {
         crate::local_resource_diagnostics::claude_telemetry_retention(counts);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `[retired_roots, retired_bytes, held_roots, read_fault]` of one run.
 fn retire(
     support_dir: &Path,
     index: &ScanIndex,
@@ -86,12 +87,11 @@ fn retire(
     named: &[String],
     roster: &g7_debt::Roster,
     stems: BTreeSet<String>,
-    counts: &mut [u64; 4],
-) {
+) -> [u64; 4] {
     let Some(protected) = protected_stems(index, scan_roots, removed, named, roster) else {
-        counts[2] += stems.len() as u64;
-        return;
+        return [0, 0, stems.len() as u64, 0];
     };
+    let mut counts = [0_u64; 4];
     // A pair written after the roster's walk began is kept.
     let fence = i64::try_from(roster.started_at_ms / 1000).unwrap_or(i64::MAX);
     let mut candidates = Vec::new();
@@ -122,6 +122,7 @@ fn retire(
     if unlinked && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
         counts[3] += 1;
     }
+    counts
 }
 
 /// The ONE protection set, as stems: every root the roster lists, the index
