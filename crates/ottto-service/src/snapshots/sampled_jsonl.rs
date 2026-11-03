@@ -79,12 +79,6 @@ impl CachedJsonlReduction {
         }
     }
     #[cfg(test)]
-    pub(in crate::snapshots) fn org_markers_for_test(
-        &self,
-    ) -> Option<&super::claude_request_identity::OrgMarkers> {
-        self.accumulator.claude_org_markers.as_deref()
-    }
-    #[cfg(test)]
     pub(in crate::snapshots) fn accumulator_for_test(&mut self) -> &mut SnapshotAccumulator {
         &mut self.accumulator
     }
