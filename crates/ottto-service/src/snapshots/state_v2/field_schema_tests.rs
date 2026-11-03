@@ -29,7 +29,7 @@ const RELEASE_LAYOUT: u32 = 5;
 /// Controls the frozen release stored beside its rows.
 const RELEASE_META: [&str; 3] = ["schema_version", "catalogue_layout", "field_presence"];
 /// A collection stops growing here even if an enum inside it has not cycled.
-const WIDTH: usize = 16;
+const WIDTH: usize = 32;
 /// Below this depth options are `None` and collections empty.
 const DEPTH: usize = 48;
 /// Shapes offered to a self-describing (`deserialize_any`) reader, in order.
@@ -654,22 +654,43 @@ fn unwritten(kind: &str) -> bool {
     kind.starts_with("raw_hold.")
         || matches!(
             kind,
-            "v1_field.repair_provenance"
-                | "file.growth_retention"
-                | "setting.upload_context_fingerprint"
-                | "v1_field.claude_desktop_census_witness"
+            "setting.upload_context_fingerprint" | "v1_field.claude_desktop_census_witness"
         )
 }
 
-/// Fields whose readers take only their own encoding: the fixture's values.
+/// Fields whose readers take only their own encoding: the fixture's values,
+/// with the account windows completed by `base`.
 const KEPT: [&str; 3] = [
     "claude_request_census",
     "claude_request_census_shadow",
     "claude_account_family_pending",
 ];
-/// A fixture index with every other stored field filled from its type.
-fn sample() -> ScanIndex {
+/// The fixture, its account windows complete, with packed member requests
+/// and an absent member.
+fn base() -> ScanIndex {
+    use crate::snapshots::{ArchivedWindows, ClaudeAccountRequestSet};
     let mut index = fixture();
+    let hashes: BTreeSet<String> = ["1", "2"].iter().map(|n| n.repeat(64)).collect();
+    for pending in index.claude_account_family_pending.values_mut() {
+        let ArchivedWindows::Resident(previous) = &mut pending.previous_windows else {
+            panic!("resident account windows");
+        };
+        for window in previous.iter_mut().chain([&mut pending.current]) {
+            let mut set = ClaudeAccountRequestSet::from_full_hashes(&hashes).unwrap();
+            set.identity_revision = Some("3".repeat(64));
+            window.census_complete = true;
+            window.members.insert("synthetic-file".into(), 2);
+            window.member_requests.insert("synthetic-file".into(), set);
+        }
+        pending
+            .confirmed_absent_members
+            .insert("synthetic-absent".into());
+    }
+    index
+}
+/// The base index with every other stored field filled from its type.
+fn sample() -> ScanIndex {
+    let mut index = base();
     let mut synth = Synth::new();
     for (name, fill) in fills() {
         if !KEPT.contains(&name) {
@@ -761,6 +782,24 @@ fn given() -> Vec<(&'static str, Vec<Given>)> {
         (
             "claude_usage_family_pending/*/contract_unproven",
             vec![g(|_| Ok(json!(true)))],
+        ),
+        (
+            "claude_usage_family_pending/*/idless_revision",
+            vec![g(|_| Ok(Json::Array(vec![json!(1); 32])))],
+        ),
+        (
+            "traversal/counts/unreadable_causes/samples",
+            vec![g(|_| {
+                let causes = (1..=8).map(|cause| {
+                    json!([
+                        {"line": cause},
+                        {"line": cause, "root": "dot_codex", "kind": "jsonl", "key": 1},
+                        {"line": cause, "root": "other_home", "kind": "jsonl_zst", "key": 2},
+                        {"line": cause, "root": "dot_codex", "kind": "other", "key": 3},
+                    ])
+                });
+                Ok(Json::Array(causes.collect()))
+            })],
         ),
         (
             "files/*/codex_applied_tier_receipt",
@@ -905,14 +944,17 @@ fn bootstrap_report() {
 }
 fn bootstrap() {
     println!("BOOTSTRAP-REPORT");
-    let mut index = fixture();
+    let mut index = base();
     let mut synth = Synth::new();
     for (name, fill) in fills() {
         println!("FIELD try {name}");
-        let mut one = fixture();
+        let mut one = base();
         let mut alone = Synth::new();
         let result = fill(&mut one, &mut alone).and_then(|()| {
-            for gap in coverage(&one).iter().filter(|g| g.starts_with(name)) {
+            for gap in coverage(&one)
+                .iter()
+                .filter(|g| g.starts_with(&format!("{name}/")))
+            {
                 println!("GAP {gap}");
             }
             let (_scratch, mut db) = stored(&one)?;
