@@ -1555,6 +1555,21 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// APFS moves an object's birth down to its mtime when the mtime is set
+/// below it: the same device and inode then report an earlier birth equal to
+/// the new mtime. That is a metadata-only change of the certified object, not
+/// a replacement; the samples, checked next, still decide its content. Linux
+/// keeps birth constant, so this never applies there.
+#[cfg(unix)]
+fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| u64::try_from(since.as_nanos()).ok());
+    birth < certified && modified == Some(birth)
+}
+
 #[cfg(unix)]
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
@@ -1655,7 +1670,10 @@ impl DurableCertificate {
         let birth = birth_unix_nanos(&metadata);
         if stamp.device != self.device
             || stamp.inode != self.inode
-            || (self.birth_nanos != 0 && birth != 0 && birth != self.birth_nanos)
+            || (self.birth_nanos != 0
+                && birth != 0
+                && birth != self.birth_nanos
+                && !birth_clamped(self.birth_nanos, birth, &metadata))
         {
             return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
@@ -3427,6 +3445,58 @@ mod tests {
                     "{change:?}: {reason:?}"
                 ),
             }
+        }
+    }
+
+    /// [behaviour] Backdating a certified file's mtime, which on APFS moves
+    /// its birth down to that mtime, keeps the grown file's Tail; a birth
+    /// earlier than the certified one is still a replacement.
+    #[cfg(unix)]
+    #[test]
+    fn durable_certificate_continues_across_a_birth_clamp_only() {
+        let f = Fixture::new(b"{\"a\":1}\n{\"b\":2}\n");
+        let checkpoint = initial(&f, 1_000);
+        let birth = birth_unix_nanos(&f.open().metadata().unwrap());
+        let certificate = checkpoint.durable_certificate(birth).unwrap();
+        f.append(b"{\"c\":3}\n");
+        let backdated = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        f.open()
+            .set_times(fs::FileTimes::new().set_modified(backdated))
+            .unwrap();
+        let now_birth = birth_unix_nanos(&f.open().metadata().unwrap());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            now_birth,
+            86_400 * 1_000_000_000,
+            "APFS clamps birth to mtime"
+        );
+        let (restored, admission) = certificate
+            .restore_grown(&mut f.open(), scope())
+            .expect("the certified object continues");
+        assert!(!admission.unchanged);
+        assert_eq!(
+            restored.samples.sealed_offset,
+            checkpoint.samples.sealed_offset
+        );
+        if now_birth != 0 {
+            let mut later = certificate.clone();
+            later.birth_nanos = now_birth - 1;
+            assert_eq!(
+                later.restore_grown(&mut f.open(), scope()).err(),
+                Some(CertificateRefusal::Changed(FullReason::Replaced)),
+                "a birth after the certified one is another object"
+            );
+            let mut unclamped = certificate.clone();
+            unclamped.birth_nanos = now_birth + 1;
+            assert_eq!(
+                unclamped.restore_grown(&mut f.open(), scope()).map(|_| ()),
+                if cfg!(target_os = "macos") {
+                    Ok(())
+                } else {
+                    Err(CertificateRefusal::Changed(FullReason::Replaced))
+                },
+                "only a birth equal to the mtime is a clamp"
+            );
         }
     }
 }

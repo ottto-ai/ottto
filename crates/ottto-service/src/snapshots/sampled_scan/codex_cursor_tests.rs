@@ -12696,10 +12696,13 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
     });
 }
 
-/// [money] active bound no record cursor preserves scope resumes and publishes.
+/// [money] An active-bound cursor keeps its file scope, resumes and publishes
+/// what a cold read does. Codex keeps its retained graph after a native
+/// publication; the restart-record store's no-record mode, which dropped it,
+/// is gone.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
-fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
+fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -12733,14 +12736,14 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
                         .retained()
                         .unwrap()
                         .peek(&local_index_key(&fixture.file(SESSION)))
-                        .is_none(),
-                    "native publication retains no optional graph"
+                        .is_some(),
+                    "a native Codex publication keeps its retained graph"
                 );
                 return;
             }
             assert!(scan.snapshots.is_empty());
         }
-        panic!("no-record cursor never completed");
+        panic!("active-bound cursor never completed");
     });
 }
 
