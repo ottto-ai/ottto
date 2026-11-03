@@ -19615,10 +19615,10 @@ mod tests {
         );
         assert_eq!(
             safe_error(
-                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
+                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveFull)
                     .context("scan local snapshots /synthetic/private/path")
             ),
-            "local state store held: state_v2_save_ceiling"
+            "local state store held: state_v2_sqlite_full"
         );
         assert_eq!(
             safe_error(&SourcesFailed(vec!["claude_code", "codex"]).into()),

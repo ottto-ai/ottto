@@ -1594,9 +1594,12 @@ pub(super) fn over_row_limit() -> BTreeSet<String> {
     BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
 }
 
-/// [format] value admission reloads the prior generation halves then retries and grows back.
+/// [money] a row over the 64 MiB decode bound refuses only that save, as
+/// DbUnavailable: no page change and no hold. The failed session reloads the
+/// committed generation before any upload or ACK, and the retried pass commits
+/// once the row fits.
 #[test]
-fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
+fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
@@ -1604,9 +1607,19 @@ fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_ba
     index
         .file_snapshot_fingerprints
         .insert("oversize".into(), over_row_limit());
+    telemetry::take_thread_event_for_test("db_unavailable_cause");
     let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-    assert_eq!(collection_page_limit(&index, 250), 125);
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+    assert_eq!(
+        telemetry::take_thread_event_for_test("db_unavailable_cause").unwrap()["at"],
+        "state_v2_value_admission"
+    );
+    assert_eq!(collection_page_limit(&index, 250), 250);
+    assert_eq!(
+        with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
+        None
+    );
+    // The refused session cannot authorize an upload or ACK.
     assert!(guard_external(
         &f.path,
         index.v2().persistence_v2.as_ref(),
@@ -1615,63 +1628,29 @@ fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_ba
     .is_err());
     let mut retry = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(retry.generation, G);
-    // Reopen cannot clear a failed-save upload fence.
-    assert!(guard_external(
-        &f.path,
-        retry.v2().persistence_v2.as_ref(),
-        retry.generation
-    )
-    .is_err());
-    // [regress] Local receipt binding must not need the upload fence: the
-    // held pass that retries the save starts here, before collection.
-    assert!(
-        crate::snapshots::ProgressRecovery::for_index(&retry, &f.path)
-            .unwrap()
-            .is_some()
-    );
-    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
-        .unwrap()
-        .unwrap();
-    recovery().unwrap();
-    assert!(save_with(&f.path, &mut retry).unwrap());
-    assert_eq!(retry.generation, G + 1);
-    assert_eq!(collection_page_limit(&retry, 250), 150);
+    assert!(!retry.file_snapshot_fingerprints.contains_key("oversize"));
     guard_external(
         &f.path,
         retry.v2().persistence_v2.as_ref(),
         retry.generation,
     )
     .unwrap();
-    for expected in [175, 200, 225, 250, 250] {
-        save_with(&f.path, &mut retry).unwrap();
-        assert_eq!(collection_page_limit(&retry, 250), expected);
-    }
-}
-
-/// [money] page one oversize holds and fences upload ack and publication.
-#[test]
-fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(collection_page_limit(&index, 1), 1);
-    index
-        .file_snapshot_fingerprints
-        .insert("oversize".into(), over_row_limit());
-    let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    let current = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(current.generation, G);
-    assert_eq!(collection_page_limit(&current, 1), 1);
-    // This is the production external boundary used before uploads and ACKs.
-    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &current);
-    assert_eq!(
-        guard().unwrap_err().downcast_ref::<Hold>(),
-        Some(&Hold::SaveOversize)
+    assert!(
+        crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
+            .unwrap()
+            .is_none()
     );
+    retry
+        .file_snapshot_fingerprints
+        .insert("fits".into(), BTreeSet::from(["0".repeat(1024)]));
+    assert!(save_with(&f.path, &mut retry).unwrap());
+    assert_eq!(retry.generation, G + 1);
+    assert_eq!(collection_page_limit(&retry, 250), 250);
+    let reloaded = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(reloaded.generation, G + 1);
     assert_eq!(
-        with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
-        Some(Hold::SaveOversize)
+        reloaded.file_snapshot_fingerprints,
+        retry.file_snapshot_fingerprints
     );
 }
 

@@ -75,9 +75,9 @@ fn quick_check_over_budget_still_opens() {
         Some(serde_json::json!(true))
     );
 
-    // The observed save-pressure hold must advise retrying, not repair.
+    // A retryable storage hold must advise retrying, not repair.
     use crate::snapshots::scan_index_health as health;
-    let error = anyhow::Error::new(Hold::SaveCeiling).context("opaque context");
+    let error = anyhow::Error::new(Hold::SaveFull).context("opaque context");
     let reason = health::state_v2_reason(&error).unwrap();
     assert_eq!(reason.code(), health::RETRY_CODE);
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
