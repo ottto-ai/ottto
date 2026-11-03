@@ -81,7 +81,7 @@ use super::{
     codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
     codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
     mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
-    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexUsageProbe,
+    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexLoginRefresh, CodexUsageProbe,
 };
 
 /// In use on this Mac: one provider read per 5 min.
@@ -999,6 +999,7 @@ fn reading_matches_login(
 pub(super) fn read_provider_and_save(
     home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     admit: impl FnOnce(Option<&SavedCodexQuota>, u64) -> bool,
 ) -> Option<Result<CodexUsageProbe, String>> {
     read_and_save_at(
@@ -1007,7 +1008,7 @@ pub(super) fn read_provider_and_save(
         home_trust,
         current_unix_seconds(),
         admit,
-        || read_codex_usage_from_provider(home, home_trust),
+        || read_codex_usage_from_provider(home, home_trust, login_refresh),
     )
 }
 
@@ -1264,6 +1265,9 @@ pub(super) struct ScheduledHome {
     pub(super) home: PathBuf,
     pub(super) trust: CodexHomeTrust,
     pub(super) ownership: CodexAccountSlotOwnershipV1,
+    /// Whether the limits probe may refresh its login: a registered account
+    /// slot's home only, never a process-only home.
+    pub(super) login_refresh: CodexLoginRefresh,
     /// The account binding of its saved reading.
     pub(super) binding: Option<String>,
     /// Latest running-process sighting in this home.
@@ -1398,12 +1402,7 @@ fn scheduled_homes_from(
             homes.push(scheduled_home(
                 support_dir,
                 running,
-                CodexHomeSlot {
-                    slot_id: "process_home".to_string(),
-                    ownership: CodexAccountSlotOwnershipV1::Managed,
-                    home: home.clone(),
-                    registered_binding: None,
-                },
+                CodexHomeSlot::process_home(home.clone()),
                 now,
             ));
         }
@@ -1426,6 +1425,7 @@ fn scheduled_home(
             .as_ref()
             .and_then(SavedCodexQuota::binding),
         process_seen_at: running.get(&slot.home).copied(),
+        login_refresh: slot.login_refresh(),
         home: slot.home,
         trust,
         ownership: slot.ownership,
@@ -1722,7 +1722,7 @@ fn scheduled_round_due(support_dir: &Path, now: u64) -> ScheduledRound {
             &sessions,
             now,
             || settings.background_quota_refresh_allowed_locked(),
-            |home| read_codex_usage_from_provider(&home.home, home.trust),
+            |home| read_codex_usage_from_provider(&home.home, home.trust, home.login_refresh),
         )
     };
     round.next_due_at = Some(
@@ -1770,7 +1770,7 @@ pub(crate) fn refresh_codex_quota_now(min_gap_seconds: u64) -> CodexExplicitRefr
         scheduled_homes(&support_dir, now),
         min_gap_seconds,
         now,
-        |home| read_codex_usage_from_provider(&home.home, home.trust),
+        |home| read_codex_usage_from_provider(&home.home, home.trust, home.login_refresh),
     )
 }
 
