@@ -2729,12 +2729,8 @@ fn decide_holders(
     let pending_files = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates::default();
 
-    {
-        let mut state = index.claude_copy_removals.clone();
-        let live = live.get_or_init(|| indexed_main_files(index));
-        state.retain_files(|file| live.contains_key(&file));
-        updates.state = Some(state);
-    }
+    // Stored removals leave only with their file (`ScanIndex::drop_file_entry`).
+    updates.state = Some(index.claude_copy_removals.clone());
 
     for wanted in wanted {
         let decided =

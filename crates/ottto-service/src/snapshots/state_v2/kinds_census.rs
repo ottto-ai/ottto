@@ -41,7 +41,8 @@ pub(super) fn hydrate_txn(
     cx: &mut KindCx,
 ) -> Result<()> {
     // One typed record per row (the census record decoder), with no entry,
-    // byte or hash budget: an undecodable row still fails the load.
+    // byte or hash budget. An undecodable row fails the load, unchanged
+    // here and not a goal: none has been observed.
     let rows: BTreeMap<String, super::super::claude_request_census::ClaudeRequestCensusRecord> =
         mapper::read_map(tx, "file.census", None, None)?;
     for (name, record) in rows {

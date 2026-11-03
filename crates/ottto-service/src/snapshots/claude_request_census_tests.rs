@@ -5,7 +5,7 @@ use super::*;
 use crate::snapshots::claude_request_census::{
     claude_census_member_status, claude_request_hash, ClaudeCensusMemberStatus,
     ClaudeRequestCensusRecord, ClaudeRequestCensusShape, CLAUDE_REQUEST_CENSUS_CANARY,
-    CLAUDE_REQUEST_CENSUS_DERIVATION, MAX_RAW_BYTES,
+    CLAUDE_REQUEST_CENSUS_DERIVATION,
 };
 use sha2::Sha256 as CanarySha256;
 
@@ -1215,30 +1215,47 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
     }
 }
 
+/// [money] The v1 reader never refuses a census for its size: a census field
+/// past the old 49 MiB raw-evidence limit (here one record padded with an
+/// unknown field) loads whole, and the CAS save reads it again.
 #[test]
-fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
+fn census_past_the_old_raw_byte_limit_loads_whole() {
     use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-hostile");
-    let path = scratch.join("oversized.json");
+    const OLD_RAW_LIMIT: usize = 49 * 1024 * 1024;
+    let scratch = crate::test_scratch::ScratchDir::new("census-past-raw-limit");
+    let path = scratch.join("large.json");
     let base = census_index_json(serde_json::json!({}));
     let mut file = std::fs::File::create(&path).unwrap();
     let json = serde_json::to_string(&base).unwrap();
-    // Write a hostile scalar without constructing it in the test process.
     let marker = "\"claude_request_census\":{}";
     let (before, after) = json.split_once(marker).expect("census field");
-    write!(file, "{before}\"claude_request_census\":\"").unwrap();
+    let small = census_record_json('b', "exact", &[2]);
+    let big = census_record_json('a', "exact", &[1]).to_string();
+    let open = big.strip_suffix('}').expect("record object");
+    write!(
+        file,
+        "{before}\"claude_request_census\":{{\"big\":{open},\"pad\":\""
+    )
+    .unwrap();
+    // Write the padding without constructing it in the test process.
     let block = [b'x'; 8192];
-    for _ in 0..=MAX_RAW_BYTES / block.len() {
+    for _ in 0..=OLD_RAW_LIMIT / block.len() {
         file.write_all(&block).unwrap();
     }
-    write!(file, "\"{after}").unwrap();
+    write!(file, "\"}},\"small\":{small}}}{after}").unwrap();
     drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("oversized evidence is optional");
+    let mut loaded = ScanIndex::load(&path).expect("a large census loads");
     assert_eq!(loaded.files.len(), 1);
-    assert!(loaded.claude_request_census_for_test().is_empty());
+    let census = loaded.claude_request_census_for_test();
+    assert_eq!(
+        census.keys_for_test(),
+        vec!["big".to_string(), "small".to_string()]
+    );
+    assert_eq!(census.get("big").unwrap().request_hashes_for_test(), &[1]);
+    assert_eq!(census.hash_total_for_test(), 2);
     loaded
         .save(&path)
-        .expect("CAS also drains oversized evidence");
+        .expect("the CAS reads the large census too");
 }
 
 /// A pre-census shape has no census fields: IgnoredAny consumes their tokens,

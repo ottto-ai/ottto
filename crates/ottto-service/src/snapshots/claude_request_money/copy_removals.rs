@@ -171,7 +171,7 @@ impl CopyRemovals {
             );
         }
         // The moved file may also be another copy's holder. Preserve that
-        // proof's indexed owner instead of letting retain_files orphan it.
+        // proof's indexed owner under the new key.
         for (_, _, groups) in &mut self.files {
             if groups.binary_search_by_key(&from, |g| g.0).is_ok() {
                 let mut merged = groups
@@ -190,20 +190,12 @@ impl CopyRemovals {
         }
     }
 
-    /// The file is no longer indexed: its removals go with it.
+    /// The file left the index: its removals go with it. The one owner is
+    /// `ScanIndex::drop_file_entry`; nothing else sweeps stored removals.
     pub(crate) fn forget(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
             self.files.remove(i);
         }
-    }
-
-    /// Keep only files `live` still indexes (every removal path included).
-    pub(crate) fn retain_files(&mut self, live: impl Fn(LocationKey) -> bool) {
-        // Whole-body-held new files are absent from the settled files map.
-        // Their debt is not absence evidence; only explicit source removal
-        // (`forget`) or a decision may clear their attempts.
-        self.files
-            .retain(|(file, attempts, _)| *attempts > 0 || live(*file));
     }
 }
 
@@ -394,17 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_removals_keep_only_indexed_files() {
-        let mut removals = CopyRemovals::default();
-        let (kept, gone) = (location_key("kept"), location_key("gone"));
-        removals.store(kept, groups(&[("h", &[1])]));
-        removals.store(gone, groups(&[("h", &[2, 3])]));
-        removals.retain_files(|file| file == kept);
-        assert!(removals.get(gone).is_empty());
-        assert_eq!(removals.get(kept)[0].1.as_ref(), &[1]);
-    }
-
-    #[test]
     fn prefix_hold_attempts_survive_restart_and_expire_on_third_pass() {
         let file = location_key("copy");
         let mut state = CopyRemovals::missing();
@@ -417,15 +398,16 @@ mod tests {
         assert!(state.is_empty());
     }
 
+    /// [money] A whole-body-held new file's hold debt survives pages and
+    /// restarts until it expires or its source is removed (`forget`).
     #[test]
-    fn held_new_file_debt_survives_intervening_page_pruning() {
+    fn held_new_file_debt_survives_pages_and_restart() {
         let file = location_key("new-held-file");
         let mut state = CopyRemovals::default();
         for pass in 1..=HOLD_PASSES {
             assert_eq!(state.advance_hold(file), pass < HOLD_PASSES);
-            // A different page sees no settled entry for the whole-body-held
-            // new file. This is not proof that its source disappeared.
-            state.retain_files(|_| false);
+            // A page without a settled entry for the whole-body-held new file
+            // does not touch its debt: no sweep exists.
             state = reload(&state);
             assert_eq!(state.pending(file), pass < HOLD_PASSES);
         }

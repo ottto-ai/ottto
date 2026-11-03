@@ -114,9 +114,6 @@ pub(crate) const CLAUDE_REQUEST_CENSUS_CANARY: (u16, &str) = (
 /// occupancy at 75% of this many request hashes. Nothing refuses, strips or
 /// tombstones a record by it; a record lives while its file is indexed.
 pub(crate) const CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE: usize = 2_097_152;
-/// The v1 index reader's optional-evidence resource guard, shared by its
-/// lexical gate (`lenient_decode`) and the raw drain below (`CensusRead`).
-pub(crate) const MAX_RAW_BYTES: usize = 49 * 1024 * 1024;
 const MAX_SHADOW_ENTRIES: usize = 65_536;
 const MAX_SHADOW_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES: usize = 4_096;
@@ -830,11 +827,10 @@ impl Serialize for ClaudeRequestCensusShadowState {
     }
 }
 
-/// Persisted readers bound raw optional evidence before Serde can buffer a
-/// scalar. Ordinary index bytes pass through unchanged. Oversized evidence is
-/// drained with constant space and replaced by null; interpretation stops at
-/// MAX_RAW_BYTES. Draining necessarily remains linear in the input bytes.
-/// The token scanner never converts a number or copies an unbounded string.
+/// Persisted readers isolate optional evidence before Serde interprets it.
+/// Ordinary index bytes pass through unchanged. The census field is read
+/// whole, whatever its size; only nesting past `MAX_EVIDENCE_DEPTH` reads as
+/// null. The token scanner never converts a number.
 pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<ScanIndex> {
     CensusRead::new(reader).decode()
 }
@@ -1070,12 +1066,7 @@ impl<R: std::io::Read> CensusRead<R> {
                 break;
             }
             if !overflow {
-                if bytes.len() == MAX_RAW_BYTES {
-                    bytes = Vec::new();
-                    overflow = true;
-                } else {
-                    bytes.push(byte);
-                }
+                bytes.push(byte);
             }
             if quoted {
                 if escaped {

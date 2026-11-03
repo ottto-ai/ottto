@@ -764,7 +764,8 @@ impl NumberState {
 fn lexical_optional_span<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<Span, Error> {
     // Match CensusRead's complete field drain, including leading/trailing
     // whitespace. Defer grammar until resource classification is final: an
-    // early bad token must not quarantine later over-limit optional evidence.
+    // early bad token must not quarantine later over-depth optional evidence.
+    // The field's size is never a resource: nothing here buffers it.
     let start = reader.stream_position()?;
     let mut len = 0u64;
     let mut depth = 0usize;
@@ -777,7 +778,6 @@ fn lexical_optional_span<R: BufRead + Seek>(reader: &mut R) -> std::result::Resu
         }
         reader.consume(1);
         len += 1;
-        resource |= len > claude_request_census::MAX_RAW_BYTES as u64;
         if quoted {
             if escaped {
                 escaped = false;

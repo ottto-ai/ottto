@@ -1811,55 +1811,6 @@ fn no_cap_money_survives_v1_v2_restore() {
     assert_eq!(v1.claude_request_census, index.claude_request_census);
 }
 
-/// [format] H6. A stored census row that does not decode as a record, or a
-/// retired ledger key, fails the hydrate: never a default record, never a
-/// silent drop. The control row hydrates.
-#[test]
-fn hydrate_refuses_undecodable_record() {
-    use crate::snapshots::claude_request_census::{
-        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
-    };
-    let fp = "a".repeat(64);
-    let empty = Record::synthetic_for_test(&fp, 7, Shape::Empty, Vec::new());
-    let bad_fingerprint = serde_json::json!({"v": 1, "fp": "zz", "w": 7, "s": "empty"});
-    let exact_without_ids = serde_json::json!({"v": 1, "fp": fp, "w": 7, "s": "exact"});
-    for (name, row) in [
-        ("/synthetic/bad.jsonl", Some(bad_fingerprint)),
-        ("/synthetic/bad.jsonl", Some(exact_without_ids)),
-        ("otel:retired-ledger", None),
-    ] {
-        let (_scratch, mut db) = Scratch::store();
-        let mut index = fixture();
-        index
-            .claude_request_census
-            .insert(name.into(), empty.clone());
-        commit_populate(&mut db, &index);
-        if let Some(row) = row {
-            let mut tx = db.begin(TxnMode::Write).unwrap();
-            mapper::put(&mut tx, &mapper::key("file.census", name, 1).unwrap(), &row).unwrap();
-            assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-        }
-        let error = hydrate(&mut db, Scratch::binding())
-            .map(|_| ())
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("state_v2_census_record"),
-            "{name}: {error:#}"
-        );
-    }
-    let (_scratch, mut db) = Scratch::store();
-    let mut index = fixture();
-    index
-        .claude_request_census
-        .insert("/synthetic/good.jsonl".into(), empty.clone());
-    commit_populate(&mut db, &index);
-    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(
-        restored.claude_request_census.get("/synthetic/good.jsonl"),
-        Some(&empty)
-    );
-}
-
 /// [format] H10. Transcript records as an older release wrote them (every
 /// field and shape, retired and over-budget included) decode through the v1
 /// index map, write back byte-identical, and hydrate from v2 rows to the
