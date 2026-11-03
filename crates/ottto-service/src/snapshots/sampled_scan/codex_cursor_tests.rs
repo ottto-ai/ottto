@@ -6599,10 +6599,18 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
     assert!(prior.accepted.contains_key(SESSION));
     assert!(prior.accepted.contains_key(SESSION_B));
     fs::remove_file(fixture.file(SESSION)).unwrap();
+    // Independent cold Full of the disk after the removal: only the sibling
+    // rollout remains, and it emits.
+    let (cold_index, cold_scan) = page(&fixture, ScanIndex::default(), None);
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+    assert!(
+        cold.snapshots.contains_key(SESSION_B),
+        "positive file-backed control"
+    );
+    assert!(!cold.snapshots.contains_key(SESSION));
     let held_key = local_index_key(&fixture.file(SESSION));
     let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
     let last = fixture.root.join("last-page.jsonl");
-    fs::write(&last, b"").unwrap();
     let new_scan = |index| {
         OwnedSourceScan::new(
             SnapshotSource::Codex,
@@ -6628,17 +6636,8 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
         ..Default::default()
     };
 
-    // Independent cold Full of the disk after the removal: only the sibling
-    // rollout (and the empty last-page file) remain, and the sibling emits.
-    let (cold_index, cold_scan) = page(&fixture, ScanIndex::default(), None);
-    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
-    assert!(
-        cold.snapshots.contains_key(SESSION_B),
-        "positive file-backed control"
-    );
-    assert!(!cold.snapshots.contains_key(SESSION));
-
     for removal_hint in [false, true] {
+        fs::write(&last, b"").unwrap();
         let mut first = new_scan(seed.clone());
         first.codex_join_prepared = true;
         first.census.ownership_incomplete_file_count = 1;
@@ -6701,8 +6700,10 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
                 "removal_hint {removal_hint}"
             );
         }
-        // The next ordinary page over the same disk: the retired owner stays
-        // held at its accepted body and every emitted sibling equals cold.
+        // The next ordinary page over the cold control's disk (the page-one
+        // file removed): the retired owner stays held at its accepted body and
+        // every emitted sibling equals cold.
+        fs::remove_file(&last).unwrap();
         let (route_index, route_scan) = page(&fixture, index, None);
         let mut route = scan_money(SnapshotSource::Codex, &route_index, &route_scan);
         route.accepted = prior.accepted.clone();
