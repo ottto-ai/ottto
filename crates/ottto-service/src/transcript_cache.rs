@@ -275,6 +275,13 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             }
         }
     }
+    /// The one exception to immutable residents: `scrub` may only shrink a state,
+    /// so its admitted charge stays an upper bound until reinsertion re-measures.
+    pub(crate) fn scrub_states(&mut self, mut scrub: impl FnMut(&mut S)) {
+        for entry in self.entries.values_mut() {
+            scrub(&mut entry.retained.state);
+        }
+    }
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
         self.entries.clear();
@@ -282,7 +289,8 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// Evict in admission victim order (oldest source, then least recently
     /// used) until the resident state fits `limit`. False when even an empty
-    /// cache does not fit. The cursor makes room for a paused job this way.
+    /// cache does not fit. The cursor makes room for a paused job or an archive
+    /// decoder this way.
     pub(crate) fn release_until(&mut self, limit: usize) -> bool {
         self.release_until_for(limit, Release::CursorReservation)
     }

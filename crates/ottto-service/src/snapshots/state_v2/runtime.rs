@@ -131,8 +131,8 @@ impl Hold {
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
     }
-    /// Content-free cause of save pressure: the charged-work ceiling or one
-    /// logical row over its value cap. Both hold as `SaveCeiling`.
+    /// Content-free cause of refused save pressure. Logical value admission
+    /// still holds as `SaveCeiling`; aggregate charged work only alarms.
     fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
         error.chain().find_map(|e| match e.to_string().as_str() {
             "state_v2_save_ceiling" => Some("charged_work"),
@@ -490,10 +490,12 @@ fn normalize_hydrated(
     let slug = source.snapshot().api_slug();
     lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
         lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-            Hold::Future.into()
+            anyhow::Error::from(Hold::Future)
         }
-        error => error.into(),
-    })
+        error => anyhow::Error::from(error),
+    })?;
+    index.clear_retired_file_size_debt();
+    Ok(())
 }
 
 fn pause(state: &mut RouteState, class: Pause) {

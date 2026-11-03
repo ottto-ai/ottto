@@ -545,9 +545,6 @@ impl HeaderInventory {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
                     if let Ok(meta) = fs::symlink_metadata(path) {
-                        if index.archive_size_refused(path, meta.len()) {
-                            continue;
-                        }
                         if let Ok(stamp) = FileStamp::capture(meta.clone()) {
                             if index.archives.get(&key).map_or(true, |old| {
                                 old.stamp
@@ -569,7 +566,6 @@ impl HeaderInventory {
                             let paced = a.header_paced();
                             let w = a.work.get_or_insert_with(Box::default);
                             if w.header.is_none() && !paced {
-                                w.header_attempts = w.header_attempts.saturating_add(1);
                                 w.header_retry_after = 0;
                                 w.reservation = ArchiveReservation::HeaderSave;
                                 index.archive_pass.dirty = true;

@@ -338,6 +338,13 @@ impl Observation {
     }
 }
 
+impl crate::heap_layout_bound::HeapLayoutBound for Stage {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // The sampler is process-global. Only this window's counters are new.
+        c.add(std::mem::size_of::<Counters>() + 2 * std::mem::size_of::<usize>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

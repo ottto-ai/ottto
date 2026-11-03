@@ -501,6 +501,23 @@ impl ContentStamp {
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
         self == other
     }
+    /// Device, inode, length and modified time, for the stored head.
+    pub(in crate::snapshots) fn parts(&self) -> (u64, u64, u64, (i64, i64)) {
+        (self.dev, self.ino, self.extent, self.modified)
+    }
+    pub(in crate::snapshots) fn from_parts(
+        dev: u64,
+        ino: u64,
+        extent: u64,
+        modified: (i64, i64),
+    ) -> Self {
+        Self {
+            dev,
+            ino,
+            extent,
+            modified,
+        }
+    }
 }
 
 impl OpenStamp {
@@ -1494,24 +1511,35 @@ fn proof_free_room(retained: &super::RetainedCache, cursor: &CursorState, charge
         .is_some()
 }
 
-/// Diagnostic counterfactual only: retain every proof/claim/root and subtract
-/// exactly the optional header entries. Never changes admission or reclaims.
-fn decoder_fits_without_headers(
-    retained: &super::RetainedCache,
-    cursor: &CursorState,
+/// The room left for retained copies beside the whole cursor state (any
+/// suspended proof included) and `charge`. `None`: even an empty retained
+/// cache would not fit.
+fn decoder_room(cursor: &CursorState, charge: usize) -> Option<usize> {
+    use crate::heap_layout_bound::bound;
+    let state = bound(cursor, state_bytes())?;
+    let floor = bound(&super::RetainedCache::default(), state_bytes())?;
+    let room = admission_budget()?
+        .checked_sub(state)?
+        .checked_sub(charge)?;
+    (room >= floor).then_some(room)
+}
+
+/// A decoder's claim, under both locks. An owed archive decode is mandatory
+/// work, so it may displace recomputable cache: header facts first, then
+/// retained copies. It never drops a suspended proof, join owner, witness or
+/// durable owed state. If the claim cannot fit, nothing is evicted.
+fn admit_decoder(
+    retained: &mut super::RetainedCache,
+    cursor: &mut CursorState,
     charge: usize,
 ) -> bool {
-    use crate::heap_layout_bound::bound;
-    (|| {
-        let headers = cursor.headers.optional_bytes().filter(|bytes| *bytes > 0)?;
-        let state = bound(cursor, state_bytes().checked_add(headers)?)?.checked_sub(headers)?;
-        let resident = bound(retained, state_bytes())?;
-        admission_budget()?
-            .checked_sub(state)?
-            .checked_sub(resident)?
-            .checked_sub(charge)
-    })()
-    .is_some()
+    if proof_free_room(retained, cursor, charge) {
+        return true;
+    }
+    reclaim_headers(cursor, true, |cursor| {
+        decoder_room(cursor, charge).is_some()
+    });
+    decoder_room(cursor, charge).is_some_and(|room| retained.release_until(room))
 }
 
 /// U1a-2a (cc rows 2–3): drop the suspended proof when the full state (the
@@ -3762,7 +3790,8 @@ impl Drop for CursorCredit {
 
 // Reserve under retained -> cursor BEFORE taking durable Stores; carry only
 // the owner across I/O. Drop Stores before release, including unwind/early exits.
-// Never account from encode/write. Free room only: no primary/proof eviction.
+// Never account from encode/write. May reclaim headers and retained copies when
+// the claim fits (`admit_decoder`): no primary floor, proof or owed-state eviction.
 static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
@@ -4221,25 +4250,15 @@ impl SharedCache {
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
         self.cursor_claim(charge, false)
     }
-    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
+    fn cursor_claim(self: &Arc<Self>, charge: usize, decoder: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
-        let mut header_occupancy_refused = false;
         let claimed = self
             .with_cursor(|cursor| {
-                let admitted = if free_only {
+                let admitted = if decoder {
+                    // The real primary tail floor stays free beside the decoder.
                     charge
                         .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
-                        .is_some_and(|with_floor| {
-                            // Decoders use free room only: preserve the real primary
-                            // tail floor without evicting any resident state. Header
-                            // reclamation belongs to feasible progress/retained admission.
-                            let admitted = proof_free_room(&retained, cursor, with_floor);
-                            if !admitted {
-                                header_occupancy_refused =
-                                    decoder_fits_without_headers(&retained, cursor, with_floor);
-                            }
-                            admitted
-                        })
+                        .is_some_and(|with_floor| admit_decoder(&mut retained, cursor, with_floor))
                 } else {
                     admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
                 };
@@ -4251,13 +4270,6 @@ impl SharedCache {
             })
             .flatten();
         drop(retained);
-        // #799 logging may perform I/O: the retained and cursor guards have
-        // both ended. A refusal still creates no credit and evicts nothing.
-        if header_occupancy_refused {
-            crate::local_resource_diagnostics::codex_zst_refused(
-                crate::local_resource_diagnostics::CodexZstCause::DecoderRefusedHeaderOccupancy,
-            );
-        }
         let claimed = claimed?;
         Some(CursorCredit {
             cache: Arc::clone(self),

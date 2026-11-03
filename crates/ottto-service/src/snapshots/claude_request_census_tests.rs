@@ -77,10 +77,8 @@ fn census_write(root: &Path, name: &str, lines: &[String]) {
 }
 
 /// The canary corpus: every shape class the parser can give a
-/// Claude record, under a fixed name each. Not covered (see the PR): the
-/// 65,536 response-record cap (it drops through the same `note_dropped_usage`
-/// as the invalid `forkedFrom` row here) and multi-item files (a Claude file
-/// yields at most one item).
+/// Claude record, under a fixed name each. Not covered (see the PR):
+/// multi-item files (a Claude file yields at most one item).
 fn write_census_corpus(root: &Path) {
     census_write(
         root,

@@ -348,6 +348,11 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
     );
 
     let mut env = Dictionary::new();
+    // libmalloc reads this at process start, before daemon initialization.
+    env.insert(
+        "MallocLargeCache".to_string(),
+        Value::String("0".to_string()),
+    );
     env.insert(
         OTTTO_SOCKET_ENV.to_string(),
         Value::String(config.socket_path.display().to_string()),
@@ -441,9 +446,16 @@ mod tests {
     use super::*;
     use ottto_core::OTTTO_SERVICE_BINARY_NAME;
 
+    /// [behaviour] Generated service jobs disable libmalloc large-cache retention.
     #[test]
     fn renders_valid_launch_agent_plist() {
         let config = config();
+        assert_eq!(
+            plist_environment(&config)
+                .get("MallocLargeCache")
+                .and_then(Value::as_string),
+            Some("0")
+        );
         let bytes = render_launch_agent_plist(&config).expect("plist should render");
         let parsed = Value::from_reader_xml(bytes.as_slice()).expect("plist should parse");
         let root = parsed

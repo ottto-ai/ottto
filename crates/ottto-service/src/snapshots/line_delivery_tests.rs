@@ -937,7 +937,7 @@ fn candidates(index: &ScanIndex) -> Vec<PathBuf> {
 /// existing decisions; the rescued old file and the young file are selected
 /// exactly as before, and counter state is no gate input.
 #[test]
-fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
+fn walk_gate_counts_age_and_admits_large_files() {
     let root = Root::new("ld-walk-gate");
     let project = root.projects().join("p");
     fs::create_dir_all(&project).unwrap();
@@ -949,7 +949,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
     set_old(&file("rescued"));
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .set_len(former_file_cap(SnapshotSource::ClaudeCode) + 1)
         .unwrap();
     let mut prepared = ScanIndex::default();
     rescue(&mut prepared.files, &file("rescued"));
@@ -988,17 +988,17 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
     let (first, counted) = walk();
     let (second, recounted) = walk();
     assert_eq!(first, second, "counter state is no gate input");
-    let mut selected = vec![file("rescued"), file("young")];
+    let mut selected = vec![file("big"), file("rescued"), file("young")];
     selected.sort();
-    assert_eq!(first, (selected, 3, 1));
-    assert_eq!(counted, json!({"age": 1, "size": 1}));
+    assert_eq!(first, (selected, 3, 0));
+    assert_eq!(counted, json!({"age": 1}));
     assert_eq!(recounted, counted);
 }
 
-/// Gate 2 (Codex retained-roster refresh): the same conditions for files
+/// [regress] Gate 2 (Codex retained-roster refresh): the same conditions for files
 /// appearing in an already-walked directory.
 #[test]
-fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
+fn roster_gate_counts_age_and_admits_large_files() {
     let root = Root::new("ld-roster-gate");
     let day = root.projects().join("2026/10/01");
     fs::create_dir_all(&day).unwrap();
@@ -1030,7 +1030,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     set_old(&file("rescued"));
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_CODEX_JSONL_FILE_BYTES + 1)
+        .set_len(former_file_cap(SnapshotSource::Codex) + 1)
         .unwrap();
     rescue(&mut index.files, &file("rescued"));
     let refresh = || {
@@ -1053,10 +1053,10 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     let (first, counted) = refresh();
     let (second, recounted) = refresh();
     assert_eq!(first, second, "counter state is no gate input");
-    let mut selected = vec![file("first"), file("rescued"), file("young")];
+    let mut selected = vec![file("big"), file("first"), file("rescued"), file("young")];
     selected.sort();
-    assert_eq!(first, (selected, 4, 1));
-    assert_eq!(counted, json!({"age": 1, "size": 1}));
+    assert_eq!(first, (selected, 4, 0));
+    assert_eq!(counted, json!({"age": 1}));
     assert_eq!(recounted, counted);
 }
 
@@ -1104,8 +1104,7 @@ pub(in crate::snapshots) fn next_walk(
 }
 
 /// [behaviour] Gate 1 with a 7-day request: an aged withheld key is still discovered and
-/// observed, an oversized one is observed, kept unread and counted, and once
-/// the holds resolve the ordinary window and size skips apply again.
+/// observed, including large files. After holds resolve the ordinary window applies.
 #[test]
 fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
     let root = Root::new("ld-withheld-walk");
@@ -1118,7 +1117,7 @@ fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
     }
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .set_len(former_file_cap(SnapshotSource::ClaudeCode) + 1)
         .unwrap();
     let mut held = ScanIndex::default();
     withhold(&mut held, &file("held"));
@@ -1155,22 +1154,22 @@ fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
     assert_eq!(
         walk(&held),
         (
-            vec![file("held")],
+            vec![file("big"), file("held")],
             vec!["held", "big"],
-            1,
-            json!({"age": 1, "size": 1, "withheld_oversized": 1})
+            0,
+            json!({"age": 1})
         )
     );
     assert_eq!(
         walk(&resolved),
-        (Vec::new(), vec!["big"], 1, json!({"age": 2, "size": 1}))
+        (vec![file("big")], vec!["big"], 0, json!({"age": 2}))
     );
 }
 
 /// [behaviour] Gates 3 and 4 (candidate revalidation, opened-object recheck): an aged
 /// withheld key opens and stays observed; unheld, the same file is removed
 /// from the census as out of window. An oversized withheld key is observed,
-/// never opened, and counted.
+/// opened without a whole-file size refusal.
 #[test]
 fn candidate_and_open_gates_keep_withheld_account_keys() {
     let root = Root::new("ld-withheld-open");
@@ -1180,7 +1179,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
     let big = root.file("big");
     fs::File::create(&big)
         .unwrap()
-        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .set_len(former_file_cap(SnapshotSource::ClaudeCode) + 1)
         .unwrap();
     let census_at = rfc3339_unix_seconds(NOW);
     assert!(census_at.is_some(), "the window is applied");
@@ -1243,16 +1242,16 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
     );
     assert_eq!(
         gates(&big, &held(&big)),
-        (None, true, false, json!({"withheld_oversized": 1}))
+        (Some(true), true, false, Value::Null)
     );
     assert_eq!(
         gates(&big, &BTreeMap::new()),
-        (None, true, false, Value::Null)
+        (Some(true), true, false, Value::Null)
     );
 }
 
 /// [behaviour] Sleep/restart retention is source-neutral: only real positive growth
-/// gains an exemption, including growth beyond the size cap (observed only).
+/// gains an age exemption, including growth beyond the former file cap.
 /// Gate counters are decisions, and overlapping owed arms count only once.
 #[test]
 fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
@@ -1290,7 +1289,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 > index.files[&local_index_key(&path("held"))].size_bytes,
             "reverted committed entry still owes growth"
         );
-        let cap = max_jsonl_file_bytes(source);
+        let cap = former_file_cap(source);
         File::create(path("big")).unwrap().set_len(cap + 1).unwrap();
         set_old(&path("big"));
         let mut big = super::tests::manifest_index_entry(None);
@@ -1306,7 +1305,10 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         {
             advance_bounded_directory_traversal(source, &mut index, 7, None, None);
         }
-        assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
+        assert_eq!(
+            candidates(&index),
+            vec![path("big"), path("grown"), path("held")]
+        );
         assert_eq!(
             index.traversal.as_ref().unwrap().observed_index_keys,
             std::collections::BTreeSet::from(
@@ -1315,10 +1317,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         );
         let counts = discovery_page(source.api_slug());
         assert_eq!(counts["discovery_retained"], json!({"grown": 3}));
-        assert_eq!(
-            counts["line_delivery_unselected"],
-            json!({"age": 2, "size": 1})
-        );
+        assert_eq!(counts["line_delivery_unselected"], json!({"age": 2}));
         assert!(reconcile_missing_index_entries_with_limit(
             &mut index,
             usize::MAX
