@@ -1062,24 +1062,12 @@ fn classify_follows_the_session_rulings() {
         identity::classify(&evidence, &facts("req_dup", at, MarkerVerdict::None)),
         RequestIdentity::Refused(Refusal::ConflictingDuplicate)
     );
-    // Login-only telemetry joins a trusted marker org only when complete
-    // telemetry already pairs that login with it.
+    // Login-only telemetry keeps its login and never borrows a marker org,
+    // even one complete telemetry already pairs with that login.
     assert_eq!(
         identity::classify(
             &evidence,
             &facts("req_login", at, MarkerVerdict::Trusted(&org_d))
-        ),
-        RequestIdentity::Tagged(AuthorityKey {
-            login: login.clone(),
-            org: Some(org_d.clone()),
-            basis: identity::TELEMETRY_LOGIN,
-            account_source: None,
-        })
-    );
-    assert_eq!(
-        identity::classify(
-            &evidence,
-            &facts("req_login", at, MarkerVerdict::Trusted(&org_e))
         ),
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
@@ -2544,7 +2532,7 @@ fn transcript_bases_need_the_original_clock() {
 }
 
 #[test]
-fn only_intact_rows_establish_login_org_membership() {
+fn forged_rows_refuse_and_login_only_telemetry_stays_org_less() {
     let org = "d".repeat(64);
     let mut forged = complete_api_row(ROOT, "req_forged", 1, 10, 1, 0);
     forged.request_identity = Some(org_identity(&org));
@@ -2558,7 +2546,6 @@ fn only_intact_rows_establish_login_org_membership() {
         ],
     );
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new());
-    assert!(evidence.memberships.is_empty());
     assert_eq!(
         identity::classify(
             &evidence,

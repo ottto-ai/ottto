@@ -1687,20 +1687,42 @@ fn sticky_current_bucket_completes_one_shared_row_before_their_union() {
 #[test]
 fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
     let (original, proof) = sticky_session(1);
-    let mut first = original.clone();
-    let mut accepted = identity::AcceptedBuckets::for_test();
-    sticky_apply(&mut first, &proof, &accepted).unwrap();
-    accepted.record(&serde_json::to_value(&first).unwrap());
-    let accepted: identity::AcceptedBuckets =
-        identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&accepted).unwrap());
-    for retag in [false, true] {
+    let accept = |proof: &[Contribution]| {
+        let mut first = original.clone();
+        let mut accepted = identity::AcceptedBuckets::for_test();
+        sticky_apply(&mut first, proof, &accepted).unwrap();
+        accepted.record(&serde_json::to_value(&first).unwrap());
+        identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&accepted).unwrap())
+    };
+    // Share 1's login with or without an org, on login-only telemetry.
+    let login_only = |org: Option<String>| {
+        RequestIdentity::Tagged(AuthorityKey {
+            login: Some(format!("{:064x}", 4)),
+            org,
+            basis: identity::TELEMETRY_LOGIN,
+            account_source: None,
+        })
+    };
+    let org_b = format!("{:064x}", 36);
+    let sends_org_less = |item: &SnapshotItem| {
+        item.request_evidence.iter().any(|evidence| {
+            evidence.identity_basis == identity::TELEMETRY_LOGIN
+                && evidence.provider_workspace_hash.is_none()
+        })
+    };
+    // (accepted share 1, today's share 1). Last: an accepted login-only share
+    // that carried an org now arrives with none; it stays frozen.
+    for (was, now) in [
+        (proof[1].identity.clone(), RequestIdentity::Missing),
+        (proof[1].identity.clone(), login_key(D64)),
+        (login_only(Some(org_b.clone())), login_only(None)),
+    ] {
+        let mut sent = proof.clone();
+        sent[1].identity = was;
+        let accepted = accept(&sent);
         let mut next = original.clone();
-        let mut changed = proof.clone();
-        changed[1].identity = if retag {
-            login_key(D64)
-        } else {
-            RequestIdentity::Missing
-        };
+        let mut changed = sent.clone();
+        changed[1].identity = now;
         identity::take_identity_counts();
         sticky_apply(&mut next, &changed, &accepted).unwrap();
         assert_eq!(next.request_identity_refusals, 1);
@@ -1726,6 +1748,7 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
         assert!(parts
             .iter()
             .all(|part| part.account_identifier_hash.as_deref() != Some(D64)));
+        assert!(!sends_org_less(&next));
         let counts =
             serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
         assert_eq!(counts["accepted_share_changed"], 1);
@@ -1740,6 +1763,7 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
         );
     }
     let mut unchanged = original.clone();
+    let accepted = accept(&proof);
     identity::take_identity_counts();
     sticky_apply(&mut unchanged, &proof, &accepted).unwrap();
     assert_eq!(unchanged.request_identity_refusals, 0);
@@ -1747,6 +1771,23 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
         serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
     assert_eq!(counts["accepted_share_changed"], 0);
     assert_eq!(counts["retained_buckets"], 1);
+    // Option (ii): the server holds each row's proof, so the org-less share
+    // is fresh proof, sent tagged and counted, never frozen.
+    let (original, mut proof) = retained_session(2);
+    proof[1].identity = login_only(Some(org_b));
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+    proof[1].identity = login_only(None);
+    identity::take_identity_counts();
+    let mut next = original.clone();
+    sticky_apply(&mut next, &proof, &state).unwrap();
+    assert_eq!(next.request_identity_refusals, 0);
+    assert!(sends_org_less(&next));
+    let counts = retained_counts();
+    assert_eq!(retained_count(&counts, "accepted_share_changed"), 1);
+    sticky_assert_reconciled(&next);
 }
 
 #[test]
