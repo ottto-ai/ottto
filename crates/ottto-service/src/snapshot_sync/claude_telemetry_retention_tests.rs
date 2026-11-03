@@ -241,7 +241,17 @@ fn telemetry_retention_positive_control_cold_restart_and_append() {
         );
         assert_equivalent(&before, &read(ScanIndex::default()));
 
+        // A restart rereads the survivor once its telemetry changes (a side
+        // call with no transcript line); an unchanged survivor emits nothing.
         let prior = c.reload(&mut warm.index);
+        c.evidence(
+            &[
+                tagged_api("r1", 10, Some(&a)),
+                tagged_api("r2", 20, Some(&b)),
+                tagged_api("side", 4, Some(&b)),
+            ],
+            &[trace("r1", ""), trace("r2", ""), trace("side", "")],
+        );
         let restarted = read(prior.clone());
         restore();
         assert_equivalent(&read(prior.clone()), &restarted);
@@ -252,9 +262,15 @@ fn telemetry_retention_positive_control_cold_restart_and_append() {
             &[
                 tagged_api("r1", 10, Some(&a)),
                 tagged_api("r2", 20, Some(&b)),
+                tagged_api("side", 4, Some(&b)),
                 tagged_api("r3", 30, Some(&a)),
             ],
-            &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
+            &[
+                trace("r1", ""),
+                trace("r2", ""),
+                trace("side", ""),
+                trace("r3", ""),
+            ],
         );
         let appended = read(prior.clone());
         restore();
