@@ -46,7 +46,7 @@ pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// Same bound the earlier holder walk used. A census walk that hits it cannot
 /// decide: the affected sessions or families are held, never counted.
-const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
+pub(in crate::snapshots) const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 /// Revision 3 keeps a listed family, and
 /// every family while the list pauses adoption, on ordinary (pre-`e2`)
@@ -2317,7 +2317,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
 
 /// What a census record proves about its file now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Evidence {
+pub(in crate::snapshots) enum Evidence {
     /// It lists the requests the file holds.
     Current,
     /// The file changed since that scan and this traversal still queues it:
@@ -2338,7 +2338,7 @@ enum Evidence {
 /// modified since its recorded read is Stale until read again.
 /// A queued size change also waits, including changes within one mtime
 /// second (PR C). Unchanged held scans remain evidence, never upload proof.
-fn scan_evidence(
+pub(in crate::snapshots) fn scan_evidence(
     index: &ScanIndex,
     key: &str,
     record: &super::super::claude_request_census::ClaudeRequestCensusRecord,

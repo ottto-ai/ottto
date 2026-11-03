@@ -8660,6 +8660,7 @@ fn finish_sync_source(
                 }
             }
         };
+    let upload_completed = telemetry_retention_follows(&upload_result);
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -9080,7 +9081,7 @@ fn finish_sync_source(
         .as_deref()
         .zip(telemetry_removed.as_ref())
         .zip(telemetry_named.as_deref())
-        .filter(|_| upload_fully_settled)
+        .filter(|_| upload_completed && upload_fully_settled)
     {
         crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
             support_dir,
@@ -9451,6 +9452,12 @@ fn prepare_upload_progress_for_cycle_with_reoffer(
 
 fn reconciliation_agent_status(collection: &AgentStatusCollection) -> &AgentStatusSnapshot {
     &collection.source_health_snapshot
+}
+
+/// Telemetry retention follows only a completed upload: a rejected,
+/// deferred, shed, disabled or failed page drops it even when it settles.
+fn telemetry_retention_follows(upload: &Result<ResumableUploadResult>) -> bool {
+    matches!(upload, Ok(ResumableUploadResult::Completed))
 }
 
 fn claude_evidence_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {

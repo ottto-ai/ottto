@@ -178,8 +178,9 @@ mean zero. Nonzero values remain exact, with no separate diagnostic record.
 On the same line, `claude_telemetry_retired_roots` and
 `claude_telemetry_retired_bytes` count Claude telemetry pairs deleted because
 every transcript of their session is gone, `claude_telemetry_held_roots` the
-candidate pairs kept (a live reader, a copy of their requests, a write after
-the walk began, a change while deleting, or no completed census traversal),
+candidate pairs kept (a live reader, a copy of their requests, a listed
+transcript not proven read at its listed revision, a write after the walk
+began, a change while deleting, or no completed census traversal),
 and `claude_telemetry_read_fault` the pairs kept because a member could not be
 read cleanly or unlinked.
 

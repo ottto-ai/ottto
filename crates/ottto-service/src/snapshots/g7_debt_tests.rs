@@ -396,7 +396,7 @@ fn authority_terminal_debt_has_its_own_label_until_settled() {
     f.close();
 }
 
-/// The retirement roster exists only for a complete walk begun in this
+/// [behaviour] The retirement roster exists only for a complete walk begun in this
 /// process with no walk issue (symlink, unreadable, too wide, disappeared, or
 /// no Tail route).
 #[test]

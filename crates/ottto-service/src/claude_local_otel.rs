@@ -1622,6 +1622,12 @@ pub(crate) fn telemetry_stems(support_dir: &Path) -> std::io::Result<BTreeSet<St
     Ok(stems)
 }
 
+/// The one digest naming a session's telemetry members.
+pub(crate) fn telemetry_stem(session_id: &str) -> String {
+    format!("{:x}", Sha256::digest(session_id.as_bytes()))
+}
+
+/// The one layout of a stem's (API, trace) members.
 fn telemetry_member_paths(support_dir: &Path, stem: &str) -> [PathBuf; 2] {
     let name = format!("{stem}.jsonl");
     [
@@ -1665,7 +1671,7 @@ pub(crate) fn read_telemetry_pair(
     let session_id = serde_json::from_str::<Value>(&first)
         .ok()
         .and_then(|row| row.get("session_id")?.as_str().map(str::to_owned))
-        .filter(|id| format!("{:x}", Sha256::digest(id.as_bytes())) == stem)
+        .filter(|id| telemetry_stem(id) == stem)
         .ok_or(())?;
     let mut request_ids = BTreeSet::new();
     let mut observed = Vec::new();
@@ -2158,17 +2164,13 @@ fn append_evidence_bytes(writer: &mut impl Write, encoded: &[u8]) -> Result<()> 
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [api, _] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    api
 }
 
 fn trace_evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(TRACE_STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [_, trace] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    trace
 }
 
 fn append_lock() -> &'static Mutex<()> {

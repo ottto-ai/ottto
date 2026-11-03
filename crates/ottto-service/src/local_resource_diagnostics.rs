@@ -511,10 +511,23 @@ fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 6]) -> T) -> T {
 pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
     add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0]);
 }
-/// One retention run: `[retired_roots, retired_bytes, held_roots, read_fault]`.
-pub(crate) fn claude_telemetry_retention(counts: [u64; 4]) {
-    let [roots, bytes, held, fault] = counts;
-    add_claude_sidecar_counts([0, 0, roots, bytes, held, fault]);
+/// One Claude telemetry retention run.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct ClaudeTelemetryRetention {
+    pub(crate) retired_roots: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) held_roots: u64,
+    pub(crate) read_fault: u64,
+}
+pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
+    add_claude_sidecar_counts([
+        0,
+        0,
+        run.retired_roots,
+        run.retired_bytes,
+        run.held_roots,
+        run.read_fault,
+    ]);
 }
 fn add_claude_sidecar_counts(deltas: [u64; 6]) {
     with_claude_sidecar_reparse(|counts| {

@@ -789,3 +789,29 @@ pub(crate) fn pause_adoption(support: &Path) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }
+
+/// Telemetry retention dependency row: an account hold on `key`.
+pub(crate) fn hold_claude_account_for_test(index: &mut ScanIndex, key: &str) {
+    index
+        .claude_account_deferred_holds
+        .insert(key.to_owned(), "held-source".to_owned());
+}
+
+/// Telemetry retention dependency row: a Tail head for `key` (no pages) on
+/// `index`'s live route, committed by an ordinary save. True when the
+/// committed heads then hold it.
+pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> bool {
+    let route = route_of(index).expect("a routed index");
+    state_v2::stage_tail(
+        &route,
+        key,
+        state_v2::StagedFile {
+            revision: 1,
+            head: b"head".to_vec(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    index.save(&route).unwrap();
+    state_v2::tail_head_keys(index).unwrap().contains(key)
+}

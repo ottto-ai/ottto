@@ -3,19 +3,22 @@
 //! the session's own transcripts, for transcripts that copied its requests,
 //! and for state that still names its root; each of those keeps the pair.
 //!
-//! Runs after a successful selected save whose upload fully settled, only
+//! Runs after a successful selected save whose upload completed and fully
+//! settled (a deferred, rejected, shed or partial upload drops the run), only
 //! while the last root walk began in this process and listed every root with
 //! no walk issue. Candidates: the roots whose indexed members this pass
 //! retired, plus every stored pair once per process (the backlog). Nothing is
 //! persisted: a crash between the two unlinks leaves one member, which the
 //! next run deletes.
 use super::claude_request_census::held_candidates;
+use super::claude_request_money::e2::{scan_evidence, Evidence, SIDE_CALL_DEADLINE};
 use super::money_freshness::index_current_since_start;
 use super::*;
-use sha2::{Digest, Sha256};
+use crate::claude_local_otel::telemetry_stem;
+use crate::local_resource_diagnostics::ClaudeTelemetryRetention as Counts;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Keys this pass removed from the index (the retirer's work).
 pub(crate) fn removed_index_keys(before: &ScanIndex, after: &ScanIndex) -> BTreeSet<String> {
@@ -25,10 +28,6 @@ pub(crate) fn removed_index_keys(before: &ScanIndex, after: &ScanIndex) -> BTree
         .filter(|key| !after.files.contains_key(*key))
         .cloned()
         .collect()
-}
-
-fn stem(root: &str) -> String {
-    format!("{:x}", Sha256::digest(root.as_bytes()))
 }
 
 fn root_of(key: &str) -> Option<&str> {
@@ -51,7 +50,7 @@ pub(crate) fn retire_claude_telemetry(
     let mut stems = removed
         .iter()
         .filter_map(|key| root_of(key))
-        .map(stem)
+        .map(telemetry_stem)
         .collect::<BTreeSet<_>>();
     if backlog {
         match crate::claude_local_otel::telemetry_stems(support_dir) {
@@ -59,8 +58,8 @@ pub(crate) fn retire_claude_telemetry(
             Err(_) => listing_fault = 1,
         }
     }
-    let mut counts = if stems.is_empty() {
-        [0; 4]
+    let mut run = if stems.is_empty() {
+        Counts::default()
     } else {
         retire(
             support_dir,
@@ -72,13 +71,13 @@ pub(crate) fn retire_claude_telemetry(
             stems,
         )
     };
-    counts[3] += listing_fault;
-    if counts != [0; 4] {
-        crate::local_resource_diagnostics::claude_telemetry_retention(counts);
+    run.read_fault += listing_fault;
+    if run != Counts::default() {
+        crate::local_resource_diagnostics::claude_telemetry_retention(run);
     }
 }
 
-/// `[retired_roots, retired_bytes, held_roots, read_fault]` of one run.
+/// One run over `stems`: every stem is retired, held or a read fault.
 fn retire(
     support_dir: &Path,
     index: &ScanIndex,
@@ -87,18 +86,23 @@ fn retire(
     named: &[String],
     roster: &g7_debt::Roster,
     stems: BTreeSet<String>,
-) -> [u64; 4] {
+) -> Counts {
+    let mut run = Counts::default();
     let Some(protected) = protected_stems(index, scan_roots, removed, named, roster) else {
-        return [0, 0, stems.len() as u64, 0];
+        run.held_roots = stems.len() as u64;
+        return run;
     };
-    let mut counts = [0_u64; 4];
     // A pair written after the roster's walk began is kept.
     let fence = i64::try_from(roster.started_at_ms / 1000).unwrap_or(i64::MAX);
     let mut candidates = Vec::new();
-    for stem in stems.into_iter().filter(|stem| !protected.contains(stem)) {
+    for stem in stems {
+        if protected.contains(&stem) {
+            run.held_roots += 1;
+            continue;
+        }
         match crate::claude_local_otel::read_telemetry_pair(support_dir, &stem) {
-            Err(()) => counts[3] += 1,
-            Ok(pair) if pair.last_write >= fence => counts[2] += 1,
+            Err(()) => run.read_fault += 1,
+            Ok(pair) if pair.last_write >= fence => run.held_roots += 1,
             Ok(pair) => candidates.push((stem, pair)),
         }
     }
@@ -106,25 +110,24 @@ fn retire(
     let mut unlinked = false;
     for ((stem, pair), copied) in candidates.iter().zip(copied) {
         if copied {
-            counts[2] += 1;
+            run.held_roots += 1;
             continue;
         }
         match crate::claude_local_otel::unlink_telemetry_pair(support_dir, stem, pair) {
             Ok(true) => {
-                counts[0] += 1;
-                counts[1] += pair.bytes;
+                run.retired_roots += 1;
+                run.retired_bytes += pair.bytes;
                 unlinked = true;
             }
-            Ok(false) => counts[2] += 1,
-            Err(_) => counts[3] += 1,
+            Ok(false) => run.held_roots += 1,
+            Err(_) => run.read_fault += 1,
         }
     }
     if unlinked && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
-        counts[3] += 1;
+        run.read_fault += 1;
     }
-    counts
+    run
 }
-
 /// The ONE protection set, as stems: every root the roster lists, the index
 /// keys, the census, pending and witness families (legacy owners included),
 /// account holds, Tail heads and named parents. A removed key is protected
@@ -163,20 +166,26 @@ fn protected_stems(
             roots.extend(root_of(key));
         }
     }
-    Some(roots.into_iter().map(stem).collect())
+    Some(roots.into_iter().map(telemetry_stem).collect())
 }
 
 /// One census traversal (subagents included) for every candidate: a record
 /// holding one of a candidate's request ids is a copy and keeps it. A listed
-/// file with no record for its listed revision is unknown; it keeps every
-/// candidate whose first request is not newer than the file (a copy is written
-/// after the requests it copies). An unfinished traversal keeps them all.
+/// file proves which requests it holds only through its census record of the
+/// listed revision (same mtime) that the `e2` source verification calls
+/// current; any other listed file (no record, stale, queued, lossy, no
+/// mtime) is unknown and keeps every candidate whose first request is not
+/// newer than the file (a copy is written after the requests it copies). An
+/// unfinished traversal keeps them all.
 fn copied_candidates(
     index: &ScanIndex,
     removed: &BTreeSet<String>,
     roster: &g7_debt::Roster,
     candidates: &[(String, crate::claude_local_otel::TelemetryPair)],
 ) -> Vec<bool> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let census = &index.claude_request_census;
     let mut wanted = BTreeMap::<u64, Vec<usize>>::new();
     for (at, (_, pair)) in candidates.iter().enumerate() {
@@ -190,7 +199,7 @@ fn copied_candidates(
     let union = wanted.keys().copied().collect::<Vec<_>>();
     let mut copied = vec![false; candidates.len()];
     let walked =
-        census.walk_transcript_holders(Instant::now() + Duration::from_secs(60), |_, _, record| {
+        census.walk_transcript_holders(Instant::now() + SIDE_CALL_DEADLINE, |_, _, record| {
             for hash in held_candidates(record, &union) {
                 for &at in &wanted[&hash] {
                     copied[at] = true;
@@ -200,19 +209,15 @@ fn copied_candidates(
     if walked.is_none() {
         return vec![true; candidates.len()];
     }
-    // The listed revision's record lists every request id the file held.
     let unknown = roster
         .listed
         .iter()
         .filter(|(key, _)| !removed.contains(*key) && root_of(key).is_some())
-        .filter(|(key, mtime)| {
+        .filter(|(key, listed)| {
             !census.get(key).is_some_and(|record| {
-                record.proves_scan()
-                    && !record.is_lossy()
-                    && record
-                        .modified()
-                        .zip(**mtime)
-                        .is_some_and(|(read, listed)| read >= listed)
+                !record.is_lossy()
+                    && listed.is_some_and(|listed| record.modified() == Some(listed))
+                    && scan_evidence(index, key, record) == Evidence::Current
             })
         })
         .map(|(_, mtime)| mtime.unwrap_or(u64::MAX))

@@ -475,7 +475,6 @@ impl Walk {
 }
 
 /// Every file a complete root walk listed, and when that walk began.
-#[derive(Debug)]
 pub(crate) struct Roster {
     pub(crate) started_at_ms: u64,
     pub(crate) listed: BTreeMap<String, Option<u64>>,
