@@ -3323,12 +3323,7 @@ fn org_marker_address_is_stored_only_as_its_keyed_digest() {
     let scratch = Scratch::new("org-keyed");
     let path = scratch.write("t.jsonl", &claude_org_lines());
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        line_cap(),
-    )
-    .unwrap();
+    let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
     let digest = crate::claude_status_coverage::address_digest(CANARY_EMAIL).unwrap();
     let keyed: Vec<u8> = (0..digest.len())
         .step_by(2)
