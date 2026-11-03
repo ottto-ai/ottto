@@ -2511,9 +2511,10 @@ fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
 /// conflict with a challenge is recorded on a production-shaped Claude body.
 /// While the answer is owed (the ledger's challenge mirrored into the scan
 /// index, as each prepare does), no read continues from stored state: (a) a
-/// 0-new-byte late-evidence selection and (b) an append both read a native
-/// Full in every arm, with no saved-head hit, equal to the cold Full, and
-/// that Full carries the answer.
+/// 0-new-byte late-evidence selection and (b) an append read a native Full,
+/// with no saved-head hit, equal to the cold Full, and that Full carries the
+/// answer. The append's Full holds the route's six-hour growth claim, so a
+/// second owner on the same route defers.
 #[test]
 fn conflict_then_append() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2615,16 +2616,23 @@ fn conflict_then_append() {
         );
         let (mut pages, disk_hits) = arms(&c, &warm, &mut disk, &prior);
         assert_eq!(pages[0].modes, (1, 0, 0), "the RAM arm reads Full");
-        // A new owner's native read of the grown file may be cap-funded
-        // (unsampled); either way it is no Tail and the bodies below match.
-        assert_eq!(
-            pages[2].modes.1 + pages[2].modes.2,
-            0,
-            "the restored arm reads natively"
-        );
         assert_eq!(disk_hits, 0, "an owed answer never continues the head");
+        // A grown file read Full takes the route's durable six-hour growth
+        // claim. The RAM arm took it on the shared route, so the new owner's
+        // growth Full of the same key defers and sends nothing.
+        assert_eq!(pages[2].modes, (0, 0, 0), "the new owner defers");
         finish_claude_pages(&c, &mut pages);
-        compare_claude_uploads(&pages);
-        answers(&pages[2], &progress, &challenge);
+        assert!(pages[2]
+            .scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != ROOT));
+        let (a, wire_a, _) = upload(&pages[0].scan.snapshots, &mut e2_progress(), ack);
+        let (b, wire_b, _) = upload(&pages[1].scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(b.unwrap(), ResumableUploadResult::Completed);
+        assert!(!wire_a.is_empty(), "fixture must reach real upload");
+        assert_eq!(wire_a, wire_b, "the RAM arm's Full equals the cold Full");
+        answers(&pages[0], &progress, &challenge);
     });
 }
