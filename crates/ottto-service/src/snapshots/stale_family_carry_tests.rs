@@ -1801,12 +1801,12 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
         assert!(!index.claude_request_identity_contract_changed);
         let mut healthy_full = 0;
         let mut held_reads_before_deadline = 0;
-        let mut page = evidence_owed::Page::default();
+
         for candidate in &candidates {
             let root = claude_index_path_member_ref(&candidate.path).unwrap().root;
             let held = records.contains_key(root);
             // Through the owed resolver: the terminal-retry re-arm owes.
-            let (decision, reason) = owed_page_decision(&mut index, &mut page, candidate, 0);
+            let (decision, reason) = owed_page_decision(&mut index, candidate, 0);
             if held {
                 held_reads_before_deadline += usize::from(decision == CandidateDecision::Parse);
                 continue;
@@ -2008,12 +2008,11 @@ fn scoped_retry_fixture(held: usize, healthy: usize, unrelated: bool) -> ScopedR
 fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> usize {
     use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
     let mut index = index.clone();
-    let mut page = evidence_owed::Page::default();
+
     candidates
         .iter()
         .filter(|candidate| {
-            if owed_page_decision(&mut index, &mut page, candidate, 0).0 != CandidateDecision::Parse
-            {
+            if owed_page_decision(&mut index, candidate, 0).0 != CandidateDecision::Parse {
                 return false;
             }
             let mut parser = OwnedJsonlParser::new(
@@ -4049,14 +4048,13 @@ fn bind_owed_records(fixture: &mut ScopedRetryFixture) {
 /// The traversal's selection with the owed resolver: the members it parses.
 fn owed_selected_parses(
     index: &mut ScanIndex,
-    page: &mut evidence_owed::Page,
     candidates: &[CandidateFile],
     window: &str,
 ) -> usize {
     candidates
         .iter()
         .filter(|candidate| {
-            owed_window_decision(index, page, candidate, window, 0).0 == CandidateDecision::Parse
+            owed_window_decision(index, candidate, window, 0).0 == CandidateDecision::Parse
         })
         .count()
 }
@@ -4065,13 +4063,12 @@ fn owed_selected_parses(
 /// traversal's census window: an owed member is read, re-offered or re-stamped
 /// only through `resolve`, never by `candidate_decision` alone.
 fn owed_decision(index: &mut ScanIndex, candidate: &CandidateFile, now: u64) -> CandidateDecision {
-    owed_page_decision(index, &mut evidence_owed::Page::default(), candidate, now).0
+    owed_page_decision(index, candidate, now).0
 }
 
-/// `owed_decision` on a shared page (its owed-read cap), with the reason.
+/// `owed_decision` with the selection reason.
 fn owed_page_decision(
     index: &mut ScanIndex,
-    page: &mut evidence_owed::Page,
     candidate: &CandidateFile,
     now: u64,
 ) -> (CandidateDecision, Option<CandidateParseReason>) {
@@ -4080,19 +4077,18 @@ fn owed_page_decision(
         .as_ref()
         .map(|traversal| traversal.census_window_end.clone())
         .unwrap_or_default();
-    owed_window_decision(index, page, candidate, &window, now)
+    owed_window_decision(index, candidate, &window, now)
 }
 
 /// `owed_page_decision` in census window `window`.
 fn owed_window_decision(
     index: &mut ScanIndex,
-    page: &mut evidence_owed::Page,
     candidate: &CandidateFile,
     window: &str,
     now: u64,
 ) -> (CandidateDecision, Option<CandidateParseReason>) {
     let (mut decision, mut reason) = index.candidate_decision_with_reason_at(candidate, now);
-    evidence_owed::resolve(index, page, candidate, window, &mut decision, &mut reason);
+    evidence_owed::resolve(index, candidate, window, &mut decision, &mut reason);
     (decision, reason)
 }
 
@@ -4108,12 +4104,7 @@ fn owed_evidence_whole_set_rearm_reads_only_the_changed_member() {
     let mut candidates = fixture.candidates.clone();
     candidates[0].source_file_fingerprint = "f".repeat(64);
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let parsed = owed_selected_parses(
-        &mut fixture.index,
-        &mut evidence_owed::Page::default(),
-        &candidates,
-        &window,
-    );
+    let parsed = owed_selected_parses(&mut fixture.index, &candidates, &window);
     assert_eq!(parsed, 1);
     // Every owed visit is counted by outcome and evidence age.
     let counts = scope.finish().contract.evidence_owed;
@@ -4150,12 +4141,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         2,
         "owed members are not observed before their selection"
     );
-    let parsed = owed_selected_parses(
-        &mut fixture.index,
-        &mut evidence_owed::Page::default(),
-        &fixture.candidates,
-        &window,
-    );
+    let parsed = owed_selected_parses(&mut fixture.index, &fixture.candidates, &window);
     assert_eq!(parsed, 0);
     for (root, pending) in before.iter() {
         let full = ClaudeUsageFamilyPending {
@@ -4208,12 +4194,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     );
     let mut index = empty.clone();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let parsed = owed_selected_parses(
-        &mut index,
-        &mut evidence_owed::Page::default(),
-        candidates,
-        &window,
-    );
+    let parsed = owed_selected_parses(&mut index, candidates, &window);
     assert_eq!(parsed, 0);
     assert_eq!(
         scope.finish().contract.evidence_owed.restamped_from_record,
@@ -4233,12 +4214,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
                 .claude_request_census
                 .insert(key.clone(), record(Some("0123456789abcdef")));
         }
-        let parsed = owed_selected_parses(
-            &mut index,
-            &mut evidence_owed::Page::default(),
-            candidates,
-            &window,
-        );
+        let parsed = owed_selected_parses(&mut index, candidates, &window);
         assert_eq!(parsed, 0, "latched={latched} requests={requests}");
         assert!(index.files[&key].evidence_owed);
     }
@@ -4260,9 +4236,9 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
     for latched in [false, true] {
         let mut index = fixture.index.clone();
         index.claude_request_identity_contract_changed = latched;
-        let mut page = evidence_owed::Page::default();
+
         assert_eq!(
-            owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
+            owed_selected_parses(&mut index, &fixture.candidates, &window),
             0,
             "latched {latched}: invalid evidence stays owed without a paced Full"
         );
@@ -4375,7 +4351,6 @@ fn owed_restamp_equals_a_real_fold_of_the_same_bytes() {
         let (mut decision, mut reason) = (CandidateDecision::Skip, None);
         evidence_owed::resolve(
             &mut owed,
-            &mut evidence_owed::Page::default(),
             candidate,
             CARRY_RETRY,
             &mut decision,
@@ -4480,14 +4455,7 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
     let mut reads = Vec::new();
     for candidate in candidates {
         let (mut decision, mut reason) = (CandidateDecision::Skip, None);
-        evidence_owed::resolve(
-            index,
-            &mut evidence_owed::Page::default(),
-            candidate,
-            window,
-            &mut decision,
-            &mut reason,
-        );
+        evidence_owed::resolve(index, candidate, window, &mut decision, &mut reason);
         if decision == CandidateDecision::Parse {
             reads.push(candidate.path.clone());
         }
@@ -4755,12 +4723,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
     };
     let visit = |index: &mut ScanIndex| {
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let parsed = owed_selected_parses(
-            index,
-            &mut evidence_owed::Page::default(),
-            &fixture.candidates,
-            &window,
-        );
+        let parsed = owed_selected_parses(index, &fixture.candidates, &window);
         (parsed, scope.finish().contract.evidence_owed)
     };
 
@@ -4850,12 +4813,7 @@ fn owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch() {
 
     let before = index.claude_usage_family_pending.clone();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let parsed = owed_selected_parses(
-        index,
-        &mut evidence_owed::Page::default(),
-        &fixture.candidates,
-        &window,
-    );
+    let parsed = owed_selected_parses(index, &fixture.candidates, &window);
     let counts = scope.finish().contract.evidence_owed;
     assert_eq!((parsed, counts.restamped, counts.read), (0, 3, 0));
     // [money] Each re-stamped pending equals a Full's fold in this window.
@@ -4969,12 +4927,7 @@ fn refused_owed_evidence_never_reads_or_requeues() {
     fixture.index.claude_usage_family_pending.clear();
     let mut index = fixture.index.clone();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let parsed = owed_selected_parses(
-        &mut index,
-        &mut evidence_owed::Page::default(),
-        &fixture.candidates,
-        &window,
-    );
+    let parsed = owed_selected_parses(&mut index, &fixture.candidates, &window);
     let counts = scope.finish().contract.evidence_owed;
     assert_eq!(
         (
@@ -4994,11 +4947,7 @@ fn refused_owed_evidence_never_reads_or_requeues() {
         .pending_candidates
         .len();
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-    let mut page = evidence_owed::Page {
-        read_cap: 1,
-        ..Default::default()
-    };
-    let parsed = owed_selected_parses(&mut fixture.index, &mut page, &fixture.candidates, &window);
+    let parsed = owed_selected_parses(&mut fixture.index, &fixture.candidates, &window);
     let counts = scope.finish().contract.evidence_owed;
     assert_eq!((parsed, counts.deferred_page_cap, counts.read), (0, 0, 0));
     let traversal = fixture.index.traversal.as_ref().unwrap();

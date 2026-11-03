@@ -3284,3 +3284,209 @@ fn vanished_root_discard_counts_shared_rows_and_keeps_indexed_members() {
     assert!(!index.claude_usage_family_pending.contains_key(vanished));
     assert_eq!(scope.finish().contract.vanished_roots_with_shared_rows, 1);
 }
+
+// Retired scheduling model retained only for the existing direct invariants.
+/// Content-free count of complete terminals that kept every proof re-arm
+/// because the unchanged-proof check was not admitted under its scratch budget.
+static CLAUDE_UNCHANGED_PROOF_BUDGET_FALLBACKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Price the unchanged-proof scratch before allocating it, against the
+/// existing parked overlap budget and with the same full-node pricing as the
+/// reported-usage construction peak. The family map borrows its keys from the
+/// terminal's proven families, and the prefix set borrows hashes from retained
+/// witnesses. An unsupported layout or a refused price keeps BASE.
+fn claude_unchanged_proof_scratch_admitted(families: usize, legacy_prefix_hashes: usize) -> bool {
+    #[cfg(test)]
+    if REFUSE_CLAUDE_UNCHANGED_PROOF_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    if !crate::heap_layout_bound::layout_supported() {
+        return false;
+    }
+    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    crate::heap_layout_bound::tree_nodes::<&str, bool>(families, &mut cost).is_some()
+        && crate::heap_layout_bound::tree_nodes::<&str, ()>(legacy_prefix_hashes, &mut cost)
+            .is_some()
+}
+
+/// Proven families of one complete closed-fence terminal whose earlier-page
+/// members need no replay, as `root -> true`. Every member of such a family
+/// was parsed in this census window under the same witness this terminal
+/// re-proved, its committed body is accepted, and nothing else re-arms or
+/// holds any member, so a reparse would rebuild the body it already has.
+/// A family is all or nothing: one member that fails any check, sits on this
+/// terminal page or was re-armed by another rule keeps every member on the
+/// BASE re-arm. `None` means the scratch was not admitted, which is BASE for
+/// the whole terminal.
+#[allow(clippy::too_many_arguments)]
+fn claude_unchanged_proof_roots<'p>(
+    index: &ScanIndex,
+    proven: &'p BTreeMap<String, ProvenClaudeUsageFamily>,
+    complete_families: &BTreeMap<String, BTreeSet<String>>,
+    witness_fingerprints_before: &BTreeMap<String, String>,
+    demoting_members_by_root: &BTreeMap<String, BTreeSet<String>>,
+    current_ids: &BTreeSet<&str>,
+    census_window_end: &str,
+    invalidated_witness_roots: &BTreeSet<String>,
+    duplicates: (
+        &BTreeSet<ClaudeDuplicateRequestOwner>,
+        &BTreeSet<String>,
+        &BTreeSet<String>,
+    ),
+    join: &terminal_join::TerminalJoin,
+) -> Option<BTreeMap<&'p str, bool>> {
+    if !index.persistence_available() {
+        return None;
+    }
+
+    let (changed_duplicate_owners, changed_duplicate_request_hashes, duplicated_request_hashes) =
+        duplicates;
+    let legacy_prefix_hash_count = index
+        .claude_usage_family_witnesses
+        .values()
+        .flat_map(|witness| witness.legacy_excluded_request_id_hashes.values())
+        .map(BTreeSet::len)
+        .fold(0_usize, usize::saturating_add);
+    if !claude_unchanged_proof_scratch_admitted(proven.len(), legacy_prefix_hash_count) {
+        CLAUDE_UNCHANGED_PROOF_BUDGET_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_UNCHANGED_PROOF_BUDGET_FALLBACKS_FOR_TEST
+            .with(|cell| cell.set(cell.get().saturating_add(1)));
+        eprintln!(
+            "local snapshot census kept every Claude family proof re-arm: the unchanged-proof check was not admitted under its scratch budget"
+        );
+        return None;
+    }
+    // Roots with a request any duplicate witness names or this terminal
+    // changed: their proof is not unchanged.
+    let duplicate_roots = join.roots_with_hashes(&terminal_join::keys(
+        duplicated_request_hashes.union(changed_duplicate_request_hashes),
+    ));
+    let mut roots = proven
+        .iter()
+        .map(|(root_session_id, family)| {
+            let witness = &family.witness;
+            // `complete_families` keeps only roots whose every member has
+            // exactly one index key, so no twin key can stand in for the
+            // member this window parsed.
+            let unchanged = complete_families.contains_key(root_session_id)
+                && claude_usage_family_witness_legacy_free(witness)
+                && !index
+                    .claude_usage_authority_quarantine
+                    .contains_key(root_session_id)
+                && !demoting_members_by_root.contains_key(root_session_id)
+                && witness_fingerprints_before
+                    .get(root_session_id)
+                    .is_some_and(|before| {
+                        *before == claude_usage_family_witness_fingerprint(witness)
+                    })
+                && index
+                    .claude_usage_family_pending
+                    .view(root_session_id)
+                    .is_some_and(|pending| {
+                        !pending.invalid()
+                            && pending.window() == census_window_end
+                            && pending
+                                .hash_members()
+                                .all(|member| !index.claude_owned_start_census.contains_key(member))
+                            && !duplicate_roots.contains(root_session_id.as_str())
+                    });
+            (root_session_id.as_str(), unchanged)
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Owners of another family's legacy copied prefix.
+    for owner in index
+        .claude_usage_family_witnesses
+        .values()
+        .flat_map(|witness| witness.legacy_owner_roots.iter())
+    {
+        if let Some(unchanged) = roots.get_mut(owner.as_str()) {
+            *unchanged = false;
+        }
+    }
+    // Families that share another family's legacy-excluded prefix.
+    if legacy_prefix_hash_count > 0 {
+        let legacy_prefix_roots = join.roots_with_hashes(&terminal_join::keys(
+            index
+                .claude_usage_family_witnesses
+                .values()
+                .flat_map(|witness| witness.legacy_excluded_request_id_hashes.values().flatten()),
+        ));
+        for (root_session_id, unchanged) in &mut roots {
+            if legacy_prefix_roots.contains(*root_session_id) {
+                *unchanged = false;
+            }
+        }
+    }
+    // Owners whose requests lead an unproven family observed in this window:
+    // a legacy fork or takeover successor can derive its copied-prefix
+    // exclusion only while the owner's root sequence is in the same window.
+    for (root_session_id, pending) in index.claude_usage_family_pending.views() {
+        if proven.contains_key(root_session_id)
+            || !complete_families.contains_key(root_session_id)
+            || pending.invalid()
+            || pending.window() != census_window_end
+        {
+            continue;
+        }
+        for owner in join.foreign_owner_roots(root_session_id) {
+            if let Some(unchanged) = roots.get_mut(owner.as_str()) {
+                *unchanged = false;
+            }
+        }
+    }
+    for (index_key, entry) in &index.files {
+        let Some(member_ref) = claude_index_path_member_ref(Path::new(index_key)) else {
+            continue;
+        };
+        let Some(unchanged) = roots.get_mut(member_ref.root) else {
+            continue;
+        };
+        if !*unchanged {
+            continue;
+        }
+        let (root_session_id, source_session_id) = member_ref.into_owned();
+        *unchanged = claude_index_file_body_accepted(index, index_key, entry)
+            && !entry.rearmed()
+            && !index.file_upload_context_requires_adoption(index_key)
+            && !current_ids.contains(source_session_id.as_str())
+            && !index
+                .claude_account_deferred_holds
+                .contains_key(index_key.as_str())
+            && !index.confirmed_empty_files.contains(index_key.as_str())
+            && !invalidated_witness_roots.contains(&root_session_id)
+            && !changed_duplicate_owners.contains(&claude_duplicate_request_owner(
+                &root_session_id,
+                &source_session_id,
+            ))
+            && index
+                .claude_usage_family_pending
+                .view(&root_session_id)
+                .is_some_and(|pending| {
+                    pending
+                        .hash_members()
+                        .any(|member| *member == source_session_id)
+                        && pending.has_occurrence_member(&source_session_id)
+                });
+    }
+    Some(roots)
+}
+
+impl ScanIndex {
+    /// Root digests of the families whose unsettled uploads this sweep owes:
+    /// none while the sweep is settled, the named families while every stamp
+    /// named them, and `None` (every family keeps its proof re-arm) for an
+    /// unscoped stamp. A loaded scope is trusted only in the shape the writer
+    /// produces: not empty, at most `MAX_SCOPED_HELD_FAMILY_ROOTS`, every
+    /// entry a canonical root digest. Anything else keeps the sweep-wide veto.
+    pub(crate) fn unchanged_proof_unsettled_families(&self) -> Option<BTreeSet<String>> {
+        if !self.bounded_sweep_had_unsettled_upload {
+            return Some(BTreeSet::new());
+        }
+        self.claude_full_rearm_progress
+            .held_family_roots
+            .clone()
+            .filter(held_family_scope_has_writer_shape)
+    }
+}

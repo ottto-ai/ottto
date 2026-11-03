@@ -54,28 +54,6 @@ pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexE
         && keep_or_clear_changes(retained, !working.source_file_fingerprint.is_empty())
 }
 
-/// Per page: the paced owed-read allowance.
-#[expect(
-    dead_code,
-    reason = "later dead-code cut: owed resolution never spends a read allowance"
-)]
-pub(super) struct Page {
-    /// Owed Fulls this page already admitted, and the one
-    /// per-page cap. It reuses the existing paced re-read page allowance
-    /// (`BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE`); the rest wait in the
-    /// walk's own queue for later pages.
-    pub(super) reads: usize,
-    pub(super) read_cap: usize,
-}
-impl Default for Page {
-    fn default() -> Self {
-        Self {
-            reads: 0,
-            read_cap: BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE,
-        }
-    }
-}
-
 /// The identity contract a pending was built under, as a bounded code plus
 /// the body-witness revision the request-money adoption reads. No identity
 /// bytes.
@@ -199,7 +177,6 @@ fn family<'a>(
 /// decided by `candidate_decision_in_window`). Only an owed entry changes.
 pub(super) fn resolve(
     index: &mut ScanIndex,
-    _page: &mut Page,
     candidate: &CandidateFile,
     census_window_end: &str,
     decision: &mut CandidateDecision,
