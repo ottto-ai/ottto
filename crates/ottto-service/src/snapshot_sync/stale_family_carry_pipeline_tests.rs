@@ -1910,7 +1910,20 @@ fn source_t2_carried_g_arm(upload: RearmUpload, keep_held: bool) {
         crate::snapshots::claude_request_identity::COLLECTOR,
         || {
             let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+            let f_key = fixture.member_path(None).to_string_lossy().into_owned();
+            let before = index.files.get(&f_key);
+            eprintln!(
+                "CENSUS_EXIT_T2_F_REPLAY before_exists={} before_revision={}",
+                u8::from(before.is_some()),
+                before.map_or(0, |entry| entry.effective_upload_body_witness_revision),
+            );
             assert!(index.prepare_historical_replay("source-t2-ordinary-history".into()));
+            let after = index.files.get(&f_key);
+            eprintln!(
+                "CENSUS_EXIT_T2_F_REPLAY after_exists={} after_revision={}",
+                u8::from(after.is_some()),
+                after.map_or(0, |entry| entry.effective_upload_body_witness_revision),
+            );
             index.save(&fixture.index_path).unwrap();
             latch_contract_generation(&fixture, 10);
         },
@@ -1936,16 +1949,69 @@ fn source_t2_carried_g_arm(upload: RearmUpload, keep_held: bool) {
             // #825 (card G (b)): A -> B itself re-owes nothing now. Owe
             // every file as its removed adoption loop did; another re-owe
             // path (path B, a money rule) leaves the same owed state.
+            let f_key = fixture.member_path(None).to_string_lossy().into_owned();
             let mut owed = ScanIndex::load(&fixture.index_path).unwrap();
+            let f_revision_before_reowe = owed
+                .files
+                .get(&f_key)
+                .map(|entry| entry.effective_upload_body_witness_revision);
+            let mut f_reowed = None;
             for key in owed.files.keys().cloned().collect::<Vec<_>>() {
-                owed.re_owe_effective_upload_body_witness_revision(&key, 2);
+                let reowed = owed.re_owe_effective_upload_body_witness_revision(&key, 2);
+                if key == f_key {
+                    f_reowed = Some(reowed);
+                }
             }
+            let f_revision_after_reowe = owed
+                .files
+                .get(&f_key)
+                .map(|entry| entry.effective_upload_body_witness_revision);
             owed.save(&fixture.index_path).unwrap();
             let migrated = latch_contract_generation(&fixture, 20);
             assert!(c1a_latch(&fixture).1, "F is still owed after A -> B");
             let saved = c1a_saved(&fixture);
             let f_key = fixture.member_path(None).to_string_lossy().into_owned();
             let g_key = c1b_sibling_path(&fixture).to_string_lossy().into_owned();
+            let f_entry = saved["files"].get(&f_key);
+            let f_revision = f_entry
+                .and_then(|entry| entry.get("effective_upload_body_witness_revision"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let f_typed_revision = ScanIndex::load(&fixture.index_path)
+                .unwrap()
+                .files
+                .get(&f_key)
+                .map(|entry| entry.effective_upload_body_witness_revision);
+            eprintln!(
+                "CENSUS_EXIT_T2_F_WITNESS exists={} reowe_called={} reowed={} before_reowe={} after_reowe={} field_present={} default_revision={} typed_exists={} typed_revision={} g_revision={} f_read={} g_read={}",
+                u8::from(f_entry.is_some()),
+                u8::from(f_reowed.is_some()),
+                u8::from(f_reowed.unwrap_or(false)),
+                f_revision_before_reowe.unwrap_or(0),
+                f_revision_after_reowe.unwrap_or(0),
+                u8::from(f_entry.is_some_and(|entry| entry.get("effective_upload_body_witness_revision").is_some())),
+                f_revision,
+                u8::from(f_typed_revision.is_some()),
+                f_typed_revision.unwrap_or(0),
+                saved["files"][&g_key]["effective_upload_body_witness_revision"].as_u64().unwrap_or(0),
+                u8::from(rearm_parsed(&migrated).contains(REARM_ROOT)),
+                u8::from(rearm_parsed(&migrated).contains(REARM_SIBLING)),
+            );
+            assert!(
+                f_entry.is_some(),
+                "F's saved file entry must remain present"
+            );
+            assert_eq!(
+                f_reowed,
+                Some(false),
+                "re-owe cannot raise legacy revision 0 to 2"
+            );
+            assert_eq!(f_revision, 0, "F keeps its legacy zero revision");
+            assert_eq!(
+                f_typed_revision,
+                Some(f_revision),
+                "serde applies the same default"
+            );
             assert_eq!(
                 saved["files"][&f_key]["effective_upload_body_witness_revision"],
                 2
