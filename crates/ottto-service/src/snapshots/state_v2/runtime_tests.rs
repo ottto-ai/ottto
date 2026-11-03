@@ -317,7 +317,8 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     assert!(save_with(&f.path, &mut index).unwrap());
     assert_eq!(index.generation, G + 1);
     // [money] Archived account windows stay row-only through the latched OFF
-    // load and save, and read back with the pre-switch placement.
+    // load and save, and read back with the pre-switch placement. The save's
+    // compaction keeps only the member's newest window.
     let f = Fixture::new();
     let window = member_window;
     let mut pre = ScanIndex::default();
@@ -342,10 +343,11 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     assert!(save_with(&f.path, &mut index).unwrap());
     let reloaded = load_with(&f.path, false).unwrap().unwrap();
     assert!(cold(&reloaded));
-    assert_eq!(
-        materialized(&reloaded).claude_account_family_pending,
-        pre.claude_account_family_pending
-    );
+    let restored = &materialized(&reloaded).claude_account_family_pending["family"];
+    let before = &pre.claude_account_family_pending["family"];
+    assert_eq!(restored.current, before.current);
+    assert_eq!(restored.previous_windows.resident(), &[window(27)]);
+    assert!(restored.history_summary() == before.history_summary());
     // A fresh route must decode the missing semantic rows, never treat them as empty.
     let f = Fixture::new();
     f.import(false);
