@@ -2458,15 +2458,8 @@ fn holder_order(
 
 /// Without an accepted origin body, removing a prefix counts it nowhere. Protected
 /// bodies stay frozen: never accepted, and no wait for an ACK that cannot come.
-/// The exact accepted-snapshot ledger proves a delivered current body even
-/// when its upload-context receipt and stamps are gone.
 fn origin_accepted(index: &ScanIndex, holder: &str) -> bool {
-    !index.claude_family_listed(holder)
-        && (index.file_has_accepted_body(holder)
-            || (super::super::claude_accepted_ledger_is_current(index)
-                && index.files.get(holder).is_some_and(|entry| {
-                    super::super::claude_index_file_body_accepted(index, holder, entry)
-                })))
+    !index.claude_family_listed(holder) && index.file_has_accepted_body(holder)
 }
 
 /// Owner direction (PR C (a)): a /branch names its original in a
