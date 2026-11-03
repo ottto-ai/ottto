@@ -1436,6 +1436,84 @@ fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
     });
 }
 
+/// [money] No undercount with the holder off the page: a post-cutoff
+/// unlisted writer's resume read without its earlier path (outside this
+/// pass's scan roots) counts the copied request exactly once, from the
+/// resume, and the page proof stays off. The same pair on one page counts it
+/// once, from the holder, with equal totals. A session first published from
+/// the resume alone then converges to the cold co-read once both are read.
+#[test]
+fn e2_pipeline_unlisted_twin_resume_counts_copied_request_once_with_holder_off_page() {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
+    with_e2(|| {
+        let line = |request, at, tokens| line_by(ROOT, request, at, tokens, UNLISTED_WRITER);
+        let mut c = Corpus::new("e2-pipeline-unlisted-twin-holder-off-page");
+        let projects = c.root.clone();
+        let r1 = line("r1", AT, 10);
+        c.write_at(&format!("a/{ROOT}.jsonl"), &r1, "2026-08-02T07:00:00Z");
+        let scanner = E2ScanFixture::default();
+        let holder = ready(&c, &scanner, ScanIndex::default(), 100, true);
+        assert_eq!(total(&holder), 1);
+        let prior = settle(&c, &ScanIndex::default(), holder, &mut e2_progress());
+        let copy = c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(r1 + &line("r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
+        );
+        // This pass scans only the resume's folder: its holder stays off the page.
+        c.root = projects.join("z");
+        e2::take_diag();
+        let alone = ready(&c, &scanner, prior.clone(), 100, true);
+        literal(&alone);
+        let opened = scanner.paths();
+        assert!(
+            opened.len() == 1 && opened[0].ends_with(format!("z/{ROOT}.jsonl")),
+            "only the resume is read: {opened:?}"
+        );
+        assert_eq!(total(&alone), 2, "r1 once (from the resume) and r2");
+        assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
+        c.root = projects;
+        e2::take_diag();
+        let together = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            true,
+        );
+        literal(&together);
+        assert_eq!(total(&together), 2, "r1 once (from the holder) and r2");
+        assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [1]);
+        // Alone the resume restores and discloses r1, beside its holder it removes it
+        // (removed_request_count, copy_unproven): compare counted totals only.
+        let counted = |page: &Page| {
+            let s = &page.scan.snapshots[0];
+            [
+                s.request_count,
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_read_tokens,
+                s.cache_creation_5m_tokens,
+                s.cache_creation_1h_tokens,
+            ]
+        };
+        assert_eq!(counted(&alone), counted(&together));
+        let prior = settle(&c, &prior, alone, &mut e2_progress());
+        append(&copy, &line("r3", "2026-11-04T09:00:00Z", 30));
+        let stored = ready(&c, &scanner, prior, 100, true);
+        literal(&stored);
+        assert_eq!(total(&stored), 3, "r1 once, r2, r3");
+        let cold = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            true,
+        );
+        money_oracle::assert_equivalent(&sent_money(&cold), &sent_money(&stored));
+    });
+}
+
 /// Each walk meets both path twins, but a settled twin does not pull its
 /// family into the page. Only a twin the page reads does; otherwise the
 /// family is read again and one batch is sent on every walk.
