@@ -1,7 +1,7 @@
 //! Census records keep the existing v1 JSON; no hand-written census binary.
 use super::catalogue::scan_index_fields;
 use super::*;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     rows.map("file.census", next.claude_request_census.storage_records())?;
@@ -40,23 +40,16 @@ pub(super) fn hydrate_txn(
     index: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<()> {
-    // Census rows decode as untyped JSON, whose serialization is not the
-    // typed record's: the seed computes their digests itself.
-    let raw: BTreeMap<String, serde_json::Value> = mapper::read_map(tx, "file.census", None, None)?;
-    for (name, value) in raw {
-        let singleton = serde_json::json!({name.clone():value});
-        let census: super::super::claude_request_census::ClaudeRequestCensus =
-            codec::strict_json(&serde_json::to_vec(&singleton)?)?;
-        let record = census
-            .storage_records()
-            .get(&name)
-            .context("state_v2_census_record")?;
+    // One typed record per row (the census record decoder), with no entry,
+    // byte or hash budget: an undecodable row still fails the load.
+    let rows: BTreeMap<String, super::super::claude_request_census::ClaudeRequestCensusRecord> =
+        mapper::read_map(tx, "file.census", None, None)?;
+    for (name, record) in rows {
         ensure!(
-            index
-                .claude_request_census
-                .storage_insert(name, record.clone()),
-            "state_v2_census_admission"
+            super::super::claude_request_census::admits_entry_key(&name),
+            "state_v2_census_record"
         );
+        index.claude_request_census.insert(name, record);
     }
     macro_rules! load_map {
         ($f:ident, Census, (map $($c:ident)*), [$kind:literal], $h:ident) => {

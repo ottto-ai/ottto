@@ -1,11 +1,11 @@
 // Durable Claude request-census records and the shadow predicate.
-// Records are produced, persisted, pruned and measured; no decision reads
+// Records are produced, persisted and measured; no decision reads
 // them. All fixtures are synthetic and content-free.
 use super::*;
 use crate::snapshots::claude_request_census::{
     claude_census_member_status, claude_request_hash, ClaudeCensusMemberStatus,
     ClaudeRequestCensusRecord, ClaudeRequestCensusShape, CLAUDE_REQUEST_CENSUS_CANARY,
-    CLAUDE_REQUEST_CENSUS_DERIVATION, MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_RAW_BYTES,
+    CLAUDE_REQUEST_CENSUS_DERIVATION, MAX_RAW_BYTES,
 };
 use sha2::Sha256 as CanarySha256;
 
@@ -459,7 +459,6 @@ fn census_unchanged_preserves_only_matching_verified_records() {
             record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
-                    held_index_keys: &BTreeSet::new(),
                     path,
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
@@ -471,7 +470,6 @@ fn census_unchanged_preserves_only_matching_verified_records() {
                     itemless_request_hashes: vec![],
                     opened_birth: None,
                     modified_unix_seconds: 0,
-                    accepted_recovery_member: false,
                 },
                 if exact {
                     std::slice::from_ref(&item)
@@ -726,23 +724,23 @@ fn census_records_follow_the_working_index_through_committable_subset() {
     );
 }
 
-/// Prune at the complete terminal: before any join, keep only keys that are
-/// indexed or were walked this generation (review F9).
+/// [money] A complete terminal prunes and retires nothing: an indexed
+/// record, a walked record without an entry and an unwalked one (held-new
+/// custody) all keep their ids; each leaves only with its file.
 #[test]
-fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
+fn census_terminal_keeps_every_record() {
     let indexed = "/census/projects/census-indexed.jsonl".to_string();
     let walked = "/census/projects/census-walked.jsonl".to_string();
-    let retired = "/census/projects/census-retired.jsonl".to_string();
+    let held = "/census/projects/census-held.jsonl".to_string();
     let mut index = ScanIndex::default();
     let mut entry = manifest_index_entry(Some("body"));
     entry.source_file_fingerprint = hex_fingerprint('a');
-    // Modified in this window: not due for transcript retirement.
     entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
     index.files.insert(indexed.clone(), entry);
     index
         .file_snapshot_fingerprints
         .insert(indexed.clone(), BTreeSet::from(["body".to_string()]));
-    for (key, seed, hash) in [(&indexed, 'a', 1), (&walked, 'b', 2), (&retired, 'c', 2)] {
+    for (key, seed, hash) in [(&indexed, 'a', 1), (&walked, 'b', 2), (&held, 'c', 3)] {
         index.claude_request_census_mut_for_test().insert_for_test(
             key,
             ClaudeRequestCensusRecord::synthetic_for_test(
@@ -753,95 +751,18 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
             ),
         );
     }
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &BTreeSet::from([walked.clone()]),
-        &BTreeSet::new(),
-        FIRST_WINDOW,
-    );
-    assert_eq!(
-        index.claude_request_census_for_test().keys_for_test(),
-        vec![indexed.clone(), walked.clone()]
-    );
-    assert_eq!(
-        index.claude_request_census_for_test().hash_total_for_test(),
-        2
-    );
-    // The retired record's copy of hash 2 no longer makes a duplicate.
-    assert_eq!(counts.duplicate_hashes, 0);
-    assert_eq!(counts.records, 2);
-    assert_eq!(counts.family_keys, 1);
-    assert_eq!(counts.covered_by_fingerprint, 1);
-    assert!(counts.would_open);
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        Some(true)
-    );
-}
-
-/// An unchanged re-parse of a record retired at 35 days
-/// (a backfill re-reading every file, a resume miss) is no derivation drift
-/// and leaves the record retired: neither the hashes nor the index bytes
-/// bounce back.
-#[test]
-fn census_retired_record_survives_an_unchanged_reparse() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-retired-reparse");
-    let root = scratch.join("projects");
-    census_write(
-        &root,
-        "census-retired.jsonl",
-        &[census_response(
-            "census-retired",
-            Some("req_retired_1"),
-            "msg_retired_1",
-            1,
-            10,
-        )],
-    );
-    // Windows far enough past the file's mtime (now) to retire it.
-    let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, "2027-03-01T09:00:00Z");
-    let key = census_key(&index, &root, "census-retired.jsonl");
-    let retired = index
-        .claude_request_census_for_test()
-        .record_for_test(&key)
-        .expect("record")
-        .clone();
-    assert_eq!(
-        retired.retired_for_test(),
-        Some(1),
-        "retired at the terminal"
-    );
-    let hashes = index.claude_request_census_for_test().totals_for_test().0;
-    index
-        .files
-        .get_mut(&key)
-        .expect("entry")
-        .source_file_fingerprint
-        .clear();
-    census_scan(&root, &mut index, "2027-03-02T09:00:00Z");
-    let reparsed = index
-        .claude_request_census_for_test()
-        .record_for_test(&key)
-        .expect("reparsed record");
-    assert_eq!(
-        reparsed.fingerprint_hex_for_test(),
-        retired.fingerprint_hex_for_test()
-    );
-    assert_eq!(reparsed.retired_for_test(), Some(1), "still retired");
-    assert!(reparsed.request_hashes_for_test().is_empty());
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        0
-    );
-    assert_eq!(
-        index.claude_request_census_for_test().totals_for_test().0,
-        hashes
-    );
+    let before = index.claude_request_census_for_test().clone();
+    // A window a year on: no age rule applies either.
+    for window in [FIRST_WINDOW, "2027-08-02T09:00:00Z"] {
+        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::new(),
+            window,
+        );
+        assert_eq!(index.claude_request_census_for_test(), &before, "{window}");
+        assert_eq!(counts.records, 3);
+        assert_eq!(counts.duplicate_hashes, 0);
+    }
 }
 
 /// A transcript of zero-usage responses only (API errors) yields no item, yet
@@ -936,7 +857,6 @@ fn census_unindexed_lossy_member_leaves_its_family_unknown() {
     );
     let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
-        &BTreeSet::from([member_key.clone()]),
         &BTreeSet::from([member_key.clone()]),
         FIRST_WINDOW,
     );
@@ -1168,12 +1088,15 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
     );
 }
 
-/// TD1c (bounds): the decoder keeps the running hash total within the budget,
-/// refusing an over-budget entry before decoding its hex.
+/// One past the request hashes the census held before it lost its caps.
+const OLD_HASH_CAP: u64 = 1_048_576;
+
+/// [money] Past the old hash cap the decoder keeps every record whole: no
+/// entry is refused for the running hash total.
 #[test]
-fn census_decoder_keeps_the_hash_budget() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-decoder-budget");
-    let full = (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect::<Vec<_>>();
+fn census_decoder_loads_past_the_old_hash_cap() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-decoder-no-cap");
+    let full = (0..OLD_HASH_CAP).collect::<Vec<_>>();
     let records = serde_json::json!({
         "a-full": census_record_json('a', "lossy", &full),
         "b-one-more": census_record_json('b', "exact", &[1]),
@@ -1181,23 +1104,25 @@ fn census_decoder_keeps_the_hash_budget() {
     });
     let loaded = census_load(
         &scratch,
-        "budget",
+        "no-cap",
         &serde_json::to_string(&census_index_json(records)).expect("json"),
     );
     let census = loaded.claude_request_census_for_test();
     assert_eq!(
         census.keys_for_test(),
-        vec!["a-full".to_string(), "c-empty".to_string()]
+        vec![
+            "a-full".to_string(),
+            "b-one-more".to_string(),
+            "c-empty".to_string()
+        ]
     );
-    assert_eq!(
-        census.hash_total_for_test(),
-        MAX_CLAUDE_REQUEST_CENSUS_HASHES
-    );
+    assert_eq!(census.hash_total_for_test(), OLD_HASH_CAP as usize + 1);
 }
 
-/// Production keeps the same budget by storing an `OverBudget` tombstone.
+/// [money] A live insert past the old hash cap stores the record whole, not
+/// as an `OverBudget` tombstone, and the hash total follows every change.
 #[test]
-fn census_records_past_the_budget_become_inert_tombstones() {
+fn transcript_insert_past_old_budget_stays_whole() {
     let mut census = crate::snapshots::claude_request_census::ClaudeRequestCensus::default();
     census.insert_for_test(
         "a",
@@ -1205,7 +1130,7 @@ fn census_records_past_the_budget_become_inert_tombstones() {
             &hex_fingerprint('a'),
             1,
             ClaudeRequestCensusShape::Lossy,
-            (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect(),
+            (0..OLD_HASH_CAP).collect(),
         ),
     );
     census.insert_for_test(
@@ -1217,18 +1142,12 @@ fn census_records_past_the_budget_become_inert_tombstones() {
             vec![1],
         ),
     );
-    let tombstone = census.get("b").expect("tombstone");
-    assert_eq!(
-        tombstone.shape_for_test(),
-        ClaudeRequestCensusShape::OverBudget
-    );
-    assert!(tombstone.request_hashes_for_test().is_empty());
-    assert_eq!(
-        census.hash_total_for_test(),
-        MAX_CLAUDE_REQUEST_CENSUS_HASHES
-    );
+    let whole = census.get("b").expect("stored whole");
+    assert_eq!(whole.shape_for_test(), ClaudeRequestCensusShape::Exact);
+    assert_eq!(whole.request_hashes_for_test(), &[1]);
+    assert_eq!(census.hash_total_for_test(), OLD_HASH_CAP as usize + 1);
     census.remove("a");
-    assert_eq!(census.hash_total_for_test(), 0);
+    assert_eq!(census.hash_total_for_test(), 1);
 }
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
@@ -1434,9 +1353,11 @@ fn census_failed_read_invalidates_old_record() {
     panic!("failure path was not reached");
 }
 
+/// [format] The decoder has no entry limit: a valid record after 65,536
+/// rejected entries still loads, and each rejected entry drops alone.
 #[test]
-fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-attempt-budget");
+fn census_decoder_keeps_a_record_after_65536_rejected_entries() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-no-entry-limit");
     let mut records = String::from("{");
     for attempted in 0..65_536 {
         use std::fmt::Write;
@@ -1445,7 +1366,7 @@ fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
     use std::fmt::Write;
     write!(
         records,
-        "\"after-budget\":{}}}",
+        "\"after-rejected\":{}}}",
         census_record_json('a', "exact", &[1])
     )
     .unwrap();
@@ -1456,9 +1377,9 @@ fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
             &format!("\"claude_request_census\":{records}"),
         );
     let loaded = census_load(&scratch, "attempts", &json);
-    assert!(
-        loaded.claude_request_census_for_test().is_empty(),
-        "rejected records must consume interpretation work too"
+    assert_eq!(
+        loaded.claude_request_census_for_test().keys_for_test(),
+        vec!["after-rejected".to_string()]
     );
 }
 
@@ -1627,62 +1548,5 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
             .filter_map(std::result::Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
         "refusal never quarantines"
-    );
-}
-
-/// [money] paced restore residue prevents 35 day census retirement until catchup.
-#[test]
-fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
-    let root = scratch.join("projects");
-    census_write(
-        &root,
-        "paced.jsonl",
-        &[census_response(
-            "paced",
-            Some("req_paced"),
-            "msg_paced",
-            1,
-            10,
-        )],
-    );
-    let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
-    let key = census_key(&index, &root, "paced.jsonl");
-    let before = index
-        .claude_request_census_for_test()
-        .record_for_test(&key)
-        .unwrap();
-    assert_eq!(before.retired_for_test(), None);
-    let held = BTreeSet::from([key.clone()]);
-    claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &held,
-        &held,
-        "2027-03-01T09:00:00Z",
-    );
-    assert_eq!(
-        index
-            .claude_request_census_for_test()
-            .record_for_test(&key)
-            .unwrap()
-            .retired_for_test(),
-        None,
-        "paced unread residue retains exact hashes past 35 days"
-    );
-    claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &held,
-        &BTreeSet::new(),
-        "2027-03-01T09:00:00Z",
-    );
-    assert_eq!(
-        index
-            .claude_request_census_for_test()
-            .record_for_test(&key)
-            .unwrap()
-            .retired_for_test(),
-        Some(1),
-        "negative control: ordinary quiet retirement remains enabled after catch-up"
     );
 }

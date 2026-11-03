@@ -68,6 +68,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | --- | --- |
 | `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
+| `retained_heap_bytes.active_graph.{census_hashes,census_occupancy_alarm}` | Request hashes the Claude census holds, and whether they reach 75% of 2,097,152. An alarm only: nothing is capped. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
@@ -434,37 +435,17 @@ disappearing: where a failure stayed possible, its new counter is named.
 Not built, and so absent from the counters: `tail_candidate_owed`,
 `tail_set_aside_probe`.
 
-### Claude Census Retirement Overlap
+### Claude Census Holder Lifetime
 
-A complete Claude terminal retires transcript census records whose file was
-last modified more than 35 days before the census window. An aged record that
-shares a request id with another unretired census record is kept instead, so a
-resumed copy keeps its cross-session copy proof while both files stay indexed.
-The terminal then emits `claude_census_retire_kept_overlap` with
-`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
-`census_retire_kept_overflow` and its two reasons,
-`census_retire_kept_overflow_occupancy` and
-`census_retire_kept_overflow_admission`, each with a `_total` process total,
-and `census_missing_over_budget`: the same terminal's census-full tombstone
-count (the shadow's `missing_over_budget`), so both read together.
-Kept records stay while the census, after the other aged records retire, is
-at most 90% full by both its hash budget and its serialized budget. Above
-that, the oldest kept records (equal ages in path order) retire until it is
-back at 90%, counted as occupancy overflow, so one index always yields one
-kept set. Kept records never cost another record its admission: a transcript
-record that does not fit whole first retires, oldest first, the records the
-age rule would retire at that window but that still hold their hashes, only
-as many as it needs; if retiring all of them would still not admit it, none
-retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
-`census_missing_over_budget`, and the records it retired as admission
-overflow. The census holds at most 65,536 records, live as on load: a new
-transcript key past that gets no record (read as missing) and emits a row
-with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
-Every row carries `census_record_limit_refused` and its `_total`. A positive
-overflow, by either reason, or a positive refusal also emits
-`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
-decides again, so a kept record retires once its partner is pruned or
-retired. Counts only; no path, id or wire event.
+A Claude transcript census record lives while its file is indexed or is held
+new custody; it is dropped, with its file's money marks and stored copy
+removals, only when the file leaves the index. No age, overlap, occupancy or
+size rule retires, refuses or strips a record, and the census and the stored
+copy removals have no capacity limit. The one signal is the occupancy alarm on
+the retained-heap line: `census_hashes`, the request hashes the census holds,
+and `census_occupancy_alarm`, true once they reach 75% of 2,097,152. Records an
+older release stored retired (no request ids) or over budget keep that shape
+until their file is re-read. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
