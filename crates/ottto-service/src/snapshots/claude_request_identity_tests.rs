@@ -2120,8 +2120,9 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
 }
 
 /// A quiet off-page family member must not lose Full authority on a
-/// debt-free Unchanged retry. Both protected-list states use legacy money,
-/// including copied-prefix exclusion and telemetry-only usage.
+/// debt-free Unchanged retry. A listed family uses legacy money, including
+/// copied-prefix exclusion and telemetry-only usage, whether its list is
+/// installed or paused with its digests kept (a pause holds adoption only).
 #[cfg(unix)]
 #[test]
 fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() {
@@ -2130,26 +2131,30 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    use crate::snapshots::claude_reemission_exclusions::ReemissionExclusions;
+    use crate::snapshots::claude_reemission_exclusions::{ListState, ReemissionExclusions};
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,
     };
     use crate::transcript_acquisition::{ReadMode, Scope};
 
     for paused in [false, true] {
-        let (dir, _, api, trace, mut index) = legacy_fork_fixture(1);
-        index.claude_reemission_exclusions = ReemissionExclusions::parse(
-            if paused {
-                "invalid".to_string()
-            } else {
+        let protected = || {
+            let list = ReemissionExclusions::parse(
                 format!(
                     "{}\n{}",
                     request_hash(LEGACY_PARENT),
                     request_hash(LEGACY_CHILD)
                 )
+                .as_bytes(),
+            );
+            if paused {
+                list.with_state_for_test(ListState::ClosureOverflow)
+            } else {
+                list
             }
-            .as_bytes(),
-        );
+        };
+        let (dir, _, api, trace, mut index) = legacy_fork_fixture(1);
+        index.claude_reemission_exclusions = protected();
         assert!(!claude_request_money::e2::family_applies(
             &index,
             LEGACY_CHILD,
@@ -2254,18 +2259,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
             .unwrap()
             .unverified_for_test());
         // Exclusion-list state is pass-local, loaded independently of the index.
-        index.claude_reemission_exclusions = ReemissionExclusions::parse(
-            if paused {
-                "invalid".to_string()
-            } else {
-                format!(
-                    "{}\n{}",
-                    request_hash(LEGACY_PARENT),
-                    request_hash(LEGACY_CHILD)
-                )
-            }
-            .as_bytes(),
-        );
+        index.claude_reemission_exclusions = protected();
         let mut later = raw
             .iter()
             .filter(|item| item.source_session_id == LEGACY_CHILD)
