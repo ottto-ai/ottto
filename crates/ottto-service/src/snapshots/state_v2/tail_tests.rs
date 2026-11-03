@@ -461,6 +461,71 @@ fn systemic_failure_commits_neither_file_nor_marker() {
     assert!(tail_set_aside(&index, SIBLING).unwrap().is_none());
 }
 
+/// [regress] A failed debt write never fails the save: it rolls back alone and
+/// sets the file aside, the graph and its receipts commit, and the next
+/// observation writes the debt.
+#[test]
+fn debt_write_failure_never_fails_the_save() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let receipt = "b".repeat(64);
+    index.files.insert(FILE.into(), progress_row());
+    index.accepted_snapshot_fingerprints.insert(receipt.clone());
+    // An unknown revision id refuses this file's debt write.
+    let mut refused = observation(&[b"debt"]);
+    refused.resolved.insert(99);
+    observe_tail(&f.path, SIBLING, refused).unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert!(stage_empty(&f.path));
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.generation, G + 1);
+    assert!(index.files.contains_key(FILE));
+    assert!(index.accepted_snapshot_fingerprints.contains(&receipt));
+    assert!(load_head(&index, SIBLING, REVISION).unwrap().is_none());
+    let marker = tail_set_aside(&index, SIBLING).unwrap().unwrap();
+    assert_eq!(marker.cause, SetAsideCause::Row);
+
+    observe_tail(&f.path, SIBLING, observation(&[b"debt"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(
+        revisions(&index, SIBLING),
+        BTreeMap::from([(0, b"debt".to_vec())])
+    );
+}
+
+/// [regress] F4 on implicit retirement: removing the progress row of a file
+/// whose head this build cannot read sets the key aside instead of retiring
+/// it, and the save commits.
+#[test]
+fn removal_over_an_unreadable_head_sets_it_aside_and_commits() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.files.insert(FILE.into(), progress_row());
+    save_with(&f.path, &mut index).unwrap();
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tail::future_head_for_test(&mut tx, FILE.as_bytes()).unwrap();
+        assert_eq!(
+            tx.commit(G + 1, G + 2),
+            DurableCommitOutcome::Committed(G + 2)
+        );
+    });
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.files.remove(FILE);
+    index.files.insert(SIBLING.into(), progress_row());
+    save_with(&f.path, &mut index).unwrap();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.generation, G + 3);
+    assert!(!index.files.contains_key(FILE));
+    assert!(index.files.contains_key(SIBLING));
+    let marker = tail_set_aside(&index, FILE).unwrap().unwrap();
+    assert_eq!(marker.cause, SetAsideCause::Row);
+    let error = load_head(&index, FILE, REVISION).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "kept");
+}
+
 /// [format] The exit commit is G to G+1 behind ACK recovery; only that confirmed
 /// generation moves the session, so stale siblings refuse and a fresh load reads.
 #[test]

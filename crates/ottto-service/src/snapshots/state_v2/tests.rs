@@ -1170,6 +1170,29 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(sample(&mut db).len(), 1);
 }
 
+/// [regress] Freshness bookkeeping never sizes the next collection page: a
+/// save under target stays under it whatever heads, revisions, set-aside
+/// markers and discovery stamp it also writes.
+#[test]
+fn freshness_bookkeeping_never_counts_toward_the_save_target() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..4_000 {
+        put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
+    }
+    for row in 0..2_000 {
+        for kind in ["tail.head", "tail.revision", "tail.set_aside"] {
+            let key = RowKey::record(kind, format!("/synthetic/{row}.jsonl"), 0).unwrap();
+            put(&mut tx, &key, b"debt");
+        }
+    }
+    let discovery = RowKey::record("scan_state.tail_discovery", Vec::<u8>::new(), 0).unwrap();
+    put(&mut tx, &discovery, b"{}");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+}
+
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {

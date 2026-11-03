@@ -28,6 +28,13 @@ pub(super) fn version_supported(version: u32) -> bool {
 pub(super) fn owned(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name().starts_with("tail."))
 }
+/// Freshness bookkeeping: heads, revisions, set-aside markers and the discovery
+/// stamp. Never charged to the save target that sizes the next collection page;
+/// reduction pages and fragments are.
+pub(super) fn bookkeeping(key: &RowKey) -> bool {
+    matches!(key, RowKey::Record { kind, .. }
+        if matches!(kind.name(), HEAD | REVISION | SET_ASIDE | "scan_state.tail_discovery"))
+}
 
 /// Paged collections, in `catalogue::TAIL_KINDS` order. `Revisions` is the
 /// file's debt (`tail.revision`, layout 5, position = revision id): it shares
@@ -1189,12 +1196,18 @@ fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
     }
     Ok(keep)
 }
-/// Retire over a future head written in `tx`, which the caller drops uncommitted.
+/// Write a head of a newer envelope in `tx`: this build cannot read it.
 #[cfg(test)]
-pub(super) fn retire_future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+pub(super) fn future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
     let mut head = encode_head(1, &MembershipTable::new(), &Common::default(), None)?;
     head[5] = 2;
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
+    Ok(())
+}
+/// Retire over a future head written in `tx`, which the caller drops uncommitted.
+#[cfg(test)]
+pub(super) fn retire_future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+    future_head_for_test(tx, file)?;
     retire(tx, file)
 }
 /// Written outside the file's rolled-back boundary, in the same transaction.
@@ -1299,7 +1312,18 @@ pub(super) fn apply(
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
     for file in removed.iter().chain(authorised) {
-        if retire(tx, file)? {
+        // F4: a head this build cannot read is set aside, never retired.
+        let mut kept = false;
+        let result = tx.isolated(&mut |tx| {
+            kept = retire(tx, file)?;
+            Ok(())
+        })?;
+        if result.is_err() {
+            mark_set_aside(tx, file, SetAsideCause::Row)?;
+            applied.set_aside += 1;
+            continue;
+        }
+        if kept {
             applied.kept_debt += 1;
         } else {
             tx.delete(&set_aside_key(file)?)?;

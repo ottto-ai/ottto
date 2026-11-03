@@ -547,9 +547,9 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// A queued directory that is gone, with no confirmed removal, proves
-    /// nothing absent beneath it.
-    pub(super) fn unlisted_directory(&mut self) {
+    /// An entry the walk could not list, or a queued directory that is gone
+    /// with no confirmed removal, proves nothing absent: no erasure this walk.
+    pub(super) fn unlisted(&mut self) {
         self.fold.debt.incomplete = true;
     }
 

@@ -47212,7 +47212,7 @@ fn advance_bounded_directory_traversal_with_budget(
                         disappearance_diagnostics::Site::WalkDirectory,
                     );
                 } else {
-                    debt.unlisted_directory();
+                    debt.unlisted();
                     disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
@@ -47288,6 +47288,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(_) => {
@@ -47328,6 +47329,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(metadata) => metadata,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

@@ -1217,7 +1217,8 @@ impl Txn<'_> {
         parts: u16,
         refs_only: bool,
     ) -> Result<()> {
-        if self.store.import {
+        // Freshness bookkeeping never sizes the next collection page.
+        if self.store.import || tail::bookkeeping(key) {
             return Ok(());
         }
         let old = self.get(key)?;
