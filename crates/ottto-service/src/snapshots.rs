@@ -53418,6 +53418,10 @@ pub(crate) fn claude_registration_display_title(value: String) -> Option<String>
     normalize_display_title(value, "custom_title")
 }
 
+pub(crate) fn prompt_prefix_display_title(value: String) -> Option<String> {
+    normalize_display_title(value, "first_prompt")
+}
+
 fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
     let raw = value.trim();
     if raw.is_empty()
