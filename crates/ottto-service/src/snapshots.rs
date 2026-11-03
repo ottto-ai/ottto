@@ -29570,6 +29570,9 @@ impl OwnedSourceScan {
                 // side seal for its live member, minted before the checkpoint
                 // is dropped (a group job retains no reduction).
                 let mut cursor_side_group_seal = None;
+                // A certified job's own seal bit for its Tail write: whether
+                // the native EOF applied an unterminated final record.
+                let mut cursor_eof_applied = None;
                 if let Some(context) = sampling.as_ref().filter(|_| active.cursor.is_some()) {
                     let current_scope = sampled_scan::reduction_dependencies(
                         source,
@@ -29630,6 +29633,7 @@ impl OwnedSourceScan {
                             // no reduction (its replay is joined).
                             cursor_side_unsealed =
                                 Some(publication.eof_applied() || fragment.is_some());
+                            cursor_eof_applied = Some(publication.eof_applied());
                             if active.group.is_some() {
                                 cursor_side_group_seal = Some(checkpoint.seal_as(
                                     sampled_scan::now_seconds(),
@@ -29968,7 +29972,15 @@ impl OwnedSourceScan {
                 // retired first, before either clone, and only where a copy can
                 // be retained (the predicates of the two clones below); a
                 // completion that retains nothing retires no proof.
+                // A codec source keeps no RAM copy (`keeps_ram`), so neither
+                // completion retains one: no proof retires for it and no copy
+                // budget is reserved.
+                #[cfg(unix)]
+                let keeps_ram = tail_source::keeps_ram(source);
+                #[cfg(not(unix))]
+                let keeps_ram = true;
                 let retaining = cache_compatible
+                    && keeps_ram
                     && match cursor_certificate.as_ref() {
                         Some(certificate) => certificate.is_some() && sealed_only,
                         None => file_sampling.is_some() && side_origin.is_none(),
@@ -30358,6 +30370,12 @@ impl OwnedSourceScan {
                             tail_base,
                             quiet_audit_checked,
                         )
+                    })
+                    // A certified cursor job stages its Tail the same way,
+                    // under its own seal bit.
+                    .map(|tail| match cursor_eof_applied {
+                        Some(eof_applied) => tail_source::certified_job(tail, eof_applied),
+                        None => tail,
                     });
                 #[cfg(unix)]
                 let parsed_file = {
@@ -31427,14 +31445,25 @@ impl OwnedSourceScan {
                     } else {
                         ScanParseOutcome::ConfirmedEmpty
                     };
-                    // N2: with the certified prefix copy retained, the entry
-                    // records only `[0, s)` as read, so the next page tails
-                    // the withheld record with main's EOF behavior. Without a
-                    // copy it records the length read and the staged debt
-                    // re-selects it at the audit cadence.
+                    // N2: with the certified prefix continued (its retained
+                    // copy, or for a codec source its staged Tail head), the
+                    // entry records only `[0, s)` as read, so the next page
+                    // tails the withheld record with main's EOF behavior.
+                    // Without a continuation it records the length read and
+                    // the staged debt re-selects it at the audit cadence.
+                    #[cfg(unix)]
+                    let prefix_continued =
+                        |completed: &sampled_jsonl::CompletedNativeAcquisition| {
+                            completed.reduction.is_some() || tail_reused == Some(true)
+                        };
+                    #[cfg(not(unix))]
+                    let prefix_continued =
+                        |completed: &sampled_jsonl::CompletedNativeAcquisition| {
+                            completed.reduction.is_some()
+                        };
                     let bound_fragment = cursor_fragment.and_then(|fragment| {
                         completed_acquisition.as_ref().and_then(|completed| {
-                            (completed.reduction.is_some()
+                            (prefix_continued(completed)
                                 && completed.checkpoint.sealed_offset() == fragment.offset)
                                 .then(|| {
                                     codex_fragment::BoundFragment::bind(&candidate, fragment.offset)
@@ -31443,11 +31472,9 @@ impl OwnedSourceScan {
                         })
                     });
                     let mut recorded = candidate;
-                    if let Some(fragment) = cursor_fragment.filter(|_| {
-                        completed_acquisition
-                            .as_ref()
-                            .is_some_and(|completed| completed.reduction.is_some())
-                    }) {
+                    if let Some(fragment) = cursor_fragment
+                        .filter(|_| completed_acquisition.as_ref().is_some_and(prefix_continued))
+                    {
                         recorded.size_bytes = fragment.offset;
                     }
                     // record consumes the candidate but does not use its root.
@@ -33549,10 +33576,17 @@ impl OwnedSourceScan {
                 let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
                 // U1a-2a G4a: a side read is a full read with no retained
                 // state, and 2a reads only a singleton (otherwise main's Skip).
+                // A codec source keeps no RAM copy: its continuation is the
+                // committed head on its route, so an append is sized from the
+                // head's sealed offset.
+                let continued = context.cache.retained_sealed_offset(&key);
+                #[cfg(unix)]
+                let continued =
+                    continued.or_else(|| tail_source::committed_sealed_offset(source, index, &key));
                 let expected = if side_plan.is_some() {
                     extent
                 } else {
-                    extent.saturating_sub(context.cache.retained_sealed_offset(&key).unwrap_or(0))
+                    extent.saturating_sub(continued.unwrap_or(0))
                 };
                 if side_plan.is_some()
                     && expected > sampled_scan::codex_cursor::Limits::current().singleton()

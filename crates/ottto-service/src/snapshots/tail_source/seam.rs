@@ -92,6 +92,13 @@ impl PendingTail {
         })
     }
 
+    /// A certified cursor job's own seal bit in place of its certificate's
+    /// fail-closed `unsealed` (`tail_source::certified_job`).
+    pub(in crate::snapshots) fn sealed_by_job(mut self, eof_applied: bool) -> Self {
+        self.unsealed = eof_applied;
+        self
+    }
+
     /// The PRE seam: encode into the local buffer only.
     pub(in crate::snapshots) fn encode(&mut self, view: &PreFinalization<'_>) {
         let encoded = (self.encode)(view, self);

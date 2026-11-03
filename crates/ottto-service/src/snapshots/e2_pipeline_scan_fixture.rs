@@ -65,9 +65,7 @@ pub(crate) fn routed_for_test(
             }
             let mut page = index.clone();
             if save_on_route(&mut page, mine).is_ok() {
-                let mut loaded = carry(ScanIndex::load(mine).unwrap());
-                carry_fragments(&index, &mut loaded);
-                return loaded;
+                return carry(ScanIndex::load(mine).unwrap());
             }
         }
     }
@@ -167,18 +165,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
 }
 
 /// An empty graph holding only `index`'s runtime-only fields.
-/// The same owner's RAM-only Codex EOF fragment custody (`codex_fragment`,
-/// never serialized) across its own save and reload, as the RAM-era fixture
-/// kept it by passing the prior in memory. A cold or new-route arm never
-/// receives it.
-fn carry_fragments(from: &ScanIndex, into: &mut ScanIndex) {
-    for (key, entry) in &from.files {
-        if let (Some(fragment), Some(loaded)) = (&entry.codex_fragment, into.files.get_mut(key)) {
-            loaded.codex_fragment = Some(fragment.clone());
-        }
-    }
-}
-
 fn runtime_only(index: &ScanIndex) -> ScanIndex {
     let mut runtime = ScanIndex::default();
     carry_runtime(index, &mut runtime);
@@ -379,7 +365,6 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
     save_on_route(index, &route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
     carry_runtime(index, &mut loaded);
-    carry_fragments(index, &mut loaded);
     loaded
 }
 
