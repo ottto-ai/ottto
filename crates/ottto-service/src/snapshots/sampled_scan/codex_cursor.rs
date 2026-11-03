@@ -476,6 +476,13 @@ pub(in crate::snapshots) struct OpenStamp {
     changed: (i64, i64),
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
+crate::durable_tail_codec::durable_struct!(OpenStamp {
+    N dev: u64,
+    N ino: u64,
+    N extent: u64,
+    N modified: (i64, i64),
+    N changed: (i64, i64),
+});
 
 /// The cursor/acquisition content key, without metadata-only ctime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6170,6 +6177,38 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     revalidate_decisions(job, traces, parents)
 }
 
+/// What this cycle's traces say about a read's earlier priority decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum PriorityDecisions {
+    Hold,
+    /// Absent or incomplete traces cannot prove a decision changed.
+    Unavailable,
+    Changed,
+}
+
+/// The one comparison of earlier priority decisions with current traces,
+/// shared by a paused job's resume and a Tail load's LIVE install.
+pub(in crate::snapshots) fn priority_decisions(
+    observed: &BTreeMap<String, bool>,
+    traces: Option<&Arc<CodexTurnTraceMap>>,
+) -> PriorityDecisions {
+    if traces.is_none() && observed.values().any(|priority| *priority) {
+        return PriorityDecisions::Unavailable;
+    }
+    let decisions_hold = observed.iter().all(|(turn, priority)| {
+        *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
+    });
+    if decisions_hold {
+        PriorityDecisions::Hold
+    } else if traces.is_some_and(|traces| traces.is_incomplete()) {
+        // R2-H1: a failed or capped trace load cannot prove a decision
+        // changed; the read waits for complete evidence.
+        PriorityDecisions::Unavailable
+    } else {
+        PriorityDecisions::Changed
+    }
+}
+
 /// Every priority decision so far still holds under this cycle's traces;
 /// then this cycle's traces and parent ledgers are installed.
 fn revalidate_decisions(
@@ -6185,21 +6224,10 @@ fn revalidate_decisions(
     else {
         return Resume::Changed;
     };
-    match traces.as_ref() {
-        None if observed.values().any(|priority| *priority) => return Resume::Unavailable,
-        traces => {
-            let decisions_hold = observed.iter().all(|(turn, priority)| {
-                *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
-            });
-            if !decisions_hold {
-                // R2-H1: a failed or capped trace load cannot prove a
-                // decision changed; the job waits for complete evidence.
-                if traces.is_some_and(|traces| traces.is_incomplete()) {
-                    return Resume::Unavailable;
-                }
-                return Resume::Changed;
-            }
-        }
+    match priority_decisions(observed, traces.as_ref()) {
+        PriorityDecisions::Hold => {}
+        PriorityDecisions::Unavailable => return Resume::Unavailable,
+        PriorityDecisions::Changed => return Resume::Changed,
     }
     let accumulator = &mut job.parser.accumulator;
     accumulator.codex_turn_traces = traces;
