@@ -558,8 +558,11 @@ fn codex_header(id: &str, account: Option<&str>, at: &str) -> String {
     serde_json::json!({"timestamp": at, "type": "session_meta", "payload": payload}).to_string()
 }
 
+/// The plain `rollout-<id>` name: its id is the path's one candidate. A
+/// timestamped name needs the sidecar's identity (production binds it), and
+/// this finish passes no sidecar, so its creator witness would be withheld.
 fn rollout_name(id: &str) -> String {
-    format!("rollout-2026-10-18T10-00-00-{id}.jsonl")
+    format!("rollout-{id}.jsonl")
 }
 
 /// `turns` closed turns under `id`'s own header with `account`'s creator pair.
