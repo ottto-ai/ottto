@@ -419,7 +419,25 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             let owed = warm.index.upload_context_owed_file_count();
             assert!(owed > 0, "{label}: positive control, unproven files");
 
+            for (key, entry) in &warm.index.files {
+                eprintln!(
+                    "PRIV1DIAG7 {label} warm file={:?} rearmed={} evidence_owed={}",
+                    Path::new(key).file_name(),
+                    entry.rearmed(),
+                    entry.evidence_owed
+                );
+            }
             let mut quiet = page_under(&c, &scanner, warm.index.clone(), after);
+            eprintln!("PRIV1DIAG7 {label} quiet modes={:?}", quiet.modes);
+            for item in &quiet.scan.snapshots {
+                eprintln!(
+                    "PRIV1DIAG7 {label} quiet emitted session={} requests={} removed={:?} file={:?}",
+                    item.source_session_id,
+                    item.request_count,
+                    item.removed_request_count,
+                    item.source_file_fingerprint.is_some()
+                );
+            }
             assert_eq!(
                 (quiet.modes.0, quiet.modes.1),
                 (0, 0),

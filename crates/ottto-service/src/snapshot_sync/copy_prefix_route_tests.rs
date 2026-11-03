@@ -158,7 +158,18 @@ fn never_delivered_holder_is_read_at_most_once_beside_a_new_copy() {
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
+            for item in &p.scan.snapshots {
+                eprintln!(
+                    "PRIV1DIAG6 page={page} holder_read={} copy_read={} emitted session={} requests={} removed={:?}",
+                    reads[page - 1],
+                    opened(&scanner, &path),
+                    item.source_session_id,
+                    item.request_count,
+                    item.removed_request_count
+                );
+            }
             let sent = deliver_counting(&mut p);
+            eprintln!("PRIV1DIAG6 page={page} posts={sent}");
             posts.push(sent);
             if reads[page - 1] {
                 assert!(
