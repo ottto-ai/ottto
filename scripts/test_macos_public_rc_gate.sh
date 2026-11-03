@@ -51,9 +51,9 @@ cat > "$app_contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>
   <string>Ottto</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0-stable-candidate.1</string>
+  <string>0.1.0-rc1</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0-stable-candidate.1</string>
+  <string>0.1.0-rc1</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 </dict>
@@ -83,8 +83,8 @@ jq -n '{
   checked_at: "2026-05-21T00:00:00Z",
   wait_seconds: 1,
   bundle_id: "net.ottto.Companion",
-  bundle_version: "0.1.0-stable-candidate.1",
-  bundle_short_version: "0.1.0-stable-candidate.1",
+  bundle_version: "0.1.0-rc1",
+  bundle_short_version: "0.1.0-rc1",
   executable_name: "Ottto",
   process_survived_wait: true,
   crash_reports: []
@@ -93,7 +93,7 @@ jq -n '{
 write_candidate_manifest() {
   local channel="$1"
   local manifest="$2"
-  local version="0.1.0-stable-candidate.1"
+  local version="0.1.0-rc1"
   local prefix="https://install.ottto.net/ottto-local-platform/releases/$channel/$version"
 
   jq -n \
@@ -187,8 +187,8 @@ write_candidate_manifest() {
           checked_at: "2026-05-21T00:00:00Z",
           wait_seconds: 1,
           bundle_id: "net.ottto.Companion",
-          bundle_version: "0.1.0-stable-candidate.1",
-          bundle_short_version: "0.1.0-stable-candidate.1",
+          bundle_version: "0.1.0-rc1",
+          bundle_short_version: "0.1.0-rc1",
           executable_name: "Ottto",
           process_survived_wait: true,
           crash_reports: [],
@@ -244,11 +244,13 @@ write_stable_binding_manifest() {
   local commit="$2"
   local candidate_sha="$3"
   local evidence_path="$4"
+  local app_commit="${5:-123456abcdef123456abcdef123456abcdef1234}"
 
   jq -n \
     --arg commit "$commit" \
     --arg candidate_sha "$candidate_sha" \
     --arg evidence_path "$evidence_path" \
+    --arg app_commit "$app_commit" \
     '{
       schema_version: 1,
       product: "ottto-local-platform",
@@ -256,6 +258,12 @@ write_stable_binding_manifest() {
       channel: "stable",
       commit: $commit,
       min_protocol_version: 15,
+      supply_chain: {
+        materials: [
+          {kind: "git_repository", repository: "ottto-ai/ottto", commit: "abcdef123456abcdef123456abcdef123456abcd"},
+          {kind: "git_subtree", repository: "ottto-ai/coding-agents-observability", commit: $app_commit, path: "tools/ottto-macos-app"}
+        ]
+      },
       quality_gates: {
         stable_candidate_rc: {
           status: "passed",
@@ -278,7 +286,7 @@ jq -e \
   --arg candidate_sha "$candidate_sha" \
   '.local_platform.runtime == "ottto-service"
    and .local_platform.service_label == "net.ottto.service"
-   and .local_platform.version == "0.1.0-stable-candidate.1"
+   and .local_platform.version == "0.1.0-rc1"
    and .local_platform.release_channel == "stable-candidate"
    and .local_platform.protocol_version == 15
    and .local_platform.release_manifest_sha256 == $candidate_sha
@@ -349,6 +357,20 @@ expect_failure "stable binding stale protocol rejected" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_protocol"
 grep -q "stable manifest min_protocol_version must be 15" /tmp/macos-public-rc-gate.out
+
+bad_stable_app_commit="$TMP_DIR/bad-stable-app-commit-manifest.json"
+write_stable_binding_manifest \
+  "$bad_stable_app_commit" \
+  "abcdef123456" \
+  "$candidate_sha" \
+  "stable-candidate-rc-qa.json" \
+  "999999abcdef123456abcdef123456abcdef1234"
+expect_failure "stable binding app source commit mismatch" \
+  "$GATE" \
+  --candidate-manifest "$candidate_manifest" \
+  --evidence "$passed_evidence" \
+  --stable-manifest "$bad_stable_app_commit"
+grep -q "release identity (base version, commit, app source commit)" /tmp/macos-public-rc-gate.out
 
 dev_manifest="$TMP_DIR/dev-release-manifest.json"
 write_candidate_manifest "dev" "$dev_manifest"

@@ -224,7 +224,7 @@ if env -u GH_TOKEN -u GITHUB_TOKEN \
   echo "Singular guard failed while verifying the private app source" >&2
   exit 2
 fi
-if ! env -u GH_TOKEN -u GITHUB_TOKEN \
+if ! env -u GH_TOKEN -u GITHUB_TOKEN GIT_TERMINAL_PROMPT=0 \
   git -C "$MAC_APP_GIT_ROOT" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
   fetch -q --no-tags "https://github.com/$MAC_APP_SOURCE_REPOSITORY.git" refs/heads/master; then
   echo "Could not fetch the private app source master from GitHub" >&2

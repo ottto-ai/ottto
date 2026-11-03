@@ -191,8 +191,11 @@ and `X.Y.Z` (stable), dispatch on the same tag, so they build the same public an
 app source commits. `scripts/macos_release_source_check.sh` checks the tag, the
 first-parent position on `main`, and the CI run before packaging; the packager
 then requires the app source checkout to be at the pinned commit and that commit
-to be on the first-parent line of the app source `master`. A tag cannot be moved
-or deleted: a release that needs new code uses a new version and tag.
+to be on the first-parent line of the app source `master`. Protected release
+tags cannot be moved or deleted: a release that needs new code uses a new
+version and tag. The stable-candidate RC gate also requires the stable manifest
+to match the verified candidate's base version, public commit, and app source
+commit.
 
 Before cutting a stable build, build an internal stable-candidate RC from the
 same commit and attach redacted stable-candidate evidence. Generate the
