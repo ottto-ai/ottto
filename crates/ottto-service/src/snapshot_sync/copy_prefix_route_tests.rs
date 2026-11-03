@@ -135,9 +135,10 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// earns its receipt. A family re-arm on that page may clear its revision for
 /// one forced reparse, so it is read at most once more; the restored revision
 /// lets the receipt prove. A copy's prefix goes only once its origin's body is
-/// accepted (#1253): page 1 sends the copy with the prefix flagged, page 3 the
-/// copy with the prefix removed after the holder's page-2 body was ACKed, and
-/// page 4 sends nothing.
+/// accepted (#1253): page 1 sends the copy with the prefix flagged and the
+/// holder; page 2 re-folds the copy from stored state with the prefix removed
+/// and sends it as an ordinary update (L02), equal to a cold Full; pages 3-4
+/// neither read the holder nor POST anything.
 #[test]
 fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
     // As every owner of this harness: commits persist durable records.
@@ -221,8 +222,8 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         );
         assert_eq!(
             (&reads[2..], &posts[..], removed_on),
-            (&[false, false][..], &[1_usize, 0, 1, 0][..], Some(3)),
-            "pages 3-4 never read the holder; only pages 1 and 3 POST, page 3 \
+            (&[false, false][..], &[1_usize, 1, 0, 0][..], Some(2)),
+            "pages 3-4 never read the holder; only pages 1 and 2 POST, page 2 \
              the copy with its prefix removed (reads {reads:?}, posts {posts:?}, {pages:#?})"
         );
     });
