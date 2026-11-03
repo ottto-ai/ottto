@@ -576,7 +576,6 @@ pub(super) fn equality_skip(
     now: u64,
     decision_calls: &mut u64,
 ) -> bool {
-    let key = local_index_key(&candidate.path);
     if candidate.source_file_fingerprint.is_empty() {
         return false;
     }
