@@ -941,6 +941,14 @@ impl ReadPlan {
     pub(crate) fn mode(&self) -> ReadMode {
         self.mode
     }
+    /// A Full with no checkpoint whose stored state already proved the file
+    /// changed: the read is the same, its reason is the proven one.
+    pub(crate) fn name_proven_full(&mut self, reason: FullReason) -> ReadMode {
+        if self.mode == ReadMode::Full(FullReason::StateMissing) {
+            self.mode = ReadMode::Full(reason);
+        }
+        self.mode
+    }
     /// Length frozen when this acquisition opened. A multi-page reader never
     /// consumes past it; later appends belong to the next tail.
     pub(crate) fn frozen_length(&self) -> u64 {
@@ -1547,6 +1555,21 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// APFS moves an object's birth down to its mtime when the mtime is set
+/// below it: the same device and inode then report an earlier birth equal to
+/// the new mtime. That is a metadata-only change of the certified object, not
+/// a replacement; the samples, checked next, still decide its content. Linux
+/// keeps birth constant, so this never applies there.
+#[cfg(unix)]
+fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| u64::try_from(since.as_nanos()).ok());
+    birth < certified && modified == Some(birth)
+}
+
 #[cfg(unix)]
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
@@ -1594,39 +1617,7 @@ impl CertificateRefusal {
 
 #[cfg(unix)]
 impl DurableCertificate {
-    /// Whether the held FD is still this certificate's object with `[0, s)`
-    /// unchanged as far as samples can tell: the same device, inode and (when
-    /// both are known) birth; not shorter; at an equal length, the same mtime;
-    /// both windows hash to the certified digests; and no stamp change while
-    /// the windows were read. ctime is never compared. A refusal is the reason
-    /// the read must be Full; no partial state exists to undo. It seeks the
-    /// FD; the caller's read plan positions it again before any native read.
-    #[cfg(test)]
-    pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
-        self.admit_samples(file, false)
-            .map(|(admission, ..)| admission)
-            .map_err(|refusal| match refusal {
-                CertificateRefusal::Changed(reason) => reason,
-                CertificateRefusal::ReadError => FullReason::InvalidCheckpoint,
-            })
-    }
-
-    /// `admits`, then the RAM checkpoint a restore continues from: this
-    /// certificate's stamp (with the current ctime, which is never a refusal
-    /// input), `scope`, the sample windows just re-read and verified from the
-    /// held FD, and the certified audit clock and debt. `select_mode` then
-    /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
-    #[cfg(test)]
-    pub(crate) fn restore(
-        &self,
-        file: &mut File,
-        scope: Scope,
-    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        self.restore_with_append(file, scope, false)
-    }
-
     /// The native engine's grown path permits concurrent appends outside the certified prefix.
-    /// The legacy certificate fixture above keeps its exact metadata guard.
     pub(crate) fn restore_grown(
         &self,
         file: &mut File,
@@ -1667,47 +1658,6 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
-    /// A stale interpretation cannot hide independent physical/content edits.
-    /// Mtime alone is deliberately excluded: compare the existing bounded
-    /// samples even when the unchanged-length mtime moved.
-    pub(crate) fn independent_edit(
-        &self,
-        file: &mut File,
-    ) -> Result<Option<FullReason>, CertificateRefusal> {
-        let stamp = file
-            .metadata()
-            .and_then(FileStamp::capture)
-            .map_err(|_| CertificateRefusal::ReadError)?;
-        if stamp.device == self.device
-            && stamp.inode == self.inode
-            && stamp.length == self.length
-            && stamp.modified == self.modified
-            && (self.birth_nanos == 0
-                || birth_unix_nanos(&file.metadata().map_err(|_| CertificateRefusal::ReadError)?)
-                    == self.birth_nanos)
-        {
-            return Ok(None);
-        }
-        let mut probe = self.clone();
-        probe.modified = stamp.modified;
-        match probe.admit_samples(file, false) {
-            Err(CertificateRefusal::Changed(
-                reason @ (FullReason::Replaced
-                | FullReason::Shrunk
-                | FullReason::HeadChanged
-                | FullReason::BoundaryChanged),
-            )) => Ok(Some(reason)),
-            Ok(_) | Err(CertificateRefusal::Changed(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// The existing allocation-free certificate edits. Keep these before
-    /// typed decode/rederive admission so resource pressure cannot hide a metadata change.
-    pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
-        self.checked_stamp(file).map(|_| ())
-    }
-
     fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
@@ -1720,7 +1670,10 @@ impl DurableCertificate {
         let birth = birth_unix_nanos(&metadata);
         if stamp.device != self.device
             || stamp.inode != self.inode
-            || (self.birth_nanos != 0 && birth != 0 && birth != self.birth_nanos)
+            || (self.birth_nanos != 0
+                && birth != 0
+                && birth != self.birth_nanos
+                && !birth_clamped(self.birth_nanos, birth, &metadata))
         {
             return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
@@ -1988,151 +1941,6 @@ mod tests {
         assert_eq!(read, 0);
         assert_eq!(next.audit_debt(), debt);
         assert_eq!(next.last_full_verified(), 100);
-    }
-
-    /// The production persisted certificate is restored after the checkpoint
-    /// is dropped; actual FD reads below prove only the appended suffix runs.
-    #[test]
-    fn durable_checkpoint_ignores_audit_age_and_clock_without_full_credit() {
-        use crate::durable_tail_store as store;
-        struct StoreDir(PathBuf);
-        impl Drop for StoreDir {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        for (now, due, append) in [
-            (8_000, None, true),
-            (8_000, Some(1_100), true),
-            (8_000, Some(1_100), false),
-            (181_000, Some(1_100), true),
-            (900, Some(u64::MAX), true),
-        ] {
-            let f = Fixture::new(b"one\n");
-            let mut cp = initial(&f, 1_000);
-            cp.audit_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
-            // Main persists this certificate in the binary store envelope;
-            // Serde derives exist only on the excluded bootstrap branch.
-            let state = StoreDir(f.0.with_extension("certificate-state"));
-            fs::create_dir_all(&state.0).unwrap();
-            let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
-            crate::snapshots::ScanIndex::default()
-                .save(&state.0.join("index.json"))
-                .unwrap();
-            let source = store::DurableSource::Codex;
-            let key = store::key_digest(source, "certificate-roundtrip");
-            // The store preserves unknown shapes, so use the shipped v1
-            // Codex allowlist and its existing real-codec fixture body.
-            let pin = "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189";
-            let allowlist =
-                std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
-            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
-            let saved = store::PendingRecord {
-                acquisition: Some(store::AcquisitionFields {
-                    acquired_revision: 3,
-                    protocol: crate::snapshots::AcquisitionProtocol::Legacy,
-                }),
-                binding: store::Binding {
-                    source,
-                    key,
-                    context: store::context_digest("certificate-fixture", None),
-                    scope: store::scope_digest(&scope().0, &allowlist, "", ""),
-                    entry: [0; 32],
-                },
-                certificate: cp.durable_certificate(0).unwrap(),
-                body: crate::snapshots::durable_store_fixture_body(
-                    crate::snapshots::SnapshotSource::Codex,
-                    1,
-                    7,
-                ),
-                allowlist,
-            };
-            assert_eq!(
-                disk.write_after_save(&lock, 1, 0, vec![saved])
-                    .unwrap()
-                    .written,
-                1
-            );
-            drop(disk);
-            drop(cp);
-            if append {
-                f.append(b"two\n");
-            }
-            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
-            let certificate = match disk.read(&key) {
-                store::ReadOutcome::Found(record) => record.record.certificate,
-                other => panic!("{other:?}"),
-            };
-            let mut file = f.open();
-            let (result, reads) = capture_sample_reads(|| certificate.restore(&mut file, scope()));
-            let (restored, admission) = result.unwrap();
-            assert_eq!(
-                reads,
-                vec![
-                    SampleRead {
-                        offset: Ok(0),
-                        requested: 4,
-                        result: Ok(4)
-                    },
-                    SampleRead {
-                        offset: Ok(0),
-                        requested: 4,
-                        result: Ok(4)
-                    },
-                ]
-            );
-            assert_eq!(
-                admission.sample_bytes_read, 8,
-                "quiet restore is not zero I/O"
-            );
-            assert_eq!(restored.last_full_verified(), 1_000);
-            assert_eq!(
-                restored.audit_debt(),
-                None,
-                "#865: no envelope debt fallback"
-            );
-            let current_index_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
-            let mut plan = ReadPlan::prepare(
-                &mut file,
-                Some(&restored),
-                &scope(),
-                current_index_debt,
-                now,
-            )
-            .unwrap();
-            assert_eq!(
-                plan.mode(),
-                if append {
-                    ReadMode::Tail
-                } else {
-                    ReadMode::Unchanged
-                }
-            );
-            assert_eq!(plan.start_offset(), 4);
-            let mut suffix = Vec::new();
-            file.read_to_end(&mut suffix).unwrap();
-            assert_eq!(
-                suffix,
-                if append {
-                    b"two\n".as_slice()
-                } else {
-                    b"".as_slice()
-                }
-            );
-            if append {
-                plan.observe_complete_records(&suffix).unwrap();
-            }
-            let next = plan
-                .commit_after_native_completion(&file, &scope(), now)
-                .unwrap();
-            assert_eq!(next.last_full_verified(), 1_000, "no Full credit");
-            assert_eq!(next.sealed_offset(), if append { 8 } else { 4 });
-            assert_eq!(
-                next.audit_debt().unwrap().due_unix_seconds,
-                due.unwrap_or(4_600)
-                    .min(if append { 4_600 } else { u64::MAX })
-            );
-        }
     }
 
     #[test]
@@ -3637,6 +3445,58 @@ mod tests {
                     "{change:?}: {reason:?}"
                 ),
             }
+        }
+    }
+
+    /// [behaviour] Backdating a certified file's mtime, which on APFS moves
+    /// its birth down to that mtime, keeps the grown file's Tail; a birth
+    /// earlier than the certified one is still a replacement.
+    #[cfg(unix)]
+    #[test]
+    fn durable_certificate_continues_across_a_birth_clamp_only() {
+        let f = Fixture::new(b"{\"a\":1}\n{\"b\":2}\n");
+        let checkpoint = initial(&f, 1_000);
+        let birth = birth_unix_nanos(&f.open().metadata().unwrap());
+        let certificate = checkpoint.durable_certificate(birth).unwrap();
+        f.append(b"{\"c\":3}\n");
+        let backdated = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        f.open()
+            .set_times(fs::FileTimes::new().set_modified(backdated))
+            .unwrap();
+        let now_birth = birth_unix_nanos(&f.open().metadata().unwrap());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            now_birth,
+            86_400 * 1_000_000_000,
+            "APFS clamps birth to mtime"
+        );
+        let (restored, admission) = certificate
+            .restore_grown(&mut f.open(), scope())
+            .expect("the certified object continues");
+        assert!(!admission.unchanged);
+        assert_eq!(
+            restored.samples.sealed_offset,
+            checkpoint.samples.sealed_offset
+        );
+        if now_birth != 0 {
+            let mut later = certificate.clone();
+            later.birth_nanos = now_birth - 1;
+            assert_eq!(
+                later.restore_grown(&mut f.open(), scope()).err(),
+                Some(CertificateRefusal::Changed(FullReason::Replaced)),
+                "a birth after the certified one is another object"
+            );
+            let mut unclamped = certificate.clone();
+            unclamped.birth_nanos = now_birth + 1;
+            assert_eq!(
+                unclamped.restore_grown(&mut f.open(), scope()).map(|_| ()),
+                if cfg!(target_os = "macos") {
+                    Ok(())
+                } else {
+                    Err(CertificateRefusal::Changed(FullReason::Replaced))
+                },
+                "only a birth equal to the mtime is a clamp"
+            );
         }
     }
 }

@@ -32,12 +32,6 @@ pub(super) fn active_cutover_unix_ms() -> i64 {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
-/// Preserve the optional representation at the pinned durable restore boundary.
-#[cfg(unix)]
-pub(super) fn cutover_unix_ms() -> Option<i64> {
-    Some(active_cutover_unix_ms())
-}
-
 /// Substitutes an epoch for scan-level tests on this thread until dropped.
 #[cfg(test)]
 pub(crate) struct TestCutover(i64);
@@ -682,15 +676,6 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
-}
-
-/// `singleton_view` by index key: the counting view a durable record
-/// binds to (written after a save and checked at restore, without a
-/// candidate).
-#[cfg(unix)]
-pub(super) fn singleton_view_of_key(key: &str, index: &ScanIndex) -> String {
-    let cutover = active_cutover_unix_ms();
-    view(key_evidence(key, index), cutover)
 }
 
 /// The counting view of a joined group (cursor K8): what

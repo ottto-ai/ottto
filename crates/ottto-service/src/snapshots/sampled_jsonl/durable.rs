@@ -1,586 +1,85 @@
-//! Durable warm-cache reuse: the record body for one retained
-//! `CachedJsonlReduction`, and the re-derivation of the content fields the
-//! body never carries.
-//!
-//! The body holds the allowlisted fields (`N`/`H`/`U`/`L`/`PL`, see
-//! `durable_tail_codec`) and, for each re-derived content field, the digest of
-//! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Growth-only restart restore prepays a
-//! bounded native content replay and fences every X field before adoption.
-//! Empty obligations move the paid decoded graph.
+//! Test support for the parser's native finish, plus the private local
+//! literal codec. Content (`X`) is never re-derived from the file: a Tail
+//! source stores it as session facts (D168-1).
 #![cfg_attr(
     not(test),
     allow(
         dead_code,
-        reason = "durable body helpers may be reached only from tests"
+        reason = "the native-finish support and local literal codec are reached only from tests"
     )
 )]
 
+#[cfg(test)]
 use std::fs::File;
 
 pub(crate) mod pl_text;
 
+#[cfg(test)]
 use super::*;
-use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, Refuse, Shape};
 
-/// Head re-parse bound for re-derived first-write-wins fields (Amendment 1,
-/// C-4).
-pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;
-/// Runtime bound only: outside the persisted allowlist digest.
-pub(crate) const TITLE_LINE_BOUND: u64 = 1024 * 1024;
-
-/// At most this many named lines are pread per entry; durable reuse uses
-/// one: the title.
-pub(crate) const NAMED_LINES: usize = 4;
-
-/// Digests (`H`) of the re-derived values. `None`: the field is empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Rederive {
-    first_prompt: Option<[u8; 32]>,
-    workspace: Option<[u8; 32]>,
-    agent_label: Option<[u8; 32]>,
-    session_start: Option<[u8; 32]>,
-    title: Option<[u8; 32]>,
-}
-crate::durable_tail_codec::durable_struct!(Rederive {
-    H first_prompt: Option<[u8; 32]>,
-    H workspace: Option<[u8; 32]>,
-    H agent_label: Option<[u8; 32]>,
-    H session_start: Option<[u8; 32]>,
-    H title: Option<[u8; 32]>,
-});
-
-fn digest(
-    domain: &str,
-    put: impl FnOnce(&mut Enc) -> Result<(), Refuse>,
-) -> Result<[u8; 32], Refuse> {
-    let mut e = Enc::hash(domain);
-    put(&mut e)?;
-    Ok(e.finish_hash())
-}
-
-fn first_prompt_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:first_prompt:v1", |e| {
-        acc.first_prompt_material.put(e)?;
-        acc.first_prompt_title.put(e)
-    })
-}
-
-fn workspace_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    workspace_value_digest(&acc.workspace_path)
-}
-
-fn workspace_value_digest(path: &Option<PathBuf>) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:workspace:v1", |e| path.put(e))
-}
-
-fn agent_label_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:agent_label:v1", |e| {
-        acc.codex_agent_label.put(e)
-    })
-}
-
-fn title_digest(acc: &SnapshotAccumulator) -> Result<[u8; 32], Refuse> {
-    digest("ottto-dt-rederive:title:v1", |e| acc.title.put(e))
-}
-
-/// The allowlist digest for `source`: the compiled field lists and classes
-/// of every persisted type, the static label table and the bounds.
-pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
-    let mut shape = Shape::default();
-    shape.push("ottto-dt-reduction:v1");
-    shape.push(source.api_slug());
-    shape.push(&format!(
-        "head_bound={HEAD_BOUND};named_lines={NAMED_LINES}"
-    ));
-    CachedJsonlReduction::shape(&mut shape);
-    Rederive::shape(&mut shape);
-    if let Some(source) = crate::durable_tail_store::DurableSource::from_snapshot(source) {
-        (source.properties().shape_extension)(&mut shape);
-    }
-    shape.digest()
-}
-
-/// Claude and Codex bodies add nothing after the shared shapes.
-pub(in crate::snapshots) fn no_shape_extension(_: &mut Shape) {}
-
-#[cfg(test)]
-pub(crate) fn shape_text() -> String {
-    let mut shape = Shape::default();
-    CachedJsonlReduction::shape(&mut shape);
-    Rederive::shape(&mut shape);
-    pi::shape_extension(&mut shape);
-    shape.text().to_string()
-}
-
-/// A mark within the head bound, or the field is not re-derivable.
-fn head_mark(mark: Option<u64>, field: &'static str) -> Result<u64, Refuse> {
-    mark.filter(|end| *end <= HEAD_BOUND)
-        .ok_or(Refuse::NotRederivable(field))
-}
-
-fn rederive_digests(acc: &SnapshotAccumulator) -> Result<Rederive, Refuse> {
-    let marks = acc.durable_marks;
-    let mut out = Rederive::default();
-    if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
-        head_mark(
-            marks.first_prompt,
-            "SnapshotAccumulator.first_prompt_material",
-        )?;
-        out.first_prompt = Some(first_prompt_digest(acc)?);
-    }
-    if acc.workspace_path.is_some() {
-        head_mark(marks.workspace, "SnapshotAccumulator.workspace_path")?;
-        out.workspace = Some(workspace_digest(acc)?);
-    }
-    if acc.codex_agent_label.is_some() {
-        head_mark(marks.agent_label, "SnapshotAccumulator.codex_agent_label")?;
-        out.agent_label = Some(agent_label_digest(acc)?);
-    }
-    out.session_start = acc
-        .session_start
-        .durable_content_digest(HEAD_BOUND)?
-        .map(|(digest, _)| digest);
-    if acc.title.is_some() {
-        marks
-            .title_line
-            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.title"))?;
-        out.title = Some(title_digest(acc)?);
-    }
-    Ok(out)
-}
-
-/// The record body for a retained reduction, or why it is not persisted.
-/// Only Claude Code and Codex entries are persisted.
-#[cfg(test)]
-pub(crate) fn encode(reduction: &CachedJsonlReduction, limit: usize) -> Result<Vec<u8>, Refuse> {
-    crate::durable_tail_store::DurableSource::from_snapshot(reduction.accumulator.source)
-        .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
-    encode_body(reduction, limit)
-}
-
-#[cfg(test)]
-pub(in crate::snapshots) fn encode_body(
-    reduction: &CachedJsonlReduction,
-    limit: usize,
-) -> Result<Vec<u8>, Refuse> {
-    let CachedJsonlReduction {
-        accumulator: acc,
-        report,
-        recognized_usage_drop_count,
-        positive_recognized_usage_count,
-        positive_usage_evidence,
-    } = reduction;
-    encode_parts(
-        acc,
-        report,
-        (
-            *recognized_usage_drop_count,
-            *positive_recognized_usage_count,
-            *positive_usage_evidence,
-        ),
-        limit,
-    )
-}
-
-/// A registry row's body walk over the borrowed live parts.
-pub(in crate::snapshots) type PutBody = fn(
-    &mut Enc<'_>,
-    &SnapshotAccumulator,
-    &JsonlReadReport,
-    (usize, usize, bool),
-    &Rederive,
-) -> Result<(), Refuse>;
-
-/// The Claude and Codex body: the reduction, then the re-derivation digests.
-pub(in crate::snapshots) fn put_body(
-    e: &mut Enc<'_>,
-    acc: &SnapshotAccumulator,
-    report: &JsonlReadReport,
-    scalars: (usize, usize, bool),
-    rederive: &Rederive,
-) -> Result<(), Refuse> {
-    CachedJsonlReduction::put_borrowed(e, acc, report, &scalars.0, &scalars.1, &scalars.2)?;
-    rederive.put(e)
-}
-
-/// Borrowed PRE-finalization state. Rederivation is computed once for both walks.
-pub(in crate::snapshots) struct BodyEncoding<'a> {
-    put: PutBody,
-    accumulator: &'a SnapshotAccumulator,
-    report: &'a JsonlReadReport,
-    scalars: (usize, usize, bool),
-    rederive: Rederive,
-}
-impl<'a> BodyEncoding<'a> {
-    pub(in crate::snapshots) fn new(
-        accumulator: &'a SnapshotAccumulator,
-        report: &'a JsonlReadReport,
-        scalars: (usize, usize, bool),
-        skill_labels_enabled: bool,
-    ) -> Result<Self, Refuse> {
-        if !skill_labels_enabled
-            && (!accumulator.activity_skills.is_empty() || !accumulator.provider_skills.is_empty())
-        {
-            return Err(Refuse::NonEmpty("skill_label_consent_off"));
-        }
-        pl_text::validate_skill_labels(
-            &accumulator.provider_skills,
-            "SnapshotAccumulator.provider_skills",
-        )?;
-        pl_text::validate_skill_labels(
-            &accumulator.activity_skills,
-            "SnapshotAccumulator.activity_skills",
-        )?;
-        // Reuse source registration; no additional Claude/Codex dispatch table.
-        let source = super::super::sampled_scan::durable_tail::durable_source(accumulator.source)
-            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
-        Ok(Self {
-            put: source.properties().put,
-            accumulator,
-            report,
-            scalars,
-            rederive: rederive_digests(accumulator)?,
-        })
-    }
-    fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
-        (self.put)(
-            e,
-            self.accumulator,
-            self.report,
-            self.scalars,
-            &self.rederive,
-        )
-    }
-    pub(in crate::snapshots) fn count(&self, limit: usize) -> Result<usize, Refuse> {
-        let mut e = Enc::count(limit);
-        self.put(&mut e)?;
-        Ok(e.counted())
-    }
-    pub(in crate::snapshots) fn write(
-        &self,
-        out: &mut dyn std::io::Write,
-        exact_len: usize,
-    ) -> Result<usize, Refuse> {
-        let mut e = Enc::writer(out, exact_len);
-        self.put(&mut e)?;
-        e.finish_written()
-    }
-}
-
-// Same field order as CachedJsonlReduction::put, for retained and live callers.
-#[cfg(test)]
-pub(in crate::snapshots) fn encode_parts(
-    acc: &SnapshotAccumulator,
-    report: &JsonlReadReport,
-    scalars: (usize, usize, bool),
-    limit: usize,
-) -> Result<Vec<u8>, Refuse> {
-    let plan = BodyEncoding::new(acc, report, scalars, true)?;
-    let len = plan.count(limit)?;
-    let mut out = Vec::with_capacity(len);
-    plan.write(&mut out, len)?;
-    Ok(out)
-}
-
-/// Production encoding always receives the effective cycle-owned permission.
-pub(in crate::snapshots) fn encode_permitted(
-    reduction: &CachedJsonlReduction,
-    limit: usize,
-    enabled: bool,
-) -> Result<Vec<u8>, Refuse> {
-    let (acc, report, scalars) = reduction.finish_view();
-    let plan = BodyEncoding::new(acc, report, scalars, enabled)?;
-    let len = plan.count(limit)?;
-    let mut out = Vec::with_capacity(len);
-    plan.write(&mut out, len)?;
-    Ok(out)
-}
-
-/// No allocation or transcript input: locate literals in a verified record body.
-pub(in crate::snapshots) fn body_has_skill_labels(
-    source: SnapshotSource,
-    body: &[u8],
-) -> Result<bool, Corrupt> {
-    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
-        .ok_or(Corrupt)?
-        .properties();
-    let mut d = Dec::new(body);
-    (row.verify)(&mut d)?;
-    Ok(d.has_pl_labels())
-}
-
-/// Structural body verification only: no reduction, re-derivation or live
-/// inputs. The caller separately checks source/binding and envelope integrity.
-/// Precondition: check size, mode and the envelope trailer before this walk.
-pub(in crate::snapshots) fn verify_body(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-    CachedJsonlReduction::verify(d)?;
-    Rederive::verify(d)?;
-    d.finish()
-}
-
-/// Decodes a Claude or Codex body, including the end check. The caller
-/// checks the decoded source against the row.
-pub(in crate::snapshots) fn take_body(d: &mut Dec<'_>) -> Result<Decoded, Corrupt> {
-    let reduction = CachedJsonlReduction::take(d)?;
-    let rederive = Rederive::take(d)?;
-    d.finish()?;
-    Ok(Decoded {
-        reduction,
-        rederive,
-    })
-}
-
-/// The registry row's decode walk, then the source binding.
-fn take_registered(d: &mut Dec<'_>, source: SnapshotSource) -> Result<Decoded, Corrupt> {
-    let row = crate::durable_tail_store::DurableSource::from_snapshot(source)
-        .ok_or(Corrupt)?
-        .properties();
-    let decoded = (row.take)(d)?;
-    if decoded.reduction.accumulator.source != source {
-        return Err(Corrupt);
-    }
-    Ok(decoded)
-}
-
-/// A decoded record before re-derivation. Its content fields are empty.
-pub(crate) struct Decoded {
-    reduction: CachedJsonlReduction,
-    rederive: Rederive,
-}
-
-#[cfg(test)]
-pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
-    let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
-    decode_body(body, source.properties().snapshot)
-}
-
-#[cfg(test)]
-pub(in crate::snapshots) fn decode_body(
-    body: &[u8],
-    source: SnapshotSource,
-) -> Result<Decoded, Corrupt> {
-    take_registered(&mut Dec::new(body), source)
-}
-
-/// Funds typed decode only; re-derivation is a separate allocation boundary.
-#[cfg(unix)]
-pub(crate) fn decode_bounded(
-    body: &[u8],
-    source: SnapshotSource,
-    lease: &mut crate::durable_tail_store::ActiveLease,
-) -> Result<Decoded, crate::durable_tail_codec::DecodeFailure> {
-    let source = crate::durable_tail_store::DurableSource::from_snapshot(source)
-        .ok_or(crate::durable_tail_codec::DecodeFailure::Integrity)?;
-    let row = source.properties();
-    (row.decode_bounded)(body, row.snapshot, lease)
-}
-
-#[cfg(unix)]
-pub(in crate::snapshots) fn decode_body_bounded(
-    body: &[u8],
-    source: SnapshotSource,
-    lease: &mut crate::durable_tail_store::ActiveLease,
-) -> Result<Decoded, crate::durable_tail_codec::DecodeFailure> {
-    use crate::durable_tail_codec::DecodeFailure;
-    if !crate::heap_layout_bound::layout_supported() {
-        return Err(DecodeFailure::Budget);
-    }
-    lease
-        .charge(std::mem::size_of::<Decoded>() as u64)
-        .map_err(|_| DecodeFailure::Budget)?;
-    let mut reserve = |bytes| lease.charge(bytes).is_ok();
-    let mut d = Dec::bounded(body, &mut reserve);
-    let result = take_registered(&mut d, source);
-    d.outcome(result)
-}
-
-/// Re-derivation I/O, for the per-pass receipt.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RederiveReceipt {
-    pub(crate) head_bytes: u64,
-    pub(crate) named_lines: u64,
-    pub(crate) line_bytes: u64,
-}
-
-impl Decoded {
-    /// Persist a deliberately inconsistent H in an otherwise native fixture.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn test_fence_body(mut self, class: usize) -> Vec<u8> {
-        let digest = match class {
-            0 => &mut self.rederive.first_prompt,
-            1 => &mut self.rederive.title,
-            2 => &mut self.rederive.agent_label,
-            3 => &mut self.rederive.session_start,
-            4 => &mut self.rederive.workspace,
-            _ => unreachable!(),
-        };
-        *digest = Some([0; 32]);
-        let put = crate::durable_tail_store::DurableSource::from_snapshot(
-            self.reduction.accumulator.source,
-        )
-        .unwrap()
-        .properties()
-        .put;
-        Enc::count_write(crate::durable_tail_store::BODY_BYTES, |e| {
-            let (acc, report, scalars) = self.reduction.finish_view();
-            put(e, acc, report, scalars, &self.rederive)
-        })
-        .unwrap()
-    }
-
-    pub(in crate::snapshots) fn permits_skill_labels(&self, enabled: bool) -> bool {
-        enabled
-            || self.reduction.accumulator.provider_skills.is_empty()
-                && self.reduction.accumulator.activity_skills.is_empty()
-    }
-}
-
-impl CachedJsonlReduction {
-    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.accumulator.durable_counting()
-    }
-}
-impl SnapshotAccumulator {
-    /// Immutable counting input and mutable ACK evidence remain distinct.
-    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.codex_counting.as_deref().map(|c| c.durable_contract())
-    }
-}
-#[cfg(unix)]
-mod bounded_value;
-#[cfg(unix)]
-mod content;
-
-/// Content obligations without a supported, pre-funded extractor.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) struct RederiveUnfunded;
-
-impl Decoded {
-    pub(crate) fn cutover(&self) -> Option<Option<i64>> {
-        self.reduction
-            .accumulator
-            .codex_counting
-            .as_deref()
-            .map(|c| c.durable_cutover())
-    }
-
-    /// Move the already-paid graph only when no content needs native input.
-    /// Even a zero head mark cannot excuse a nonempty digest obligation.
-    #[cfg(test)]
-    pub(crate) fn without_rederive(
-        self,
-    ) -> Result<(CachedJsonlReduction, RederiveReceipt), RederiveUnfunded> {
-        if self.rederive != Rederive::default() {
-            return Err(RederiveUnfunded);
-        }
-        Ok((self.reduction, RederiveReceipt::default()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.reduction.durable_counting()
-    }
-
-    pub(in crate::snapshots) fn immutable_counting(
-        &self,
-    ) -> Result<crate::snapshots::ImmutableCounting, crate::durable_tail_store::Refusal> {
-        crate::snapshots::ImmutableCounting::from_reduction(&self.reduction)
-    }
-
-    /// How far the head re-parse must read: the latest mark of a field to
-    /// re-derive. 0 when nothing needs the head.
-    pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
-        let acc = &self.reduction.accumulator;
-        let marks = acc.durable_marks;
-        let mut end = 0;
-        if self.rederive.first_prompt.is_some() {
-            end = end.max(head_mark(
-                marks.first_prompt,
-                "SnapshotAccumulator.first_prompt_material",
-            )?);
-        }
-        if self.rederive.workspace.is_some() {
-            end = end.max(head_mark(
-                marks.workspace,
-                "SnapshotAccumulator.workspace_path",
-            )?);
-        }
-        if self.rederive.agent_label.is_some() {
-            end = end.max(head_mark(
-                marks.agent_label,
-                "SnapshotAccumulator.codex_agent_label",
-            )?);
-        }
-        if self.rederive.session_start.is_some() {
-            end = end.max(head_mark(
-                acc.session_start.durable_content_end(),
-                "SessionStartState.content_end",
-            )?);
-        }
-        Ok(end)
-    }
-
-    /// The title line to pread, when the head re-parse does not reach it.
-    fn title_line(&self, head_end: u64) -> Result<Option<(u64, u64)>, Refuse> {
-        if self.rederive.title.is_none() {
-            return Ok(None);
-        }
-        let (offset, len) = self
-            .reduction
-            .accumulator
-            .durable_marks
-            .title_line
-            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.title"))?;
-        Ok((offset.saturating_add(len) > head_end).then_some((offset, len)))
-    }
-}
-
-#[cfg(test)]
-#[path = "durable_tests.rs"]
-mod tests;
-
-#[path = "durable_pi.rs"]
-pub(in crate::snapshots) mod pi;
-
-#[cfg(test)]
-pub(crate) fn test_replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
-    tests::replay_privacy_artifacts(root)
-}
-
+/// The finished parser's upload items, as the money tests compare them.
 #[cfg(test)]
 pub(in crate::snapshots) fn test_finish_items(
     parser: OwnedJsonlParser,
     path: &Path,
     source: SnapshotSource,
 ) -> Value {
-    tests::items(parser, path, source)
+    items(parser, path, source)
 }
 
 #[cfg(test)]
-pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
-    let reduction = CachedJsonlReduction {
-        accumulator: SnapshotAccumulator::new(source),
-        report: JsonlReadReport::default(),
-        recognized_usage_drop_count: count as usize,
-        positive_recognized_usage_count: sum as usize,
-        positive_usage_evidence: false,
-    };
-    encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
+/// The finished upload items of a parser that read to completion. Claude
+/// finishes with the money context the scan passes (the `e2` fold's read
+/// context over an index holding the file), so the money fold is compared
+/// too.
+fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    items_at(parser, path, source)
 }
 
 #[cfg(test)]
-pub(crate) fn store_skill_fixture_body() -> Vec<u8> {
-    store_skill_fixture_body_for_source(SnapshotSource::ClaudeCode)
-}
-
-#[cfg(test)]
-pub(crate) fn store_skill_fixture_body_for_source(source: SnapshotSource) -> Vec<u8> {
-    let mut decoded = decode(&store_fixture_body(source, 1, 7), source).unwrap();
-    decoded
-        .reduction
-        .accumulator
-        .note_provider_skill(Some("SyntheticPurgeLabel".into()));
-    encode(&decoded.reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
+fn items_at(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    const COLLECTED: &str = "2026-10-27T08:00:00Z";
+    let identity = opened_object_identity(source, &mut File::open(path).unwrap()).unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        local_index_key(path),
+        serde_json::from_value(
+            serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}),
+        )
+        .unwrap(),
+    );
+    let twins = Default::default();
+    let money =
+        (source == SnapshotSource::ClaudeCode).then_some(claude_request_money::e2::ReadContext {
+            index: &index,
+            path,
+            twins: &twins,
+        });
+    let parsed = parser
+        .finish_with_repository_identity(
+            &identity,
+            path,
+            COLLECTED,
+            "fp".into(),
+            None,
+            None,
+            None,
+            None,
+            money,
+        )
+        .unwrap();
+    // The fold is not serialized (`serde(skip)`): compare its entity body.
+    let money = parsed
+        .snapshots
+        .iter()
+        .map(|item| {
+            item.claude_money
+                .as_deref()
+                .map(|fold| format!("{:?}", fold.entity))
+        })
+        .collect::<Vec<_>>();
+    if source == SnapshotSource::ClaudeCode {
+        assert!(money.iter().all(Option::is_some), "the money fold ran");
+    }
+    serde_json::json!({"items": serde_json::to_value(&parsed.snapshots).unwrap(), "money": money})
 }

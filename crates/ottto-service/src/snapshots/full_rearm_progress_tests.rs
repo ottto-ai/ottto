@@ -1696,7 +1696,7 @@ fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
         .files
         .iter()
         .map(|(key, entry)| PendingIndexFinalization {
-            restored_behind_accepted: false,
+            stored_reuse: None,
             withheld_content: None,
             sampled_audit_verified: false,
             codex_pending_recovery: false,

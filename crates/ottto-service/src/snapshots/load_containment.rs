@@ -957,12 +957,8 @@ impl ScanIndex {
             .map(|(_, members)| members.len())
             .sum::<usize>()
             .saturating_add(self.claude_history_emission.skipped_carried_entries);
-        #[cfg(unix)]
-        let durable_head = sampled_scan::durable_tail::rederive_head_bytes_total(source);
-        #[cfg(not(unix))]
-        let durable_head = 0_u64;
         emit_scan_index_containment_line(format!(
-                "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} durable_rederive_head_bytes={durable_head} carried_ack_pending_age_seconds={age}",
+                "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} carried_ack_pending_age_seconds={age}",
             source.api_slug(), census_complete
         ));
     }

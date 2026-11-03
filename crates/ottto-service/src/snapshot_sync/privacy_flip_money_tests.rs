@@ -45,6 +45,8 @@ fn attribution_under(c: &Corpus, key: u8) -> crate::session_attribution::Session
 }
 
 fn page_under(c: &Corpus, scanner: &E2ScanFixture, mut index: ScanIndex, mode: Mode) -> Page {
+    // Claude continues from its state database route, never RAM.
+    index = scanner.routed(index, &c.base);
     let attribution = mode
         .policy
         .session_attribution_enabled

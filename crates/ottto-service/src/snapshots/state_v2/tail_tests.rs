@@ -1142,8 +1142,21 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     );
 }
 
-/// A published store whose head, page and live WAL hold these literals in the
-/// clear. The returned session keeps them there and erases them when dropped.
+/// The session facts S2 stores (D168-1), each seeded as `{literal}-{fact}`:
+/// title, first prompt material and display title, workspace, opening
+/// instructions and an opening file path.
+pub(crate) const TAIL_FACT_LITERALS: [&str; 6] = [
+    "TITLE",
+    "PROMPT",
+    "DISPLAY",
+    "WORKSPACE",
+    "INSTRUCTIONS",
+    "PATH",
+];
+
+/// A published store whose head, pages (session facts among them) and live
+/// WAL hold these literals in the clear. The returned session keeps them
+/// there and erases them when dropped.
 pub(crate) fn seed_tail_literals_for_test(
     support: &Path,
     literal: &str,
@@ -1155,12 +1168,20 @@ pub(crate) fn seed_tail_literals_for_test(
     );
     let path = session.path().to_owned();
     let (label, private) = (format!("{literal}-L"), format!("{literal}-PL"));
+    let facts: Vec<String> = TAIL_FACT_LITERALS
+        .iter()
+        .map(|fact| format!("{literal}-{fact}"))
+        .collect();
+    let fact_page = facts.join("\n");
     stage_tail(
         &path,
         FILE,
         staged(
             label.as_bytes(),
-            &[(Collection::ToolUses, 0, private.as_bytes())],
+            &[
+                (Collection::ToolUses, 0, private.as_bytes()),
+                (Collection::SessionFacts, 0, fact_page.as_bytes()),
+            ],
         ),
     )
     .unwrap();
@@ -1170,7 +1191,7 @@ pub(crate) fn seed_tail_literals_for_test(
         "-wal",
     ))
     .unwrap();
-    for needle in [&label, &private] {
+    for needle in [&label, &private].into_iter().chain(&facts) {
         assert!(
             wal.windows(needle.len()).any(|b| b == needle.as_bytes()),
             "positive control: the literal is stored in the clear"
@@ -1191,4 +1212,43 @@ pub(crate) fn stage_tail_for_test(path: &Path) {
 }
 pub(crate) fn tail_published_for_test(index: &ScanIndex) -> bool {
     read(index, FILE).is_ok_and(|(head, _)| head.is_some())
+}
+
+/// Every Tail kind a Claude file can hold, through the real route on the live
+/// session at `path`: a head of `canary`, a session-facts page past one
+/// fragment that starts with it, one revision of it and a sibling's set-aside
+/// marker. One full save commits them.
+pub(crate) fn seed_tail_kinds_for_test(path: &Path, index: &mut ScanIndex, canary: &str) {
+    let mut facts = canary.as_bytes().to_vec();
+    facts.extend(long_value());
+    stage_tail(
+        path,
+        FILE,
+        staged(canary.as_bytes(), &[(Collection::SessionFacts, 0, &facts)]),
+    )
+    .unwrap();
+    observe_tail(path, FILE, observation(&[canary.as_bytes()])).unwrap();
+    set_aside_tail(path, SIBLING, SetAsideCause::Encode).unwrap();
+    save_locked(path, index, false, None, true).unwrap();
+}
+/// Rows of each Tail kind in the store behind `index`, every file.
+pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for name in catalogue::TAIL_KINDS {
+            let kind = RecordKind::parse(name).unwrap();
+            let (mut count, mut after) = (0, None);
+            loop {
+                let rows = tx.scan_kind(&kind, after.as_ref(), 128).unwrap();
+                let Some(last) = rows.last() else {
+                    break;
+                };
+                after = Some(last.key.clone());
+                count += rows.len();
+            }
+            counts.insert(*name, count);
+        }
+    });
+    counts
 }

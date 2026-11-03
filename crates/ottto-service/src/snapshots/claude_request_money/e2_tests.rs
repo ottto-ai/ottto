@@ -4446,8 +4446,8 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
 #[test]
 fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
     use crate::snapshots::claude_request_census::{
-        invalidate_claude_request_census, retain_held, ClaudeRequestBirth,
-        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+        invalidate_claude_request_census, ClaudeRequestBirth, ClaudeRequestCensusRecord,
+        ClaudeRequestCensusShape,
     };
     use std::os::unix::fs::MetadataExt;
     {
@@ -4568,7 +4568,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
                     fingerprint_birth_nanos: 0,
                     withheld_content_stamp: None,
                 };
-                assert!(!retain_held(&mut index, &candidate));
+                invalidate_claude_request_census(&mut index, &candidate.path);
             } else {
                 // Same invalidation used by the native reader on failed
                 // scope/object revalidation; the old file entry stays put.

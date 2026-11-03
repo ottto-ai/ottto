@@ -139,7 +139,7 @@ cause; explicit integrity repair, lost fences, foreign bindings and reference
 drift also retain repair advice. A successful compatible load clears retrying;
 a different current refusal replaces the old reason.
 
-There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
+There is no rebuild. The retired restart-record directory is removed whole each pass (`tail_legacy_dir`) and never read.
 
 The existing service error log contains content-free JSON lines prefixed
 `ottto-service: local_resources`. The macOS app/dev LaunchAgent writes
@@ -219,12 +219,10 @@ That tag survives an index reload in the same process; a process restart loses
 the diagnostic tag while retaining the persisted retry witness.
 
 Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
-completion/RAM admission. With an active durable store the scheduling marker
-remains until the same writer durably stores no debt and a second index CAS
-clears the marker. The existing diagnostics carrier then emits
+completion/RAM admission. The scheduling marker remains until a second index save clears it. The existing diagnostics carrier then emits
 `sampled_audit_retirement` with `audit_quiet_retired` and `pending_audits`.
 The page's retirement count is zero while that receipt remains outstanding.
-Writer errors, skipped records and deferrals keep the obligation scheduled.
+A failed save keeps the obligation scheduled.
 Freed slots become usable on the next committed scan; the current page reserves
 them because partial-save reconciliation can restore an unacknowledged marker.
 Quiet retirement keeps the old Full verification time and grants no
@@ -378,126 +376,63 @@ source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
 
-### Durable Store Alarm
+### Tail Counters
 
-A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
-whose durable-store counts for that source changed. Each count is
-`[since the last alarm, process total]`: `held_keys` (unknown, newer,
-undecodable or unbindable records), `t14_rebuild` (known corrupt records
-read Full once and replaced after the save) and `mode_repaired` (store
-directory or records restored to owner-only). `store_disabled` appears once,
-with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
-(more than max(20, 2%) corrupt records in one pass), when the store becomes
-memory-only for the process. While a key is held, its source's census stays
-retryable (red) for the whole hold, so census close, retirement and
-account-family proof wait for that source; a held key is not yet terminal
-disclosed residue.
+Claude's continuation state lives in the state database. Its counters ride a
+`durable_tail_alarm` record (schema 2 additive, source label) on any page where
+one changed; each source with a Tail codec (today Claude only) has its own
+record and keys. Each is `[since the last record, process total]`, counts only;
+they reset at process start and never decide anything.
 
-The `durable_tail` line also carries `store_write_after_save_failed[files]`
-(records offered to a post-save batch that returned an error; the store keeps
-their predecessors) and **`store_write_failed_restart_full[files,bytes]`
-(upper bound)**: Fulls whose restore refused the record as
-`ineligible.entry_changed`, with the completed native bytes those Fulls read.
-It is not an exact count of write failures. It reuses the existing
-`entry_changed` refusal, and no persisted marker records that a write failed,
-so it also counts a record that was never offered (deferred or evicted before
-the write) and any RAM-miss restore of such a record. Both are process totals.
-On the first counted file in a process, a `durable_tail_restart_full_alarm`
-record (`store_write_failed_restart_full` `[files, bytes]` and the
-write-failure total) is emitted at once, then at most once per 24 h in that
-process; a restarted process alarms again on its own first file. The counter
-remains the persistent signal. The mark and the alarm time are RAM-only;
-nothing is persisted.
+| Counter | Unit / meaning |
+|---|---|
+| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
+| `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
+| `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
+| `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
+| `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
+| `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
+| `tail_refold{reason}` | A file selected for late evidence on an unchanged transcript (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) re-folded from stored state with 0 transcript bytes, and its body was not the ACKed one: sent as an ordinary update on the head CAS, the body a native read sends. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead. |
+| `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
 
-An absent record is a restore `missing` outcome and keeps the existing Full
-admission; it is not a held key. For Claude, `upgrade_state_missing` counts the
-first native read of a previously indexed key that grew while it had no record
-(observation only: no hold and no claim ledger); it is zero for Codex.
+`tail_restart_full_alarm` is emitted on the first reconstruction after a head,
+then at most once per 24 h; the time is RAM only, so a restart alarms again.
 
-Claude restore adds R2 transitional counts, each `[since, total]` and each an
-alarm when nonzero: `old_binding_no_match` (an unprovable original binding),
-`context`, `restore_semantics` and `revision_adoption_required` (stale holds),
-`retail_exhausted` (the Tail re-read allowance is spent or its accounting was
-lost). Each is one counted Full, taken only on growth past the accepted end and
-paced to one per key per six hours through one shared RAM map;
-`retail_exhausted_paced` counts growth skipped by that pace. On map overflow the
-oldest key is evicted and the read allowed; `pace_evicted` counts it and alarms
-separately from the growth counts. `t14_rebuild_full_started` is the process
-total of admitted rebuild Fulls. Audit deadlines remain owned by the index,
-and the v1 writer takes compatibility debt from the current committed index at
-write time, including after a restore dropped the envelope field. Unknown debt
-tags, absent-with-nonzero deadlines and present-with-zero deadlines are
-`unbindable` holds, preserved byte for byte. A debt-bearing record whose index
-entry is absent is a miss counted once by the common acquisition guard as
-`ineligible.audit_carrier`, including when sampling admission skips restore.
-It does not increment `durable_held` or the held-key alarm. The guard uses the
-already classified store header and adds no read. The old reduction is never
-restored as audit-clean: normal acquisition reads Full. The validated envelope
-deadline travels with that acquisition independently of sampling admission.
-Import requires the record's binding context to equal the live namespace/account
-digest and clamps the deadline once to min(envelope due, recovery time). Foreign
-contexts and malformed/unknown records supply no deadline. A direct restore
-carrier check likewise cannot import a foreign context's scheduling authority.
-Native parsing creates the index entry; only source-verified Full completion
-satisfies the audit and supplies the post-save replacement. Terminal row loss
-may publish without verification: the native-created entry then receives the
-existing unverified-source marker with the recovered deadline. That marker
-survives save/restart and keeps discovery eligible beyond the age window until
-a verified Full retires the obligation. No index membership is inferred from a
-record, and no persisted field or acquisition cause is introduced.
-The production `durable_tail` pass summary emits `ineligible={...}` with static
-class names and process-total counts, including
-`audit_carrier_staged_unverified:1` after the first staged transition.
-`ineligible.audit_carrier_staged_unverified` counts only the successful transition
-to the native-created entry's unverified marker; the earlier
-`ineligible.audit_carrier` counts recovery misses. A verified-first Full has zero
-staged transitions and uses the existing `audits_completed` counter. Later retries
-and later deadline offers cannot renew the recovered obligation.
-Grouped Codex members, aliases included, take the same live-context, once-clamped
-deadline at group job start (not at the preflight hold check); a paused paged job
-carries it, while a deferred group recaptures at its later start. At settlement
-each member's native-created entry stages the existing marker when the group
-publishes unverified; a verified group Full retires each recovered or marked
-member through `audits_completed`. Group retirements have no `audits_started`
-counterpart (groups never plan a sampled mode), so `audits_completed` may exceed
-`audits_started`. A paged group member or singleton that captured no deadline but
-has no index entry at settlement (a fresh index loaded while the job was parked)
-re-probes the same handoff before recording; the job is not invalidated. The
-re-probe only reads the record header: it applies the live-context gate and the
-once clamp, but takes no hold, T14 rebuild authorization, breaker accounting or
-RAM-corrupt count. A re-probed singleton retired by a verified Full counts
-`audits_completed` once, like a captured deadline. Both
-carrier counters advance once per settled member, never on preflight or pause.
-Post-save GC preserves same-context debt-bearing records whose key is absent
-from the index; fresh-index cleanup without a trusted context preserves their
-debt evidence too, until acquisition establishes custody. These preservation
-decisions keep counting `format_hold.unbindable`. Once the real entry carries
-unverified-source debt, GC keeps its same-context predecessor regardless of a
-decided scope change until verification permits ordinary replacement/collection.
-Proven foreign-context records remain ordinary GC candidates. An existing entry with reset/postponed
-debt instead re-arms an immediate index audit and plans Full(`audit_due`), also
-recovering an index-new/record-old crash after a successful audit. Direct restore
-misses also count `ineligible.audit_carrier`, without becoming held exits.
-Re-arming changes no accepted body, witness or ACK; native completion alone can
-clear the obligation. No record means ordinary Full-on-miss admission.
-The `format_hold` and `durable_held` arrays keep eight slots:
-`newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted`.
-The retired coordinate (slot 5) stays zero; the removed hold is not restored.
-ReceiptPending remains slot 6.
+`tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
+directory beside a scan index. Each pass removes the record directory alone
+under the writer lock and syncs the parent. A failed removal is counted in
+each pass's point and retried by the next; an absent directory emits nothing.
 
-Store header reads for GC (including representation lookup for a decided key)
-are counted in `gc_records_read` / `gc_bytes_read`, using actual bytes read;
-GC trailer/body verification uses `delete_verify_bytes`. They do not inflate
-`guard_header_bytes` / `guard_verify_bytes`. A decided key currently needs two
-bounded header reads (each at most 324 bytes); the verification memo avoids a
-second full verification. Representation lookup opens only the durable record,
-never a transcript. A direct fixture removes the synthetic transcript, rejects
-body reads after verification, observes both header accesses and asserts exactly
-648 additional GC bytes, no guard/verification bytes and an unchanged record.
-These are store bytes, separate from transcript re-derivation bytes. Counters
-on the durable pass summary are process totals; `take_pass` store receipts reset
-their flows while retaining disk levels. Alarm counts retain the delta/total
-contract above.
+The page's `sampled_acquisition` block splits native reduction bytes:
+`completed_full_native_bytes` is the Full reads' part of
+`completed_native_bytes`; the rest is Tail.
+
+The old restart-record counters map as follows. Nothing below became zero by
+disappearing: where a failure stayed possible, its new counter is named.
+
+| Old | New or retired |
+|---|---|
+| `store_write_failed_restart_full[files,bytes]` (upper bound) | `tail_reconstruct`, `tail_reconstruct_bytes`, `tail_reconstruct_after_head` (exact) |
+| `durable_tail_restart_full_alarm` | `tail_restart_full_alarm` |
+| `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
+| `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
+| `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
+| `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
+| `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
+| `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
+| `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `completed_guard_bytes` |
+| Sampled native bytes | `completed_native_bytes`, `completed_full_native_bytes`, `tail_bootstrap_full` |
+| `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage`, `tail_stage_dropped`, `tail_publish{dropped}` |
+| `disk_records`, `disk_bytes`, `max_record_bytes`, `bytes_written`, `records_written`, `records_clean`, `batches`, `native_flushes`, `peak_codec_bytes`, `store_bytes_alarm` | Retired with `.rec`; `tail_apply`, `store_growth`, `wal_size_alarm` at database level, with no source label on engine statistics |
+| `retail_*`, `stale_full`, `pace_anomaly`, `pace_evicted`, `upgrade_missing_full`, `d3`, `restore_pending_quiet` | Retired with their mechanisms |
+| `store_disabled`, `t14_*`, `mode_repaired`, `stale_record_refused`, `temp_*`, `resource_pause*`, `memo_evicted`, `receipt_*`, `uninventoried_records`, `owed_overflow_discovery_only`, `native_stage_skipped`, `restore_unavailable_*` | Retired, `.rec` mechanics. A corrupt row is `tail_reconstruct{corrupt}`; the database owner's mode is the store's own |
+| `gc_*`, `rec_orphans_erased`, `native_class_*`, `records_invalidated`, `off_v1_*` | `tail_legacy_dir`, `tail_apply.retired`, the erasure epoch and deadline, `tail_reconstruct{identity}` |
+| `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
+
+Not built, and so absent from the counters: `tail_candidate_owed`,
+`tail_set_aside_probe`.
 
 ### Claude Census Retirement Overlap
 
@@ -742,7 +677,7 @@ sources. Existing identity/anchor controls remain in
 `transcript_acquisition::tests::shrink_and_replacement_reset_even_with_identical_samples`,
 `fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure`,
 `fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses`,
-and `sampled_scan::durable_tail_tests::certificate_sample_truncation_is_shrunk_for_both_windows`.
+and the certificate restore tests in `transcript_acquisition`.
 They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
 length-only retention grants no Tail authority. Existing sampled acquisition's
 accepted unsampled-interior-edit limitations still apply.
@@ -1603,19 +1538,10 @@ The digest is RAM-only authority and is never emitted in diagnostic records.
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include
-`counts.full_causes.restore_outcome`. Counts are saturating u64 values,
-scoped to that page's attempted durable restores. A resumed scan keeps its
-counts until the page completes. This is separate from process-lifetime
-store/write/GC totals, which remain on the existing `durable_tail` line;
-restore-class totals on that text line are retired.
-
-| Field under `restore_outcome` | Unit / meaning |
-|---|---|
-| `restored` | Restore returned a charged, retained reduction. |
-| `held` | Restore's existing integrity guard returned Held. |
-| `pending` | Restore yielded for active funding or a quiet resource refusal; no successful restore or read permission. |
-| `miss.<class>` | Restore returned no retained reduction, with the class below. |
-| `stale.<reason>` | Claude restore kept the accepted body stale: a typed, content-free reason from the original-binding proof or restore semantics (for example `old_binding_no_match`, `context`, `restore_semantics`, `revision_adoption_required`, `descriptor`, `accepted_floor_missing`). Growth past the accepted end may take the paced counted Full on the `durable_tail` alarm. |
+`counts.full_causes.restore_outcome.miss.<class>` for Codex and Pi: saturating
+u64 counts, scoped to that page, of files with no retained reduction, by the
+class below. Claude keeps no reduction in RAM, so its loads are counted by
+`tail_db_loads` instead.
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.
@@ -1623,32 +1549,8 @@ class means zero attempts of that class, not a disabled store.
 A pre-acquisition guard hold is not a restore attempt and adds no count here.
 Retries count again; a cooperative yield does not recount a completed decision.
 
-Miss keys are fixed, content-free class labels. Dots below are part of the
-JSON class key, not extra nested objects:
-
-- `unavailable`, `no_entry`, `missing`;
-- `resource_full.{decode,cache_transit,stores_unavailable,input,cache_key,certificate_scope,rederive_unfunded}` records a growing-file resource refusal returning an ordinary Full miss; it grants no independent read permission;
-- `ineligible.{selection_cleared,history_owed,source,key,context,scope,generation_ahead,entry_changed}`;
-- `refused_record.{newer,unknown,undecodable,unbindable,corrupt,receipt_pending}`, `corrupt_body`;
-- `certificate_refused.{replaced,shrunk,same_size_edit,head_changed,boundary_changed,invalid_checkpoint,read_error}`;
-- `not_rederived.<field>` preserves the existing codec's static field/class
-  labels, including `SnapshotAccumulator.title` and `compressed`; these are
-  code field names or representation classes,
-  never filesystem paths or transcript values;
-- `unregistered_replay.{body_witness,money_rule}` attributes a scope miss
-  only when the current replay lever has no registry row and replacing that
-  lever with a registered value reproduces the record's scope. Unattributed
-  changes remain `ineligible.scope`. Registered audit rows cover body witness
-  r3 and money rules v1/v2; they grant no new replay.
-
-A disabled store reports `unavailable`, while an absent record in a usable
-store reports `missing`. Sample reads cut short by concurrent truncation report
-`certificate_refused.shrunk`. Other sample I/O errors are
-`certificate_refused.read_error`, never evidence of a real edit. This precursor
-changes diagnostics only: it adds no Full-admission policy, new body reads, persisted fields, record grants, or integrity holds.
-Capacity/availability retain their existing degraded behavior. Full-cause
-admission and its other counter projections arrive in subsequent slices.
-
+Miss keys are fixed, content-free class labels: `no_entry`,
+`ineligible.history_owed`, `missing`, `unavailable`.
 
 ## Claude Family Census Shadow (schema 2 additive)
 
@@ -1778,7 +1680,6 @@ sessions, decoded bytes or money. No path or session id is included.
 | `CompressedProofParentUnsupported` | Proof parent reader |
 | `CompressedProofChildUnsupported` | Proof child reader |
 | `CompressedParentSideUnsupported` | Parent side acquisition |
-| `CompressedDurableTailUnsupported` | Durable certificate restore and rederive |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
 | `CompressedParentLedgerUnbound` | Parent rollout is compressed and cannot supply ledger evidence, or the shared ownership parser held an ordinary archive fork after Full decoding without proven parent-prefix evidence |
@@ -1818,9 +1719,9 @@ Pi fork files exclude copied usage entries whose envelope timestamp is strictly
 before their session header time. If the envelope time is absent, the provider
 time can establish the cutoff. Entries at or after the header time retain normal
 identity and deduplication. Missing or invalid cutoff evidence never proves a
-copy; ordinary timestamp validation still applies. A fork's durable Pi section
-stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
-ledger. The L cutoff never enters logs, diagnostics or uploads.
+copy; ordinary timestamp validation still applies. Pi has no stored section
+until its Tail codec: a fork's `has_parent` and local header timestamp live in
+the RAM reduction only. The cutoff never enters logs, diagnostics or uploads.
 The `parentSession` value is checked at the header and never retained in the
 ledger or included in records, logs, diagnostics or uploads.
 
@@ -1850,21 +1751,10 @@ pins it for Claude Code, Codex and Pi.
 Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.
-Pi uses the shared durable restore path. An indexed file that changes without
-an available RAM or durable reduction reads Full under the shared `state_missing`
+An indexed Pi file that changes without an available RAM reduction reads Full under the shared `state_missing`
 planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
 fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
-A Pi usage ledger above 65,536 keys refuses persistence through the shared
-`not_persisted{wa.entry_cap}` class; the ledger is never truncated.
-
-`restored_behind_accepted.published` on `durable_tail_alarm` with source `pi`
-counts a durable-restored Tail read ending strictly below the frozen indexed
-accepted extent when it offers a complete body after policy and semantic no-op
-suppression. Pi has no accepted-body floor. Full, Unchanged and RAM-retained
-reads do not count. Upload retries count again. The same signal uses source
-`codex` for surviving restored Tail offers and source `claude_code` with outcome
-`held` for accepted-floor holds. It contains only counts, source and outcome,
-with no file names, response ids or content.
+A Pi usage ledger has no key cap and is never truncated.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
@@ -1955,74 +1845,6 @@ and drops the split on save; re-upgrade preserves S as all-unattributed, without
 backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
-
-Whole-file size no longer bypasses recovery pacing. The legacy `near_cap`
-recovery annotation remains zero; transcripts have no whole-file admission cap.
-
-With restart restore enabled, content re-derivation runs only after growth
-past the committed extent. Quiet files return Pending before certificate samples
-or content input. Grown files validate the existing certificate samples before
-any decode, support, pacing or allocation refusal, so those refusals cannot hide
-prefix edits. This includes valid records with no content obligations: quiet
-restores return counted `QuietPending` before decode or sample reads. With the
-switch OFF, the durable-tail store is disabled; ordinary no-record pacing applies.
-
-The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
-An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
-requested allocations per line, prepaid on the existing active lease. Decoded
-raw-value magic keys refuse to the counted growth Full; no partial parse is
-adopted. Shared native content helpers rebuild the projection, and all recorded
-content digests must match before any fields move. `rederive_fence_mismatch`
-is an alarm: any nonzero value needs investigation. No content enters diagnostics.
-
-`rederive_head_reads` and `rederive_head_bytes` are process totals; the latter
-includes title input and partial reads. Use daily byte deltas for replay cost.
-`rederive_line_peak_bytes` records exact metered line high-water, alongside the
-active-lease high-water (which survives refunds) and stage footprint samples.
-`rederive_refused` counts failures after input by content class.
-`rederive_unsupported` names fixed boundary/mark/title refusal classes.
-`resource_full.decode` keeps decode refusals separate from certificate edits.
-Success receipts count successful restores separately from physical input;
-do not add the two byte counters together.
-
-A replay attempt is remembered by predecessor extent, not exact generation.
-A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours.
-There is no size-based extra read. Budget contention waits without a Full; after six hours its counted
-`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
-overflow permits at most one extra head per evicted extent and alarms
-`pace_evicted`. Discovery custody survives pace eviction independently.
-
-Fence and certificate-edit retirement is bound to a verified predecessor.
-`rederive_retire.{retired,superseded,retry}` describes writer outcomes; missing
-binding authority is counted as `rederive_retire_unproven` or
-`rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
-obligation survives an absent path and is retried at saves. Pending receipts
-and unknown survivors remain protected. Retirement never creates an ACK.
-Missing retirement authority also emits `retire_exact_held{edge}`, where `edge`
-is `metadata`, `accepted_object`, `independent_edit` or `scoped_certificate`.
-The predecessor and discovery hold remain. `retire_exact_held_exit` names an
-existing exit: `revalidated_retire_exact` means a later eligible verified read
-can reacquire the witness for the post-save writer; `native_replacement_receipt`
-means a later native acquisition must commit its exact replacement receipt
-(`receipt_acquisition`/`discharge_owed`, which release restore-pending discovery).
-Conflicting retained predecessors also require their existing writer/receipt
-settlement before another witness can be installed. A failed stat/read is never
-proven absence; unlink's pending directory sync stays in key custody.
-
-Claude's accepted-floor hold reports `restored_behind_accepted.held` at its
-actual decision edges. The discovery dependency continues to hard-gate the
-production switch; RAM pacing does not establish restart-persistent bounds.
-Codex and Pi report `restored_behind_accepted.published` when a complete restored
-Tail body below the frozen accepted extent reaches publication.
-
-`restore_pending_quiet{source}` is emitted once per source pass as a cumulative
-process total on the existing `durable_tail_alarm` carrier with `process_id`.
-It counts metadata-only restores returning Pending with zero transcript input.
-It does not decode obligations and cannot establish `pending_no_obligation`.
-Compare totals using `process_id`; they reset on restart and carry no key identity.
-Full-spend time for funded keys lives in key custody, so evicting
-the paid pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
 

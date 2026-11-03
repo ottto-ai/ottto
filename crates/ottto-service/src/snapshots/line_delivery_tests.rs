@@ -166,6 +166,11 @@ fn claude_page(
     observer: Option<&Recorder>,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> (ScanIndex, SourceScanResult, usize, Vec<Value>) {
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+        SnapshotSource::ClaudeCode,
+        cache.map(|cache| cache.as_ref()),
+        index,
+    );
     let ((index, result, steps), rows) = capture(|| {
         let mut scan = new_scan(root, index);
         if let Some(cache) = cache {
@@ -966,13 +971,7 @@ fn walk_gate_counts_age_and_admits_large_files() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(
-                SnapshotSource::ClaudeCode,
-                &mut index,
-                30,
-                None,
-                None,
-            );
+            advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, &mut index, 30, None);
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1016,7 +1015,7 @@ fn roster_gate_counts_age_and_admits_large_files() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 30, None);
     }
     unselected_page("codex");
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1074,7 +1073,7 @@ pub(in crate::snapshots) fn walk_all(index: &mut ScanIndex, days: u64) {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::ClaudeCode, index, days, None);
     }
 }
 
@@ -1200,7 +1199,6 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                     ..ScanIndex::default()
                 },
                 None,
-                None,
             ),
         )
         .map(|candidate| {
@@ -1252,10 +1250,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
 /// Gate counters are decisions, and overlapping owed arms count only once.
 #[test]
 fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
+    // Claude rediscovers any size change for Tail recovery, so only Codex gates
+    // a shrunk file by age.
     for (source, recovery_overlap) in [
-        (SnapshotSource::ClaudeCode, false),
         (SnapshotSource::Codex, false),
-        (SnapshotSource::ClaudeCode, true),
         (SnapshotSource::Codex, true),
     ] {
         let root = Root::new("ld-grown-gates");
@@ -1300,7 +1298,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             .pending_directories
             .is_empty()
         {
-            advance_bounded_directory_traversal(source, &mut index, 7, None, None);
+            advance_bounded_directory_traversal(source, &mut index, 7, None);
         }
         assert_eq!(
             candidates(&index),
@@ -1352,7 +1350,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut census,
                 rfc3339_unix_seconds(NOW),
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             );
             assert_eq!(candidate.is_some(), retained, "candidate {name}");
             assert_eq!(
@@ -1381,7 +1379,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 &mut ScanCensus::default(),
                 None,
                 7,
-                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
             )
             .unwrap();
             if recovery_overlap && name == "grown" {
@@ -1530,7 +1528,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         .pending_directories
         .is_empty()
     {
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
     }
     discovery_page("codex");
     // Match the existing roster fixture's directory-change granularity.
@@ -1656,7 +1654,8 @@ fn grown_virtual_audit_uses_the_scheduling_clock_before_and_at_due() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(modes, vec![DeliveryMode::Full], "due recovery reads once");
+    // The released cache keeps the committed head, so the owed growth continues.
+    assert_eq!(modes, vec![held_growth_mode()], "due recovery reads once");
     assert_eq!(result.scanned_file_count, 1);
 }
 
@@ -1679,6 +1678,11 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
             days_from_now(days)
         };
         let recorder = Recorder::default();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         let ((index, result, _), _) = capture(|| {
             finish(
                 OwnedSourceScan::new(
@@ -2002,6 +2006,11 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let page = |index: ScanIndex, collected_at: &str| {
         let recorder = Recorder::default();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         let ((index, result, _), _) = capture(|| {
             finish(
                 OwnedSourceScan::new(
@@ -2242,7 +2251,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         fs::rename(&original, &moved).unwrap();
         assert_eq!(fs::metadata(&moved).unwrap().modified().unwrap(), modified);
         let checkpoint = root.0.join("held-rename-index.json");
-        held.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut held, &checkpoint);
         held = ScanIndex::load(&checkpoint).unwrap();
         let mut active = held.clone();
         if hint_only {
@@ -2283,7 +2292,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 &mut ScanCensus::default(),
                 rfc3339_unix_seconds(&at),
                 1_000,
-                &mut CandidateDiscovery::new(&mut active, None, None),
+                &mut CandidateDiscovery::new(&mut active, None),
             );
             assert!(
                 candidate.is_none(),
@@ -2465,7 +2474,12 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let today = days_from_now(0);
     let clamp_events = std::cell::Cell::new(0_u64);
     let last_page = RefCell::new(Value::Null);
-    let page = |mut index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+    let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+        let mut index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::ClaudeCode,
+            Some(cache.as_ref()),
+            index,
+        );
         cache.bind_withheld(&mut index);
         let recorder = Recorder::default();
         let ((index, result, _), rows) = capture(|| {
@@ -2515,15 +2529,19 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let withhold = |committed: &mut ScanIndex, parsed: ScanIndex, result: &SourceScanResult| {
         // Exercise classify -> Completed settlement -> durable save/reload;
         // copying the hold map misses the real fingerprint restore seam.
+        let route = parsed.clone();
         *committed = crate::snapshot_sync::withheld_support::settle_withheld(
             committed,
             parsed,
             result.clone(),
         );
+        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(committed, &route);
         assert!(committed.claude_account_deferred_holds.contains_key(&key));
         assert!(!committed.files[&key].source_file_fingerprint.is_empty());
-        committed.save(&checkpoint).unwrap();
-        *committed = ScanIndex::load(&checkpoint).unwrap();
+        *committed = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            committed,
+            &checkpoint,
+        );
     };
     let touch = || {
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -2592,6 +2610,10 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     // A restart: an empty process memo and RAM cache.
     withheld_account::support::restart(&committed.withheld_memo);
     let cache = Arc::new(sampled_scan::SharedCache::default());
+    crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
+        &cache,
+        &crate::snapshots::e2_pipeline_scan_fixture::route_of(&committed).unwrap(),
+    );
     let (parsed, result, reads) = page(committed.clone(), &cache);
     assert_eq!(reads.len(), 1, "at most one re-parse per held key");
     withhold(&mut committed, parsed, &result);
@@ -3319,6 +3341,11 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let page = |index: ScanIndex, hints: &[PathBuf], at: &str| {
             let recorder = Recorder::default();
+            let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+                SnapshotSource::ClaudeCode,
+                Some(cache.as_ref()),
+                index,
+            );
             let ((index, scan, _), counts) = capture(|| {
                 finish(
                     OwnedSourceScan::new(
@@ -3761,7 +3788,7 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         assert!(!held.files.contains_key(&key));
         assert!(held.claude_account_deferred_holds.contains_key(&key));
         let checkpoint = root.0.join("hold-only.json");
-        held.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut held, &checkpoint);
         let held = ScanIndex::load(&checkpoint).unwrap();
         fs::remove_file(&path).unwrap();
         if removed == "project" {
@@ -4025,7 +4052,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     assert!(held.claude_account_deferred_holds.contains_key(&key));
     let checkpoint = root.0.join("equal-held.json");
     let reload = |index: &mut ScanIndex| {
-        index.save(&checkpoint).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &checkpoint);
         let mut index = ScanIndex::load(&checkpoint).unwrap();
         index.withheld_memo = memo.clone();
         activate(&mut index, revision);

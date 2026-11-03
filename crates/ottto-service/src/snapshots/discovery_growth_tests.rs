@@ -78,7 +78,7 @@ impl Fixture {
             &now,
             7,
         );
-        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None, None);
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
         let traversal = index.traversal.as_mut().unwrap();
         // This known member was already consumed. Saved retryable loss
         // elsewhere retains the roster; the retry is not due yet.
@@ -129,6 +129,11 @@ impl Fixture {
         now: &str,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            source,
+            Some(self.cache.as_ref()),
+            index,
+        );
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
@@ -182,7 +187,7 @@ impl Fixture {
         let path = self.root.join("index.json");
         // Preserve the production save's updated optimistic-concurrency stamp
         // in the index passed into the next real page.
-        index.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &path);
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
@@ -370,7 +375,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None, None),
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -751,7 +756,7 @@ fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> Sc
         &collected_at,
         7,
     );
-    advance_bounded_directory_traversal(source, &mut index, 7, None, None);
+    advance_bounded_directory_traversal(source, &mut index, 7, None);
     let traversal = index.traversal.as_mut().unwrap();
     assert!(traversal.pending_directories.is_empty());
     traversal.pending_candidates.clear();
@@ -893,7 +898,7 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         let mut f = Fixture::new();
         let mut index = kept_generation(&f, source, true);
         let path = f.root.join("index.json");
-        index.save(&path).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
         let index = ScanIndex::load(&path).unwrap();
         f.cache = Arc::new(sampled_scan::SharedCache::default());
         let opens = all_transcript_opens_for_test();
@@ -966,7 +971,7 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
                 start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
-                advance_bounded_directory_traversal(source, &mut walked, 7, None, None);
+                advance_bounded_directory_traversal(source, &mut walked, 7, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
                     .iter()
@@ -1064,7 +1069,7 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
     start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
-    advance_bounded_directory_traversal(source, index, 7, None, None);
+    advance_bounded_directory_traversal(source, index, 7, None);
     assert!(index
         .traversal
         .as_ref()

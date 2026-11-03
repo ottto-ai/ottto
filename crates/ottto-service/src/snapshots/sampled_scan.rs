@@ -11,46 +11,15 @@ use sampled_jsonl::CachedJsonlReduction;
 // separate 1MiB reserve covers bounded marker strings in existing index copies
 // and fixed acquisition/path scratch; it is not a daemon RSS allowance.
 const AUDIT_AND_SCRATCH_BYTES: usize = 1024 * 1024;
-#[cfg(unix)]
-const RETAIL_RESERVE_BYTES: usize = 2 * (2 * crate::durable_tail_store::MAX_RECORDS + 1) * 1024;
-#[cfg(not(unix))]
-const RETAIL_RESERVE_BYTES: usize = 0;
-#[cfg(unix)]
-const KEY_RESERVE_BYTES: usize = durable_tail::KEY_RESERVE_BYTES;
-#[cfg(not(unix))]
-const KEY_RESERVE_BYTES: usize = 0;
-#[cfg(unix)]
-const STALE_PREDECESSOR_RESERVE_BYTES: usize = durable_tail::STALE_PREDECESSOR_RESERVE_BYTES;
-#[cfg(not(unix))]
-const STALE_PREDECESSOR_RESERVE_BYTES: usize = 0;
-const STATE_BYTES: usize = CACHE_BYTES
-    - crate::source_rotation::OVERLAP_BUDGET
-    - AUDIT_AND_SCRATCH_BYTES
-    - RETAIL_RESERVE_BYTES
-    - KEY_RESERVE_BYTES
-    - STALE_PREDECESSOR_RESERVE_BYTES;
-
-/// The restart-restore custody/pacing reserve cannot reduce main's OFF admission budget.
+/// The retained-state budget.
 fn state_bytes() -> usize {
-    if restart_restore::enabled() {
-        STATE_BYTES
-    } else {
-        CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES
-    }
+    CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES
 }
 
 pub(super) mod codex_cursor;
 pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
-pub(super) mod durable_tail;
-#[cfg(unix)]
-pub(crate) use durable_tail::MissClass;
-#[cfg(unix)]
-pub(crate) use durable_tail::RestoreOutcome;
-#[cfg(all(test, unix))]
-mod m3_format_tests;
-#[cfg(all(test, unix))]
-mod m3_write_ahead_tests;
+mod retired_records;
 pub(super) mod side_ledger;
 #[cfg(all(test, unix))]
 pub(crate) mod transition_fixture;
@@ -72,7 +41,7 @@ pub(super) fn retained_held() -> bool {
 /// The retained-copy lock, marked held for its scope, so a relock on the same
 /// thread panics in debug builds instead of hanging. Reset on drop, unwinds
 /// included.
-pub(super) struct RetainedGuard<'a> {
+pub(in crate::snapshots) struct RetainedGuard<'a> {
     guard: std::sync::MutexGuard<'a, RetainedCache>,
 }
 impl<'a> RetainedGuard<'a> {
@@ -190,13 +159,15 @@ pub(crate) struct SharedCache {
     /// lock (retained, then cursor, then side; nothing is locked under it).
     /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
     side: Mutex<side_ledger::SideLedger>,
-    /// Durable warm-cache stores and write candidates. A leaf lock, never
-    /// held while taking another. Not part of the state budget: bounded by
-    /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
+    /// Quiet retirements of the current passes, and the retired record
+    /// directory's failed-removal ages. A leaf lock, never held while taking
+    /// another. Outside the state budget: pass-scoped, never walked.
     #[cfg(unix)]
-    durable: Mutex<durable_tail::StoreRoot>,
-    #[cfg(unix)]
-    durable_bytes: std::sync::atomic::AtomicUsize,
+    pub(in crate::snapshots) quiet: Mutex<sampled_audit::quiet_retirement::QuietRetirements>,
+    /// The state database this owner's fixture scans continue from: Claude's
+    /// continuation lives there, not in RAM.
+    #[cfg(test)]
+    pub(crate) test_route: Mutex<Option<e2_pipeline_scan_fixture::FixtureRoute>>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
@@ -207,9 +178,9 @@ impl Default for SharedCache {
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
-            durable: Mutex::new(durable_tail::StoreRoot::default()),
-            #[cfg(unix)]
-            durable_bytes: std::sync::atomic::AtomicUsize::new(0),
+            quiet: Mutex::default(),
+            #[cfg(test)]
+            test_route: Default::default(),
         }
     }
 }
@@ -239,7 +210,7 @@ impl HeapLayoutBound for SharedCache {
         // every copy budget. The ledger's whole heap is this proved constant;
         // its inline tables are inside `size_of::<SharedCache>()`, which the
         // caller's `bound` (or `Arc`) charges once (size test).
-        c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.durable_root_charge())?)
+        c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.root_reservation())?)
     }
 }
 #[cfg(test)]
@@ -251,31 +222,13 @@ impl SharedCache {
     }
 }
 
-// Qualified 64-bit main root: Stores 18,272 B, complete SharedCache 40,784 B.
-// The memo handle fits the root's existing padding; its owned header is
-// charged separately above. The touched-family
-// view remains behind the already boxed cursor job.
-// Keep its reservation while OFF, even though optional restart-restore owners now allocate
-// only for ON or the approved erasure/invalidation actions.
+// The qualified 64-bit root reservation. The budgets it feeds stay as they were.
 const OFF_MAIN_SHARED_BYTES: usize = 40_784;
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SharedCache>() <= OFF_MAIN_SHARED_BYTES);
 impl SharedCache {
-    // Main's Stores root reservation on the qualified 64-bit toolchains.
-    // This is conservative when OFF's optional owner is absent; every real
-    // ON/exception allocation is added as well, without taking a leaf lock.
-    fn durable_root_charge(&self) -> usize {
-        #[cfg(unix)]
-        {
-            OFF_MAIN_SHARED_BYTES.saturating_sub(size_of::<SharedCache>())
-                + self
-                    .durable_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed)
-        }
-        #[cfg(not(unix))]
-        {
-            0
-        }
+    fn root_reservation(&self) -> usize {
+        OFF_MAIN_SHARED_BYTES.saturating_sub(size_of::<SharedCache>())
     }
 }
 impl SharedCache {
@@ -306,7 +259,7 @@ impl SharedCache {
 
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
-    pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
+    pub(in crate::snapshots) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
         debug_assert!(
             !codex_cursor::cursor_held(),
             "retained lock taken under the cursor lock"
@@ -506,43 +459,17 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, true, false)
+        self.insert_with_custody(key, completed, live_bytes, false)
             .is_ok()
-    }
-    /// A completion whose durable record the native route already
-    /// settled. A receipted record keeps its post-save audit-carrier offer;
-    /// a no-record disposition must not retry the failed write after effects.
-    #[cfg(unix)]
-    pub(super) fn insert_settled(
-        &self,
-        key: String,
-        completed: sampled_jsonl::CompletedNativeAcquisition,
-        live_bytes: usize,
-        write_candidate: bool,
-    ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, write_candidate, false)
-            .is_ok()
-    }
-    pub(super) fn return_prepared_taken(
-        &self,
-        key: String,
-        taken: Box<crate::transcript_cache::Taken<CachedJsonlReduction>>,
-    ) -> Result<(), Box<crate::transcript_cache::Taken<CachedJsonlReduction>>> {
-        self.insert_taken(key, taken, false, false).map(|_| ())
     }
     fn insert_taken<I: crate::transcript_cache::Incoming<CachedJsonlReduction>>(
         &self,
         key: String,
         incoming: I,
-        _write_candidate: bool,
-        take_back: bool,
-    ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, I> {
+    ) -> Result<(), I> {
         let taken: &crate::transcript_cache::Taken<CachedJsonlReduction> = incoming.borrow();
-        let custody_bytes = taken.durable.retained_bytes(state_bytes());
-        let fits = custody_bytes.is_some();
         #[cfg(test)]
-        let fits = fits && !sampled_jsonl::preparation_tests::heap_refused();
-        if !fits {
+        if sampled_jsonl::preparation_tests::heap_refused() {
             record(Event::InsertEntryBoundRefused);
             return Err(incoming);
         }
@@ -553,22 +480,9 @@ impl SharedCache {
         let live_bytes = taken.finalization_charge;
         let reserved =
             self.retained_reservation(&cache, &key, taken, live_bytes, taken.modified_hint);
-        let touched = key.clone();
         let result = cache.insert_taken_reserving(key, incoming, reserved);
         self.drop_suspended_proof_if_over(&cache, live_bytes);
-        #[cfg(unix)]
-        if result.is_ok() && _write_candidate {
-            self.durable_touch(&touched);
-        }
-        // No cold copy is observable between admission and take: both happen
-        // under this retained guard, with ordinary cursor/side reservations.
-        result.map(|()| {
-            if take_back {
-                cache.take(&touched)
-            } else {
-                None
-            }
-        })
+        result
     }
     // Refusal returns the original inline graph; boxing adds an unfunded allocation.
     #[allow(
@@ -581,12 +495,7 @@ impl SharedCache {
         mut completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
         held_new: bool,
-        write_candidate: bool,
-        take_back: bool,
-    ) -> Result<
-        Option<crate::transcript_cache::Taken<CachedJsonlReduction>>,
-        sampled_jsonl::CompletedNativeAcquisition,
-    > {
+    ) -> Result<(), sampled_jsonl::CompletedNativeAcquisition> {
         let Some(state) = completed.reduction.take() else {
             return Err(completed);
         };
@@ -601,17 +510,15 @@ impl SharedCache {
                 checkpoint: completed.checkpoint,
                 state,
             },
-            durable: completed.durable,
             modified_hint: rank,
             finalization_charge: live_bytes,
             e2_held_new_file: held_new,
         };
-        match self.insert_taken(key, taken, write_candidate, take_back) {
-            Ok(taken) => Ok(taken),
+        match self.insert_taken(key, taken) {
+            Ok(()) => Ok(()),
             Err(taken) => Err(sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
-                durable: taken.durable,
                 released: completed.released,
                 unsealed: completed.unsealed,
             }),
@@ -628,6 +535,8 @@ pub(super) struct Context {
     pub(super) tail_files: usize,
     pub(super) unchanged_files: usize,
     pub(super) native_bytes: u64,
+    /// Of `native_bytes`, a Full read's; the rest is Tail.
+    pub(super) full_native_bytes: u64,
     pub(super) sample_bytes: u64,
     pub(super) full_reasons: [usize; 11],
     pub(super) priority_replays: usize,
@@ -642,15 +551,11 @@ pub(super) struct Context {
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
-    full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
+    full_files, tail_files, unchanged_files, native_bytes, full_native_bytes, sample_bytes, full_reasons,
     priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, start_overdue_seconds,
     completion_overdue_seconds, admission);
 
 pub(super) struct Active {
-    /// Structural fallback keeps cursor/scope metadata but retains no graph.
-    pub(super) no_record: bool,
-    /// Frozen observation only; never participates in admission or settlement.
-    pub(super) restored_behind_accepted: bool,
     pub(super) key: String,
     pub(super) scope: Scope,
     pub(super) mode: ReadMode,
@@ -670,7 +575,7 @@ pub(super) struct Active {
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
 crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
-    retained_finalization_charge, retained_usage, reinsertion; inline no_record, restored_behind_accepted);
+    retained_finalization_charge, retained_usage, reinsertion);
 
 impl Context {
     #[inline(never)]
@@ -737,8 +642,15 @@ impl Context {
             ReadMode::Unchanged => self.unchanged_files += 1,
         }
     }
-    pub(super) fn record_input(&mut self, metrics: crate::transcript_acquisition::ReadMetrics) {
+    pub(super) fn record_input(
+        &mut self,
+        metrics: crate::transcript_acquisition::ReadMetrics,
+        full: bool,
+    ) {
         self.native_bytes = self.native_bytes.saturating_add(metrics.native_bytes);
+        if full {
+            self.full_native_bytes = self.full_native_bytes.saturating_add(metrics.native_bytes);
+        }
         self.sample_bytes = self
             .sample_bytes
             .saturating_add(metrics.sample_bytes as u64);
@@ -757,16 +669,13 @@ impl OwnedSourceScan {
         cache: Arc<SharedCache>,
         namespace: Scope,
     ) -> Self {
-        self.durable_guard = Some(Arc::downgrade(&cache));
         if self.source == SnapshotSource::ClaudeCode {
             cache.bind_withheld(&mut self.index);
             self.resource_probe
                 .set_withheld_memo(self.index.withheld_memo.clone());
         }
-        #[cfg(unix)]
-        let admitted = durable_tail::durable_source(self.source).is_some();
-        #[cfg(not(unix))]
-        let admitted = self.source != SnapshotSource::Pi;
+        // Every source is admitted on unix.
+        let admitted = cfg!(unix) || self.source != SnapshotSource::Pi;
         if admitted {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
@@ -791,6 +700,7 @@ impl OwnedSourceScan {
                 tail_files: 0,
                 unchanged_files: 0,
                 native_bytes: 0,
+                full_native_bytes: 0,
                 sample_bytes: 0,
                 full_reasons: [0; 11],
                 priority_replays: 0,
@@ -842,7 +752,6 @@ impl OwnedSourceScan {
 /// where another implies it today.
 fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
     active.sampling.is_none()
-        && !active.parser.return_pending()
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
@@ -1155,6 +1064,7 @@ fn context_overhead(context: &Context) -> Option<usize> {
         tail_files: _,
         unchanged_files: _,
         native_bytes: _,
+        full_native_bytes: _,
         sample_bytes: _,
         full_reasons: _,
         priority_replays: _,
@@ -1178,7 +1088,7 @@ fn context_overhead(context: &Context) -> Option<usize> {
         .checked_add(align_of::<SharedCache>())?
         .checked_add(2 * size_of::<usize>())?
         .checked_add(side_ledger::SIDE_LEDGER_BYTES)?
-        .checked_add(context.cache.durable_root_charge())?;
+        .checked_add(context.cache.root_reservation())?;
     size_of::<Context>()
         .checked_add(shared)?
         .checked_add(bound(namespace, state_bytes())?)?
@@ -2040,29 +1950,17 @@ pub(super) mod test_hooks {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(in crate::snapshots) enum Point {
-        BeforeRetireWitness,
-        /// A bounded restore is decoded, immediately before identity sampling.
-        BeforeRestoredIdentity,
         /// The first opened-object identity sample has actually been read.
         AfterIdentityHead,
-        /// Content replay succeeded, before its final accepted-floor check.
-        AfterRestoredContent,
         /// After revalidation, before `retain_reduction`.
         BeforeRetain,
         /// `retain_reduction`'s deferred path, before the stamp gate.
         BeforeStampGate,
         /// After `retain_reduction` returns, before `finish`.
         AfterRetain,
-        /// The prepared native finish returned (any staged temp still
-        /// private), before the commit fences or any store decision.
-        BeforeNativeSettle,
         /// The completion is settled (receipt, owed hold or degraded
         /// disposition), before cursor publication, birth or any effect.
         BeforeNativeEffects,
-        /// Before the retained PRE binding changes on disk; no POST is allowed.
-        BeforeFaultBarrier,
-        /// The retained PRE rebind is durable; the uploader may now proceed.
-        AfterFaultBarrier,
     }
 
     /// What `tail_completion_budget` measured on its last call.
@@ -2122,29 +2020,12 @@ pub(super) mod test_hooks {
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         static X_OUT: std::cell::Cell<Option<super::XOut>> = const { std::cell::Cell::new(None) };
+        static ACTIVE_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     /// Run `hook` each time this thread reaches `point`, until `clear`.
     pub(in crate::snapshots) fn set(point: Point, hook: impl FnMut() + 'static) {
         HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
-    }
-
-    /// Change test inputs after selection, before acquisition; restore nested hooks on unwind.
-    /// Its only caller is a native-layout restore test, which is macOS-only.
-    #[cfg(target_os = "macos")]
-    pub(in crate::snapshots) fn with_after_selection<T>(
-        hook: impl FnOnce(&mut super::super::ScanIndex, Option<super::super::CandidateParseReason>)
-            + 'static,
-        run: impl FnOnce() -> T,
-    ) -> T {
-        struct Reset(Option<SelectionHook>);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                AFTER_SELECTION.with(|slot| *slot.borrow_mut() = self.0.take());
-            }
-        }
-        let _reset = Reset(AFTER_SELECTION.with(|slot| slot.replace(Some(Box::new(hook)))));
-        run()
     }
 
     pub(in crate::snapshots) fn after_selection(
@@ -2184,6 +2065,19 @@ pub(super) mod test_hooks {
             hook();
         }
         HOOKS.with(|hooks| hooks.borrow_mut().extend(fired));
+    }
+
+    /// `fire`, with the candidate's index key readable through
+    /// `active_key` while the hooks run.
+    pub(in crate::snapshots) fn fire_for_key(point: Point, key: &str) {
+        ACTIVE_KEY.with(|active| *active.borrow_mut() = Some(key.to_owned()));
+        fire(point);
+        ACTIVE_KEY.with(|active| active.borrow_mut().take());
+    }
+
+    /// The key `fire_for_key` is firing for, if any.
+    pub(in crate::snapshots) fn active_key() -> Option<String> {
+        ACTIVE_KEY.with(|active| active.borrow().clone())
     }
 
     pub(in crate::snapshots) fn probe(update: impl FnOnce(&mut Probe)) {
@@ -2425,29 +2319,20 @@ pub(super) fn reduction_dependencies(
     if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
         return None;
     }
-    if source == SnapshotSource::Codex {
-        Some(sha256_hex(&[
+    match source {
+        SnapshotSource::Codex => Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
             &codex.path_reduction_fingerprint(&candidate.path),
             &codex_file_join::header_reduction_witness(candidate).ok()?,
-        ]))
-    } else {
-        let mut scoped = candidate.clone();
-        // Claude API/trace evidence is joined freshly after native finish, not
-        // retained in the pre-finish transcript accumulator. Keep Desktop and
-        // child naming dependencies here; keep usage sidecars in selection.
-        let reduction_support = if source == SnapshotSource::ClaudeCode {
-            None
-        } else {
-            support
-        };
-        prepare_owned_scan_candidate(source, &mut scoped, codex, claude, reduction_support);
-        if source == SnapshotSource::ClaudeCode {
-            Some(sha256_hex(&[
-                "claude_reduction_dependencies:v1",
-                &scoped.source_file_fingerprint,
-            ]))
-        } else {
+        ])),
+        // Claude's sidecar evidence and its Desktop and child naming are live
+        // inputs joined at finish, never in the pre-finish reduction: a
+        // rename re-selects the file (its sidecar fingerprint) and never voids
+        // its reduction (L05).
+        SnapshotSource::ClaudeCode => Some("claude_reduction_dependencies:v2".to_owned()),
+        SnapshotSource::Pi => {
+            let mut scoped = candidate.clone();
+            prepare_owned_scan_candidate(source, &mut scoped, codex, claude, support);
             Some(scoped.source_file_fingerprint)
         }
     }
@@ -2481,10 +2366,46 @@ mod cache_lifecycle_tests {
     }
 }
 
-// The daemon owns this cache; the guard is a non-owning alias beside Context.cache.
-impl HeapLayoutBound for std::sync::Weak<SharedCache> {
-    const INLINE_ONLY: bool = true;
-    fn heap_bound(&self, _: &mut Counter) -> Option<()> {
-        Some(())
+/// Why a read found no stored continuation.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissClass {
+    NoEntry,
+    HistoryOwed,
+    Missing,
+    Unavailable,
+}
+#[cfg(unix)]
+impl MissClass {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NoEntry => "no_entry",
+            Self::HistoryOwed => "ineligible.history_owed",
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// A RAM miss classified solely from committed index state and pass
+/// registration. A cleared fingerprint is owed evidence, not a class: the file
+/// misses for the same reason as one whose fingerprint survived.
+#[cfg(unix)]
+pub(in crate::snapshots) fn ram_miss_class(
+    index: &ScanIndex,
+    key: &str,
+    has_slot: bool,
+) -> MissClass {
+    let entry = index.files.get(key);
+    if entry.is_none() && !has_slot {
+        MissClass::NoEntry
+    } else if index.effective_upload_body_witness_revision_requires_adoption(key) {
+        MissClass::HistoryOwed
+    } else if entry.is_none() {
+        MissClass::NoEntry
+    } else if has_slot {
+        MissClass::Missing
+    } else {
+        MissClass::Unavailable
     }
 }

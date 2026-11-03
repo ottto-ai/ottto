@@ -100,7 +100,6 @@ fn walk(source: SnapshotSource, roots: &[PathBuf], index: &mut ScanIndex) -> ser
             BACKFILL_WINDOW_DAYS,
             64,
             None,
-            None,
         )
     });
     rows.into_iter()

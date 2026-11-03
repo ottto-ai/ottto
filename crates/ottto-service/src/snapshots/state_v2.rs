@@ -4,7 +4,8 @@
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
 //!
-//! Restart records live elsewhere; joined by key digest, never referenced here.
+//! Tail heads and pages are kinds of this store (`tail`), committed with the
+//! index; the retired restart-record directory is only removed, never read.
 use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -16,15 +17,10 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "R1 consumes this staged crate-visible erasure seam"
-    )
-)]
-pub(crate) use runtime::live_key_digests;
-pub(crate) use runtime::{erase_source, source_erasure_alarm, IncompleteReason, LiveKeys};
+pub(crate) use runtime::{
+    erase_source, erase_tail_rows, remove_retired_record_dir, retired_record_dir,
+    source_erasure_alarm,
+};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
@@ -32,8 +28,8 @@ pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, save_locked,
-    save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
+    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, runtime_path,
+    save_locked, save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
     visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
 };
 mod catalogue;
@@ -51,6 +47,8 @@ mod mapper;
 mod sqlite;
 mod tail;
 use kinds::KindCx;
+#[cfg(test)]
+pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
 #[allow(
     unused_imports,
     reason = "the acquisition cutover consumes this staged route"
@@ -115,6 +113,17 @@ impl crate::heap_layout_bound::HeapLayoutBound for Runtime {
     }
 }
 
+/// `index`'s route made unreadable, as a poisoned session lock is: its
+/// `runtime_path` reports `DbUnavailable` from now on.
+#[cfg(test)]
+pub(crate) fn poison_route_for_test(index: &ScanIndex) {
+    let runtime = index.v2().persistence_v2.as_ref().expect("a routed index");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _session = runtime.session.lock().unwrap();
+        panic!("poisons the route's session lock");
+    }));
+}
+
 /// Stable seam shared with selection and census retention. Derived/subset
 /// indices carry the committed route; switch changes do not erase custody.
 pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
@@ -138,7 +147,7 @@ struct Identity {
 
 /// Sources whose index routes through this store: their durable_sources row.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    crate::durable_tail_store::DurableSource::from_snapshot(source.snapshot())
+    crate::snapshots::durable_sources::DurableSource::from_snapshot(source.snapshot())
         .is_some_and(|source| source.properties().state_v2)
 }
 const INLINE_BYTES: usize = 512;
@@ -588,7 +597,8 @@ mod money_fault_tests;
 pub(super) mod money_test_support;
 #[cfg(test)]
 pub(crate) use runtime::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+    seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
+    tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
 // Growth receipts attest confirmed DB custody, independently of the root fence.
 pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};

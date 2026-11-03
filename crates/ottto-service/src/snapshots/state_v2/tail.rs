@@ -163,7 +163,6 @@ impl StagedFile {
 #[serde(rename_all = "snake_case")]
 pub(in crate::snapshots) enum SetAsideCause {
     Encode,
-    UnexpectedFinishField,
     Row,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,14 +276,33 @@ pub(super) struct TailStage {
     debt: BTreeMap<Vec<u8>, Debt>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
+    /// Every Tail row of every file goes, debt included (`erase_every`).
+    every: bool,
     peak_bytes: u64,
 }
 impl TailStage {
+    /// Account removal: every `tail.*` row of the route, of any file and kind,
+    /// debt and markers included. Graph, index and census rows stay.
+    pub(super) fn erase_every() -> Self {
+        Self {
+            every: true,
+            ..Default::default()
+        }
+    }
+    /// The head this pass staged for `key`, if any: (revision, head bytes).
+    #[cfg(test)]
+    pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
+        match self.files.get(key.as_bytes()) {
+            Some(Entry::File(file)) => Some((file.revision, file.head.clone())),
+            _ => None,
+        }
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.files.is_empty()
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
+            && !self.every
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         self.replace_observation(key, observation);
@@ -914,6 +932,23 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result
         purge(tx, gone.collect())?;
     }
 }
+/// Every row of every Tail kind, read from headers alone: no head is decoded,
+/// so a damaged or future one never vetoes it. The number of rows removed.
+fn erase_every(tx: &mut dyn Transaction) -> Result<u64> {
+    let mut erased = 0;
+    for name in catalogue::TAIL_KINDS {
+        let kind = RecordKind::parse(name)?;
+        loop {
+            let rows = tx.scan_kind(&kind, None, HEADER_PAGE)?;
+            let count = rows.len() as u64;
+            if !purge(tx, rows)? {
+                break;
+            }
+            erased += count;
+        }
+    }
+    Ok(erased)
+}
 /// The file's committed revision rows, from headers alone.
 fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
     let kind = RecordKind::parse(REVISION)?;
@@ -951,6 +986,8 @@ struct Applied {
     disposed_absence: u64,
     disposed_settled: u64,
     erased: u64,
+    /// Rows removed by an `erase_every` stage.
+    erased_rows: u64,
 }
 impl Applied {
     fn absorb(&mut self, one: Self) {
@@ -1255,6 +1292,17 @@ pub(super) fn removed_files(old: &mapper::Digests) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+fn write_closure(tx: &mut dyn Transaction, closure: &[mapper::ClosureRow]) -> Result<()> {
+    for row in closure {
+        match &row.value {
+            Some(value) => {
+                mapper::put(tx, &row.key, &**value)?;
+            }
+            None => mapper::remove(tx, &row.key)?,
+        }
+    }
+    Ok(())
+}
 /// Every staged file, each alone, with its own graph rows (`Rows::take_closure`)
 /// and its debt changes: a failure rolls back only that file and sets it aside,
 /// so siblings and shared rows commit. Debt-only changes take no graph rows. A
@@ -1276,6 +1324,17 @@ pub(super) fn apply(
             Some(Entry::File(staged)) => Some(staged),
             _ => None,
         };
+        // Retirement wins: this save removes the file's progress row, so its
+        // stage is stale. Its graph rows write as an unstaged file's do, and the
+        // retirement below drops its reduction.
+        let staged = match staged {
+            Some(_) if removed.contains(file) => {
+                let closure = rows.take_closure(file)?;
+                write_closure(rows.tx()?, &closure)?;
+                None
+            }
+            staged => staged,
+        };
         let mut failed = match entry {
             Some(Entry::Failed(cause)) => Some(*cause),
             _ => None,
@@ -1287,14 +1346,7 @@ pub(super) fn apply(
             };
             // The file's closure boundary: its graph rows, then its Tail rows.
             let result = rows.tx()?.isolated(&mut |tx| {
-                for row in &closure {
-                    match &row.value {
-                        Some(value) => {
-                            mapper::put(tx, &row.key, &**value)?;
-                        }
-                        None => mapper::remove(tx, &row.key)?,
-                    }
-                }
+                write_closure(tx, &closure)?;
                 applied.absorb(write_file(tx, file, staged, debt)?);
                 Ok(())
             })?;
@@ -1335,6 +1387,9 @@ pub(super) fn apply(
         delete_rows(tx, file, false)?;
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
+    }
+    if stage.is_some_and(|stage| stage.every) {
+        applied.erased_rows = erase_every(tx)?;
     }
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);

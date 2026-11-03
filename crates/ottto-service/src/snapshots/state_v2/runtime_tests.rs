@@ -723,24 +723,16 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
     assert!(usage.contains_key("r2"));
     assert!(usage.family("r2").is_err());
 }
-/// [format] f6 explicit forget deletes all artifacts, invalidates stale clones,
-/// and exposes only committed file membership to the restart-record sweep.
+/// [format] f6 explicit forget deletes all artifacts, including a retired
+/// record directory, and invalidates stale clones.
 #[test]
 fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
-    use crate::durable_tail_store::DurableSource;
     use crate::snapshots::scan_index_persistence::Source;
-    for (source, keys) in [
-        (Source::Claude, Some(DurableSource::ClaudeCode)),
-        (Source::Codex, Some(DurableSource::Codex)),
-        (Source::Pi, Some(DurableSource::Pi)),
-    ] {
-        f6_forget(source, keys);
+    for source in [Source::Claude, Source::Codex, Source::Pi] {
+        f6_forget(source);
     }
 }
-fn f6_forget(
-    source: crate::snapshots::scan_index_persistence::Source,
-    keys: Option<crate::durable_tail_store::DurableSource>,
-) {
+fn f6_forget(source: crate::snapshots::scan_index_persistence::Source) {
     let mut f = Fixture::new();
     // This API is binding-scoped (source + namespace dir name), so a shared
     // literal namespace collides with parallel fixtures: use a unique one.
@@ -756,19 +748,7 @@ fn f6_forget(
     f.path = parent.join(super::super::money_test_support::synthetic_file(
         source, ".json",
     ));
-    let live = || {
-        let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        crate::snapshots::state_v2::live_key_digests(&f.path).unwrap()
-    };
-    assert_eq!(live().incomplete_reason, Some(IncompleteReason::Off));
-    let Some(keys) = keys else {
-        let off = live();
-        assert!(!off.complete && off.digests.is_empty());
-        return;
-    };
     f.published();
-    // Published custody before this process's first load: v1 JSON is stale.
-    assert_eq!(live().incomplete_reason, Some(IncompleteReason::Import));
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     let file = serde_json::from_value(serde_json::json!({
         "size_bytes": 4, "modified_unix_seconds": 1,
@@ -778,36 +758,10 @@ fn f6_forget(
     .unwrap();
     index.files.insert("committed".into(), file);
     save_with(&f.path, &mut index).unwrap();
-    let digest = crate::durable_tail_store::key_digest(keys, "committed");
-    let committed = live();
-    assert!(committed.complete);
-    assert_eq!(committed.incomplete_reason, None);
-    assert_eq!(committed.generation, index.generation);
-    assert_eq!(committed.digests, BTreeSet::from([digest]));
-    index
-        .files
-        .insert("uncommitted".into(), index.files["committed"].clone());
-    // Even a mutated live graph cannot add an uncommitted key to membership.
-    assert_eq!(live().digests, BTreeSet::from([digest]));
     fill_session(&mut index);
     assert!(save_with(&f.path, &mut index).is_err());
-    let held = live();
-    assert!(!held.complete);
-    assert_eq!(held.incomplete_reason, Some(IncompleteReason::Hold));
     let mut retry = load_with(&f.path, false).unwrap().unwrap();
-    assert!(!retry.files.contains_key("uncommitted"));
     save_with(&f.path, &mut retry).unwrap();
-    let committed = live();
-    assert!(committed.complete);
-    assert_eq!(committed.generation, retry.generation);
-    assert_eq!(committed.digests, BTreeSet::from([digest]));
-    let fence_bytes = fs::read(&f.path).unwrap();
-    fs::write(&f.path, b"invalid-publication-fence").unwrap();
-    {
-        let _owner = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        assert!(crate::snapshots::state_v2::live_key_digests(&f.path).is_err());
-    }
-    fs::write(&f.path, fence_bytes).unwrap();
     let mut stale = retry.clone();
     assert!(fence::sibling(&f.path, ".v2.sqlite.owner").exists());
     for suffix in [
@@ -831,21 +785,13 @@ fn f6_forget(
         b"forgotten-path-canary",
     )
     .unwrap();
-    let records = crate::durable_tail_store::store_dir_for_index(&f.path);
+    let records = crate::snapshots::state_v2::retired_record_dir(&f.path);
     fs::create_dir(&records).unwrap();
     fs::write(records.join("synthetic.rec"), b"restart-record").unwrap();
     with_session_db(&retry, |db| {
         db.control("erasure_pending", &retry.generation).unwrap()
     });
-    let pending = live();
-    assert!(!pending.complete);
-    assert_eq!(pending.incomplete_reason, Some(IncompleteReason::Hold));
-    assert_eq!(pending.generation, retry.generation);
     crate::snapshots::erase_claude_state_v2_artifacts(&f.support).unwrap();
-    let erased = live();
-    assert!(erased.complete);
-    assert_eq!(erased.incomplete_reason, None);
-    assert!(erased.digests.is_empty());
     assert!(!records.exists());
     assert!(!recovery.exists());
     for suffix in [

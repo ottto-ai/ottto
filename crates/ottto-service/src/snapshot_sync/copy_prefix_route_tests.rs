@@ -14,17 +14,64 @@ fn route(mode: Mode, page: &Page) -> RouteResult {
 /// Deliver a finished page: its exact ACKs earn per-file upload-context
 /// receipts, as the service records them after settlement.
 fn deliver(page: &mut Page) {
-    deliver_counting(page);
+    deliver_into(page, &mut Ledger::new());
 }
 
-/// `deliver`, also returning the page's POST count.
-fn deliver_counting(page: &mut Page) -> usize {
+/// Each session's last exact-ACKed body, as the server keeps it:
+/// `(request_count, removed_request_count)`.
+type Ledger = BTreeMap<String, (u64, u64)>;
+
+/// How many accepted bodies hold the shared ids A and B: (holder, copy). The
+/// holder's body is exactly A and B; the copy's is its own turn C plus the
+/// prefix unless it removed or deferred it.
+fn shared(ledger: &Ledger) -> (u64, u64) {
+    let holder = ledger.get(ROOT).map_or(0, |(count, _)| *count);
+    let copy = ledger
+        .get(COPY)
+        .map_or(0, |(count, _)| count.saturating_sub(1));
+    (holder, copy)
+}
+
+/// Deliver a page as `deliver` does; every exact-ACKed body replaces its
+/// session's ledger entry. Returns the POST count.
+fn deliver_into(page: &mut Page, ledger: &mut Ledger) -> usize {
     let mut progress = e2_progress();
-    let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+    let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, |batch| {
+        let response = ack(batch)?;
+        for entity in &response.accepted_entities {
+            let item = batch
+                .iter()
+                .find(|item| item.snapshot_fingerprint == entity.snapshot_fingerprint)
+                .expect("an ACK names a sent body");
+            ledger.insert(
+                item.source_session_id.clone(),
+                (item.request_count, item.removed_request_count.unwrap_or(0)),
+            );
+        }
+        Ok(response)
+    });
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    // The exact ACKs land as the service records them before it saves; the
+    // committed Tail heads continue only from accepted bodies.
+    page.index
+        .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     let acks = std::mem::take(&mut progress.fresh_context_body_acks);
     accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
     sent.len()
+}
+
+/// #1253 at ACK granularity: a copy's prefix removal is decided only on
+/// holder acceptance already ACKed on an EARLIER page (`before`, the ledger
+/// before this page's POSTs), never on the page's own pending holder POST.
+fn assert_removal_follows_acceptance(page: usize, removed: bool, before: &Ledger) {
+    if removed {
+        assert_eq!(
+            shared(before).0,
+            2,
+            "page {page}: the copy removed its prefix before the holder's body \
+             was accepted (ledger {before:?})"
+        );
+    }
 }
 
 /// The warm owner reads Full, is delivered as the service delivers every
@@ -37,7 +84,6 @@ fn warm_delivered(c: &Corpus, disk: &Disk) -> (E2ScanFixture, ScanIndex) {
     warm.finish();
     deliver(&mut warm);
     let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
-    assert!(disk.records() > 0, "the warm owner persists its records");
     (scanner, prior)
 }
 
@@ -56,7 +102,6 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// the prefix go.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("resumed_copy_prefix_dedupe") {
         return;
     }
@@ -106,7 +151,7 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
                 );
             }
             let restart = disk.owner(SnapshotSource::ClaudeCode);
-            let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0), (0, 1, 0));
+            let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
             finish_claude_pages(&c, &mut pages);
             bodies.push(compare_claude_uploads(&pages));
             let [tail, full, mut disk_page] = pages;
@@ -118,7 +163,10 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
                 SnapshotSource::ClaudeCode,
                 &mut disk_page.index,
             );
-            priors = [tail.index, full.index, next];
+            // The cold arm reads the same committed prior: its own unACKed
+            // lineage, republished on a new route, holds a growth claim bound
+            // to the old one (as `restart_between_pages`).
+            priors = [next.clone(), next.clone(), next];
         }
         assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
     });
@@ -127,8 +175,9 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// [regress] A holder whose page was never delivered owes its upload-context
 /// proof, as a production file without a receipt does. That proof alone
 /// selects no read: the holder is never read, stays owed and never becomes an
-/// accepted origin (e2.rs `origin_accepted`). The new copy therefore holds its
-/// copied prefix for the bounded prefix hold (copy_removals.rs `advance_hold`,
+/// accepted origin (e2.rs `origin_accepted`). A copy's prefix goes only once
+/// its origin's body is accepted (#1253), so the new copy holds its copied
+/// prefix for the bounded prefix hold (copy_removals.rs `advance_hold`,
 /// `HOLD_PASSES` = 3): page 1 emits only its own turn, page 2 re-parses it
 /// from the pending hold (snapshots.rs `claude_copy_removals.pending`) with
 /// an identical body and no POST, page 3 expires the hold and emits the
@@ -136,8 +185,6 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// never-delivered holder's requests are counted once, in the copy.
 #[test]
 fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
-    // As every owner of this harness: commits persist durable records.
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("never_delivered_holder_reread_bound") {
         return;
     }
@@ -147,7 +194,7 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
         input_clock(&holder);
         let disk = Disk::new(&c);
         // Committed, never delivered: no receipt.
-        let (scanner, mut prior) = warm_claude(&c, &disk);
+        let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),
@@ -157,20 +204,21 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
         let mut reads = Vec::new();
         let mut posts = Vec::new();
         let mut copy_requests = Vec::new();
+        let mut ledger = Ledger::new();
         for page in 1..=4 {
             disk.begin(&scanner, SnapshotSource::ClaudeCode);
             let mut p = c.raw(&scanner, prior, 100, true, &[]);
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
-            copy_requests.push(
-                p.scan
-                    .snapshots
-                    .iter()
-                    .find(|item| item.source_session_id == COPY)
-                    .map(|item| item.request_count),
+            let copy = body(&p, COPY).map(|copy| (copy.request_count, copy.removed_request_count));
+            copy_requests.push(copy.map(|(requests, _)| requests));
+            assert_removal_follows_acceptance(
+                page,
+                copy.is_some_and(|(_, removed)| removed.unwrap_or(0) > 0),
+                &ledger,
             );
-            posts.push(deliver_counting(&mut p));
+            posts.push(deliver_into(&mut p, &mut ledger));
             assert!(
                 upload_context_owed_for_test(&p.index, &holder),
                 "page {page}: the holder's proof stays owed, paid by its next read"
@@ -183,6 +231,11 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
             (&[1_usize, 0, 1, 0][..], &[Some(1), None, Some(3), None][..]),
             "own turn, held, expired prefix once, quiet"
         );
+        assert_eq!(
+            shared(&ledger),
+            (0, 2),
+            "A and B end in exactly one accepted body, the copy's (ledger {ledger:?})"
+        );
     });
 }
 
@@ -191,7 +244,6 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
 /// head but no receipt or stamp. That is no acceptance: the copy keeps the prefix.
 #[test]
 fn server_learned_head_is_not_an_accepted_origin() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("server_learned_head_origin") {
         return;
     }

@@ -439,9 +439,16 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 )
                 .index;
                 settle_index_after_upload(&mut settled, &page.committed, &progress);
-                // One index file per row: each row is its own install.
+                // One index file per row: each row is its own install, so a
+                // routed row restarts on its own route.
                 let mut reopened =
-                    c.reload_in(&mut settled, &format!("restart-identity-{identity}.json"));
+                    if crate::snapshots::e2_pipeline_scan_fixture::route_of(&settled).is_some() {
+                        crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(
+                            &settled, &c.base,
+                        )
+                    } else {
+                        c.reload_in(&mut settled, &format!("restart-identity-{identity}.json"))
+                    };
                 let record = reopened
                     .quarantined_snapshot_fingerprints
                     .get_mut(&fp)

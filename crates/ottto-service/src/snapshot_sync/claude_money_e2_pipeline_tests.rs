@@ -142,6 +142,9 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
+        if sampled {
+            index = scanner.routed(index, &self.base);
+        }
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
@@ -175,7 +178,9 @@ impl Corpus {
         self.reload_in(index, "scan-index.json")
     }
     fn reload_in(&self, index: &mut ScanIndex, name: &str) -> ScanIndex {
-        let path = self.base.join(name);
+        // Claude continues from its route; anything else from its own file.
+        let path = crate::snapshots::e2_pipeline_scan_fixture::route_of(index)
+            .unwrap_or_else(|| self.base.join(name));
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
@@ -230,11 +235,13 @@ impl Page {
             unobserved(|| {
                 let mut whole = twin(self);
                 let mut accepted = accepted.as_deref().cloned();
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(true));
                 let reads = api_reads(|| {
                     whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
                 });
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(false));
                 (whole, accepted, reads)
             })
         });
@@ -381,12 +388,7 @@ impl StreamedChecks {
     /// without normalization for bodies (contract-5 tags included), the
     /// persisted index, stats, holds and the finalized wire; the money oracle
     /// for totals and account placement.
-    fn compare(
-        &mut self,
-        terminal: bool,
-        whole: ComparedSide<'_>,
-        streamed: ComparedSide<'_>,
-    ) {
+    fn compare(&mut self, terminal: bool, whole: ComparedSide<'_>, streamed: ComparedSide<'_>) {
         use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
         let ((whole, whole_accepted, whole_reads), (streamed, accepted, reads)) = (whole, streamed);
         assert_eq!(
@@ -395,7 +397,13 @@ impl StreamedChecks {
             "bodies, contract-5 tags included"
         );
         assert_eq!(whole.scan.census_complete, streamed.scan.census_complete);
-        assert_eq!(canonical(&whole.index), canonical(&streamed.index), "index");
+        // A routed index compares its resident graph.
+        let resident = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test;
+        assert_eq!(
+            canonical(&resident(&whole.index)),
+            canonical(&resident(&streamed.index)),
+            "index"
+        );
         assert_eq!(canonical(&whole.stats), canonical(&streamed.stats), "stats");
         assert_eq!(whole.disposition, streamed.disposition, "holds and counts");
         assert_eq!(whole_accepted, accepted, "accepted buckets");
@@ -412,7 +420,7 @@ impl StreamedChecks {
                         &sent.scan.snapshots,
                     )
                 });
-                (canonical(&sent.index), (batches, route))
+                (canonical(&resident(&sent.index)), (batches, route))
             });
         assert_eq!(whole_index, index, "settled index");
         assert_eq!(whole_route.0, route.0, "wire bytes");
@@ -455,17 +463,33 @@ fn api_reads(read: impl FnOnce()) -> usize {
 
 /// (session, login, org, requests) of every share placed by a carried-forward
 /// account.
-fn carried_forward(snapshots: &[SnapshotItem]) -> Vec<(String, Option<String>, Option<String>, u64)> {
+fn carried_forward(
+    snapshots: &[SnapshotItem],
+) -> Vec<(String, Option<String>, Option<String>, u64)> {
     let mut carried = Vec::new();
     for item in snapshots {
         let evidence = |at: Option<u16>| at.map(|at| &item.request_evidence[usize::from(at)]);
-        for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+        for row in item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+        {
             let shares = match &row.identity_parts {
                 Some(parts) => parts
                     .iter()
-                    .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                    .map(|part| {
+                        (
+                            &part.account_identifier_hash,
+                            part.evidence_ref,
+                            part.request_count,
+                        )
+                    })
                     .collect(),
-                None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+                None => vec![(
+                    &row.account_identifier_hash,
+                    row.evidence_ref,
+                    row.request_count,
+                )],
             };
             for (login, at, requests) in shares {
                 if let Some(evidence) = evidence(at).filter(|evidence| {
@@ -602,7 +626,10 @@ fn five_root_sweep(multi_root: bool) {
                 api_login(LOGINS, "d-own", 5, '1', Some('9')),
                 api_for(LOGINS, "resumed", 15, 150),
             ],
-            &[trace_for(LOGINS, "d-own", ""), trace_for(LOGINS, "resumed", "")],
+            &[
+                trace_for(LOGINS, "d-own", ""),
+                trace_for(LOGINS, "resumed", ""),
+            ],
         );
         c.write_at(
             &format!("{MALFORMED}.jsonl"),
@@ -1074,7 +1101,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         );
         assert_eq!(total(&unchanged), 1);
         assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(1));
-        scanner.evict();
+        scanner.evict(&prior);
         let evicted = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(evicted.modes, (1, 0, 0));
         assert_eq!(
@@ -3400,19 +3427,11 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 // Keep the CI test filter stable while its base-compatible transplant stays
-// independent of the restart-restore implementation used by this build.
+// independent of the Tail implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
-    include!("restart_restore_money_tests.rs");
+    include!("claude_tail_money_tests.rs");
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
-    }
-    #[cfg(unix)]
-    mod durable_transition_tests {
-        include!("../snapshots/sampled_scan/durable_transition_tests.rs");
-    }
-    #[cfg(unix)]
-    mod durable_transition_pi_tests {
-        include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
     }
     #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
@@ -3428,6 +3447,9 @@ pub(in crate::snapshot_sync) mod reject_isolation_tests {
 mod state_v2_money_tests {
     include!("state_v2_money_tests.rs");
 }
+
+#[cfg(unix)]
+mod s2_oracle_tests;
 
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
@@ -3469,7 +3491,12 @@ fn settle_captured_holds(
         &sent,
         &progress.fresh_context_body_acks,
     );
-    c.reload(&mut settled.index)
+    // The daemon's save and reload: a routed page commits over its route's
+    // current baseline, as the route moved on while the page was scanned.
+    crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+        &mut settled.index,
+        &c.base.join("scan-index.json"),
+    )
 }
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
@@ -3509,11 +3536,18 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
             "held NEW keys must never gain money authority after real save/load"
         );
         let restarted = E2ScanFixture::default();
+        if let Some(route) = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior) {
+            // A restart keeps the state database: only RAM is lost.
+            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
+                &restarted.cache,
+                &route,
+            );
+        }
         if loss == 1 {
-            scanner.evict();
+            scanner.evict(&prior);
         } else if loss == 2 {
             // Actual capacity eviction through the existing victim mechanism.
-            scanner.evict_for_pressure();
+            scanner.evict_for_pressure(&prior);
         }
         let scanner = if loss == 3 { &restarted } else { &scanner };
         let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
@@ -3522,16 +3556,13 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         });
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
-            // These assertions run only in the macOS-specific tests below.
+            // On the database route the held-new custody is durable (the
+            // withheld read's census record and committed head): a RAM
+            // clear, eviction or restart still continues it.
             assert_eq!(
                 retry.modes,
-                if loss != 0 {
-                    (1, 0, 0)
-                } else if grow {
-                    (0, 1, 0)
-                } else {
-                    (0, 0, 1)
-                }
+                if grow { (0, 1, 0) } else { (0, 0, 1) },
+                "retry, loss={loss}"
             );
         }
         let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
@@ -3539,12 +3570,17 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         let before = std::fs::metadata(&path).unwrap();
         let restored = ready(&c, scanner, prior.clone(), 100, sampled);
         if sampled {
-            assert_eq!(restored.modes, (0, 0, 1));
+            assert_eq!(restored.modes, (0, 0, 1), "restored, loss={loss}");
         }
         literal(&restored);
         // Cold Full is only the fixture's reference oracle. Production keeps
         // the retained read when the external census becomes available.
-        let full_prior = prior.clone();
+        // A routed prior reads unrouted here, as every cold oracle does.
+        let full_prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::ClaudeCode,
+            None,
+            prior.clone(),
+        );
         assert!(!full_prior
             .files
             .contains_key(path.to_string_lossy().as_ref()));
@@ -3589,19 +3625,16 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     withheld_new_file_retries_from_retained_read(true, false, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
     withheld_new_file_retries_from_retained_read(false, true, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
     withheld_new_file_retries_from_retained_read(true, true, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
     for loss in 1..=3 {
@@ -4157,6 +4190,8 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
+            // The expired hold's body went on its own pass, a stored re-fold
+            // sent as an ordinary update (L02); nothing selects afterwards.
             let quiet = ready(&c, &scanner, prior, 100, sampled);
             assert!(
                 body(&quiet, COPY).is_none(),

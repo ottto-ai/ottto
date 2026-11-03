@@ -2,9 +2,8 @@
 use super::*;
 use crate::transcript_acquisition::Scope;
 
-/// The sampled scope and identity-capture mode this fixture's scans bind; a
-/// durable record (#806) restores only under the same pair.
-fn durable_binding(source: SnapshotSource) -> (Scope, bool) {
+/// The sampled scope and identity-capture mode this fixture's scans bind.
+fn scan_binding(source: SnapshotSource) -> (Scope, bool) {
     match source {
         SnapshotSource::ClaudeCode => (Scope("e2-pipeline".into()), CLAUDE_IDENTITY_CAPTURE),
         // Outside a sync cycle every scan captures (also in tests).
@@ -12,6 +11,355 @@ fn durable_binding(source: SnapshotSource) -> (Scope, bool) {
     }
 }
 const CLAUDE_IDENTITY_CAPTURE: bool = false;
+
+/// The state database a fixture's Claude scans continue from.
+pub(crate) struct FixtureRoute {
+    path: PathBuf,
+    /// The caller saves through `Disk`; a page never commits on its own.
+    caller_commits: bool,
+    /// The routes this owner made for its other indexes: one source has one
+    /// route per index, so another index's scan never orphans this one's heads.
+    others: Vec<PathBuf>,
+}
+
+/// Routes fixtures made. Any other route belongs to the caller's session.
+fn fixture_routes() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static ROUTES: std::sync::OnceLock<Mutex<BTreeSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROUTES.get_or_init(Default::default)
+}
+
+/// Claude continues only from the state database, so an owner's retained
+/// state is its route: the prior this owner produced is committed there first,
+/// as the daemon saves between passes, and any other owner's prior moves to a
+/// new, empty route, which reads what changed Full. A caller's own session is
+/// left alone.
+pub(crate) fn routed_for_test(
+    cache: &sampled_scan::SharedCache,
+    index: ScanIndex,
+    dir: &Path,
+) -> ScanIndex {
+    let on = route_of(&index);
+    // A save and reload drops the runtime-only fields; the RAM-era fixture
+    // passed every prior in memory, so each page keeps them.
+    let runtime = runtime_only(&index);
+    let carry = |mut loaded: ScanIndex| {
+        carry_runtime(&runtime, &mut loaded);
+        loaded
+    };
+    let mut own = cache.test_route.lock().unwrap();
+    if let Some(route) = own.as_mut() {
+        if route.caller_commits {
+            return match on {
+                Some(_) => index,
+                None => carry(ScanIndex::load(&route.path).unwrap()),
+            };
+        }
+        if let Some(mine) = on
+            .as_ref()
+            .filter(|on| **on == route.path || route.others.contains(on))
+        {
+            if *mine != route.path {
+                route.others.retain(|other| other != mine);
+                let left = std::mem::replace(&mut route.path, mine.clone());
+                route.others.push(left);
+            }
+            let mut page = index.clone();
+            if save_on_route(&mut page, mine).is_ok() {
+                return carry(ScanIndex::load(mine).unwrap());
+            }
+        }
+    }
+    if on
+        .as_ref()
+        .is_some_and(|path| !fixture_routes().lock().unwrap().contains(path))
+    {
+        return index;
+    }
+    let prior = if on.is_some() {
+        state_v2::money_test_support::resident(&index)
+    } else {
+        index
+    };
+    let (path, cold) = publish_route(&prior, dir);
+    let others = own.take().map_or_else(Vec::new, |route| {
+        let mut others = route.others;
+        others.push(route.path);
+        others
+    });
+    *own = Some(FixtureRoute {
+        path,
+        caller_commits: false,
+        others,
+    });
+    carry(cold)
+}
+
+/// `settled` (a settlement saved beside its own files) back on `from`'s route.
+pub(crate) fn onto_route_for_test(settled: &mut ScanIndex, from: &ScanIndex) {
+    settled.retain_persistence_baseline_from(from);
+}
+
+/// A restarted owner `cache` continues from `route`'s committed heads.
+pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: &Path) {
+    *cache.test_route.lock().unwrap() = Some(FixtureRoute {
+        path: route.to_owned(),
+        caller_commits: false,
+        others: Vec::new(),
+    });
+}
+
+/// `index`'s files with no continuation, on their own route: RAM is released
+/// and each head retired, so the next read of each is a Full as a first read
+/// is. A released cache alone keeps the heads, as in production.
+pub(crate) fn forget_continuations_for_test(cache: &sampled_scan::SharedCache, index: &ScanIndex) {
+    cache.clear();
+    if let Some(route) = route_of(index) {
+        state_v2::retire_tail(&route, index.files.keys().cloned()).unwrap();
+    }
+}
+
+/// Saves `index` on its route. A prior offered again after the route moved on
+/// (a fixture re-feeding one committed index, as a held page does) first takes
+/// the route's current baseline, as the daemon's reload would.
+fn save_on_route(index: &mut ScanIndex, route: &Path) -> Result<()> {
+    let mut first = index.clone();
+    if first.save(route).is_ok() {
+        *index = first;
+        return Ok(());
+    }
+    let current = ScanIndex::load(route)?;
+    index.retain_persistence_baseline_from(&current);
+    index.generation = current.generation;
+    index.decode_holds = current.decode_holds.clone();
+    index.save(route)
+}
+
+/// An in-memory prior keeps every runtime-only (`serde(skip)`) field across
+/// the fixture's save and reload, as the RAM-era fixture's index did; a sync
+/// cycle also re-applies the paused list and copy capabilities to each index.
+fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
+    into.claude_reemission_exclusions = from.claude_reemission_exclusions.clone();
+    into.copy_unproven_enabled = from.copy_unproven_enabled;
+    into.copy_prefix_base_upload_context = from.copy_prefix_base_upload_context.clone();
+    into.codex_counting_moved_evidence = from.codex_counting_moved_evidence.clone();
+    into.active_quarantine_witness = from.active_quarantine_witness.clone();
+    into.active_upload_context_fingerprint = from.active_upload_context_fingerprint.clone();
+    into.context_read_counts = from.context_read_counts.clone();
+    into.active_effective_upload_body_witness_revision =
+        from.active_effective_upload_body_witness_revision;
+    into.active_effective_upload_body_witness_revision_monotone =
+        from.active_effective_upload_body_witness_revision_monotone;
+    into.effective_upload_body_witness_revision_excluded_source_files = from
+        .effective_upload_body_witness_revision_excluded_source_files
+        .clone();
+    into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
+    into.terminal_contract_retries = from.terminal_contract_retries.clone();
+    into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
+    into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
+    into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
+    into.codex_counting_evictions = from.codex_counting_evictions;
+    into.claude_no_list_policy = from.claude_no_list_policy;
+    into.claude_history_emission = from.claude_history_emission.clone();
+    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
+    into.withheld_memo = from.withheld_memo.clone();
+}
+
+/// An empty graph holding only `index`'s runtime-only fields.
+fn runtime_only(index: &ScanIndex) -> ScanIndex {
+    let mut runtime = ScanIndex::default();
+    carry_runtime(index, &mut runtime);
+    runtime
+}
+
+/// `prior` published on a new fixture route under `dir`: (route, cold graph).
+fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (session, cold) = StateV2ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        prior,
+        &dir.canonicalize().unwrap().join(format!("route-{n}")),
+    );
+    let path = session.path().to_owned();
+    // Other arms still read this route; the scratch dir owns it.
+    std::mem::forget(session);
+    E2ScanFixture::register_route_for_test(&path);
+    (path, cold)
+}
+
+/// A restart of `index` as its own install: its resident graph published on
+/// a new route, so another install's commits from the same prior never stale
+/// it. An unrouted index is returned as is.
+pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
+    if route_of(index).is_none() {
+        return index.clone();
+    }
+    // A restart from disk: runtime-only fields are gone, as through a file.
+    publish_route(&state_v2::money_test_support::resident(index), dir).1
+}
+
+/// This thread's process total of the Tail counter `name{label}`, summed over
+/// sources.
+pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> u64 {
+    tail_source::counters::total(name, label)
+}
+
+/// The certified checkpoint a key continues from, read back for assertions.
+pub(crate) struct Continuation {
+    audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
+    last_full_verified: u64,
+}
+impl Continuation {
+    pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
+        self.audit_debt
+    }
+    pub(crate) fn last_full_verified(&self) -> u64 {
+        self.last_full_verified
+    }
+}
+
+/// `key`'s continuation: for a source with a Tail codec its head on
+/// `index`'s route (this pass's staged head, else the committed one), as the
+/// RAM-era fixture read its retained checkpoint; any other source's retained
+/// copy.
+pub(crate) fn continuation_for_test(
+    source: SnapshotSource,
+    cache: &sampled_scan::SharedCache,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<Continuation> {
+    let certificate = match source {
+        SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
+        SnapshotSource::Codex | SnapshotSource::Pi => {
+            return cache
+                .retained_checkpoint(key)
+                .map(|checkpoint| Continuation {
+                    audit_debt: checkpoint.audit_debt(),
+                    last_full_verified: checkpoint.last_full_verified(),
+                })
+        }
+    };
+    Some(Continuation {
+        audit_debt: certificate
+            .audit_debt_unix_seconds
+            .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
+        last_full_verified: certificate.verified_unix_seconds,
+    })
+}
+
+/// `key`'s head certificate on `index`'s route, through `S`'s codec.
+fn head_certificate<S: tail_source::TailSource>(
+    index: &ScanIndex,
+    key: &str,
+) -> Option<crate::transcript_acquisition::DurableCertificate> {
+    let route = route_of(index)?;
+    let (revision, body) = match state_v2::staged_head_for_test(&route, key) {
+        Some(staged) => staged,
+        None => {
+            let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
+            (head.revision, head.body)
+        }
+    };
+    let mut acc = SnapshotAccumulator::new(S::SOURCE);
+    Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
+}
+
+/// A routed graph read back resident, for byte comparisons; an unrouted one
+/// as is.
+pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
+    if route_of(index).is_some() {
+        state_v2::money_test_support::resident(index)
+    } else {
+        index.clone()
+    }
+}
+
+/// A scan fixture's page of a source with a Tail codec continues from its
+/// owner's route; with no cache it reads a fixture route unrouted. Other
+/// sources are left alone.
+pub(crate) fn route_for_test(
+    source: SnapshotSource,
+    cache: Option<&sampled_scan::SharedCache>,
+    index: ScanIndex,
+) -> ScanIndex {
+    if !tail_source::has_codec(source) {
+        return index;
+    }
+    let Some(cache) = cache else {
+        // A scan with no cache to own a route is the cold oracle: it reads a
+        // fixture route's graph unrouted, as before Claude kept its Tail there,
+        // so another arm's commits on that route never stale it.
+        let fixture_route =
+            route_of(&index).is_some_and(|path| fixture_routes().lock().unwrap().contains(&path));
+        if !fixture_route {
+            return index;
+        }
+        let mut copy = state_v2::money_test_support::resident(&index);
+        copy.v2_mut().persistence_v2 = None;
+        carry_runtime(&index, &mut copy);
+        return copy;
+    };
+    let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    routed_for_test(cache, index, &dir)
+}
+
+/// The time a fixture's next visit is taken to come after its last. The
+/// fixtures' `collected_at` never moves, so a kept generation's metadata
+/// re-listing (`LISTING_INTERVAL_SECONDS`) and its owed-file pace
+/// (`LISTING_OWED_PACE_SECONDS`) would never come due; production's clock
+/// moves on. Age the walk's listing clocks by the longer of the two, as a
+/// visit that much later sees them. Only the listing clocks move.
+pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
+    let Some(walk) = index.traversal.as_mut() else {
+        return;
+    };
+    let age = |at: &mut u64| {
+        *at = at.saturating_sub(LISTING_INTERVAL_SECONDS.max(LISTING_OWED_PACE_SECONDS));
+    };
+    if let Some(started) = walk.listing_started_unix_seconds.as_mut() {
+        age(started);
+    }
+    walk.listing_owed_requeued_unix_seconds
+        .values_mut()
+        .for_each(age);
+}
+
+/// The state database `index` is bound to, if any.
+pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
+    state_v2::runtime_path(index).ok().flatten()
+}
+
+/// A fixture's save beside its own files. A routed index commits on its route
+/// and leaves an unrouted copy at `path`: a later load from there holds no
+/// Claude continuation, so its next change reads Full.
+pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
+    let Some(route) = route_of(index) else {
+        return index.save(path).unwrap();
+    };
+    save_on_route(index, &route).unwrap();
+    let mut copy = state_v2::money_test_support::resident(index);
+    copy.v2_mut().persistence_v2 = None;
+    // A fresh copy each save: its generation is the route's, not this file's.
+    let _ = fs::remove_file(path);
+    copy.generation = 0;
+    copy.save(path).unwrap();
+}
+
+/// The same owner's save and reload between passes, as the daemon's: a
+/// routed index commits on its route and continues from it (the RAM-era
+/// fixture kept its cache across this reload); an unrouted one round-trips
+/// through `path`.
+pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
+    let Some(route) = route_of(index) else {
+        index.save(path).unwrap();
+        return ScanIndex::load(path).unwrap();
+    };
+    save_on_route(index, &route).unwrap();
+    let mut loaded = ScanIndex::load(&route).unwrap();
+    carry_runtime(index, &mut loaded);
+    loaded
+}
 
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
@@ -47,42 +395,47 @@ impl E2ScanFixture {
         self.observed.lock().unwrap().clone()
     }
 
-    /// Begins this owner's pass on the real durable store beside
-    /// `index_path`, as the daemon does before a scan. `state_dir` holds the
-    /// index and the single-writer lock.
-    pub(crate) fn begin_durable(
-        &self,
-        source: SnapshotSource,
-        state_dir: &Path,
-        index_path: &Path,
-    ) {
-        let (scope, capture) = durable_binding(source);
+    pub(crate) fn register_route_for_test(path: &Path) {
+        fixture_routes().lock().unwrap().insert(path.to_owned());
+    }
+
+    /// This owner continues from `path`'s committed heads.
+    pub(crate) fn on_committed_route(&self, path: &Path) {
+        *self.cache.test_route.lock().unwrap() = Some(FixtureRoute {
+            path: path.to_owned(),
+            caller_commits: true,
+            others: Vec::new(),
+        });
+    }
+
+    pub(crate) fn routed(&self, index: ScanIndex, dir: &Path) -> ScanIndex {
+        routed_for_test(&self.cache, index, dir)
+    }
+
+    /// Begins this owner's pass, as the daemon does before a scan.
+    /// `state_dir` holds the index and the single-writer lock.
+    pub(crate) fn begin_pass(&self, source: SnapshotSource, state_dir: &Path, index_path: &Path) {
+        let (scope, capture) = scan_binding(source);
         let capture = if source == SnapshotSource::ClaudeCode {
             self.capture_claude_identity
         } else {
             capture
         };
-        begin_durable_pass(
-            &self.cache,
-            state_dir,
-            source,
-            index_path,
-            false,
-            &scope,
-            capture,
-            true,
-        );
+        begin_source_pass(&self.cache, state_dir, source, index_path, &scope, capture);
     }
 
-    pub(crate) fn evict(&self) {
-        self.cache.clear();
+    /// `index`'s files lose their continuation.
+    pub(crate) fn evict(&self, index: &ScanIndex) {
+        forget_continuations_for_test(&self.cache, index);
     }
 
-    pub(crate) fn evict_for_pressure(&self) {
+    pub(crate) fn evict_for_pressure(&self, index: &ScanIndex) {
         let mut retained = self.cache.retained().unwrap();
         let empty = sampled_scan::RetainedCache::default();
         let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
         assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
+        drop(retained);
+        forget_continuations_for_test(&self.cache, index);
     }
 
     #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
@@ -110,7 +463,7 @@ impl E2ScanFixture {
             self.capture_claude_identity,
         );
         if sampled {
-            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
+            let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         // The same synthetic root births reach the page's staged twin probes,
@@ -150,7 +503,7 @@ impl E2ScanFixture {
             false,
         );
         if sampled {
-            let (scope, _) = durable_binding(source);
+            let (scope, _) = scan_binding(source);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         if let Some(versions) = self.versions.as_ref() {

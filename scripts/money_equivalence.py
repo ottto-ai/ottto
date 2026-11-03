@@ -6,7 +6,6 @@ import os
 from decimal import Decimal
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import time
 
@@ -20,8 +19,11 @@ def output(args):
 
 
 # Disk-only lifecycle fixtures (#806): a VERIFIED line each, no receipt file.
-DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision",
-                 "downgrade_then_reupgrade")
+DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision")
+# A base with the retired restart-record store also runs its downgrade
+# fixture; the head has no record store to downgrade from (its Tail writer is
+# forward-only), so this line is accepted only from the base and never required.
+BASE_ONLY_DISK_FIXTURES = ("downgrade_then_reupgrade",)
 
 
 # Only base -> head ADDITIONS at the batch envelope may be ignored. Never
@@ -199,8 +201,16 @@ def require_base_scan_fixture(base):
     """Keep the base's scanner adapter: the head's may require newer runtime APIs."""
     fixture = base / "crates/ottto-service/src/snapshots/e2_pipeline_scan_fixture.rs"
     text = fixture.read_text()
-    if any(f"fn {name}(" not in text for name in ("scan", "scan_other", "begin_durable")):
-        raise RuntimeError("base compat: scanner fixture lacks scan/scan_other/begin_durable")
+    if any(f"fn {name}(" not in text for name in ("scan", "scan_other")) or not any(
+            f"fn {name}(" in text for name in ("begin_durable", "begin_pass")):
+        raise RuntimeError("base compat: scanner fixture lacks scan/scan_other/begin_durable|begin_pass")
+
+
+def require_base_harness(base):
+    """Each arm runs its own in-tree harness under the same module name."""
+    tests = base / "crates/ottto-service/src/snapshot_sync/claude_money_e2_pipeline_tests.rs"
+    if "mod money_equivalence_tests" not in tests.read_text():
+        raise RuntimeError("base compat: base predates the in-tree money_equivalence_tests harness")
 
 
 def main():
@@ -232,8 +242,7 @@ def main():
         base_sha = resolved.stdout.strip()
     if not explicit:
         # Compare against the branch's fork point, not the base tip: later
-        # base changes are not this branch's, and the transplanted head test
-        # file need not compile against newer base test files.
+        # base changes are not this branch's.
         base_sha = output(["git", "merge-base", base_sha, "HEAD"])
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
@@ -243,31 +252,9 @@ def main():
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
     try:
-        # Only test code is transplanted. No P2a/runtime/limits/lockfile changes.
-        sync = Path("crates/ottto-service/src/snapshot_sync")
+        # Nothing is transplanted: each arm builds its own tree unchanged.
         require_base_scan_fixture(base)
-        shutil.copy2(repo / sync / "money_equivalence_tests.rs", base / sync / "money_equivalence_tests.rs")
-        # Bases before #870 have no audit-retirement reconcile: their post-save
-        # step is durable_after_save alone. Call the base's own production step.
-        snapshots = (base / "crates/ottto-service/src/snapshots.rs").read_text()
-        if "fn durable_after_save_and_retire(" not in snapshots:
-            transplanted = base / sync / "money_equivalence_tests.rs"
-            text = transplanted.read_text()
-            head_call = ("crate::snapshots::durable_after_save_and_retire(\n"
-                         "            cache,\n"
-                         "            &self.dir,\n"
-                         "            source,\n"
-                         "            index,\n"
-                         "            &self.index,\n"
-                         "        );")
-            if text.count(head_call) != 1:
-                raise RuntimeError("base compat: expected exactly one durable_after_save_and_retire call")
-            transplanted.write_text(text.replace(
-                head_call, "crate::snapshots::durable_after_save(cache, &self.dir, source, index);"))
-        tests = base / sync / "claude_money_e2_pipeline_tests.rs"
-        include = '\nmod money_equivalence_tests { include!("money_equivalence_tests.rs"); }\n'
-        if "mod money_equivalence_tests" not in tests.read_text():
-            tests.write_text(tests.read_text() + include)
+        require_base_harness(base)
         for arm, tree in [("base", base), ("head", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
@@ -297,8 +284,12 @@ def main():
             }
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
-            # Every disk line must be VERIFIED, once per fixture: 10 + 3 receipts.
+            # Every disk line must be VERIFIED, once per fixture: 10 + 2 receipts.
             disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
+            optional = BASE_ONLY_DISK_FIXTURES if arm == "base" else ()
+            if any(status != "VERIFIED" for _, status in disk) or len(disk) != len(set(disk)):
+                raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
+            disk = [(name, status) for name, status in disk if name not in optional]
             if sorted(disk) != sorted((name, "VERIFIED") for name in DISK_FIXTURES):
                 raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):

@@ -9,7 +9,7 @@ behaviour described here, update this page in the same PR.
 
 ```
 file-system hint / periodic listing → select file → read new bytes from saved offset → per-source reducer
-  → running result kept in RAM (and the record store when enabled) → upload → exact acknowledgement → index save
+  → running result kept in RAM (Claude: the state database's Tail) → upload → exact acknowledgement → index save
 ```
 
 - **Discovery.** The recursive watcher (`snapshot_watcher.rs`) turns file-system events into
@@ -45,16 +45,15 @@ non-permanent reasons hold their entity without invalidating sibling ACKs. See
   the archive-read allowance is spent; a refused family waits for the next load.
   Queued rollovers and opaque decode holds defer compaction. Row deletion and exact cold
   metadata publish together; loading stays read-only and idle maintenance owns reclaim.
-- **Record store** (`durable_tail_store.rs`, `durable_tail_codec.rs`): format v3 write-ahead
-  records stage the running reduction at native settlement, before publication effects and index
-  save. Exact local receipts settle record custody, never upload acknowledgement. Restore validates
-  source, key, context, scope, format, file certificate and committed index evidence before bounded
-  content replay and Tail. Refusals use counted recovery or hold without changing accepted usage.
-  Byte budgets pace writes and replay; deferred work stays discoverable. Skill labels stay in
-  private local records independently of upload settings and never enter diagnostics or uploads
-  from the store. Erasure unlinks
-  records and syncs the directory under the existing writer lock; failures are counted and retried.
-- The two stores join by key digest and hold no references into each other.
+- **Claude continuation** (`snapshots/tail_source/`, `durable_tail_codec.rs`): a completed read stages
+  its running reduction into the state database; the pass's save commits it with the index. A later
+  read loads the committed head, checks identity and the file certificate, and streams the pages,
+  session facts (title, first prompt, workspace, opening settings) among them: no transcript byte is
+  read back for content. A refusal is a counted Full; only a newer build's
+  head holds. Codex and Pi keep RAM reductions and read Full after a restart. Each pass removes the
+  retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
+  retried, never via full erasure.
+- The Tail is one more kind in the same state database, committed in the same save as the index.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
@@ -91,7 +90,7 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
 ## One generic path per source
 
 Claude Code, Codex and Pi share one implementation of discovery, selection, tail reads, read
-counters, the record store, saving, erasure, upload, acknowledgement, status, counters and
+counters, the Tail store, saving, erasure, upload, acknowledgement, status, counters and
 switches. Per-source code is limited to the root layout, the file reader and reducer, and money
 rules that really differ: copied-prefix deduplication for Claude, cumulative deltas for Codex and
 forks for Pi. Source capabilities are table fields, not `== Source::Claude` checks in shared code.
@@ -115,12 +114,6 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
   variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
   explicitly documented changes. When retired, the feature is either on by default with the OFF
   path deleted, or deleted.
-- **Restart restore** (`snapshots/restart_restore.rs`) defaults OFF. Its process-fixed policy
-  requires the `restart_restore_enabled` marker and `DISCOVERY_DEPENDENCY_READY`. That constant is
-  false in this build, so the marker cannot turn it ON until the discovery dependency is implemented
-  and the constant flips. OFF disables ordinary record reads, writes, repair and GC; source
-  erasure and counted deletion of outgrown v1 records remain active. The former v1 warm-restore
-  route is removed: files use no-record acquisition, with a paced Full on growth when needed.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.

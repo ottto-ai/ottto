@@ -16,12 +16,16 @@
 //!   Dropped on identity failure and erased with
 //!   its record. Never exposed in logs, diagnostics, status, support bundles or
 //!   error text; single use, restoring only the same approved upload/state.
-//! - `X` content (text, paths). Never encoded. Restored by re-derivation from
-//!   the file itself and verified by hash, else the entry reads in Full;
+//! - `X` content (text, paths). Never encoded in its type's body: a Tail
+//!   source stores it as session facts (`tail.page.session_facts`), apart;
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
 //!   record, and the entry reads in Full;
 //! - `I` a live input re-injected every pass. Never encoded;
 //! - `D` a nested persisted type, encoded by its own field classes.
+//! - `G` an `N` fixed-size array stored with its length (`GrownArray`), so a
+//!   build that appends slots still reads old records: a shorter stored array
+//!   pads the new slots with `Default`, a longer one is corrupt. Slots are
+//!   append-only: never insert, reorder or remove one.
 //! - `P` pass-through: a shared payload (an enum variant used by several
 //!   fields) whose class is the enclosing field's, so an `L` span is only
 //!   ever the leaf field that holds the id.
@@ -53,8 +57,6 @@ pub(crate) enum Refuse {
     TooLarge,
     /// The output sink could not accept the encoded bytes.
     WriteFailed,
-    /// An `X` field cannot be re-derived from the file under the bound.
-    NotRederivable(&'static str),
     /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
     /// SHA-256 or HMAC value).
     NotDigest(&'static str),
@@ -344,11 +346,6 @@ impl<'a> Dec<'a> {
         }
         Ok(len)
     }
-    /// The next length, not consumed: a caller's bound before the field's
-    /// own decode asks for any allowance.
-    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
-        Dec::new(&self.bytes[self.at..]).take_len()
-    }
     pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], Corrupt> {
         let len = self.take_len()?;
         self.raw(len)
@@ -368,9 +365,6 @@ impl<'a> Dec<'a> {
     }
     pub(crate) fn note_pl_labels(&mut self, len: usize) {
         self.pl_labels_nonempty |= len != 0;
-    }
-    pub(crate) fn has_pl_labels(&self) -> bool {
-        self.pl_labels_nonempty
     }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
@@ -405,12 +399,6 @@ impl Shape {
     }
     pub(crate) fn leave(&mut self) {
         self.text.push('}');
-    }
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"ottto-durable-tail-shape:v1");
-        hasher.update(self.text.as_bytes());
-        hasher.finalize().into()
     }
     #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
@@ -780,72 +768,6 @@ fn verify_entries_bounded<'a, K: Ord>(
 pub(crate) trait DurableEmpty {
     fn durable_empty(&self) -> bool;
 }
-
-mod pi_only_sealed {
-    pub trait Sealed {}
-}
-
-/// A Pi-only runtime type behind a labelled `E` field
-/// (`E f: Real as Label`). The shape keeps `Label`'s text, so the shared
-/// allowlist digests do not move when Pi-only state grows. Sealed: only the
-/// types next to `PI_ONLY_E_LABELS` implement it, and the labelled arm of
-/// `durable_struct!` refuses to compile for any other type, path or label.
-pub(crate) trait PiOnlyDurable: pi_only_sealed::Sealed + DurableEmpty + Default {
-    /// The `Type.field` path the label is allowed on.
-    const FIELD: &'static str;
-    /// The type whose text the shape keeps.
-    type Label: ?Sized;
-}
-
-/// The labelled `E` allowlist: (field path, label text). One entry per sealed
-/// type; anything else is a compile error in `durable_struct!`.
-pub(crate) const PI_ONLY_E_LABELS: &[(&str, &str)] = &[
-    // The Pi usage ledger plus the Pi fork state. An `E` field: Claude and
-    // Codex must leave it empty, and Pi moves it into the Pi section, whose
-    // allowlist binds its shape. The shape keeps the earlier type text, so
-    // the Claude and Codex allowlist digests stay byte-identical.
-    (
-        "SnapshotAccumulator.seen_pi_usage_keys",
-        "BTreeMap<String, PiUsageDedupState>",
-    ),
-];
-impl pi_only_sealed::Sealed for crate::snapshots::PiLedger {}
-
-const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Whether `path` is allowlisted and is the path `field` (the sealed type's
-/// own `FIELD`) names. Evaluated in a const by the labelled arm.
-pub(crate) const fn pi_only_label_allowed(path: &str, field: &str, label: &str) -> bool {
-    if !str_eq(path, field) {
-        return false;
-    }
-    let mut i = 0;
-    while i < PI_ONLY_E_LABELS.len() {
-        if str_eq(PI_ONLY_E_LABELS[i].0, path) && str_eq(PI_ONLY_E_LABELS[i].1, label) {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Compiles only when `A` and `B` are the same type.
-pub(crate) trait SameType<T: ?Sized> {}
-impl<T: ?Sized> SameType<T> for T {}
-pub(crate) fn same_type<A: ?Sized + SameType<B>, B: ?Sized>() {}
 
 // Scalar validation stays identical to decode, including ranges and labels.
 macro_rules! scalar_verify {
@@ -1252,6 +1174,65 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
     }
 }
 
+/// A fixed-size array stored with its length, so the array may grow by
+/// appended slots without breaking stored records. Decode keeps the stored
+/// slots and fills the slots this build appended with `pad`; a stored array
+/// longer than this build's is corrupt. Slots are append-only.
+pub(crate) trait GrownArray: Sized {
+    type Item;
+    fn put_grown(&self, e: &mut Enc) -> Result<(), Refuse>;
+    fn take_grown(d: &mut Dec<'_>, pad: impl FnMut() -> Self::Item) -> Result<Self, Corrupt>;
+    fn verify_grown(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    fn shape_grown(s: &mut Shape);
+}
+
+impl<T: Durable, const N: usize> GrownArray for [T; N] {
+    type Item = T;
+    fn put_grown(&self, e: &mut Enc) -> Result<(), Refuse> {
+        e.varint(N as u64)?;
+        self.iter().try_for_each(|item| item.put(e))
+    }
+    fn take_grown(d: &mut Dec<'_>, pad: impl FnMut() -> Self::Item) -> Result<Self, Corrupt> {
+        let stored = grown_len::<N>(d)?;
+        d.slots::<T>(N)?;
+        let mut out = Vec::with_capacity(N);
+        for _ in 0..stored {
+            out.push(T::take(d)?);
+        }
+        out.resize_with(N, pad);
+        out.try_into().map_err(|_| Corrupt)
+    }
+    fn verify_grown(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..grown_len::<N>(d)? {
+            T::verify(d)?;
+        }
+        Ok(())
+    }
+    fn shape_grown(s: &mut Shape) {
+        // No `N`: appending a slot keeps stored records readable.
+        s.push("[len]");
+        T::shape(s);
+    }
+}
+
+/// Test only: a grown array's stored bytes at `len` slots (cycling `items`
+/// past their end), as a build with `len` slots would write them.
+#[cfg(test)]
+pub(crate) fn grown_bytes_for_test<T: Durable>(items: &[T], len: usize) -> Vec<u8> {
+    let mut e = Enc::bytes(1 << 16);
+    e.varint(len as u64).unwrap();
+    for item in items.iter().cycle().take(len) {
+        item.put(&mut e).unwrap();
+    }
+    e.into_bytes()
+}
+
+/// A grown array's stored length: at most this build's `N`.
+fn grown_len<const N: usize>(d: &mut Dec<'_>) -> Result<usize, Corrupt> {
+    let len = usize::try_from(d.varint()?).map_err(|_| Corrupt)?;
+    (len <= N).then_some(len).ok_or(Corrupt)
+}
+
 impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
         put_seq(e, self.len(), self.iter())
@@ -1464,6 +1445,10 @@ macro_rules! durable_field {
     (put D, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put G, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::GrownArray::put_grown(value, $e)?;
+    }};
     (put P, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
@@ -1503,6 +1488,9 @@ macro_rules! durable_field {
     (take P, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take G, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::GrownArray>::take_grown($d, ::std::default::Default::default)?
+    };
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
@@ -1516,6 +1504,7 @@ macro_rules! durable_field {
     (verify L, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify G, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::GrownArray>::verify_grown($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
     (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL fields cannot appear in durable keys") };
     (key PL, $d:ident, $ty:ty) => { compile_error!("PL fields cannot appear in durable keys") };
@@ -1541,28 +1530,12 @@ macro_rules! durable_field {
         $s.push(concat!("H ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::HDigest>::shape_h($s);
     }};
+    (shape G, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("G ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::GrownArray>::shape_grown($s);
+    }};
     (shape E, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("E ", stringify!($f), ": ", stringify!($ty)))
-    };
-    // A labelled `E` field: the shape keeps the label's text, exactly as the
-    // unlabelled arm above would print it for that type.
-    (shape E, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {{
-        const _: () = assert!(
-            $crate::durable_tail_codec::pi_only_label_allowed(
-                $path,
-                <$ty as $crate::durable_tail_codec::PiOnlyDurable>::FIELD,
-                stringify!($label),
-            ),
-            "labelled E field is not in PI_ONLY_E_LABELS"
-        );
-        $crate::durable_tail_codec::same_type::<
-            $label,
-            <$ty as $crate::durable_tail_codec::PiOnlyDurable>::Label,
-        >();
-        $s.push(concat!("E ", stringify!($f), ": ", stringify!($label)))
-    }};
-    (shape $c:ident, $s:ident, $f:ident, $ty:ty, as $label:ty, $path:expr) => {
-        compile_error!("only E fields may carry a shape label")
     };
     (shape I, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("I ", stringify!($f), ": ", stringify!($ty)))
@@ -1578,18 +1551,6 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
-    (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
-        $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
-        impl $t {
-            fn put_borrowed(e: &mut $crate::durable_tail_codec::Enc, $($f: &$ty),*)
-                -> Result<(), $crate::durable_tail_codec::Refuse> {
-                $($crate::durable_tail_codec::durable_field!(
-                    put $c, e, $f, $ty, concat!(stringify!($t), ".", stringify!($f))
-                );)*
-                Ok(())
-            }
-        }
-    };
     (key $t:ident $body:tt) => {
         $crate::durable_tail_codec::durable_struct!($t $body);
         $crate::durable_tail_codec::durable_struct!(@key $t $body);
@@ -1605,7 +1566,7 @@ macro_rules! durable_struct {
             }
         }
     };
-    ($t:ident { $($c:ident $f:ident : $ty:ty $(as $label:ty)?),* $(,)? }) => {
+    ($t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
             #[allow(unused_variables, reason = "no fields leaves the encoder unused")]
             fn put(
@@ -1631,10 +1592,7 @@ macro_rules! durable_struct {
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
-                    $($crate::durable_tail_codec::durable_field!(
-                        shape $c, s, $f, $ty
-                        $(, as $label, concat!(stringify!($t), ".", stringify!($f)))?
-                    );)*
+                    $($crate::durable_tail_codec::durable_field!(shape $c, s, $f, $ty);)*
                     s.leave();
                 }
             }
@@ -1737,72 +1695,6 @@ macro_rules! durable_enum {
 }
 pub(crate) use durable_enum;
 
-/// Where each re-derived (`X`) field was last assigned, as absolute byte
-/// offsets in the transcript (`N`). Restore re-reads the file only up to these
-/// lines and checks each re-derived value against its stored hash.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DurableMarks {
-    /// End of the last line that set the first prompt material or title.
-    pub(crate) first_prompt: Option<u64>,
-    /// End of the line that set the workspace path.
-    pub(crate) workspace: Option<u64>,
-    /// End of the last line that assigned the Codex agent label.
-    pub(crate) agent_label: Option<u64>,
-    /// The last line that changed the title: (offset, length).
-    pub(crate) title_line: Option<(u64, u64)>,
-    /// A re-derived field was assigned by a line whose position was unknown.
-    pub(crate) unknown: bool,
-}
-durable_struct!(DurableMarks {
-    N first_prompt: Option<u64>,
-    N workspace: Option<u64>,
-    N agent_label: Option<u64>,
-    N title_line: Option<(u64, u64)>,
-    N unknown: bool,
-});
-impl crate::heap_layout_bound::HeapLayoutBound for DurableMarks {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    // Plain integers: no heap, one walker visit for the whole struct.
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
-
-impl DurableMarks {
-    /// Records the current line's end as the latest assignment.
-    /// An unknown position clears the mark: the field is then not
-    /// re-derivable and its entry reads in Full.
-    pub(crate) fn note_end(&mut self, mark: fn(&mut Self) -> &mut Option<u64>) {
-        let line = current_line();
-        *mark(self) = line.map(|(offset, len)| offset.saturating_add(len));
-        self.unknown |= line.is_none();
-    }
-    pub(crate) fn note_title_line(&mut self) {
-        let line = current_line();
-        self.title_line = line;
-        self.unknown |= line.is_none();
-    }
-}
-
-thread_local! {
-    /// The physical line the JSONL reader is applying: (offset, length) in
-    /// the file. `None` outside a positioned read.
-    static LINE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
-}
-
-/// Runs `apply` with `line` as the current line, then restores the previous.
-pub(crate) fn with_line<T>(line: Option<(u64, u64)>, apply: impl FnOnce() -> T) -> T {
-    let previous = LINE.with(|cell| cell.replace(line));
-    let out = apply();
-    LINE.with(|cell| cell.set(previous));
-    out
-}
-
-pub(crate) fn current_line() -> Option<(u64, u64)> {
-    LINE.with(std::cell::Cell::get)
-}
-
 #[cfg(test)]
 thread_local! {
     /// Byte spans of `L` fields in the bodies this thread encoded, with the
@@ -1839,14 +1731,6 @@ fn note_verify_visit(at: usize, varint: bool) {
             visits.push((at, varint));
         }
     });
-}
-#[cfg(test)]
-pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
-    VERIFY_PRESENT_OPTIONS.with(|count| count.set(0));
-    VERIFY_VISITS.with(|visits| *visits.borrow_mut() = Some(Vec::new()));
-    f();
-    let visits = VERIFY_VISITS.with(|visits| visits.borrow_mut().take().unwrap());
-    (visits, VERIFY_PRESENT_OPTIONS.with(std::cell::Cell::get))
 }
 
 #[cfg(test)]
@@ -2258,7 +2142,6 @@ mod tests {
         round(ProbeKind::Unit);
         round(ProbeKind::Pair(7, "payload".into()));
         round(ProbeKind::Named { at: 9 });
-        round(DurableMarks::default());
         round(Digests::default());
         for bad in [
             "abc".to_string(),

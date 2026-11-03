@@ -1007,7 +1007,8 @@ fn guard_current(
     }))
 }
 
-fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
+/// The route of this graph's live session: the index path its stage is kept under.
+pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
     let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(None);
     };
@@ -1133,7 +1134,6 @@ impl BaselineRelease {
         )
     }
     /// The normal cycle exit's Tail-only commit, when anything is staged.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the acquisition cutover exits"))]
     pub(crate) fn commit_tail(&self) -> Result<()> {
         match &self.0 {
             Some((path, runtime)) => tail_route::commit_at_exit(path, runtime),
@@ -1206,7 +1206,7 @@ fn erasure_inventory(path: &Path) -> Result<()> {
         .filter_map(|(suffix, _, class)| class.map(|class| (class, fence::sibling(path, suffix))))
         .chain(std::iter::once((
             "restart_record_inventory",
-            crate::durable_tail_store::store_dir_for_index(path),
+            retired_record_dir(path),
         )));
     for (class, artifact) in artifacts {
         let mut count = 0_u64;
@@ -1268,6 +1268,24 @@ pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     close_tree(support, false)
 }
 
+/// The retired restart-record directory beside a scan index.
+pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
+    index_path.with_extension("durable-tail")
+}
+
+/// Removes that directory, never following a link, and syncs its parent.
+/// `Ok(false)`: nothing was there.
+pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
+    match fs::symlink_metadata(records) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
+        Ok(_) => fs::remove_file(records)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    super::super::sync_checkpoint_parent(records)?;
+    Ok(true)
+}
+
 /// Explicit erasure only. Close the shared session before unlinking all
 /// artifacts, and invalidate clones before releasing CheckpointLock.
 pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
@@ -1284,13 +1302,7 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
     }
     super::ack::erase_failed_imports(path)?;
     super::super::sync_checkpoint_parent(path)?;
-    let records = crate::durable_tail_store::store_dir_for_index(path);
-    match fs::symlink_metadata(&records) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(&records)?,
-        Ok(_) => fs::remove_file(&records)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    remove_retired_record_dir(&retired_record_dir(path))?;
     super::super::sync_checkpoint_parent(path)?;
     // Retain the invalidated route's custody latch: erased artifacts must not
     // let this process resume v1 or re-create v2 without an explicit new lineage.
@@ -1349,6 +1361,51 @@ pub(crate) fn erase_source(
     complete()?;
     telemetry::event("source_erasure_confirmed", &indexes.len());
     Ok(())
+}
+
+/// Account removal: every Tail row of the route at `path`, of any file and
+/// kind, debt included, in one Tail-only commit; then a TRUNCATE checkpoint,
+/// so no removed value stays in the WAL (`secure_delete` zeroes freed pages).
+/// Graph, index and census rows stay. Live sessions close first, as erasure's
+/// do; the next load reopens the store. `Ok(false)`: no store at `path`.
+pub(crate) fn erase_tail_rows(path: &Path) -> Result<bool> {
+    let Some(binding) = binding(path) else {
+        return Ok(false);
+    };
+    if !fence::exists(&fence::sibling(path, ".v2.sqlite"))? {
+        return Ok(false);
+    }
+    let _owner = super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        with_state(path, |state| {
+            let Some((identity, db_path)) = fence::reconcile(path, &binding, state.latched)? else {
+                return Ok(false);
+            };
+            state.latched = true;
+            state.save_digests = None;
+            state.tail = Default::default();
+            let current = state.current.take();
+            let live = state.runtimes.drain(..).filter_map(|r| r.upgrade());
+            for runtime in live.chain(current) {
+                runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .take();
+            }
+            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
+            let expected = db.stamp()?.0;
+            super::ack::ProgressRecovery::recover_route_locked(&identity, expected, path, owner)?;
+            let every = tail::TailStage::erase_every();
+            tail::commit_exit(&mut db, &identity, expected, &every)?;
+            let checkpoint = db.checkpoint(CheckpointMode::IdleReclaim);
+            ensure!(
+                checkpoint.state == CheckpointState::Complete,
+                Hold::DbUnavailable
+            );
+            Ok(true)
+        })
+    })
 }
 
 pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
@@ -1673,19 +1730,12 @@ pub(in super::super) fn confirmed_growth_stamp(
 mod growth_tests;
 
 #[path = "runtime_tail.rs"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the acquisition cutover calls these")
-)]
 pub(super) mod tail_route;
 #[cfg(test)]
 #[path = "tail_tests.rs"]
 mod tail_tests;
 #[cfg(test)]
 pub(crate) use tail_tests::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+    seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
+    tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
-
-#[path = "runtime_live_keys.rs"]
-mod live_keys;
-pub(crate) use live_keys::{live_key_digests, IncompleteReason, LiveKeys};

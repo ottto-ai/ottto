@@ -36,9 +36,18 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
+/// The head this pass staged on `path` for `key`, not yet committed.
+#[cfg(test)]
+pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Option<(u32, Vec<u8>)> {
+    with_state(path, |state| Ok(state.tail.staged_head(key))).unwrap()
+}
 /// A debt-only change of one file, committed with the next save or at exit; a
 /// later one of the same file before then replaces it. It never publishes the
 /// file's graph progress and never clears its marker.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn observe_tail(
     path: &Path,
     key: &str,
@@ -61,6 +70,10 @@ pub(in crate::snapshots) fn observe_tails(
 }
 /// The caller's authorised final disposition of the file's whole debt: its
 /// revisions go and its marker clears; a head left with no reduction goes too.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn dispose_tail(
     path: &Path,
     key: &str,

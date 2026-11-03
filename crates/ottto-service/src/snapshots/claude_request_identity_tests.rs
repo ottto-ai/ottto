@@ -2161,6 +2161,11 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         let key = local_index_key(&quiet_path);
         let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
         let run = |index: ScanIndex| {
+            let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+                SnapshotSource::ClaudeCode,
+                Some(cache.as_ref()),
+                index,
+            );
             let mut scan = OwnedSourceScan::new(
                 SnapshotSource::ClaudeCode,
                 std::slice::from_ref(&dir),
@@ -2188,10 +2193,6 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         };
         let (mut index, full, mode) = run(index);
         assert!(matches!(mode, Some(ReadMode::Full(_))));
-        let checkpoint = cache
-            .retained_checkpoint(&key)
-            .expect("the quiet member's Full read must retain its native reduction");
-        assert!(checkpoint.audit_debt().is_none());
         let verified = index.claude_request_census.get(&key).unwrap().clone();
         assert!(!verified.unverified_for_test());
         let raw = full.snapshots;
@@ -2228,18 +2229,24 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
             .clear();
         let (mut index, _, mode) = run(index);
         assert_eq!(mode, Some(ReadMode::Unchanged));
-        assert!(cache
-            .retained_checkpoint(&key)
-            .expect("the quiet member's Unchanged read must retain its native reduction")
+        assert!(
+            crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+                SnapshotSource::ClaudeCode,
+                &cache,
+                &index,
+                &key,
+            )
+            .expect("the quiet member's Unchanged read must keep its committed head")
             .audit_debt()
-            .is_none());
+            .is_none()
+        );
         assert!(!index
             .claude_request_census
             .get(&key)
             .unwrap()
             .unverified_for_test());
         let saved = dir.join("index.json");
-        index.save(&saved).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &saved);
         let mut index = ScanIndex::load(&saved).unwrap();
         assert!(!index
             .claude_request_census

@@ -1,6 +1,6 @@
 // The Codex creator-slot naming row of the shared transition matrix. Included
-// beside `durable_transition_tests` inside the money-equivalence pipeline
-// fixture, so Corpus/Disk/other_page/other_wire are its native adapters.
+// inside the money-equivalence pipeline fixture, so
+// Corpus/Disk/other_page/other_wire are its native adapters.
 use super::*;
 use crate::codex_scan_diagnostics::CREATOR_NAMED;
 use crate::snapshots::sampled_scan::transition_fixture::{
@@ -9,14 +9,14 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 use serde_json::json;
 
 /// [money] Codex sessions whose rows record no login mode, named from their
-/// creator record by its single registered subscription slot, emit on a
-/// restored Tail and on the warm RAM Tail what a cold Full emits after a
-/// restart, in totals and placement: each named session's rows carry its
-/// matched slot's account, and a session whose creator matches no slot stays
-/// untagged on every route. Control: swapped account tags fail the comparator.
+/// creator record by its single registered subscription slot, emit after a
+/// restart (Codex keeps only its RAM reduction, so a new owner reads Full) and
+/// on the warm RAM Tail what a cold Full emits, in totals and placement: each
+/// named session's rows carry its matched slot's account, and a session whose
+/// creator matches no slot stays untagged on every route. Control: swapped
+/// account tags fail the comparator.
 #[test]
 fn shared_codex_creator_slot_naming_matches_cold_full() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("shared_codex_creator_slot_naming") {
         return;
     }
@@ -101,14 +101,17 @@ fn shared_codex_creator_slot_naming_matches_cold_full() {
     assert_eq!(cold_modes, (3, 0, 0));
     let owner = disk.owner(source);
     let (restart_index, restart_scan, restart_modes) = page(&owner, prior.clone());
-    assert_eq!(restart_modes, (0, 3, 0));
-    assert_eq!(durable_restores(&owner.cache, source).1, 3);
+    assert_eq!(
+        restart_modes,
+        (3, 0, 0),
+        "a restarted Codex owner reads Full"
+    );
     disk.begin(&scanner, source);
     let (ram_index, ram_scan, ram_modes) = page(&scanner, prior.clone());
     assert_eq!(ram_modes, (0, 3, 0));
     for (scan, route) in [
         (&cold_scan, "cold Full"),
-        (&restart_scan, "restored Tail"),
+        (&restart_scan, "restarted Full"),
         (&ram_scan, "RAM Tail"),
     ] {
         assert_tags(scan, route);

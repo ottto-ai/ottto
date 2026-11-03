@@ -170,7 +170,7 @@ fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
         Some(D)
     );
     let path = root.0.join("index.json");
-    index.save(&path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
     let reloaded = ScanIndex::load(&path).unwrap();
     assert_eq!(slot(&reloaded), Some((failing.clone(), D, false)));
     assert_eq!(
@@ -304,7 +304,7 @@ fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
     assert!(awaits_hold_deadline_restoration(&index, &keys[0]));
 
     let path = root.0.join("index.json");
-    index.save(&path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
     let mut index = ScanIndex::load(&path).unwrap();
     assert_eq!(slot(&index), Some((keys[0].clone(), owed, false)));
     // The next rotation queues it at that due: it may retry, never later.

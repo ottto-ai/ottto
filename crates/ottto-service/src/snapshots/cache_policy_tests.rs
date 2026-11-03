@@ -441,7 +441,7 @@ struct FullCache {
 /// `older_tail` pins the tailed file's mtime two days back, below every
 /// filler's rank.
 fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
-    full_cache_in(SnapshotSource::ClaudeCode, older_tail, None)
+    full_cache_in(SnapshotSource::Codex, older_tail, None)
 }
 
 /// `full_cache_with_retained_file` for a `source` file, with the fillers'
@@ -525,18 +525,13 @@ fn append_padded_usage_at(tailed: &ScanFixture, id: usize) {
         "type": "synthetic-padding",
         "text": "x".repeat(TAIL_PADDING_BYTES),
     }));
-    tailed.append(&usage(
-        SnapshotSource::ClaudeCode,
-        140 + id as u64,
-        id,
-        MODEL,
-    ));
+    tailed.append(&usage(SnapshotSource::Codex, 140 + id as u64, id, MODEL));
 }
 
 /// `full_cache_with_retained_file`, then `append` to the file and read the
 /// append as a tail that meets a zero copy budget at a step start.
 fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBesideFullCache {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let FullCache {
         cache,
         tailed,
@@ -633,7 +628,7 @@ fn tail_growth_records() -> usize {
 /// The tailed file's append for test (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
-    tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + tail_growth_records());
+    tailed.append_usage(SnapshotSource::Codex, 1..1 + tail_growth_records());
 }
 
 /// Test (ii), corrected.
@@ -652,6 +647,7 @@ fn append_growth(tailed: &ScanFixture) {
 /// Was `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
 /// which pinned two evictions: a release without benefit.
 #[test]
+#[ignore = "Claude-only: only a Claude Tail grows its borrowed state per response, and Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
     if unexecuted("M1_tail_growth_refusal") {
         return;
@@ -719,7 +715,7 @@ fn tail_active(full: &FullCache, older_tail: bool) -> OwnedSourceScan {
 /// `tail_active`, with the tailed file's mtime set to `modified` after the
 /// append.
 fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     full.tailed.append(&usage(source, 140, 1, MODEL));
     if let Some(modified) = modified {
         full.tailed.set_modified(modified);
@@ -903,7 +899,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     if unexecuted("M1_hot_tail") {
         return;
     }
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let FullCache {
         cache,
         tailed,
@@ -962,7 +958,7 @@ fn cache_policy_m1_exempt_unsampled_read_remeasures_an_unknown_resident() {
     if unexecuted("M1_exempt_remeasure") {
         return;
     }
-    let source = SnapshotSource::ClaudeCode;
+    let source = SnapshotSource::Codex;
     let (cache, _) = filled_cache();
     let fixture = ScanFixture::new(source);
     fixture.append_usage(source, 0..150);
@@ -1244,6 +1240,7 @@ fn assert_no_victims(run: &MaRun, label: &str) {
 /// one whose checked arithmetic overflows, releases nothing: the copy is
 /// refused at its pre-release budget and every resident stays.
 #[test]
+#[ignore = "Claude-only X_out release proof: Claude keeps no RAM resident since its Tail lives in the state database (S2); Codex has no X_out"]
 fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
     if unexecuted("M_a_T2") {
         return;
@@ -1254,7 +1251,7 @@ fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
         sampled_scan::XOut::Bound(usize::MAX),
     ] {
         let run = m_a_tail(
-            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
             now - OLD_SECONDS,
             now - 600,
             &[],
@@ -1387,7 +1384,7 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
     let now = unix_now();
     let tail_modified = now - 600;
     m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         tail_modified,
         &[
@@ -1405,6 +1402,7 @@ fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
 /// `x_out_for` measures (no `set_x_out`), as production does. Its X_out
 /// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
 #[test]
+#[ignore = "Claude-only X_out release proof: Claude keeps no RAM resident since its Tail lives in the state database (S2); Codex has no X_out"]
 fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
     if unexecuted("M_a_T8_measured") {
         return;
@@ -1425,7 +1423,7 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
     let now = unix_now();
     let tail_modified = now - 600;
     let run = m_a_tail(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         tail_modified,
         &[],
@@ -1488,7 +1486,8 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
     let now = unix_now();
     let file_modified = now - 600;
     let newer_modified = now - 300;
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         for grew in [false, true] {
             for idle_modified in [now - OLD_SECONDS, file_modified, newer_modified] {
                 let releases =
@@ -1648,6 +1647,7 @@ pub(super) fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIden
 /// the release proof refuses: zero victims, no copy retained, every filler
 /// at its rank, the refusal counted.
 #[test]
+#[ignore = "Claude-only X_out repository identity: Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
     if unexecuted("M_a_U3_cold") {
         return;
@@ -1660,7 +1660,7 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
         "precondition: cold"
     );
     let run = m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         now - 600,
         &[],
@@ -1714,6 +1714,7 @@ fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
 /// (`Point::AfterRetain`), and the item still carries the peeked identity,
 /// not a re-resolved or re-read one.
 #[test]
+#[ignore = "Claude-only X_out repository identity: Claude keeps no RAM resident since its Tail lives in the state database (S2)"]
 fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
     if unexecuted("M_a_U3_warm") {
         return;
@@ -1727,7 +1728,7 @@ fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
         .insert(path.clone(), (SystemTime::now(), u3_identity("warm")));
     let replace = path.clone();
     let run = m_a_tail_with(
-        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
         now - OLD_SECONDS,
         now - 600,
         &[],

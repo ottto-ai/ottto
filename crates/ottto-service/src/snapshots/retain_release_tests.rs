@@ -105,30 +105,6 @@ fn append_ignored(fixture: &ScanFixture, _: SnapshotSource) {
     fixture.file.append(&json!({"type":"ignored"}));
 }
 
-/// T-R0c (Claude): one usage-bearing assistant record with 2,500 browser
-/// `tool_use` blocks, every block with its own id. Since #667 the response
-/// book keeps a per-record summary (`owned_heap`), so many small records no
-/// longer reach the walk's 4,096 visits; one record whose `tool_uses` (two
-/// strings per call) pass them leaves its summary, and so the active,
-/// unmeasured. Usage rows alone do not: the parser's walk is constant in its
-/// row count (pinned by
-/// `sampled_native_large_history_has_constant_step_charge_and_conservative_clones`).
-fn append_many(fixture: &ScanFixture, source: SnapshotSource) {
-    assert_eq!(source, SnapshotSource::ClaudeCode);
-    let blocks = (0..2_500_usize)
-        .map(|block| {
-            json!({"type":"tool_use", "id":format!("toolu_r0_{block:04}"),
-                "name":"mcp__claude-in-chrome__navigate", "input":{}})
-        })
-        .collect::<Vec<_>>();
-    fixture.file.append(
-        &json!({"type":"assistant", "sessionId":"native-tail-fixture",
-        "requestId":"req_r0_many", "timestamp":"2026-10-07T11:00:00Z",
-        "message":{"id":"response-r0-many", "role":"assistant", "model":"fixture-model-tail",
-            "usage":{"input_tokens":1,"output_tokens":1}, "content":blocks}}),
-    );
-}
-
 const OLDER: usize = 3;
 /// The incumbent's rows: enough state that `2K + max(A, ins_extra)` covers
 /// its own resident copy plus one older resident, so the calibrated budget
@@ -438,7 +414,8 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         let mut world = World::new(source);
         assert!(
             matches!(
@@ -584,7 +561,8 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let fixture = resident(
             source,
@@ -600,7 +578,6 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
         cache.insert(
             key(&fixture),
             sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 released: None,
@@ -749,7 +726,8 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         let spec = Spec {
             older: 1,
             rows: 0,
@@ -766,50 +744,6 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
     }
 }
 
-/// T-R0c: a Claude Tail whose active state passes the walk's 4096 visits.
-/// No step-start clear; the completion is granted 0 with the active
-/// unmeasured (bucket `Walk`), and nothing is released.
-#[test]
-fn r0_tail_past_the_visit_limit_is_granted_without_release() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let source = SnapshotSource::ClaudeCode;
-    let mut world = World::build(
-        source,
-        Spec {
-            change: append_many,
-            ..SPEC
-        },
-    );
-    let run = run(&mut world, Opts::default());
-    assert_eq!(
-        run.decisions,
-        vec![Decision::Granted {
-            budget: 0,
-            resident_measured: true,
-            active_measured: false,
-        }]
-    );
-    assert_eq!(run.buckets, vec![Bucket::Walk]);
-    let counts = run.counts;
-    assert_eq!(
-        (
-            counts.clear_other_active,
-            counts.clear_no_active,
-            counts.clear_full_resident_bound_unknown,
-            counts.clear_metadata_unsupported,
-            counts.clear_entries_released,
-            counts.insert_entries_evicted,
-            counts.copy_refusal_admission_evicted,
-            counts.copy_refusal_entries_evicted,
-            counts.retention_bound_refused,
-        ),
-        (0, 0, 0, 0, 0, 0, 0, 0, 1)
-    );
-    assert_eq!(victims(&world.cache), run.before);
-}
-
 /// T-R0d: every borrowed-state conjunct keeps a Tail off shape F, so its
 /// step-start refusal keeps `ClearOtherActive`, and its completion never
 /// reaches `tail_completion_budget` (the only source of `Deferred`, called
@@ -821,7 +755,8 @@ fn r0_non_f_shapes_keep_clear_other_active() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         let mut world = World::new(source);
         let index = std::mem::take(&mut world.index);
         let mut scan = step_until(
@@ -944,7 +879,8 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
             counts.clear_no_active,
         )
     };
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         // A: a new file read Full beside one resident.
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let base = SystemTime::now() - Duration::from_secs(3_600);
@@ -1026,7 +962,8 @@ fn r0_unknown_resident_evicts_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+    {
+        let source = SnapshotSource::Codex;
         let mut world = World::new(source);
         let cache = Arc::clone(&world.cache);
         let run = run(

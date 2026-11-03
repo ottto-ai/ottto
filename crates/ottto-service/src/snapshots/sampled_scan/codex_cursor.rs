@@ -3781,7 +3781,6 @@ static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
     pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
-        debug_assert!(!super::durable_tail::stores_held(), "reserve before Stores");
         use std::sync::atomic::Ordering::SeqCst;
         if DECODER_LIVE.swap(true, SeqCst) {
             return None;
@@ -3796,7 +3795,6 @@ impl DecoderOwner {
     }
     // Normal completion/error calls this after destroying the decoder.
     pub(in crate::snapshots) fn release(mut self) {
-        debug_assert!(!super::durable_tail::stores_held(), "release after Stores");
         self.refund();
     }
     fn refund(&mut self) {
@@ -4159,10 +4157,6 @@ impl SharedCache {
         live: usize,
         rank: (i64, i64),
     ) -> usize {
-        let custody_bytes = incoming
-            .durable
-            .retained_bytes(state_bytes())
-            .unwrap_or(state_bytes());
         self.with_cursor(|cursor| {
             let reservation = |cursor: &CursorState| {
                 live.saturating_add(state_for_main(cursor).unwrap_or(state_bytes()))
@@ -4172,20 +4166,12 @@ impl SharedCache {
                 && !retained.insertion_fits(
                     key,
                     &incoming.retained,
-                    custody_bytes,
                     reservation(cursor),
                     rank,
                     false,
                 );
             reclaim_headers(cursor, needed, |cursor| {
-                retained.insertion_fits(
-                    key,
-                    &incoming.retained,
-                    custody_bytes,
-                    reservation(cursor),
-                    rank,
-                    true,
-                )
+                retained.insertion_fits(key, &incoming.retained, reservation(cursor), rank, true)
             });
             reservation(cursor)
         })
@@ -6874,7 +6860,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
-        restored_behind_accepted: false,
+        stored_reuse: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index

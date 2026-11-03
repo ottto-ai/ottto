@@ -66,7 +66,6 @@ fn walk(
         false,
         true,
         scope,
-        None,
     );
     let mut opened = Vec::new();
     for _ in 0..100_000 {

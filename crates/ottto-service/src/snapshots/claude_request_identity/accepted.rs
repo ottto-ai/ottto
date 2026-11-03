@@ -385,6 +385,20 @@ pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
     )))
 }
 
+/// The epoch of the bound key, the one every keyed Tail head field is made
+/// under; `None` without a key.
+pub(crate) fn session_context_key_epoch() -> Option<[u8; 32]> {
+    with_session_context_key(|bound| bound.clone().flatten()).map(|key| key_epoch(&key))
+}
+
+/// Binds `key` (`None`: no key) as a cycle would.
+#[cfg(test)]
+pub(crate) fn bind_test_session_context_key(key: Option<[u8; 32]>) {
+    with_session_context_key(|bound| {
+        *bound = Some(key.map(|key| FingerprintKey(Zeroizing::new(key))))
+    });
+}
+
 pub(super) fn session_context_key_bound() -> bool {
     with_session_context_key(|bound| matches!(bound, Some(Some(_))))
 }

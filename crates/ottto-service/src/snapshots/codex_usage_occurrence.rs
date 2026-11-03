@@ -56,41 +56,12 @@ pub(super) struct CodexCounting {
 }
 
 impl CodexCounting {
-    pub(super) fn durable_cutover(&self) -> Option<i64> {
-        self.cutover_unix_ms
-    }
-
-    pub(super) fn durable_contract(&self) -> (Option<i64>, u8, u8) {
-        (
-            self.cutover_unix_ms,
-            match self.version {
-                None => 0,
-                Some(CountingVersion::Legacy) => 1,
-                Some(CountingVersion::V2) => 2,
-            },
-            match self.evidence {
-                AckEvidence::None => 0,
-                AckEvidence::V2Marked => 1,
-                AckEvidence::LegacyAcked => 2,
-            },
-        )
-    }
-
     pub(super) fn new(evidence: AckEvidence, cutover_unix_ms: Option<i64>) -> Self {
         Self {
             evidence,
             cutover_unix_ms,
             version: None,
             reducer: None,
-        }
-    }
-
-    pub(super) fn content_scratch(&self) -> Self {
-        Self {
-            evidence: self.evidence,
-            cutover_unix_ms: self.cutover_unix_ms,
-            version: self.version,
-            reducer: (self.version == Some(CountingVersion::V2)).then(Box::default),
         }
     }
 
@@ -757,16 +728,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    pub(super) fn observe_codex_content_counting(&mut self, value: &Value) {
-        self.observe_codex_turn_lifecycle(value, false);
-        if !self.codex_counting_v2() {
-            return;
-        }
-        if string_eq_at(value, &["type"], "token_usage_record") {
-            let _ = self.note_codex_native_authority(value);
-        }
-    }
-
     /// Closure publishes a UI-only turn's staged rows. A later native for the
     /// closed turn adds nothing, which is exactly the Legacy outcome. Every
     /// explicit closure is final, including one whose start was never bound.
@@ -1234,6 +1195,7 @@ fn pending_row_content_bytes(
 
 /// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
 /// two response ids, the open turn id, the closed-turn ring and the filter.
+#[cfg(test)]
 pub(super) const fn max_fixed_heap_bytes() -> usize {
     std::mem::size_of::<OccurrenceReducer>()
         + std::mem::align_of::<OccurrenceReducer>()
@@ -1350,55 +1312,3 @@ crate::durable_tail_codec::durable_struct!(OccurrenceCounters {
     N closed_filter_hit_unconfirmed_native_usage: T6,
     N pending_overflow_flushes: u64,
 });
-
-#[cfg(test)]
-mod content_decision_tests {
-    use super::*;
-    /// [money] unbound equal totals precede bound repeat filter and physical duplicates.
-    #[test]
-    fn unbound_equal_totals_precede_bound_repeat_filter_and_physical_duplicates() {
-        for bound in [false, true] {
-            let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
-            let mut counting = CodexCounting::new(AckEvidence::None, None);
-            counting.version = Some(CountingVersion::V2);
-            counting.reducer = Some(Box::default());
-            acc.codex_counting = Some(Box::new(counting));
-            if bound {
-                acc.observe_codex_content_counting(
-                    &serde_json::json!({"payload":{"type":"task_started","turn_id":"t"}}),
-                );
-            }
-            let usage = UsageTotals {
-                input_tokens: 10,
-                output_tokens: 2,
-                request_count: 1,
-                ..Default::default()
-            };
-            for (identity, admitted) in [("a", true), ("b", !bound), ("b", false)] {
-                acc.codex_occurrence().unwrap().line_ui =
-                    Some(([10, 0, 0, 2, 0, 12], [10, 0, 0, 2, 0, 12]));
-                assert_eq!(
-                    acc.decide_codex_usage(
-                        None,
-                        usage.clone(),
-                        Some(usage.clone()),
-                        Some(identity.into()),
-                        Some(1)
-                    )
-                    .is_some(),
-                    admitted
-                );
-            }
-            assert!(
-                acc.usage_buckets.is_empty(),
-                "scratch decisions cannot publish or stage money"
-            );
-            assert!(acc
-                .codex_occurrence()
-                .unwrap()
-                .turn
-                .as_ref()
-                .is_none_or(|turn| turn.pending.is_empty()));
-        }
-    }
-}

@@ -40,10 +40,11 @@ mod accepted;
 mod budget;
 use super::claude_folder_login::{FolderTrace, QualifiedFolder};
 pub(crate) use accepted::bind_session_context_key;
+#[cfg(test)]
+pub(crate) use accepted::bind_test_session_context_key;
 pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::keyed_text_digest;
-#[cfg(test)]
-pub(crate) use accepted::session_context_digest;
+pub(crate) use accepted::session_context_key_epoch;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -3087,6 +3088,16 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Every recorded response position: each is the file's response count
+    /// when its line was read.
+    pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .chain(&self.starting_marker)
+            .map(|marker| marker.position)
+            .chain(self.context_position)
+            .chain(self.context_flip_position)
+    }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
     /// read, so position 0 stands in when none was recorded: the next sentence

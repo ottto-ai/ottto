@@ -1,188 +1,14 @@
 //! Shared test-only transition vocabulary and emitted-money oracle.
 //!
-//! Drivers must use native scanning, upload/ACK and the one durable store.
-//! The old writer writes AFTER index save; `Receipt` below does not imply write-ahead.
-//! New slice drivers supply their native order rather than changing this oracle.
-//!
-//! Extension rows (keep the one comparator):
-//! - 5b: stale selection clear (#859), finite revision candidates (record's own
-//!   applied revision, current active revision, revisions explicitly retained
-//!   by the index; exactly one match), scope barriers and accepted-body floor.
-//! - a0: direct restore with cache admission refused, active lease/cap pressure,
-//!   pending receipt reconciliation and directory creation/parent-sync edges.
-//! - a1: live preparation/finish success/error and receipt BEFORE publication.
-//! - audit gate: quiet/append after 1h/50h and >256 slots, clock/debt controls.
-//! - `e2`: protected nonempty TierReplay, group/EOF/archive and cursor custody.
-//!
-//! The old writer's named crash edges cannot stand in for the later edges; cheap/raw I/O
-//! stays unmeasured until the acquisition owner supplies a real observation.
+//! Drivers must use native scanning and upload/ACK. New drivers supply their
+//! native order rather than changing this oracle. Cheap/raw I/O stays
+//! unmeasured until the acquisition owner supplies a real observation.
 use crate::snapshots::{
     snapshot_semantic_envelope, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
 };
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-
-/// Checked historical bytes and independent generation facts, for transition consumers.
-pub(crate) struct V1Golden<'a> {
-    pub(crate) case_id: &'static str,
-    pub(crate) record: &'a [u8],
-    pub(crate) input: &'a [u8],
-    pub(crate) expected: Value,
-    pub(crate) metadata: Value,
-}
-
-impl V1Golden<'_> {
-    /// Relocate only the envelope key for a scratch-path rebuild fixture.
-    /// The body, old pin, generation, certificate and interpretation stay archived;
-    /// this is NOT evidence of a portable old-writer restore binding.
-    pub(crate) fn relocated_record(&self, key: [u8; 32]) -> Vec<u8> {
-        use sha2::{Digest, Sha256};
-        let mut bytes = self.record.to_vec();
-        bytes[43..75].copy_from_slice(&key);
-        let end = bytes.len() - 32;
-        let checksum = Sha256::digest(&bytes[..end]);
-        bytes[end..].copy_from_slice(&checksum);
-        bytes
-    }
-}
-
-#[derive(Clone, Copy)]
-struct V1Files<'a> {
-    case_id: &'static str,
-    record: &'a [u8],
-    input: &'a [u8],
-    expected: &'a [u8],
-}
-
-const V1_MANIFEST: &[u8] = include_bytes!("../../../testdata/v1/MANIFEST.json");
-const V1_FILES: [V1Files<'static>; 4] = {
-    macro_rules! case {
-        ($id:literal) => {
-            V1Files {
-                case_id: $id,
-                record: include_bytes!(concat!("../../../testdata/v1/", $id, ".rec")),
-                input: include_bytes!(concat!("../../../testdata/v1/inputs/", $id, ".jsonl")),
-                expected: include_bytes!(concat!("../../../testdata/v1/expected/", $id, ".json")),
-            }
-        };
-    }
-    [
-        case!("claude-three-request"),
-        case!("claude-selector-unequal"),
-        case!("codex-legacy-acked"),
-        case!("codex-v2-24b"),
-    ]
-};
-
-/// Validate provenance and every file before returning any fixture authority.
-pub(crate) fn load_v1_goldens() -> Result<Vec<V1Golden<'static>>, String> {
-    validate_v1_goldens(
-        serde_json::from_slice(V1_MANIFEST).map_err(|e| e.to_string())?,
-        &V1_FILES,
-    )
-}
-
-fn validate_v1_goldens<'a>(
-    manifest: Value,
-    files: &[V1Files<'a>; 4],
-) -> Result<Vec<V1Golden<'a>>, String> {
-    use sha2::{Digest, Sha256};
-    let bad = || "invalid v1 golden manifest or file".to_owned();
-    if manifest["schema_version"] != 1
-        || manifest["source_sha"] != "53d05a4304f2e87effbaa48661e10286bff01c58"
-        || manifest["repo"] != "ottto-ai/ottto"
-        || manifest["workflow_path"] != ".github/workflows/linux-tests.yml"
-        || manifest["artifact_id"] != 13031099044u64
-        || manifest["artifact_name"] != "v1-goldens-53d05a43"
-        || [
-            "generator_commit",
-            "run_id",
-            "run_attempt",
-            "run_url",
-            "toolchain",
-            "rustc",
-            "runner_os",
-            "runner_arch",
-        ]
-        .iter()
-        .any(|key| manifest[*key].as_str().map_or(true, str::is_empty))
-    {
-        return Err(bad());
-    }
-    let cases = manifest["cases"]
-        .as_array()
-        .filter(|cases| cases.len() == 4)
-        .ok_or_else(bad)?;
-    files
-        .iter()
-        .zip(cases)
-        .map(|(file, case)| {
-            if case["case_id"] != file.case_id {
-                return Err(bad());
-            }
-            for (metadata, bytes, path) in [
-                (case, file.record, format!("{}.rec", file.case_id)),
-                (
-                    &case["input"],
-                    file.input,
-                    format!("inputs/{}.jsonl", file.case_id),
-                ),
-                (
-                    &case["expected"],
-                    file.expected,
-                    format!("expected/{}.json", file.case_id),
-                ),
-            ] {
-                if metadata["path"] != path
-                    || metadata["byte_length"].as_u64() != Some(bytes.len() as u64)
-                    || metadata["sha256"] != format!("{:x}", Sha256::digest(bytes))
-                {
-                    return Err(bad());
-                }
-            }
-            let expected: Value =
-                serde_json::from_slice(file.expected).map_err(|e| e.to_string())?;
-            if expected["case_id"] != file.case_id || expected["facts"] != case["expected_facts"] {
-                return Err(bad());
-            }
-            Ok(V1Golden {
-                case_id: file.case_id,
-                record: file.record,
-                input: file.input,
-                expected,
-                metadata: case.clone(),
-            })
-        })
-        .collect()
-}
-
-/// [format] Historical fixtures lose authority on provenance, inventory or byte tampering.
-#[test]
-fn v1_golden_provenance_and_tampering() {
-    let manifest: Value = serde_json::from_slice(V1_MANIFEST).unwrap();
-    assert_eq!(load_v1_goldens().unwrap().len(), 4);
-    for pointer in ["/source_sha", "/cases/0/sha256", "/run_id"] {
-        let mut changed = manifest.clone();
-        *changed.pointer_mut(pointer).unwrap() = Value::Null;
-        assert!(
-            validate_v1_goldens(changed, &V1_FILES).is_err(),
-            "{pointer}"
-        );
-    }
-    let mut missing = manifest.clone();
-    missing.as_object_mut().unwrap().remove("run_id");
-    assert!(validate_v1_goldens(missing, &V1_FILES).is_err());
-    let mut incomplete = manifest.clone();
-    incomplete["cases"].as_array_mut().unwrap().pop();
-    assert!(validate_v1_goldens(incomplete, &V1_FILES).is_err());
-    let mut changed = V1_FILES[0].record.to_vec();
-    changed[crate::durable_tail_store::HEADER_BYTES] ^= 1;
-    let mut files = V1_FILES;
-    files[0].record = &changed;
-    assert!(validate_v1_goldens(manifest, &files).is_err());
-}
 
 /// Emitted-body comparison for native scan fixtures without a transport driver.
 pub(crate) fn scan_money(
@@ -226,24 +52,6 @@ pub(crate) fn codex_evidence(
     })
 }
 
-/// Keep private acquisition internals private; sibling test adapters enter here.
-pub(crate) fn local_key(path: &Path) -> String {
-    super::super::local_index_key(path)
-}
-pub(crate) fn seed_old_writer(
-    cache: &super::SharedCache,
-    source: SnapshotSource,
-    key: &str,
-    pin: &str,
-) -> Vec<u8> {
-    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, pin)
-}
-
-/// The production body allowlist, without exposing the private codec module.
-pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
-    super::super::sampled_jsonl::durable::allowlist_digest(source)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {
     ColdFull,
@@ -251,127 +59,6 @@ pub(crate) enum Mode {
     DiskRestore,
     Restart,
     EvictRetry,
-}
-
-/// Logical boundaries use `reach`; physical old-writer boundaries use the store's
-/// existing before-rename and before-directory-sync hooks. No fake fsyncs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CrashPoint {
-    OldWriter,
-    Restore,
-    Tail,
-    BeforeAck,
-    AfterAck,
-    BeforeIndexSave,
-    AfterIndexSave,
-    BeforeTempWrite,
-    TempWritten,
-    FileSynced,
-    BeforeRename,
-    BeforeDirectorySync,
-    Receipt,
-    SaveGc,
-    RestartOne,
-    RestartTwo,
-    BeforeDirectoryCreate,
-    DirectoryCreated,
-    BeforeParentSync,
-    ParentSynced,
-    BeforePrepare,
-    Prepared,
-    BeforeNativeFinish,
-    NativeFinishOk,
-    NativeFinishError,
-    BeforeRetireUnlink,
-    RetiredUnlink,
-    BeforeRetireSync,
-    RetiredSynced,
-    BeforeNativeEffects,
-    AfterNativeEffects,
-    BeforeCodexPublication,
-}
-impl CrashPoint {
-    // Preserve the existing old-writer executable matrix. Later points must not be
-    // appended here until its child driver actually traverses those paths.
-    pub(crate) const ALL: [Self; 16] = [
-        Self::OldWriter,
-        Self::Restore,
-        Self::Tail,
-        Self::BeforeAck,
-        Self::AfterAck,
-        Self::BeforeIndexSave,
-        Self::AfterIndexSave,
-        Self::BeforeTempWrite,
-        Self::TempWritten,
-        Self::FileSynced,
-        Self::BeforeRename,
-        Self::BeforeDirectorySync,
-        Self::Receipt,
-        Self::SaveGc,
-        Self::RestartOne,
-        Self::RestartTwo,
-    ];
-    /// The executable native-engine SIGKILL rows (m3_d3_tests::OrderPoint).
-    /// FileSynced is N/A: plain-flush engine: no fsync boundary.
-    /// The old-writer ALL matrix above keeps its historical row.
-    pub(crate) const NATIVE_M3: [Self; 3] = [
-        Self::Prepared,
-        Self::BeforeRename,
-        Self::BeforeNativeEffects,
-    ];
-    /// Additional physical store edges wired on this fixture branch. The
-    /// retirement edges refer to classified remove_keys, never temp cleanup.
-    pub(crate) const STORE_EXTENSION: [Self; 6] = [
-        Self::BeforeDirectoryCreate,
-        Self::DirectoryCreated,
-        Self::BeforeRetireUnlink,
-        Self::RetiredUnlink,
-        Self::BeforeRetireSync,
-        Self::RetiredSynced,
-    ];
-    /// Names reserved for the owning a0/a1/`e2` call sites. They are NOT a
-    /// runnable matrix on the old writer; reach() must be placed at the real boundaries.
-    pub(crate) const LIVE_EXTENSION: [Self; 10] = [
-        Self::BeforeParentSync,
-        Self::ParentSynced,
-        Self::BeforePrepare,
-        Self::Prepared,
-        Self::BeforeNativeFinish,
-        Self::NativeFinishOk,
-        Self::NativeFinishError,
-        Self::BeforeNativeEffects,
-        Self::AfterNativeEffects,
-        Self::BeforeCodexPublication,
-    ];
-    pub(crate) fn name(self) -> String {
-        format!("{self:?}")
-    }
-}
-
-// A child acknowledges the exact edge durably, then actually dies. Only the
-// isolated child test sets these variables. Parent checks SIGKILL and marker.
-thread_local! { static CRASH_ARMED: Cell<bool> = const { Cell::new(false) }; }
-pub(crate) fn arm_crashes() {
-    CRASH_ARMED.with(|armed| armed.set(true));
-}
-pub(crate) fn reach(point: CrashPoint) {
-    if !CRASH_ARMED.with(Cell::get) {
-        return;
-    }
-    let name = point.name();
-    if std::env::var("OTTTO_TRANSITION_CRASH").ok().as_deref() != Some(name.as_str()) {
-        return;
-    }
-    let marker = std::env::var_os("OTTTO_TRANSITION_MARKER").expect("child marker");
-    let mut file = std::fs::File::create(marker).unwrap();
-    use std::io::Write;
-    file.write_all(name.as_bytes()).unwrap();
-    file.sync_all().unwrap();
-    // SAFETY: raise has no pointer/ownership preconditions; only this child dies.
-    unsafe {
-        libc::raise(libc::SIGKILL);
-    }
-    panic!("SIGKILL unexpectedly returned");
 }
 
 // Consumed bytes at the real BoundedJsonlReader::consume boundary, including
@@ -435,7 +122,6 @@ pub(crate) struct RouteResult {
     pub(crate) codex_evidence: Value,
     pub(crate) io: IoBytes,
     pub(crate) modes: (usize, usize, usize),
-    pub(crate) restored: u64,
 }
 impl RouteResult {
     /// Exact existing cross-build sentinel: only physical fingerprint and its
@@ -528,46 +214,8 @@ impl RouteResult {
             codex_evidence: Value::Null,
             io: IoBytes::default(),
             modes: (0, 0, 0),
-            restored: 0,
         }
     }
-}
-
-/// Test adapter observes the real native boundary without exposing the
-/// acquisition module or constructing a synthetic publication receipt.
-pub(crate) struct NativeEffectsObserver;
-impl NativeEffectsObserver {
-    pub(crate) fn new(callback: impl FnMut() + 'static) -> Self {
-        super::test_hooks::set(super::test_hooks::Point::BeforeNativeEffects, callback);
-        Self
-    }
-}
-impl Drop for NativeEffectsObserver {
-    fn drop(&mut self) {
-        super::test_hooks::clear();
-    }
-}
-
-/// Slices implement this over their native pipeline, not an alternate parser.
-/// `emit_bodies` starts from the same accepted index in all five routes.
-pub(crate) trait TransitionDriver {
-    fn emit_bodies(&mut self, mode: Mode) -> RouteResult;
-    fn save_gc(&mut self, mode: Mode);
-    fn restart(&mut self);
-}
-
-pub(crate) fn assert_child_killed(
-    status: std::process::ExitStatus,
-    marker: &Path,
-    point: CrashPoint,
-) {
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "child did not die at {point:?}"
-    );
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), point.name());
 }
 
 pub(crate) mod money_oracle {
@@ -1077,6 +725,23 @@ pub(crate) mod money_oracle {
         }
     }
 
+    #[allow(dead_code, reason = "commit 6's oracle rows hold this comparator")]
+    /// Caller supplies independently known extent/revision regression; money
+    /// shrink is not inferred from tokens (legitimate corrections exist).
+    pub(crate) fn assert_no_smaller_reemit(
+        entity: &str,
+        prior: &RouteResult,
+        candidate: &RouteResult,
+        cold: &RouteResult,
+        behind_accepted: bool,
+    ) {
+        if behind_accepted {
+            assert_held(entity, prior, candidate, cold);
+        } else {
+            assert_equivalent(cold, candidate);
+        }
+    }
+
     /// `entity` is held in `other`; every emitted sibling must still equal cold.
     pub(crate) fn assert_held(
         entity: &str,
@@ -1127,22 +792,6 @@ pub(crate) mod money_oracle {
         } else {
             assert!(actual.snapshots.is_empty());
             assert_eq!(expected.normalized, actual.normalized);
-        }
-    }
-
-    /// Caller supplies independently known extent/revision regression; money
-    /// shrink is not inferred from tokens (legitimate corrections exist).
-    pub(crate) fn assert_no_smaller_reemit(
-        entity: &str,
-        prior: &RouteResult,
-        candidate: &RouteResult,
-        cold: &RouteResult,
-        behind_accepted: bool,
-    ) {
-        if behind_accepted {
-            assert_held(entity, prior, candidate, cold);
-        } else {
-            assert_equivalent(cold, candidate);
         }
     }
 
@@ -1309,97 +958,6 @@ pub(crate) fn with_scan_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// Snapshots only real native state supplied by a caller, including empty
-/// values. No disk reads, fabricated debt, ACK, or new authority. Call before
-/// and after the held finish path, then compare the relevant fields exactly.
-pub(crate) fn native_effects(
-    index: &super::super::ScanIndex,
-    scan: &super::super::SourceScanResult,
-) -> Value {
-    json!({
-        "files": index.files,
-        "accepted": index.accepted_snapshot_fingerprints,
-        "parent_ledgers": index.codex_parent_ownership_ledgers,
-        "parent_refs": index.codex_parent_ownership_refs,
-        "proofs": index.codex_parent_prefix_proofs,
-        "proof_seq": index.codex_parent_proof_seq,
-        "proof_parents_live": index.codex_parent_proof_parents_live,
-        "side": index.codex_parent_side,
-        "side_generation": index.codex_parent_side_generation,
-        "side_requests": index.codex_parent_side_requests,
-        "blocked": index.codex_state_only_blocked_session_ids,
-        "blocked_by_file": index.codex_state_only_blocked_by_file,
-        "pending_finalizations": scan.pending_finalization.len(),
-        "witnesses": scan.snapshots.iter().map(|item|
-            (item.source_session_id.clone(),
-             super::super::snapshot_upload_body_witness(item)))
-            .collect::<BTreeMap<_, _>>(),
-        "census": {
-            "complete": scan.census_complete,
-            "state_complete": scan.state_census_complete,
-            "sidecar_complete": scan.sidecar_census_complete,
-            "sessions": scan.scanned_session_count,
-            "ownership_incomplete": scan.ownership_incomplete_file_count,
-            "terminal_ownership_incomplete": scan.terminal_ownership_incomplete_file_count,
-            "residue_keys": scan.census_residue_index_key_count,
-            "residue_blocked": scan.census_residue_blocked_session_count,
-            "residue_archived": scan.census_residue_archived_rollout_count,
-        },
-    })
-}
-
-/// Read native ACK membership without granting or copying it into another index.
-pub(crate) fn accepted_fingerprints(index: &super::super::ScanIndex) -> &BTreeSet<String> {
-    &index.accepted_snapshot_fingerprints
-}
-
-/// A scoped error at a REAL store call. Install on the worker thread. Existing
-/// rename/dir-sync hooks are preserved. Reaching the nth edge is mandatory:
-/// callers assert hits(), so an unvisited injection cannot pass as a hold.
-pub(crate) struct StoreFailure {
-    previous: Option<crate::durable_tail_store::test_hooks::TransitionHook>,
-    hits: std::rc::Rc<Cell<usize>>,
-}
-impl StoreFailure {
-    pub(crate) fn hits(&self) -> usize {
-        self.hits.get()
-    }
-}
-impl Drop for StoreFailure {
-    fn drop(&mut self) {
-        crate::durable_tail_store::test_hooks::replace_transition_hook(self.previous.take());
-    }
-}
-pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
-    assert!(nth > 0);
-    assert!(matches!(
-        point,
-        CrashPoint::BeforeDirectoryCreate
-            | CrashPoint::DirectoryCreated
-            | CrashPoint::BeforeRename
-            | CrashPoint::BeforeDirectorySync
-            | CrashPoint::BeforeRetireUnlink
-            | CrashPoint::RetiredUnlink
-            | CrashPoint::BeforeRetireSync
-            | CrashPoint::RetiredSynced
-    ));
-    let hits = std::rc::Rc::new(Cell::new(0_usize));
-    let count = std::rc::Rc::clone(&hits);
-    let previous = crate::durable_tail_store::test_hooks::replace_transition_hook(Some(Box::new(
-        move |reached, _| {
-            if reached == point {
-                let n = count.get().checked_add(1).expect("edge counter overflow");
-                count.set(n);
-                if n == nth {
-                    return Err(std::io::Error::other(format!("injected {point:?}")));
-                }
-            }
-            Ok(())
-        },
-    )));
-    StoreFailure { previous, hits }
-}
-
 /// [format] scan clock restores after nested scope and unwind.
 #[test]
 fn scan_clock_restores_after_nested_scope_and_unwind() {
@@ -1412,303 +970,11 @@ fn scan_clock_restores_after_nested_scope_and_unwind() {
     });
 }
 
-/// [format] transition failure restores outer hook after unwind.
-#[test]
-fn transition_failure_restores_outer_hook_after_unwind() {
-    use crate::durable_tail_store::test_hooks;
-    let outer = fail_store_at(CrashPoint::BeforeDirectoryCreate, 2);
-    assert!(std::panic::catch_unwind(|| {
-        let inner = fail_store_at(CrashPoint::BeforeDirectoryCreate, 1);
-        assert!(test_hooks::transition_edge(
-            CrashPoint::BeforeDirectoryCreate,
-            Path::new("synthetic")
-        )
-        .is_err());
-        assert_eq!(inner.hits(), 1);
-        panic!("cancel");
-    })
-    .is_err());
-    assert_eq!(outer.hits(), 0);
-    assert!(
-        test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, Path::new("synthetic"))
-            .is_ok()
-    );
-    assert!(
-        test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, Path::new("synthetic"))
-            .is_err()
-    );
-    assert_eq!(outer.hits(), 2);
-}
-
-/// Protect the existing matrix while publishing new names for owners. This
-/// checks vocabulary only; it is not evidence that live call sites execute.
-/// [format] crash extension names are disjoint from the m1 matrix.
-#[test]
-fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
-    let mut names = BTreeSet::new();
-    for point in CrashPoint::ALL
-        .into_iter()
-        .chain(CrashPoint::STORE_EXTENSION)
-        .chain(CrashPoint::LIVE_EXTENSION)
-    {
-        assert!(names.insert(point.name()), "duplicate boundary {point:?}");
-    }
-    assert_eq!(names.len(), 32);
-    assert!(names.contains("BeforeCodexPublication"));
-}
-
-/// [format] native m3 plain flush matrix has no file fsync boundary.
-#[test]
-fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
-    assert!(CrashPoint::ALL.contains(&CrashPoint::FileSynced));
-    assert!(
-        !CrashPoint::NATIVE_M3.contains(&CrashPoint::FileSynced),
-        "plain-flush engine: no fsync boundary"
-    );
-    // Qualify the real native engine, not a synthetic crash edge. Any new
-    // file fsync on this path requires revisiting the design and its matrix.
-    let native = include_str!("../../durable_tail_store/stream.rs")
-        .split("#[cfg(test)]\nmod tests")
-        .next()
-        .unwrap();
-    for forbidden in [".sync_all(", ".sync_data(", "libc::fsync(", ".sync()"] {
-        assert!(
-            !native.contains(forbidden),
-            "native-M3 added file fsync: {forbidden}"
-        );
-    }
-    let store = include_str!("../../durable_tail_store.rs");
-    let temp_commit = store
-        .split("fn commit(&mut self, path: &Path, prior: Option<Stamp>)")
-        .nth(1)
-        .unwrap()
-        .split("fn discard(")
-        .next()
-        .unwrap();
-    assert!(
-        !temp_commit.contains(".sync"),
-        "native temp commit added fsync"
-    );
-}
-
 /// Native cold-store setup shared by transition tests. Scans stop before
 /// policy finalization, ACK and save; each driver chooses its settlement.
 pub(crate) mod native_cold {
-    #[cfg(target_os = "macos")]
-    use super::super::durable_tail;
-    use super::super::SharedCache;
-    use crate::durable_tail_store::{self as store, DurableSource};
-    use crate::locked_state_dir::test_locks;
     use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
-    #[cfg(target_os = "macos")]
-    use std::sync::Arc;
-
-    pub(crate) struct NativeColdStore {
-        pub(crate) writer: &'static crate::locked_state_dir::LockedStateDir,
-        #[cfg(target_os = "macos")]
-        pub(crate) source: SnapshotSource,
-        pub(crate) root: PathBuf,
-        pub(crate) sessions: PathBuf,
-        #[cfg(target_os = "macos")]
-        pub(crate) index_path: PathBuf,
-        pub(crate) namespace: Scope,
-        #[cfg(target_os = "macos")]
-        pub(crate) cache: Arc<SharedCache>,
-        #[cfg(target_os = "macos")]
-        pub(crate) index: ScanIndex,
-        scratch: Option<crate::test_scratch::ScratchDir>,
-    }
-    impl NativeColdStore {
-        pub(crate) fn with_scope(source: SnapshotSource, tag: &str, namespace: Scope) -> Self {
-            let scratch = crate::test_scratch::ScratchDir::new(tag);
-            let mut fixture = Self::open_with_scope(source, scratch.to_path_buf(), namespace);
-            fixture.scratch = Some(scratch);
-            fixture
-        }
-        pub(crate) fn open_with_scope(
-            source: SnapshotSource,
-            root: PathBuf,
-            namespace: Scope,
-        ) -> Self {
-            #[cfg(not(target_os = "macos"))]
-            let _ = source;
-            let sessions = root.join("sessions");
-            fs::create_dir_all(&sessions).unwrap();
-            let writer = test_locks::hold(&root);
-            #[cfg(target_os = "macos")]
-            let index_path = root.join("index.json");
-            #[cfg(target_os = "macos")]
-            let index = if index_path.exists() {
-                ScanIndex::load(&index_path).unwrap()
-            } else {
-                ScanIndex::default()
-            };
-            Self {
-                writer,
-                #[cfg(target_os = "macos")]
-                source,
-                root,
-                sessions,
-                #[cfg(target_os = "macos")]
-                index_path,
-                namespace,
-                #[cfg(target_os = "macos")]
-                cache: Arc::new(SharedCache::default()),
-                #[cfg(target_os = "macos")]
-                index,
-                scratch: None,
-            }
-        }
-        #[cfg(target_os = "macos")]
-        pub(crate) fn restart(&mut self) {
-            self.cache = Arc::new(SharedCache::default());
-            self.index = ScanIndex::load(&self.index_path).unwrap();
-        }
-        pub(crate) fn path(&self, session: &str) -> PathBuf {
-            self.sessions.join(format!("{session}.jsonl"))
-        }
-        #[cfg(target_os = "macos")]
-        pub(crate) fn key(&self, session: &str) -> String {
-            local_index_key(&self.path(session))
-        }
-        #[cfg(target_os = "macos")]
-        pub(crate) fn digest(&self, session: &str) -> store::Digest32 {
-            store::key_digest(
-                durable_tail::durable_source(self.source).unwrap(),
-                &self.key(session),
-            )
-        }
-        #[cfg(target_os = "macos")]
-        pub(crate) fn store_dir(&self) -> PathBuf {
-            store::store_dir_for_index(&self.index_path)
-        }
-    }
-
-    pub(crate) fn jsonl(lines: impl IntoIterator<Item = serde_json::Value>) -> String {
-        lines
-            .into_iter()
-            .map(|line| line.to_string() + "\n")
-            .collect()
-    }
-    pub(crate) fn save(index_path: &Path, index: &mut ScanIndex) {
-        index.save(index_path).unwrap();
-    }
-
-    pub(crate) fn cache(
-        source: SnapshotSource,
-        index: &Path,
-        namespace: &Scope,
-        capture: bool,
-    ) -> SharedCache {
-        let cache = SharedCache::default();
-        cache.durable_begin_pass(source, index, namespace, capture);
-        cache
-    }
-    pub(crate) fn store(index: &Path, source: DurableSource) -> store::DurableTailStore {
-        store::DurableTailStore::new(store::store_dir_for_index(index), source)
-    }
-    pub(crate) fn acquisition(source: SnapshotSource) -> Option<store::AcquisitionFields> {
-        Some(store::AcquisitionFields {
-            acquired_revision: crate::snapshot_sync::effective_upload_body_witness_revision(source),
-            protocol: AcquisitionProtocol::Legacy,
-        })
-    }
-    pub(crate) fn pending(
-        source: SnapshotSource,
-        binding: store::Binding,
-        certificate: crate::transcript_acquisition::DurableCertificate,
-        body: Vec<u8>,
-    ) -> store::PendingRecord {
-        store::PendingRecord {
-            acquisition: acquisition(source),
-            binding,
-            certificate,
-            body,
-            allowlist: super::allowlist_digest(source),
-        }
-    }
-
-    /// Advance production scanning only. The pre-step counters match native
-    /// drivers; source-specific finish/save/ACK remains with each caller.
-    pub(crate) fn scan(
-        mut owned: OwnedSourceScan,
-        steps: usize,
-    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize), u64) {
-        for _ in 0..steps {
-            let (modes, bytes) = owned.sampling.as_ref().map_or(((0, 0, 0), 0), |s| {
-                (
-                    (s.full_files, s.tail_files, s.unchanged_files),
-                    s.native_bytes,
-                )
-            });
-            match owned.step(None) {
-                OwnedSourceScanStep::Pending(next) => owned = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => {
-                    return (index, scan, modes, bytes)
-                }
-            }
-        }
-        panic!("native fixture scan did not complete");
-    }
-
-    pub(crate) fn scan_modes(
-        owned: OwnedSourceScan,
-        steps: usize,
-    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-        let (index, scan, modes, _) = scan(owned, steps);
-        (index, scan, modes)
-    }
-    pub(crate) fn scan_reads(
-        owned: OwnedSourceScan,
-        steps: usize,
-    ) -> (ScanIndex, SourceScanResult, (usize, usize, u64)) {
-        let (index, scan, modes, bytes) = scan(owned, steps);
-        (index, scan, (modes.0, modes.1, bytes))
-    }
-    /// Seal the exact complete bytes through production ReadPlan, retaining
-    /// the caller's open file and resulting position for later growth reads.
-    pub(crate) fn checkpoint(
-        file: &mut std::fs::File,
-        scope: &Scope,
-        now: u64,
-    ) -> crate::transcript_acquisition::Checkpoint {
-        use std::io::Read;
-        let mut plan =
-            crate::transcript_acquisition::ReadPlan::prepare(file, None, scope, None, now).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        plan.observe_complete_records(&bytes).unwrap();
-        plan.commit_after_native_completion(file, scope, now)
-            .unwrap()
-    }
-
-    pub(crate) fn record_path(dir: &Path, key: &store::Digest32) -> PathBuf {
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        dir.join(format!("{hex}.rec"))
-    }
-
-    pub(crate) fn native_header(
-        source: DurableSource,
-        binding: store::Binding,
-        certificate: crate::transcript_acquisition::DurableCertificate,
-        revision: u64,
-        generation: u64,
-        body_len: usize,
-    ) -> store::PreparedHeader {
-        store::PreparedHeader {
-            binding,
-            certificate,
-            format: store::FORMAT_V3,
-            allowlist: source.properties().allowlist(),
-            acquisition: store::AcquisitionFields {
-                acquired_revision: revision,
-                protocol: AcquisitionProtocol::WriteAhead,
-            },
-            generation,
-            body_len,
-        }
-    }
 
     pub(in crate::snapshots) fn parser(
         source: SnapshotSource,
@@ -1735,44 +1001,5 @@ pub(crate) mod native_cold {
             _ => panic!("a clean native fixture is certified"),
         };
         (reduction, checkpoint)
-    }
-
-    /// Reset existing counterfactual-route records without manufacturing a
-    /// receipt or changing their per-route save/ACK order.
-    pub(crate) fn restore_records(
-        index: &Path,
-        records: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
-    ) {
-        let dir = store::store_dir_for_index(index);
-        for (path, bytes) in records {
-            let target = dir.join(path.file_name().unwrap());
-            if fs::read(&target).unwrap() != *bytes {
-                fs::write(target, bytes).unwrap();
-            }
-        }
-    }
-
-    /// Real v3 streaming; no receipt is synthesized and flush stays explicit.
-    pub(crate) fn commit(
-        disk: &mut store::DurableTailStore,
-        writer: &dyn store::SingleWriter,
-        header: store::PreparedHeader,
-        body: &[u8],
-    ) -> store::ReceiptProof {
-        let prepared = disk
-            .prepare_stream(writer, header)
-            .unwrap()
-            .write(|out| {
-                out.write_all(body)
-                    .map_err(|_| crate::durable_tail_codec::Refuse::WriteFailed)?;
-                Ok(body.len())
-            })
-            .unwrap();
-        let committed = disk
-            .commit_stream(writer, prepared)
-            .unwrap()
-            .commit()
-            .unwrap();
-        disk.finish_stream(committed).unwrap()
     }
 }
