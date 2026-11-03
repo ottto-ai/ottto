@@ -71,15 +71,12 @@ fn no_key_stores_no_field_and_fails_closed() {
     note_marker_line(&mut markers, &org(ORG_1), 0);
     note_marker_line(&mut markers, &sentence("two@example.invalid"), 2);
     note_marker_line(&mut markers, &org(ORG_2), 2);
-    let mut markers = markers.unwrap();
+    let markers = markers.unwrap();
     assert_eq!(markers.context_digest, None);
     assert_eq!(markers.context_position, Some(0));
     assert_eq!(markers.context_flip_position, Some(2));
-    markers.home = Some(crate::claude_status_coverage::home_key(
-        std::path::Path::new("/synthetic/home"),
-    ));
-    assert!(markers.email_home(1).is_some());
-    assert!(markers.email_home(2).is_none());
+    assert!(markers.email_precedes(1));
+    assert!(!markers.email_precedes(2));
     assert!(matches!(
         markers.verdict(0, false),
         MarkerVerdict::Trusted(_)
@@ -196,12 +193,9 @@ fn scrub_drops_a_pending_change_and_remembers_a_blank_sentence() {
     note_marker_line(&mut blank, &sentence(""), 1);
     assert!(!blank.as_ref().unwrap().context_changed);
     note_marker_line(&mut blank, &org(ORG_2), 1);
-    let mut blank = blank.unwrap();
+    let blank = blank.unwrap();
     assert_eq!(blank.verdict(1, false), MarkerVerdict::UntrustedFlip);
-    blank.home = Some(crate::claude_status_coverage::home_key(
-        std::path::Path::new("/synthetic/home"),
-    ));
-    assert!(blank.email_home(1).is_none());
+    assert!(!blank.email_precedes(1));
 }
 
 /// SOURCE condition 1 with no sentence digest to clear: a blank no-key sentence

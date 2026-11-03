@@ -167,6 +167,7 @@ impl Corpus {
             unhealthy: Default::default(),
             stats: Default::default(),
             delivered: None,
+            upload_policy: SnapshotUploadPolicy::default(),
         }
     }
 
@@ -198,6 +199,8 @@ struct Page {
     /// Exact ACKs of this page's final bodies, when `ready` delivered them:
     /// `finish` then earns the file receipts as the service finish does.
     delivered: Option<BTreeMap<String, String>>,
+    /// What this pass's upload filter keeps.
+    upload_policy: SnapshotUploadPolicy,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -270,7 +273,7 @@ impl Page {
         crate::snapshots::apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
-            SnapshotUploadPolicy::default(),
+            self.upload_policy,
         );
         let backfill = crate::backfill::load_backfill_state(&corpus.support);
         apply_backfill_cutoff_with_claude_corrections(
@@ -299,6 +302,9 @@ impl Page {
         disposition
     }
     fn finish(&mut self) -> LocalHoldSettlement {
+        self.finish_with(snapshot_upload_body_witness)
+    }
+    fn finish_with(&mut self, witness: impl FnMut(&SnapshotItem) -> String) -> LocalHoldSettlement {
         exclude_held_effective_body_witness_revision(
             &mut self.index,
             &self.scan.snapshots,
@@ -308,7 +314,7 @@ impl Page {
             SnapshotSource::ClaudeCode,
             &mut self.scan,
             &mut self.index,
-            snapshot_upload_body_witness,
+            witness,
         );
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
@@ -713,6 +719,7 @@ fn twin(p: &Page) -> Page {
         stats: p.stats.clone(),
         // A twin is an undelivered copy: only `ready`'s original earns receipts.
         delivered: None,
+        upload_policy: p.upload_policy,
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -781,17 +788,35 @@ fn e2_progress() -> SnapshotUploadProgress {
     )
 }
 fn request(items: &[SnapshotItem]) -> SnapshotBatchRequest {
+    request_under(SnapshotUploadPolicy::default(), items)
+}
+fn request_under(
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+) -> SnapshotBatchRequest {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: SnapshotSource::ClaudeCode.api_slug().into(),
         machine_id: "a".repeat(64),
         collector_version: Some("0.1.synthetic".into()),
         snapshots: items.to_vec(),
-        upload_policy: SnapshotUploadPolicy::default(),
+        upload_policy,
         client_report: crate::client_report::ClientReport::empty(),
     }
 }
 fn upload(
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_under(SnapshotUploadPolicy::default(), items, progress, respond)
+}
+fn upload_under(
+    upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
@@ -815,7 +840,7 @@ fn upload(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let wire = request(&batch);
+            let wire = request_under(upload_policy, &batch);
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");
             sent.push(canonical(&wire));
@@ -1376,6 +1401,81 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
             "a partial twin must never overwrite complete history"
         );
         assert!(original.is_file());
+    });
+}
+
+/// [regress] A grown twin whose growth Full was paced still pulled its
+/// unchanged twin into a forced-family Full on every listing; the pace then
+/// deferred the grown twin, so the sibling was held as `absent_twin` each page.
+/// While paced neither twin is read and nothing is held; once due, both read
+/// together, the growth publishes and nothing is held.
+#[test]
+fn e2_pipeline_paced_twin_does_not_force_its_family() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{indexed_size, owe_claimed_growth};
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-twin-paced");
+        c.write_at(
+            &format!("a/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        let twin = c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut index = ScanIndex::default();
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            let mut page = c.raw(&scanner, index, 100, false, &[]);
+            page.enrich(&c);
+            page.finish();
+            if !page.scan.snapshots.is_empty() {
+                let mut progress = e2_progress();
+                let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                page.index
+                    .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+                accept_upload_context_acks_for_test(
+                    &mut page.index,
+                    &page.scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
+            }
+            reads.push(page.scan.scanned_file_count);
+            index = c.reload(&mut page.index);
+        }
+        assert_eq!(reads.last(), Some(&0), "both twins settled: {reads:?}");
+        let indexed = indexed_size(&index, &twin);
+        append(&twin, &line(ROOT, "r3", "2026-08-02T07:04:00Z", 30));
+        for paced in [true, false] {
+            let owed = owe_claimed_growth(&index, &c.base, &twin, paced);
+            let mut page = c.raw(&scanner, owed, 100, false, std::slice::from_ref(&twin));
+            page.enrich(&c);
+            assert_eq!(
+                page.disposition
+                    .request_owned_hold_reasons
+                    .get("absent_twin"),
+                None,
+                "paced={paced}: no twin is held off the page"
+            );
+            if paced {
+                assert_eq!(
+                    (scanner.paths().len(), page.scan.snapshots.len()),
+                    (0, 0),
+                    "a paced twin pulls no forced-family Full"
+                );
+                assert_eq!(
+                    indexed_size(&page.index, &twin),
+                    indexed,
+                    "growth stays owed"
+                );
+            } else {
+                assert_eq!(scanner.paths().len(), 2, "both twins read together");
+                assert_eq!(total(&page), 3, "the due growth publishes");
+            }
+        }
     });
 }
 

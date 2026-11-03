@@ -253,6 +253,12 @@ pub(crate) struct Counts {
     pub(crate) claude_reread: Rearm,
     #[serde(skip_serializing_if = "CachePage::is_empty")]
     pub(crate) retained_cache_page_events: CachePage,
+    /// Text the always-on link scrape tokenized: its cost is watched, not capped.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) link_scrape_bytes: u64,
+    /// Links left off an upload for the receiver's value length.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) links_over_limit: u64,
 }
 /// Finalized file offers, not parses or stored-body acknowledgements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -419,6 +425,10 @@ impl Counts {
             std::array::from_fn(|i| self.absence.0[i].saturating_add(other.absence.0[i]));
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
+        self.link_scrape_bytes = self
+            .link_scrape_bytes
+            .saturating_add(other.link_scrape_bytes);
+        self.links_over_limit = self.links_over_limit.saturating_add(other.links_over_limit);
     }
     /// What a non-Claude page emits: the shared retained cache's events only.
     pub(super) fn retained_cache_only(self) -> Self {
@@ -524,6 +534,16 @@ pub(super) fn update(f: impl FnOnce(&mut Counts)) {
             current.set(Some(counts));
         }
     });
+}
+pub(crate) fn link_scrape_bytes(bytes: u64) {
+    if bytes > 0 {
+        update(|counts| counts.link_scrape_bytes = counts.link_scrape_bytes.saturating_add(bytes));
+    }
+}
+pub(crate) fn links_over_limit(links: u64) {
+    if links > 0 {
+        update(|counts| counts.links_over_limit = counts.links_over_limit.saturating_add(links));
+    }
 }
 pub(crate) fn cache_event(event: cache_lifecycle::Event, amount: u64) {
     update(|counts| counts.retained_cache_page_events.events.add(event, amount));

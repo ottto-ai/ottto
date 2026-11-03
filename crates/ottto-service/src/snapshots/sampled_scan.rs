@@ -279,15 +279,24 @@ impl SharedCache {
     }
 }
 impl SharedCache {
-    /// A change of the key retained digests were made under. Keeps every parse:
-    /// a server hint can change the key, and that must never cause a re-read.
-    pub(crate) fn scrub_retained_context_digests(&self) {
+    /// A change of the key retained digests were made under (`context`), or of
+    /// the login-address key or its capability (`address`). Keeps every parse:
+    /// a server hint can change either, and that must never cause a re-read.
+    pub(crate) fn scrub_retained_identity(&self, context: bool, address: bool) {
         self.retained()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .scrub_states(sampled_jsonl::CachedJsonlReduction::scrub_context_digest);
+            .scrub_states(|state| state.scrub_identity(context, address));
     }
 
     /// Bind before constructor-time discovery/selection, which consults CONTENT.
+    /// Drops every retained parse: a miss only re-reads. For source-off erase
+    /// and account removal, explicit actions that end what those parses hold.
+    pub(crate) fn forget_retained_transcripts(&self) {
+        self.retained()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
         index.withheld_memo = self.withheld_memo.clone();
         index
@@ -693,33 +702,20 @@ impl Context {
         source: SnapshotSource,
         candidate: &CandidateFile,
         sidecar: &str,
-        artifacts: bool,
-        index: &ScanIndex,
     ) -> Scope {
+        // Only what changes the reader's output. Settings, capabilities and
+        // the replay directive apply after the scan; the parser is compiled,
+        // so it changes only across a restart, which drops RAM checkpoints.
         Scope(sha256_hex(&[
-            "sampled_native_reduction:v1",
+            "sampled_native_reduction:v2",
             &self.namespace.0,
             source.api_slug(),
-            source.parser_version(),
             source.scan_identity_version(),
             &local_index_key(&candidate.scan_root),
             &local_index_key(&candidate.path),
             sidecar,
-            if artifacts {
-                "artifacts"
-            } else {
-                "no_artifacts"
-            },
             // Retired full context-curve upload: keeps the scope bytes.
             "no_curve",
-            index
-                .active_upload_context_fingerprint
-                .as_deref()
-                .unwrap_or("none"),
-            index
-                .historical_replay_generation
-                .as_deref()
-                .unwrap_or("none"),
         ]))
     }
     pub(super) fn record_mode(&mut self, mode: ReadMode, audit_due: Option<u64>) {
@@ -2324,7 +2320,6 @@ pub(super) struct ParserOptions<'a> {
     pub(super) metadata: &'a CodexTitleMetadata,
     pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    pub(super) artifacts: bool,
     pub(super) identity_capture: bool,
     pub(super) cache: Option<&'a Arc<SharedCache>>,
 }
@@ -2340,7 +2335,6 @@ pub(super) fn new_source_parser(
         metadata,
         traces,
         parents,
-        artifacts,
         identity_capture,
         cache,
     } = options;
@@ -2387,7 +2381,6 @@ pub(super) fn new_source_parser(
         (source == SnapshotSource::Codex).then_some(metadata),
         traces,
         parents,
-        artifacts,
     )?;
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {

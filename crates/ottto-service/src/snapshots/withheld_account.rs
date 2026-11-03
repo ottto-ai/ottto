@@ -213,17 +213,15 @@ impl ScanIndex {
         }
         candidate.withheld_content_stamp.as_deref().map(|stamp| {
             // Restored body/activity debt may be deferred only under the
-            // authority that completed this parse. A revision or context
-            // activation must invalidate CONTENT even with equal samples.
+            // authority that completed this parse. A revision activation must
+            // invalidate CONTENT even with equal samples; a setting or
+            // capability changes no parse.
             let mut seen = self.withheld_seen(CONTENT, candidate.size_bytes, stamp);
             let authority = digest(&[
                 CONTENT,
                 &self
                     .active_effective_upload_body_witness_revision
                     .to_string(),
-                self.active_upload_context_fingerprint
-                    .as_deref()
-                    .unwrap_or("\0none"),
             ]);
             let mut hash = Sha256::new();
             hash.update(seen.evidence);

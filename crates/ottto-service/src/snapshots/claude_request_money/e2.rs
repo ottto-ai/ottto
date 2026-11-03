@@ -396,6 +396,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         telemetry,
         accounts,
         prefix: _,
+        folder_trace,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -414,6 +415,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
+    *folder_trace = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -911,8 +913,10 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
+    /// Which file this fold read, for the folder ledger; set as it becomes an item.
+    pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1032,6 +1036,7 @@ impl FileFold {
             ambiguous,
             accounts,
             proof,
+            crate::snapshots::claude_folder_login::FolderTrace::finish_heap_bound(),
         ] {
             out = out.checked_add(bytes)?;
         }
@@ -1139,6 +1144,7 @@ impl FileFold {
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
+            folder_trace: None,
         };
         fold.spend(started);
         fold
@@ -1230,6 +1236,23 @@ impl FileFold {
         !occurrence.usage.is_zero()
             && self.money_birth.copied_with_slack(at, SLACK) == Some(true)
             && !self.is_skipped(occurrence.sequence)
+    }
+
+    /// Whether this file holds a prefix from elsewhere: a response older than
+    /// its birth, a held pre-birth range, or a birth inherited across a move.
+    pub(crate) fn copied_or_moved<'a>(
+        &self,
+        mut occurrences: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
+    ) -> bool {
+        !self.skipped.is_empty()
+            || matches!(
+                (self.money_birth.birth_nanos(), self.physical),
+                (Some(effective), Some(physical)) if effective != physical
+            )
+            || occurrences.any(|occurrence| {
+                let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
+                self.money_birth.copied_with_slack(at, SLACK) == Some(true)
+            })
     }
 
     /// `placed` is the native finalizer's own placement of this response

@@ -217,7 +217,6 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
         Some(&CodexTitleMetadata::default()),
         None,
         None,
-        false,
     )
     .unwrap();
     (parser, expected)
@@ -225,14 +224,14 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
 
 /// One native acquisition: reuse `old` if the reader accepts it, read to EOF,
 /// retain a copy within the entry limit, then finish natively.
-fn acquire(
+pub(in crate::snapshots) fn acquire_items(
     path: &Path,
     old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
     now: u64,
 ) -> (
     Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
     ReadMode,
-    Value,
+    Vec<SnapshotItem>,
 ) {
     let scope = Scope("r1a-native".into());
     let (mut parser, expected) = native_parser(path);
@@ -262,7 +261,19 @@ fn acquire(
             None,
         )
         .unwrap();
-    let mut items = parsed.snapshots;
+    (retained, mode, parsed.snapshots)
+}
+
+fn acquire(
+    path: &Path,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    Value,
+) {
+    let (retained, mode, mut items) = acquire_items(path, old, now);
     apply_upload_policy(
         SnapshotSource::ClaudeCode,
         &mut items,
@@ -272,9 +283,7 @@ fn acquire(
 }
 
 fn oracle(path: &Path) -> Value {
-    let mut items =
-        parse_claude_code_jsonl_file_with_artifacts(path, NOW, "native-fixture".into(), false)
-            .unwrap();
+    let mut items = parse_claude_code_jsonl_file(path, NOW, "native-fixture".into()).unwrap();
     apply_upload_policy(
         SnapshotSource::ClaudeCode,
         &mut items,

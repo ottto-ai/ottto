@@ -111,7 +111,6 @@ fn acquire(
             now,
             BACKFILL_WINDOW_DAYS,
             8,
-            false,
             None,
             &[],
             false,

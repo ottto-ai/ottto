@@ -71,7 +71,6 @@ fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
         "2026-08-20T10:02:00Z",
         183,
         1,
-        false,
     )
     .unwrap();
     let main_context = main_context_fingerprint_reference(
@@ -82,8 +81,14 @@ fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
     );
     assert_eq!(
         index.traversal.as_ref().unwrap().context_fingerprint,
-        main_context
+        scan_traversal_context_fingerprint(
+            SnapshotSource::ClaudeCode,
+            &[scratch.to_path_buf()],
+            183
+        )
     );
+    // The checkpoint as main wrote it: the delivery-bound form.
+    index.traversal.as_mut().unwrap().context_fingerprint = main_context;
     let entry_bytes = serde_json::to_vec(&index.files).unwrap();
     index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
     assert_eq!(
@@ -95,6 +100,15 @@ fn default_off_untagged_shipped_main_checkpoint_resumes_without_rearm() {
             183
         ),
         TraversalProgress::Resumed
+    );
+    assert_eq!(
+        index.traversal.as_ref().unwrap().context_fingerprint,
+        scan_traversal_context_fingerprint(
+            SnapshotSource::ClaudeCode,
+            &[scratch.to_path_buf()],
+            183
+        ),
+        "adopted to the current form"
     );
     assert_eq!(
         serde_json::to_vec(&index.files).unwrap(),

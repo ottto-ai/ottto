@@ -90,7 +90,6 @@ fn request_owned_sessions(scan: &crate::snapshots::SourceScanResult) -> BTreeSet
 }
 
 impl PipelineFixture {
-
     fn new(name: &str) -> Self {
         let base = test_dir(name);
         let root = base.join("projects");
@@ -168,7 +167,6 @@ impl PipelineFixture {
             self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
         })
     }
-
 
     fn page_with_reoffers_born(
         &self,
@@ -501,7 +499,6 @@ impl PipelineFixture {
         }
     }
 
-
     /// Pages of one traversal, until its census completes or the page bound.
     fn traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
         let mut pages: Vec<PipelinePage> = Vec::new();
@@ -524,7 +521,6 @@ impl PipelineFixture {
         }
         pages
     }
-
 
     /// The baseline: every session committed and accepted, one owner proven.
     fn baseline(&self) -> ScanIndex {
@@ -3864,7 +3860,6 @@ fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause(
     }
 }
 
-
 /// [money] F5 root (Codex money audit: 38 observed-but-unindexed files,
 /// $202.81): a partial ACK with no restart. A page reads two of three files
 /// and only one is acknowledged, so the partial checkpoint has no entry for
@@ -3900,7 +3895,6 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
             &format!("2026-10-29T12:0{minute}:00Z"),
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             file_limit,
-            false,
         )
         .unwrap();
         crate::snapshots::finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);

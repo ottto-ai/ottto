@@ -114,14 +114,15 @@ impl ScanIndex {
         archive_alarm(alarm);
         crate::local_resource_diagnostics::codex_zst_refused_flush();
     }
-    pub(super) fn hold_archive_corrections(&mut self, context: Option<&str>) {
+    /// A historical replay re-owes every acquired archive. No setting or
+    /// capability does: they correct nothing in an archive's evidence.
+    pub(super) fn hold_archive_corrections(&mut self) {
         let mut count = 0;
         for a in self.archives.values_mut() {
             if matches!(
                 a.disposition,
                 ArchiveDisposition::Acquired | ArchiveDisposition::Empty
-            ) && context.map_or(true, |context| a.context.as_deref() != Some(context))
-            {
+            ) {
                 a.transition(ArchiveTransition::Correctness(
                     CodexZstCause::CorrectionUnapplied,
                 ));

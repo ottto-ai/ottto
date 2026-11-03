@@ -1210,7 +1210,6 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         if !veto_rows {
@@ -1426,7 +1425,6 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         index.claude_duplicate_request_witness_overflowed = fence_closed;
@@ -1589,7 +1587,6 @@ fn native_read(
         Some(&CodexTitleMetadata::default()),
         None,
         None,
-        false,
     )
     .expect("parser");
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());

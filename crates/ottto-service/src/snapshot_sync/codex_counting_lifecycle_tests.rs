@@ -8,7 +8,6 @@ fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         "2026-10-06T23:00:00Z",
         7,
         10,
-        false,
     )
     .unwrap();
     index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut scan.snapshots, &[]);

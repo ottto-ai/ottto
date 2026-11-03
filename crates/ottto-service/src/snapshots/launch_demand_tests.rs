@@ -145,7 +145,6 @@ fn scan(
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -201,7 +200,11 @@ fn subagents_with_unbatched_parents_keep_one_prepared_native_batch() {
     }
     let probe = home.context();
     let mut sweep_steps = 0;
-    while !probe.prepare_launch_step(&[TOP.to_owned()]).unwrap() {
+    while !probe
+        .launch_events()
+        .prepare_step(&[TOP.to_owned()])
+        .unwrap()
+    {
         sweep_steps += 1;
     }
     assert!(sweep_steps > 4, "one retained-store sweep crosses steps");
@@ -228,7 +231,7 @@ fn subagents_with_unbatched_parents_keep_one_prepared_native_batch() {
         .attribution_facts
         .iter()
         .any(|fact| fact.field == "agent_kind" && fact.value == "opus-cli-agent"));
-    assert!(context.launches_prepared(&[TOP.to_owned()]));
+    assert!(context.launch_events().prepared(&[TOP.to_owned()]));
     for (_, session, parent) in &fixture.subagents {
         let launched_item = item(&launched, session);
         assert_subagent_without_launch_lineage(launched_item, parent);
@@ -260,7 +263,7 @@ fn incomplete_lookup_holds_top_level_workers_but_not_subagents() {
     // A regular file where the inbox directory belongs fails every sweep.
     fs::write(home.0.join(".ottto/launch-events/pending"), b"unreadable").unwrap();
     let (_, result, _, context) = scan(&home, &fixture.root);
-    assert!(!context.launches_prepared(&[TOP.to_owned()]));
+    assert!(!context.launch_events().prepared(&[TOP.to_owned()]));
     assert!(
         result.unreadable_path_count > 0,
         "top-level worker stays owed"

@@ -49,7 +49,7 @@ fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlPa
     } else {
         apply_claude_code_line
     };
-    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
+    OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
 }
 
 struct ClearPreparationFault;
@@ -266,7 +266,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -447,7 +446,6 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -1348,7 +1346,6 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 "2026-10-20T12:00:00Z",
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -2149,7 +2146,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     "2026-10-20T12:00:00Z",
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     false,
@@ -2460,7 +2456,6 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                     "2026-10-20T12:00:00Z",
                     365,
                     100,
-                    false,
                     Some(&root),
                     &[],
                     false,
@@ -2800,7 +2795,6 @@ pub(super) fn known_corrupt_scan(
         at,
         365,
         100,
-        false,
         Some(support),
         &[],
         false,
@@ -3810,7 +3804,6 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         None,
         None,
         None,
-        false,
     )
     .unwrap();
     let taken = cache
@@ -3911,7 +3904,6 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
             at,
             365,
             100,
-            false,
             None,
             &[],
             false,
@@ -4284,7 +4276,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     at,
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     rediscover,
@@ -4931,7 +4922,6 @@ fn a1a_scan_at(
             at,
             183,
             100,
-            false,
             Some(support),
             &[],
             false,
@@ -4989,7 +4979,6 @@ fn owed_rearmed_restore_equals_cold_full_and_stamps_current_contract() {
                     "2026-08-02T08:00:00Z",
                     183,
                     100,
-                    false,
                     Some(&disk.root),
                     &[],
                     false,
@@ -5812,7 +5801,6 @@ fn b1g_owned(
             "2026-08-02T08:00:00Z",
             183,
             100,
-            false,
             Some(root),
             &[],
             false,
@@ -6570,7 +6558,6 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
                     "2026-10-29T12:00:00Z",
                     365,
                     100,
-                    false,
                     None,
                     &[],
                     false,
@@ -6779,7 +6766,6 @@ impl O3Fixture {
             at,
             days,
             100,
-            false,
             Some(&self.root),
             &[],
             false,
@@ -7041,7 +7027,6 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
             "2026-10-29T12:00:00Z",
             365,
             100,
-            false,
             None,
             &[],
             false,
@@ -7241,7 +7226,6 @@ fn b4_structural_transition() {
                 at,
                 1,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -7511,7 +7495,6 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
                 at,
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -8014,7 +7997,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                 None,
                 None,
                 None,
-                false,
             )
             .unwrap();
             codex_counting_version::configure_group_once(
@@ -9519,7 +9501,7 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
 
             assert!(bind_session_context_key(to.map(attribution).as_ref()));
             take_context_digest_scrubs_for_test();
-            owner.cache.scrub_retained_context_digests();
+            owner.cache.scrub_retained_identity(true, false);
             assert_eq!(take_context_digest_scrubs_for_test(), parses as u64);
             assert_eq!(retained(), parses);
             let ((index, _, _), bytes) = observe_consumed(|| scan(index));
@@ -9548,6 +9530,76 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
             );
         });
     }
+}
+
+/// [money] D156: a recorded-login capability flap (key on, off, on again) only
+/// scrubs each retained recorded login. No parse is dropped, every count stays,
+/// and the scans after each change read 0 transcript bytes.
+#[test]
+fn capability_flap_scrubs_recorded_logins_without_a_read() {
+    use crate::claude_status_coverage::bind_address_key;
+    use crate::snapshots::claude_request_identity::take_address_scrubs_for_test;
+    let attachment = |body: serde_json::Value| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"attachment",
+                "sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","attachment":body})
+        )
+    };
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("capability-flap-scrub");
+        let _lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(
+            &path,
+            attachment(serde_json::json!({"type":"session_context",
+                "context":{"userEmail":"one@example.invalid"}}))
+                + &attachment(serde_json::json!({"type":"credential_org",
+                    "organizationUuid":"11111111-1111-4111-8111-111111111111"}))
+                + &a1a_row("accepted", 100),
+        )
+        .unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::capturing_identity();
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut index, mut first, _) = scan(index);
+        a1a_wire(&root, &mut index, &mut first);
+        let retained = || owner.cache.retained().unwrap().keys().count();
+        let parses = retained();
+        assert!(parses > 0);
+        for key in [None, Some([0x42; 32])] {
+            assert!(bind_address_key(key.map(zeroize::Zeroizing::new)));
+            take_address_scrubs_for_test();
+            owner.cache.scrub_retained_identity(false, true);
+            assert_eq!(take_address_scrubs_for_test(), parses as u64);
+            assert_eq!(retained(), parses);
+            let ((next, _, _), bytes) = observe_consumed(|| scan(index));
+            assert_eq!(bytes, 0);
+            assert_eq!(retained(), parses);
+            index = next;
+        }
+        bind_address_key(None);
+    });
 }
 
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
@@ -11135,7 +11187,6 @@ fn content_v3_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
                 at,
                 365,
                 100,
-                false,
                 None,
                 &[],
                 false,
@@ -12087,7 +12138,6 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             None,
             None,
             None,
-            false,
         )
         .unwrap();
         codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));

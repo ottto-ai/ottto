@@ -839,7 +839,6 @@ fn apc_scan(census_complete: bool, pending: Vec<PendingIndexFinalization>) -> So
         APC_WINDOW,
         365,
         10,
-        false,
     )
     .expect("empty synthetic scan");
     scan.snapshots.clear();

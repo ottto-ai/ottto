@@ -145,7 +145,6 @@ fn full_version_feed(home: &Path, start: &str, version: &str) -> Arc<CodexVersio
         "2026-10-07T12:00:00Z",
         30,
         10,
-        false,
         None,
         &[],
         false,
