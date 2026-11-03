@@ -2236,13 +2236,9 @@ fn family_root_key(path: &Path) -> Option<String> {
 /// holds, or a root without scan state, stays counted.
 fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &ScanIndex) {
     let root = claude_snapshot_family_root_ref(&items[at]).to_owned();
-    let on_page = items
-        .iter()
-        .filter(|item| item.source_session_id == root)
-        .map(|item| &item.claude_usage_request_ids)
-        .collect::<Vec<_>>();
+    let root_on_page = items.iter().any(|item| item.source_session_id == root);
     let record = index.claude_request_census.get(root_key);
-    if on_page.is_empty() {
+    if !root_on_page {
         let evidence = record.map(|record| scan_evidence(index, root_key, record));
         if matches!(evidence, Some(Evidence::Queued | Evidence::Stale))
             || (evidence.is_none() && queued(index, root_key))
@@ -2253,6 +2249,11 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
             return;
         }
     }
+    let on_page = items
+        .iter()
+        .filter(|item| item.source_session_id == root)
+        .map(|item| &item.claude_usage_request_ids)
+        .collect::<Vec<_>>();
     let item = &items[at];
     let Some(fold) = item.claude_money.as_deref() else {
         return;
@@ -2262,7 +2263,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
         .iter()
         .filter(|(id, occurrence)| {
             !fold.is_skipped(occurrence.sequence)
-                && match record.filter(|_| on_page.is_empty()) {
+                && match record.filter(|_| !root_on_page) {
                     Some(record) => record.holds_hash(claude_request_hash(id)),
                     None => on_page.iter().any(|ids| ids.contains(*id)),
                 }
