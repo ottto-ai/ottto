@@ -2004,6 +2004,7 @@ pub(super) mod test_hooks {
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static INS_EXTRA: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         static X_OUT: std::cell::Cell<Option<super::XOut>> = const { std::cell::Cell::new(None) };
+        static ACTIVE_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     /// Run `hook` each time this thread reaches `point`, until `clear`.
@@ -2048,6 +2049,19 @@ pub(super) mod test_hooks {
             hook();
         }
         HOOKS.with(|hooks| hooks.borrow_mut().extend(fired));
+    }
+
+    /// `fire`, with the candidate's index key readable through
+    /// `active_key` while the hooks run.
+    pub(in crate::snapshots) fn fire_for_key(point: Point, key: &str) {
+        ACTIVE_KEY.with(|active| *active.borrow_mut() = Some(key.to_owned()));
+        fire(point);
+        ACTIVE_KEY.with(|active| active.borrow_mut().take());
+    }
+
+    /// The key `fire_for_key` is firing for, if any.
+    pub(in crate::snapshots) fn active_key() -> Option<String> {
+        ACTIVE_KEY.with(|active| active.borrow().clone())
     }
 
     pub(in crate::snapshots) fn probe(update: impl FnOnce(&mut Probe)) {

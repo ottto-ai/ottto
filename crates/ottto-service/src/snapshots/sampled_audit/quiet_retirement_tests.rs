@@ -1006,13 +1006,27 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
         START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
     );
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    for expected in [(0, 1, 0), (0, 0, 1)] {
+    for (visit, expected) in [(0, 1, 0), (0, 0, 1)].into_iter().enumerate() {
         // UnknownOutcome forces the second quiet visit while the account
         // deferral still owns this retry; it confers no audit authority.
+        // An unchanged file is not re-listed, so the watcher hint delivers
+        // the second visit (a held key keeps its hint).
         index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
         crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let hinted: &[std::path::PathBuf] = if visit == 1 {
+            std::slice::from_ref(&fixture.file.0)
+        } else {
+            &[]
+        };
         let ((next, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-            production_scan(&fixture, source, index, Some(cache.clone()), "held-cap")
+            production_scan_hinted(
+                &fixture,
+                source,
+                index,
+                Some(cache.clone()),
+                "held-cap",
+                hinted,
+            )
         });
         assert_eq!(
             modes, expected,
@@ -1112,20 +1126,15 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         let committed = index.clone();
         let order = Arc::new(Mutex::new(Vec::new()));
         let observed_order = order.clone();
-        // Each file's head stages after this point: an unstaged quiet head
-        // means the quiet file is the one retaining.
-        let observed_route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
+        // The probe names the file retaining at each point.
         let observed_quiet = quiet_key.clone();
         let observed_held = held_key.clone();
         sampled_scan::test_hooks::set(sampled_scan::test_hooks::Point::AfterRetain, move || {
-            let route = observed_route.as_deref().unwrap();
-            let staged =
-                |key: &str| crate::snapshots::state_v2::staged_head_for_test(route, key).is_some();
-            let who = if !staged(&observed_quiet) {
-                "quiet"
-            } else {
-                assert!(!staged(&observed_held));
-                "held"
+            let active = sampled_scan::test_hooks::active_key();
+            let who = match active.as_deref() {
+                Some(key) if key == observed_quiet => "quiet",
+                Some(key) if key == observed_held => "held",
+                _ => "other",
             };
             observed_order.lock().unwrap().push(who);
         });
