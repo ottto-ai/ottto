@@ -37,11 +37,10 @@ impl ScanIndex {
         source_change: Option<SourceChange>,
     ) -> (Token, bool) {
         use CandidateParseReason as R;
-        let receipt_context = || {
+        let delivered = || {
             self.files
                 .get(key)
-                .and_then(|entry| entry.upload_context_receipt.as_ref())
-                .map(|receipt| receipt.context_fingerprint.as_str())
+                .is_some_and(|entry| entry.upload_context_receipt.is_some())
         };
         let token = match reason {
             Some(R::TranscriptChanged) => Token::Append,
@@ -50,11 +49,7 @@ impl ScanIndex {
             Some(R::AuthorityQuarantine | R::ForcedFamily) => Token::CopyOwnership,
             Some(R::ActivityOrQuarantineRetry) => Token::AckRecovery,
             Some(R::BodyWitnessAdoption) => self.revision_change_reason(key),
-            Some(R::UploadContext)
-                if self
-                    .upload_context_proof
-                    .privacy_turned_off_since(receipt_context()) =>
-            {
+            Some(R::UploadContext) if delivered() && counts::privacy_off(source.api_slug()) => {
                 Token::PrivacyOffErase
             }
             Some(R::SourceChanged) => {
@@ -218,10 +213,10 @@ mod tests {
         }
     }
 
-    /// [format] A proof written before the change-reason direction decodes and
-    /// re-serializes to its exact bytes, and the new field round-trips too.
+    /// [format] A proof without the retired direction keeps its exact bytes;
+    /// one with it decodes, drops it, and is never written with it again.
     #[test]
-    fn proof_state_without_direction_decodes_exactly() {
+    fn retired_direction_decodes_and_is_dropped() {
         let old = serde_json::json!({
             "inputs": {
                 "policy": "a".repeat(64), "namespace": "b".repeat(64),
@@ -234,6 +229,16 @@ mod tests {
         let decoded: upload_context_receipt::ProofState =
             serde_json::from_value(old.clone()).unwrap();
         assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+        let mut with_direction = old.clone();
+        with_direction["direction"] = serde_json::json!({
+            "policy": [false, true, false, false, false],
+            "context": "f".repeat(64),
+            "previous_context": "b".repeat(64),
+            "last_change_mask": 1
+        });
+        let decoded: upload_context_receipt::ProofState =
+            serde_json::from_value(with_direction).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
         let mut index = ScanIndex {
             upload_context_proof: decoded,
             ..ScanIndex::default()
@@ -245,9 +250,6 @@ mod tests {
             SnapshotUploadPolicy::default(),
         );
         let new = serde_json::to_value(&index.upload_context_proof).unwrap();
-        assert_eq!(new["direction"]["context"], "f".repeat(64));
-        let again: upload_context_receipt::ProofState =
-            serde_json::from_value(new.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&again).unwrap(), new);
+        assert!(new.get("direction").is_none());
     }
 }
