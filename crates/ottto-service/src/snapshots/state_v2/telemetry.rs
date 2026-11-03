@@ -79,6 +79,8 @@ pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
 thread_local! {
     static THREAD_EVENTS: std::cell::RefCell<BTreeMap<&'static str, serde_json::Value>> =
         Default::default();
+    static THREAD_CHECKPOINTS: std::cell::RefCell<Vec<(&'static str, serde_json::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 /// Test evidence only: takes this thread's latest value of an event, so a
 /// concurrent test cannot supply or overwrite it.
@@ -201,6 +203,13 @@ pub(super) fn hydrate_checkpoint(
                 ..Default::default()
             },
         );
+        #[cfg(test)]
+        THREAD_CHECKPOINTS.with(|checkpoints| {
+            checkpoints.borrow_mut().push((
+                name,
+                serde_json::to_value(stats.stage_memory.get(name).unwrap()).unwrap(),
+            ));
+        });
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
@@ -560,39 +569,29 @@ mod ops_tests {
         .unwrap();
         for cold in [true, false] {
             pass_start();
-            let (loaded, records) = crate::local_resource_diagnostics::capture(|| {
-                if cold {
-                    super::super::money_test_support::publish(
-                        &ScanIndex::default(),
-                        &path,
-                        &progress,
-                    )
-                } else {
-                    ScanIndex::load(&path).unwrap()
-                }
-            });
-            let mut previous = None;
-            for name in [
-                "hydrate_route_entry",
-                "hydrate_after_ack",
-                "hydrate_entry",
-                "hydrate_after_decode",
-                "hydrate_after_baseline",
-                "hydrate_exit",
-            ] {
-                let position = records
+            THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
+            let loaded = if cold {
+                super::super::money_test_support::publish(&ScanIndex::default(), &path, &progress)
+            } else {
+                ScanIndex::load(&path).unwrap()
+            };
+            let checkpoints = THREAD_CHECKPOINTS
+                .with(|checkpoints| std::mem::take(&mut *checkpoints.borrow_mut()));
+            assert_eq!(
+                checkpoints
                     .iter()
-                    .position(|record| {
-                        record["stage"] == "claude_state_v2"
-                            && record["counts"]["stage_memory"][name].is_object()
-                    })
-                    .unwrap_or_else(|| panic!("missing {name}"));
-                assert!(
-                    previous.is_none_or(|previous| position > previous),
-                    "{name}"
-                );
-                previous = Some(position);
-                let sample = &records[position]["counts"]["stage_memory"][name];
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+                [
+                    "hydrate_route_entry",
+                    "hydrate_after_ack",
+                    "hydrate_entry",
+                    "hydrate_after_decode",
+                    "hydrate_after_baseline",
+                    "hydrate_exit",
+                ]
+            );
+            for (name, sample) in checkpoints {
                 assert!(sample["current"].is_object());
                 assert!(sample["save_digests"].is_u64());
                 if name == "hydrate_after_baseline" || name == "hydrate_exit" {
