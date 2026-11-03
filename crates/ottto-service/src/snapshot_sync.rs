@@ -4486,8 +4486,7 @@ impl PermanentRefusalCounts {
 
 /// Last retained-refusal log line per source. A quiet cycle that re-discloses
 /// the same list does not log it again.
-static SOURCE_REFUSAL_LOGS: OnceLock<Mutex<BTreeMap<&'static str, RefusalLogLine>>> =
-    OnceLock::new();
+static SOURCE_REFUSAL_LOGS: Mutex<[Option<RefusalLogLine>; 3]> = Mutex::new([None, None, None]);
 
 /// Retained refusal counts, the authority-downgrade share of the dominated
 /// ones, and whether they were reported as settled residue.
@@ -4504,14 +4503,9 @@ fn log_retained_permanent_refusals(
     settled_residue: bool,
 ) {
     let line = (retained, authority_downgrades, settled_residue);
-    let previous = SOURCE_REFUSAL_LOGS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()
-        .and_then(|mut logged| logged.insert(source.api_slug(), line));
-    if previous == Some(line) {
+    let Some(previous) = rejection_log::changed(&SOURCE_REFUSAL_LOGS, source, line) else {
         return;
-    }
+    };
     if previous.is_some_and(|p| retained.exposure.owed_entities > p.0.exposure.owed_entities) {
         eprintln!("ottto-service: refusal exposure alarm source={} reason=accepted_log_stale_older_upload owed_entities={} oldest_age_seconds={}", source.api_slug(), retained.exposure.owed_entities, retained.exposure.oldest_age_seconds);
     }
@@ -12547,8 +12541,23 @@ fn report_status_with_fresh_relay_token(
         );
     }
     client.report_status(&relay_token, &request)?;
+    // Content-free, after a successful send: the closed error-code slug and
+    // enabled flag, once per change per source (and once after start).
+    let line = (request.enabled, request.last_error_code);
+    if rejection_log::changed(&SOURCE_STATUS_LOGS, source, line.clone()).is_some() {
+        let code = line.1.as_deref().unwrap_or("none");
+        eprintln!(
+            "ottto-service: collector status source={} enabled={} code={code}",
+            source.api_slug(),
+            line.0
+        );
+    }
     Ok(())
 }
+
+/// Last reported (enabled, error code) per source slot.
+static SOURCE_STATUS_LOGS: Mutex<[Option<(bool, Option<String>)>; 3]> =
+    Mutex::new([None, None, None]);
 
 /// A policy stop before scanning: withdraw this source's manifest, clear its
 /// active sessions, then report `status` with the manifest withdrawn.
