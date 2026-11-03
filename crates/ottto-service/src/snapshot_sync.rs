@@ -22815,6 +22815,10 @@ mod tests {
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        #[cfg(unix)]
+        mod privacy_flip_money_tests {
+            include!("snapshot_sync/privacy_flip_money_tests.rs");
+        }
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");

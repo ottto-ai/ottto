@@ -6,6 +6,7 @@ use super::money_equivalence_tests::{claude_change, claude_corpus, input_clock};
 use super::state_v2_money_tests::{otel_rows, routed, second_account, tagged_api};
 use super::*;
 use crate::session_attribution::{normalize_template_material, opaque_hmac_id};
+use crate::snapshots::privacy_flip_modes::{all as policy_all, link, Mode, FLIPS};
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle::assert_equivalent, RouteResult,
 };
@@ -17,44 +18,6 @@ const COLD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const PROMPT: &str = "Review the synthetic checkout flow and report only safe results.";
 const SKILL: &str = "synthetic-review";
 
-/// Every input of the delivery context: the five settings, the attribution
-/// key, the cache capability and the copy-unproven capability.
-#[derive(Clone, Copy)]
-struct Mode {
-    policy: SnapshotUploadPolicy,
-    key: u8,
-    cache: bool,
-    copy: bool,
-}
-type Flip = (&'static str, fn(&mut Mode));
-const FLIPS: [Flip; 8] = [
-    ("titles", |m| flip(&mut m.policy.session_titles_enabled)),
-    ("workspace", |m| {
-        flip(&mut m.policy.workspace_labels_enabled)
-    }),
-    ("links", |m| flip(&mut m.policy.session_artifacts_enabled)),
-    ("attribution", |m| {
-        flip(&mut m.policy.session_attribution_enabled)
-    }),
-    ("labels", |m| {
-        flip(&mut m.policy.session_attribution_labels_enabled)
-    }),
-    ("key", |m| m.key ^= 1),
-    ("cache", |m| flip(&mut m.cache)),
-    ("copy", |m| flip(&mut m.copy)),
-];
-fn flip(value: &mut bool) {
-    *value = !*value;
-}
-fn policy_all(value: bool) -> SnapshotUploadPolicy {
-    SnapshotUploadPolicy {
-        session_titles_enabled: value,
-        workspace_labels_enabled: value,
-        session_artifacts_enabled: value,
-        session_attribution_enabled: value,
-        session_attribution_labels_enabled: value,
-    }
-}
 /// The state a flip starts from. A key only shows while attribution is on, so
 /// its row starts there, from either key.
 fn start_of(name: &str, start: bool) -> Mode {
@@ -125,9 +88,6 @@ fn page_under(c: &Corpus, scanner: &E2ScanFixture, mut index: ScanIndex, mode: M
         upload_policy: mode.policy,
     }
 }
-fn link_line(n: u32) -> serde_json::Value {
-    json!({"timestamp":AT,"sessionId":ROOT,"message":{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":format!("Opened https://github.com/ottto-ai/repo/pull/{n}")}]}]}})
-}
 /// The root with everything a setting governs: a title, a repository, a link,
 /// a first prompt (a keyed template and its label) and a skill (a keyed id, its
 /// label and the activity summary).
@@ -152,7 +112,7 @@ fn write_root_material(c: &mut Corpus) -> PathBuf {
         json!({"type":"user","sessionId":ROOT,"timestamp":AT,"cwd":cwd,
             "message":{"role":"user","content":PROMPT}}),
         json!({"timestamp":AT,"sessionId":ROOT,"summary":"Synthetic title","cwd":cwd}),
-        link_line(0),
+        link(ROOT, AT, 0),
         response,
     ]
     .iter()
@@ -344,7 +304,7 @@ fn flipped_policy_tail_places_money_like_a_full() {
                 let mut warm = page_under(&c, &scanner, ScanIndex::default(), before);
                 settle(&c, &mut warm, before);
                 claude_change(&c, &path, "progressive_response");
-                append(&path, &format!("{}\n", link_line(1)));
+                append(&path, &format!("{}\n", link(ROOT, AT, 1)));
                 second_account(&c, &path);
                 side_call(&c);
                 evidence_gap(&mut c, true);

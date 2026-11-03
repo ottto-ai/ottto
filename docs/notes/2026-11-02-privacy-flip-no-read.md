@@ -20,7 +20,8 @@ recomputed under the active delivery context and replay generation, equals it; o
 starts as before. Tier receipts and archive contexts still record the delivery context for older
 readers but are never compared, so none is held or re-read.
 
-Session links are always scraped; the setting and the server's 512-byte limit apply at upload, and
-over-limit links are counted. Consequences: enabling a setting applies to sessions active after it
+Session links are always scraped; the setting and the server's 512-character value limit apply at
+upload (a longer value would refuse the whole batch). Scraped bytes and over-limit links are counted
+on the existing page counts. Consequences: enabling a setting applies to sessions active after it
 is turned on; closed sessions gain nothing unless an operator backfill is requested; a body held in
 quarantine is reassessed at its deadline rather than on a context change.

@@ -153,6 +153,8 @@ mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]
+pub(crate) mod privacy_flip_modes;
+#[cfg(test)]
 mod upload_context_receipt_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
@@ -2344,8 +2346,11 @@ pub struct SessionArtifact {
 
 /// Maximum VCS artifacts retained per session (runaway-transcript guard).
 const MAX_SESSION_ARTIFACTS: usize = 50;
-/// The receiver rejects a longer link value. Kept locally, never uploaded.
-const MAX_SESSION_ARTIFACT_VALUE_BYTES: usize = 512;
+/// Wire contract, not a cap: the receiver's `SessionArtifact.value` is
+/// `Field(min_length=7, max_length=512)`, counted in characters after a strip
+/// (extracted values carry no surrounding whitespace). A longer value refuses
+/// the whole batch (422), so it is kept locally and never uploaded.
+const MAX_SESSION_ARTIFACT_VALUE_CHARS: usize = 512;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -8574,7 +8579,7 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
-    let mut links_over_limit = 0_usize;
+    let mut links_over_limit = 0_u64;
     for item in snapshots {
         let mut fingerprint_needs_refresh = false;
         if !policy.session_titles_enabled
@@ -8602,9 +8607,9 @@ pub fn apply_upload_policy(
         }
         let links = item.session_artifacts.len();
         item.session_artifacts
-            .retain(|link| link.value.len() <= MAX_SESSION_ARTIFACT_VALUE_BYTES);
+            .retain(|link| link.value.chars().count() <= MAX_SESSION_ARTIFACT_VALUE_CHARS);
         if item.session_artifacts.len() != links {
-            links_over_limit += links - item.session_artifacts.len();
+            links_over_limit += (links - item.session_artifacts.len()) as u64;
             fingerprint_needs_refresh = true;
         }
         if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
@@ -8635,13 +8640,7 @@ pub fn apply_upload_policy(
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
     }
-    if links_over_limit > 0 {
-        crate::local_resource_diagnostics::traversal_point(
-            "session_links_over_limit",
-            source.api_slug(),
-            &BTreeMap::from([("count", links_over_limit)]),
-        );
-    }
+    crate::local_resource_diagnostics::claude_reread::links_over_limit(links_over_limit);
 }
 
 #[cfg(test)]
@@ -41487,7 +41486,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // Local collection never depends on a toggle: `apply_upload_policy` decides
     // what leaves the machine.
     let text = claude_code_scannable_text(value);
-    upload_context_receipt::note_link_scrape_bytes(text.len());
+    crate::local_resource_diagnostics::claude_reread::link_scrape_bytes(text.len() as u64);
     let artifacts = extract_session_artifacts(&text);
     if !artifacts.is_empty() {
         accumulator.add_artifacts(artifacts);
