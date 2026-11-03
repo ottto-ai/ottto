@@ -6460,7 +6460,7 @@ fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace:
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
 /// namespace (pure; a continuation page must use the same bytes, K5).
-fn cycle_sampled_scope(
+pub(crate) fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,

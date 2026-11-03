@@ -14,7 +14,7 @@ use crate::snapshots::sampled_jsonl::SideCertificate;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::state_v2::{BaselineRelease, TailHead};
-use crate::transcript_acquisition::ReadMode;
+use crate::transcript_acquisition::{ReadMode, Scope};
 use serde_json::Value;
 
 /// What the shared rows need from a source.
@@ -63,6 +63,11 @@ fn id<S: FixtureSource>(route: &Route, path: &Path) -> HeadIdentity {
 /// `S`'s load of `path`'s committed head, with a fresh parser's accumulator as
 /// this read's live inputs, as the scan prepares them before the load.
 fn load_at<S: FixtureSource>(route: &Route, path: &Path, key: &str) -> Load {
+    load_under::<S>(route, path, key, &scope())
+}
+
+/// `load_at` under this read's acquisition `scope`.
+fn load_under<S: FixtureSource>(route: &Route, path: &Path, key: &str, scope: &Scope) -> Load {
     let mut held = File::open(path).unwrap();
     let live = open::<S>(path);
     load::<S>(
@@ -71,7 +76,7 @@ fn load_at<S: FixtureSource>(route: &Route, path: &Path, key: &str) -> Load {
         key,
         &id::<S>(route, path),
         &mut held,
-        &scope(),
+        scope,
         &candidate(path),
         &live.accumulator,
     )
@@ -82,12 +87,24 @@ fn load_at<S: FixtureSource>(route: &Route, path: &Path, key: &str) -> Load {
 fn finish<S: FixtureSource>(
     route: &Route,
     path: &Path,
-    mut parser: OwnedJsonlParser,
+    parser: OwnedJsonlParser,
     base: Option<TailBase>,
     at_pre: impl FnOnce(&mut SnapshotAccumulator),
 ) -> (PendingTail, Result<ParsedJsonlFile>) {
+    finish_under::<S>(route, path, parser, base, at_pre, &scope())
+}
+
+/// `finish` under this read's acquisition `scope`.
+fn finish_under<S: FixtureSource>(
+    route: &Route,
+    path: &Path,
+    mut parser: OwnedJsonlParser,
+    base: Option<TailBase>,
+    at_pre: impl FnOnce(&mut SnapshotAccumulator),
+    scope: &Scope,
+) -> (PendingTail, Result<ParsedJsonlFile>) {
     let SideCertificate::Certified { completed, .. } =
-        parser.certify_without_retention(&scope(), NOW).unwrap()
+        parser.certify_without_retention(scope, NOW).unwrap()
     else {
         panic!("a clean fixture is certified");
     };
@@ -303,11 +320,21 @@ fn codex_ack_a_before_b_save_recovers_after_a_crash() {
 
 /// One stored read past the committed head of `path`.
 fn stored_read(route: &Route, path: &Path, key: &str) -> (OwnedJsonlParser, TailBase, ReadMode) {
-    let Load::Reused(taken, Some(base)) = load_at::<Codex>(route, path, key) else {
+    stored_read_under(route, path, key, &scope())
+}
+
+/// `stored_read` under this read's acquisition `scope`.
+fn stored_read_under(
+    route: &Route,
+    path: &Path,
+    key: &str,
+    scope: &Scope,
+) -> (OwnedJsonlParser, TailBase, ReadMode) {
+    let Load::Reused(taken, Some(base)) = load_under::<Codex>(route, path, key, scope) else {
         panic!("the committed head is reused with its base");
     };
     let mut parser = open::<Codex>(path);
-    let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), &scope(), None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), scope, None, NOW) else {
         panic!("the read prepares");
     };
     if !matches!(mode, ReadMode::Unchanged) {
@@ -626,13 +653,24 @@ fn codex_stored(
     mode: Mode,
     expect: fn(&ReadMode) -> bool,
 ) -> (RouteResult, Vec<(PendingTail, Result<ParsedJsonlFile>)>) {
+    codex_stored_under(route, paths, mode, expect, &scope())
+}
+
+/// `codex_stored` under this read's acquisition `scope`.
+fn codex_stored_under(
+    route: &Route,
+    paths: &[PathBuf],
+    mode: Mode,
+    expect: fn(&ReadMode) -> bool,
+    scope: &Scope,
+) -> (RouteResult, Vec<(PendingTail, Result<ParsedJsonlFile>)>) {
     let mut items = Vec::new();
     let mut completions = Vec::new();
     for path in paths {
         let key = local_index_key(path);
-        let (parser, base, read) = stored_read(route, path, &key);
+        let (parser, base, read) = stored_read_under(route, path, &key, scope);
         assert!(expect(&read), "{}: {read:?}", path.display());
-        let (tail, native) = finish::<Codex>(route, path, parser, Some(base), |_| {});
+        let (tail, native) = finish_under::<Codex>(route, path, parser, Some(base), |_| {}, scope);
         items.extend(native.as_ref().unwrap().snapshots.clone());
         completions.push((tail, native));
     }
@@ -712,6 +750,63 @@ fn codex_cold_full_equals_tail_restart_and_upgrade_in_totals_and_placement() {
     append(&paths[1], 3, 4);
     let (upgraded, _) = codex_stored(&route, &paths[1..2], Mode::DiskRestore, is_tail);
     money_oracle::assert_equivalent(&codex_cold(&route, &paths[1..2]), &upgraded);
+}
+
+/// [money] D168-3: an account-witness change, then a destination change, after
+/// a restart (each a new acquisition scope) continue every Codex head from
+/// Tail, and each restart equals a cold Full in totals AND creator placement:
+/// account evidence is applied from the stored creator facts and this read's
+/// live evidence, never by a re-read. A swapped placement fails the oracle.
+#[test]
+fn a_codex_restart_under_a_changed_account_scope_places_like_a_cold_full() {
+    let mut route = route_for(Source::Codex);
+    let paths = [
+        account_rollout(&route, SESSION, Some("a"), 3),
+        account_rollout(&route, ACCOUNT_B, Some("b"), 2),
+        account_rollout(&route, GAP, None, 2),
+    ];
+    for path in &paths {
+        let (tail, native) = complete::<Codex>(&route, path, None, |_| {});
+        assert!(tail.publish(&native));
+    }
+    route.save(false);
+    let first = codex_cold(&route, &paths);
+    let (a, b) = (evidence(&first, SESSION), evidence(&first, ACCOUNT_B));
+    assert!(a.is_object() && b.is_object(), "two tagged sessions");
+    assert_ne!(a, b, "positive control: two accounts");
+
+    let is_tail = |read: &ReadMode| matches!(read, ReadMode::Tail);
+    for (n, namespace) in ["tail-seam-witness-changed", "tail-seam-destination-changed"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_ne!(Scope(namespace.into()), scope());
+        append(&paths[0], 3 + n, 4 + n);
+        append(&paths[1], 2 + n, 3 + n);
+        append(&paths[2], 2 + n, 3 + n);
+        let (restart, completions) = codex_stored_under(
+            &route,
+            &paths,
+            Mode::Restart,
+            is_tail,
+            &Scope(namespace.into()),
+        );
+        let cold = codex_cold(&route, &paths);
+        money_oracle::assert_equivalent(&cold, &restart);
+        assert_eq!(evidence(&restart, SESSION), a, "{namespace}");
+        assert_eq!(evidence(&restart, ACCOUNT_B), b, "{namespace}");
+        assert!(evidence(&restart, GAP).is_null(), "{namespace}");
+        let mut swapped = restart.clone();
+        swapped.snapshots.get_mut(ACCOUNT_B).unwrap()["session_account_evidence"] = a.clone();
+        assert!(
+            std::panic::catch_unwind(|| money_oracle::assert_equivalent(&cold, &swapped)).is_err(),
+            "the oracle sees a moved placement ({namespace})"
+        );
+        for (tail, native) in completions {
+            assert!(tail.publish(&native));
+        }
+        route.save(false);
+    }
 }
 
 /// [money] A future revision's head holds its file: no body is re-emitted,
