@@ -90,10 +90,16 @@ impl Fixture {
         policy: SnapshotUploadPolicy,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> Walked {
+        // A source with a Tail codec continues from its state database route.
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            self.source,
+            Some(self.cache.as_ref()),
+            std::mem::take(&mut self.index),
+        );
         let mut scan = OwnedSourceScan::new(
             self.source,
             std::slice::from_ref(&self.root),
-            std::mem::take(&mut self.index),
+            index,
             "2026-10-29T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
             10,

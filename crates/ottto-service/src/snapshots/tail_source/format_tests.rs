@@ -242,7 +242,7 @@ fn codec_list_gives_routes_and_counters_stay_per_source() {
 fn the_ram_copy_is_kept_and_taken_only_without_a_codec() {
     assert!(!keeps_ram(SnapshotSource::ClaudeCode));
     assert!(keeps_ram(SnapshotSource::Codex));
-    assert!(keeps_ram(SnapshotSource::Pi));
+    assert!(!keeps_ram(SnapshotSource::Pi));
 }
 
 /// [format] The one hourly page codec carries usage buckets (`UsageHours`,
