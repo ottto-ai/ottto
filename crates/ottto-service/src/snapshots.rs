@@ -8340,9 +8340,6 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    /// This read re-folded late evidence from stored state: a body that is
-    /// not the ACKed one goes as an ordinary update, counted by its reason.
-    stored_reuse: Option<CandidateParseReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -8565,19 +8562,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
             .map(snapshot_file_upload_body_set_hex);
-        // A late-evidence re-fold that is not the ACKed body is an ordinary
-        // update on the head CAS, the body a native read would send now.
-        #[cfg(unix)]
-        if let Some(reason) = pending.stored_reuse.filter(|_| {
-            final_group_fingerprint != pending.previous_snapshot_fingerprint
-                || final_upload_body_witness != pending.previous_upload_body_witness
-        }) {
-            tail_source::counters::bump(
-                source,
-                "tail_refold",
-                CANDIDATE_PARSE_REASON_NAMES[reason as usize],
-            );
-        }
         if pending.sampled_audit_verified {
             crate::local_resource_diagnostics::sampled_audit_comparison(
                 source.api_slug(),
@@ -30243,22 +30227,6 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 let tail_base = parser.take_tail_base();
                 #[cfg(unix)]
-                let stored_reuse = parser
-                    .take_stored_read()
-                    .then_some(parse_reason)
-                    .flatten()
-                    .filter(|reason| tail_source::load::late_evidence(*reason))
-                    .filter(|_| {
-                        file_sampling.as_ref().is_some_and(|active| {
-                            !matches!(
-                                active.mode,
-                                crate::transcript_acquisition::ReadMode::Full(_)
-                            )
-                        })
-                    });
-                #[cfg(not(unix))]
-                let stored_reuse = None;
-                #[cfg(unix)]
                 let mut tail = completed_acquisition
                     .as_ref()
                     .zip(file_sampling.as_ref())
@@ -31215,7 +31183,6 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
-                            stored_reuse: None,
                         });
                         let alias_items = parsed
                             .iter()
@@ -31286,7 +31253,6 @@ impl OwnedSourceScan {
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
                         .active_effective_upload_body_witness_revision,
-                    stored_reuse,
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -33916,7 +33882,17 @@ impl OwnedSourceScan {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
-                                        parser.set_stored_read();
+                                        // A late-evidence re-fold from
+                                        // stored state, counted by its reason.
+                                        if let Some(reason) = parse_reason.filter(|reason| {
+                                            tail_source::load::late_evidence(*reason)
+                                        }) {
+                                            tail_source::counters::bump(
+                                                source,
+                                                "tail_refold",
+                                                CANDIDATE_PARSE_REASON_NAMES[reason as usize],
+                                            );
+                                        }
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -35197,12 +35173,8 @@ struct ParserPending {
     /// PRE seam's encode.
     #[cfg(unix)]
     tail_base: Option<tail_source::seam::TailBase>,
-    /// This read continues from a loaded head, with or without a base.
-    #[cfg(unix)]
-    stored_read: bool,
 }
-crate::heap_layout_bound::fields!(ParserPending; #[cfg(unix)] tail_base,
-    #[cfg(unix)] stored_read);
+crate::heap_layout_bound::fields!(ParserPending; #[cfg(unix)] tail_base);
 
 struct OwnedJsonlParser {
     #[cfg(test)]
@@ -35226,18 +35198,6 @@ impl OwnedJsonlParser {
     #[cfg(unix)]
     fn take_tail_base(&mut self) -> Option<tail_source::seam::TailBase> {
         self.pending.as_mut()?.tail_base.take()
-    }
-    #[cfg(unix)]
-    fn set_stored_read(&mut self) {
-        self.pending
-            .get_or_insert_with(Default::default)
-            .stored_read = true;
-    }
-    #[cfg(unix)]
-    fn take_stored_read(&mut self) -> bool {
-        self.pending
-            .as_mut()
-            .is_some_and(|pending| std::mem::take(&mut pending.stored_read))
     }
     fn new(
         file: File,
@@ -82567,7 +82527,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, stored_reuse);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 // Hand-written so an absent fork costs no visit: every Claude and Codex
 // accumulator carries an empty ledger, and their frames must keep the visit
