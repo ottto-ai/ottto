@@ -725,8 +725,7 @@ pub(crate) mod money_oracle {
         }
     }
 
-    // Commit 6's oracle rows hold this comparator.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "commit 6's oracle rows hold this comparator")]
     /// Caller supplies independently known extent/revision regression; money
     /// shrink is not inferred from tokens (legitimate corrections exist).
     pub(crate) fn assert_no_smaller_reemit(

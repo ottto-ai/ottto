@@ -2785,7 +2785,6 @@ fn deferred(reason: &'static str) -> Cycle {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_once(
     grants: &GrantStore,
     state_store: &StateStore,

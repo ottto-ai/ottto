@@ -1160,11 +1160,11 @@ impl SnapshotBatchResponse {
                 ));
             }
         }
-        for reference in self
-            .accepted_entities
-            .iter()
-            .chain(&self.unchanged_entities)
-        {
+        let mut first = None;
+        let mut bad_refs = 0_usize;
+        let accepted = self.accepted_entities.iter().map(|r| ("accepted", r));
+        let unchanged = self.unchanged_entities.iter().map(|r| ("unchanged", r));
+        for (class, reference) in accepted.chain(unchanged) {
             let key = (
                 reference.source_session_id.clone(),
                 reference.snapshot_fingerprint.clone(),
@@ -1172,22 +1172,38 @@ impl SnapshotBatchResponse {
             let Some((expected_version, expected_digest)) = expected.get(&key) else {
                 continue;
             };
-            if reference.body_witness_version.as_ref() != Some(expected_version)
-                || reference.body_witness_digest.as_ref() != Some(expected_digest)
-            {
-                if answered.contains(&key) {
-                    warn_answered_body_witness_rejection(
-                        &reference.source_session_id,
-                        *expected_version,
-                        reference.body_witness_version,
-                    );
-                }
-                return Err(anyhow!(
-                    "snapshot ACK lacks exact durable context curve body witness proof"
+            let Some(reason) =
+                body_witness_refusal_reason(reference, *expected_version, expected_digest)
+            else {
+                continue;
+            };
+            // Diagnostic only: keep counting after the first refusal; the
+            // decision below is the same as refusing at the first one.
+            bad_refs += 1;
+            if first.is_none() {
+                first = Some((
+                    reason,
+                    class,
+                    reference,
+                    *expected_version,
+                    answered.contains(&key),
                 ));
             }
         }
-        Ok(())
+        let Some((reason, class, reference, expected_version, answered)) = first else {
+            return Ok(());
+        };
+        warn_body_witness_refusal(
+            reason,
+            class,
+            reference,
+            expected_version,
+            answered,
+            bad_refs,
+        );
+        Err(anyhow!(
+            "snapshot ACK lacks exact durable context curve body witness proof"
+        ))
     }
 
     pub(crate) fn validate_entity_ack_identities<'a>(
@@ -1277,30 +1293,53 @@ impl SnapshotBatchResponse {
     }
 }
 
-/// The one residual risk of a head-CAS challenge answer: the server stored
-/// it, but its ACK echoes a different body witness, so this cycle cannot
-/// settle. The next upload conflicts again and the existing refused-answer
-/// count and window take over. Session hash and versions only; no content.
-fn warn_answered_body_witness_rejection(
-    source_session_id: &str,
+/// The first check an ACK reference fails against its request body witness.
+fn body_witness_refusal_reason(
+    reference: &SnapshotEntityRef,
     expected_version: u64,
-    echoed_version: Option<u64>,
+    expected_digest: &str,
+) -> Option<&'static str> {
+    match (
+        reference.body_witness_version,
+        reference.body_witness_digest.as_deref(),
+    ) {
+        (None, _) => Some("missing_version"),
+        (Some(version), _) if version != expected_version => Some("version_mismatch"),
+        (_, None) => Some("missing_digest"),
+        (_, Some(digest)) if digest != expected_digest => Some("digest_mismatch"),
+        _ => None,
+    }
+}
+
+/// One line per refused body-witness ACK, naming the first failing reference
+/// and how many failed. An answered head-CAS challenge recovers through the
+/// next conflict. Session hash, fingerprint prefix and versions only.
+fn warn_body_witness_refusal(
+    reason: &str,
+    class: &str,
+    reference: &SnapshotEntityRef,
+    expected_version: u64,
+    answered: bool,
+    bad_refs: usize,
 ) {
     let line = format!(
-        "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
-         witness_version={expected_version} echoed_witness_version={} \
-         reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
-        crate::snapshot_sync::SessionHash::of(source_session_id),
-        echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
+        "warning: local snapshot ACK body witness refused: reason={reason} class={class} \
+         session_hash={} fingerprint={} witness_version={expected_version} \
+         echoed_witness_version={} bad_refs={bad_refs} answered={answered}",
+        crate::snapshot_sync::SessionHash::of(&reference.source_session_id),
+        reference.snapshot_fingerprint.get(..8).unwrap_or_default(),
+        reference
+            .body_witness_version
+            .map_or_else(|| "none".to_string(), |version| version.to_string()),
     );
     eprintln!("{line}");
     #[cfg(test)]
-    ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow_mut().push(line));
+    BODY_WITNESS_REFUSALS.with(|lines| lines.borrow_mut().push(line));
 }
 
 #[cfg(test)]
 thread_local! {
-    pub(crate) static ANSWERED_WITNESS_WARNINGS: std::cell::RefCell<Vec<String>> =
+    pub(crate) static BODY_WITNESS_REFUSALS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -2510,7 +2549,6 @@ impl SnapshotApiClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_composition_start_verdicts(
         &self,
         request: &SnapshotBatchRequest,
@@ -2617,7 +2655,6 @@ impl SnapshotApiClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_batch_http_failure(
         &self,
         request: &SnapshotBatchRequest,
@@ -4640,6 +4677,124 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    /// Two witnessed bodies, one accepted and one unchanged, each echoed exactly.
+    fn witnessed_ack() -> (SnapshotBatchRequest, SnapshotBatchResponse) {
+        let first = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        let mut second = first.clone();
+        second.source_session_id = "synthetic-second-session".into();
+        let echo = |item: &crate::snapshots::SnapshotItem| SnapshotEntityRef {
+            body_witness_version: snapshot_ack_body_witness_version(item).unwrap(),
+            body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(item)),
+            // Cache observations put the request under the head-CAS contract.
+            head_etag: Some("e".repeat(64)),
+            ..entity_ref(&item.source_session_id, &item.snapshot_fingerprint, 1)
+        };
+        let mut ack = entity_ack(2, vec![echo(&first)]);
+        ack.unchanged_entities.push(echo(&second));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![first, second],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        (request, ack)
+    }
+
+    /// The refusal is unchanged; returns its one diagnostic line.
+    fn refused_witness_line(edit: impl FnOnce(&mut SnapshotBatchResponse)) -> String {
+        let (request, mut ack) = witnessed_ack();
+        edit(&mut ack);
+        let error = ack.validate_body_witness_ack(&request).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "snapshot ACK lacks exact durable context curve body witness proof"
+        );
+        let lines = BODY_WITNESS_REFUSALS.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_missing_version() {
+        let line = refused_witness_line(|ack| {
+            let reference = &mut ack.accepted_entities[0];
+            reference.body_witness_version = None;
+            reference.body_witness_digest = None;
+        });
+        assert!(
+            line.contains("reason=missing_version class=accepted "),
+            "{line}"
+        );
+        assert!(
+            line.contains("echoed_witness_version=none bad_refs=1 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_version_mismatch() {
+        let line = refused_witness_line(|ack| {
+            ack.unchanged_entities[0].body_witness_version = Some(3);
+        });
+        assert!(
+            line.contains("reason=version_mismatch class=unchanged "),
+            "{line}"
+        );
+        assert!(
+            line.contains("echoed_witness_version=3 bad_refs=1 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_missing_digest() {
+        let line = refused_witness_line(|ack| {
+            ack.accepted_entities[0].body_witness_digest = None;
+        });
+        assert!(
+            line.contains("reason=missing_digest class=accepted "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_digest_mismatch_and_counts_every_bad_ref() {
+        let (request, _) = witnessed_ack();
+        let first = &request.snapshots[0];
+        let version = snapshot_ack_body_witness_version(first).unwrap().unwrap();
+        let line = refused_witness_line(|ack| {
+            ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+            ack.unchanged_entities[0].body_witness_version = None;
+        });
+        assert_eq!(
+            line,
+            format!(
+                "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
+                 class=accepted session_hash={} fingerprint={} witness_version={version} \
+                 echoed_witness_version={version} bad_refs=2 answered=false",
+                crate::snapshot_sync::SessionHash::of(&first.source_session_id),
+                &first.snapshot_fingerprint[..8],
+            )
+        );
+        let (digest, zeros) = (
+            crate::snapshots::snapshot_upload_body_witness(first),
+            "0".repeat(64),
+        );
+        for secret in [&digest, &first.source_session_id, &zeros] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+
+    #[test]
+    fn exact_body_witness_echo_still_settles_without_a_refusal_line() {
+        let (request, ack) = witnessed_ack();
+        ack.validate_entity_ack(&request).unwrap();
+        assert!(BODY_WITNESS_REFUSALS.with(|lines| lines.borrow().is_empty()));
     }
 
     #[test]

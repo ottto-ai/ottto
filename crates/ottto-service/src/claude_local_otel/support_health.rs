@@ -147,7 +147,7 @@ impl Rows {
         }
     }
 }
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn valid_row<T: Serialize>(
     session: &str,
     request: &str,

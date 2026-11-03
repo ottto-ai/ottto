@@ -13,6 +13,12 @@ adapters.
 - Keep public docs standalone; they must not require private repository context.
 - Update tests and docs when behavior, CLI contracts, schemas, connector
   manifests, release metadata, or support workflows change.
+- A pull request that changes Rust code carries a line starting with `Reuse:`
+  in its description: what you searched for and which existing code you reused
+  or extended. The Linux clippy step checks that line and rejects added
+  crate/module-level blanket `#![allow(...)]` or `#![cfg_attr(...allow...)]`
+  lines. Clippy requires suppression reasons. After fixing the description,
+  push a commit, because a re-run reads the original one.
 
 ## Local Checks
 

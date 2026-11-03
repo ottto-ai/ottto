@@ -13,7 +13,7 @@ pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
     /// Registry identity; Pi records return with S2c.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "Pi records read the tag again with S2c")]
     pub(crate) tag: u8,
     /// Its index routes through the state v2 store. Only ever set: a published
     /// route's custody wins, and clearing it would let v1 load the frozen

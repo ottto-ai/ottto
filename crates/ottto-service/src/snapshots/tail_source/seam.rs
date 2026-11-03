@@ -52,7 +52,10 @@ impl PendingTail {
     /// route or no valid certificate, so nothing is written for this read.
     /// `base` is the committed head the load continued; `quiet` a quiet audit
     /// this completion retires, so the head no longer carries its debt.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the certificate binds every completion input"
+    )]
     pub(in crate::snapshots) fn new<S: TailSource>(
         index: &ScanIndex,
         completed: &CompletedNativeAcquisition,

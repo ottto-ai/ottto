@@ -88,7 +88,10 @@ fn drop_retired_direction<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> std::result::Result<(), D::Error> {
     #[derive(Deserialize)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "retired fields are decoded only for backward compatibility"
+    )]
     struct Retired {
         policy: [bool; 5],
         context: Option<String>,

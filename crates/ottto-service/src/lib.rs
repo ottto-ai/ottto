@@ -3977,7 +3977,7 @@ struct ConnectorRegistry {
     sources: Vec<RegistrySourceEntry>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "fields pin the registry schema; some unread")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistrySourceEntry {
@@ -3992,7 +3992,7 @@ struct RegistrySourceEntry {
     collectors: Vec<RegistryCollectorEntry>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "fields pin the registry schema; some unread")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryCollectorEntry {

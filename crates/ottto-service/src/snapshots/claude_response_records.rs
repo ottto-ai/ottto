@@ -697,7 +697,7 @@ impl CompactClaudeResponseRecord {
     /// record itself. `position` is its index in the response. Decoding reads
     /// that index from the vector; the saved field keeps its old width, so past
     /// `u16::MAX` it saturates.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     pub(super) fn encode(
         first: Option<&Self>,
         position: usize,

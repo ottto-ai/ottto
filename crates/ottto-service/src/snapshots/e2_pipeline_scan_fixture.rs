@@ -438,7 +438,7 @@ impl E2ScanFixture {
         forget_continuations_for_test(&self.cache, index);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
     pub(crate) fn scan(
         &self,
         roots: &[PathBuf],

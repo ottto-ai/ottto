@@ -4384,7 +4384,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
 // copy proportional to response count; id-less native usage remains counted.
 // The next request is the minimum over every member's peeked head; a
 // `while let` would hold that mutable walk across the body.
-#[allow(clippy::while_let_loop)]
+#[expect(clippy::while_let_loop, reason = "a while-let holds the walk borrow")]
 fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
     let mut identified = 0u64;
     let mut total = 0u64;

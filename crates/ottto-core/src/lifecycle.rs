@@ -355,7 +355,10 @@ enum SupportDirClaim {
     HeldByThisDaemon,
     /// This process holds the lock for the rest of the uninstall.
     #[cfg(unix)]
-    Owned(#[allow(dead_code)] crate::state_dir_lock::StateDirLock),
+    Owned(
+        #[allow(dead_code, reason = "held only so the lock is released on drop")]
+        crate::state_dir_lock::StateDirLock,
+    ),
     /// No directory when the claim was made. Anything created there later
     /// belongs to someone else and is never deleted by this uninstall.
     Absent,

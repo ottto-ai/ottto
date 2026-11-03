@@ -67,7 +67,10 @@ pub(in crate::snapshots) fn keeps_ram(source: SnapshotSource) -> bool {
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one codec dispatch carries the cycle's load inputs"
+)]
 pub(in crate::snapshots) fn load_candidate(
     source: SnapshotSource,
     index: &ScanIndex,
@@ -108,7 +111,10 @@ fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, 
 }
 
 /// `source`'s pending Tail write for one completion, through its codec.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one codec dispatch carries the completion's write inputs"
+)]
 pub(in crate::snapshots) fn pending(
     source: SnapshotSource,
     index: &ScanIndex,

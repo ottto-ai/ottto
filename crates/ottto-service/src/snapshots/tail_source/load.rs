@@ -247,7 +247,10 @@ struct Hit {
     page_bytes: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared load takes every codec's cycle inputs"
+)]
 pub(super) fn load<S: TailSource>(
     index: &ScanIndex,
     route: &Path,

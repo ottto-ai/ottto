@@ -145,7 +145,10 @@ pub(crate) mod claude_folder_login;
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
 // These census helpers remain until the separate persisted-format cleanup.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "these census helpers await the persisted-format cleanup"
+)]
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
@@ -276,7 +279,6 @@ use codex_compressed_input::{ArchiveDisposition, ArchiveReservation, ArchiveTran
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
-#[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
 #[cfg(test)]
@@ -996,9 +998,8 @@ pub(crate) fn provider_context_bucket(
         "short"
     })
 }
-// Generous ceilings: scanning is incremental (per-file fingerprint) and
-// streaming, so a larger history is a one-time backfill cost with bounded
-// memory. The finite caps still guard a pathological ~/.codex.
+// Per-page read budget, not a history bound: discovery queues every file in
+// the window into the durable traversal and the rest continues next page.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 // Directory discovery has its own hard per-tick budget. Candidate parsing was
 // already capped, but recursively walking an arbitrarily large tree before
@@ -1012,8 +1013,6 @@ pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
 /// A re-listing pass queues an owed file whose stamp is unchanged at most
 /// once per this interval.
 const LISTING_OWED_PACE_SECONDS: u64 = 6 * 60 * 60;
-/// Bound on `ScanTraversalCheckpoint::listing_owed_requeued_unix_seconds`.
-const MAX_LISTING_OWED_PACES: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2676,10 +2675,6 @@ struct ScanTraversalCounts {
     /// once per file per `LISTING_OWED_PACE_SECONDS`.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_owed_requeued: u64,
-    /// Pacing stamps dropped because the map reached its bound; each lets
-    /// its file be re-queued before six hours.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    listing_owed_pace_evicted: u64,
     /// Diagnostic only: paced growth reads deferred until their claim ages
     /// out. Never an unreadable path, a retryable problem or an error.
     #[serde(skip_serializing_if = "is_zero_u64")]
@@ -2852,8 +2847,7 @@ struct ScanTraversalCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listing_started_unix_seconds: Option<u64>,
     /// Owed files with an unchanged stamp that a re-listing pass queued,
-    /// with that pass's start. Bounded: past the bound the oldest stamp is
-    /// dropped, so the bound can only bring a re-queue forward.
+    /// with that pass's start. Stamps older than the pace are pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
@@ -2907,9 +2901,6 @@ impl ScanTraversalResidue {
             && self.codex_inventory_hold.is_none()
     }
 }
-
-/// Upper bound on each key set of a `CodexInventoryHold`.
-const MAX_CODEX_INVENTORY_HOLD_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 
 /// Codex candidates a page held only because its header inventory was
 /// incomplete, with the evidence that made it incomplete.
@@ -3021,7 +3012,6 @@ struct CodexParentOwnershipLedger {
 /// U1a-2a: the `cause` of a held side verdict (and of a lineage owe) with no
 /// `CodexParentUnresolvable`: P's own fork lineage is still pending. Outside
 /// every ordinal (`CodexParentUnresolvable::COUNT` is 12).
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 pub(in crate::snapshots) const CAUSE_NO_EVIDENCE: u8 = 255;
 /// U1a-2a: a side request is evicted at this many charged attempts.
 pub(in crate::snapshots) const SIDE_REQUEST_EVICT_ATTEMPTS: u8 = 7;
@@ -3030,7 +3020,6 @@ const _: () = assert!(CodexParentUnresolvable::COUNT < CAUSE_NO_EVIDENCE as usiz
 /// U1a-2a: the verdict of a parent rollout P's latest certified parse, as
 /// the parent of forks whose boundary needs P's prefix. It says whether P's
 /// own parse settled; it is never ownership evidence for P or a child.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(in crate::snapshots) enum SideVerdict {
@@ -3065,7 +3054,10 @@ fn codex_parent_side_verdict(parsed: &ParsedJsonlFile) -> SideVerdict {
 /// U1a-2a: the verdict without P's lineage term, for the invalid-census keep
 /// only. It discounts the ownership hold that lineage itself sets
 /// (`defer_parent_resolution`), so a real downgrade still overwrites.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the side writers
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "first production caller is the side writers")
+)]
 fn codex_parent_side_verdict_without_lineage(parsed: &ParsedJsonlFile) -> SideVerdict {
     let held = !parsed.report.complete()
         || parsed.recognized_usage_drop_count > 0
@@ -3247,7 +3239,6 @@ pub(in crate::snapshots) fn codex_side_epoch_stale(epoch: u64, wrap: u64) -> boo
 }
 
 /// U1a-2a (row 32): what one sweep removed.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct SideSweep {
     pub(in crate::snapshots) orphans: usize,
@@ -3303,7 +3294,6 @@ impl CodexSidePass {
 /// U1a-2a (Stage 1 interface, parent r79): which page a Codex pass serves.
 /// Production builds only `Ordinary` until the Stage 1 lease adds
 /// continuation pages.
-#[cfg_attr(not(test), allow(dead_code))] // `Continuation` is Stage 1's
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum CodexPageKind {
     Ordinary,
@@ -9303,7 +9293,10 @@ pub(crate) fn apply_claude_reported_usage_with_identity(
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test seam preserves the usage authority inputs"
+)]
 fn apply_claude_reported_usage_with_index_and_limits(
     snapshots: &mut [SnapshotItem],
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -9362,7 +9355,7 @@ pub(crate) struct ClaudeNativeObservations {
     index_generation: u64,
 }
 
-#[allow(dead_code)] // The inactive driver's pre-offer path is not integrated yet.
+#[allow(dead_code, reason = "inactive driver's pre-offer path not wired yet")]
 pub(crate) fn record_claude_native_observations(
     scan: &SourceScanResult,
     index: &mut ScanIndex,
@@ -9451,7 +9444,7 @@ impl ClaudeEvidenceRows<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -9580,7 +9573,7 @@ fn claude_page_refused(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
 fn apply_claude_reported_usage_with_index_limits_and_current_files(
     snapshots: &mut [SnapshotItem],
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -11360,7 +11353,7 @@ fn claude_family_members_unobserved_where(
 /// re-arms once; that window records the new set. A census closed only by
 /// coverage in an incremental window is held closed by the same unchanged
 /// families, so it is skipped too.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn claude_full_rearm_structural_terminal(
     index: &mut ScanIndex,
     census_window_end: &str,
@@ -12508,7 +12501,7 @@ impl ClaudeTombstoneFenceKeptAlarm {
 /// terminal page or was re-armed by another rule keeps every member on the
 /// BASE re-arm. `None` means the scratch was not admitted, which is BASE for
 /// the whole terminal.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn claude_unchanged_proof_roots<'p>(
     index: &ScanIndex,
     proven: &'p BTreeMap<String, ProvenClaudeUsageFamily>,
@@ -16383,7 +16376,7 @@ enum ClaudeResolveFailure {
 }
 
 impl ClaudeResponseObservation {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     fn new(
         sequence: u64,
         usage: UsageTotals,
@@ -16420,7 +16413,7 @@ impl ClaudeResponseObservation {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     fn push(
         &mut self,
         usage: UsageTotals,
@@ -19737,7 +19730,7 @@ impl SnapshotAccumulator {
     /// Retain one Claude usage-bearing record for response-level resolution.
     /// No session-exclusive metric is mutated here; `finalize_claude_responses`
     /// admits exactly one terminal observation after the full file is read.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn observe_claude_response(
         &mut self,
         value: &Value,
@@ -20833,7 +20826,7 @@ impl SnapshotAccumulator {
     // Usage ownership needs the event identity, selector, activity time, and
     // effort beside both cumulative and last-response counters. Keeping these
     // inputs together makes the one-occurrence accounting invariant explicit.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     fn set_cumulative_usage_with_selector(
         &mut self,
         model: Option<String>,
@@ -22000,7 +21993,10 @@ pub fn scan_source_roots_with_attribution(
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test seam preserves the scanner attribution and watcher inputs"
+)]
 pub fn scan_source_roots_with_attribution_and_hints(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -22028,7 +22024,7 @@ pub fn scan_source_roots_with_attribution_and_hints(
 /// Production scan entry that tracks both the local Claude OTLP sidecar and
 /// bounded watcher hints. Keeping the support directory explicit preserves
 /// the pure scan API for audits and backfills.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -22057,7 +22053,6 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
 /// Compatibility entry retained for focused account-attribution and effort
 /// sidecar tests that do not exercise watcher hints.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub fn scan_source_roots_with_attribution_and_claude_effort(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -22177,7 +22172,6 @@ impl CodexParentUnresolvable {
         self as usize
     }
     /// U1a: every cause in ordinal order (`ALL[i].index() == i`).
-    #[allow(dead_code)] // first production caller is the proof map decode
     pub(in crate::snapshots) const ALL: [Self; Self::COUNT] = [
         Self::Absent,
         Self::Duplicated,
@@ -22193,7 +22187,6 @@ impl CodexParentUnresolvable {
         Self::DeferredRestart,
     ];
     /// U1a: the persisted ordinal's inverse; `None` for an unknown ordinal.
-    #[allow(dead_code)] // first production caller is the proof map decode
     pub(in crate::snapshots) fn from_index(index: u8) -> Option<Self> {
         Self::ALL.get(usize::from(index)).copied()
     }
@@ -23439,11 +23432,9 @@ fn codex_parent_owed(shared: Option<&CodexStepMap>, parent: &str) -> bool {
 }
 
 /// U1a: chained digest over a child's ownership signatures.
-#[allow(dead_code)] // first production callers are the proof job and finish
 pub(in crate::snapshots) type PrefixDigest = [u8; 32];
 
 /// U1a: the chain's format tag (and its seed).
-#[allow(dead_code)] // first production callers are the proof job and finish
 const CODEX_PARENT_PROOF_FORMAT: &str = "codex_parent_prefix_proof:v1";
 
 /// The interpretation binding of every proof,
@@ -23565,7 +23556,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for ProofRefusal {
 /// U1a: a persisted parent-prefix proof for one fork child (local index
 /// key). Only divergence outcomes are stored. Never authoritative alone:
 /// installed only when `installable`, and fenced at every use.
-#[allow(dead_code)] // first production callers are the proof job and finish
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::snapshots) struct CodexParentPrefixProof {
     /// Resolved parent session id (the child's `forked_from_id`).
@@ -23585,7 +23575,6 @@ pub(in crate::snapshots) struct CodexParentPrefixProof {
 }
 crate::heap_layout_bound::fields!(CodexParentPrefixProof; parent, parent_seal, matched, child_digest, owned, published);
 
-#[allow(dead_code)] // first production callers are the proof job and finish
 impl CodexParentPrefixProof {
     /// Install checks, no I/O: the mislabel guard, the seal's scope (a
     /// subset of `select_mode`'s refusals, to avoid a doomed parse; it never
@@ -23603,12 +23592,10 @@ impl CodexParentPrefixProof {
 }
 
 /// U1a: the stamp a wake compares with `OpenStamp::wake_compatible`.
-#[allow(dead_code)] // first production callers are the proof job and finish
 pub(in crate::snapshots) type WakeStamp = sampled_scan::codex_cursor::OpenStamp;
 
 /// U1a: the change that can cure the last outcome. Gated by
 /// `not_before_unix_seconds`, except `Due`.
-#[allow(dead_code)] // first production callers are the proof job and finish
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(in crate::snapshots) enum ProofWake {
@@ -23674,7 +23661,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ProofWake {
 
 /// U1a: the last finished attempt's outcome kind (counter index and
 /// backoff key), persisted as its `u8`; 0 = none.
-#[allow(dead_code)] // first production callers are the proof job and finish
+#[allow(dead_code, reason = "first callers: the proof job and finish")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(in crate::snapshots) enum ProofOutcome {
@@ -23704,7 +23691,7 @@ pub(in crate::snapshots) enum ProofOutcome {
     StepRefusedMemory,
     SideUnreadable,
 }
-#[allow(dead_code)] // first production callers are the proof job and finish
+#[allow(dead_code, reason = "first callers: the proof job and finish")]
 impl ProofOutcome {
     pub(in crate::snapshots) const LAST: u8 = Self::SideUnreadable as u8;
 }
@@ -23722,7 +23709,6 @@ pub(in crate::snapshots) enum OwedOrigin {
 crate::heap_layout_bound::no_heap!(true; OwedOrigin);
 
 /// U1a: proof work a held fork child (or a lineage parent) is owed.
-#[allow(dead_code)] // first production callers are the owe and finish
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::snapshots) struct CodexParentProofOwed {
     /// The resolved parent id the proof is against.
@@ -23750,7 +23736,6 @@ pub(in crate::snapshots) struct CodexParentProofOwed {
 }
 crate::heap_layout_bound::fields!(CodexParentProofOwed; parent, seq, cause, origin, wake, outcome, attempts, not_before_unix_seconds, kept);
 
-#[allow(dead_code)] // first production callers are the owe and finish
 impl CodexParentProofOwed {
     pub(in crate::snapshots) fn new(
         parent: String,
@@ -23900,7 +23885,6 @@ pub(in crate::snapshots) enum ProofSettle {
 }
 
 /// U1a-2a (row 2): what a finished proof job hands back for one child.
-#[allow(dead_code)] // first production caller is the proof finish (cc PROOF rows)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ProofFinish {
     Proven(CodexParentPrefixProof),
@@ -23910,7 +23894,6 @@ pub(in crate::snapshots) enum ProofFinish {
     },
 }
 
-#[allow(dead_code)] // first production callers are the record site and the proof finish
 impl ScanIndex {
     /// Owe `key`'s proof against `parent`. Idempotent: an `Owed` entry for
     /// the same parent keeps its wake, outcome, attempts, backoff, `kept`
@@ -24028,7 +24011,6 @@ impl ScanIndex {
     ///
     /// No byte of any transcript is read; the transient is ≤ 2 ×
     /// `CODEX_SIDE_SWEEP_KEYS` key clones.
-    #[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
     pub(in crate::snapshots) fn sweep_codex_parent_side(
         &mut self,
         census_valid: bool,
@@ -24982,7 +24964,6 @@ fn release_departed_join_owners(
 
 /// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
 /// one child use of P's side record at sealed offset `needed`.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum SideFence {
     /// P's same-object, settled record covers `needed` and its seal admits
@@ -25004,7 +24985,6 @@ pub(in crate::snapshots) enum SideFence {
 }
 
 /// U1a-2a fence: why P is a new object for its side state.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SideNewObject {
     /// Another (dev, ino); the old object's key, if a request named it.
@@ -25021,7 +25001,6 @@ struct SideNow {
     ctime: (i64, i64),
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
 impl SideRequest {
     /// The fence's created request: `Live`, extents and ctimes at P's
     /// current stamp.
@@ -25042,7 +25021,6 @@ impl SideRequest {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the record site (row 7)
 impl ScanIndex {
     /// U1a-2a (row 6, [ADM]): the side fence for one child use of P's record
     /// at sealed offset `needed`, on P's held `file` (unix-only), over the
@@ -25263,7 +25241,7 @@ impl ScanIndex {
     /// request restarts (`Live{attempts = 0}`) unless the current key's
     /// ledger entry is the request (no reset); a replace ends the old key's
     /// ledger generation. Counted as a re-arm.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn side_new_object(
         &mut self,
         p_key: &str,
@@ -25307,7 +25285,7 @@ impl ScanIndex {
     /// refusal's re-arm table (rev 18.2); otherwise the fence's create and
     /// growth cure (rev 16). `needed = max(needed, ..)` always. Every write
     /// goes to both stores.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn side_request_path(
         &mut self,
         p_key: &str,
@@ -25888,7 +25866,6 @@ pub(crate) fn scan_source_roots_with_test_limit(
 
 /// Bounded fixture driver with real watcher input, using the service selector.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_source_roots_with_test_limit_and_hints(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -25938,7 +25915,7 @@ pub(crate) fn scan_source_roots_with_test_limit_and_claude_support(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn scan_source_roots_with_limit_and_attribution(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -26174,7 +26151,7 @@ struct OwnedActiveFile {
     /// main write on its path is gated; it ends at the side exit.
     side_origin: Option<SideOrigin>,
 }
-#[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
+#[allow(clippy::large_enum_variant, reason = "one context moves between steps")]
 pub(crate) enum OwnedSourceScanStep {
     Pending(OwnedSourceScan),
     Complete {
@@ -26499,7 +26476,7 @@ impl OwnedSourceScan {
             .unwrap_or(0)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(crate) fn new(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -26528,7 +26505,7 @@ impl OwnedSourceScan {
     /// `claude_request_identity_capture`: this scan captures transcript
     /// markers and keeps the Desktop census witness (every Claude sync cycle;
     /// `claude_request_identity::captures`). Without it it does neither.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     pub(crate) fn new_with_identity_capture(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -26557,7 +26534,7 @@ impl OwnedSourceScan {
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -26587,7 +26564,6 @@ impl OwnedSourceScan {
     }
 
     /// Performs no selection, inventory read or traversal update.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
         roots: &[PathBuf],
         mut owned_index: ScanIndex,
@@ -26680,7 +26656,7 @@ impl OwnedSourceScan {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
     fn new_selecting(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -26897,6 +26873,18 @@ impl OwnedSourceScan {
         // starves it; always putting it first can starve the census instead.
         // Continuations never select new work. A hint alone does not trigger
         // a read: all selected paths still pass the unchanged candidate gate.
+        // The turn a freshness page owes alternates census (C) and ordinary
+        // (O) work while queued work neither of those selects waits: F C F O;
+        // with no such work it stays F C F C. Fresh keeps its cadence. An
+        // ordinary turn is dedicated too: due audits, then queued non-member,
+        // non-fresh paths (archives, plain re-reads). Order only.
+        let ordinary_turn = source == SnapshotSource::Codex
+            && selection_limit > 0
+            && traversal.codex_freshness_yield
+            && codex_census_turn_was_last(&traversal.scan_roots)
+            && traversal.pending_candidates.iter().any(|candidate| {
+                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+            });
         let freshness_page = source == SnapshotSource::Codex
             && selection_limit > 0
             && !traversal.codex_freshness_yield
@@ -26907,6 +26895,7 @@ impl OwnedSourceScan {
             && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
         let census_page = source == SnapshotSource::Codex
             && selection_limit > 0
+            && !ordinary_turn
             && traversal.codex_freshness_yield
             && traversal
                 .pending_candidates
@@ -26914,13 +26903,33 @@ impl OwnedSourceScan {
                 .any(|candidate| candidate.census_member);
         if source == SnapshotSource::Codex && selection_limit > 0 {
             traversal.codex_freshness_yield = freshness_page;
+            if !freshness_page {
+                note_codex_census_turn(&traversal.scan_roots, census_page);
+            }
         }
-        if freshness_page || census_page {
+        if freshness_page || census_page || ordinary_turn {
             let limit = if freshness_page {
                 selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             } else {
                 selection_limit
             };
+            let ordinary_only = |candidate: &ScanTraversalPath| {
+                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+            };
+            if ordinary_turn {
+                traversal.pending_candidates.retain(|candidate| {
+                    let due = pending_paths.len() < limit
+                        && index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .is_some_and(|entry| entry.audit_requires_full(audit_now))
+                        && ordinary_only(candidate);
+                    if due {
+                        pending_paths.push(candidate.clone());
+                    }
+                    !due
+                });
+            }
             // Rotate the original queue once without allocating another
             // backlog-sized container. Keep unselected paths in FIFO order.
             for _ in 0..traversal.pending_candidates.len() {
@@ -26930,9 +26939,11 @@ impl OwnedSourceScan {
                 let eligible = pending_paths.len() < limit
                     && if freshness_page {
                         codex_fresh_data_pending(&candidate, &index.files)
-                    } else {
+                    } else if census_page {
                         candidate.census_member
                             && !codex_fresh_data_pending(&candidate, &index.files)
+                    } else {
+                        ordinary_only(&candidate)
                     };
                 if eligible {
                     pending_paths.push(candidate);
@@ -26958,7 +26969,7 @@ impl OwnedSourceScan {
         // Dedicated turns select only their own work, plus any retry riders:
         // new hinted members, audits or old groups cannot consume the other
         // turn's allowance.
-        let selection_limit = if freshness_page || census_page {
+        let selection_limit = if freshness_page || census_page || ordinary_turn {
             pending_paths.len()
         } else {
             selection_limit
@@ -35048,7 +35059,10 @@ struct ParsedSnapshotFile {
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test seam preserves file identity, window and parser inputs"
+)]
 fn parse_jsonl_file(
     path: &Path,
     collected_at: &str,
@@ -35234,7 +35248,6 @@ impl OwnedJsonlParser {
             .as_mut()
             .is_some_and(|pending| std::mem::take(&mut pending.stored_read))
     }
-    #[allow(clippy::too_many_arguments)]
     fn new(
         file: File,
         path: &Path,
@@ -35262,7 +35275,6 @@ impl OwnedJsonlParser {
     /// Every input kind reaches the same line parser through one opened
     /// object. Its File was opened and identified by the caller; a compressed
     /// input arrives with its decoder credit already paid.
-    #[allow(clippy::too_many_arguments)]
     fn new_opened(
         reader: OpenedInput,
         path: &Path,
@@ -35462,7 +35474,7 @@ impl OwnedJsonlParser {
         };
         drive(&mut self.reader, &mut sink)
     }
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn finish(
         self,
         expected_opened_object_identity: &str,
@@ -35500,7 +35512,7 @@ impl OwnedJsonlParser {
     /// `finish`, with the repository identity the M-a release proof measured
     /// (#665, X_out family U3). `Some` is used as-is, so the finished item never
     /// re-resolves (IO) a value the proof did not measure.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     fn finish_with_repository_identity(
         self,
         expected_opened_object_identity: &str,
@@ -35965,7 +35977,10 @@ fn claude_birth_seconds(created_unix_seconds: u64) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test seam preserves opened-file identity and parser inputs"
+)]
 fn parse_opened_jsonl_file(
     file: File,
     expected_opened_object_identity: &str,
@@ -39831,7 +39846,7 @@ impl PiLedger {
     }
 
     /// The pure constructor S2c's Pi Tail decode refills the ledger with.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "the S2c Pi Tail decode is its first caller")]
     pub(crate) fn from_parts(
         usage_keys: BTreeMap<String, PiUsageDedupState>,
         has_parent: bool,
@@ -43769,6 +43784,31 @@ fn codex_selection_may_exhaust_page(
     false
 }
 
+/// Codex scan-root sets whose last non-fresh selecting page was a census turn.
+/// Scheduling only and RAM only: the index is reloaded every page, and a
+/// restart costs at most one rotation. One entry per configured root set.
+static CODEX_CENSUS_TURN_LAST: Mutex<BTreeSet<Vec<PathBuf>>> = Mutex::new(BTreeSet::new());
+
+fn codex_census_turns() -> std::sync::MutexGuard<'static, BTreeSet<Vec<PathBuf>>> {
+    CODEX_CENSUS_TURN_LAST.lock().unwrap_or_else(|poisoned| {
+        CODEX_CENSUS_TURN_LAST.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn codex_census_turn_was_last(roots: &[PathBuf]) -> bool {
+    codex_census_turns().contains(roots)
+}
+
+fn note_codex_census_turn(roots: &[PathBuf], census: bool) {
+    let mut turns = codex_census_turns();
+    if !census {
+        turns.remove(roots);
+    } else if !turns.contains(roots) {
+        turns.insert(roots.to_vec());
+    }
+}
+
 /// Priority only, never read admission. Byte length is content-relevant;
 /// ctime, inode, permissions and mtime alone cannot promote an unchanged file.
 /// New paths need a watcher/roster hint so a cold history walk stays FIFO.
@@ -43839,28 +43879,8 @@ fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool
         return false;
     }
     paced.retain(|_, at| fresh(at));
-    traversal.counts.listing_owed_pace_evicted +=
-        trim_listing_owed_paces(paced, MAX_LISTING_OWED_PACES - 1);
     paced.insert(key.to_owned(), now);
     true
-}
-
-/// Drops the oldest pacing stamps until at most `bound` remain, so a bound
-/// can only bring a re-queue forward. Returns how many were dropped.
-fn trim_listing_owed_paces(paces: &mut BTreeMap<String, u64>, bound: usize) -> u64 {
-    let excess = paces.len().saturating_sub(bound);
-    if excess == 0 {
-        return 0;
-    }
-    let mut by_age = paces
-        .iter()
-        .map(|(key, at)| (*at, key.clone()))
-        .collect::<Vec<_>>();
-    by_age.sort_unstable();
-    for (_, key) in by_age.into_iter().take(excess) {
-        paces.remove(&key);
-    }
-    excess as u64
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -43916,7 +43936,7 @@ fn enqueue_watcher_hints(
         .iter()
         .filter(|p| !codex_archive_path(p))
         .chain(hinted_paths.iter().filter(|p| codex_archive_path(p)));
-    for path in ordered.take(MAX_BACKFILL_FILES_PER_SOURCE) {
+    for path in ordered {
         if !transcript_path_admitted(source, path)
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
@@ -44207,7 +44227,6 @@ fn requeue_unindexed_observed(source: SnapshotSource, index: &mut ScanIndex) {
                 && fs::symlink_metadata(key)
                     .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         })
-        .take(MAX_BACKFILL_FILES_PER_SOURCE)
         .cloned()
         .collect::<Vec<_>>();
     let traversal = index.traversal.as_mut().expect("traversal checked above");
@@ -44250,26 +44269,6 @@ fn record_codex_inventory_hold(
             .map(|(key, witness)| (key.clone(), witness.clone())),
     );
     hold.outside_roster.extend(outside_roster);
-    if hold.owed.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-        || hold.refused_headers.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-        || hold.outside_roster.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-    {
-        // Count distinct discarded keys across the three overlapping sets.
-        let keys = hold.owed.len()
-            + hold
-                .refused_headers
-                .keys()
-                .filter(|key| !hold.owed.contains(*key))
-                .count()
-            + hold
-                .outside_roster
-                .keys()
-                .filter(|key| !hold.owed.contains(*key) && !hold.refused_headers.contains_key(*key))
-                .count();
-        CapCounts::record("codex", 5, keys as u64);
-        // Past the bound only the next walk re-selects them, as before.
-        traversal.residue.codex_inventory_hold = None;
-    }
 }
 
 /// Queue the candidates of a `CodexInventoryHold` again once its evidence
@@ -44460,7 +44459,6 @@ fn advance_bounded_directory_traversal_with_budget(
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
-            saved.listing_owed_pace_evicted = counts.listing_owed_pace_evicted;
             saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
         }
@@ -54386,24 +54384,20 @@ where
 }
 
 /// U1a: the proof chain's seed, `d_0`.
-#[allow(dead_code)] // first production callers are the proof job and finish
 fn codex_parent_prefix_seed() -> PrefixDigest {
     Sha256::digest(CODEX_PARENT_PROOF_FORMAT.as_bytes()).into()
 }
 /// U1a: `d_{k+1} = sha256(d_k || len(s_k) || s_k)`.
-#[allow(dead_code)] // first production callers are the proof job and finish
 fn codex_parent_prefix_chain(previous: &PrefixDigest, signature: &str) -> PrefixDigest {
     let mut digest = Sha256::new();
     digest.update(previous);
     update_length_prefixed(&mut digest, signature.as_bytes());
     digest.finalize().into()
 }
-#[allow(dead_code)] // first production callers are the proof job and finish
 fn codex_digest_hex(digest: &PrefixDigest) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 /// U1a: lower-case 64-hex only.
-#[allow(dead_code)] // first production callers are the proof map decode
 fn codex_digest_from_hex(hex: &str) -> Option<PrefixDigest> {
     if hex.len() != 64
         || !hex
@@ -82572,7 +82566,7 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_fi
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

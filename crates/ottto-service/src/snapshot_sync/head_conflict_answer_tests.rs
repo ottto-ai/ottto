@@ -378,9 +378,14 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     );
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
     assert!(progress.head_conflict_challenges.is_empty());
-    assert!(
-        crate::snapshot_client::ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow().is_empty())
-    );
+    let refusals = || {
+        crate::snapshot_client::BODY_WITNESS_REFUSALS
+            .with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    };
+    let unanswered = refusals();
+    assert_eq!(unanswered.len(), 1);
+    assert!(unanswered[0].contains("reason=digest_mismatch class=accepted "));
+    assert!(unanswered[0].ends_with(" bad_refs=1 answered=false"));
 
     // That predecessor is now stale on the server: conflict with challenge.
     let (result, _) = cycle(&mut progress, &item, 1_001, |item| {
@@ -396,12 +401,8 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     );
 
     // Residual risk: the answered upload's ACK echoes another witness. The
-    // cycle does not settle, and one content-free warning names the session
-    // hash and versions. An unanswered rejection (above) warns nothing.
-    let warnings = || {
-        crate::snapshot_client::ANSWERED_WITNESS_WARNINGS
-            .with(|lines| std::mem::take(&mut *lines.borrow_mut()))
-    };
+    // cycle does not settle, and one content-free line names the failed
+    // check, session hash, fingerprint prefix and versions.
     let version = crate::snapshot_client::snapshot_ack_body_witness_version(&item)
         .unwrap()
         .unwrap();
@@ -412,12 +413,13 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     });
     assert!(result.is_err());
     assert_eq!(
-        warnings(),
+        refusals(),
         [format!(
-            "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
-             witness_version={version} echoed_witness_version={version} \
-             reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
-            &key[..8]
+            "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
+             class=accepted session_hash={} fingerprint={} witness_version={version} \
+             echoed_witness_version={version} bad_refs=1 answered=true",
+            &key[..8],
+            &item.snapshot_fingerprint[..8]
         )]
     );
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());

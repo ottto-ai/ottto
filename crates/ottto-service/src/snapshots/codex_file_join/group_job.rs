@@ -23,7 +23,6 @@ const PROBE_BYTES: usize = 1024 * 1024;
 /// (#603 `configure_group_once`). Only the reader is swapped per member, so
 /// no member reconfigures it. The legacy tee (`legacy_tee`) stays
 /// unconfigured: it is baseline evidence, not a second counted stream.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn new_group_parser(
     file: File,
     member: &CandidateFile,
@@ -739,7 +738,6 @@ fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, Gro
 /// A member that was indexed as its own file before it joined keeps its
 /// legacy pricing baseline: the same records, applied to a second parser in
 /// the same pass (no extra read), finished like the pre-P2 proof parser.
-#[allow(clippy::too_many_arguments)]
 fn legacy_tee(
     legacy_expected: &BTreeMap<String, String>,
     member: &CandidateFile,
