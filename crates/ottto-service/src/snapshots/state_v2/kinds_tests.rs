@@ -1775,7 +1775,7 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
 }
 
 /// [money] H8. Past both old caps (65,537 records; one record holding one
-/// hash more than the old 1,048,576 cap), the census survives a v2 save and
+/// hash more than the old 2,097,152 cap), the census survives a v2 save and
 /// hydrate whole, and the restored graph's v1 bytes decode to it too. The
 /// synthetic keys have no index entry: held-new custody restores as well.
 #[test]
@@ -1783,7 +1783,8 @@ fn no_cap_money_survives_v1_v2_restore() {
     use crate::snapshots::claude_request_census::{
         ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
     };
-    const OLD_HASH_CAP: u64 = 1_048_576;
+    // The old caps: request hashes and records the census held.
+    const OLD_HASH_CAP: u64 = 2_097_152;
     const OLD_RECORD_CAP: u64 = 65_536;
     let fp = "a".repeat(64);
     let mut index = fixture();

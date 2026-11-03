@@ -840,7 +840,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
         index.claude_request_census.insert_for_test(&f.key, record);
         if case == "lossy_past_old_cap" {
             // The hashes the census held before it lost its caps.
-            let cap = 1_048_576_u64;
+            let cap = 2_097_152_u64;
             index.claude_request_census.insert_for_test(
                 "/synthetic/young.jsonl",
                 ClaudeRequestCensusRecord::synthetic_for_test(

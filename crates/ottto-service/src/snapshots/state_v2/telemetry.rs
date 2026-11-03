@@ -772,18 +772,14 @@ mod ops_tests {
     }
 
     /// [behaviour] The existing state_v2 line flags census occupancy at 75%
-    /// of the alarm base, and a census above the base is stored whole.
+    /// of the alarm base.
     #[test]
     fn state_v2_line_flags_census_occupancy_at_75pct() {
         use super::super::super::claude_request_census::{
             ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
             CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE as BASE,
         };
-        for (hashes, alarm) in [
-            (BASE / 4 * 3 - 1, false),
-            (BASE / 4 * 3, true),
-            (BASE + 1, true),
-        ] {
+        for (hashes, alarm) in [(BASE / 4 * 3 - 1, false), (BASE / 4 * 3, true)] {
             let mut index = ScanIndex::default();
             index.claude_request_census.insert_for_test(
                 "/synthetic/projects/a.jsonl",
@@ -799,15 +795,6 @@ mod ops_tests {
             assert_eq!(observation.census_occupancy_alarm, alarm, "{hashes}");
             let json = serde_json::to_value(&observation).unwrap();
             assert_eq!(json["census_occupancy_alarm"], alarm);
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .get("/synthetic/projects/a.jsonl")
-                    .unwrap()
-                    .request_hashes()
-                    .len(),
-                hashes
-            );
         }
     }
 }

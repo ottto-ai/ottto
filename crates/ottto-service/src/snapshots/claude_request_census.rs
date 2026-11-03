@@ -2121,8 +2121,6 @@ impl ClaudeRequestCensusJoin {
                 hashes: census.hash_total,
                 hash_budget_usage_percent: census.hash_total.saturating_mul(100)
                     / CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE,
-                hash_budget_warning: census.hash_total.saturating_mul(100)
-                    >= CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE * 80,
                 ..ClaudeRequestCensusShadowCounts::default()
             },
             coverage: BTreeMap::new(),
@@ -2394,8 +2392,8 @@ impl ClaudeRequestCensusJoin {
     /// `claude_census_disjointness_complete`: on a terminal page with
     /// `census_complete`, (1) every indexed Claude family-member key that is
     /// not confirmed empty has a covering record (by fingerprint or this
-    /// window; never excused by a quarantine), (2) the hash total fits the
-    /// budget and (3) the duplicate owners fit the owner bound. It states only
+    /// window; never excused by a quarantine), and (2) the duplicate owners
+    /// fit the owner bound. It states only
     /// that every visible request id was compared with every other key's ids,
     /// never that any member is unique or owned.
     pub(crate) fn disjointness_complete(&self, census_complete: bool) -> bool {
@@ -2403,7 +2401,6 @@ impl ClaudeRequestCensusJoin {
         census_complete
             && !counts.transient_limited
             && counts.covered_by_fingerprint + counts.covered_by_window == counts.family_keys
-            && counts.hashes <= CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
     }
 

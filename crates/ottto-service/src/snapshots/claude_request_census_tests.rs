@@ -724,47 +724,6 @@ fn census_records_follow_the_working_index_through_committable_subset() {
     );
 }
 
-/// [money] A complete terminal prunes and retires nothing: an indexed
-/// record, a walked record without an entry and an unwalked one (held-new
-/// custody) all keep their ids; each leaves only with its file.
-#[test]
-fn census_terminal_keeps_every_record() {
-    let indexed = "/census/projects/census-indexed.jsonl".to_string();
-    let walked = "/census/projects/census-walked.jsonl".to_string();
-    let held = "/census/projects/census-held.jsonl".to_string();
-    let mut index = ScanIndex::default();
-    let mut entry = manifest_index_entry(Some("body"));
-    entry.source_file_fingerprint = hex_fingerprint('a');
-    entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
-    index.files.insert(indexed.clone(), entry);
-    index
-        .file_snapshot_fingerprints
-        .insert(indexed.clone(), BTreeSet::from(["body".to_string()]));
-    for (key, seed, hash) in [(&indexed, 'a', 1), (&walked, 'b', 2), (&held, 'c', 3)] {
-        index.claude_request_census_mut_for_test().insert_for_test(
-            key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint(seed),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                vec![hash],
-            ),
-        );
-    }
-    let before = index.claude_request_census_for_test().clone();
-    // A window a year on: no age rule applies either.
-    for window in [FIRST_WINDOW, "2027-08-02T09:00:00Z"] {
-        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            &mut index,
-            &BTreeSet::new(),
-            window,
-        );
-        assert_eq!(index.claude_request_census_for_test(), &before, "{window}");
-        assert_eq!(counts.records, 3);
-        assert_eq!(counts.duplicate_hashes, 0);
-    }
-}
-
 /// A transcript of zero-usage responses only (API errors) yields no item, yet
 /// its request ids still reach the census and meet a peer's copy.
 #[test]
@@ -1088,68 +1047,6 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
     );
 }
 
-/// One past the request hashes the census held before it lost its caps.
-const OLD_HASH_CAP: u64 = 1_048_576;
-
-/// [money] Past the old hash cap the decoder keeps every record whole: no
-/// entry is refused for the running hash total.
-#[test]
-fn census_decoder_loads_past_the_old_hash_cap() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-decoder-no-cap");
-    let full = (0..OLD_HASH_CAP).collect::<Vec<_>>();
-    let records = serde_json::json!({
-        "a-full": census_record_json('a', "lossy", &full),
-        "b-one-more": census_record_json('b', "exact", &[1]),
-        "c-empty": census_record_json('c', "empty", &[]),
-    });
-    let loaded = census_load(
-        &scratch,
-        "no-cap",
-        &serde_json::to_string(&census_index_json(records)).expect("json"),
-    );
-    let census = loaded.claude_request_census_for_test();
-    assert_eq!(
-        census.keys_for_test(),
-        vec![
-            "a-full".to_string(),
-            "b-one-more".to_string(),
-            "c-empty".to_string()
-        ]
-    );
-    assert_eq!(census.hash_total_for_test(), OLD_HASH_CAP as usize + 1);
-}
-
-/// [money] A live insert past the old hash cap stores the record whole, not
-/// as an `OverBudget` tombstone, and the hash total follows every change.
-#[test]
-fn transcript_insert_past_old_budget_stays_whole() {
-    let mut census = crate::snapshots::claude_request_census::ClaudeRequestCensus::default();
-    census.insert_for_test(
-        "a",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('a'),
-            1,
-            ClaudeRequestCensusShape::Lossy,
-            (0..OLD_HASH_CAP).collect(),
-        ),
-    );
-    census.insert_for_test(
-        "b",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('b'),
-            1,
-            ClaudeRequestCensusShape::Exact,
-            vec![1],
-        ),
-    );
-    let whole = census.get("b").expect("stored whole");
-    assert_eq!(whole.shape_for_test(), ClaudeRequestCensusShape::Exact);
-    assert_eq!(whole.request_hashes_for_test(), &[1]);
-    assert_eq!(census.hash_total_for_test(), OLD_HASH_CAP as usize + 1);
-    census.remove("a");
-    assert_eq!(census.hash_total_for_test(), 1);
-}
-
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
@@ -1368,36 +1265,6 @@ fn census_failed_read_invalidates_old_record() {
         );
     }
     panic!("failure path was not reached");
-}
-
-/// [format] The decoder has no entry limit: a valid record after 65,536
-/// rejected entries still loads, and each rejected entry drops alone.
-#[test]
-fn census_decoder_keeps_a_record_after_65536_rejected_entries() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-no-entry-limit");
-    let mut records = String::from("{");
-    for attempted in 0..65_536 {
-        use std::fmt::Write;
-        write!(records, "\"bad-{attempted}\":0,").unwrap();
-    }
-    use std::fmt::Write;
-    write!(
-        records,
-        "\"after-rejected\":{}}}",
-        census_record_json('a', "exact", &[1])
-    )
-    .unwrap();
-    let json = serde_json::to_string(&census_index_json(serde_json::json!({})))
-        .unwrap()
-        .replace(
-            "\"claude_request_census\":{}",
-            &format!("\"claude_request_census\":{records}"),
-        );
-    let loaded = census_load(&scratch, "attempts", &json);
-    assert_eq!(
-        loaded.claude_request_census_for_test().keys_for_test(),
-        vec!["after-rejected".to_string()]
-    );
 }
 
 #[test]

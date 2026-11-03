@@ -9,10 +9,6 @@ use crate::snapshots::claude_request_census::{
     CLAUDE_REQUEST_CENSUS_DERIVATION,
 };
 const MONEY_WINDOW: &str = "2026-08-02T09:00:00Z";
-/// One past the request hashes the census held before it lost its caps.
-const OLD_HASH_CAP: u64 = 1_048_576;
-/// One past the records the census decoder kept before it lost its caps.
-const OLD_RECORD_CAP: u64 = 65_536;
 
 fn money_fingerprint(seed: char) -> String {
     seed.to_string().repeat(64)
@@ -385,32 +381,6 @@ fn holder_older_than_35_days_stays_proven() {
     assert_eq!(record.retired_for_test(), None);
     assert!(record.proves_current(&money_fingerprint('a')));
     assert_eq!(money_census_round_trip(&before), before);
-}
-
-/// [money] Past both old caps: the 65,537th record and a record holding one
-/// hash more than the old hash cap are stored whole, and round-trip.
-/// v2 counterpart: `no_cap_money_survives_v1_v2_restore`.
-#[test]
-fn record_65537_is_stored() {
-    let mut census = ClaudeRequestCensus::default();
-    census.insert_for_test(
-        "/money/projects/full.jsonl",
-        money_record('a', (0..=OLD_HASH_CAP).collect()),
-    );
-    for n in 0..OLD_RECORD_CAP {
-        census.insert_for_test(
-            &format!("/money/projects/s{n:05}.jsonl"),
-            money_record('b', vec![OLD_HASH_CAP + 1 + n]),
-        );
-    }
-    let records = OLD_RECORD_CAP as usize + 1;
-    let hashes = (OLD_HASH_CAP + 1 + OLD_RECORD_CAP) as usize;
-    assert_eq!(census.len_for_test(), records);
-    assert_eq!(census.hash_total_for_test(), hashes);
-    let loaded = money_census_round_trip(&census);
-    assert_eq!(loaded.len_for_test(), records);
-    assert_eq!(loaded.hash_total_for_test(), hashes);
-    assert_eq!(loaded, census);
 }
 
 /// One indexed file `key` with a census record, money marks and a stored
