@@ -13,14 +13,14 @@ use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDige
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
 /// type inside `$arm`; every other source takes `$none`. A source joins by
-/// adding its arm here, never through its `state_v2` registry flag (Codex has
-/// that flag before its codec exists).
+/// adding its arm here, never through its `state_v2` registry flag.
 macro_rules! with_codec {
     ($source:expr, $s:ident => $arm:expr, _ => $none:expr) => {
         match $source {
@@ -125,10 +125,6 @@ pub(in crate::snapshots) fn pending(
 
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Claude's live inputs join at finish; the next codec constructs these"
-)]
 pub(in crate::snapshots) enum LiveLoadError {
     /// The live input is not available now: the file holds with its debt.
     Unavailable,
