@@ -209,3 +209,67 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
         serde_json::to_vec(&opened).unwrap()
     );
 }
+
+/// [regress] 0.1.213: every refused archive pass rewrote every archive row (a
+/// header attempt spent at reservation, then refunded), so each save was over
+/// target and halved the scan page limit (`saved_page`). Through the production
+/// refusal path, only the first refusal records each archive's cause; a repeat
+/// refused pass writes the rows an unchanged save writes, so the limit is kept.
+#[test]
+fn a_repeat_refused_archive_pass_dirties_no_row_and_keeps_the_page_limit() {
+    use crate::local_resource_diagnostics::CodexZstCause;
+    use crate::snapshots::codex_compressed_input::{ArchiveReservation, ArchiveTransition};
+    // What a pass does to each archive whose funded header read is refused.
+    let refused_pass = |index: &mut ScanIndex| {
+        for a in index.archives.values_mut() {
+            let w = a.work.get_or_insert_with(Box::default);
+            w.reservation = ArchiveReservation::HeaderReady;
+            w.cancel_unopened_header();
+            a.transition(ArchiveTransition::Transient(
+                CodexZstCause::AdmissionRefused,
+            ));
+        }
+        index.disclose_archive_debt();
+    };
+    let mut index = ScanIndex::default();
+    // One row over the limiter's 5,000-row target.
+    for n in 0..5_001 {
+        index.archives.insert(
+            format!("/synthetic/archived/{n}.jsonl.zst"),
+            ArchiveEvidence::unknown(),
+        );
+    }
+    let (scratch, mut db) = codex_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let mut cx = KindCx {
+        binding: Some(codex_binding()),
+        ..Default::default()
+    };
+    populate(&index, &mut tx, &mut cx).unwrap();
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    // An import store does not count dirty rows: measure a finished one.
+    let identity: Identity = db.read_control("identity").unwrap().unwrap();
+    db.finish_import().unwrap();
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    db.path_extractor(private_paths);
+    let save = |db: &mut sqlite::Sqlite, pass: &dyn Fn(&mut ScanIndex)| {
+        let (mut next, mut cx) = hydrate(db, codex_binding()).unwrap();
+        let previous = next.clone();
+        pass(&mut next);
+        let before = db.save_row_attempts();
+        save_graph(db, &identity, &previous, &mut next, &mut cx).unwrap();
+        let after = db.save_row_attempts();
+        (after.0 - before.0, after.1 - before.1)
+    };
+    // Control: the first refusal changes every row once, over target.
+    save(&mut db, &refused_pass);
+    assert!(
+        db.save_over_target(),
+        "the first refusal records each cause"
+    );
+    let unchanged = save(&mut db, &|_: &mut ScanIndex| {});
+    assert!(!db.save_over_target());
+    assert_eq!(save(&mut db, &refused_pass), unchanged, "no archive row");
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+}

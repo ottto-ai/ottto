@@ -154,6 +154,8 @@ pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidat
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]
 mod upload_context_receipt_tests;
+#[cfg(test)]
+mod upload_policy_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -255,6 +257,8 @@ mod claude_response_compaction_tests;
 mod claude_response_records;
 #[cfg(test)]
 mod claude_thinking_tokens_tests;
+#[cfg(test)]
+mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
@@ -1039,10 +1043,23 @@ const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
 /// usage accepted before the release keeps exactly the row it had.
 const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_794_182_400;
 
-fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+/// 2026-11-04T00:00:00Z, a 00:00Z expected on/after install of the release
+/// that carries the Legacy repeat gate. Legacy drops an equal-total repeat
+/// only when the repeated line itself is dated from here, so its row is a
+/// function of its file's bytes on every read route and history before this
+/// keeps exactly the rows it had. Correcting older repeats is an operator
+/// decision.
+const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+
+/// `false` for a missing or unparsable timestamp.
+fn dated_on_or_after(timestamp: Option<&str>, from_unix_seconds: u64) -> bool {
     timestamp
         .and_then(rfc3339_unix_seconds)
-        .is_some_and(|seconds| seconds >= CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
+        .is_some_and(|seconds| seconds >= from_unix_seconds)
+}
+
+fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+    dated_on_or_after(timestamp, CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
 }
 
 /// One request's bucket from its prompt size, its model and its own usage
@@ -1500,6 +1517,8 @@ fn with_test_line_cap<T>(cap: usize, run: impl FnOnce() -> T) -> T {
 // content-free ordered turn/usage proof required by a referenced parent, and
 // fail closed when either bound is exceeded.
 const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
+/// Past this a Codex file's cache observations are incomplete; usage is unaffected.
+const MAX_CODEX_CACHE_REQUESTS_PER_FILE: usize = 65_536;
 const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1790,11 +1809,7 @@ pub struct SnapshotActivityCount {
 /// One privacy-safe transcript-observed tool-name aggregate. Only the bounded
 /// name and count cross the wire; tool ids, arguments, results, and paths stay
 /// local to the parser.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotToolUsage {
-    pub name: String,
-    pub count: u64,
-}
+pub type SnapshotToolUsage = SnapshotActivityCount;
 
 /// One privacy-safe agent capability count. The identifiers are collector-owned
 /// constants; raw tool arguments, results, URLs, browser ids, and screenshots
@@ -3413,7 +3428,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// to an index that no longer exists. Removal needs the state-directory
 /// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)] // Cycle-owned privacy permission travels with the existing pass inputs.
+#[allow(clippy::too_many_arguments)] // Keep the cycle policy input at the local/upload boundary.
 pub(crate) fn begin_durable_pass(
     cache: &sampled_scan::SharedCache,
     support_dir: &Path,
@@ -3422,10 +3437,12 @@ pub(crate) fn begin_durable_pass(
     index_fresh: bool,
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
-    skill_labels_enabled: bool,
+    _skill_labels_enabled: bool,
 ) {
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
-    cache.durable_skill_label_permission(source, skill_labels_enabled);
+    // Privacy settings govern uploads. Local custody always retains the native
+    // labels, including restore and post-save erasure decisions.
+    cache.durable_skill_label_permission(source, true);
     if index_fresh {
         if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
             let _ = cache.durable_remove(writer, source);
@@ -8536,7 +8553,7 @@ struct PendingIndexFinalization {
     restored_behind_accepted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
@@ -8573,65 +8590,7 @@ impl Default for SnapshotUploadPolicy {
     }
 }
 
-pub fn apply_upload_policy(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-) {
-    for item in snapshots {
-        let mut fingerprint_needs_refresh = false;
-        if !policy.session_titles_enabled
-            && (item.session_display_name.is_some() || item.session_display_name_source.is_some())
-        {
-            item.session_display_name = None;
-            item.session_display_name_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.workspace_labels_enabled
-            && (item.workspace_display_label.is_some()
-                || item.workspace_label_source.is_some()
-                || item.repository_label.is_some()
-                || item.repository_label_source.is_some())
-        {
-            item.workspace_display_label = None;
-            item.workspace_label_source = None;
-            item.repository_label = None;
-            item.repository_label_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
-            item.session_artifacts.clear();
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
-            item.attribution_facts.clear();
-            fingerprint_needs_refresh = true;
-        } else if (!policy.session_titles_enabled || !policy.session_attribution_labels_enabled)
-            && crate::session_attribution::strip_display_labels(&mut item.attribution_facts)
-        {
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_labels_enabled {
-            if let Some(summary) = item.activity_summary.as_mut() {
-                if !summary.skills.is_empty() {
-                    summary.skills.clear();
-                    fingerprint_needs_refresh = true;
-                }
-            }
-        }
-        if let Some(start) = item.session_start.as_mut() {
-            // Outside the fingerprint: consent changes only which identity an
-            // opening file carries, never the session's content.
-            start.apply_upload_policy(
-                policy.workspace_labels_enabled,
-                policy.session_attribution_enabled,
-            );
-        }
-        if fingerprint_needs_refresh {
-            item.snapshot_fingerprint = snapshot_fingerprint(source, item);
-        }
-    }
-}
+pub use crate::upload_policy::apply_upload_policy;
 
 #[cfg(test)]
 pub(crate) fn snapshot_item_wire_size(
@@ -16537,12 +16496,10 @@ struct ClaudeResponseRecord {
     tool_uses: BTreeMap<String, String>,
 }
 
-// Response-local buffering exists only to repair provider-time ordering. Bound
-// both its pathological single-key amplification and its aggregate per-file
-// heap. Normal local evidence is far below these ceilings (the 91-file Fable
-// canary's affected root has 9,768 usage-bearing physical records total).
-const MAX_CLAUDE_RECORDS_PER_RESPONSE: usize = 4_096;
-const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
+// Response-local buffering repairs provider-time ordering, so it grows with the
+// file's usage-bearing lines and never refuses one. Above this size the
+// finalizer only counts a hit: it gates nothing.
+const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
 
 /// One Claude provider response assembled from its content-block transcript
 /// records. Usage is withheld from the session projection until this response
@@ -16552,6 +16509,9 @@ struct ClaudeResponseObservation {
     sequence: u64,
     preceding_user_timestamp: Option<String>,
     records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    /// Never set any more. A book saved while the record caps existed may
+    /// carry it: that book lost records, so it stays retryable until a cold
+    /// read, which now keeps them all.
     record_limit_exceeded: bool,
     desktop_request: bool,
 }
@@ -16596,9 +16556,8 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
 /// Why a retained Claude response has no resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeResolveFailure {
-    /// The per-file record cap dropped some of its records.
-    Capped,
-    /// A compact record no longer decodes against the file's selector table.
+    /// A compact record no longer decodes against the file's selector table,
+    /// or a restored book already lost records.
     Decode,
     /// Incompatible observations: the native resolver's conflict.
     Conflict,
@@ -16653,18 +16612,10 @@ impl ClaudeResponseObservation {
         computed_effective_input_context: Option<u64>,
         tool_uses: BTreeMap<String, String>,
         cache_slot: RequestSlot,
-    ) -> bool {
-        if self.records.len() >= MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            self.record_limit_exceeded = true;
-            return false;
-        }
-        let Ok(physical_sequence) = u16::try_from(self.records.len()) else {
-            self.record_limit_exceeded = true;
-            return false;
-        };
+    ) {
         let record = CompactClaudeResponseRecord::encode(
             self.records.first(),
-            physical_sequence,
+            self.records.len(),
             usage,
             model,
             selector.into(),
@@ -16676,14 +16627,6 @@ impl ClaudeResponseObservation {
             cache_slot,
         );
         self.records.push(record);
-        true
-    }
-
-    /// Test shim for an observation built without a file's selector table:
-    /// its selectors are inline, so the empty table decodes them exactly.
-    #[cfg(test)]
-    fn resolve(self) -> Option<ResolvedClaudeResponse> {
-        self.resolve_with(&ClaudeSelectorTable::default())
     }
 
     #[cfg(test)]
@@ -16698,7 +16641,7 @@ impl ClaudeResponseObservation {
         selectors: &ClaudeSelectorTable,
     ) -> Result<ResolvedClaudeResponse, ClaudeResolveFailure> {
         if self.record_limit_exceeded {
-            return Err(ClaudeResolveFailure::Capped);
+            return Err(ClaudeResolveFailure::Decode);
         }
         let mut records =
             claude_response_records::decode_records(self.records.into_vec(), selectors)
@@ -18404,8 +18347,8 @@ struct SnapshotAccumulator {
     // schedule, and explicit slash-skill facts. The source text is never copied
     // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
     first_prompt_material: Option<String>,
-    // In-memory only: provider-native skill names. HMACed before facts are
-    // produced; an allowlisted short name may also become a private display
+    // Private local state: provider-native skill names. HMACed before facts
+    // are produced; an allowlisted short name may also become a private display
     // label, which upload policy strips unless title consent is active.
     provider_skills: BTreeSet<String>,
     started_at: Option<String>,
@@ -20051,21 +19994,7 @@ impl SnapshotAccumulator {
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
         let key = claude_response_key(value, self.claude_response_sequence);
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
-            crate::local_resource_diagnostics::claude_record_cap_hit();
-            if self.claude_responses.contains_key(&key) {
-                self.claude_responses
-                    .get_mut(&key)
-                    .expect("response exists")
-                    .record_limit_exceeded = true;
-            } else {
-                // No response object exists to carry the one-time overflow
-                // marker into finalization. Account for this refused positive
-                // usage row immediately so the enclosing file stays retryable.
-                self.note_dropped_usage();
-            }
-            return;
-        }
+        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let selector = self.claude_responses.selectors.intern(selector);
         // The request's own usage records carry entrypoint. Missing or mixed
         // records fail closed; session-first origin is deliberately irrelevant.
@@ -20073,7 +20002,7 @@ impl SnapshotAccumulator {
             value.get("entrypoint").and_then(Value::as_str) == Some("claude-desktop");
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             existing.desktop_request &= desktop_request;
-            if existing.push(
+            existing.push(
                 usage,
                 model,
                 selector,
@@ -20083,15 +20012,11 @@ impl SnapshotAccumulator {
                 computed_effective_input_context,
                 tool_uses,
                 cache_slot,
-            ) {
-                self.claude_response_record_count =
-                    self.claude_response_record_count.saturating_add(1);
-            }
+            );
             return;
         }
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
-        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         let mut response = ClaudeResponseObservation::new(
             sequence,
             usage,
@@ -20150,9 +20075,15 @@ impl SnapshotAccumulator {
                 responses.first().map(|response| response.sequence),
             );
         }
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
-            crate::local_resource_diagnostics::claude_record_cap_half_file();
-        }
+        crate::local_resource_diagnostics::claude_record_counts(
+            self.claude_response_record_count,
+            responses
+                .iter()
+                .map(|response| response.records.len())
+                .max()
+                .unwrap_or(0),
+            CLAUDE_RECORDS_PER_FILE_ALARM,
+        );
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
             let mut response = match response.resolve_classified(&selectors) {
@@ -20170,9 +20101,9 @@ impl SnapshotAccumulator {
                     }
                     continue;
                 }
-                // The record cap and an undecodable compact record are loss
-                // held for retry, never a resolver conflict.
-                Err(ClaudeResolveFailure::Capped | ClaudeResolveFailure::Decode) => {
+                // An undecodable compact record is loss held for retry, never
+                // a resolver conflict.
+                Err(ClaudeResolveFailure::Decode) => {
                     self.note_dropped_usage();
                     continue;
                 }
@@ -20728,11 +20659,7 @@ impl SnapshotAccumulator {
         // R: the book, and what each resolved response's rows take from here.
         let book_bounds = self.claude_responses.completion_bounds(limit)?;
         let responses = book_bounds.output?;
-        let resolved = self
-            .claude_responses
-            .values()
-            .filter(|response| !response.record_limit_exceeded)
-            .count();
+        let resolved = self.claude_responses.values().count();
         // Charged for every Claude file: whether it is itemless (no positive
         // usage evidence) is the parser's to know, not this accumulator's.
         let buffered_records = self
@@ -21192,6 +21119,7 @@ impl SnapshotAccumulator {
             usage,
             last_usage,
             usage_event_identity,
+            timestamp,
             implicit_request_count,
         )?;
         self.add_usage_with_selector(
@@ -21252,6 +21180,7 @@ impl SnapshotAccumulator {
         usage: UsageTotals,
         last_usage: Option<UsageTotals>,
         usage_event_identity: Option<String>,
+        timestamp: Option<&str>,
         implicit_request_count: Option<u64>,
     ) -> Option<(String, UsageTotals)> {
         let (resolved_model, previous, reset) =
@@ -21260,8 +21189,8 @@ impl SnapshotAccumulator {
         // correct across compaction/restart resets. Older rollouts lack it; in
         // that case use a cumulative delta, beginning a new additive epoch on
         // a reset. Never erase usage already accepted from the same rollout.
-        let mut delta = match last_usage {
-            Some(last) => last,
+        let mut delta = match &last_usage {
+            Some(last) => last.clone(),
             None => match &previous {
                 Some(previous) if !reset => usage.delta_from(previous),
                 Some(_) | None => usage.clone(),
@@ -21273,6 +21202,14 @@ impl SnapshotAccumulator {
             }
         }
         if delta.is_zero() {
+            return None;
+        }
+        // The V2 equal-total repeat gate: a re-emitted line with the same
+        // `last` and total as the previous counted one is not a new request.
+        // Forward only: earlier lines count as they always did, and still
+        // set the tuple a later dated repeat is compared with.
+        let may_drop = dated_on_or_after(timestamp, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS);
+        if self.codex_legacy_ui_repeat(last_usage, usage, &delta, may_drop) {
             return None;
         }
         Some((resolved_model, delta))
@@ -27389,6 +27326,7 @@ impl OwnedSourceScan {
                 file_limit,
             );
         }
+        let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
@@ -27559,6 +27497,19 @@ impl OwnedSourceScan {
             }
         }
         let retry_service_end = pending_paths.len();
+        // A growth Full deferred by its claim left the queue; once the claim
+        // expires, its queued path rides this page instead of waiting behind
+        // the census FIFO. The claim still admits one Full per interval.
+        if !growth_wake.is_empty() {
+            traversal.pending_candidates.retain(|candidate| {
+                let due = pending_paths.len() < selection_limit
+                    && growth_wake.contains(candidate.path.as_path());
+                if due {
+                    pending_paths.push(candidate.clone());
+                }
+                !due
+            });
+        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
                 index
@@ -39991,8 +39942,10 @@ fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
 }
 
 /// The referenced parent history is external: local ordinals begin exactly
-/// where that parent's paginated base ends. This proves only this header's own
-/// creation claim; the caller must still prove first-record/file/stream ownership.
+/// where that parent's paginated base ends. `history_base.thread_id` may name
+/// the parent's physical segment file rather than its logical id, so it must
+/// only differ from this session. This proves only this header's own creation
+/// claim; the caller must still prove first-record/file/stream ownership.
 fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
     if !string_eq_at(meta, &["history_mode"], "paginated")
         || string_eq_at(meta, &["thread_source"], "subagent")
@@ -40010,9 +39963,10 @@ fn codex_paginated_fork_creation_header(value: &Value, meta: &Value) -> bool {
         return false;
     };
     id != parent
-        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) == Some(id)
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])).as_ref()
+            == Some(&id)
         && resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]))
-            == Some(parent)
+            .is_some_and(|base| base != id)
         && u64_at(value, &["ordinal"]).is_some_and(|ordinal| {
             u64_at(meta, &["history_base", "end_ordinal_exclusive"]) == Some(ordinal)
         })
@@ -40703,7 +40657,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             });
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
-        if accumulator.cache_requests.len() < MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
+        if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
             accumulator.cache_requests.push(request);
         } else {
             accumulator.cache_requests_complete = false;
@@ -40751,9 +40705,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             string_at(value, &["session_meta", "payload", "agent_role"])
                 .or_else(|| string_at(value, &["payload", "agent_role"]));
     }
-    let timestamp = string_at(value, &["timestamp"])
-        .or_else(|| string_at(value, &["time"]))
-        .or_else(|| string_at(value, &["created_at"]));
+    let timestamp = codex_line_timestamp(value);
     accumulator.note_time(timestamp.clone());
     codex_prompt_content(value, accumulator);
     accumulator.set_model(
@@ -41541,17 +41493,13 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // Defer the whole response. Sidechain content-block rows progressively
     // increase cumulative output and may add selectors late; neither the first
     // nor an arbitrary line is an authoritative complete response.
-    if let Some(usage) = claude_code_delta_usage(value) {
+    if let Some((usage, root)) = claude_code_delta_usage(value).zip(claude_code_usage_root(value)) {
         // Reconciled against `usage.iterations[]`: on a resumed session's first
         // response the top-level prompt fields read all-zero while the real
         // prompt sits in the iterations, and the small non-zero remainder would
         // otherwise be accepted as this session's baseline.
-        let effective_input_context = claude_code_effective_input_context(value, &usage);
-        if claude_code_usage_root(value)
-            .and_then(|root| root.get("iterations"))
-            .and_then(Value::as_array)
-            .is_some_and(|iterations| iterations.len() > 1)
-        {
+        let effective_input_context = claude_code_effective_input_context(root);
+        if claude_code_usage_iterations(root).len() > 1 {
             // Each iteration is a distinct model request, but the containing
             // response exposes only one stable request id and one terminal
             // timestamp. Keep the response-level peak watermarks, but never
@@ -41559,6 +41507,19 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.claude_context_curve_request_index_complete = false;
         }
         let selector = claude_code_selector_from_line(value);
+        let model = string_at(value, &["message", "model"])
+            .or_else(|| string_at(value, &["model"]))
+            .or_else(|| string_at(value, &["payload", "model"]));
+        // A call naming another model (a refusal fallback's declined first
+        // attempt) is billed here at the response's model; count it.
+        if claude_code_usage_iterations(root).iter().any(|iteration| {
+            iteration
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|other| Some(other) != model.as_deref())
+        }) {
+            crate::local_resource_diagnostics::claude_usage_iteration_model_differs();
+        }
         // The derived context bucket is attached only after all content-block
         // records for this response are canonically resolved. Early progressive
         // records may still have zero input/cache counters; classifying those
@@ -41575,9 +41536,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.observe_claude_response(
             value,
             usage,
-            string_at(value, &["message", "model"])
-                .or_else(|| string_at(value, &["model"]))
-                .or_else(|| string_at(value, &["payload", "model"])),
+            model,
             selector,
             timestamp,
             reasoning_effort,
@@ -41928,6 +41887,13 @@ fn codex_model_context_window(value: &Value) -> Option<u64> {
         .or_else(|| raw_value_at(value, &["info", "model_context_window"]))
         .and_then(Value::as_u64)
         .filter(|window| *window > 0)
+}
+
+/// A Codex line's own envelope time, the same on every read route.
+fn codex_line_timestamp(value: &Value) -> Option<String> {
+    string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["time"]))
+        .or_else(|| string_at(value, &["created_at"]))
 }
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {
@@ -42925,6 +42891,52 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
     ) {
         return None;
     }
+    // Claude Code can state part of a response's usage only in
+    // `usage.iterations[]`, one entry per API call: an all-zero top level
+    // beside a carrying iteration, or a top level restating only the last of
+    // several calls. The top level never exceeds the iterations' sum and
+    // equals it on almost every line, so each billed kind takes the larger of
+    // the two, never both. Cache writes are normalized per entry first and
+    // keep their 5m and 1h buckets apart.
+    let mut usage = claude_code_usage_fields(root);
+    let mut summed = UsageTotals::default();
+    for iteration in claude_code_usage_iterations(root)
+        .iter()
+        .map(claude_code_usage_fields)
+    {
+        summed.input_tokens = summed.input_tokens.saturating_add(iteration.input_tokens);
+        summed.output_tokens = summed.output_tokens.saturating_add(iteration.output_tokens);
+        summed.cache_read_tokens = summed
+            .cache_read_tokens
+            .saturating_add(iteration.cache_read_tokens);
+        summed.cache_creation_5m_tokens = summed
+            .cache_creation_5m_tokens
+            .saturating_add(iteration.cache_creation_5m_tokens);
+        summed.cache_creation_1h_tokens = summed
+            .cache_creation_1h_tokens
+            .saturating_add(iteration.cache_creation_1h_tokens);
+    }
+    usage.input_tokens = usage.input_tokens.max(summed.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(summed.output_tokens);
+    usage.cache_read_tokens = usage.cache_read_tokens.max(summed.cache_read_tokens);
+    usage.cache_creation_5m_tokens = usage
+        .cache_creation_5m_tokens
+        .max(summed.cache_creation_5m_tokens);
+    usage.cache_creation_1h_tokens = usage
+        .cache_creation_1h_tokens
+        .max(summed.cache_creation_1h_tokens);
+    Some(usage)
+}
+
+fn claude_code_usage_iterations(root: &Value) -> &[Value] {
+    root.get("iterations")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// One usage object's own counters: a response's top level or one of its
+/// `iterations[]` entries.
+fn claude_code_usage_fields(root: &Value) -> UsageTotals {
     let (cache_5m, cache_1h) = claude_code_cache_creation_split(root);
     let output_tokens = u64_at(root, &["output_tokens"])
         .or_else(|| u64_at(root, &["outputTokens"]))
@@ -42937,7 +42949,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| u64_at(root, &["output_tokens_details", "thinking_tokens"]))
         .unwrap_or_default()
         .min(output_tokens);
-    let usage = UsageTotals {
+    UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
             .or_else(|| u64_at(root, &["inputTokens"]))
             .unwrap_or_default(),
@@ -42951,8 +42963,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         unattributed_total_tokens: 0,
         request_count: 1,
         costs: UsageCosts::default(),
-    };
-    Some(usage)
+    }
 }
 
 fn usage_object_has_numeric_field(root: &Value, fields: &[&str]) -> bool {
@@ -43027,32 +43038,17 @@ fn claude_code_cache_creation_split(root: &Value) -> (u64, u64) {
 /// 104,266 top-level over iterations of 82,241 and 82,222, and the larger figure
 /// is the one to keep.
 ///
-/// Billing is deliberately untouched: `claude_code_delta_usage` still totals the
-/// top-level fields, which are the aggregate the cost path is priced from.
-fn claude_code_effective_input_context(value: &Value, usage: &UsageTotals) -> u64 {
-    let top_level = usage.effective_input_context();
-    let Some(iterations) = claude_code_usage_root(value)
-        .and_then(|root| root.get("iterations"))
-        .and_then(Value::as_array)
-    else {
-        return top_level;
-    };
-    iterations
+/// Billing differs on purpose: `claude_code_delta_usage` takes, per kind, the
+/// larger of the top level and the iterations' sum. This watermark reads the
+/// raw top level and single iterations, never that billing fold.
+fn claude_code_effective_input_context(root: &Value) -> u64 {
+    claude_code_usage_iterations(root)
         .iter()
-        .map(|iteration| {
-            let (cache_5m, cache_1h) = claude_code_cache_creation_split(iteration);
-            u64_at(iteration, &["input_tokens"])
-                .or_else(|| u64_at(iteration, &["inputTokens"]))
-                .unwrap_or_default()
-                .saturating_add(
-                    u64_at(iteration, &["cache_read_input_tokens"])
-                        .or_else(|| u64_at(iteration, &["cache_read_tokens"]))
-                        .unwrap_or_default(),
-                )
-                .saturating_add(cache_5m)
-                .saturating_add(cache_1h)
-        })
-        .fold(top_level, u64::max)
+        .map(|iteration| claude_code_usage_fields(iteration).effective_input_context())
+        .fold(
+            claude_code_usage_fields(root).effective_input_context(),
+            u64::max,
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -70751,78 +70747,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_response_record_caps_fail_closed_without_unbounded_buffering() {
-        let mut response = ClaudeResponseObservation::new(
-            0,
-            UsageTotals::default(),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        );
-        for _ in 1..MAX_CLAUDE_RECORDS_PER_RESPONSE {
-            assert!(response.push(
-                UsageTotals::default(),
-                None,
-                SelectorCapture::default(),
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-                RequestSlot::default(),
-            ));
-        }
-        assert!(!response.push(
-            UsageTotals::default(),
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-            RequestSlot::default(),
-        ));
-        assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
-        // A capped response is loss held for retry, never a resolver conflict.
-        assert_eq!(
-            response
-                .clone()
-                .resolve_classified(&ClaudeSelectorTable::default())
-                .err(),
-            Some(ClaudeResolveFailure::Capped)
-        );
-        assert!(response.resolve().is_none());
-
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-        accumulator.claude_response_record_count = MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE;
-        accumulator.observe_claude_response(
-            &json!({
-                "requestId": "request-at-total-cap",
-                "message": {"id": "message-at-total-cap"},
-            }),
-            UsageTotals {
-                input_tokens: 1,
-                request_count: 1,
-                ..UsageTotals::default()
-            },
-            None,
-            SelectorCapture::default(),
-            None,
-            None,
-            Some(1),
-        );
-        assert!(accumulator.claude_responses.is_empty());
-        assert_eq!(accumulator.dropped_usage_record_count, 1);
-    }
-
-    #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
         // Legacy reported-usage body/authority assertions; `e2` emits request-owned grains.
 
@@ -71185,14 +71109,13 @@ mod tests {
         assert_ne!(item.first_turn_context_tokens, Some(1_684));
         assert_eq!(item.peak_context_fill_tokens, Some(902_004));
 
-        // Billing is read from the top-level fields only and must be untouched
-        // by the reconciliation above: the zeroed record contributes its 1,684
-        // cache write and nothing else, NOT the 894,911 cache read that only
-        // `iterations[]` states.
-        assert_eq!(item.input_tokens, 4);
-        assert_eq!(item.cache_read_tokens, 900_000);
+        // Billing takes, per kind, the larger of the top level and the
+        // iterations' sum: the zeroed record counts what only `iterations[]`
+        // states, and its 1,684 cache write once, not twice.
+        assert_eq!(item.input_tokens, 6);
+        assert_eq!(item.cache_read_tokens, 1_794_911);
         assert_eq!(item.cache_creation_1h_tokens, 3_684);
-        assert_eq!(item.output_tokens, 90);
+        assert_eq!(item.output_tokens, 402);
         assert_eq!(item.request_count, 2);
 
         let _ = fs::remove_file(path);
@@ -71231,10 +71154,11 @@ mod tests {
         assert_ne!(item.peak_context_fill_tokens, Some(1_588_417));
         assert_ne!(item.peak_context_fill_tokens, Some(708_733));
 
-        // One API response, so billing counts the top level once.
-        assert_eq!(item.input_tokens, 3);
-        assert_eq!(item.cache_read_tokens, 706_730);
-        assert_eq!(item.cache_creation_5m_tokens, 2_000);
+        // Billing counts both calls (the iterations' sum beats the top level),
+        // still as one response.
+        assert_eq!(item.input_tokens, 8);
+        assert_eq!(item.cache_read_tokens, 1_582_409);
+        assert_eq!(item.cache_creation_5m_tokens, 6_000);
         assert_eq!(item.request_count, 1);
 
         let _ = fs::remove_file(path);
@@ -82895,6 +82819,83 @@ mod tests {
         header
     }
 
+    /// Observed shape: `history_base.thread_id` names the parent's physical
+    /// segment file, not `forked_from_id`. The session's own pair names it;
+    /// usage totals are the same with or without that pair.
+    #[test]
+    fn codex_paginated_fork_names_itself_when_base_is_a_parent_segment() {
+        let mut header = codex_paginated_creator_fixture();
+        header["payload"]["history_base"]["thread_id"] =
+            json!("019e253c-4444-7000-9000-dddddddddddd");
+        let id = header["payload"]["id"].as_str().unwrap().to_string();
+        let parent_id = header["payload"]["forked_from_id"].clone();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+
+        let items = codex_fork_creator_items(&[header.clone(), usage(1362)], &id);
+        assert_eq!(items.len(), 1);
+        let evidence = items[0].session_account_evidence.as_ref().unwrap();
+        assert_eq!(evidence.evidence_source, "codex_creator_header:v1");
+        assert_eq!(
+            evidence.account_identifier_hash,
+            ottto_core::billing_identity_hash("openai", "account", "synthetic-user")
+        );
+
+        // Placement only: every other wire field, totals included, matches the
+        // same transcript without a creator pair.
+        let mut creator_free = header.clone();
+        let meta = creator_free["payload"].as_object_mut().unwrap();
+        meta.remove("creator_user_id");
+        meta.remove("creator_account_id");
+        let creator_free = codex_fork_creator_items(&[creator_free, usage(1362)], &id);
+        assert!(creator_free[0].session_account_evidence.is_none());
+        let mut named = serde_json::to_value(&items).unwrap();
+        named[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("session_account_evidence");
+        assert_eq!(named, serde_json::to_value(&creator_free).unwrap());
+        assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
+
+        // A parent header in this file never names the session: not as the
+        // first record, and not later (with this session's header first).
+        let mut foreign = header.clone();
+        foreign["payload"]["id"] = parent_id.clone();
+        foreign["payload"]["session_id"] = parent_id;
+        foreign["payload"]["forked_from_id"] = json!("019e253c-5555-7000-9000-eeeeeeeeeeee");
+        foreign["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        let foreign_first = codex_fork_creator_items(&[foreign.clone(), usage(1362)], &id);
+        assert!(foreign_first
+            .iter()
+            .all(|item| item.session_account_evidence.is_none()));
+        foreign["ordinal"] = json!(1362);
+        foreign["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        let foreign_later = codex_fork_creator_items(&[header.clone(), foreign, usage(1363)], &id);
+        assert!(foreign_later[0].session_account_evidence.is_none());
+        assert_eq!(
+            (
+                foreign_later[0].input_tokens,
+                foreign_later[0].output_tokens
+            ),
+            (100, 5)
+        );
+
+        // Conflicting own headers still refuse the pair and keep the usage.
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        let conflicted = codex_fork_creator_items(&[header, conflict, usage(1363)], &id);
+        assert!(conflicted[0].session_account_evidence.is_none());
+        assert_eq!(
+            (conflicted[0].input_tokens, conflicted[0].output_tokens),
+            (100, 5)
+        );
+    }
+
     #[test]
     fn codex_paginated_fork_own_creation_requires_exact_external_boundary() {
         let header = codex_paginated_creator_fixture();
@@ -82911,9 +82912,9 @@ mod tests {
             ("partial_pair", "/payload/creator_user_id", Value::Null),
             ("missing_pair", "/payload/creator_account_id", json!(" ")),
             (
-                "wrong_parent",
+                "missing_base_thread",
                 "/payload/history_base/thread_id",
-                json!("other-parent"),
+                Value::Null,
             ),
             (
                 "internal_parent",
@@ -86083,7 +86084,6 @@ crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
 crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
-crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);

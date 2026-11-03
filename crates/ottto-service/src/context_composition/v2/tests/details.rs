@@ -3,15 +3,21 @@ use super::*;
 use crate::context_composition::v2::aggregate::{AggregateRef, StoredAggregate};
 use crate::context_composition::v2::scope::Scope;
 use crate::context_composition::v2::upload::{build_request, details_enabled, DETAILS_CONTRACT};
+use crate::snapshots::SnapshotUploadPolicy;
 
-fn payload(scope: &Scope, enabled: bool, labels: bool) -> Value {
+pub(super) fn payload(scope: &Scope, enabled: bool, labels: bool) -> Value {
     let mut capture = Capture::default();
     let target = UploadTarget {
         uploader: &mut capture,
         machine_id: "machine-test",
         destination: "test-destination",
-        labels_enabled: labels,
+        policy: SnapshotUploadPolicy {
+            session_titles_enabled: labels,
+            workspace_labels_enabled: labels,
+            ..SnapshotUploadPolicy::default()
+        },
         details_enabled: enabled,
+        names_withheld: false,
     };
     let now = base_now();
     let (request, _) = build_request(
@@ -26,7 +32,7 @@ fn payload(scope: &Scope, enabled: bool, labels: bool) -> Value {
     serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap()
 }
 
-fn scope() -> Scope {
+pub(super) fn scope() -> Scope {
     Scope::new(
         "scope",
         ScopeInfo {
@@ -281,8 +287,9 @@ fn actual_reader_stored_state_and_wire_agree_on_session_winner() {
         uploader: &mut capture,
         machine_id: "machine-test",
         destination: "test-destination",
-        labels_enabled: true,
+        policy: SnapshotUploadPolicy::default(),
         details_enabled: true,
+        names_withheld: false,
     };
     let now = base_now();
     let result = super::super::upload::upload_scope(
@@ -325,8 +332,9 @@ fn capability_change_refreshes_acked_scope_without_transcript_changes() {
             uploader: &mut capture,
             machine_id: "machine-test",
             destination: "test-destination",
-            labels_enabled: true,
+            policy: SnapshotUploadPolicy::default(),
             details_enabled: enabled,
+            names_withheld: false,
         };
         assert_eq!(
             upload_scope(&dir, Source::Claude, &scope, &mut target, now, window).outcome,

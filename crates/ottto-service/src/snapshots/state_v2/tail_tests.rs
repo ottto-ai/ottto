@@ -291,14 +291,25 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     .unwrap();
     save_with(&f.path, &mut index).unwrap();
 
-    let oversized = vec![1_u8; 4 * 1024 * 1024];
+    // Refused by key admission after the reset's purge and the first page's write.
     let bad = || StagedFile {
         change: Change::Reset,
         ..staged(
             b"new",
             &[
                 (Collection::Responses, 0, b"new"),
-                (Collection::Responses, 1, &oversized),
+                (Collection::Responses, i64::MAX as u64 + 1, b"refused"),
+            ],
+        )
+    };
+    let large = vec![1_u8; 4 * 1024 * 1024];
+    let good = || StagedFile {
+        change: Change::Reset,
+        ..staged(
+            b"new",
+            &[
+                (Collection::Responses, 0, b"new"),
+                (Collection::Responses, 1, &large),
             ],
         )
     };
@@ -323,7 +334,6 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
         assert_eq!(family.map(|family| family.hash_member_count()), Some(1));
     };
     for attempts in 1..=2 {
-        with_session_db(&index, |db| sqlite::set_save_ceiling(db, 1024 * 1024));
         advance(&mut index);
         stage_tail(&f.path, FILE, bad()).unwrap();
         stage_tail(
@@ -356,7 +366,7 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     }
 
     advance(&mut index);
-    stage_tail(&f.path, FILE, bad()).unwrap();
+    stage_tail(&f.path, FILE, good()).unwrap();
     save_with(&f.path, &mut index).unwrap();
     let index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(index.files.get(FILE).unwrap().size_bytes, 8);
@@ -364,7 +374,7 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     shared_committed(&index);
     let (head, pages) = read(&index, FILE).unwrap();
     assert_eq!(head.unwrap().body, b"new");
-    assert_eq!(pages[&(Collection::Responses, 1)], oversized);
+    assert_eq!(pages[&(Collection::Responses, 1)], large);
     assert!(
         tail_set_aside(&index, FILE).unwrap().is_none(),
         "retry clears"

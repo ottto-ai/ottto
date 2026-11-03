@@ -175,7 +175,14 @@ pub(super) enum Group {
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 4;
+// Append one line per bump; two PRs appending the same number conflict by design.
+pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
+    (1, "original catalogue"),
+    (2, "kind-introduction layouts and upload context proof"),
+    (3, "copy-prefix recovery nonce"),
+    (4, "tail store"),
+];
+pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 /// Tail state's closed kinds, each owned by `tail.rs`: no `ScanIndex` field, no
 /// hook, and never a row of `enumerate` or a baseline. Pages first, in
@@ -266,7 +273,7 @@ mod tests {
         }
         assert!(RESERVED.iter().all(|kind| group(kind).is_none()));
         assert_eq!(group("family.requests"), Some(Group::Census));
-        // Each kind is introduced at a supported layout; the newest is current.
+        // Each graph kind is introduced at a supported layout.
         assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
         assert_eq!(TAIL_LAYOUT, LAYOUT);
         // Tail kinds are a closed list too: no wildcard, and no graph owner.

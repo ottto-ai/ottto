@@ -2326,6 +2326,12 @@ fn holder_order(
     Some((birth, location_key(key)))
 }
 
+/// Without an accepted origin body, removing a prefix counts it nowhere. Protected
+/// bodies stay frozen: never accepted, and no wait for an ACK that cannot come.
+fn origin_accepted(index: &ScanIndex, holder: &str) -> bool {
+    !index.claude_family_listed(holder) && index.file_has_accepted_body(holder)
+}
+
 /// Owner direction (PR C (a)): a /branch names its original in a
 /// `fork-context-ref` line. When that original is still indexed but its
 /// census cannot answer (retired after 35 idle days, over budget, older
@@ -2344,6 +2350,7 @@ fn parent_proves(
     member.subagent_stem.is_none()
         && member.root != session
         && index.files.contains_key(parent)
+        && origin_accepted(index, parent)
         && !index
             .claude_request_census
             .get(parent)
@@ -2356,7 +2363,7 @@ fn parent_proves(
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
 /// The walk deadline, a queued size change, a holder modified since its
-/// census read, and an unscanned other-session main file delay a decision.
+/// census read, an unscanned other-session main file or an unaccepted holder delay it.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2389,6 +2396,8 @@ fn decide_holders(
         waiting: bool,
         /// Hashes held only by an earlier file modified since its census read.
         stale: BTreeSet<u64>,
+        /// Hashes whose only proof is a holder with no accepted body.
+        unaccepted: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
     }
@@ -2417,6 +2426,7 @@ fn decide_holders(
             // removals stand, counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
+            let mut unaccepted = BTreeSet::new();
             for (holder, held) in index.claude_copy_removals.get(order.1) {
                 let key = live
                     .get_or_init(|| indexed_main_files(index))
@@ -2426,6 +2436,13 @@ fn decide_holders(
                     if hashes.binary_search(&hash).is_err()
                         || stored_holder_answer(index, key, hash) == Some(false)
                     {
+                        continue;
+                    }
+                    // Stays recorded; applies again once the indexed holder is accepted.
+                    if let Some(key) = key.filter(|key| !origin_accepted(index, key)) {
+                        if !index.claude_family_listed(key) {
+                            unaccepted.insert(hash);
+                        }
                         continue;
                     }
                     stored.insert(hash);
@@ -2446,6 +2463,7 @@ fn decide_holders(
                 resumed,
                 waiting: false,
                 stale: BTreeSet::new(),
+                unaccepted,
                 parent,
             })
         })
@@ -2467,7 +2485,7 @@ fn decide_holders(
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey))>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2480,17 +2498,26 @@ fn decide_holders(
                         if evidence == Evidence::None {
                             return None;
                         }
-                        Some((evidence, holder_order(store, root, key)?))
+                        Some((
+                            evidence,
+                            holder_order(store, root, key)?,
+                            origin_accepted(index, key),
+                        ))
                     });
                     match holder {
-                        Some((evidence, holder)) if holder < file.order => match evidence {
+                        Some((evidence, holder, proven)) if holder < file.order => match evidence {
                             Evidence::Queued => file.waiting = true,
                             Evidence::Stale => {
                                 file.stale.insert(hash);
                             }
-                            Evidence::Current => {
+                            Evidence::Current if proven => {
                                 let earliest = file.covered.entry(hash).or_insert(holder);
                                 *earliest = (*earliest).min(holder);
+                            }
+                            Evidence::Current => {
+                                if !index.claude_family_listed(key) {
+                                    file.unaccepted.insert(hash);
+                                }
                             }
                             Evidence::None => {}
                         },
@@ -2532,6 +2559,16 @@ fn decide_holders(
             diag("copy_removal_holder_absent_kept", absent_kept);
             record_counts(Counts::one(25, absent_kept));
         }
+        // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
+        if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
+            let late = wanted
+                .covered
+                .keys()
+                .filter(|hash| !wanted.stored.contains(hash))
+                .count() as u64;
+            diag("copy_prefix_late_origin_removed", late);
+            record_counts(Counts::one(26, late));
+        }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
             let stored = state.store(wanted.order.1, groups);
@@ -2560,6 +2597,26 @@ fn decide_holders(
                 &mut updates.state,
                 wanted.order.1,
                 "held_copy_stale_holder",
+                accepted,
+            );
+            continue;
+        }
+        if uncovered.iter().any(|h| wanted.unaccepted.contains(h)) {
+            // One decision pass waited, and once per wait a copy that waits.
+            let first = updates
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.pending(wanted.order.1));
+            diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
+            diag("copy_prefix_origin_unaccepted_passes", 1);
+            record_counts(Counts::one(27, u64::from(first)));
+            record_counts(Counts::one(28, 1));
+            defer_prefix(
+                &mut items[wanted.at],
+                &uncovered,
+                &mut updates.state,
+                wanted.order.1,
+                "held_copy_origin_unaccepted",
                 accepted,
             );
             continue;
@@ -4271,8 +4328,12 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
+    // A prefix removed after its origin's late acceptance; copies and passes waiting for one.
+    "copy_prefix_late_origin_removed",
+    "copy_prefix_origin_unaccepted_copies",
+    "copy_prefix_origin_unaccepted_passes",
 ];
-const COUNT_LEN: usize = 26;
+const COUNT_LEN: usize = 29;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
