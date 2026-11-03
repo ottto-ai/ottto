@@ -554,36 +554,6 @@ mod alias_tests {
         .is_err());
     }
 
-    /// [format] A sticky folder ledger stays unqualified across a reopen, and an
-    /// index from before the ledger imports empty.
-    #[test]
-    fn folder_login_ledger_sticky_stays_unqualified() {
-        use crate::snapshots::claude_folder_login::{qualify, OwnerReport};
-        let old = br#"{"files":{}}"#;
-        assert_eq!(inventory(old.as_slice()), Ok(()));
-        assert!(strict_json::<ScanIndex>(old)
-            .unwrap()
-            .claude_folder_login_ledger
-            .is_empty());
-        let record = |mixed: bool| {
-            serde_json::json!({"files":{},"claude_folder_login_ledger":{"folder":{
-                "fresh":true,"mixed":mixed,"login":"a","org":"o","owner_proven":true,
-                "census_complete":true,"covered_from":3600,"matched":[7]}}})
-        };
-        let owner = OwnerReport {
-            pair: Some(("a".to_string(), "o".to_string())),
-            email: Some("e".to_string()),
-            ..OwnerReport::default()
-        };
-        for (mixed, qualifies) in [(false, true), (true, false)] {
-            let raw = serde_json::to_vec(&record(mixed)).unwrap();
-            assert_eq!(inventory(raw.as_slice()), Ok(()));
-            let index = strict_json::<ScanIndex>(&raw).unwrap();
-            let folder = &index.claude_folder_login_ledger["folder"];
-            assert_eq!(qualify(folder, &owner).is_some(), qualifies);
-        }
-    }
-
     /// [format] v1 import inventory admits each leaf a shipped writer stored
     /// and the ledger retired, and still refuses an unknown sibling beside it.
     #[test]
@@ -620,11 +590,16 @@ mod alias_tests {
         }
     }
 
-    /// [format] An older index holding the retired Desktop census witness
-    /// still passes the import inventory: the slot decodes and drops.
+    /// [format] An older index holding a retired slot (the Desktop census
+    /// witness, the folder login ledger) still passes the import inventory:
+    /// the slot decodes and drops.
     #[test]
     fn inventory_accepts_the_retired_desktop_census_witness() {
-        let raw = br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#;
-        assert_eq!(inventory(raw.as_slice()), Ok(()));
+        for raw in [
+            br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#.as_slice(),
+            br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":false,"login":"a","org":"o","matched":[7]}}}"#.as_slice(),
+        ] {
+            assert_eq!(inventory(raw), Ok(()));
+        }
     }
 }

@@ -143,7 +143,6 @@ mod shared_value;
 #[cfg(test)]
 mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
-pub(crate) mod claude_folder_login;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
@@ -2159,23 +2158,7 @@ pub struct SnapshotRequestEvidence {
     /// never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
-    /// Present only on `transcript_recorded_login`, under its capability. Outside
-    /// the semantic leaf: a witness-only change causes no upload.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sole_login_witness: Option<SoleLoginWitness>,
 }
-
-/// Why a recorded-login request was named: the folder's kind, a count key and
-/// how far back the folder's evidence reaches. No path, email, plan or org type.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SoleLoginWitness {
-    pub v: u8,
-    /// `folder` or `slot`.
-    pub kind: String,
-    pub folder: String,
-    pub covered_from: String,
-}
-crate::heap_layout_bound::fields!(SoleLoginWitness; v, kind, folder, covered_from);
 
 /// Exact shared activity-hint capability for carried-account provenance.
 /// Missing/null/unknown keeps existing wire bytes for every source.
@@ -4162,9 +4145,10 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
-    /// Per-config-folder login evidence, written only under its capability.
-    #[serde(default)]
-    pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// The per-folder login ledger, retired with its only consumer.
+    #[serde(rename = "claude_folder_login_ledger", default)]
+    retired_claude_folder_login_ledger: serde::de::IgnoredAny,
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
@@ -4387,7 +4371,7 @@ impl Default for ScanIndex {
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
             copy_prefix_last_accepted_nonce: None,
-            claude_folder_login_ledger: BTreeMap::new(),
+            retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: TailDiscovery::default(),
             copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
@@ -20993,13 +20977,6 @@ impl SnapshotAccumulator {
             && claude_transcript_excluded_from_snapshots(path)
         {
             return Vec::new();
-        }
-        if let Some(fold) = self.claude_money.as_deref_mut() {
-            let forked =
-                self.claude_fork_parent.is_some() || self.claude_context_curve_owned_start_proven;
-            fold.folder_trace = Some(Box::new(claude_folder_login::FolderTrace::of_file(
-                path, forked,
-            )));
         }
         let Some(source_session_id) = self
             .source_session_id
@@ -52009,7 +51986,7 @@ impl ScanIndex {
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
-            claude_folder_login_ledger: self.claude_folder_login_ledger.clone(),
+            retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: self.tail_discovery,
             copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
@@ -82712,7 +82689,7 @@ crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, 
 crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
-crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source, sole_login_witness);
+crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
     U thread_source: Option<String>,

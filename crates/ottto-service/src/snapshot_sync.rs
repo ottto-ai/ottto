@@ -6765,26 +6765,13 @@ fn prepare_sync_source_inner(
         encoded_key.zeroize();
     }
     if source == SnapshotSource::ClaudeCode {
-        // No capability or no key: no address digest, so no verdict.
-        let sole_login = activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
-        let key = attribution_context
-            .as_ref()
-            .filter(|_| sole_login)
-            .map(SessionAttributionContext::accepted_fingerprint_key);
-        // A key or capability change only scrubs what retained parses compare
-        // under the old key: every parse, cursor and count stays, so a server
-        // hint never causes a re-read.
-        let address = crate::claude_status_coverage::bind_address_key(key);
-        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
+        // A key change only scrubs what retained parses compare under the old
+        // key: every parse, cursor and count stays, so a server hint never
+        // causes a re-read.
+        if crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        );
-        if context || address {
-            daemon
-                .transcript_cache
-                .scrub_retained_identity(context, address);
+        ) {
+            daemon.transcript_cache.scrub_retained_context_digests();
         }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
@@ -7737,21 +7724,6 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
-    if source == SnapshotSource::ClaudeCode {
-        let sole_login = activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
-        upload_progress
-            .accepted_identity_buckets
-            .set_sole_login_enabled(sole_login);
-        crate::snapshots::claude_folder_login::begin_page(
-            &mut index,
-            &committed_index,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            sole_login,
-        );
-    }
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10368,25 +10340,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
-    if let Some(accepted) =
-        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
-    {
-        let census_clean = scan_result.census_complete
-            && scan_result.census_residue_index_key_count == 0
-            && scan_result.census_residue_blocked_session_count == 0;
-        crate::snapshots::claude_folder_login::note_page(
-            index,
-            &scan_result.snapshots,
-            &api_report,
-            census_clean,
-        );
-        crate::snapshots::claude_folder_login::stamp_page(
-            &mut scan_result.snapshots,
-            index,
-            &api_report,
-            accepted,
-        );
-    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -12901,7 +12854,6 @@ pub(crate) fn erase_disabled_sources(
             cache.forget_codex_jobs();
         }
         if source == SnapshotSource::ClaudeCode {
-            crate::claude_status_coverage::forget_addresses();
             cache.forget_retained_transcripts();
         }
         let marker = source_marker_path(support_dir, source);
@@ -12974,7 +12926,6 @@ fn erase_owed_login_addresses(
     {
         return;
     }
-    crate::claude_status_coverage::forget_addresses();
     cache.forget_retained_transcripts();
     let erased = erase_claude_tail_rows(support_dir).and_then(|()| {
         std::fs::remove_file(&marker)?;

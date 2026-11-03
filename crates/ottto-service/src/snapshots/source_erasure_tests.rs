@@ -423,18 +423,9 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
     );
 }
 
-const LOGIN_ADDRESS: &str = "one@example.test";
-
-/// A held key, one report email under it and one retained parse.
+/// One retained parse, whose org markers an older build could have kept an
+/// address digest in.
 fn hold_login_address_state(f: &Fixture) {
-    use crate::claude_status_coverage as coverage;
-    coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
-    coverage::observe_with_email(
-        "folder".into(),
-        coverage::OwnerReport::default(),
-        Some(LOGIN_ADDRESS),
-    );
-    assert!(coverage::snapshot()["folder"].email.is_some());
     let (root, _) = f.transcript();
     let (retained, _, _) = crate::snapshots::claude_response_compaction_tests::acquire_items(
         &root.join(format!("{SESSION}.jsonl")),
@@ -449,9 +440,6 @@ fn hold_login_address_state(f: &Fixture) {
 }
 
 fn assert_login_address_state_gone(f: &Fixture) {
-    use crate::claude_status_coverage as coverage;
-    assert_eq!(coverage::address_digest(LOGIN_ADDRESS), None);
-    assert_eq!(coverage::snapshot()["folder"].email, None);
     assert!(f.cache.retained().unwrap().victims().is_empty());
 }
 
@@ -509,7 +497,7 @@ fn account_removal_erase_clears_the_login_address_only() {
 
     hold_login_address_state(&f);
     assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
-    assert!(crate::claude_status_coverage::address_digest(LOGIN_ADDRESS).is_some());
+    assert!(!f.cache.retained().unwrap().victims().is_empty());
 }
 
 const TAIL_CANARY: &str = "LOGIN-ADDRESS-TAIL-CANARY-20261103";
