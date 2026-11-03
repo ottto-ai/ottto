@@ -13,14 +13,14 @@ use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDige
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
 /// type inside `$arm`; every other source takes `$none`. A source joins by
-/// adding its arm here, never through its `state_v2` registry flag (Codex has
-/// that flag before its codec exists).
+/// adding its arm here, never through its `state_v2` registry flag.
 macro_rules! with_codec {
     ($source:expr, $s:ident => $arm:expr, _ => $none:expr) => {
         match $source {
@@ -28,7 +28,11 @@ macro_rules! with_codec {
                 type $s = claude::Claude;
                 $arm
             }
-            SnapshotSource::Codex | SnapshotSource::Pi => $none,
+            SnapshotSource::Codex => {
+                type $s = codex::Codex;
+                $arm
+            }
+            SnapshotSource::Pi => $none,
         }
     };
 }
@@ -49,19 +53,22 @@ pub(in crate::snapshots) fn tail_route(
         .flatten()
 }
 
-/// `source`'s load of `candidate` on `route`, through its codec.
+/// `source`'s load of `candidate` on `route`, through its codec. `live` is the
+/// read's fresh accumulator, configured with this cycle's inputs.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn load_candidate(
     source: SnapshotSource,
     index: &ScanIndex,
     route: &Path,
     candidate: &CandidateFile,
+    live: &SnapshotAccumulator,
     capture: bool,
     held: &mut File,
     scope: &crate::transcript_acquisition::Scope,
 ) -> load::Load {
     with_codec!(
         source,
-        S => load::entry::<S>(index, route, candidate, capture, held, scope),
+        S => load::entry::<S>(index, route, candidate, live, capture, held, scope),
         _ => load::Load::Cold(None)
     )
 }
@@ -88,10 +95,6 @@ pub(in crate::snapshots) fn pending(
 
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Claude's live inputs join at finish; the next codec constructs these"
-)]
 pub(in crate::snapshots) enum LiveLoadError {
     /// The live input is not available now: the file holds with its debt.
     Unavailable,
@@ -306,10 +309,13 @@ pub(in crate::snapshots) trait TailSource {
     /// under; `None` without a key. A head from another key is never reused.
     fn key_epoch() -> Option<[u8; 32]>;
     /// Installs the live inputs of this read into a validated stored state,
-    /// before the load publishes it as reused.
+    /// before the load publishes it as reused. `live` is the read's fresh
+    /// accumulator, configured before any line (traces, parent ledgers and
+    /// proof, sidecar projection, counting rule); a load never parses with it.
     fn install_live(
         stored: &mut SnapshotAccumulator,
         fresh: &CandidateFile,
+        live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError>;
 
     /// After every page: each declared collection's stored geometry and
@@ -475,6 +481,11 @@ fn hour_pages<K: Durable, V: Durable>(
         .collect()
 }
 
+/// A capability bucket's start: the first part of its key.
+fn capability_hour(key: &(String, String, String)) -> &str {
+    &key.0
+}
+
 /// One stored `Hour` page into `map`. An entry off its own hour's page, or a
 /// key stored twice, is corrupt.
 fn read_hour_page<K: Durable + Ord, V: Durable>(
@@ -517,17 +528,19 @@ macro_rules! head_fields {
 // plain data and the fork parent and artifacts are stored. `X` fields are
 // re-derived. `I` marks a field this walk does not store: a codec keeps its
 // own `I` fields in its pages or in a trailer after this walk, or never
-// stores them (finish-only and live fields). Claude's: pages (responses, tool
+// stores them (finish-only and live fields), and lists every `I` field it
+// never stores in `finish_field_nonempty`. Claude's: pages (responses, tool
 // uses, changed files, capability buckets, compactions), finish-only fields
 // (usage ids and occurrences, money, cache observations and requests, usage
 // buckets and totals), live fields (Desktop identity and spawn lineage,
-// account hash) and the Pi ledger.
+// account hash), the Pi ledger, and Codex's paged, trailer and live fields,
+// empty on Claude. Codex's: `codex::Codex`.
 head_fields! {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
     N cache_task_complete_at: Option<String>,
     N cache_pending_idle: Option<u64>,
-    L cache_active_turns: BTreeSet<String>,
+    I cache_active_turns: BTreeSet<String>,
     N context_curve_enabled: bool,
     U source_session_id: Option<String>,
     I account_identifier_hash: Option<String>,
@@ -545,9 +558,9 @@ head_fields! {
     U latest_reasoning_effort: Option<String>,
     L latest_turn_id: Option<String>,
     I codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
-    L codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
+    I codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
     N codex_priority_witnesses_uncapped: bool,
-    E codex_tier_replay: Option<codex_file_join::TierReplay>,
+    I codex_tier_replay: Option<codex_file_join::TierReplay>,
     D codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
     D current_selector: SelectorCapture,
     I session_cumulative_usage: Option<UsageTotals>,
@@ -573,13 +586,13 @@ head_fields! {
     N codex_bind_seed_len: Option<u64>,
     I codex_sidecar_projected_next_ordinal: Option<u64>,
     U codex_parent_session_ref: Option<String>,
-    E codex_parent_signatures: Option<CodexParentPrefix>,
+    I codex_parent_signatures: Option<CodexParentPrefix>,
     H codex_parent_prefix_digest: PrefixDigest,
     D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
-    E codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
-    E codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
+    I codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    I codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     N codex_parent_proof_mismatch: bool,
-    E codex_parent_proof_refusal: Option<ProofRefusal>,
+    I codex_parent_proof_refusal: Option<ProofRefusal>,
     N codex_proof_decision_only: bool,
     N codex_boundary_buffer_count: u8,
     H codex_proof_ledger_row: Option<String>,
@@ -593,7 +606,7 @@ head_fields! {
     N codex_native_created_thread_last_nanos: Option<i128>,
     L codex_native_created_thread_task_turn_id: Option<String>,
     N codex_native_created_thread_first_turn_bound: bool,
-    H codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
+    I codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
     N codex_physical_signatures_complete: bool,
     N codex_ordinal_expected: Option<u64>,
     N codex_ordinal_sequence_valid: bool,
@@ -613,11 +626,11 @@ head_fields! {
     U codex_root_session_ref: Option<String>,
     N codex_spawn_depth: Option<u64>,
     X codex_agent_label: Option<String>,
-    U activity_tool_counts: BTreeMap<String, u64>,
-    D activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
-    U activity_mcp_tool_counts: BTreeMap<String, u64>,
-    U activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
-    L activity_mcp_call_ids: BTreeMap<String, bool>,
+    I activity_tool_counts: BTreeMap<String, u64>,
+    I activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
+    I activity_mcp_tool_counts: BTreeMap<String, u64>,
+    I activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    I activity_mcp_call_ids: BTreeMap<String, bool>,
     I activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     I seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
     N activity_skills: BTreeSet<String>,
@@ -666,11 +679,12 @@ head_fields! {
     N peak_context_fill_window_tokens: Option<u64>,
     N last_turn_context_window_tokens: Option<u64>,
     N compaction_count: u64,
-    N compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    I compaction_timestamps: crate::owned_heap::OwnedVec<String>,
     D codex_compaction_sizes: CodexCompactionSizes,
     D local_context_points: LocalContextPoints,
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
     D durable_marks: crate::durable_tail_codec::DurableMarks,
+    I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
 }

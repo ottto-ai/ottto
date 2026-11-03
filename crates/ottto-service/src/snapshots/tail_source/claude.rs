@@ -9,9 +9,9 @@
 //! content (`X`) is re-derived from the file and hash-checked, including each
 //! opening call's file paths by call id. Skill labels are stored as they are.
 use super::{
-    encode, fixed_pages, hour_pages, page_bytes, put_fields, read_hour_page, read_page, slot_start,
-    take_fields, CollectionSpec, DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause,
-    TailSource,
+    capability_hour, encode, fixed_pages, hour_pages, page_bytes, put_fields, read_hour_page,
+    read_page, slot_start, take_fields, CollectionSpec, DecodedHead, HeadIdentity, LiveLoadError,
+    ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{Dec, Durable, HDigest, Refuse};
 use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
@@ -117,6 +117,55 @@ impl TailSource for Claude {
             (
                 "account_identifier_hash",
                 acc.account_identifier_hash.is_some(),
+            ),
+            // Codex's paged, trailer and live fields: never set on Claude.
+            ("codex_tier_replay", acc.codex_tier_replay.is_some()),
+            (
+                "codex_parent_signatures",
+                acc.codex_parent_signatures.is_some(),
+            ),
+            (
+                "codex_parent_prefix_proof",
+                acc.codex_parent_prefix_proof.is_some(),
+            ),
+            (
+                "codex_parent_proof_used",
+                acc.codex_parent_proof_used.is_some(),
+            ),
+            (
+                "codex_parent_proof_refusal",
+                acc.codex_parent_proof_refusal.is_some(),
+            ),
+            ("cache_active_turns", !acc.cache_active_turns.is_empty()),
+            (
+                "codex_observed_priority_turns",
+                acc.codex_observed_priority_turns.is_some(),
+            ),
+            (
+                "codex_physical_signatures",
+                !acc.codex_physical_signatures.is_empty(),
+            ),
+            ("activity_tool_counts", !acc.activity_tool_counts.is_empty()),
+            ("activity_call_tools", !acc.activity_call_tools.is_empty()),
+            (
+                "activity_mcp_tool_counts",
+                !acc.activity_mcp_tool_counts.is_empty(),
+            ),
+            (
+                "activity_mcp_tool_usage_counts",
+                !acc.activity_mcp_tool_usage_counts.is_empty(),
+            ),
+            (
+                "activity_mcp_call_ids",
+                !acc.activity_mcp_call_ids.is_empty(),
+            ),
+            (
+                "compaction_timestamps",
+                !acc.compaction_timestamps.is_empty(),
+            ),
+            (
+                "codex_dictionary_slots",
+                !acc.codex_dictionary_slots.is_empty(),
             ),
         ]
         .into_iter()
@@ -328,14 +377,10 @@ impl TailSource for Claude {
     fn install_live(
         _stored: &mut SnapshotAccumulator,
         _fresh: &CandidateFile,
+        _live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError> {
         Ok(())
     }
-}
-
-/// A capability bucket's start: the first part of its key.
-fn capability_hour(key: &(String, String, String)) -> &str {
-    &key.0
 }
 
 #[cfg(test)]

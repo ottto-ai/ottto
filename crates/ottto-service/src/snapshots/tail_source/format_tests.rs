@@ -163,6 +163,7 @@ fn legacy_erasure_is_counted_before_the_first_load() {
             &mut held,
             &scope(),
             &fresh,
+            &SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
         )
     });
     assert!(matches!(load, Load::Reused(_, Some(_))));
@@ -208,17 +209,18 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
         .all(|epoch| *epoch == claude_request_money::e2::RULE_EPOCH));
 }
 
-/// [behaviour] L01: only Claude has a codec, whatever the registry's
-/// `state_v2` flag says, and each source's counters stay on its own line.
+/// [behaviour] L01: Claude and Codex have codecs and Pi has none, whatever
+/// the registry's `state_v2` flag says, and each source's counters stay on
+/// its own line.
 #[test]
-fn only_claude_has_a_codec_and_counters_stay_per_source() {
+fn claude_and_codex_have_codecs_and_counters_stay_per_source() {
     let route = route();
-    assert!(has_codec(SnapshotSource::ClaudeCode));
-    assert!(tail_route(SnapshotSource::ClaudeCode, &route.index).is_some());
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        assert!(!has_codec(source));
-        assert!(tail_route(source, &route.index).is_none());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        assert!(has_codec(source));
+        assert!(tail_route(source, &route.index).is_some());
     }
+    assert!(!has_codec(SnapshotSource::Pi));
+    assert!(tail_route(SnapshotSource::Pi, &route.index).is_none());
     counters::bump(SnapshotSource::ClaudeCode, "tail_db_loads", "hit");
     let ((), codex) = capture(|| counters::emit(SnapshotSource::Codex));
     assert!(codex.is_empty());
