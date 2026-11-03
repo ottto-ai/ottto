@@ -27,6 +27,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
   accepted, and parts the server did accept stay recorded.
 
+Stale-older refusals from current servers mean the server already holds the
+newer usage. Earlier refusals stay counted as owed, with their dispositions
+unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
+use retained bodies; transcripts are read again only for changed input. Unknown
+non-permanent reasons hold their entity without invalidating sibling ACKs. See
+[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
