@@ -164,6 +164,7 @@ macro_rules! codex_cursor_events {
 pub(crate) use codex_cursor_events;
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod change_reason;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
@@ -684,7 +685,7 @@ pub(crate) enum UnselectedReason {
 }
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
-const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
+const UNSELECTED_REASONS: usize = change_reason::END;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -694,9 +695,13 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
         const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
+fn source_slot(source: &str) -> Option<usize> {
+    ["claude_code", "codex", "pi"]
+        .iter()
+        .position(|s| *s == source)
+}
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
-    let sources = ["claude_code", "codex", "pi"];
-    let Some(slot) = sources.iter().position(|s| *s == source) else {
+    let Some(slot) = source_slot(source) else {
         return 0;
     };
     #[cfg(test)]
@@ -1126,6 +1131,8 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            change_reasons: Option<change_reason::Page>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -1160,6 +1167,7 @@ impl Probe {
                 })
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
+            change_reasons: change_reason::drain(source),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
