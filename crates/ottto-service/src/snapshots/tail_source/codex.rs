@@ -771,3 +771,7 @@ impl Trailer {
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
     }
 }
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+pub(in crate::snapshots) mod tests;

@@ -3129,6 +3129,9 @@ mod state_v2_money_tests {
 #[cfg(unix)]
 mod s2_oracle_tests;
 
+#[cfg(unix)]
+mod codex_tail_oracle_tests;
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {

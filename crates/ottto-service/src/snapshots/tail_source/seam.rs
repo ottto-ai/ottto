@@ -351,3 +351,6 @@ fn log_pages<S: TailSource>(
 #[cfg(test)]
 #[path = "seam_tests.rs"]
 pub(in crate::snapshots::tail_source) mod tests;
+#[cfg(test)]
+#[path = "transition_tests.rs"]
+mod transition_tests;
