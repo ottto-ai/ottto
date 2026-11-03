@@ -557,6 +557,15 @@ impl Uploader {
         );
         Ok((counts.files, counts.bytes))
     }
+    /// As a mid-pass checkpoint commit: the ledger's ACKs so far become the
+    /// index's durable stamps.
+    pub(crate) fn checkpoint_stamps(&self, index: &mut ScanIndex) {
+        index.stamp_entity_upload_context_acks(
+            &self.progress.destination_namespace_hash,
+            &self.progress.accepted_body_witnesses,
+            &self.progress.accepted_body_contexts,
+        );
+    }
     pub(crate) fn finish_adopted_index(
         &mut self,
         index: &mut ScanIndex,

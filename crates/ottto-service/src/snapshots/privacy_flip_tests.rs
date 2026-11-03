@@ -4,6 +4,9 @@ use super::*;
 use crate::snapshots::privacy_flip_modes::{all, link, Flip, Mode, FLIPS};
 use serde_json::Value;
 
+#[path = "privacy_flip_tail_tests.rs"]
+mod tail_rows;
+
 const SOURCES: [SnapshotSource; 3] = [
     SnapshotSource::ClaudeCode,
     SnapshotSource::Codex,
@@ -53,6 +56,8 @@ fn attribution(
 struct Walked {
     scan: SourceScanResult,
     retained: Vec<Value>,
+    modes: (usize, usize, usize),
+    bytes: u64,
 }
 
 impl Fixture {
@@ -100,7 +105,16 @@ impl Fixture {
             self.cache.clone(),
             crate::transcript_acquisition::Scope("upload-context-fixture".into()),
         );
+        let (mut modes, mut bytes) = ((0, 0, 0), 0);
         loop {
+            if let Some(sampling) = scan.sampling.as_ref() {
+                modes = (
+                    sampling.full_files,
+                    sampling.tail_files,
+                    sampling.unchanged_files,
+                );
+                bytes = sampling.native_bytes;
+            }
             match scan.step(attribution) {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete {
@@ -119,7 +133,12 @@ impl Fixture {
                         .collect();
                     apply_upload_policy(self.source, &mut scan.snapshots, policy);
                     finalize_scan_after_policy(self.source, &mut scan, &mut self.index);
-                    return Walked { scan, retained };
+                    return Walked {
+                        scan,
+                        retained,
+                        modes,
+                        bytes,
+                    };
                 }
             }
         }
