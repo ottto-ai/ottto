@@ -276,7 +276,6 @@ pub(super) fn resolve(
                 if let Some(entry) = index.files.get_mut(&key) {
                     entry.evidence_owed = false;
                 }
-                return;
             }
             Err(refusal) => claude_contract::note(|c| {
                 let owed = &mut c.evidence_owed;

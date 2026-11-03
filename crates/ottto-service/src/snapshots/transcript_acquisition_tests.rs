@@ -5170,7 +5170,7 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             production_scan(&f, source, ScanIndex::default(), None, "rearm-cause");
         let key = local_index_key(&f.file.0);
         rearm_cause::retain(&index);
-        rearm_cause::clear(&key, index.files.get_mut(&key).unwrap(), cause);
+        rearm_cause::clear_owed(&key, index.files.get_mut(&key).unwrap(), cause, false);
         // The actual sync path reloads an index between pages in one process.
         let encoded = serde_json::to_vec(&index).unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains("rearm_cleared"));

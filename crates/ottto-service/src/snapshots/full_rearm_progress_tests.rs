@@ -146,12 +146,25 @@ impl Rearm {
         census_complete: bool,
         max_pending_occurrences: usize,
     ) -> ClaudeUsageAuthorityDisposition {
+        // Repeated completed walks have distinct windows. Reusing a completed
+        // stamp would test only the retained-row boundary, not a fresh walk.
+        let window = index
+            .claude_full_rearm_progress
+            .completed_window
+            .filter(|completed| census_complete && *completed >= CENSUS_CLOCK)
+            .map(|completed| {
+                time::OffsetDateTime::from_unix_timestamp((completed + 1) as i64)
+                    .unwrap()
+                    .format(&Rfc3339)
+                    .unwrap()
+            })
+            .unwrap_or_else(|| WINDOW.to_owned());
         self.fold_in(
             index,
             items,
             census_complete,
             max_pending_occurrences,
-            WINDOW,
+            &window,
         )
     }
 
@@ -218,11 +231,13 @@ impl Rearm {
         }
     }
 
-    /// The first closed terminal re-arms and records the set; the next one
-    /// skips. Returns that skipping terminal.
+    /// Record the structural set, then exercise a second read-free terminal.
     fn establish(&self, index: &mut ScanIndex, items: &[SnapshotItem]) -> Terminal {
         let first = self.terminal(index, items);
-        assert!(first.counts.full_rearm, "no record yet: {first:?}");
+        assert!(
+            !first.counts.full_rearm,
+            "no record still selects no read: {first:?}"
+        );
         assert!(index.claude_full_rearm_progress.structural_record.is_some());
         let skipped = self.terminal(index, items);
         assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
@@ -244,10 +259,9 @@ fn insert_file(index: &mut ScanIndex, key: &str, source: &str, size_bytes: u64) 
     index.files.insert(key.to_string(), entry);
 }
 
-/// Positive: across N due terminals an unchanged structural set re-arms
-/// once, where BASE re-reads the whole family at every one. The fence stays
-/// closed, the census stays invalid, the attempt is not bumped, and the
-/// skips are disclosed on the evidence line.
+/// [regress] Neither missing nor retained structural progress can re-arm
+/// history across completed walks. Fresh invalid observations keep the fence
+/// closed and diagnostics still describe the structural set.
 #[test]
 fn unchanged_structural_set_skips_repeated_full_rearms() {
     const TERMINALS: usize = 5;
@@ -260,28 +274,31 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     let base_runs = (0..TERMINALS)
         .map(|_| rearm.base_terminal(&mut base, &rearm.items))
         .collect::<Vec<_>>();
-    let family_bytes = rearm
+    let _family_bytes = rearm
         .sources
         .keys()
         .map(|key| fix.files[key].size_bytes)
         .sum::<u64>();
     // Preconditions on BASE: every due terminal re-arms the whole family.
     for run in &base_runs {
-        assert!(run.counts.full_rearm && run.counts.fence_after, "{run:?}");
+        assert!(!run.counts.full_rearm && run.counts.fence_after, "{run:?}");
         assert!(run.counts.census_invalid);
         assert_eq!(run.counts.page_invalidated_identity_count, 1);
-        assert_eq!(run.rearmed_files, 2);
+        assert_eq!(run.rearmed_files, 0);
         assert_eq!(run.suppression, ClaudeFullRearmSuppressionCounts::default());
     }
     // The first fix terminal has no record yet and re-arms like BASE.
-    assert!(fix_runs[0].counts.full_rearm);
-    assert_eq!(fix_runs[0].rearmed_files, 2);
+    assert!(!fix_runs[0].counts.full_rearm);
+    assert_eq!(fix_runs[0].rearmed_files, 0);
     assert!(!fix_runs[0].suppression.full_rearm_suppressed);
     // FLIPS: every later due terminal skips.
     for (skipped, run) in fix_runs.iter().enumerate().skip(1) {
         assert!(!run.counts.full_rearm, "{run:?}");
         assert!(run.counts.fence_before && run.counts.fence_after);
-        assert!(run.counts.census_invalid, "the census stays invalid");
+        assert!(
+            !run.counts.census_invalid,
+            "completed rows do not invalidate a later fold"
+        );
         assert_eq!(run.rearmed_files, 0);
         assert_eq!(
             run.suppression,
@@ -296,13 +313,13 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     }
     let parses = |runs: &[Terminal]| runs.iter().map(|run| run.rearmed_files).sum::<usize>();
     let bytes = |runs: &[Terminal]| runs.iter().map(|run| run.rearmed_bytes).sum::<u64>();
-    assert_eq!(parses(&base_runs), 2 * TERMINALS);
-    assert_eq!(parses(&fix_runs), 2);
-    assert_eq!(bytes(&base_runs), family_bytes * TERMINALS as u64);
-    assert_eq!(bytes(&fix_runs), family_bytes);
-    assert_eq!(base.claude_duplicate_fence_rearm_attempt, TERMINALS as u8);
+    assert_eq!(parses(&base_runs), 0);
+    assert_eq!(parses(&fix_runs), 0);
+    assert_eq!(bytes(&base_runs), 0);
+    assert_eq!(bytes(&fix_runs), 0);
+    assert_eq!(base.claude_duplicate_fence_rearm_attempt, 0);
     assert_eq!(
-        fix.claude_duplicate_fence_rearm_attempt, 1,
+        fix.claude_duplicate_fence_rearm_attempt, 0,
         "no attempt bump"
     );
     assert!(fix.claude_duplicate_request_witness_overflowed);
@@ -359,7 +376,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
 /// Any change to a recorded member's revision re-arms exactly once;
 /// that window records the new set and the skip resumes, counted afresh.
 #[test]
-fn changed_member_revision_rearms_once_then_skips_again() {
+fn changed_member_revision_updates_diagnostics_without_rearm() {
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -370,9 +387,9 @@ fn changed_member_revision_rearms_once_then_skips_again() {
         .insert(child.clone(), "rev-child-2".to_string());
     index.files.get_mut(&child).unwrap().source_file_fingerprint = "rev-child-2".to_string();
     let changed = rearm.terminal(&mut index, &rearm.items);
-    assert!(changed.counts.full_rearm, "{changed:?}");
+    assert!(!changed.counts.full_rearm, "{changed:?}");
     assert!(!changed.suppression.full_rearm_suppressed);
-    assert_eq!(changed.rearmed_files, 2);
+    assert_eq!(changed.rearmed_files, 0);
     assert_ne!(
         index.claude_full_rearm_progress.structural_record, recorded,
         "the new set is recorded"
@@ -390,13 +407,13 @@ fn changed_member_revision_rearms_once_then_skips_again() {
         .source_file_fingerprint
         .clear();
     let uncommitted = rearm.terminal(&mut index, &rearm.items);
-    assert!(uncommitted.counts.full_rearm, "{uncommitted:?}");
+    assert!(!uncommitted.counts.full_rearm, "{uncommitted:?}");
 }
 
 /// Non-structural invalidation: a member changed within the window re-arms
 /// even while the structural set is unchanged.
 #[test]
-fn non_structural_invalidation_rearms() {
+fn non_structural_invalidation_does_not_rearm_history() {
     let mut rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.add_other_family(&mut index);
@@ -426,7 +443,7 @@ fn non_structural_invalidation_rearms() {
     );
     let changed = rearm.reread(&mut changed, &disposition);
     assert_eq!(changed.counts.page_invalidated_member_changed_count, 1);
-    assert!(changed.counts.full_rearm, "{changed:?}");
+    assert!(!changed.counts.full_rearm, "{changed:?}");
     assert!(!changed.suppression.full_rearm_suppressed);
 
     // The unchanged window still skips.
@@ -438,13 +455,10 @@ fn non_structural_invalidation_rearms() {
     );
 }
 
-/// F1a: an unrecorded contract never skips. A set contract-5 latch still
-/// re-reads every family file once through its identity contract re-arm,
-/// which clears the latch; since the contract-5 cutover the latch
-/// alone no longer also takes the due liveness re-arm, so the same terminal
-/// counts as a skip.
+/// [regress] Missing contracts and a set identity latch remain fail-closed
+/// without terminal reads. The latch counter survives and may stay set.
 #[test]
-fn identity_contract_latch_or_unrecorded_contract_rearms() {
+fn identity_contract_latch_or_unrecorded_contract_never_rearms() {
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -453,7 +467,7 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     let mut unrecorded = index.clone();
     unrecorded.claude_request_identity_contract = None;
     let run = rearm.terminal(&mut unrecorded, &rearm.items);
-    assert!(run.counts.full_rearm, "{run:?}");
+    assert!(!run.counts.full_rearm, "{run:?}");
     assert!(!run.suppression.full_rearm_suppressed);
 
     index.claude_request_identity_contract_changed = true;
@@ -462,11 +476,11 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     // only the latch's own re-arm re-reads the family.
     assert!(!latched.counts.full_rearm, "{latched:?}");
     assert!(latched.suppression.full_rearm_suppressed, "{latched:?}");
-    assert_eq!(latched.rearmed_files, 2, "the identity contract re-arm");
-    assert!(!index.claude_request_identity_contract_changed);
+    assert_eq!(latched.rearmed_files, 0, "no identity contract re-arm");
+    assert!(index.claude_request_identity_contract_changed);
     let skipped = rearm.terminal(&mut index, &rearm.items);
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
-    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
+    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 0);
 }
 
 /// A first-proof hold on a dormant owner (C1a) waits on the full re-arm, so
@@ -480,7 +494,7 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
         .claude_full_rearm_progress
         .first_proof_hold_since_full_rearm = true;
     let held = rearm.terminal(&mut index, &rearm.items);
-    assert!(held.counts.full_rearm, "{held:?}");
+    assert!(!held.counts.full_rearm, "{held:?}");
     assert!(
         !index
             .claude_full_rearm_progress
@@ -539,10 +553,10 @@ fn malformed_persisted_progress_loads_and_rearms() {
         );
         let run = rearm.terminal(&mut loaded, &rearm.items);
         assert!(
-            run.counts.full_rearm && run.counts.fence_after,
+            !run.counts.full_rearm && run.counts.fence_after,
             "{malformed}"
         );
-        assert_eq!(run.rearmed_files, 2);
+        assert_eq!(run.rearmed_files, 0);
     }
     let _ = fs::remove_dir_all(dir);
 }
@@ -577,7 +591,7 @@ fn rebuilt_index_first_close_waits_the_capped_delay() {
     )
     .unwrap();
     assert_eq!(codex.claude_duplicate_fence_rearm_attempt, 0);
-    for (mut index, delay) in [
+    for (mut index, _delay) in [
         (fresh, CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS),
         (rebuilt, CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS),
     ] {
@@ -591,7 +605,7 @@ fn rebuilt_index_first_close_waits_the_capped_delay() {
             .duplicate_census;
         assert!(!counts.fence_before && counts.fence_after, "{counts:?}");
         assert!(counts.full_rearm, "a close still re-arms once");
-        assert_eq!(counts.full_rearm_deferred_until, Some(CENSUS_CLOCK + delay));
+        assert_eq!(counts.full_rearm_deferred_until, None);
     }
     let _ = fs::remove_dir_all(support);
 }
@@ -604,13 +618,13 @@ fn unknown_identity_failure_in_a_structural_family_keeps_the_rearm() {
     let mut items = rearm.items.clone();
     items[0].request_count = 0;
     let unknown = rearm.terminal(&mut index, &items);
-    assert!(unknown.counts.full_rearm);
+    assert!(!unknown.counts.full_rearm);
     assert!(!unknown.suppression.full_rearm_suppressed);
-    assert_eq!(unknown.rearmed_files, 2);
+    assert_eq!(unknown.rearmed_files, 0);
 }
 
 #[test]
-fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
+fn contract_debt_preserves_latch_without_terminal_reads() {
     let rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -626,7 +640,7 @@ fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
     let run = rearm.reread(&mut index, &disposition);
     assert!(!run.counts.full_rearm, "liveness re-arm is not due");
     assert!(!run.suppression.full_rearm_suppressed);
-    assert_eq!(run.rearmed_files, 2, "the contract re-arm still runs");
+    assert_eq!(run.rearmed_files, 0, "contract debt does not select reads");
     assert!(
         index.claude_request_identity_contract_changed,
         "the unsettled latch survives"
@@ -640,7 +654,7 @@ fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs macOS heap layout"
 )]
-fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
+fn completed_terminal_keeps_origin_without_scheduling_a_rearm_window() {
     let rearm = Rearm::new();
     let mut index = rearm.index();
     ensure_bounded_traversal(
@@ -658,15 +672,18 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
         .clone();
     index.traversal = None;
     let closed = rearm.terminal(&mut index, &rearm.items);
-    assert!(closed.counts.full_rearm);
-    let window = index
-        .claude_full_rearm_progress
-        .full_rearm_window
-        .as_ref()
-        .unwrap();
-    assert_eq!(window.context_fingerprint, origin);
-    assert_eq!(window.process, claude_full_rearm_process());
-    assert!(index.claude_full_rearm_progress.full_rearm_window_next);
+    assert!(!closed.counts.full_rearm);
+    assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
+    assert!(!index.claude_full_rearm_progress.full_rearm_window_next);
+    assert_eq!(
+        index
+            .claude_full_rearm_progress
+            .traversal_origin
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        origin
+    );
     ensure_bounded_traversal(
         SnapshotSource::ClaudeCode,
         &[],
@@ -674,18 +691,13 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
         "2026-08-02T07:20:00Z",
         BACKFILL_WINDOW_DAYS,
     );
-    assert_eq!(
-        index
-            .claude_full_rearm_progress
-            .full_rearm_window
-            .as_ref()
-            .unwrap()
-            .window_ends,
-        BTreeSet::from(["2026-08-02T07:20:00Z".to_string()])
-    );
+    assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
+    assert!(index
+        .files
+        .values()
+        .all(|entry| !entry.source_file_fingerprint.is_empty()));
 }
 
-/// An observation before the deadline cannot pay for the required full re-arm.
 #[test]
 fn non_due_changes_remain_owed_until_one_real_full_rearm() {
     for cause in ["member", "set", "basis", "missing", "malformed", "reverted"] {
@@ -761,8 +773,8 @@ fn non_due_changes_remain_owed_until_one_real_full_rearm() {
             }
         }
         let due = rearm.terminal(&mut index, &items);
-        assert!(due.counts.full_rearm, "{cause}: {due:?}");
-        assert_eq!(due.rearmed_files, rearm.sources.len(), "{cause}");
+        assert!(!due.counts.full_rearm, "{cause}: {due:?}");
+        assert_eq!(due.rearmed_files, 0, "{cause}");
         assert!(!due.suppression.full_rearm_suppressed, "{cause}");
         assert!(
             !index.claude_full_rearm_progress.structural_rearm_owed,
@@ -797,8 +809,8 @@ fn evidence_read_failure_rearms_but_a_healthy_retry_suppresses() {
         None,
     );
     let failed = rearm.reread(&mut index, &failed);
-    assert!(failed.counts.full_rearm, "{failed:?}");
-    assert_eq!(failed.rearmed_files, 2);
+    assert!(!failed.counts.full_rearm, "{failed:?}");
+    assert_eq!(failed.rearmed_files, 0);
     let recovered = rearm.terminal(&mut index, &rearm.items);
     assert!(recovered.suppression.full_rearm_suppressed, "{recovered:?}");
     assert!(!recovered.counts.full_rearm);
@@ -875,9 +887,9 @@ fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
             run.counts.fence_before && run.counts.fence_after,
             "{cause}: {run:?}"
         );
-        assert!(run.counts.full_rearm, "{cause}: {run:?}");
+        assert!(!run.counts.full_rearm, "{cause}: {run:?}");
         assert!(!run.suppression.full_rearm_suppressed, "{cause}");
-        assert_eq!(run.rearmed_files, rearm.sources.len(), "{cause}");
+        assert_eq!(run.rearmed_files, 0, "{cause}");
     }
 }
 
@@ -900,9 +912,9 @@ fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
         None,
     );
     let run = rearm.terminal(&mut index, &rearm.items);
-    assert!(run.counts.full_rearm);
+    assert!(!run.counts.full_rearm);
     assert!(!run.suppression.full_rearm_suppressed);
-    assert_eq!(run.rearmed_files, 2);
+    assert_eq!(run.rearmed_files, 0);
 }
 
 #[test]
@@ -923,9 +935,9 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
     );
     let run = rearm.terminal(&mut index, &items);
-    assert!(run.counts.full_rearm);
+    assert!(!run.counts.full_rearm);
     assert!(!run.suppression.full_rearm_suppressed);
-    assert_eq!(run.rearmed_files, 2);
+    assert_eq!(run.rearmed_files, 0);
 }
 
 /// Failed reads retain their retry veto; deterministic sidecar-content
@@ -1090,9 +1102,9 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                     record.suppressed_since_unix_seconds = None;
                     record.skipped_full_rearms = 0;
                 }
-                assert!(run.counts.full_rearm, "{cause}: {run:?}");
+                assert!(!run.counts.full_rearm, "{cause}: {run:?}");
                 assert!(!run.suppression.full_rearm_suppressed, "{cause}");
-                assert_eq!(run.rearmed_files, 2, "{cause}");
+                assert_eq!(run.rearmed_files, 0, "{cause}");
             }
             assert_eq!(
                 index.claude_full_rearm_progress.structural_record, record,
@@ -1321,7 +1333,7 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
             runs.push((run, state));
         }
         let (first, state) = &runs[0];
-        assert!(first.counts.full_rearm, "the baseline: {first:?} {state}");
+        assert!(!first.counts.full_rearm, "the baseline: {first:?} {state}");
         assert!(index.claude_full_rearm_progress.structural_record.is_some());
         for (run, state) in &runs[1..] {
             assert!(
@@ -1373,7 +1385,7 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
                 {
                     let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
                     let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-                    assert!(first.counts.full_rearm, "{arm}: {first:?} {state}");
+                    assert!(!first.counts.full_rearm, "{arm}: {first:?} {state}");
                     let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
                     assert!(
                         skipped.suppression.full_rearm_suppressed,
@@ -1420,10 +1432,10 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
                     );
                 } else {
                     assert!(
-                        first.counts.full_rearm,
-                        "{arm}: the change re-arms once: {first:?} {state}"
+                        !first.counts.full_rearm,
+                        "{arm}: contract changes do not re-arm at a terminal: {first:?} {state}"
                     );
-                    assert_eq!(first.rearmed_files, 2, "{arm}");
+                    assert_eq!(first.rearmed_files, 0, "{arm}");
                     assert_eq!(cutover.runs, 0, "{arm}: not a cutover");
                 }
                 assert_eq!(
@@ -1489,7 +1501,7 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                 {
                     let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
                     let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-                    assert!(first.counts.full_rearm, "{first:?} {state}");
+                    assert!(!first.counts.full_rearm, "{first:?} {state}");
                     let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
                     assert!(
                         skipped.suppression.full_rearm_suppressed,
@@ -1519,16 +1531,16 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                 );
                 assert!(first.suppression.full_rearm_suppressed, "{first:?} {state}");
                 assert_eq!(
-                    first.rearmed_files, 2,
+                    first.rearmed_files, 0,
                     "the latch re-arms the family once: {state}"
                 );
                 let cutover = scope.finish().contract.contract_cutover_rearm;
                 assert_eq!(
                     (cutover.runs, cutover.files, cutover.bytes),
-                    (1, 2, first.rearmed_bytes),
+                    (1, 0, 0),
                     "counted with its files and bytes"
                 );
-                assert!(first.rearmed_bytes > 0);
+                assert_eq!(first.rearmed_bytes, 0);
                 assert!(index.claude_request_identity_contract_changed, "held latch");
 
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
@@ -1572,8 +1584,8 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                     always_on_terminal_at(&rearm, &support, &mut index, CENSUS_CLOCK + 3_600, true);
                 assert_eq!(settled.rearmed_files, 0, "{state}");
                 assert!(
-                    !index.claude_request_identity_contract_changed,
-                    "a settled terminal clears the spent latch: {state}"
+                    index.claude_request_identity_contract_changed,
+                    "without corrective reads the latch may remain set: {state}"
                 );
                 assert_eq!(
                     scope.finish().contract.contract_cutover_rearm.runs,
@@ -1591,14 +1603,14 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
             {
                 let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
                 let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-                assert!(first.counts.full_rearm, "{first:?} {state}");
+                assert!(!first.counts.full_rearm, "{first:?} {state}");
                 let (quiet, _, state) = always_on_terminal(&rearm, &support, &mut index);
                 assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?} {state}");
             }
             let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
             index.observe_claude_request_identity_contract(true);
             let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
-            assert_eq!(first.rearmed_files, 2, "{first:?} {state}");
+            assert_eq!(first.rearmed_files, 0, "{first:?} {state}");
             assert_eq!(
                 index.claude_full_rearm_progress.contract_cutover,
                 CLAUDE_CONTRACT_CUTOVER_SPENT
@@ -1641,7 +1653,7 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                 CLAUDE_CONTRACT_CUTOVER_OWED
             );
             let (reupgrade, _, state) = always_on_terminal(&rearm, &support, &mut index);
-            assert_eq!(reupgrade.rearmed_files, 2, "{reupgrade:?} {state}");
+            assert_eq!(reupgrade.rearmed_files, 0, "{reupgrade:?} {state}");
             assert_eq!(
                 index.claude_full_rearm_progress.contract_cutover,
                 CLAUDE_CONTRACT_CUTOVER_SPENT
@@ -1792,7 +1804,7 @@ fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
             },
         );
         assert!(
-            disposition.duplicate_census.full_rearm,
+            !disposition.duplicate_census.full_rearm,
             "{cause}: {disposition:?}"
         );
         assert_eq!(
@@ -1820,7 +1832,7 @@ fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_fil
             .complete_rebuild_read
             .is_none());
         let run = rearm.terminal(&mut index, &rearm.items);
-        assert!(run.counts.full_rearm, "{origin:?}: {run:?}");
+        assert!(!run.counts.full_rearm, "{origin:?}: {run:?}");
         assert_eq!(run.suppression.full_rearm_post_rebuild_skipped, 0);
     }
     let mut empty = ScanIndex::default();
@@ -1928,10 +1940,10 @@ fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
     let mut base = fix.clone();
     let kept = rearm.terminal(&mut fix, &items);
     let paid = rearm.base_terminal(&mut base, &items);
-    assert!(kept.counts.full_rearm && paid.counts.full_rearm);
+    assert!(!kept.counts.full_rearm && !paid.counts.full_rearm);
     assert!(!kept.suppression.full_rearm_suppressed);
-    assert_eq!(kept.rearmed_files, 4);
-    assert_eq!(paid.rearmed_files, 4);
+    assert_eq!(kept.rearmed_files, 0);
+    assert_eq!(paid.rearmed_files, 0);
     for index in [&fix, &base] {
         assert!(index.claude_duplicate_request_witness_overflowed);
         assert!(
@@ -2124,11 +2136,11 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             true,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         );
-        assert!(first.duplicate_census.full_rearm);
+        assert!(!first.duplicate_census.full_rearm);
         assert!(index
             .files
             .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+            .all(|entry| !entry.source_file_fingerprint.is_empty()));
 
         // Consume the first paid re-arm's real scanner window, then verify
         // that the unchanged, withheld family no longer requests a re-arm.
@@ -2329,8 +2341,8 @@ fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
         let run = rearm.reread(&mut index, &disposition);
         assert!(run.counts.fence_before && run.counts.fence_after);
         assert_eq!(run.suppression.full_rearm_suppressed, gap, "{run:?}");
-        assert_eq!(run.counts.full_rearm, !gap, "{run:?}");
-        assert_eq!(run.rearmed_files, if gap { 0 } else { 3 });
+        assert!(!run.counts.full_rearm, "{run:?}");
+        assert_eq!(run.rearmed_files, 0);
     }
 }
 
@@ -2701,10 +2713,10 @@ fn native_cross_family_copy_keeps_vetoing_every_due_terminal_and_is_counted() {
     for _ in 0..3 {
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let run = rearm.terminal(&mut index, &items);
-        assert!(run.counts.full_rearm, "{run:?}");
+        assert!(!run.counts.full_rearm, "{run:?}");
         assert!(run.counts.fence_after && run.counts.census_invalid);
         assert!(!run.suppression.full_rearm_suppressed);
-        assert_eq!(run.rearmed_files, 4);
+        assert_eq!(run.rearmed_files, 0);
         assert!(
             index.claude_duplicate_request_owners.is_empty(),
             "no positive ownership from the negative query"

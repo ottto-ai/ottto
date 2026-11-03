@@ -3924,7 +3924,7 @@ fn resumed_codex_page_preserves_claude_full_cause() {
     let key = carry_key(CARRY_ROOT, None);
     let mut entry = manifest_index_entry(Some("accepted"));
     entry.source_file_fingerprint = "proven".into();
-    rearm_cause::clear(&key, &mut entry, rearm_cause::Cause::ContextChanged);
+    rearm_cause::clear_owed(&key, &mut entry, rearm_cause::Cause::ContextChanged, false);
 
     let mut codex = ScanIndex::default();
     ensure_bounded_traversal(
@@ -4497,13 +4497,22 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
             );
         }
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let mut reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
         let counts = scope.finish().contract.evidence_owed;
         assert_eq!(
             (counts.restamped, counts.refused_record, reads.len()),
-            if api_error { (1, 1, 1) } else { (2, 0, 0) },
+            if api_error { (1, 1, 0) } else { (2, 0, 0) },
             "api_error={api_error}"
         );
+        // A later independent selection may still rebuild the refused member;
+        // the owed resolver itself selected no read.
+        for candidate in &candidates {
+            let key = local_index_key(&candidate.path);
+            if owed.files[&key].evidence_owed {
+                reads.push(candidate.path.clone());
+                owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+            }
+        }
         let read = items
             .iter()
             .filter(|item| {
@@ -4613,7 +4622,7 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
             rearm_cause::Cause::TerminalUnhealthyRetry,
         );
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let mut reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
         let counts = scope.finish().contract.evidence_owed;
         assert_eq!(
             (
@@ -4621,9 +4630,14 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                 counts.restamped,
                 reads.len()
             ),
-            (1, 0, 1),
-            "{session}: read"
+            (1, 0, 0),
+            "{session}: refusal stays owed"
         );
+        assert!(owed.files[&key].evidence_owed);
+        // Model an independently selected read, then retain the money oracle.
+        for candidate in &candidates {
+            owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+        }
         let bodies = fold_real(&mut owed, &items, CARRY_RETRY);
         census(&mut owed, CARRY_RETRY);
         assert_bodies_equal_a_full(&full_bodies, &bodies);
@@ -4726,7 +4740,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
         ("placeholder", placeholder),
     ] {
         let (parsed, counts) = visit(&mut index);
-        assert_eq!(parsed, 2, "{name}");
+        assert_eq!(parsed, 0, "{name}");
         assert_eq!(
             (counts.refused_contract_latch, counts.restamped),
             (2, 0),
@@ -4741,7 +4755,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
     // After an exempt latch clear and the quarantine lifting, the family
     // proves its contract only through its own stamp: without it every owed
     // member takes the Full path, never a re-stamp through the cleared latch.
-    for (stamped, parsed, restamped, refused) in [(false, 2, 0, 2), (true, 0, 2, 0)] {
+    for (stamped, parsed, restamped, refused) in [(false, 0, 0, 2), (true, 0, 2, 0)] {
         let mut index = fixture.index.clone();
         index.claude_request_identity_contract_changed = false;
         stamp(&mut index, stamped.then_some(current).flatten());
@@ -4827,7 +4841,7 @@ fn owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch() {
 /// cold Full's under the current contract (the emitted-money oracle, with
 /// placement), as does the family pending.
 #[test]
-fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
+fn owed_evidence_old_contract_refuses_without_read_then_independent_read_equals_full() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4880,10 +4894,13 @@ fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
             counts.identity_owed_read_under_latch,
             counts.restamped
         ),
-        (2, 2, 2, 2, 0),
+        (0, 0, 2, 0, 0),
         "{counts:?}"
     );
-    assert!(owed.files.values().all(|entry| !entry.evidence_owed));
+    assert!(owed.files.values().all(|entry| entry.evidence_owed));
+    for candidate in &candidates {
+        owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+    }
     let bodies = fold_real(&mut owed, &items, CARRY_RETRY);
     assert_bodies_equal_a_full(&full_bodies, &bodies);
     assert_eq!(
@@ -4893,11 +4910,10 @@ fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [behaviour] Owed Fulls share ONE per-page allowance
-/// (the paced history-upgrade re-read budget). Past it an owed read is
-/// deferred, counted, and requeued as a non-member re-read, still owed.
+/// [regress] A refused unchanged member stays owed without selecting a
+/// Full or adding a retry to the traversal, regardless of the old allowance.
 #[test]
-fn owed_evidence_reads_are_capped_per_page() {
+fn refused_owed_evidence_never_reads_or_requeues() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4920,7 +4936,7 @@ fn owed_evidence_reads_are_capped_per_page() {
             counts.refused_no_pending,
             counts.restamped
         ),
-        (3, 3, 3, 0)
+        (0, 0, 3, 0)
     );
 
     let queued = fixture
@@ -4937,9 +4953,9 @@ fn owed_evidence_reads_are_capped_per_page() {
     };
     let parsed = owed_selected_parses(&mut fixture.index, &mut page, &fixture.candidates, &window);
     let counts = scope.finish().contract.evidence_owed;
-    assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
+    assert_eq!((parsed, counts.deferred_page_cap, counts.read), (0, 0, 0));
     let traversal = fixture.index.traversal.as_ref().unwrap();
-    assert_eq!(traversal.pending_candidates.len(), queued + 2);
+    assert_eq!(traversal.pending_candidates.len(), queued);
     assert!(traversal
         .pending_candidates
         .iter()
@@ -5137,7 +5153,8 @@ fn context_restart_never_owes_invalid_rows_and_replay_still_clears() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for replay in [false, true] {
+    for mode in ["context", "no_retained", "replay"] {
+        let replay = mode == "replay";
         let (mut fixture, _) = owed_rearmed(2);
         let window = fixture
             .index
@@ -5173,12 +5190,29 @@ fn context_restart_never_owes_invalid_rows_and_replay_still_clears() {
             .map(|c| c.scan_root.clone())
             .into_iter()
             .collect::<Vec<_>>();
+        if mode == "no_retained" {
+            fixture.index.traversal = None;
+        }
+        let start_roots = if mode == "no_retained" {
+            &[][..]
+        } else {
+            &scan_roots[..]
+        };
         ensure_bounded_traversal(
             SnapshotSource::ClaudeCode,
-            &scan_roots,
+            start_roots,
             &mut fixture.index,
             &window,
-            BACKFILL_WINDOW_DAYS + 1,
+            BACKFILL_WINDOW_DAYS + u64::from(mode != "no_retained"),
+        );
+        assert_eq!(
+            fixture
+                .index
+                .claude_usage_family_pending
+                .roots()
+                .cloned()
+                .collect::<Vec<_>>(),
+            roots
         );
         for candidate in &candidates {
             let key = local_index_key(&candidate.path);
@@ -5189,6 +5223,9 @@ fn context_restart_never_owes_invalid_rows_and_replay_still_clears() {
             }
             if member.root == invalid {
                 assert!(!entry.evidence_owed);
+            } else if !replay {
+                assert!(entry.evidence_owed, "{mode}: valid evidence remains owed");
+                assert!(!entry.source_file_fingerprint.is_empty());
             }
         }
     }

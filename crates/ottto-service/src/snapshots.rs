@@ -45537,7 +45537,14 @@ fn ensure_bounded_traversal(
             retained: index
                 .traversal
                 .as_ref()
-                .map(|t| t.context_fingerprint.as_str()),
+                .map(|t| t.context_fingerprint.as_str())
+                .or_else(|| {
+                    index
+                        .claude_full_rearm_progress
+                        .traversal_origin
+                        .as_ref()
+                        .map(|origin| origin.context_fingerprint.as_str())
+                }),
             backfill: backfill_window_days,
             active: index.active_upload_context_fingerprint.as_deref(),
             replay: index.historical_replay_generation.as_deref(),
@@ -45803,8 +45810,7 @@ fn ensure_bounded_traversal(
             .claude_usage_family_pending
             .views()
             .filter(|(_, pending)| {
-                pending.window() != collected_at
-                    && (!transition.owes() || !claude_pending_completed(index, *pending))
+                pending.window() != collected_at && !claude_pending_completed(index, *pending)
             })
             .filter(|(root, _)| {
                 !index
@@ -51844,6 +51850,9 @@ impl ScanIndex {
         }
         self.hold_archive_corrections(None);
         self.historical_replay_generation = Some(generation);
+        // Explicit history replay re-enters kept rows; ordinary restarts keep
+        // the completed-window boundary and cannot turn them into read debt.
+        self.claude_full_rearm_progress.completed_window = None;
         for (_, entry) in self.files.slots_mut() {
             if entry.upload_context_receipt.is_some() {
                 entry.make_mut().upload_context_receipt = None;
@@ -67122,8 +67131,8 @@ mod tests {
                 invalid_current_window_family_count: 1,
                 page_invalidated_identity_count: 1,
                 coverage_complete: true,
-                full_rearm: true,
-                rearm_attempt: 1,
+                full_rearm: false,
+                rearm_attempt: 0,
                 full_rearm_deferred_until: next_full_rearm,
                 ..Default::default()
             }
@@ -67208,8 +67217,8 @@ mod tests {
                 census_invalid: true,
                 pending_occurrence_count: 5,
                 coverage_missing_member_count: 1,
-                full_rearm: true,
-                rearm_attempt: 1,
+                full_rearm: false,
+                rearm_attempt: 0,
                 full_rearm_deferred_until: next_full_rearm,
                 ..Default::default()
             }

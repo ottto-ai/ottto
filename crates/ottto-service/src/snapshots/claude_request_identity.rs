@@ -4599,7 +4599,7 @@ impl RequestRootIndex {
         self.0.extend(ids.into_iter().map(|id| (id, root)));
     }
 
-    /// Once every root is in: sort, then collapse ids held by several roots.
+    /// Once every root is in: sort and keep one entry per request and root.
     pub(crate) fn finish(&mut self) {
         self.0.sort_unstable();
         // Keep each root ordinal so terminal discard can count shared rows.
@@ -4612,7 +4612,7 @@ impl RequestRootIndex {
         let id = <[u8; 32]>::from(sha2::Sha256::digest(request_id.as_bytes()));
         let at = self.0.partition_point(|(known, _)| *known < id);
         let (_, root) = self.0.get(at).filter(|(known, _)| *known == id)?;
-        Some((self.0.get(at + 1).is_none_or(|(next, _)| *next != id)).then_some(*root))
+        Some((self.0.get(at + 1).map_or(true, |(next, _)| *next != id)).then_some(*root))
     }
 
     pub(super) fn root_holds_hash(&self, root: u32, hash: &[u8; 32]) -> bool {

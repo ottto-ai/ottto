@@ -802,9 +802,39 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     &Default::default(),
                     "2026-10-02T09:00:00Z",
                 );
-            let _ = counts;
+            let record = index
+                .claude_request_census
+                .get(&local_index_key(&off_page))
+                .unwrap();
+            assert!(record.retired().is_none());
+            assert_eq!(record.request_hashes(), &[claude_request_hash("held")]);
+            // Negative control: this same aged record really retires once its
+            // family leaves the cohort, so the keep arm cannot pass vacuously.
+            let mut absent = index.clone();
+            absent.claude_usage_family_pending.clear();
+            let retired = absent.retire_claude_transcript_records_for_test(
+                rfc3339_unix_seconds("2026-10-02T09:00:00Z").unwrap(),
+            );
+            assert_eq!(retired.0, 1);
+            assert!(absent
+                .claude_request_census
+                .get(&local_index_key(&off_page))
+                .unwrap()
+                .retired()
+                .is_some());
         }
-        let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+        let mut items = vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("r", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                line("unmatched", &at(3), 30),
+            ],
+        )];
         let read = sidecar(&[row("r", 1, 10), row("held", 2, 20), row("orphan", 5, 50)]);
         attach_page(&mut items, &read);
         side_calls_page(
@@ -823,14 +853,20 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
         );
         assert_eq!(requests(&items[0], REPORTED), side, "holder={holder}");
         let total = root.entity.totals().1;
-        assert_eq!(total, 1 + side, "holder={holder}");
-        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(total, 2 + side, "holder={holder}");
+        let got = tag_owned(publish(items, None, TelemetryRead::Loaded, &index), &index);
         assert_eq!(got.len(), 1);
         assert_eq!(
             (got[0].request_count, got[0].input_tokens),
-            (total, if holder { 60 } else { 80 }),
+            (total, if holder { 90 } else { 110 }),
             "holder={holder}"
         );
+        assert_eq!(
+            org_amounts(&got[0]).len(),
+            2,
+            "two-account mid-session control"
+        );
+        assert!(!got[0].request_evidence.is_empty());
         if holder {
             use crate::snapshots::sampled_scan::transition_fixture::{
                 money_oracle, Mode, RouteResult,

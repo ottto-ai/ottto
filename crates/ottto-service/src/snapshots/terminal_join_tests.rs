@@ -302,6 +302,11 @@ fn a_patched_head_is_read_and_saved_with_its_flag() {
 fn completed_terminal_keeps_cold_and_resident_cohort() {
     let (dir, child, api, trace, index) = accumulated();
     let before = claude_pending_family_session_ids(&index);
+    let fingerprints = index
+        .files
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect::<BTreeMap<_, _>>();
     let scratch = crate::test_scratch::canonical_private_dir("terminal-cohort");
     let (custody, mut cold) =
         v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
@@ -315,6 +320,12 @@ fn completed_terminal_keeps_cold_and_resident_cohort() {
             index.claude_usage_family_pending.len()
         );
         assert!(!disposition.duplicate_census.full_rearm);
+        let after = view
+            .files
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(after, fingerprints, "terminal re-arms zero files");
     }
     let (_, reloaded) = custody.save_reload(&mut cold);
     assert_eq!(claude_pending_family_session_ids(&reloaded), before);

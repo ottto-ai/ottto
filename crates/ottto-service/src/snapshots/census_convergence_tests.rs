@@ -328,15 +328,16 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
             fence_after: true,
             pending_occurrence_count: 5,
             coverage_missing_member_count: 1,
-            full_rearm: true,
-            rearm_attempt: 1,
-            full_rearm_deferred_until: Some(
-                CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
-            ),
+            full_rearm: false,
+            rearm_attempt: 0,
+            full_rearm_deferred_until: None,
             ..Default::default()
         }
     );
-    assert!(after.files[unobserved].source_file_fingerprint.is_empty());
+    assert_eq!(
+        after.files[unobserved].source_file_fingerprint,
+        closed.files[unobserved].source_file_fingerprint
+    );
 
     // Inside the backoff the same closed census does not replay again.
     let mut deferred = after.clone();
@@ -354,11 +355,8 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
     );
     assert!(deferred_after.claude_duplicate_request_witness_overflowed);
     assert!(!counts.full_rearm);
-    assert_eq!(counts.rearm_attempt, 1);
-    assert_eq!(
-        counts.full_rearm_deferred_until,
-        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS)
-    );
+    assert_eq!(counts.rearm_attempt, 0);
+    assert_eq!(counts.full_rearm_deferred_until, None);
     assert_eq!(
         deferred_after.files[unobserved].source_file_fingerprint,
         "source"
@@ -378,7 +376,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
     );
     assert!(lost_after.claude_duplicate_request_witness_overflowed);
-    assert!(counts.full_rearm);
+    assert!(!counts.full_rearm);
 
     // An open fence is not closed by coverage alone.
     let mut open = closed.clone();
@@ -407,7 +405,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
     );
     assert!(!covered_after.claude_duplicate_request_witness_overflowed);
     assert!(counts.coverage_complete);
-    assert!(counts.full_rearm);
+    assert!(!counts.full_rearm);
     assert_eq!(covered_after.claude_duplicate_fence_rearm_attempt, 0);
     assert_eq!(
         covered_after.claude_duplicate_fence_next_full_rearm_unix_seconds,
@@ -3182,8 +3180,10 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
 #[test]
 fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
     for initially_closed in [false, true] {
-        let mut index = ScanIndex::default();
-        index.claude_duplicate_request_witness_overflowed = initially_closed;
+        let mut index = ScanIndex {
+            claude_duplicate_request_witness_overflowed: initially_closed,
+            ..ScanIndex::default()
+        };
         let key = "/synthetic/kept-root.jsonl";
         index
             .files
@@ -3211,4 +3211,41 @@ fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
             assert!(index.claude_usage_family_pending.contains_key("kept-root"));
         }
     }
+}
+
+/// [regress] A completion drops only an absent root, retains a root with
+/// only an indexed member, and counts the absent root's shared sidecar rows.
+#[test]
+fn vanished_root_discard_counts_shared_rows_and_keeps_indexed_members() {
+    let present = "a1111111-1111-4111-8111-111111111111";
+    let vanished = "b2222222-2222-4222-8222-222222222222";
+    let key = format!("/synthetic/{present}/subagents/agent-child.jsonl");
+    let hash = format!("{:x}", Sha256::digest(b"shared"));
+    let mut index = ScanIndex::default();
+    index.files.insert(key, committed_entry("revision", "body"));
+    for root in [present, vanished] {
+        index
+            .claude_usage_family_pending
+            .insert(root.into(), current_pending(root, &hash));
+    }
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(
+            vanished.into(),
+            vec![complete_api_row(vanished, "shared", 0, 10, 1, 0)],
+        )]),
+        health: Default::default(),
+    };
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let disposition = apply_claude_reported_usage_with_index(
+        &mut [],
+        &api,
+        &Default::default(),
+        &mut index,
+        true,
+        WINDOW,
+    );
+    assert_eq!(disposition.terminal, ClaudeTerminalOutcome::Complete);
+    assert!(index.claude_usage_family_pending.contains_key(present));
+    assert!(!index.claude_usage_family_pending.contains_key(vanished));
+    assert_eq!(scope.finish().contract.vanished_roots_with_shared_rows, 1);
 }

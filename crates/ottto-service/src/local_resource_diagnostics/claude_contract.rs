@@ -195,7 +195,7 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> ContextParts {
             }
         });
         let restamp_only = state.retained.as_ref().is_some_and(|(key, prior, _)| {
-            observed.retained.is_none_or(|retained| retained == key)
+            observed.retained.is_some_and(|retained| retained == key)
                 && prior[6] == parts[6]
                 && prior[7] == parts[7]
         });
@@ -212,6 +212,32 @@ pub(crate) fn started_context(key: &str, parts: ContextParts, roots: &[PathBuf])
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [regress] Only observed context parts can owe evidence. Replay,
+    /// scanner identities and unknown start provenance still require clearing.
+    #[test]
+    fn restamp_requires_observed_context_and_unchanged_replay_and_identity() {
+        context(|state| *state = ContextState::default());
+        let roots = [PathBuf::from("/synthetic/root")];
+        let compare = |retained, backfill, replay, identity| {
+            compare_context(TraversalContext {
+                retained,
+                backfill,
+                active: Some("upload-context"),
+                replay,
+                roots: &roots,
+                identity,
+            })
+        };
+        let first = compare(None, 1, None, "identity-v1");
+        assert!(!first.restamp_only);
+        started_context("first", first, &roots);
+        assert!(compare(Some("first"), 2, None, "identity-v1").restamp_only);
+        assert!(!compare(Some("first"), 2, Some("operator-replay"), "identity-v1").restamp_only);
+        assert!(!compare(Some("first"), 2, None, "identity-v2").restamp_only);
+        assert!(!compare(Some("other"), 2, None, "identity-v1").restamp_only);
+        assert!(!compare(None, 2, None, "identity-v1").restamp_only);
+    }
+
     #[test]
     fn context_comparisons_use_retained_start_and_same_count_ordered_roots() {
         context(|state| *state = ContextState::default());
