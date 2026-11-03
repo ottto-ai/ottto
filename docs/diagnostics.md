@@ -2228,7 +2228,11 @@ proved rows sent with different proof.
 Each source emits one `local_resources` `freshness_alarm` point when a root walk
 ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
 `now - live mtime` over indexed files whose live listing stamp differs from the
-stored settled stamp, and `changed_files` and `over_6h_files` count them.
+stored settled stamp, and over discovered files with no index entry yet, and
+`changed_files` and `over_6h_files` count them. `never_indexed_files` counts the
+second group; their age is a lower bound, since only the latest write is known.
+It takes the read filters: a file outside the discovery window, an oversized file
+(its own oversized disclosure) and a Codex archive (its own archive debt) stay out.
 Members of an `UnprovenTerminal` Claude usage-authority family are reported
 apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
 hold keeps the pre-growth stamp and no read reaches the growth, so they are real
