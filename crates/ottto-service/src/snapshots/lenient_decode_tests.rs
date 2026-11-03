@@ -4071,6 +4071,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     }
 }
 
+/// [format] Legacy count slots survive load/save while retired refusal counts become zero.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
@@ -4116,6 +4117,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
+        // Load retires only this decoded legacy value; neighboring positional counts survive.
+        expected["oversized_file_count"] = serde_json::json!(0);
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",

@@ -42,7 +42,7 @@ See [the local handoff contract](session-launch.md).
 
 Local collection includes a `claude_local_evidence` section with separate API
 and trace counters for available canonical rows, duplicate/conflicting requests,
-malformed or unframed rows, oversized files/lines, unavailable or changed files,
+malformed or unframed rows, oversized lines, unavailable or changed files,
 and limited selection/reads. The inspection is on demand: at most four files per
 store, 64 directory entries per store, 64 KiB read per file (512 KiB total),
 16 KiB per line and 128 physical rows per file. Selection can be partial and is
@@ -161,6 +161,11 @@ accepting version 1 binaries; there is no version negotiation.
 | --- | --- | --- |
 | `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
+Claude page counters `claude_sidecar_reparse_files` and
+`claude_sidecar_reparse_bytes` report side-file read attempts and actual input
+bytes since the previous Claude page. Repeated reads count again; absent keys
+mean zero. Nonzero values remain exact, with no separate diagnostic record.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -572,29 +577,34 @@ Claude/Pi walk, candidate revalidation and open, the Codex roster and
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
-File-size caps still apply. Registered sources today are the unverified
+Whole-file size no longer limits admission. Registered sources today are the unverified
 sampled-generation marker (any source) and Claude withheld-account holds. A new
 owed source (a Codex owed-residue set, a compressed hold) registers as one field
 plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
 separate exemption.
 
-The `local_resources` stage `oversized_discovery_alarm` reports oversized debt
-per source, per page: `outstanding_file_count`, `outstanding_bytes` (last
-observed total size) and `first_seen_oversized_age_seconds` (oldest first-seen
-age in the current traversal). The row is omitted at zero outstanding files.
-Debt follows the existing traversal checkpoint lifetime. Older checkpoints
-without these scalars default bytes to zero and first-seen to load time.
+The former `oversized_discovery_alarm`, `size` and `withheld_oversized`
+observations are retired with whole-file refusal. `last_oversized_file_count`
+remains on the wire and emits zero. Saved refusal debt stays decodable and is
+cleared after load through the ordinary save path.
 
-`counts.line_delivery_unselected` counts discovery skip decisions for the page's
-source: `age` (outside the backfill window, not held for verification and not
-withheld for an unresolved Claude account) and `size` (over the source's
-file-size cap). `withheld_oversized` counts the decisions, at the walk,
-candidate revalidation or open, that keep an over-cap key observed without a
-full parse while its parsed revision is withheld for an unresolved account: the
-entry and hold stay, and growth past the cap is not read. They are recorded
-after the existing decision, are drained by that source's next completed page,
-and count repeated decisions, not distinct files or bytes. They are recorded
-whether or not an observer is registered.
+The `local_resources` stage `file_size` reports the process high-water
+`largest_file_bytes` per source, with `file_over_1gib` on that same record.
+`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
+and existing footprint observations through native finish. Existing
+`bounded_traversal_transition` records report `max_unread_bytes` on retirement
+or in `previous` when replacing a traversal, with no per-file log emissions.
+This traversal maximum uses disk length minus the last native checkpoint's size
+(zero if none); it conservatively includes uncommitted reads.
+It resets on restart/new traversal. No persisted fields or per-file clocks are
+added; unread age and its six-hour alert are deferred because existing metadata
+does not record when an extent first became owed. Observations contain no paths
+or identities and never gate reads.
+
+`counts.line_delivery_unselected.age` counts a discovery decision outside the
+window without an owed-growth, verification or unresolved-account exemption.
+It is drained by that source's completed page, whether or not an observer is
+registered, and counts decisions rather than distinct files or bytes.
 
 `DiscoveryRetention::owes_with_len` also retains a file whose current length
 exceeds its committed indexed `size_bytes`, using metadata already available at
@@ -647,10 +657,10 @@ that never reaches a save has no fate row. Population/age rows describe bounded
 page observations, not a whole-index census.
 
 Retention changes no refusal/backoff or acquisition decision. Unchanged account
-refusals keep the existing content memo skip; oversized growth remains observed
+refusals keep the existing content memo skip; large-file growth remains observed
 without parsing each pass. The dedicated `discovery_growth_tests` fixtures cover
 real account-hold classification, Completed restoration and two unchanged passes
-with zero extra body bytes, saved catch-up, and oversized aging in all three
+with zero extra body bytes, saved catch-up, and large-file aging in all three
 sources. Existing identity/anchor controls remain in
 `reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
 `transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
@@ -1602,12 +1612,24 @@ differs from the line's model (a refusal fallback's declined first attempt, whic
 is billed at the line's model); rereads count again. It is a cumulative
 saturating process total with no path or session id, and it never affects money.
 
+## Claude usage keys the parser does not read
+
+`usage_unknown_numeric_key` in `process_retained_cache_lifecycle_totals` counts
+each numeric key the Claude usage parser does not read, in `usage`,
+`usage.cache_creation`, `usage.output_tokens_details` and the same three levels of
+each `usage.iterations[]` entry. Non-numeric values and deeper objects are not
+counted. A non-zero value means a new numeric usage field is not reaching money.
+Counts are per parsed usage line, not per unique request; rereads count again. It
+is a cumulative saturating process total with no key name, path or session id,
+and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
-`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
-saturating process-lifetime counter for that cause. These count refused attempts,
-not distinct sessions, decoded bytes or money. No path or session id is included.
+`counts.codex_zst_refused{cause}`: a sparse map of the non-zero, saturating
+process-lifetime counters. One line is flushed per Codex pass, only when the
+counters changed since the last flush. These count refused attempts, not distinct
+sessions, decoded bytes or money. No path or session id is included.
 
 | Cause | Unsupported boundary |
 | --- | --- |
@@ -1629,11 +1651,16 @@ usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
-retained → cursor before taking the durable Stores leaf lock. It keeps an
+retained → cursor before taking the durable Stores leaf lock. It keeps a
 fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
-for primary Tail reads; admission never evicts or charges retained bytes twice.
+for primary Tail reads and never charges retained bytes twice. When free room is
+short and the claim can fit beside the whole cursor state, it reclaims optional
+header facts, then releases retained copies, counted in
+`cursor_reservation_entries_evicted`. It never drops a suspended proof, join
+owner, witness or durable owed state. A released copy can mean one more existing
+`state_missing` Full. `decoder_refused_header_occupancy` is no longer counted.
 Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
-A short reservation or busy singleton yields `None`, counts
+A claim that cannot fit evicts nothing. It or a busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
@@ -1790,10 +1817,8 @@ Full. Structural Full publishes without a replacement retained reduction.
 The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
 seven-day sanity maximum expires toward reading. Codex page/cursor deferral
 consumes no structural allowance; the stamp is enrolled at acquisition start.
-Growth at 90% or more of the source file cap bypasses pacing immediately, under
-the same cause with a `near_cap` annotation. Source caps predate this path:
-512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
-rejection/disclosure still applies; near-cap admission does not expand it.
+Whole-file size no longer bypasses recovery pacing. The legacy `near_cap`
+recovery annotation remains zero; transcripts have no whole-file admission cap.
 
 The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
 An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
@@ -1815,10 +1840,8 @@ do not add the two byte counters together.
 
 A replay attempt is remembered by predecessor extent, not exact generation.
 A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours, plus at
-most one extra near the source cap, counted `rederive_failure_full.near_cap`.
-This exception avoids losing discovery when a held file grows beyond its source
-cap. Budget contention waits without a Full; after six hours its counted
+Re-derive failures take at most one growth Full per key per six hours.
+There is no size-based extra read. Budget contention waits without a Full; after six hours its counted
 `rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
 overflow permits at most one extra head per evicted extent and alarms
 `pace_evicted`. Discovery custody survives pace eviction independently.

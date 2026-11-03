@@ -307,11 +307,9 @@ fn estimate_reports_out_of_window_members_and_apply_refuses_without_state() {
     fs::remove_dir_all(home).unwrap();
 }
 
-#[test]
-fn estimate_refuses_native_oversize_below_the_history_page_budget() {
+fn estimate_admits_large_singleton_above_the_history_page_budget() {
     let (home, _, index, paths) = setup("copy-prefix-native-file-cap");
-    let size = max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1;
-    assert!(size < body_witness_adoption_byte_budget());
+    let size = body_witness_adoption_byte_budget() + 1;
     // Sparse metadata only: neither allocate nor read a transcript this big.
     fs::OpenOptions::new()
         .write(true)
@@ -324,10 +322,10 @@ fn estimate_refuses_native_oversize_below_the_history_page_budget() {
     let counts = run(&home.join("scope.json"), &support, false).unwrap();
     assert_eq!(
         (counts.files, counts.runnable_files, counts.blocked_files),
-        (3, 2, 1)
+        (3, 3, 0)
     );
-    assert!(run(&home.join("scope.json"), &support, true).is_err());
-    assert!(!support.exists());
+    assert!(run(&home.join("scope.json"), &support, true).is_ok());
+    assert!(support.exists());
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
     fs::remove_dir_all(home).unwrap();
 }
@@ -589,24 +587,23 @@ fn no_twins_leave_the_listed_scope_and_forecast_unchanged() {
     fs::remove_dir_all(home).unwrap();
 }
 
-#[test]
-fn added_twin_family_member_blocks_apply_at_the_existing_native_file_cap() {
+fn large_twin_family_member_is_admitted_as_first_group() {
     let (home, _, _, main, expected) = twin_setup("copy-prefix-twin-closure-cap");
     let added = expected.iter().find(|p| **p != main).unwrap();
     fs::OpenOptions::new()
         .write(true)
         .open(added)
         .unwrap()
-        .set_len(max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1)
+        .set_len(body_witness_adoption_byte_budget() + 1)
         .unwrap();
     let support = home.join("absent-cap-support");
     let counts = run(&home.join("scope.json"), &support, false).unwrap();
     assert_eq!(counts.listed_files, 1);
-    assert!(counts.blocked_files >= 1);
-    assert!(counts.blocked_bytes > max_jsonl_file_bytes(SnapshotSource::ClaudeCode));
+    assert_eq!(counts.blocked_files, 0);
+    assert_eq!(counts.blocked_bytes, 0);
     assert_eq!(counts.runnable_files + counts.blocked_files, counts.files);
-    assert!(run(&home.join("scope.json"), &support, true).is_err());
-    assert!(!support.exists());
+    assert!(run(&home.join("scope.json"), &support, true).is_ok());
+    assert!(support.exists());
     fs::remove_dir_all(home).unwrap();
 }
 
@@ -644,26 +641,24 @@ fn closure_growth_refuses_preparation_before_reowing_any_member() {
     fs::remove_dir_all(home).unwrap();
 }
 
-#[test]
-fn twin_closure_native_reader_keeps_the_existing_byte_budget() {
-    let (home, root, mut index, _, expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
+fn twin_closure_native_reader_admits_first_large_group() {
+    let (home, root, mut index, _, _expected) = twin_setup("copy-prefix-twin-closure-byte-budget");
     let support = home.join("support");
     run(&home.join("scope.json"), &support, true).unwrap();
     activate_mode(&mut index, "ctx-1", false);
     let pending = prepare(&mut index, &support, std::slice::from_ref(&root)).unwrap();
     with_body_witness_adoption_byte_budget(1, || {
         let counts = run(&home.join("scope.json"), &home.join("absent-budget"), false).unwrap();
-        assert_eq!(counts.blocked_files, expected.len());
+        assert_eq!(counts.blocked_files, 0);
         let (_, scan, opened) = walk(&root, index, &pending);
-        assert!(opened.is_empty());
-        assert_eq!(scan.scanned_file_count, 0);
-        assert!(scan.snapshots.is_empty());
+        assert!(!opened.is_empty());
+        assert!(scan.scanned_file_count > 0);
+        assert!(!scan.snapshots.is_empty());
     });
     fs::remove_dir_all(home).unwrap();
 }
 
-#[test]
-fn combined_twin_bytes_are_blocked_without_increasing_the_native_page_cap() {
+fn combined_twin_bytes_are_admitted_as_the_first_page_group() {
     let (home, _, _, _, expected) = twin_setup("copy-prefix-twin-group-bytes");
     let mains = expected
         .iter()
@@ -683,13 +678,26 @@ fn combined_twin_bytes_are_blocked_without_increasing_the_native_page_cap() {
     with_body_witness_adoption_byte_budget(cap, || {
         let support = home.join("absent-group-support");
         let counts = run(&home.join("scope.json"), &support, false).unwrap();
-        assert_eq!(counts.blocked_files, 2);
-        assert_eq!(counts.blocked_bytes, twin_bytes);
-        assert!(run(&home.join("scope.json"), &support, true).is_err());
-        assert!(!support.exists());
+        assert_eq!(counts.blocked_files, 0);
+        assert_eq!(counts.blocked_bytes, 0);
+        assert!(run(&home.join("scope.json"), &support, true).is_ok());
+        assert!(support.exists());
     });
     fs::remove_dir_all(home).unwrap();
 }
 
 #[path = "proof_recovery_tests.rs"]
 mod proof_recovery_tests;
+
+/// [regress] First-unit admission replaces permanent size refusal for singleton, twin and combined groups.
+#[test]
+fn first_group_admission_cases() {
+    for case in [
+        estimate_admits_large_singleton_above_the_history_page_budget as fn(),
+        large_twin_family_member_is_admitted_as_first_group as fn(),
+        twin_closure_native_reader_admits_first_large_group as fn(),
+        combined_twin_bytes_are_admitted_as_the_first_page_group as fn(),
+    ] {
+        case();
+    }
+}

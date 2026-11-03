@@ -302,34 +302,6 @@ fn grown_catchup_reports_committed_only_against_saved_extent() {
         json!({"le_30d":0,"d31_90":0,"gt_90d":0,"unknown":0})
     );
 }
-/// [behaviour] Oversized grown age is disclosed for every source without body reads.
-
-#[test]
-fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
-    for source in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ] {
-        let f = Fixture::new();
-        let cap = max_jsonl_file_bytes(source);
-        File::create(&f.path).unwrap().set_len(cap + 1).unwrap();
-        f.age(91);
-        let key = local_index_key(&f.path);
-        let mut index = ScanIndex::default();
-        let mut entry = super::tests::manifest_index_entry(None);
-        entry.size_bytes = cap;
-        index.files.insert(key.clone(), entry);
-        let (mut next, scan, reads, _) = f.page(source, index);
-        assert_eq!(next.files[&key].size_bytes, cap);
-        assert!(reads.0.lock().unwrap().0.is_empty());
-        assert_eq!(scan.scanned_file_count, 0);
-        let counts = f.save_and_report(&mut next, &scan);
-        fate(&counts, 0, 1);
-        assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
-    }
-}
-
 /// [behaviour] Rewrite control: the same inode is truncated and rewritten past
 /// the committed extent with a changed prefix. Growth retention discovers it;
 /// acquisition's existing prefix samples force the counted Full rebuild.

@@ -293,7 +293,7 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded = 15,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 16,
-    // Optional plain header occupancy refused an otherwise fundable decoder.
+    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
     #[serde(rename = "decoder_refused_header_occupancy")]
     DecoderRefusedHeaderOccupancy = 17,
     #[serde(rename = "CompressedFamilyUnproven")]
@@ -311,22 +311,94 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
-    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+/// Every counted cause; the length is checked against `__Count`.
+const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+    CodexZstCause::ReplayNotAuthorized,
+    CodexZstCause::ProofParentUnsupported,
+    CodexZstCause::ProofChildUnsupported,
+    CodexZstCause::ParentSideUnsupported,
+    CodexZstCause::DurableTailUnsupported,
+    CodexZstCause::GroupProbeUnsupported,
+    CodexZstCause::GroupReadUnsupported,
+    CodexZstCause::ParentLedgerUnbound,
+    CodexZstCause::PhysicalOffsetUnsupported,
+    CodexZstCause::AdmissionRefused,
+    CodexZstCause::DecodeFailed,
+    CodexZstCause::OwnerUnproven,
+    CodexZstCause::OutputHeld,
+    CodexZstCause::DecodedOverLimit,
+    CodexZstCause::HeaderInvalid,
+    CodexZstCause::CorrectionUnapplied,
+    CodexZstCause::HeaderUnfunded,
+    CodexZstCause::CompatibilityUnfunded,
+    CodexZstCause::DecoderRefusedHeaderOccupancy,
+    CodexZstCause::FamilyUnproven,
+    CodexZstCause::ArchiveEquivalenceUnproven,
+];
+struct CodexZstRefused {
+    counters: [AtomicU64; CODEX_ZST_CAUSES],
+    /// The counters' sum at the last flush.
+    flushed: AtomicU64,
+}
+impl CodexZstRefused {
+    const fn new() -> Self {
+        Self {
+            counters: [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES],
+            flushed: AtomicU64::new(0),
+        }
+    }
+}
+#[cfg(not(test))]
+static CODEX_ZST_REFUSED: CodexZstRefused = CodexZstRefused::new();
+#[cfg(test)]
+thread_local! {
+    static CODEX_ZST_REFUSED: CodexZstRefused = const { CodexZstRefused::new() };
+}
+fn with_codex_zst_refused<T>(f: impl FnOnce(&CodexZstRefused) -> T) -> T {
+    #[cfg(test)]
+    {
+        CODEX_ZST_REFUSED.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CODEX_ZST_REFUSED)
+    }
+}
 
+/// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
-    let counter = &CODEX_ZST_REFUSED[cause as usize];
-    let previous = counter
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-        .unwrap_or_else(|n| n);
-    traversal_point(
-        "codex_zst_refused",
-        "codex",
-        &BTreeMap::from([(
+    with_codex_zst_refused(|refused| {
+        let _ = refused.counters[cause as usize]
+            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
+/// One sparse line of the non-zero cumulative counters, only when their sum
+/// moved since the last flush.
+pub(crate) fn codex_zst_refused_flush() {
+    let counts = with_codex_zst_refused(|refused| {
+        let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
+            .into_iter()
+            .map(|cause| (cause, refused.counters[cause as usize].load(Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        let total = counts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        (refused.flushed.swap(total, Relaxed) != total).then_some(counts)
+    });
+    if let Some(counts) = counts {
+        traversal_point(
             "codex_zst_refused",
-            BTreeMap::from([(cause, previous.saturating_add(1))]),
-        )]),
-    );
+            "codex",
+            &BTreeMap::from([("codex_zst_refused", counts)]),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_refused_count(cause: CodexZstCause) -> u64 {
+    with_codex_zst_refused(|refused| refused.counters[cause as usize].load(Relaxed))
 }
 
 /// Counts per observed usage line, before response deduplication and timestamp
@@ -350,6 +422,16 @@ pub(crate) fn codex_non_default_thread_tier() {
 /// registry atomics are updated.
 pub(crate) fn claude_usage_iteration_model_differs() {
     cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
+}
+
+/// Counts per numeric key the Claude usage parser does not read, per observed
+/// usage line; rereads count again. Only the lifecycle registry atomics are
+/// updated.
+pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -390,9 +472,12 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
 
 /// Sidecar read attempts and actual input bytes since the last Claude page.
 /// Repeated reads count again; missing/refused files add nothing. No identities.
+/// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
+    #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_bytes: u64,
 }
 #[cfg(not(test))]
@@ -580,15 +665,13 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
-    Size,
-    /// The subset of size skips whose key holds a withheld-account revision.
-    WithheldOversized,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
-const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
+const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
+const UNSELECTED_REASONS: usize = PAGE_SELECTION_START + 4;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -632,6 +715,29 @@ pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u
         });
     }
 }
+/// One page's selection, counted after it was made; never a gate input.
+#[derive(Clone, Copy)]
+pub(crate) enum PageSelection {
+    /// Queued paths the page took.
+    Selected,
+    /// The selected paths whose index entry is re-armed (owed).
+    OwedSelected,
+    /// Selected paths that ended as a Skip (unchanged or confirmed empty).
+    Skipped,
+    /// Claude roots put back at the queue front to wait for their family.
+    DeferredRoots,
+}
+pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
+    source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+const PAGE_SELECTION: [(&str, usize); 4] = [
+    ("selected", PAGE_SELECTION_START),
+    ("owed_selected", PAGE_SELECTION_START + 1),
+    ("skipped", PAGE_SELECTION_START + 2),
+    ("deferred_roots", PAGE_SELECTION_START + 3),
+];
 const UNACKED_LOST: [(&str, usize); 4] = [
     ("files", UNACKED_LOST_START),
     ("requests", UNACKED_LOST_START + 1),
@@ -1030,6 +1136,8 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            page_selection: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -1064,6 +1172,7 @@ impl Probe {
                 })
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
+            page_selection: drain(source, &PAGE_SELECTION),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
@@ -1241,6 +1350,7 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    first_read_bytes: Option<u64>,
 }
 impl StageWindow {
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
@@ -1249,16 +1359,68 @@ impl StageWindow {
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            first_read_bytes: None,
         }
+    }
+    pub(crate) fn first_read(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| {
+            let mut window = Self::begin(source.api_slug(), "first_read");
+            window.first_read_bytes = Some(bytes);
+            window
+        })
     }
 }
 impl Drop for StageWindow {
     fn drop(&mut self) {
-        emit_stage(self.stage, self.source, || {
-            self.probe.stage_observation(self.footprint.as_ref())
+        if std::thread::panicking() {
+            return;
+        }
+        let observation = self.probe.stage_observation(self.footprint.as_ref());
+        let counts = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
+            serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
+                "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
+        });
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: self.stage,
+            source: self.source,
+            observation,
+            counts,
         });
     }
 }
+/// Process high-water file sizes, without paths or read admission decisions.
+pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LARGEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let slot = match source {
+        crate::snapshots::SnapshotSource::ClaudeCode => 0,
+        crate::snapshots::SnapshotSource::Codex => 1,
+        crate::snapshots::SnapshotSource::Pi => 2,
+    };
+    let previous = LARGEST[slot].fetch_max(bytes, Ordering::Relaxed);
+    if bytes > previous {
+        traversal_point(
+            "file_size",
+            source.api_slug(),
+            &serde_json::json!({"largest_file_bytes": bytes, "file_over_1gib": bytes > 1024 * 1024 * 1024}),
+        );
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
+    }
+}
+
 fn wall_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -2162,6 +2324,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sidecar_reparse_counts_are_sparse_exact_and_drained_per_page() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        // Drain earlier fixture activity on this test thread.
+        take_claude_sidecar_reparse();
+        let (_, rows) = capture(|| {
+            Probe::start().collection("claude_code", collection());
+            claude_sidecar_reparse(2, 123);
+            Probe::start().collection("claude_code", collection());
+            Probe::start().collection("claude_code", collection());
+        });
+        for row in [&rows[0], &rows[2]] {
+            for key in [
+                "claude_sidecar_reparse_files",
+                "claude_sidecar_reparse_bytes",
+            ] {
+                assert!(row["counts"].get(key).is_none());
+            }
+        }
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_files"], 2);
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_bytes"], 123);
+        let maximum = serde_json::to_value(ClaudeSidecarReparse {
+            claude_sidecar_reparse_files: u64::MAX,
+            claude_sidecar_reparse_bytes: u64::MAX,
+        })
+        .unwrap();
+        assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
+        assert_eq!(maximum["claude_sidecar_reparse_bytes"], u64::MAX);
+    }
+
+    #[test]
     fn connection_binding_failures_are_counted_without_sensitive_detail() {
         let (_, lines) = capture(|| {
             assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
@@ -2877,9 +3074,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields, the Codex tier field and the Claude iteration
-        // model field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2474);
+        // The four Pi fields, the Codex tier field and the two Claude usage
+        // fields stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2523);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

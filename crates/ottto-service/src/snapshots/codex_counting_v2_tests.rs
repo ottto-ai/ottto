@@ -732,16 +732,18 @@ fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
 }
 
 #[test]
-fn codex_v2_equal_total_repeat_is_dropped_and_legacy_is_unchanged() {
+fn codex_v2_and_legacy_drop_the_same_equal_total_repeat() {
     let values = [
         header(POST),
-        started("2026-10-18T10:00:01Z", "turn-1"),
-        context("2026-10-18T10:00:02Z", "turn-1"),
-        ui("2026-10-18T10:00:15Z", S1, S1),
-        ui("2026-10-18T10:00:20Z", S1, S1),
-        aborted("2026-10-18T10:00:21Z", "turn-1"),
+        started("2026-11-04T10:00:01Z", "turn-1"),
+        context("2026-11-04T10:00:02Z", "turn-1"),
+        ui("2026-11-04T10:00:15Z", S1, S1),
+        ui("2026-11-04T10:00:20Z", S1, S1),
+        aborted("2026-11-04T10:00:21Z", "turn-1"),
     ];
-    assert_eq!(legacy(&values).money(), five(sum(S1, S1)));
+    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
+    assert!(!selected_legacy.v2);
+    assert_eq!(selected_legacy.money(), five(S1));
     let counted = v2(&values);
     assert_eq!(counted.money(), five(S1));
     assert_eq!(counted.counters().ui_equal_total_repeat, 1);
@@ -754,18 +756,161 @@ fn codex_v2_real_reset_counts_first_post_reset_last() {
     let pre_reset_total = [9_659_248, 9_216_896, 0, 21_146, 3_331, 9_680_394];
     let values = [
         header(POST),
-        started("2026-10-18T10:00:01Z", "turn-1"),
-        context("2026-10-18T10:00:02Z", "turn-1"),
-        ui("2026-10-18T10:00:10Z", first_last, pre_reset_total),
-        ui("2026-10-18T10:00:20Z", S3_RESET, S3_RESET),
-        ui("2026-10-18T10:00:34Z", S3_NEXT, S3_NEXT_TOTAL),
-        completed("2026-10-18T10:00:40Z", "turn-1"),
+        started("2026-11-04T10:00:01Z", "turn-1"),
+        context("2026-11-04T10:00:02Z", "turn-1"),
+        ui("2026-11-04T10:00:10Z", first_last, pre_reset_total),
+        ui("2026-11-04T10:00:20Z", S3_RESET, S3_RESET),
+        ui("2026-11-04T10:00:34Z", S3_NEXT, S3_NEXT_TOTAL),
+        completed("2026-11-04T10:00:40Z", "turn-1"),
     ];
     let expected = five(sum(sum(first_last, S3_RESET), S3_NEXT));
     let counted = v2(&values);
     assert_eq!(counted.money(), expected);
     assert_eq!(counted.counters().ui_equal_total_repeat, 0);
     assert_eq!(legacy(&values).money(), expected);
+    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
+    assert_eq!(selected_legacy.money(), expected);
+    assert_eq!(selected_legacy.counters().ui_equal_total_repeat, 0);
+}
+
+/// A Legacy session's money read straight through (Full), and read again with
+/// a durable save and restore after `tail_from` lines (Tail). The two routes
+/// must always agree, and the restored session stays Legacy.
+fn legacy_on_both_routes(lines: &[Value], tail_from: usize) -> Run {
+    let cold = run(lines, Some(AckEvidence::None));
+    assert!(!cold.v2);
+
+    use crate::durable_tail_codec::{Dec, Durable, Enc};
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    for value in &lines[..tail_from] {
+        apply_codex_line(value, &mut accumulator);
+    }
+    let saved = accumulator.codex_counting.take().expect("configured");
+    assert!(
+        saved.counters().is_some(),
+        "the first counted UI line allocates the slot"
+    );
+    let mut e = Enc::bytes(1 << 20);
+    saved.put(&mut e).unwrap();
+    let body = e.into_bytes();
+    let restored =
+        codex_usage_occurrence::CodexCounting::take(&mut Dec::new(&body)).expect("decode");
+    let fresh = codex_usage_occurrence::CodexCounting::new(AckEvidence::None, Some(CUTOVER));
+    assert!(codex_counting_version::reusable(
+        Some(&restored),
+        Some(&fresh)
+    ));
+    accumulator.codex_counting = Some(Box::new(restored));
+    assert!(
+        !accumulator.codex_counting_v2(),
+        "the slot never selects V2"
+    );
+    for value in &lines[tail_from..] {
+        apply_codex_line(value, &mut accumulator);
+    }
+    assert!(!accumulator.codex_counting_v2());
+    let path = PathBuf::from(format!(
+        "/synthetic/sessions/rollout-2026-10-18T10-00-00-{SESSION}.jsonl"
+    ));
+    let item = accumulator
+        .into_items(&path, "2026-10-21T00:00:00Z", "fp".into(), None)
+        .pop()
+        .expect("item");
+    assert_eq!(
+        [
+            item.input_tokens,
+            item.cache_read_tokens,
+            item.cache_creation_5m_tokens,
+            item.output_tokens,
+            item.reasoning_output_tokens,
+        ],
+        cold.money(),
+        "Tail and Full agree"
+    );
+    cold
+}
+
+/// A pre-cutover session's turn with one `token_count` per timestamp, all
+/// with the same `last` and total.
+fn legacy_reemissions(day: &str, at: &[&str]) -> Vec<Value> {
+    let mut lines = vec![
+        header(PRE),
+        started(&format!("{day}T10:00:01Z"), "turn-1"),
+        context(&format!("{day}T10:00:02Z"), "turn-1"),
+    ];
+    lines.extend(at.iter().map(|at| ui(at, S1, S1)));
+    lines.push(completed(&format!("{day}T23:59:59Z"), "turn-1"));
+    lines
+}
+
+/// [regress] A pre-cutover (Legacy) session counted a re-emitted `token_count`
+/// with the same `last` and total and a new timestamp twice. Dated on or after
+/// the forward date it counts once on Full and across a save and restore.
+#[test]
+fn codex_legacy_equal_total_reemission_counts_once_across_restore() {
+    let lines = legacy_reemissions(
+        "2026-11-04",
+        &["2026-11-04T10:00:15Z", "2026-11-04T10:00:20Z"],
+    );
+    let counted = legacy_on_both_routes(&lines, 4);
+    assert_eq!(counted.money(), five(S1));
+    assert_eq!(counted.counters().ui_equal_total_repeat, 1);
+    assert_eq!(counted.counters().ui_equal_total_repeat_usage, S1);
+}
+
+/// Control: the same shape dated before the forward date keeps both rows on
+/// every route, and is not a counted drop.
+#[test]
+fn codex_legacy_reemission_before_forward_date_counts_twice_on_every_route() {
+    let lines = legacy_reemissions(
+        "2026-11-03",
+        &["2026-11-03T10:00:15Z", "2026-11-03T10:00:20Z"],
+    );
+    let counted = legacy_on_both_routes(&lines, 4);
+    assert_eq!(counted.money(), five(sum(S1, S1)));
+    assert_eq!(counted.counters().ui_equal_total_repeat, 0);
+}
+
+/// The tuple crosses the forward date: the first dated repeat of an earlier
+/// line is dropped, at the boundary second, wherever the save lands. Earlier
+/// repeats keep their rows.
+#[test]
+fn codex_legacy_repeat_tuple_crosses_the_forward_date() {
+    let lines = legacy_reemissions(
+        "2026-11-03",
+        &["2026-11-03T23:59:59Z", "2026-11-04T00:00:00Z"],
+    );
+    let counted = legacy_on_both_routes(&lines, 4);
+    assert_eq!(counted.money(), five(S1));
+    assert_eq!(counted.counters().ui_equal_total_repeat, 1);
+
+    let lines = legacy_reemissions(
+        "2026-11-03",
+        &[
+            "2026-11-03T23:59:58Z",
+            "2026-11-03T23:59:59Z",
+            "2026-11-04T00:00:00Z",
+        ],
+    );
+    for tail_from in [4, 5] {
+        let counted = legacy_on_both_routes(&lines, tail_from);
+        assert_eq!(counted.money(), five(sum(S1, S1)));
+        assert_eq!(counted.counters().ui_equal_total_repeat, 1);
+    }
+}
+
+/// A repeat with no readable timestamp counts as it always did.
+#[test]
+fn codex_legacy_repeat_without_a_timestamp_counts() {
+    let mut lines = legacy_reemissions(
+        "2026-11-04",
+        &["2026-11-04T10:00:15Z", "2026-11-04T10:00:20Z"],
+    );
+    lines[4].as_object_mut().unwrap().remove("timestamp");
+    let counted = legacy_on_both_routes(&lines, 4);
+    assert_eq!(counted.money(), five(sum(S1, S1)));
+    assert_eq!(counted.counters().ui_equal_total_repeat, 0);
 }
 
 #[test]
@@ -1048,21 +1193,22 @@ fn codex_v2_overlapping_native_counts_only_uncovered_part() {
 
 #[test]
 fn codex_v2_legacy_selection_is_byte_identical_to_unconfigured_parse() {
-    let values = |timestamp: &str| {
+    let values = |timestamp: &str, day: &str| {
+        let at = |time: &str| format!("{day}T{time}Z");
         vec![
             header(timestamp),
-            started("2026-10-18T10:00:01Z", "turn-1"),
-            context("2026-10-18T10:00:02Z", "turn-1"),
+            started(&at("10:00:01"), "turn-1"),
+            context(&at("10:00:02"), "turn-1"),
             native(
-                "2026-10-18T10:00:10Z",
+                &at("10:00:10"),
                 "turn-1",
                 "resp-1",
                 S2_FIRST,
                 sum(S2_BASE, S2_FIRST),
             ),
-            ui("2026-10-18T10:00:11Z", S2_FIRST, S2_FIRST),
-            ui("2026-10-18T10:00:12Z", S2_FIRST, S2_FIRST),
-            completed("2026-10-18T10:00:20Z", "turn-1"),
+            ui(&at("10:00:11"), S2_FIRST, S2_FIRST),
+            ui(&at("10:00:12"), S2_FIRST, S2_FIRST),
+            completed(&at("10:00:20"), "turn-1"),
         ]
     };
     for (timestamp, evidence) in [
@@ -1070,11 +1216,28 @@ fn codex_v2_legacy_selection_is_byte_identical_to_unconfigured_parse() {
         (PRE, AckEvidence::V2Marked),
         (POST, AckEvidence::LegacyAcked),
     ] {
-        let fixture = values(timestamp);
+        // Before the forward date: exactly the unconfigured parse.
+        let fixture = values(timestamp, "2026-10-18");
         let selected = run(&fixture, Some(evidence));
         assert!(!selected.v2);
-        assert!(selected.counters.is_none());
+        assert_eq!(selected.counters, Some(OccurrenceCounters::default()));
         assert_eq!(selected.wire(), legacy(&fixture).wire());
+        // From it: the same parse less the one equal-total re-emission the
+        // shared repeat gate drops. Natives stay V2-only.
+        let fixture = values(timestamp, "2026-11-04");
+        let selected = run(&fixture, Some(evidence));
+        assert!(!selected.v2);
+        assert_eq!(
+            selected.counters,
+            Some(OccurrenceCounters {
+                ui_equal_total_repeat: 1,
+                ui_equal_total_repeat_usage: S2_FIRST,
+                ..Default::default()
+            })
+        );
+        let mut without_reemission = fixture.clone();
+        without_reemission.remove(5);
+        assert_eq!(selected.wire(), legacy(&without_reemission).wire());
     }
 }
 

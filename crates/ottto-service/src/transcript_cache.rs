@@ -243,7 +243,8 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// Evict in admission victim order (oldest source, then least recently
     /// used) until the resident state fits `limit`. False when even an empty
-    /// cache does not fit. The cursor makes room for a paused job this way.
+    /// cache does not fit. The cursor makes room for a paused job or an archive
+    /// decoder this way.
     pub(crate) fn release_until(&mut self, limit: usize) -> bool {
         self.release_until_for(limit, Release::CursorReservation)
     }

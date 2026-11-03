@@ -410,12 +410,9 @@ pub(crate) fn retained_refusal_settles_for_test(
     )
 }
 
-// Local index projection producer revision; independent of semantic/wire identity.
-// Each indexed file whose stored revision differs is re-read once; the stamp is
-// written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in; 3 (`e2`)
-// re-reads it once more for request-owned money, paced. Bump a
-// source at most once per release; Codex and Pi stay unchanged.
+// Pinned with the replay strings in `backfill.rs`: a compiled history revision never
+// triggers a re-read of existing history; new meaning ships forward via a rule epoch.
+// Changing a pinned value needs owner approval (pin test: `history_revisions_are_pinned`).
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::ClaudeCode => 3,
@@ -6652,15 +6649,7 @@ fn prepare_sync_source_inner(
     {
         daemon.transcript_cache.scrub_retained_context_digests();
     }
-    let upload_policy = SnapshotUploadPolicy {
-        session_titles_enabled: activity_hint.session_titles_enabled,
-        workspace_labels_enabled: activity_hint.workspace_labels_enabled,
-        session_artifacts_enabled: activity_hint.session_artifacts_enabled,
-        session_attribution_enabled: activity_hint.session_attribution_enabled,
-        session_attribution_labels_enabled: activity_hint.session_attribution_enabled
-            && activity_hint.session_titles_enabled
-            && activity_hint.session_attribution_labels_enabled,
-    };
+    let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     let receipt_client = client
         .clone()
@@ -7885,7 +7874,8 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            crate::snapshots::apply_upload_policy(source, snapshots, upload_policy);
+            // Checks a fingerprint an older release persisted, under that release's rules.
+            crate::upload_policy::apply_upload_policy_v1(source, snapshots, upload_policy);
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -12030,7 +12020,7 @@ fn collector_status_request(
         last_census_complete: Some(status.counts.census_complete),
         last_symlink_rejected_count: status.counts.symlink_rejected_count,
         last_unreadable_path_count: status.counts.unreadable_path_count,
-        last_oversized_file_count: status.counts.oversized_file_count,
+        last_oversized_file_count: 0,
         last_disappeared_file_count: status.counts.disappeared_file_count,
         last_malformed_json_line_count: status.counts.malformed_json_line_count,
         last_invalid_utf8_line_count: status.counts.invalid_utf8_line_count,
@@ -12700,19 +12690,39 @@ pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: Snaps
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
-fn erase_source_files(
-    support_dir: &Path,
-    source: SnapshotSource,
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let others: Vec<PathBuf> = [
+/// A source's caches outside `snapshots`, with their temp copies.
+fn source_cache_files(support_dir: &Path, source: SnapshotSource) -> Vec<PathBuf> {
+    [
         crate::active_sessions::active_session_cache_path(support_dir, source),
         detected_uses_cache_path(support_dir, source),
         crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
     .flat_map(|path| [path.with_extension("json.tmp"), path])
-    .collect();
+    .collect()
+}
+
+/// Forget: every source's caches. The opt-out markers beside them stay.
+pub(crate) fn erase_all_source_caches(support_dir: &Path) -> std::io::Result<()> {
+    for path in SNAPSHOT_SOURCES
+        .into_iter()
+        .flat_map(|source| source_cache_files(support_dir, source))
+    {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn erase_source_files(
+    support_dir: &Path,
+    source: SnapshotSource,
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::context_composition::erase_source_state(support_dir, source)?;
+    let others = source_cache_files(support_dir, source);
     let stable = snapshot_index_path(support_dir, source);
     let destinations = support_dir.join("snapshots/destinations");
     // Every parent exists, so an fsync of it fails only on a real I/O error.
@@ -13294,6 +13304,22 @@ mod tests {
         include!("snapshot_sync/ack_retention_tests.rs");
     }
     use crate::snapshots::finalize_scan_after_policy;
+    /// [behaviour] Pinned: changing a history revision or replay string re-reads all history.
+    #[test]
+    fn history_revisions_are_pinned() {
+        for (source, revision, replay) in [
+            (
+                SnapshotSource::ClaudeCode,
+                3,
+                "claude_reported_usage_union:v4",
+            ),
+            (SnapshotSource::Codex, 1, "codex_session_exclusive_usage:v7"),
+            (SnapshotSource::Pi, 1, "pi_founder_backfill_leg_a:v1"),
+        ] {
+            assert_eq!(effective_upload_body_witness_revision(source), revision);
+            assert_eq!(current_historical_replay(source).revision, replay);
+        }
+    }
     #[test]
     fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
         let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
@@ -22821,9 +22847,6 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-                mod oversized_discovery_pipeline_tests {
-                    include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
-                }
             }
         }
     }

@@ -18,10 +18,17 @@ pub(super) fn jsonl_parse_attempted() {
         counts.set((d, p + 1));
     });
 }
-/// Counters are cumulative process totals; captures isolate this thread's events.
+/// Counters are cumulative totals, per thread under test. The flush a pass makes
+/// reports them on one row.
 pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -> T {
+    use crate::local_resource_diagnostics::{codex_zst_refused_count, codex_zst_refused_flush};
     let before = ACTIVITY.with(std::cell::Cell::get);
-    let (result, rows) = capture(run);
+    let count = codex_zst_refused_count(cause);
+    let (result, rows) = capture(|| {
+        let result = run();
+        codex_zst_refused_flush();
+        result
+    });
     assert_eq!(
         ACTIVITY.with(std::cell::Cell::get),
         before,
@@ -38,12 +45,54 @@ pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -
                 .expect("named cause counter")
         })
         .collect::<Vec<_>>();
-    assert!(!totals.is_empty());
-    assert!(totals[0] > 0);
-    for pair in totals.windows(2) {
-        assert!(pair[1] > pair[0]);
-    }
+    assert_eq!(totals, [codex_zst_refused_count(cause)]);
+    assert!(totals[0] > count);
     result
+}
+
+/// §13: a pass flushes one sparse line when the counters changed, none when not.
+#[test]
+fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
+    use crate::local_resource_diagnostics::codex_zst_refused;
+    let flushed = |rows: &[Value]| {
+        rows.iter()
+            .filter(|row| row["stage"] == "codex_zst_refused")
+            .map(|row| row["counts"]["codex_zst_refused"].clone())
+            .collect::<Vec<_>>()
+    };
+    let mut index = ScanIndex::default();
+    let (_, rows) = capture(|| index.disclose_archive_debt());
+    assert_eq!(flushed(&rows), Vec::<Value>::new(), "nothing refused yet");
+    let (_, rows) = capture(|| {
+        for _ in 0..3 {
+            codex_zst_refused(CodexZstCause::AdmissionRefused);
+        }
+        codex_zst_refused(CodexZstCause::HeaderUnfunded);
+        // No line per refusal: only the pass reports.
+        index.disclose_archive_debt();
+    });
+    assert_eq!(
+        flushed(&rows),
+        [serde_json::json!({
+            "CompressedAdmissionRefused": 3,
+            "CompressedHeaderUnfunded": 1,
+        })]
+    );
+    let (_, rows) = capture(|| index.disclose_archive_debt());
+    assert_eq!(flushed(&rows), Vec::<Value>::new(), "unchanged pass");
+    let (_, rows) = capture(|| {
+        codex_zst_refused(CodexZstCause::AdmissionRefused);
+        index.disclose_archive_debt();
+        index.disclose_archive_debt();
+    });
+    assert_eq!(
+        flushed(&rows),
+        [serde_json::json!({
+            "CompressedAdmissionRefused": 4,
+            "CompressedHeaderUnfunded": 1,
+        })],
+        "cumulative, one line for the changed pass"
+    );
 }
 
 pub(super) fn candidate(path: &Path) -> CandidateFile {
