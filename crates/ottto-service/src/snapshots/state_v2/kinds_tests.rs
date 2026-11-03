@@ -1651,6 +1651,8 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
 
 #[path = "codex_archive_kinds_tests.rs"]
 mod codex_archive_tests;
+#[path = "field_schema_tests.rs"]
+mod field_schema_tests;
 
 /// Stores `row` (exact 0.1.215 serialized shape) as `kind`'s field row of an
 /// otherwise current store, then reads it back through the production
