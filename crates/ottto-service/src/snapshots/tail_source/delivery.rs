@@ -58,6 +58,48 @@ pub(in crate::snapshots) fn retry_pending(index: &ScanIndex, key: &str) -> bool 
             })
 }
 
+/// One pass's delivery custody, before its save (D177). A failed or shed
+/// publish owes every file whose bodies lack an exact ACK; an exact ACK of
+/// every incident entity's effective body retires the debt. Deferred and
+/// rejected bodies keep their own quarantine retry.
+pub(in crate::snapshots) fn settle(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    accepted: &BTreeMap<String, String>,
+    failed: bool,
+) {
+    if tail_route(source, index).is_none() || snapshots.is_empty() {
+        return;
+    }
+    let bodies = snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (key, entities) in index.file_snapshot_fingerprints.iter() {
+        let incident = entities
+            .iter()
+            .filter_map(|fp| bodies.get(fp.as_str()).map(|body| (fp, body)))
+            .collect::<Vec<_>>();
+        if incident.is_empty() {
+            continue;
+        }
+        let exact = incident
+            .iter()
+            .all(|(fp, body)| accepted.get(fp.as_str()) == Some(*body));
+        if !exact && failed {
+            let _ = state_v2::tail_delivery(index, key, true);
+        } else if exact && owed(index, key) {
+            let _ = state_v2::tail_delivery(index, key, false);
+        }
+    }
+}
+
 /// Periodic wake independent of file changes, outside the watcher hint cap.
 /// Reuse the ordinary queue and its acquisition checks; deleted paths stay
 /// owed in the head and alarm instead of turning into a repeated failed open.

@@ -46948,6 +46948,18 @@ pub(crate) enum CandidateParseReason {
     DeliveryDebt,
 }
 
+/// D177 delivery custody for one pass's bodies, before its save.
+#[cfg(unix)]
+pub(crate) fn settle_tail_delivery(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    accepted: &BTreeMap<String, String>,
+    failed: bool,
+) {
+    tail_source::delivery::settle(source, index, snapshots, accepted, failed);
+}
+
 pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 16;
 pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",

@@ -52,7 +52,6 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
 pub(in crate::snapshots) use runtime::tail_route::{
     dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
     set_aside_tail, stage_tail, tail_delivery, tail_head_keys, tail_set_aside,
-    with_delivery_on_route,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]

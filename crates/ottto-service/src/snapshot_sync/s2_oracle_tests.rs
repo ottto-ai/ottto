@@ -703,6 +703,19 @@ fn delivery_debt_failure_rebuild_exact_ack_matches_cold_and_resident() {
         assert!(failed.is_err());
         assert!(!sent.is_empty(), "the publish actually failed");
         assert!(progress.accepted_fingerprints.is_empty());
+        let owe = |index: &ScanIndex,
+                   snapshots: &[SnapshotItem],
+                   progress: &SnapshotUploadProgress,
+                   failed| {
+            crate::snapshots::settle_tail_delivery(
+                SnapshotSource::ClaudeCode,
+                index,
+                snapshots,
+                &progress.accepted_body_witnesses,
+                failed,
+            )
+        };
+        owe(&first.index, &first.scan.snapshots, &progress, true);
         let saved = session.save_reload(&mut first.index).0;
         assert!(owed(&saved, &path));
         let mut retry = page(&c, saved, 100, true); // no watcher or file change
@@ -720,6 +733,7 @@ fn delivery_debt_failure_rebuild_exact_ack_matches_cold_and_resident() {
             &retry.scan.snapshots,
             &progress.fresh_context_body_acks,
         );
+        owe(&retry.index, &retry.scan.snapshots, &progress, false);
         let saved = session.save_reload(&mut retry.index).0;
         assert!(!owed(&saved, &path));
         let mut quiet = page(&c, saved, 100, true);

@@ -8531,6 +8531,18 @@ fn finish_sync_source(
                 .map(String::as_str)
         });
     }
+    // D177: delivery custody joins this pass's first save on the Tail route.
+    #[cfg(unix)]
+    crate::snapshots::settle_tail_delivery(
+        source,
+        &index,
+        &scan_result.snapshots,
+        &upload_progress.accepted_body_witnesses,
+        matches!(
+            upload_result,
+            Ok(ResumableUploadResult::Shed { .. }) | Err(_)
+        ),
+    );
     // Shed and upload-error partial checkpoint: save wholly settled files,
     // then release adopted ACK capacity against the full scan's references
     // (#778 R2-2). A failed save is logged and yields `None`; a failed

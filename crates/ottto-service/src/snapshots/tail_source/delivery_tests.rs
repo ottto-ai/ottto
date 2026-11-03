@@ -1,14 +1,23 @@
 use super::*;
 use crate::snapshots::tail_source::load::settlement_tests::{finalize, stored_finish};
 use crate::snapshots::tail_source::load::tests::committed;
-use crate::snapshots::tail_source::seam::tests::route;
+use crate::snapshots::tail_source::seam::tests::{route, Route};
+
+/// A committed file whose publishing save lacked its exact ACK.
+fn owed_commit(route: &mut Route) -> (PathBuf, String) {
+    let (path, key) = committed(route, "a.jsonl", 3);
+    assert!(!owed(&route.index, &key), "a stage alone owes nothing");
+    state_v2::tail_delivery(&route.index, &key, true).unwrap();
+    route.save(false);
+    (path, key)
+}
 
 /// [behaviour] A partial/wrong/old ACK cannot clear debt for an entity set.
 /// Rebuilding, saving and restarting also grant no acceptance.
 #[test]
 fn every_rebuilt_incident_entity_needs_an_exact_ack() {
     let mut route = route();
-    let (path, key) = committed(&mut route, "a.jsonl", 3);
+    let (path, key) = owed_commit(&mut route);
     assert!(owed(&route.index, &key));
     route
         .index
@@ -72,7 +81,7 @@ fn every_rebuilt_incident_entity_needs_an_exact_ack() {
 #[test]
 fn deleted_source_stays_owed_after_retirement_and_restart() {
     let mut route = route();
-    let (path, key) = committed(&mut route, "a.jsonl", 3);
+    let (path, key) = owed_commit(&mut route);
     fs::remove_file(&path).unwrap();
     state_v2::retire_tail(&route.path, [key.clone()]).unwrap();
     route.save(false);
@@ -93,7 +102,7 @@ fn deleted_source_stays_owed_after_retirement_and_restart() {
 #[test]
 fn held_debt_does_not_rebuild() {
     let mut route = route();
-    let (_, key) = committed(&mut route, "a.jsonl", 3);
+    let (_, key) = owed_commit(&mut route);
     assert!(retry_pending(&route.index, &key));
     let fp = "c".repeat(64);
     route

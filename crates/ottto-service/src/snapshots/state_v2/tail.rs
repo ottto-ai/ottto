@@ -1169,9 +1169,12 @@ fn write_file(
     if let Some(observation) = debt.and_then(|debt| debt.observation.as_ref()) {
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
     }
-    // Inside the file's cursor closure: publication and delivery debt are one
-    // transaction, including a Tail-only cycle-exit save after a failed POST.
-    if staged.is_some() || debt.and_then(|debt| debt.delivery) == Some(true) {
+    // Inside the file's cursor closure: a publishing save whose bodies lack an
+    // exact ACK owes delivery in the same transaction, including a Tail-only
+    // cycle-exit save after a failed POST. Only a file with a cursor owes it.
+    if debt.and_then(|debt| debt.delivery) == Some(true)
+        && (staged.is_some() || reduction.is_some())
+    {
         common.debt.reason_bits |= reason_bits::DELIVERY_DEBT;
         common
             .debt
