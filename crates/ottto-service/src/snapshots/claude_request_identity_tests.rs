@@ -3758,7 +3758,7 @@ fn no_key_flip_refusals_count_only_uncompared_terminal_flips() {
             )
             .remove(0);
         let (api, trace) = reports(Vec::new(), Vec::new());
-        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new());
         let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
         for (request_id, occurrence) in &item.claude_usage_occurrences {
             let (key, _, _) = build_row_identity(

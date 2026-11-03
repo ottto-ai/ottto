@@ -1583,7 +1583,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "historical_replay_generation"
             | "copy_prefix_last_accepted_nonce"
             | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
-            "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
             _ => panic!("add a non-default native fixture for persisted field {field}"),
         };
         value[field] = replacement;

@@ -202,7 +202,7 @@ fn run_page(
         health: Default::default(),
     };
     let trace = ClaudeTraceOwnershipLoadReport::default();
-    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     assert!(
         entity(&items).certificate_ok,
