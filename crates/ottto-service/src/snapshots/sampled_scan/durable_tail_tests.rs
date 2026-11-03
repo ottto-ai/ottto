@@ -2258,7 +2258,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if held {
                     assert!(admission
                         .as_ref()
-                        .map_or(true, |a| a["attempts"].as_u64() == Some(0)));
+                        .map_or(true, |a| a["attempts"].as_u64().unwrap_or(0) == 0));
                 } else if reachable {
                     let observed = match bypass {
                         "owning_header_false" if source == SnapshotSource::Codex => {

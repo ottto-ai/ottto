@@ -4708,17 +4708,15 @@ pub(crate) struct ScanEvidence<'a> {
 }
 
 /// Each request id named by healthy API or trace rows, as its SHA-256, with
-/// the ordinal of the one root holding it, or `SEVERAL` when rows
-/// under several roots name it. Rows are keyed by trace root, so this is how a
+/// each root ordinal holding it. Ownership lookup refuses requests named
+/// by several roots. Rows are keyed by trace root, so this is how a
 /// fork or resume copy under another root sees that the request already has
 /// an owner. A root's API and trace rows of one request are one claim: each
-/// root's ids are deduplicated as the root is added, before the collapse.
+/// root's ids are deduplicated as the root is added.
 #[derive(Default)]
-pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
+pub(crate) struct RequestRootIndex(pub(super) Vec<([u8; 32], u32)>);
 
 impl RequestRootIndex {
-    const SEVERAL: u32 = u32::MAX;
-
     /// Adds one root's API and trace request ids, in any order. Call once per root.
     pub(crate) fn add_root<'r>(&mut self, root: u32, request_ids: impl Iterator<Item = &'r str>) {
         let mut ids = request_ids
@@ -4729,25 +4727,20 @@ impl RequestRootIndex {
         self.0.extend(ids.into_iter().map(|id| (id, root)));
     }
 
-    /// Once every root is in: sort, then collapse ids held by several roots.
+    /// Once every root is in: sort and keep one entry per request and root.
     pub(crate) fn finish(&mut self) {
         self.0.sort_unstable();
-        self.0.dedup_by(|later, kept| {
-            if later.0 != kept.0 {
-                return false;
-            }
-            kept.1 = Self::SEVERAL;
-            true
-        });
+        // Keep each root ordinal for the terminal's batched shared-row count.
+        self.0.dedup();
         self.0.shrink_to_fit();
     }
 
     /// `Some(Some(root))`: one root's rows name `request_id`; `Some(None)`: several.
     pub(crate) fn get(&self, request_id: &str) -> Option<Option<u32>> {
         let id = <[u8; 32]>::from(sha2::Sha256::digest(request_id.as_bytes()));
-        let at = self.0.binary_search_by(|(known, _)| known.cmp(&id)).ok()?;
-        let root = self.0[at].1;
-        Some((root != Self::SEVERAL).then_some(root))
+        let at = self.0.partition_point(|(known, _)| *known < id);
+        let (_, root) = self.0.get(at).filter(|(known, _)| *known == id)?;
+        Some((self.0.get(at + 1).map_or(true, |(next, _)| *next != id)).then_some(*root))
     }
 }
 

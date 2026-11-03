@@ -1510,7 +1510,7 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
             assert!(index
                 .files
                 .values()
-                .any(|entry| entry.source_file_fingerprint.is_empty()));
+                .all(|entry| !entry.source_file_fingerprint.is_empty()));
         } else {
             assert!(index
                 .files

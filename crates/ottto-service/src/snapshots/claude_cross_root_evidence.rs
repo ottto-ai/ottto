@@ -27,7 +27,7 @@ const NO_SINGLE_OWNER: u32 = u32::MAX;
 pub(crate) struct CrossRootEvidence {
     support_dir: PathBuf,
     /// Every root added, by ordinal; tripwire rows name their root this way.
-    roots: Vec<String>,
+    pub(super) roots: Vec<String>,
     /// (a) Each healthy root's API and trace request ids, for fork and resume
     /// copies under another root.
     pub(crate) request_roots: RequestRootIndex,

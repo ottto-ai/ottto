@@ -3711,8 +3711,11 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         }
         assert_eq!(counts["index_entry_present"]["matched"], 0);
         assert_eq!(counts["sampling_allowed"]["matched"], 0);
-        assert_eq!(counts["prepare_started"], usize::from(!blocked));
-        assert_eq!(counts["prepare_failed"], 0);
+        assert_eq!(
+            counts["prepare_started"].as_u64().unwrap_or_default(),
+            u64::from(!blocked)
+        );
+        assert_eq!(counts["prepare_failed"].as_u64().unwrap_or_default(), 0);
         let (_, control, _, _) = production_scan_at_with_setup(
             &f,
             SnapshotSource::ClaudeCode,
@@ -5157,7 +5160,7 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             production_scan(&f, source, ScanIndex::default(), None, "rearm-cause");
         let key = local_index_key(&f.file.0);
         rearm_cause::retain(&index);
-        rearm_cause::clear(&key, index.files.get_mut(&key).unwrap(), cause);
+        rearm_cause::clear_owed(&key, index.files.get_mut(&key).unwrap(), cause, false);
         // The actual sync path reloads an index between pages in one process.
         let encoded = serde_json::to_vec(&index).unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains("rearm_cleared"));

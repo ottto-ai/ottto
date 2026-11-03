@@ -212,10 +212,14 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 &loaded,
                 &BTreeSet::new()
             ));
-            assert!(!claude_fence_held_only_by_witnessed_families(
-                &loaded,
-                "2026-10-29T00:00:00Z"
-            ));
+            assert_eq!(
+                claude_duplicate_fence_coverage_missing_member_count(
+                    &loaded,
+                    "2026-10-29T00:00:00Z"
+                ),
+                1,
+                "unavailable persistence cannot prove coverage"
+            );
             let old_move_hold = loaded.claude_history_move_released;
             loaded.note_claude_history_cutoff(PriorHistory::Moved, true, false);
             assert_eq!(loaded.claude_history_move_released, old_move_hold);

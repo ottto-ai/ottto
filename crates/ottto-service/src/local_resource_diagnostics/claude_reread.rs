@@ -563,6 +563,13 @@ pub(crate) fn restored(previous_empty: bool, held: bool, exact_only: bool) {
             .saturating_add(u64::from(exact_only));
     });
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later dead-code cut: census terminals no longer clear history"
+    )
+)]
 pub(crate) enum ClearSite {
     OwnedStart,
     AccountReproof,

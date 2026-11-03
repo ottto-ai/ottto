@@ -32,10 +32,10 @@ fn accepted_retry_no_otel_change_ack_then_carry_again() {
     )
     .unwrap();
     let closing = c1b_generation(&fixture, "accepted", (8, 0));
-    assert!(closing.census_complete && closing.full_rearm);
+    assert!(closing.census_complete && !closing.full_rearm);
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     let seed = c1b_generation(&fixture, "accepted", (8, 10));
-    assert!(seed.red && seed.parsed.contains(session));
+    assert!(seed.red && !seed.parsed.contains(session));
     let before = c1a_saved(&fixture);
     assert!(before["claude_usage_family_witnesses"]
         .get(session)
@@ -297,10 +297,9 @@ fn c1b_red_chain_with(
     arm: &str,
     between: impl FnOnce(&RearmFixture),
 ) -> C1bRun {
-    let family = rearm_family_sessions().len();
     let closing = c1b_generation(&fixture, arm, (8, 0));
     assert!(closing.census_complete, "{arm}: the first census completes");
-    assert!(closing.fence_after && closing.full_rearm, "{arm}");
+    assert!(closing.fence_after && !closing.full_rearm, "{arm}");
     assert!(closing.proven, "{arm}: the family is proven");
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     RearmFixture::append(
@@ -310,8 +309,8 @@ fn c1b_red_chain_with(
     let red = c1b_generation(&fixture, arm, (8, 10));
     assert!(red.red && !red.census_complete, "{arm}: the window is red");
     assert_eq!(
-        red.family_reads, family,
-        "{arm}: the re-arm reads the family"
+        red.family_reads, 0,
+        "{arm}: the terminal did not re-arm the unchanged family"
     );
     assert!(
         red.parsed.contains(REARM_TERMINAL),
@@ -386,7 +385,6 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len() as u64;
     let fix = c1b_red_chain("c1b-red-window", "fix", c1b_without_full_rearm_window);
     let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
@@ -418,11 +416,10 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         // BASE re-stamps (no read) where the fix carries.
         assert_eq!(window.family_reads, 0, "the carried family is not read");
         assert_eq!(window.reads, base_window.reads);
-        assert_eq!(start.carried_pending_families, Some(1));
-        assert_eq!(start.carried_index_files, Some(family));
+        assert_eq!(start.carried_pending_families, Some(0));
+        assert_eq!(start.carried_index_files, Some(0));
         assert_eq!(
-            start.rearmed_index_files.map(|files| files + family),
-            base_start.rearmed_index_files,
+            start.rearmed_index_files, base_start.rearmed_index_files,
             "every other stale family keeps the BASE re-arm"
         );
     }
@@ -448,8 +445,11 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
         "witness unchanged"
     );
     assert_eq!(fix.witness_after, base.witness_after);
-    assert!(!fix.family_pending_after, "the complete census retires it");
-    assert!(!base.family_pending_after);
+    assert!(
+        fix.family_pending_after,
+        "the complete census keeps its rows"
+    );
+    assert!(base.family_pending_after);
 }
 
 /// Q4 strict: the witnessed family's pending from the red window is invalid
@@ -474,9 +474,11 @@ fn c1b_invalid_pending_keeps_base_rearm() {
     };
     let fix = c1b_red_chain("c1b-invalid-pending", "fix", invalidate);
     let base = c1b_base_red_chain("c1b-invalid-pending-base", invalidate);
-    let family = rearm_family_sessions().len();
     let retry = &fix.windows[2];
-    assert_eq!(retry.family_reads, family, "the invalid family re-arms");
+    assert_eq!(
+        retry.family_reads, 0,
+        "the invalid family is neither owed nor re-read"
+    );
     assert_eq!(retry.family_reads, base.windows[2].family_reads);
     assert_eq!(retry.start, base.windows[2].start, "the start is BASE's");
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
@@ -529,10 +531,9 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         };
         let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
         let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
-        let family = rearm_family_sessions().len();
         // terminal-retry owe: the first retry reads under the old contract;
         // the second re-stamps that current-contract read.
-        let base_reads = [family, 0];
+        let base_reads = [0, 0];
         for ((window, base_window), base_reads) in fix
             .windows
             .iter()
@@ -654,7 +655,11 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     let _source_manifests = SourceManifestTestGuard::new();
     let (fix, base, cancelled, held) =
         c1b_recoverable_change_arms_listed("c1b-terminal-page-member-change", 64, true);
-    assert_eq!((cancelled, held), (0, 1), "one hold, no cancel");
+    assert_eq!(
+        (cancelled, held),
+        (0, 0),
+        "completed rows install no carry to cancel or hold"
+    );
     let retry = &fix.windows[2];
     let base_retry = &base.windows[2];
     // The listed retry reads the family on ordinary money; the unlisted
@@ -672,13 +677,17 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
             "{arm}: no listed family body is request-owned"
         );
     }
-    // BASE: the healthy terminal page re-proves the family. Its terminal-retry
-    // re-arm owes, so only the changed member is read; the rest re-stamp.
-    assert!(base_retry.census_complete && !base_retry.red);
+    // Both arms read only the changed member. The retained proof stays,
+    // while the incomplete new family remains on the ordinary retry path.
+    assert!(!base_retry.census_complete && !base_retry.red);
     assert_eq!(base_retry.family_reads, 1);
-    assert!(base_retry.proven && !base_retry.retry_pending);
+    assert!(base_retry.proven && base_retry.retry_pending);
     let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
+    assert_eq!(
+        start.carried_pending_families,
+        Some(0),
+        "no completed-row carry"
+    );
     assert_eq!(retry.family_reads, 1, "only the changed member is read");
     assert!(retry.retry_pending, "the ordinary path holds the family");
 }
@@ -727,7 +736,7 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
     // BASE's terminal-retry re-arm owes: the remaining members re-stamp.
     assert_eq!(base_retry.family_reads, 0, "BASE re-stamps the rest");
     let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_pending_families, Some(0));
     assert_eq!(retry.family_reads, 0, "the carry stands in this window");
     assert_eq!(retry.red, base_retry.red);
 }
@@ -871,8 +880,8 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
     assert_eq!(base_start.reason, start.reason);
     assert_eq!(
         start.carried_pending_families,
-        Some(1),
-        "the witnessed family"
+        Some(0),
+        "the completed family needs no stale carry"
     );
     assert_eq!(fix.retry.family_reads, 0, "the carried family is not read");
     // BASE's terminal-retry re-arm owes: it re-stamps the unchanged family.
@@ -930,7 +939,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
                 .and_then(serde_json::Value::as_object_mut)
                 .expect("the preceding full re-arm recorded its progress");
             assert!(
-                progress.remove("full_rearm_window").is_some(),
+                progress.remove("full_rearm_window").is_none(),
                 "explicitly leave Fix 2's window"
             );
             progress.remove("full_rearm_window_next");
@@ -971,7 +980,7 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
                 saved
                     .get("claude_full_rearm_progress")
                     .and_then(|progress| progress.get("full_rearm_window"))
-                    .is_some(),
+                    .is_none(),
                 "retain Fix 2's full-rearm window"
             );
             saved.insert(
@@ -1015,7 +1024,7 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
     };
     assert_eq!(
         fix.retry.start.as_ref().unwrap().carried_pending_families,
-        Some(1)
+        Some(0)
     );
     assert_eq!(
         base.retry.start.as_ref().unwrap().carried_pending_families,
@@ -1076,11 +1085,10 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let fixture = c1a_fixture("c1a-latch-retry-pending-debt");
     let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
-    assert!(closing.census_complete && closing.full_rearm && closing.fence_after);
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    assert!(closing.census_complete && !closing.full_rearm && closing.fence_after);
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
     c1a_edit_index(&fixture, |saved| {
         saved.remove("claude_request_identity_contract");
         saved.remove("claude_request_identity_contract_changed");
@@ -1091,7 +1099,7 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     index.save(&fixture.index_path).unwrap();
     c1a_full_rearm_due(&fixture);
     let held = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
-    assert_eq!(held.family_reads, family);
+    assert_eq!(held.family_reads, 0);
     assert!(!held.census_complete, "the census stays withheld");
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(saved
@@ -1119,8 +1127,8 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     assert!(cleared.census_complete);
     assert_eq!(
         c1a_latch(&fixture),
-        (c1a_collector(), false),
-        "the next clean terminal clears it"
+        (c1a_collector(), true),
+        "the terminal keeps the latch without an automatic re-read"
     );
 }
 
@@ -1133,7 +1141,7 @@ fn fix2_clean_followup(fixture: &RearmFixture) {
             saved
                 .get("claude_full_rearm_progress")
                 .and_then(|progress| progress.get("full_rearm_window"))
-                .is_some(),
+                .is_none(),
             "the 08:10 start opened a full-rearm window"
         );
         saved.remove("traversal");
@@ -1156,7 +1164,6 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len() as u64;
     let fix = c1b_red_chain("fix2-clean-followup", "fix", fix2_clean_followup);
     let base = c1b_base_red_chain("fix2-clean-followup-base", fix2_clean_followup);
     let [_, _, followup, repaired, _] = &fix.windows;
@@ -1173,7 +1180,7 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         base_start.stale_pending_families
     );
     // Preconditions on BASE: the clean follow-up re-reads the family.
-    assert_eq!(base_followup.family_reads as u64, family);
+    assert_eq!(base_followup.family_reads, 0);
     assert_eq!(base_start.carried_pending_families, Some(0));
     // FLIPS: the unchanged family is carried, not re-read.
     assert_eq!(followup.family_reads, 0, "the carried family is not read");
@@ -1181,11 +1188,10 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
         followup.parsed.contains(REARM_TERMINAL),
         "unwitnessed: BASE"
     );
-    assert_eq!(start.carried_pending_families, Some(1));
-    assert_eq!(start.carried_index_files, Some(family));
+    assert_eq!(start.carried_pending_families, Some(0));
+    assert_eq!(start.carried_index_files, Some(0));
     assert_eq!(
-        start.rearmed_index_files.map(|files| files + family),
-        base_start.rearmed_index_files,
+        start.rearmed_index_files, base_start.rearmed_index_files,
         "every other stale family keeps the BASE re-arm"
     );
     assert_eq!(
@@ -1225,7 +1231,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("scoped-retry-late-identity");
     let closing = c1b_generation(&fixture, "scoped", (8, 0));
-    assert!(closing.census_complete && closing.proven && closing.full_rearm);
+    assert!(closing.census_complete && closing.proven && !closing.full_rearm);
     assert!(
         closing.request_owned.contains(REARM_ROOT),
         "positive control: the unlisted root body is request-owned"
@@ -1248,7 +1254,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     let retry = c1b_generation(&fixture, "scoped", (8, 20));
     assert_eq!(
         retry.start.as_ref().unwrap().carried_pending_families,
-        Some(1)
+        Some(0)
     );
     assert_eq!(
         retry.family_reads, 0,
@@ -1402,7 +1408,7 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     let run = c1b_held_retry_chain("scoped-retry-mark-and-authority", "scoped", mark);
     let start = run.retry.start.as_ref().unwrap();
     assert_eq!(start.reason, "terminal_unhealthy_retry");
-    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_pending_families, Some(0));
     assert_eq!(run.retry.family_reads, 0);
     assert_eq!(run.record_after_retry, run.record_after_red);
     assert!(run
@@ -1612,7 +1618,7 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
     fixture.owned_base_preparation = true;
     fixture.request_identity = false;
     c1a_generation(&fixture, "A", (8, 0));
-    assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+    assert_eq!(c1a_latch(&fixture), (Some(String::new()), true));
     let mut ended = false;
     for number in 0..C1A_MAX_PAGES {
         fixture.request_identity = number != 0;
@@ -1625,7 +1631,7 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
         ended = !page.index.scan_traversal_in_progress_for_test();
         if number == 0 {
             assert!(!ended, "B must arrive inside the Started A traversal");
-            assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+            assert_eq!(c1a_latch(&fixture), (Some(String::new()), true));
         } else {
             assert_eq!(
                 c1a_latch(&fixture),
@@ -1653,6 +1659,173 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
         c1a_latch(&fixture),
         (Some(C1A_MID_TRAVERSAL.to_owned()), true)
     );
+}
+
+// Reproduce main's first-terminal scheduling effects only in this reference
+// fixture: its automatic Full cleared progress and discarded pending. The
+// ordinary body builder, identity fold, exact ACK validator and save remain
+// the same production paths. No production read cause is added.
+fn source_t2_ordinary_reference() -> RearmFixture {
+    let mut reference = c1a_fixture("source-t2-ordinary-reference");
+    reference.owned_base_preparation = true;
+    reference.native_file_limit = 2;
+    c1a_add_family_request_identity(&reference);
+    crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
+        crate::snapshots::claude_request_identity::COLLECTOR,
+        || {
+            latch_contract_generation(&reference, 0);
+            let mut index = ScanIndex::load(&reference.index_path).unwrap();
+            for entry in index.files.values_mut() {
+                entry.source_file_fingerprint.clear();
+            }
+            let mut saved = serde_json::to_value(&index).unwrap();
+            saved["claude_usage_family_pending"] = serde_json::json!({});
+            index = serde_json::from_value(saved).unwrap();
+            index.save(&reference.index_path).unwrap();
+            reference.list_held(&[REARM_ROOT, REARM_SIBLING]);
+            latch_contract_generation(&reference, 10);
+        },
+    );
+    reference
+}
+
+fn source_t2_placement(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for bucket in body["usage_buckets"].as_array().unwrap() {
+        for row in bucket["model_usage"].as_array().unwrap() {
+            assert!(
+                row.get("identity_parts").is_none(),
+                "single-account fixture"
+            );
+            let evidence = row["evidence_ref"]
+                .as_u64()
+                .map(|at| &body["request_evidence"][at as usize]);
+            let mut placement = serde_json::json!({
+                "hour": bucket["bucket_start"], "model": row["model"],
+                "account": row["account_identifier_hash"],
+                "organization": evidence.map(|e| &e["provider_workspace_hash"]),
+            });
+            for field in [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_5m_tokens",
+                "cache_creation_1h_tokens",
+                "reasoning_output_tokens",
+                "unattributed_total_tokens",
+                "request_count",
+                "auth_mode",
+                "billing_channel",
+                "billing_provider",
+                "gateway_provider",
+                "model_provider",
+                "subscription_product",
+                "cost_usd",
+                "input_cost_usd",
+                "output_cost_usd",
+                "cache_read_cost_usd",
+                "cache_creation_cost_usd",
+            ] {
+                placement[field] = row[field].clone();
+            }
+            rows.push(placement);
+        }
+    }
+    rows.sort_by_key(serde_json::Value::to_string);
+    rows
+}
+
+fn source_t2_quantify_forward_only(fixture: &RearmFixture) {
+    let reference = source_t2_ordinary_reference();
+    let current = ScanIndex::load(&fixture.index_path).unwrap();
+    let main = ScanIndex::load(&reference.index_path).unwrap();
+    let actual = fixture.body_trace.borrow();
+    let base = reference.body_trace.borrow();
+    let sessions = [
+        rearm_member_session(None),
+        rearm_member_session(Some(REARM_AGENTS[0])),
+        rearm_member_session(Some(REARM_AGENTS[1])),
+        REARM_SIBLING.to_owned(),
+    ];
+    // Emit every synthetic member before the first equality guard can stop the
+    // comparison. Keep raw wire rows separate from aggregate placement: row
+    // splitting, selector shape and cost spelling are not owner changes.
+    for (ordinal, session) in sessions.iter().enumerate() {
+        eprintln!(
+            "CENSUS_EXIT_T2_ROWS role={ordinal} main={} forward={}",
+            serde_json::to_string(&source_t2_placement(&base.finalizer_bodies[session])).unwrap(),
+            serde_json::to_string(&source_t2_placement(&actual.finalizer_bodies[session])).unwrap(),
+        );
+    }
+    for (ordinal, session) in sessions.iter().enumerate() {
+        let a = &actual.finalizer_bodies[session];
+        let b = &base.finalizer_bodies[session];
+        let counts = |body: &serde_json::Value| {
+            [
+                "request_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_5m_tokens",
+                "cache_creation_1h_tokens",
+                "reasoning_output_tokens",
+                "unattributed_total_tokens",
+            ]
+            .map(|field| body[field].as_u64().unwrap_or_default())
+        };
+        let custody = |fixture: &RearmFixture,
+                       index: &ScanIndex,
+                       trace: &RearmBodyTrace,
+                       body: &serde_json::Value| {
+            let key = if session == REARM_SIBLING {
+                c1b_sibling_path(fixture)
+            } else {
+                let agent = REARM_AGENTS.iter().find(|agent| session.ends_with(**agent));
+                fixture.member_path(agent.copied())
+            }
+            .to_string_lossy()
+            .into_owned();
+            let saved = serde_json::to_value(index).unwrap();
+            let entities = saved["file_snapshot_fingerprints"][&key]
+                .as_array()
+                .unwrap();
+            let fingerprint = body["snapshot_fingerprint"].as_str().unwrap();
+            let entry = &saved["files"][&key];
+            [
+                entities.len() as u64,
+                u64::from(entities.iter().any(|fp| fp == fingerprint)),
+                u64::from(
+                    index
+                        .accepted_snapshot_fingerprints_for_test()
+                        .contains(fingerprint),
+                ),
+                u64::from(
+                    trace.strict_ack_witnesses[session] == trace.finalizer_witnesses[session],
+                ),
+                entry["effective_upload_body_witness_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ]
+        };
+        let ac = custody(fixture, &current, &actual, a);
+        let bc = custody(&reference, &main, &base, b);
+        let placed = source_t2_placement(a) == source_t2_placement(b);
+        eprintln!("CENSUS_EXIT_T2 role={ordinal} main_counts={:?} forward_counts={:?} placement_equal={placed} main_custody={bc:?} forward_custody={ac:?} semantic_key_equal={} additive_key_equal={}",
+            counts(b), counts(a), a["snapshot_fingerprint"] == b["snapshot_fingerprint"],
+            actual.strict_ack_witnesses[session] == base.strict_ack_witnesses[session]);
+        assert_eq!(counts(a), counts(b), "forward-only totals role={ordinal}");
+        assert_eq!(
+            counts(a),
+            if ordinal == 0 {
+                [2, 20, 20, 0, 0, 0, 0, 0]
+            } else {
+                [1, 10, 10, 0, 0, 0, 0, 0]
+            }
+        );
+        assert!(placed, "forward-only placement role={ordinal}");
+        assert_eq!(ac, bc, "forward-only custody role={ordinal}");
+        assert_eq!(ac, [1, 1, 1, 1, 3], "one exact accepted entity per file");
+    }
 }
 
 // Finish the invariant/current-contract G first while F remains
@@ -1688,6 +1861,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 },
             );
         }
+        source_t2_quantify_forward_only(&fixture);
         let old_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
         for session in [REARM_ROOT, REARM_SIBLING] {
             assert_ne!(

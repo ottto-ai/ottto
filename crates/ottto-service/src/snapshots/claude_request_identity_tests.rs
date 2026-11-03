@@ -1860,7 +1860,7 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
         Some(&evidence),
     );
     assert!(index.claude_usage_family_witnesses.contains_key(&parent));
-    assert_eq!(armed(&index), [true, true], "both members re-armed");
+    assert_eq!(armed(&index), [false, false], "proof keeps both revisions");
 
     // The next pass re-parses them under an incomplete (unsettled) census.
     let mut reparsed = items;

@@ -3289,6 +3289,23 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
     retire_claude_transcript_records_excluding(index, window, None)
 }
 
+/// Age is not absence: cohort holders keep their hashes, and owed members
+/// remain available for a read-free restamp. Admission-pressure releases keep
+/// main's policy; neither age rule retires Tail state.
+fn age_retirement_family_hold(index: &ScanIndex) -> impl Fn(&str) -> bool + '_ {
+    let cohort = super::claude_pending_family_session_ids(index)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    move |key| {
+        index
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.evidence_owed)
+            || super::claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| cohort.contains(member.root))
+    }
+}
+
 fn retire_claude_transcript_records_excluding(
     index: &mut ScanIndex,
     window: u64,
@@ -3314,8 +3331,11 @@ fn retire_claude_transcript_records_excluding(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
+    let family_held = age_retirement_family_hold(index);
     let held = |key: &str| {
-        super::restart_restore::enabled() && terminal_residue.is_some_and(|held| held.contains(key))
+        family_held(key)
+            || (super::restart_restore::enabled()
+                && terminal_residue.is_some_and(|held| held.contains(key)))
     };
     let growth_excluded = |key: &str| {
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
@@ -3405,6 +3425,7 @@ fn retire_claude_transcript_records_excluding(
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;
     }
+    drop(family_held);
     index.claude_request_census = owned_census;
     retirement
 }

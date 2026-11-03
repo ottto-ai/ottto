@@ -310,10 +310,13 @@ fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
         pending.invalid = true;
     };
     let ((fix, row), (_, base_row)) = carry_arms(&mutate, BACKFILL_WINDOW_DAYS);
-    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(
+        base_row["rearmed_index_files"], 2,
+        "invalid family is not owed"
+    );
     // FLIPS: BASE re-arms every member.
     assert_eq!(row["carried_pending_families"], 1);
-    assert_eq!(row["rearmed_index_files"], 1);
+    assert_eq!(row["rearmed_index_files"], 0);
     for key in carry_family_keys() {
         assert!(!fix.files[&key].source_file_fingerprint.is_empty());
     }
@@ -621,7 +624,12 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
         // A terminal-retry re-arm owes; the context-changed control clears.
         for key in carry_family_keys() {
             if let Some(entry) = fix.files.get(&key) {
-                assert!(entry.rearmed(), "{}: {key} re-arms", control.name);
+                assert!(
+                    control.name == "empty_fingerprint_member"
+                        || !entry.source_file_fingerprint.is_empty(),
+                    "{}: {key} keeps its existing progress (empty stays empty)",
+                    control.name
+                );
             }
         }
         assert!(
@@ -1200,7 +1208,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         );
     }
     let unwitnessed = carry_key(CARRY_UNWITNESSED, None);
-    assert!(fix.files[&unwitnessed].source_file_fingerprint.is_empty());
+    assert!(!fix.files[&unwitnessed].source_file_fingerprint.is_empty());
     assert_compacted_and_invalid(&fix, CARRY_ROOT);
     assert_eq!(
         fix.claude_usage_family_witnesses,
@@ -1220,6 +1228,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         .get_mut(&unwitnessed)
         .unwrap()
         .source_file_fingerprint = before.files[&unwitnessed].source_file_fingerprint.clone();
+    fix.files.get_mut(&unwitnessed).unwrap().evidence_owed = false;
     fix.claude_usage_family_pending
         .get_mut(CARRY_UNWITNESSED)
         .unwrap()
@@ -1251,7 +1260,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
     let row = carry_start(&mut next, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
     assert_eq!(row["rearmed_index_files"], 1);
     assert!(row.get("stale_rearm_capped_families").is_none());
-    assert!(next.files[&unwitnessed].source_file_fingerprint.is_empty());
+    assert!(!next.files[&unwitnessed].source_file_fingerprint.is_empty());
 
     // The cap never holds a family whose member is not accepted, nor any
     // family while the contract-5 latch is set.
@@ -1345,6 +1354,7 @@ fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
     assert_eq!(first["rearm_window_rearmed_files"], 2);
     for (key, entry) in &mut index.files {
         entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+        entry.evidence_owed = false; // This fixture explicitly simulates the paid read.
     }
     index
         .claude_usage_family_pending
@@ -1457,6 +1467,7 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
                 .get_mut(&unwitnessed)
                 .unwrap()
                 .source_file_fingerprint = revision;
+            active.files.get_mut(&unwitnessed).unwrap().evidence_owed = false;
             active
                 .claude_usage_family_pending
                 .get_mut(CARRY_UNWITNESSED)
@@ -1598,6 +1609,7 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
     // error requires another walk. The consumed allowance cannot hold them.
     for (key, entry) in &mut index.files {
         entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+        entry.evidence_owed = false; // This fixture explicitly simulates the paid read.
     }
     for pending in index.claude_usage_family_pending.values_mut() {
         pending.census_window_end = CARRY_RETRY.to_string();
@@ -1614,7 +1626,7 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
     assert_eq!(row["carried_pending_families"], 0);
     assert!(row.get("stale_rearm_capped_families").is_none());
     for (key, entry) in &index.files {
-        assert!(entry.source_file_fingerprint.is_empty(), "{key}");
+        assert!(!entry.source_file_fingerprint.is_empty(), "{key}");
         assert_eq!(
             entry.source_file_fingerprint,
             base.files[key].source_file_fingerprint
@@ -1643,6 +1655,11 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
         .get_mut(&carry_key(CARRY_UNWITNESSED, None))
         .unwrap()
         .source_file_fingerprint = revision;
+    index
+        .files
+        .get_mut(&carry_key(CARRY_UNWITNESSED, None))
+        .unwrap()
+        .evidence_owed = false;
     index
         .claude_usage_family_pending
         .get_mut(CARRY_UNWITNESSED)
@@ -1823,7 +1840,7 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
             while !parser.step().unwrap() {}
             healthy_full += 1;
         }
-        assert_eq!(healthy_full, expected_healthy_full);
+        assert_eq!(healthy_full, 0, "refusals never select an unchanged Full");
         assert_eq!(held_reads_before_deadline, 0);
         // Control: the held families still select when their own deadline is
         // due. This changes no binding, accepted body or identity latch.
@@ -2035,7 +2052,7 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
             let _base = KeepStaleClaudeFamilyRearmForTest::new();
             carry_start(&mut base, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         }
-        assert_eq!(scoped_retry_full_reads(&base, &fixture.candidates), 32);
+        assert_eq!(scoped_retry_full_reads(&base, &fixture.candidates), 0);
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         assert_eq!(row["prior_unsettled_upload"], true);
         assert_eq!(row["carried_pending_families"], 32);
@@ -2341,9 +2358,21 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
         } else {
             assert_eq!(row["carried_pending_families"], 0, "{case}");
             if !matches!(case, "context" | "mid_walk") {
-                assert_eq!(row["rearmed_index_files"], 32, "{case}");
+                assert_eq!(
+                    row["rearmed_index_files"],
+                    if case == "invalid_pending" { 0 } else { 32 },
+                    "{case}"
+                );
             }
-            assert_eq!(healthy_full, 32, "{case}");
+            assert_eq!(
+                healthy_full,
+                if matches!(case, "context" | "mid_walk") {
+                    32
+                } else {
+                    0
+                },
+                "{case}"
+            );
         }
     }
 }
@@ -2530,8 +2559,12 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
             .unwrap();
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 0),
-            CandidateDecision::Parse,
-            "{case}"
+            if matches!(case, "scan_version" | "empty_revision" | "account_hold" | "authority_hold") {
+                CandidateDecision::Parse
+            } else {
+                CandidateDecision::Skip
+            },
+            "{case}: refused unchanged evidence remains owed; changed identity keeps its existing selection"
         );
         if case != "list_missing" {
             assert_eq!(
@@ -2712,7 +2745,13 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
         } else {
             assert_eq!(
                 owed_decision(&mut fixture.index, &fixture.candidates[0], 0),
-                CandidateDecision::Parse,
+                if case == "changed" {
+                    CandidateDecision::Parse
+                } else if case == "version" {
+                    CandidateDecision::Migrate
+                } else {
+                    CandidateDecision::Skip
+                },
                 "{case}"
             );
             if case != "changed" {
@@ -2783,7 +2822,11 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
         }
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 1),
-            CandidateDecision::Parse,
+            if matches!(case, "identity_latch" | "missing_replay") {
+                CandidateDecision::Skip
+            } else {
+                CandidateDecision::Parse
+            },
             "{case}"
         );
         if case == "identity_latch" {
@@ -3560,7 +3603,11 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         }
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 1),
-            CandidateDecision::Parse,
+            if matches!(case, "content" | "sidecar" | "account" | "upload_context") {
+                CandidateDecision::Parse
+            } else {
+                CandidateDecision::Skip
+            },
             "{case}"
         );
         if matches!(case, "content" | "sidecar" | "account") {
@@ -3912,7 +3959,7 @@ fn resumed_codex_page_preserves_claude_full_cause() {
     let key = carry_key(CARRY_ROOT, None);
     let mut entry = manifest_index_entry(Some("accepted"));
     entry.source_file_fingerprint = "proven".into();
-    rearm_cause::clear(&key, &mut entry, rearm_cause::Cause::ContextChanged);
+    rearm_cause::clear_owed(&key, &mut entry, rearm_cause::Cause::ContextChanged, false);
 
     let mut codex = ScanIndex::default();
     ensure_bounded_traversal(
@@ -4180,7 +4227,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
             candidates,
             &window,
         );
-        assert_eq!(parsed, 1, "latched={latched} requests={requests}");
+        assert_eq!(parsed, 0, "latched={latched} requests={requests}");
         assert!(index.files[&key].evidence_owed);
     }
 
@@ -4204,8 +4251,8 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         let mut page = evidence_owed::Page::default();
         assert_eq!(
             owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
-            1,
-            "latched {latched}"
+            0,
+            "latched {latched}: invalid evidence stays owed without a paced Full"
         );
         assert_eq!(index.claude_usage_family_pending[&root], invalid);
         assert!(index.files.values().all(|entry| entry.evidence_owed));
@@ -4485,13 +4532,22 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
             );
         }
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let mut reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
         let counts = scope.finish().contract.evidence_owed;
         assert_eq!(
             (counts.restamped, counts.refused_record, reads.len()),
-            if api_error { (1, 1, 1) } else { (2, 0, 0) },
+            if api_error { (1, 1, 0) } else { (2, 0, 0) },
             "api_error={api_error}"
         );
+        // A later independent selection may still rebuild the refused member;
+        // the owed resolver itself selected no read.
+        for candidate in &candidates {
+            let key = local_index_key(&candidate.path);
+            if owed.files[&key].evidence_owed {
+                reads.push(candidate.path.clone());
+                owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+            }
+        }
         let read = items
             .iter()
             .filter(|item| {
@@ -4609,9 +4665,14 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                 counts.restamped,
                 reads.len()
             ),
-            (1, 0, 1),
-            "{session}: read"
+            (1, 0, 0),
+            "{session}: refusal stays owed"
         );
+        assert!(owed.files[&key].evidence_owed);
+        // Model an independently selected read, then retain the money oracle.
+        for candidate in &candidates {
+            owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+        }
         let bodies = fold_real(&mut owed, &items, CARRY_RETRY);
         census(&mut owed, CARRY_RETRY);
         assert_bodies_equal_a_full(&full_bodies, &bodies);
@@ -4714,7 +4775,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
         ("placeholder", placeholder),
     ] {
         let (parsed, counts) = visit(&mut index);
-        assert_eq!(parsed, 2, "{name}");
+        assert_eq!(parsed, 0, "{name}");
         assert_eq!(
             (counts.refused_contract_latch, counts.restamped),
             (2, 0),
@@ -4729,7 +4790,7 @@ fn owed_evidence_contract_stamp_restamps_only_a_current_contract_read() {
     // After an exempt latch clear and the quarantine lifting, the family
     // proves its contract only through its own stamp: without it every owed
     // member takes the Full path, never a re-stamp through the cleared latch.
-    for (stamped, parsed, restamped, refused) in [(false, 2, 0, 2), (true, 0, 2, 0)] {
+    for (stamped, parsed, restamped, refused) in [(false, 0, 0, 2), (true, 0, 2, 0)] {
         let mut index = fixture.index.clone();
         index.claude_request_identity_contract_changed = false;
         stamp(&mut index, stamped.then_some(current).flatten());
@@ -4815,7 +4876,7 @@ fn owed_evidence_current_contract_reads_reopen_the_fence_under_the_latch() {
 /// cold Full's under the current contract (the emitted-money oracle, with
 /// placement), as does the family pending.
 #[test]
-fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
+fn owed_evidence_old_contract_refuses_without_read_then_independent_read_equals_full() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4868,10 +4929,13 @@ fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
             counts.identity_owed_read_under_latch,
             counts.restamped
         ),
-        (2, 2, 2, 2, 0),
+        (0, 0, 2, 0, 0),
         "{counts:?}"
     );
-    assert!(owed.files.values().all(|entry| !entry.evidence_owed));
+    assert!(owed.files.values().all(|entry| entry.evidence_owed));
+    for candidate in &candidates {
+        owed.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+    }
     let bodies = fold_real(&mut owed, &items, CARRY_RETRY);
     assert_bodies_equal_a_full(&full_bodies, &bodies);
     assert_eq!(
@@ -4881,11 +4945,10 @@ fn owed_evidence_old_contract_read_takes_one_paced_read_equal_to_a_full() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [behaviour] Owed Fulls share ONE per-page allowance
-/// (the paced history-upgrade re-read budget). Past it an owed read is
-/// deferred, counted, and requeued as a non-member re-read, still owed.
+/// [behaviour] A refused unchanged member stays owed without selecting a
+/// Full or adding a retry to the traversal, regardless of the old allowance.
 #[test]
-fn owed_evidence_reads_are_capped_per_page() {
+fn refused_owed_evidence_never_reads_or_requeues() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -4908,7 +4971,7 @@ fn owed_evidence_reads_are_capped_per_page() {
             counts.refused_no_pending,
             counts.restamped
         ),
-        (3, 3, 3, 0)
+        (0, 0, 3, 0)
     );
 
     let queued = fixture
@@ -4925,9 +4988,9 @@ fn owed_evidence_reads_are_capped_per_page() {
     };
     let parsed = owed_selected_parses(&mut fixture.index, &mut page, &fixture.candidates, &window);
     let counts = scope.finish().contract.evidence_owed;
-    assert_eq!((parsed, counts.deferred_page_cap), (1, 2));
+    assert_eq!((parsed, counts.deferred_page_cap, counts.read), (0, 0, 0));
     let traversal = fixture.index.traversal.as_ref().unwrap();
-    assert_eq!(traversal.pending_candidates.len(), queued + 2);
+    assert_eq!(traversal.pending_candidates.len(), queued);
     assert!(traversal
         .pending_candidates
         .iter()
@@ -5116,4 +5179,89 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
     assert!(v2::usage_head_only(&gone, CARRY_ROOT), "nothing compacted");
     drop(custody);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// [regress] Context-only starts owe valid members; invalid rows stay in
+/// the cohort without permanent debt. Replay keeps its explicit clear.
+#[test]
+fn context_restart_never_owes_invalid_rows_and_replay_still_clears() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for mode in ["context", "no_retained", "replay"] {
+        let replay = mode == "replay";
+        let (mut fixture, _) = owed_rearmed(2);
+        let window = fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .census_window_end
+            .clone();
+        for entry in fixture.index.files.values_mut() {
+            entry.evidence_owed = false;
+        }
+        let roots = fixture
+            .index
+            .claude_usage_family_pending
+            .roots()
+            .cloned()
+            .collect::<Vec<_>>();
+        let invalid = roots[0].clone();
+        fixture
+            .index
+            .claude_usage_family_pending
+            .get_mut(&invalid)
+            .unwrap()
+            .invalid = true;
+        if replay {
+            fixture.index.historical_replay_generation = Some("explicit-replay".into());
+        }
+        // The prior fixture's traversal was captured in this process. Changing
+        // backfill is an observed context part; replay is never restamp-only.
+        let candidates = fixture.candidates.clone();
+        let scan_roots = candidates
+            .first()
+            .map(|c| c.scan_root.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if mode == "no_retained" {
+            fixture.index.traversal = None;
+        }
+        let start_roots = if mode == "no_retained" {
+            &[][..]
+        } else {
+            &scan_roots[..]
+        };
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            start_roots,
+            &mut fixture.index,
+            &window,
+            BACKFILL_WINDOW_DAYS + u64::from(mode != "no_retained"),
+        );
+        assert_eq!(
+            fixture
+                .index
+                .claude_usage_family_pending
+                .roots()
+                .cloned()
+                .collect::<Vec<_>>(),
+            roots
+        );
+        for candidate in &candidates {
+            let key = local_index_key(&candidate.path);
+            let entry = &fixture.index.files[&key];
+            let member = claude_index_path_member_ref(&candidate.path).unwrap();
+            if replay {
+                assert!(entry.source_file_fingerprint.is_empty());
+            }
+            if member.root == invalid {
+                assert!(!entry.evidence_owed);
+            } else if !replay {
+                assert!(entry.evidence_owed, "{mode}: valid evidence remains owed");
+                assert!(!entry.source_file_fingerprint.is_empty());
+            }
+        }
+    }
 }

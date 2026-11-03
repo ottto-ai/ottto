@@ -21,7 +21,7 @@ use super::*;
 /// the join keeps no hash strings.
 type RequestKey = [u8; 32];
 
-const HASH: u8 = 1;
+pub(super) const HASH: u8 = 1;
 const OCCURRENCE: u8 = 2;
 const CURRENT: u8 = 4;
 
@@ -90,7 +90,7 @@ pub(super) struct TerminalJoin {
     /// (key, owner, flags), sorted, one entry per key and owner.
     entries: Vec<(RequestKey, u32, u8)>,
     /// Owner ids: (root, member), each family's members contiguous and sorted.
-    owners: Vec<(String, String)>,
+    pub(super) owners: Vec<(String, String)>,
     /// Root -> its first owner id and member count.
     families: BTreeMap<String, (u32, u32)>,
     /// Root -> the other roots the legacy request owners name for its root
@@ -430,7 +430,7 @@ impl TerminalJoin {
         Some(first + at as u32)
     }
 
-    fn runs<'k>(
+    pub(super) fn runs<'k>(
         &'k self,
         keys: &'k BTreeSet<RequestKey>,
     ) -> impl Iterator<Item = &'k (RequestKey, u32, u8)> + 'k {

@@ -391,8 +391,8 @@ impl Family {
         assert_eq!(child[0].usage_accounting_contract.as_deref(), REPORTED);
         let first_witness = self.witness();
         assert!(
-            !self.armed(&self.parent_key),
-            "the first exact proof re-arms the earlier-page root once"
+            self.armed(&self.parent_key),
+            "the first exact proof keeps earlier-page progress"
         );
         assert!(self.armed(&self.child_key));
         self.reload();
@@ -482,8 +482,8 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
     assert_eq!(disposition.quarantined_entity_count(), 2);
     family.page(&mut [], true, "2026-08-02T07:40:00Z");
     assert_ne!(family.witness(), first_witness);
-    assert!(!family.armed(&parent_key));
-    assert!(!family.armed(&child_key));
+    assert!(family.armed(&parent_key));
+    assert!(family.armed(&child_key));
 
     // The re-armed members rebuild from the new witness with the grown usage,
     // which resolves the quarantine.

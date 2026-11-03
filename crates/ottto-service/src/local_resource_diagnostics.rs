@@ -2150,9 +2150,15 @@ impl AssessedBool {
         self.matched = self.matched.saturating_add(usize::from(value));
     }
 }
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct AcquisitionAdmission {
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub(crate) attempts: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub(crate) cache_lookup_miss_unknown_origin: usize,
     pub(crate) retained_entry: AssessedBool,
     pub(crate) owning_header_current: AssessedBool,
@@ -2168,8 +2174,11 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) audit_debt_present: AssessedBool,
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub(crate) retained_entry_rejected_by_eligibility: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub(crate) prepare_started: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub(crate) prepare_failed: usize,
 }
 crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);

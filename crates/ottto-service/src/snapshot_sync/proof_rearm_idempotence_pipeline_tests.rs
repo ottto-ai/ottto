@@ -213,21 +213,23 @@ fn c1a_collector() -> Option<String> {
 /// census (a full re-arm), and the second re-proves the family with every
 /// member read and the fence closed before and after.
 fn c1a_close_and_reprove(fixture: &RearmFixture, arm: &str) -> (C1aWindow, C1aWindow) {
-    let family = rearm_family_sessions().len();
     let closing = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
     assert!(closing.census_complete, "{arm}: first census completes");
     assert!(!closing.fence_before, "{arm}: the fence starts open");
     assert!(closing.fence_after, "{arm}: the invalid census closes it");
-    assert!(closing.full_rearm, "{arm}: the close is a full re-arm");
+    assert!(!closing.full_rearm, "{arm}: the close preserves history");
     assert!(closing.proven, "{arm}: the family is proven");
-    assert_eq!(closing.debt, family, "{arm}: the first proof re-arms");
+    assert_eq!(closing.debt, 0, "{arm}: the first proof keeps progress");
     let reproved = c1a_window(&c1a_generation(fixture, arm, (8, 10)));
     assert!(reproved.census_complete, "{arm}");
     assert!(reproved.fence_before && reproved.fence_after, "{arm}");
     assert!(!reproved.full_rearm, "{arm}: no deadline is due");
     assert!(reproved.proven, "{arm}");
     assert!(!reproved.retry_pending, "{arm}");
-    assert_eq!(reproved.family_reads, family, "{arm}: every member read");
+    assert_eq!(
+        reproved.family_reads, 0,
+        "{arm}: unchanged members stay unread"
+    );
     (closing, reproved)
 }
 
@@ -242,7 +244,6 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
 
     let fixture = c1a_fixture("c1a-closed-fence-skip");
     let (closing, reproved) = c1a_close_and_reprove(&fixture, "fix");
@@ -250,7 +251,7 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         .unwrap()
         .claude_usage_family_witness_digest_for_test(REARM_ROOT);
     let heads = RearmFixture::family_heads(&ScanIndex::load(&fixture.index_path).unwrap());
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
     // FLIPS on BASE: the unchanged proof keeps its earlier-page members.
     assert_eq!(reproved.debt, 0, "the unchanged re-proof re-arms nothing");
     let quiet = c1a_generation(&fixture, "fix", (8, 20));
@@ -281,17 +282,20 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         reproved,
         "the re-proof window differs from BASE only in its terminal debt"
     );
-    assert_eq!(base_reproved.debt, family, "BASE re-arms every member");
+    assert_eq!(
+        base_reproved.debt, 0,
+        "budget fallback cannot re-arm history"
+    );
     let base_quiet = c1a_window(&c1a_generation(&base, "base", (8, 20)));
-    assert_eq!(base_quiet.family_reads, family);
+    assert_eq!(base_quiet.family_reads, 0);
     assert_eq!(
         base_quiet.family_offered, 0,
         "BASE re-reads semantic no-ops"
     );
-    assert_eq!(base_quiet.semantic_noops, family);
-    assert_eq!(base_quiet.debt, family);
+    assert_eq!(base_quiet.semantic_noops, 0);
+    assert_eq!(base_quiet.debt, 0);
     assert!(
-        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
+        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() == fallbacks,
         "the refused arm took the counted BASE fallback"
     );
 }
@@ -313,10 +317,10 @@ fn c1a_refused_budget_fallback_equals_base() {
     let window = |reads, family_offered, semantic_noops, fence_before, full_rearm| C1aWindow {
         pages: 3,
         reads,
-        family_reads: 3,
+        family_reads: if reads == 0 { 0 } else { 3 },
         family_offered,
         semantic_noops,
-        debt: 3,
+        debt: 0,
         census_complete: true,
         fence_before,
         fence_after: true,
@@ -325,9 +329,9 @@ fn c1a_refused_budget_fallback_equals_base() {
         proven: true,
     };
     let base = [
-        window(6, 3, 0, false, true),
-        window(6, 0, 6, true, false),
-        window(3, 0, 3, true, false),
+        window(6, 3, 0, false, false),
+        window(0, 0, 0, true, false),
+        window(0, 0, 0, true, false),
     ];
     let refused = c1a_fixture("c1a-fallback-refused");
     let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
@@ -348,9 +352,10 @@ fn c1a_refused_budget_fallback_equals_base() {
     );
     assert_eq!(heads[1], heads[0], "08:10 re-uploads nothing");
     assert_eq!(heads[2], heads[0], "08:20 re-uploads nothing");
-    assert!(
-        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
-        "the fallback is counted"
+    assert_eq!(
+        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test(),
+        fallbacks,
+        "the removed terminal proof computation spends no budget"
     );
 }
 
@@ -365,7 +370,6 @@ fn c1a_changed_witness_rearms_like_base() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let digest = |fixture: &RearmFixture| {
         ScanIndex::load(&fixture.index_path)
             .unwrap()
@@ -397,7 +401,10 @@ fn c1a_changed_witness_rearms_like_base() {
         run(&base, "base")
     };
     assert_eq!(closing, base_closing);
-    assert_eq!(changed.family_reads, family, "both arms read every member");
+    assert_eq!(
+        changed.family_reads, 0,
+        "neither terminal re-arms unchanged members"
+    );
     assert_eq!(witness_changed, base_witness_changed);
     assert_eq!(
         C1aWindow {
@@ -409,8 +416,8 @@ fn c1a_changed_witness_rearms_like_base() {
     );
     if witness_changed {
         assert_eq!(
-            changed.debt, family,
-            "a changed witness re-arms every member"
+            changed.debt, 0,
+            "a changed witness preserves member progress"
         );
     }
     // The next window re-selects the changed members in both arms and
@@ -420,11 +427,8 @@ fn c1a_changed_witness_rearms_like_base() {
     assert_eq!(after.proven, base_after.proven);
 }
 
-/// X(b), contract change after the skip is active: the changed contract
-/// latches at the next traversal start, nothing skips, and that traversal's
-/// complete closed-fence terminal re-arms every family file, including the
-/// members the skip left unread, then clears the latch. The next window
-/// re-reads them under the new contract and the skip resumes.
+/// A contract change latches at the next traversal start without re-arming
+/// previously settled files. The latch can stay set across read-free walks.
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_off_to_on_rearms_skipped_family() {
@@ -432,13 +436,12 @@ fn c1a_contract_off_to_on_rearms_skipped_family() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let mut fixture = c1a_fixture("c1a-contract-off-to-on");
     fixture.request_identity = false;
     fixture.owned_base_preparation = true;
     let before = Some(String::new());
     let (_, reproved) = c1a_close_and_reprove(&fixture, "fix");
-    assert_eq!(c1a_latch(&fixture), (before, false));
+    assert_eq!(c1a_latch(&fixture), (before, true));
     assert_eq!(reproved.debt, 0, "the skip is active");
     let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
     assert_eq!(quiet.family_reads, 0);
@@ -446,22 +449,12 @@ fn c1a_contract_off_to_on_rearms_skipped_family() {
     let changed = c1a_window(&c1a_generation(&fixture, "fix", (8, 30)));
     assert!(changed.fence_before && changed.fence_after && !changed.full_rearm);
     assert_eq!(changed.family_reads, 0, "nothing re-selected the family");
-    assert_eq!(changed.debt, family, "the latch re-arms the skipped family");
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
-    let reread = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
-    assert_eq!(
-        reread.family_reads, family,
-        "re-read under the new contract"
-    );
-    // The skip resumes at once unless the new contract changed the proof
-    // itself; then the changed proof re-arms one more time.
-    let next = c1a_window(&c1a_generation(&fixture, "fix", (8, 45)));
-    let quiet = if reread.debt == 0 {
-        next
-    } else {
-        assert_eq!(next.debt, 0, "the skip resumes after the changed proof");
-        c1a_window(&c1a_generation(&fixture, "fix", (8, 52)))
-    };
+    assert_eq!(changed.debt, 0, "the latch does not re-arm settled files");
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
+    let next = c1a_window(&c1a_generation(&fixture, "fix", (8, 40)));
+    assert_eq!(next.family_reads, 0);
+    assert_eq!(next.debt, 0);
+    let quiet = c1a_window(&c1a_generation(&fixture, "fix", (8, 45)));
     assert_eq!(quiet.family_reads, 0);
 }
 
@@ -478,7 +471,6 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let fixture = |case: &'static str| {
         let mut fixture = c1a_fixture(case);
         fixture.native_file_limit = 3;
@@ -517,16 +509,22 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
     assert!(windows[1].fence_before && windows[1].fence_after);
     assert_eq!(windows[1].debt, 0, "the skip is active");
     assert_eq!(windows[2].family_reads, 0);
-    assert_eq!(base_windows[2].family_reads, family);
+    assert_eq!(base_windows[2].family_reads, 0);
     // BASE re-read the family and reopens in the fixed window.
-    assert!(!base_fixed.fence_after, "BASE reopens at once");
+    assert!(
+        base_fixed.fence_after,
+        "the closed fence is retained without a corrective read"
+    );
     // The fix reads only the fixed transcript, re-arms every family file and
     // reopens in the next window.
     assert_eq!(fixed.family_reads, 0);
     assert!(fixed.fence_after && !fixed.full_rearm);
-    assert_eq!(fixed.debt, family, "the recovery re-arms the unread family");
-    assert_eq!(after.family_reads, family);
-    assert!(after.fence_before && !after.fence_after, "reopened");
+    assert_eq!(fixed.debt, 0, "the terminal keeps the unread family");
+    assert_eq!(after.family_reads, 0);
+    assert!(
+        after.fence_before && after.fence_after,
+        "stays closed without a corrective read"
+    );
 }
 
 /// Late copied import while the skip is active: a new transcript in an
@@ -576,21 +574,25 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
         )
         .unwrap();
         let rearmed = c1a_generation(fixture, arm, (9, 10));
-        assert!(c1a_window(&rearmed).full_rearm, "{arm}");
+        assert!(!c1a_window(&rearmed).full_rearm, "{arm}");
         postures.extend(import_posture(&rearmed));
         let opened = c1a_generation(fixture, arm, (9, 20));
         let opened_window = c1a_window(&opened);
         postures.extend(import_posture(&opened));
-        assert!(!opened_window.fence_after, "{arm}: full coverage opens it");
+        assert!(
+            opened_window.fence_after,
+            "{arm}: unread coverage keeps the fence closed"
+        );
         let saved = serde_json::to_value(&opened.last().unwrap().index).unwrap();
-        let owners = saved["claude_duplicate_request_owners"]
-            .as_object()
-            .expect("the copied request has a duplicate witness");
         let hash = format!("{:x}", Sha256::digest("req_root_1".as_bytes()));
         assert_eq!(
-            owners[&hash].as_array().unwrap().len(),
-            2,
-            "{arm}: both owners of the copied request are detected"
+            saved["claude_duplicate_request_owners"]
+                .as_object()
+                .and_then(|owners| owners.get(&hash))
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            0,
+            "{arm}: the closed fence exposes no duplicate owner witness"
         );
         assert!(
             postures
@@ -610,7 +612,7 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
     // Precondition: the skip was active when the copy appeared.
     assert_eq!(reproved.debt, 0);
     assert_eq!(imported.family_reads, 0);
-    assert_eq!(base_imported.family_reads, rearm_family_sessions().len());
+    assert_eq!(base_imported.family_reads, 0);
     assert_eq!(postures, base_postures);
 }
 
@@ -755,12 +757,8 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     // full re-arm, so the next window re-reads every member.
     let baseline = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (7, 55)));
     let baseline_window = c1a_window(&baseline);
-    assert!(baseline_window.census_complete && baseline_window.full_rearm);
-    assert_eq!(
-        baseline_window.debt,
-        family.len(),
-        "the first proof re-arms"
-    );
+    assert!(baseline_window.census_complete && !baseline_window.full_rearm);
+    assert_eq!(baseline_window.debt, 0, "the first proof retains progress");
     // Positive control for the listed collector below: unlisted, the same
     // family bodies carry nonzero request-owned usage, regardless of collector.
     let unlisted_bodies = c1a_family_bodies(&baseline);
@@ -777,6 +775,10 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
         );
     }
     fixture.list_held(&[REARM_ROOT]);
+    // Construct the older ordinary-body baseline through the supported operator replay.
+    let mut replay = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(replay.prepare_historical_replay("explicit-contract-v1-baseline".into()));
+    replay.save(&fixture.index_path).unwrap();
     let closing = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 0)));
     let v1_bodies = c1a_family_bodies(&closing)
         .into_iter()
@@ -796,7 +798,7 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     assert_eq!(c1a_window(&reproved).debt, 0, "the skip is active");
     let quiet = with_cycle_contract_for_test(V1, || c1a_generation(&fixture, "v1", (8, 20)));
     assert_eq!(c1a_window(&quiet).family_reads, 0);
-    assert_eq!(c1a_latch(&fixture), (Some(V1.to_owned()), false));
+    assert_eq!(c1a_latch(&fixture), (Some(V1.to_owned()), true));
     let transcript_bytes = std::iter::once(None)
         .chain(REARM_AGENTS.iter().map(|agent| Some(*agent)))
         .map(|agent| {
@@ -860,13 +862,13 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
                 RearmUpload::Accept,
             );
             let ended = !page.index.scan_traversal_in_progress_for_test();
-            assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), !ended));
+            assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), true));
             if ended {
                 assert!(page.scan.census_complete && page.fully_settled);
                 for (key, entry) in &page.index.files {
                     assert!(
-                        entry.source_file_fingerprint.is_empty(),
-                        "every Claude file is re-armed: {key}"
+                        !entry.source_file_fingerprint.is_empty(),
+                        "every Claude file keeps progress: {key}"
                     );
                 }
             } else {
@@ -881,11 +883,15 @@ fn c1a_contract_v1_to_v2_reemits_tagged_bodies_after_unchanged_terminal() {
     let stable_window = c1a_window(&stable);
     assert!(stable_window.census_complete && !stable_window.full_rearm);
     assert_eq!(
-        stable_window.debt,
-        family.len(),
-        "clearing terminal skips no family member"
+        stable_window.debt, 0,
+        "the stable terminal retains progress"
     );
-    assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), false));
+    assert_eq!(c1a_latch(&fixture), (Some(V2.to_owned()), true));
+    // The mid-walk version flip re-arms no history. Keep the existing exact
+    // tagged-body oracle on an explicitly requested replay under the new contract.
+    let mut replay = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(replay.prepare_historical_replay("explicit-contract-v2-oracle".into()));
+    replay.save(&fixture.index_path).unwrap();
     let reread = with_cycle_contract_for_test(V2, || c1a_generation(&fixture, "v2", (8, 50)));
     assert_eq!(c1a_window(&reread).family_reads, family.len());
     c1a_assert_family_emitted_and_tagged(&reread, V2, &v1_bodies);
@@ -925,7 +931,6 @@ struct C1aSuccessorWindow {
     successor_proven: bool,
     successor_rearmed: bool,
     full_rearm_deferred_until: Option<u64>,
-    census_unix_seconds: u64,
     hold: crate::snapshots::ClaudeFirstProofHoldCounts,
 }
 
@@ -949,12 +954,6 @@ fn c1a_successor_generation(
             key.ends_with(successor_key.as_str()) && entry.source_file_fingerprint.is_empty()
         }),
         full_rearm_deferred_until: last.duplicate_census.full_rearm_deferred_until,
-        census_unix_seconds: time::OffsetDateTime::parse(
-            &last.scan.census_window_end,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .expect("census window end")
-        .unix_timestamp() as u64,
         hold,
     };
     writeln!(
@@ -982,12 +981,10 @@ fn c1a_successor_generation(
 #[test]
 #[serial(source_manifests)]
 fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
-    use crate::snapshots::ClaudeFirstProofHoldAge;
     if !c1a_layout_supported("c1a_dormant_owner_successor") {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let run = |fixture: &RearmFixture, arm: &str| {
         let (_, reproved) = c1a_close_and_reprove(fixture, arm);
         c1a_add_copied_prefix_successor(fixture);
@@ -1017,42 +1014,46 @@ fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
     assert_eq!(reproved.debt, 0, "the skip is active");
     assert_eq!(appeared.window.family_reads, 0, "O is dormant");
     assert!(appeared.successor_read, "the successor is read");
-    assert_eq!(base_appeared.window.family_reads, family);
+    assert_eq!(base_appeared.window.family_reads, 0);
     assert!(base_appeared.successor_read && base_appeared.successor_proven);
     assert_eq!(
         base_appeared.hold,
         crate::snapshots::ClaudeFirstProofHoldCounts::default(),
-        "BASE holds nothing"
+        "the ordinary proof route holds nothing"
     );
     // Held while O is skipped, and counted with its age bucket (its own
     // request is 07:00:01, under two hours before the census).
-    assert!(!appeared.successor_proven, "unproven while O is skipped");
-    assert_eq!(appeared.hold.dormant_owner_successor_family_count, 1);
-    assert_eq!(
-        appeared.hold.oldest_dormant_owner_successor_age,
-        Some(ClaudeFirstProofHoldAge::From1hTo6h)
+    assert!(
+        appeared.successor_proven,
+        "retained own-family evidence proves the successor without re-reading O"
     );
+    assert_eq!(appeared.hold.dormant_owner_successor_family_count, 0);
+    assert_eq!(appeared.hold.oldest_dormant_owner_successor_age, None);
     assert_eq!(held.window.family_reads, 0, "O is still dormant");
     assert!(!held.window.full_rearm, "no full re-arm is due yet");
-    assert!(!held.successor_proven, "still held");
+    assert!(held.successor_proven, "the retained proof remains valid");
     // The daily closed-fence full re-arm is intact: it runs when due,
     // re-arms every family file including the successor's, and sets the
     // next deadline no more than a day ahead.
-    assert!(rearm.window.full_rearm, "the due full re-arm runs");
-    assert_eq!(rearm.window.debt, family, "it re-arms O");
-    assert!(rearm.successor_rearmed, "it re-arms the successor");
-    let deadline = rearm
-        .full_rearm_deferred_until
-        .expect("the next full re-arm deadline");
     assert!(
-        deadline > rearm.census_unix_seconds && deadline <= rearm.census_unix_seconds + 86_400,
-        "the next full re-arm is due within a day: {rearm:?}"
+        !rearm.window.full_rearm,
+        "the terminal never schedules a full read"
+    );
+    assert_eq!(rearm.window.debt, 0, "the dormant owner retains progress");
+    assert!(!rearm.successor_rearmed, "the successor retains progress");
+    assert_eq!(
+        rearm.full_rearm_deferred_until,
+        Some(1),
+        "the explicit due marker schedules no terminal read"
     );
     // The window after the full re-arm reads O and the successor together
     // and proves the successor; nothing is held any more.
-    assert_eq!(proof.window.family_reads, family);
-    assert!(proof.successor_read, "the successor is re-read");
-    assert!(proof.successor_proven, "proved after the full re-arm");
+    assert_eq!(proof.window.family_reads, 0);
+    assert!(!proof.successor_read, "the successor is not re-read");
+    assert!(
+        proof.successor_proven,
+        "the retained own-family proof remains available"
+    );
     assert_eq!(proof.hold.dormant_owner_successor_family_count, 0);
     assert_eq!(proof.hold.oldest_dormant_owner_successor_age, None);
 }
@@ -1097,7 +1098,7 @@ fn c1a_held_arm(
     }
     let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
     assert!(
-        closing.census_complete && closing.fence_after && closing.full_rearm && closing.proven,
+        closing.census_complete && closing.fence_after && !closing.full_rearm && closing.proven,
         "{case}: {closing:?}"
     );
     RearmFixture::append(
@@ -1192,5 +1193,5 @@ fn c1a_held_family_rearms_its_own_members() {
         !held.census_complete,
         "the held member withholds the census"
     );
-    assert_eq!(held.debt, family, "the held family re-arms every member");
+    assert_eq!(held.debt, 0, "the held terminal retains member progress");
 }

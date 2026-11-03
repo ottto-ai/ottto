@@ -4597,3 +4597,6 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
         }
     }
 }
+
+#[path = "census_exit_tests.rs"]
+mod census_exit_tests;
