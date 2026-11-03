@@ -2177,16 +2177,16 @@ values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
 (>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
 charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
-the complete valid save commits; `value_admission` for one row over its cap still
-refuses the save. At page size one, a value-admission failure raises
+the complete valid save commits; `value_admission` for one row over its physical
+limit (64 MiB, or a kind's smaller fixed limit) still refuses the save. At page size one, a value-admission failure raises
 `save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires
 erasure instead of comparing strings.
-`row_cap_max` reports the largest written row as a percent of its cap, with its
-kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
-refuse every save of that source.
+`row_cap_max` reports the largest written row as a percent of its sizing target
+(1 MiB for mutable rows), with its kind name; `row_cap_alarm` flags 75% or more.
+Above 100% the row still commits; the alarm never refuses.
 `store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
 SQLite store once a day, on any between-cycles window, before reference verification.
 Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count

@@ -1276,7 +1276,7 @@ fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
     let header = tx.get(&large).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), bytes);
 }
-/// [behaviour] a written row at 78% of its cap reports a counts-only gauge and alarm.
+/// [behaviour] a written row at 78% of its target reports a counts-only gauge and alarm.
 #[test]
 fn row_near_its_cap_reports_gauge_and_alarm() {
     let tmp = Scratch::new();
@@ -1284,7 +1284,7 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
     let key = mapper::key("file.progress", "synthetic-private-row", 0).unwrap();
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        // 800 KiB plus two quotes of logical JSON against the 1 MiB mutable cap.
+        // 800 KiB plus two quotes of logical JSON against the 1 MiB mutable target.
         mapper::put(&mut tx, &key, &"x".repeat(800 * 1024)).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     });
@@ -1297,13 +1297,43 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
         .any(|r| r.to_string().contains("synthetic-private")));
 
     // A row refused while encoding still reports, so the refusal is visible.
+    let key = mapper::key("scan_state.traversal", "", 0).unwrap();
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        assert!(mapper::put(&mut tx, &key, &"x".repeat(2 * 1024 * 1024)).is_err());
+        assert!(mapper::put(&mut tx, &key, &"x".repeat(16 * 1024 * 1024)).is_err());
     });
-    let gauge = serde_json::json!({ "percent": 100, "kind": "file.progress" });
+    let gauge = serde_json::json!({ "percent": 100, "kind": "scan_state.traversal" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
+}
+/// [behaviour] a usage.pending row past its 1 MiB target commits, decodes
+/// byte-identical and alarms above 100%: the target never refuses the save.
+#[test]
+fn usage_pending_row_over_its_target_commits_and_alarms() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = mapper::key("usage.pending", "synthetic-family", 1).unwrap();
+    // Residual family JSON once request-hash sets move to shared rows: ~1.5 MiB.
+    let row = serde_json::json!({
+        "member_request_id_hashes": {},
+        "occurrences": "x".repeat(1536 * 1024),
+    });
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::put(&mut tx, &key, &row).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    });
+    let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
+    let gauge = serde_json::json!({ "percent": 150, "kind": "usage.pending" });
+    assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
+    assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 150));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    let restored: serde_json::Value = mapper::read(&mut tx, &header, None).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&row).unwrap()
+    );
 }
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
@@ -1576,8 +1606,8 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
     let mutable = file("family".into());
     let raw = raw_hold("family".into());
     for (key, size, ok) in [
-        (&mutable, MUTABLE_VALUE_BYTES, true),
-        (&mutable, MUTABLE_VALUE_BYTES + 1, false),
+        (&mutable, MUTABLE_VALUE_BYTES + 1, true),
+        (&mutable, VALUE_BYTES + 1, false),
         (&raw, VALUE_BYTES, true),
         (&raw, VALUE_BYTES + 1, false),
     ] {

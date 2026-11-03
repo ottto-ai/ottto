@@ -257,12 +257,6 @@ struct Projection {
     refs: Vec<RowKey>,
     created: Vec<RowKey>,
 }
-fn input_cap(key: &RowKey) -> u64 {
-    match key {
-        RowKey::Record { kind, .. } if shared(kind.name()).is_some() => VALUE_BYTES,
-        _ => value_cap(key),
-    }
-}
 fn shared_json(
     tx: &mut dyn Transaction,
     kind: &str,
@@ -348,10 +342,10 @@ pub(super) fn put<T: Serialize + ?Sized>(
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",
     };
-    let mut json = codec::json(value, input_cap(key)).inspect_err(|e| {
+    let mut json = codec::json(value, value_cap(key)).inspect_err(|e| {
         // Refused while encoding, before its size is known: report it as over.
         if e.to_string().contains("state_v2_value_admission") {
-            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_cap(key));
+            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_target(key));
         }
     })?;
     let old = tx.get(key)?;
@@ -377,9 +371,12 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
-    let cap = value_cap(key);
-    telemetry::row_cap(kind, json.len() as u64, cap);
-    ensure!(json.len() as u64 <= cap, "state_v2_value_admission");
+    // Over the target is an alarm, never a refusal; only the physical limit refuses.
+    telemetry::row_cap(kind, json.len() as u64, value_target(key));
+    ensure!(
+        json.len() as u64 <= value_cap(key),
+        "state_v2_value_admission"
+    );
     let encoded = codec::encode(&json)?;
     tx.put(RowInput {
         key,

@@ -346,7 +346,9 @@ fn integrity(hash: sha2::Sha256) -> [u8; 16] {
         .try_into()
         .expect("fixed digest width")
 }
-fn value_cap(key: &RowKey) -> u64 {
+/// Sizing target of one row's logical JSON: `row_cap` reports percent of it
+/// and alarms at 75%. Mutable rows past their 1 MiB target still commit.
+fn value_target(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
@@ -362,6 +364,14 @@ fn value_cap(key: &RowKey) -> u64 {
         }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
+    }
+}
+/// Admission and decode bound, moved together so a row this build commits
+/// also decodes on it: the physical row limit for mutable rows, else the target.
+fn value_cap(key: &RowKey) -> u64 {
+    match value_target(key) {
+        MUTABLE_VALUE_BYTES => VALUE_BYTES,
+        target => target,
     }
 }
 fn admit_key(key: &RowKey) -> Result<()> {
