@@ -381,7 +381,9 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             let mut response = ack(items)?;
             let mut refused = response.accepted_entities.pop().unwrap();
             response.accepted -= 1;
-            refused.head_etag = None;
+            // Cache rows put the request under head-CAS: the refusal then
+            // carries the server's challenge instead of a head.
+            refused.head_challenge = refused.head_etag.take().map(|_| "c".repeat(64));
             response.conflict_entities.push(refused);
             Ok(response)
         });

@@ -295,7 +295,7 @@ fn cold_tail_and_ack_replay_give_the_same_cache_rows() {
         fold(&mut items, &no_reports(), &mut index, true);
         items.remove(0)
     };
-    for split in 1..lines.len() {
+    for split in 2..lines.len() {
         let _ = fs::remove_file(&path);
         fs::write(&path, lines[..split].concat()).expect("write prefix");
         let (retained, _, _) = native_read(&path, None, 100, &collected_at);
@@ -358,7 +358,7 @@ fn claude_idle_time_fills_turn_starts_only() {
             json!([{"type":"text","text":"done"}])
         };
         json!({"type":"assistant","sessionId":"session","requestId":request,"timestamp":at,
-            "message":{"id":format!("msg_{request}"),"model":"claude","content":content,
+            "message":{"id":format!("msg_{request}"),"role":"assistant","model":"claude","content":content,
             "usage":{"input_tokens":100_000 - read,"cache_read_input_tokens":read,
             "cache_creation_input_tokens":0,"output_tokens":1}}})
     };

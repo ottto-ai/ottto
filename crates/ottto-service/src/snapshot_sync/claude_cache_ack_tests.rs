@@ -71,7 +71,9 @@ fn claude_cache_rows_keep_the_stored_body_ack() {
     let key = cache_session_key(SESSION);
     let state = crate::snapshots::cache_state_from_patch(None, &patch).unwrap();
     assert_eq!(with_rows.accepted_cache_states.get(&key), Some(&state));
+    // The replay advances the ACK counter as it does for a body without rows.
     ack(&mut with_rows, &claude_body(Some(&patch)));
+    ack(&mut control, &claude_body(None));
     assert_eq!(with_rows.accepted_cache_states.get(&key), Some(&state));
     assert_eq!(
         with_rows.accepted_identity_buckets,
