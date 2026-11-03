@@ -838,7 +838,7 @@ impl Transaction for ReadBack<'_> {
     ) -> Result<Result<()>> {
         bail!(Pause::Mismatch)
     }
-    fn mark_erasure(&mut self) -> Result<()> {
+    fn mark_erasure(&mut self, _: bool) -> Result<()> {
         bail!(Pause::Mismatch)
     }
     fn request_set_candidates(

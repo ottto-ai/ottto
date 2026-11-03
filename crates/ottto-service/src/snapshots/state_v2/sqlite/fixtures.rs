@@ -221,3 +221,7 @@ pub(in super::super) fn set_save_ceiling(db: &mut Sqlite, bytes: u64) {
 pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
     db.purge_policy.path_diff_budget = bytes;
 }
+/// Rows the last committed save charged to the save target.
+pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
+    db.stats.dirty_rows_per_save
+}

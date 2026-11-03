@@ -865,7 +865,7 @@ fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
     if rows.is_empty() {
         return Ok(false);
     }
-    tx.mark_erasure()?;
+    tx.mark_erasure(rows.iter().all(|row| bookkeeping(&row.key)))?;
     for header in rows {
         tx.delete(&header.key)?;
     }
@@ -1000,7 +1000,7 @@ fn observe(
         let key = row(REVISION, file, id)?;
         let old = tx.get(&key)?.context("state_v2_tail_membership")?;
         toggle(&mut entry.commit, &term(REVISION, id, &old.digest));
-        tx.mark_erasure()?;
+        tx.mark_erasure(true)?;
         match value {
             Some(value) => {
                 let written = write_value(tx, file, owner, id, &key, value)?;
@@ -1067,7 +1067,7 @@ fn write_file(
         );
         // A reset's purge of actual prior rows marks itself; a bootstrap owes nothing.
         if staged.change == Change::DropsPrivate {
-            tx.mark_erasure()?;
+            tx.mark_erasure(false)?;
         }
         for (collection, meta) in &staged.collections {
             table
@@ -1091,7 +1091,7 @@ fn write_file(
                 entry.pages = entry.pages.wrapping_sub(1);
                 tx.delete(&page_key)?;
                 delete_fragments(tx, file, collection.owner(), page, 0)?;
-                tx.mark_erasure()?;
+                tx.mark_erasure(false)?;
             }
         }
         applied.dirty_pages = staged.pages.len() as u64;

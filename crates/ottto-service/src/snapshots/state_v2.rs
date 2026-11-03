@@ -324,7 +324,9 @@ pub(super) trait Transaction {
     ) -> Result<Result<()>>;
     /// An opaque value this transaction replaced or deleted may have held a
     /// private string: require the existing physical purge at commit.
-    fn mark_erasure(&mut self) -> Result<()>;
+    /// `bookkeeping`: only freshness bookkeeping rows went, so the purge's own
+    /// epoch rows are bookkeeping too.
+    fn mark_erasure(&mut self, bookkeeping: bool) -> Result<()>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 

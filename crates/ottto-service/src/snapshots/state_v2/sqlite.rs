@@ -325,6 +325,7 @@ pub(super) struct Txn<'a> {
     original_paths: BTreeMap<RowKey, BTreeSet<String>>,
     path_bytes: usize,
     shared_erasure: bool,
+    bookkeeping_erasure: bool,
     failed: bool,
     record_delta: i64,
     file_delta: i64,
@@ -754,6 +755,7 @@ impl Sqlite {
                 original_paths: BTreeMap::new(),
                 path_bytes: 0,
                 shared_erasure: false,
+                bookkeeping_erasure: false,
                 failed: false,
                 record_delta: 0,
                 file_delta: 0,
@@ -849,6 +851,7 @@ impl Sqlite {
             original_paths: BTreeMap::new(),
             path_bytes: 0,
             shared_erasure: false,
+            bookkeeping_erasure: false,
             failed: false,
             record_delta: 0,
             file_delta: 0,
@@ -1217,8 +1220,13 @@ impl Txn<'_> {
         parts: u16,
         refs_only: bool,
     ) -> Result<()> {
-        // Freshness bookkeeping never sizes the next collection page.
-        if self.store.import || tail::bookkeeping(key) {
+        // Freshness bookkeeping never sizes the next collection page: neither
+        // its rows nor the erasure epoch a save owes only for them.
+        let epoch = matches!(key, RowKey::Meta(name) if name == "erasure_since" || name == "erasure_pending");
+        if self.store.import
+            || tail::bookkeeping(key)
+            || (epoch && self.bookkeeping_erasure && !self.shared_erasure)
+        {
             return Ok(());
         }
         let old = self.get(key)?;
@@ -1560,7 +1568,7 @@ impl Transaction for Txn<'_> {
         let removed_keys = std::mem::take(&mut self.removed_keys);
         let original_paths = std::mem::take(&mut self.original_paths);
         let path_bytes = self.path_bytes;
-        let shared_erasure = self.shared_erasure;
+        let shared_erasure = (self.shared_erasure, self.bookkeeping_erasure);
         let deltas = (self.record_delta, self.file_delta);
         let dirty = (self.dirty_bytes, self.estimated_pages, self.dirty_rows);
         let save_failure = self.store.save_failure;
@@ -1588,7 +1596,7 @@ impl Transaction for Txn<'_> {
             self.removed_keys = removed_keys;
             self.original_paths = original_paths;
             self.path_bytes = path_bytes;
-            self.shared_erasure = shared_erasure;
+            (self.shared_erasure, self.bookkeeping_erasure) = shared_erasure;
             (self.record_delta, self.file_delta) = deltas;
             (self.dirty_bytes, self.estimated_pages, self.dirty_rows) = dirty;
             self.store.save_failure = save_failure;
@@ -1596,8 +1604,12 @@ impl Transaction for Txn<'_> {
         }
         Ok(result)
     }
-    fn mark_erasure(&mut self) -> Result<()> {
-        self.shared_erasure = true;
+    fn mark_erasure(&mut self, bookkeeping: bool) -> Result<()> {
+        if bookkeeping {
+            self.bookkeeping_erasure = true;
+        } else {
+            self.shared_erasure = true;
+        }
         Ok(())
     }
     fn commit(self, expected: u64, next: u64) -> DurableCommitOutcome {
@@ -1619,7 +1631,9 @@ impl Txn<'_> {
             );
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
             ensure!(actual == expected, "state_v2_concurrent_change");
-            let purge = self.paths_removed()?;
+            // Any erasure purges; only an ordinary one charges its epoch rows.
+            self.shared_erasure = self.paths_removed()?;
+            let purge = self.shared_erasure || self.bookkeeping_erasure;
             if purge {
                 self.store.stats.erasure_pending_marks =
                     self.store.stats.erasure_pending_marks.saturating_add(1);
