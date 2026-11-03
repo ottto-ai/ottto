@@ -534,6 +534,23 @@ impl ContentStamp {
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
         self == other
     }
+    /// Device, inode, length and modified time, for the stored head.
+    pub(in crate::snapshots) fn parts(&self) -> (u64, u64, u64, (i64, i64)) {
+        (self.dev, self.ino, self.extent, self.modified)
+    }
+    pub(in crate::snapshots) fn from_parts(
+        dev: u64,
+        ino: u64,
+        extent: u64,
+        modified: (i64, i64),
+    ) -> Self {
+        Self {
+            dev,
+            ino,
+            extent,
+            modified,
+        }
+    }
 }
 
 impl OpenStamp {
