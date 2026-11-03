@@ -317,7 +317,7 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded = 16,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 17,
-    // Optional plain header occupancy refused an otherwise fundable decoder.
+    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
     #[serde(rename = "decoder_refused_header_occupancy")]
     DecoderRefusedHeaderOccupancy = 18,
     #[serde(rename = "CompressedFamilyUnproven")]
@@ -335,22 +335,94 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
-    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+/// Every counted cause; the length is checked against `__Count`.
+const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+    CodexZstCause::ReplayNotAuthorized,
+    CodexZstCause::ProofParentUnsupported,
+    CodexZstCause::ProofChildUnsupported,
+    CodexZstCause::ParentSideUnsupported,
+    CodexZstCause::DurableTailUnsupported,
+    CodexZstCause::GroupProbeUnsupported,
+    CodexZstCause::GroupReadUnsupported,
+    CodexZstCause::ParentLedgerUnbound,
+    CodexZstCause::PhysicalOffsetUnsupported,
+    CodexZstCause::AdmissionRefused,
+    CodexZstCause::DecodeFailed,
+    CodexZstCause::OwnerUnproven,
+    CodexZstCause::OutputHeld,
+    CodexZstCause::DecodedOverLimit,
+    CodexZstCause::HeaderInvalid,
+    CodexZstCause::CorrectionUnapplied,
+    CodexZstCause::HeaderUnfunded,
+    CodexZstCause::CompatibilityUnfunded,
+    CodexZstCause::DecoderRefusedHeaderOccupancy,
+    CodexZstCause::FamilyUnproven,
+    CodexZstCause::ArchiveEquivalenceUnproven,
+];
+struct CodexZstRefused {
+    counters: [AtomicU64; CODEX_ZST_CAUSES],
+    /// The counters' sum at the last flush.
+    flushed: AtomicU64,
+}
+impl CodexZstRefused {
+    const fn new() -> Self {
+        Self {
+            counters: [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES],
+            flushed: AtomicU64::new(0),
+        }
+    }
+}
+#[cfg(not(test))]
+static CODEX_ZST_REFUSED: CodexZstRefused = CodexZstRefused::new();
+#[cfg(test)]
+thread_local! {
+    static CODEX_ZST_REFUSED: CodexZstRefused = const { CodexZstRefused::new() };
+}
+fn with_codex_zst_refused<T>(f: impl FnOnce(&CodexZstRefused) -> T) -> T {
+    #[cfg(test)]
+    {
+        CODEX_ZST_REFUSED.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CODEX_ZST_REFUSED)
+    }
+}
 
+/// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
-    let counter = &CODEX_ZST_REFUSED[cause as usize];
-    let previous = counter
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-        .unwrap_or_else(|n| n);
-    traversal_point(
-        "codex_zst_refused",
-        "codex",
-        &BTreeMap::from([(
+    with_codex_zst_refused(|refused| {
+        let _ = refused.counters[cause as usize]
+            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
+/// One sparse line of the non-zero cumulative counters, only when their sum
+/// moved since the last flush.
+pub(crate) fn codex_zst_refused_flush() {
+    let counts = with_codex_zst_refused(|refused| {
+        let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
+            .into_iter()
+            .map(|cause| (cause, refused.counters[cause as usize].load(Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        let total = counts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        (refused.flushed.swap(total, Relaxed) != total).then_some(counts)
+    });
+    if let Some(counts) = counts {
+        traversal_point(
             "codex_zst_refused",
-            BTreeMap::from([(cause, previous.saturating_add(1))]),
-        )]),
-    );
+            "codex",
+            &BTreeMap::from([("codex_zst_refused", counts)]),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_refused_count(cause: CodexZstCause) -> u64 {
+    with_codex_zst_refused(|refused| refused.counters[cause as usize].load(Relaxed))
 }
 
 /// Counts per observed usage line, before response deduplication and timestamp
@@ -367,6 +439,13 @@ pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
 /// not; rereads count again. Only the lifecycle registry atomics are updated.
 pub(crate) fn codex_non_default_thread_tier() {
     cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
+/// Counts per observed Claude usage line with an `iterations[]` entry naming
+/// another model than the line; rereads count again. Only the lifecycle
+/// registry atomics are updated.
+pub(crate) fn claude_usage_iteration_model_differs() {
+    cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -405,61 +484,130 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
     );
 }
 
-/// Nonzero-only counters on the existing native_collection_page line.
+/// Sidecar read attempts and actual input bytes since the last Claude page.
+/// Repeated reads count again; missing/refused files add nothing. No identities.
+#[derive(Default, Serialize)]
+struct ClaudeSidecarReparse {
+    claude_sidecar_reparse_files: u64,
+    claude_sidecar_reparse_bytes: u64,
+}
+#[cfg(not(test))]
+static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_SIDECAR_REPARSE.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_SIDECAR_REPARSE)
+    }
+}
+pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    with_claude_sidecar_reparse(|counts| {
+        for (counter, delta) in counts.iter().zip([files, bytes]) {
+            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+        }
+    });
+}
+fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
+    with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
+        claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
+        claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+    })
+}
+
+/// Nonzero-only counters on the existing native_collection_page line. They
+/// observe a finalized file's retained records and gate nothing.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_half_files: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_money_record_cap_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_file: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_response: u64,
 }
 pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
+struct ClaudeRecordCounters {
+    half: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    max_file: std::sync::atomic::AtomicU64,
+    max_response: std::sync::atomic::AtomicU64,
+}
+impl ClaudeRecordCounters {
+    const fn new() -> Self {
+        Self {
+            half: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            max_file: std::sync::atomic::AtomicU64::new(0),
+            max_response: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
 #[cfg(not(test))]
-static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(not(test))]
-static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = ClaudeRecordCounters::new();
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
-    static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+    static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = const { ClaudeRecordCounters::new() };
 }
-fn with_claude_record_caps<T>(
-    f: impl FnOnce(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64) -> T,
-) -> T {
+fn with_claude_record_counters<T>(f: impl FnOnce(&ClaudeRecordCounters) -> T) -> T {
     #[cfg(test)]
     {
-        CLAUDE_CAP_HALF.with(|half| CLAUDE_CAP_HITS.with(|hits| f(half, hits)))
+        CLAUDE_RECORD_COUNTERS.with(f)
     }
     #[cfg(not(test))]
     {
-        f(&CLAUDE_CAP_HALF, &CLAUDE_CAP_HITS)
+        f(&CLAUDE_RECORD_COUNTERS)
     }
 }
-pub(crate) fn claude_record_cap_half_file() {
-    with_claude_record_caps(|half, _| {
-        half.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-pub(crate) fn claude_record_cap_hit() {
-    with_claude_record_caps(|_, hits| {
-        hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// `file_alarm` is the size this parser once refused past: nothing is dropped
+/// above it, the counters only show how memory grows.
+pub(crate) fn claude_record_counts(
+    file_records: usize,
+    largest_response_records: usize,
+    file_alarm: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| {
+        if file_records >= file_alarm / 2 {
+            counters.half.fetch_add(1, Relaxed);
+        }
+        if file_records > file_alarm {
+            counters.hits.fetch_add(1, Relaxed);
+        }
+        counters.max_file.fetch_max(file_records as u64, Relaxed);
+        counters
+            .max_response
+            .fetch_max(largest_response_records as u64, Relaxed);
     });
 }
 fn take_claude_record_caps() -> ClaudeRecordCaps {
-    with_claude_record_caps(|half, hits| ClaudeRecordCaps {
-        claude_money_record_cap_half_files: half.swap(0, std::sync::atomic::Ordering::Relaxed),
-        claude_money_record_cap_hits: hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| ClaudeRecordCaps {
+        claude_money_record_cap_half_files: counters.half.swap(0, Relaxed),
+        claude_money_record_cap_hits: counters.hits.swap(0, Relaxed),
+        claude_records_max_per_file: counters.max_file.swap(0, Relaxed),
+        claude_records_max_per_response: counters.max_response.swap(0, Relaxed),
     })
 }
 
 #[cfg(test)]
-pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
+pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64, u64, u64) {
     let c = take_claude_record_caps();
     (
         c.claude_money_record_cap_half_files,
         c.claude_money_record_cap_hits,
+        c.claude_records_max_per_file,
+        c.claude_records_max_per_response,
     )
 }
 
@@ -926,11 +1074,7 @@ impl Probe {
         observation
     }
     fn observation(&self) -> Observation {
-        Observation::between(
-            self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            self.process,
-            process_sample(),
-        )
+        Observation::between(wall_us(self.started), self.process, process_sample())
     }
     #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
@@ -952,6 +1096,8 @@ impl Probe {
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
+            #[serde(flatten)]
+            sidecar_reparse: Option<ClaudeSidecarReparse>,
             #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
@@ -1026,6 +1172,7 @@ impl Probe {
             } else {
                 Default::default()
             },
+            sidecar_reparse: claude.then(take_claude_sidecar_reparse),
             caps: if claude {
                 take_claude_record_caps()
             } else {
@@ -1203,16 +1350,66 @@ impl StageWindow {
 }
 impl Drop for StageWindow {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
+        emit_stage(self.stage, self.source, || {
+            self.probe.stage_observation(self.footprint.as_ref())
+        });
+    }
+}
+fn wall_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn emit_stage(stage: &'static str, source: Source, observation: impl FnOnce() -> Observation) {
+    if std::thread::panicking() {
+        return;
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source,
+        observation: observation(),
+        counts: EmptyCounts {},
+    });
+}
+/// Named window summed over repeated steps inside a source stage: one record
+/// with summed wall time and process CPU, and no footprint fields. Empty
+/// counts; unwinding emits nothing, like `StageWindow`.
+pub(crate) struct StageSum {
+    stage: &'static str,
+    source: Source,
+    wall_us: u64,
+    cpu_us: Option<u64>,
+}
+impl StageSum {
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            wall_us: 0,
+            cpu_us: Some(0),
         }
-        emit(&Record {
-            schema_version: SCHEMA_VERSION,
-            process_id: std::process::id(),
-            stage: self.stage,
-            source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
-            counts: EmptyCounts {},
+    }
+    /// Runs `step` unchanged and adds its wall and CPU to the window.
+    pub(crate) fn time<T>(&mut self, step: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let before = process_sample();
+        let result = step();
+        let delta = Observation::between(wall_us(started), before, process_sample());
+        self.wall_us = self.wall_us.saturating_add(delta.wall_elapsed_us);
+        self.cpu_us = self
+            .cpu_us
+            .zip(delta.shared_process_cpu_delta_us)
+            .map(|(sum, cpu)| sum.saturating_add(cpu));
+        result
+    }
+}
+impl Drop for StageSum {
+    fn drop(&mut self) {
+        emit_stage(self.stage, self.source, || {
+            let mut observation = Observation::point();
+            observation.wall_elapsed_us = self.wall_us;
+            observation.shared_process_cpu_delta_us = self.cpu_us;
+            observation
         });
     }
 }
@@ -1511,6 +1708,20 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Content-free allocator launch configuration, called once before serving.
+pub fn log_startup_resources() {
+    let value = std::env::var_os("MallocLargeCache");
+    traversal_point(
+        "startup",
+        "unknown",
+        &serde_json::json!({
+            "malloc_large_cache_set": value.is_some(),
+            "malloc_large_cache": value.as_deref().and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok()),
+        }),
+    );
+}
+
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
@@ -2023,6 +2234,23 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    /// [behaviour] Startup settings use the versioned content-free diagnostic carrier.
+    #[test]
+    fn startup_resources_use_the_shared_carrier() {
+        let (_, rows) = super::capture(super::log_startup_resources);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], std::process::id());
+        assert_eq!(row["stage"], "startup");
+        assert_eq!(row["source"], "unknown");
+        let counts = row["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert!(counts["malloc_large_cache_set"].is_boolean());
+        let value = &counts["malloc_large_cache"];
+        assert!(value.is_null() || value.is_u64());
+    }
+
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
@@ -2766,7 +2994,7 @@ mod tests {
     fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_record_cap_half_file();
+            claude_record_counts(2, 1, 4);
             claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
             claude_reread::terminal_rearm(
                 claude_reread::IgnoredVeto::WithheldAccount.bit(),
@@ -2860,8 +3088,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields and the Codex tier field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2421);
+        // The four Pi fields, the Codex tier field and the Claude iteration
+        // model field stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2474);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -3339,15 +3568,20 @@ pub(crate) fn scan_index_repair_required(
 /// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
 /// can contribute. Peaks are 50-ms observations, not hard memory bounds.
 pub(crate) struct StateV2Probe {
+    started: Instant,
     footprint: Option<footprint::Stage>,
     cpu: Option<ProcessSample>,
 }
 impl StateV2Probe {
     pub(crate) fn begin() -> Self {
         Self {
+            started: Instant::now(),
             footprint: footprint::Stage::begin(),
             cpu: process_sample(),
         }
+    }
+    pub(crate) fn wall_us(&self) -> u64 {
+        wall_us(self.started)
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         self.footprint

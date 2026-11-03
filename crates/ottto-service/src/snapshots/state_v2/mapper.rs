@@ -391,6 +391,44 @@ pub(super) fn remove(tx: &mut dyn Transaction, key: &RowKey) -> Result<()> {
     }
     Ok(())
 }
+/// File-owned kinds: maps whose members are keyed by the file's index key. A
+/// file staged in Tail commits or rolls back its rows of these kinds together
+/// with its Tail rows (`tail::apply`).
+const CLOSURE: &[&str] = &[
+    "file.progress",
+    "file.terminal",
+    "file.entities",
+    "file.confirmed_empty",
+    "file.growth_retention",
+    "file.census",
+    "v1_field.claude_desktop_title_files",
+    "proof.deferred_account",
+];
+/// A file-owned kind's row: (file key, position). Position 0 is the cardinality.
+fn closure_row(key: &RowKey) -> Option<(&[u8], u64)> {
+    match key {
+        RowKey::Record {
+            kind,
+            key_bytes,
+            position,
+        } if CLOSURE.contains(&kind.name()) => Some((key_bytes, *position)),
+        _ => None,
+    }
+}
+fn record_kind(key: &RowKey) -> Option<&str> {
+    match key {
+        RowKey::Record { kind, .. } => Some(kind.name()),
+        _ => None,
+    }
+}
+/// One changed row of a staged file's closure, written inside its boundary.
+pub(super) struct ClosureRow {
+    pub(super) key: RowKey,
+    /// The committed digest, restored if the boundary rolls back.
+    old: Option<[u8; 32]>,
+    /// `None`: the save removes the row.
+    pub(super) value: Option<Box<serde_json::value::RawValue>>,
+}
 /// Expanded logical rows, before evidence projection or compression. Consuming
 /// the old inventory makes deletions independent of how a subset was rebuilt.
 #[derive(Default)]
@@ -400,6 +438,10 @@ pub(super) struct Rows<'a> {
     pub(super) next: BTreeMap<RowKey, [u8; 32]>,
     /// Baseline seed only: digests recorded when these rows were decoded.
     pub(super) seed: Digests,
+    /// Files staged in Tail: their changed closure rows wait for their boundary.
+    pub(super) closures: BTreeMap<Vec<u8>, Vec<ClosureRow>>,
+    /// Closure kinds' cardinality rows, written by `finish` from `next`.
+    pub(super) counted: BTreeSet<RowKey>,
 }
 pub(super) fn digest<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32]> {
     use sha2::Digest;
@@ -410,6 +452,11 @@ pub(super) fn digest<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32]> {
 }
 impl Rows<'_> {
     pub(super) fn put<T: Serialize + ?Sized>(&mut self, key: RowKey, value: &T) -> Result<()> {
+        // A file-owned kind counts the members that commit, after the boundaries.
+        if closure_row(&key).is_some_and(|(_, position)| position == 0) {
+            self.counted.insert(key);
+            return Ok(());
+        }
         let digest = self.digest(&key, value)?;
         self.put_digest(key, value, digest)
     }
@@ -432,8 +479,16 @@ impl Rows<'_> {
         value: &T,
         digest: [u8; 32],
     ) -> Result<()> {
-        if self.old.remove(&key) != Some(digest) {
-            if let Some(tx) = self.tx.as_deref_mut() {
+        let old = self.old.remove(&key);
+        if old != Some(digest) {
+            let staged = closure_row(&key).and_then(|(file, _)| self.closures.get_mut(file));
+            if let Some(closure) = staged {
+                closure.push(ClosureRow {
+                    key: key.clone(),
+                    old,
+                    value: Some(serde_json::value::to_raw_value(value)?),
+                });
+            } else if let Some(tx) = self.tx.as_deref_mut() {
                 put(tx, &key, value)?;
             }
         }
@@ -491,7 +546,55 @@ impl Rows<'_> {
         }
         Ok(())
     }
+    pub(super) fn tx(&mut self) -> Result<&mut dyn Transaction> {
+        let tx = self.tx.as_deref_mut().context("state_v2_save_tx")?;
+        Ok(tx)
+    }
+    /// `file`'s changed closure rows, with those this save removes: they leave
+    /// `old`, so `finish` never deletes them outside the file's boundary.
+    pub(super) fn take_closure(&mut self, file: &[u8]) -> Result<Vec<ClosureRow>> {
+        let mut closure = self.closures.remove(file).unwrap_or_default();
+        for kind in CLOSURE {
+            let first = RowKey::record(kind, file, 0)?;
+            let removed: Vec<_> = self
+                .old
+                .range::<RowKey, _>(&first..)
+                .take_while(|(key, _)| {
+                    record_kind(key) == Some(*kind)
+                        && closure_row(key).is_some_and(|(key, _)| key == file)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in removed {
+                let old = self.old.remove(&key);
+                closure.push(ClosureRow {
+                    key,
+                    old,
+                    value: None,
+                });
+            }
+        }
+        Ok(closure)
+    }
+    /// The file's boundary rolled back: its committed rows stand.
+    pub(super) fn revert(&mut self, closure: Vec<ClosureRow>) {
+        for row in closure {
+            match row.old {
+                Some(digest) => self.next.insert(row.key, digest),
+                None => self.next.remove(&row.key),
+            };
+        }
+    }
     pub(super) fn finish(mut self) -> Result<BTreeMap<RowKey, [u8; 32]>> {
+        for manifest in std::mem::take(&mut self.counted) {
+            let members = self
+                .next
+                .range::<RowKey, _>(&manifest..)
+                .take_while(|(key, _)| record_kind(key) == record_kind(&manifest))
+                .count();
+            let digest = self.digest(&manifest, &members)?;
+            self.put_digest(manifest, &members, digest)?;
+        }
         if let Some(tx) = self.tx.as_deref_mut() {
             for key in self.old.keys() {
                 remove(tx, key)?;

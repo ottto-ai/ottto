@@ -1017,7 +1017,90 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
     assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
 }
 
-/// [behaviour] idle maintenance emits counts once per daily reference-maintenance pass.
+/// [regress] a busy store, with no quiet cycle, still emits its daily sample;
+/// the reference check stays quiet-gated.
+#[test]
+fn store_growth_sample_runs_on_a_busy_cycle() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("busy".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.between_cycles(false).unwrap();
+    let gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    assert_eq!(gauge["partial"], false);
+    assert_eq!(gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+    assert_eq!(
+        db.read_control::<u64>("reference_check_attempt").unwrap(),
+        None
+    );
+    // Daily: the next busy cycle does not sample again.
+    db.between_cycles(false).unwrap();
+    assert!(telemetry::take_thread_event_for_test("store_growth.claude").is_none());
+}
+
+/// [regress] a reference check that exhausts its budget cannot starve the
+/// sample, and its failure names a fixed cause.
+#[test]
+fn store_growth_sample_survives_a_reference_check_over_budget() {
+    fn over_budget(
+        _: &Header,
+        _: &dyn Value,
+        _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    ) -> Result<()> {
+        // Past the 2 s + 10 ms/MiB budget of this small store.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        )
+        .into())
+    }
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("slow".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.reference_extractor(over_budget);
+    db.maintenance(true).unwrap();
+    let gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    assert_eq!(gauge["partial"], false);
+    assert_eq!(gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["reference_check_failed"], 1);
+    assert_eq!(
+        stats["reference_check_failed_causes"],
+        serde_json::json!({"timeout": 1})
+    );
+}
+
+/// [regress] Claude and Codex stores keep separate latest samples.
+#[test]
+fn store_growth_samples_stay_separate_per_store() {
+    let (claude, codex) = (Scratch::new(), Scratch::new());
+    let mut claude_db = claude.live_store();
+    let mut identity = codex.identity();
+    identity.binding.source = super::super::scan_index_persistence::Source::Codex;
+    let mut import = sqlite::Sqlite::create_import(&codex.path()).unwrap();
+    import.control("identity", &identity).unwrap();
+    import.control("generation", &0_u64).unwrap();
+    import.finish_import().unwrap();
+    let mut codex_db = sqlite::Sqlite::open(&codex.path(), &identity).unwrap();
+    codex_db.path_extractor(test_paths);
+    let mut tx = codex_db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("codex-only".into()), b"evidence");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    claude_db.between_cycles(false).unwrap();
+    codex_db.between_cycles(false).unwrap();
+    assert!(telemetry::latest_for_test("store_growth.claude").is_some());
+    assert!(telemetry::latest_for_test("store_growth.codex").is_some());
+    let claude_gauge = telemetry::take_thread_event_for_test("store_growth.claude").unwrap();
+    let codex_gauge = telemetry::take_thread_event_for_test("store_growth.codex").unwrap();
+    assert!(claude_gauge["kinds"].get("scan_state.traversal").is_none());
+    assert_eq!(codex_gauge["kinds"]["scan_state.traversal"]["rows"], 1);
+}
+
+/// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {
     fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
@@ -1031,7 +1114,7 @@ fn store_growth_gauge_is_daily_and_counts_only() {
             crate::local_resource_diagnostics::capture(|| db.maintenance(true).unwrap());
         records
             .into_iter()
-            .filter_map(|r| r["counts"]["latest"].get("store_growth").cloned())
+            .filter_map(|r| r["counts"]["latest"].get("store_growth.claude").cloned())
             .collect()
     }
     let tmp = Scratch::new();
@@ -1081,10 +1164,9 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(gauge["chunk_bytes"], 1300);
     assert_eq!(gauge["partial"], false);
     assert!(!gauge.to_string().contains("synthetic-private"));
-    // No second sample until the next daily maintenance pass runs.
+    // No second sample until a day has passed.
     assert!(sample(&mut db).is_empty());
-    db.control("reference_check_success", &0_u64).unwrap();
-    db.control("reference_check_attempt", &0_u64).unwrap();
+    db.control("store_growth_success", &0_u64).unwrap();
     assert_eq!(sample(&mut db).len(), 1);
 }
 
@@ -1106,9 +1188,9 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
         assert_eq!(value(&mut tx, &header), b"evidence");
     }
 }
-/// [format] ceiling rolls back every row and keeps committed headers.
+/// [behaviour] complete saves alarm only when crossing the threshold.
 #[test]
-fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
+fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("first".into());
@@ -1117,9 +1199,10 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let removed = traversal("removed".into());
     put(&mut tx, &removed, b"retained");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    // Leave room for both the replacement and deletion, including their
-    // charged metadata, before the oversized row refuses the whole save.
+    // Lower the production alarm threshold to keep this fixture small.
     sqlite::set_save_ceiling(&mut db, 4096);
+    telemetry::take_thread_event_for_test("save_ceiling_alarm");
+    telemetry::take_thread_event_for_test("save_ceiling_cause");
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut before = mapper::Rows::default();
     before.raw(key.clone(), b"old").unwrap();
@@ -1134,32 +1217,64 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"new");
     assert!(tx.get(&removed).unwrap().is_none());
-    let error = tx
-        .put(RowInput {
-            key: &traversal("over-ceiling".into()),
-            fixed: &Fixed::None,
-            value_version: 1,
-            value: &serde_json::to_vec(&"x".repeat(8192)).unwrap(),
-        })
-        .unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    let large = traversal("over-ceiling".into());
+    let bytes = serde_json::to_vec(&"x".repeat(8192)).unwrap();
+    tx.put(RowInput {
+        key: &large,
+        fixed: &Fixed::None,
+        value_version: 1,
+        value: &bytes,
+    })
+    .unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     drop(pending);
-    assert_eq!(db.save_failure(), Some(Hold::SaveCeiling));
-    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(1));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"old");
-    let header = tx.get(&removed).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"retained");
-    drop(tx);
+    assert_eq!(db.save_failure(), None);
+    assert!(db.refused_save_bytes() > 4096);
+    assert!(
+        telemetry::take_thread_event_for_test("save_ceiling_alarm")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+            > 4096
+    );
+    assert_eq!(
+        telemetry::take_thread_event_for_test("save_ceiling_cause"),
+        Some(serde_json::json!("charged_work"))
+    );
+    // A second large save stays above; a small save re-arms the next crossing.
+    let changed_bytes = serde_json::to_vec(&"y".repeat(8192)).unwrap();
+    for (generation, payload, alarm) in [
+        (2, Some(changed_bytes.as_slice()), false),
+        (3, None, false),
+        (4, Some(bytes.as_slice()), true),
+    ] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        if let Some(payload) = payload {
+            put(&mut tx, &large, payload);
+        }
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        assert_eq!(db.refused_save_bytes() >= 4096, payload.is_some());
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some(),
+            alarm
+        );
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_cause"),
+            alarm.then(|| serde_json::json!("charged_work"))
+        );
+    }
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(5));
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"old");
-    let header = tx.get(&removed).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"retained");
+    assert_eq!(value(&mut tx, &header), b"new");
+    assert!(tx.get(&removed).unwrap().is_none());
+    let header = tx.get(&large).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), bytes);
 }
 /// [behaviour] a written row at 78% of its cap reports a counts-only gauge and alarm.
 #[test]

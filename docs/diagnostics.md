@@ -66,7 +66,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 
 | Field | Measurement |
 | --- | --- |
-| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
@@ -159,6 +159,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
+| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Each completed `native_collection_page` records existing scanned-file and
@@ -338,6 +339,13 @@ windows.
 Claude Code's local-evidence stage adds three such footprint records (empty
 counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
+Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
+read) and `evidence_cross_root` (each root's cross-root summary add plus the
+final sort) are summed over roots into one record each per pass, with
+`wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
+step) and no footprint fields.
+A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
+around folding stored usage families into heads.
 
 There is one bounded observation per completed page, batch call and normally
 returned prepare or finish, with two CPU/lifetime-RSS samples per observation,
@@ -1684,12 +1692,21 @@ counts each `thread_settings_applied` line whose `service_tier` is `fast`,
 count again. It is a cumulative saturating process total with no labelled log
 line and no path or session id, and it never affects money.
 
+## Claude usage iteration on another model
+
+`usage_iteration_model_differs` in `process_retained_cache_lifecycle_totals`
+counts each Claude usage line with a `usage.iterations[]` entry whose `model`
+differs from the line's model (a refusal fallback's declined first attempt, which
+is billed at the line's model); rereads count again. It is a cumulative
+saturating process total with no path or session id, and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
-`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
-saturating process-lifetime counter for that cause. These count refused attempts,
-not distinct sessions, decoded bytes or money. No path or session id is included.
+`counts.codex_zst_refused{cause}`: a sparse map of the non-zero, saturating
+process-lifetime counters. One line is flushed per Codex pass, only when the
+counters changed since the last flush. These count refused attempts, not distinct
+sessions, decoded bytes or money. No path or session id is included.
 
 | Cause | Unsupported boundary |
 | --- | --- |
@@ -1712,11 +1729,16 @@ usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
-retained → cursor before taking the durable Stores leaf lock. It keeps an
+retained → cursor before taking the durable Stores leaf lock. It keeps a
 fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
-for primary Tail reads; admission never evicts or charges retained bytes twice.
+for primary Tail reads and never charges retained bytes twice. When free room is
+short and the claim can fit beside the whole cursor state, it reclaims optional
+header facts, then releases retained copies, counted in
+`cursor_reservation_entries_evicted`. It never drops a suspended proof, join
+owner, witness or durable owed state. A released copy can mean one more existing
+`state_missing` Full. `decoder_refused_header_occupancy` is no longer counted.
 Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
-A short reservation or busy singleton yields `None`, counts
+A claim that cannot fit evicts nothing. It or a busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
@@ -2110,10 +2132,11 @@ on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records the
-charged bytes of a save refused as save pressure, with `save_ceiling_cause`:
-`charged_work` above 256 MiB or `value_admission` for one row over its cap; at page size one,
-`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
+charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
+the complete valid save commits; `value_admission` for one row over its cap still
+refuses the save. At page size one, a value-admission failure raises
+`save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires
@@ -2121,17 +2144,20 @@ erasure instead of comparing strings.
 `row_cap_max` reports the largest written row as a percent of its cap, with its
 kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
 refuse every save of that source.
-`store_growth` samples the SQLite store once per idle daily reference-maintenance
-pass, after reference verification (an hourly retry of a failed pass samples again).
-It reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
+`store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
+SQLite store once a day, on any between-cycles window, before reference verification.
+Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
 (`rows`), `key_bytes` and `value_bytes` for each present catalogue kind, plus
 `shared_value_bytes` and `chunk_bytes`. Value bytes use the store's logical
 length metadata; chunk bytes sum stored chunk lengths and overlap the logical
 record/shared values, so do not add them together. These are payload lengths,
-not per-table allocated space. Sampling uses what remains of the existing
-reference-check VM budget. `partial: true` means
+not per-table allocated space. Sampling has its own VM budget, the same size as
+the reference check's. `partial: true` means
 sampling was interrupted, failed or ran out of budget; completed counts remain,
 unavailable scalar counts are null and missing kinds are unknown, not zero.
+`reference_check_failed_causes` counts each failed reference check by a fixed cause:
+timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
+counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
 `account_windows_alarm` and `account_windows_retained` still report retained
 account-window pressure without capping owed history; `account_windows_retained`

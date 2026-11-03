@@ -333,6 +333,29 @@ impl ScanIndex {
         body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
     }
 
+    /// An exact ACK of a body this daemon sent, in any context; proves a body, not each id.
+    /// A settled revision (stamped before POST) and server-learned heads are not evidence.
+    pub(super) fn file_has_accepted_body(&self, key: &str) -> bool {
+        let Some(entry) = self.files.get(key) else {
+            return false;
+        };
+        let proof = &self.upload_context_proof;
+        !self.decode_holds_file(key)
+            && (entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| !receipt.body_witness.is_empty())
+                || (proof.replay_generation == self.historical_replay_generation
+                    && self
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .is_some_and(|entities| {
+                            entities
+                                .iter()
+                                .any(|entity| proof.entity_stamps.contains_key(entity))
+                        })))
+    }
+
     /// An entity's durable stamp proves this body under THIS file's context in
     /// the stamp set's destination and replay generation. The context carries
     /// the destination namespace, so a destination change is a context change.

@@ -24,6 +24,7 @@ use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
+use crate::upload_policy::remembered_policy;
 use anyhow::{anyhow, Result};
 use ottto_core::{default_support_dir, LocalDeviceBinding};
 use serde::{Deserialize, Serialize};
@@ -662,17 +663,21 @@ fn string_env(value: Option<&Value>) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Extract disabled server names from settings.
+/// Extract disabled server names from settings or a `~/.claude.json` project
+/// entry, where `/mcp` records its toggle (legacy key until Claude Code migrates
+/// it). Each list is an array of names or a single name.
 fn get_disabled_servers(value: &Value) -> Vec<String> {
-    value
-        .get("disabledMcpjsonServers")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut names = Vec::new();
+    for key in ["disabledMcpjsonServers", "disabledMcpServers"] {
+        match value.get(key) {
+            Some(Value::Array(list)) => {
+                names.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+            }
+            Some(Value::String(name)) => names.push(name.clone()),
+            _ => {}
+        }
+    }
+    names
 }
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
@@ -839,7 +844,9 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     }
     if let Some(root) = claude_json.as_ref() {
         if let Some(projects) = root.get("projects").and_then(Value::as_object) {
-            for project_dir in projects.keys() {
+            for (project_dir, project_cfg) in projects {
+                // No cwd here: a server off in any project is treated as off.
+                disabled_names.extend(get_disabled_servers(project_cfg));
                 for settings in [
                     Path::new(project_dir).join(".claude").join("settings.json"),
                     Path::new(project_dir)
@@ -858,6 +865,12 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     // user can re-enable is information worth reporting. The backend excludes
     // disabled servers from server_count / tool_count / grand_total_tokens.
     for name in disabled_names {
+        // `/mcp` names a plugin server `plugin:<plugin>:<server>`; its row here is
+        // `plugin_<plugin>_<server>`.
+        let name = match name.strip_prefix("plugin:") {
+            Some(rest) => format!("plugin_{}", rest.replacen(':', "_", 1)),
+            None => name,
+        };
         if let Some(server) = servers.get_mut(&name) {
             server.disabled = true;
         }
@@ -1478,6 +1491,11 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// returned unreachable with `deferred = true`, and the cycle keeps the last
 /// good inventory (see `harvest_source`).
 fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput, bool) {
+    // The agent never loads a disabled server, so it is reported without
+    // launching it.
+    if server.disabled {
+        return (unreachable_server(server), false);
+    }
     let tools = match &server.transport {
         Transport::Stdio {
             command,
@@ -2178,18 +2196,23 @@ fn harvest_source(
     // re-claim/re-onboard/repoint (different identity) never inherits the marker
     // and falls through to harvesting, the default-on behavior.
     let marker = org_disabled_marker_path(support_dir, source);
-    match client.get_activity_hint(&relay_token) {
+    let policy = match client.get_activity_hint(&relay_token) {
         Ok(hint) => {
             if !hint.mcp_inventory_harvest_enabled {
                 write_org_disabled_marker(&marker, &identity);
                 return Ok(());
             }
             clear_org_disabled_marker(&marker);
+            remembered_policy(support_dir, &identity, Some(&hint))
         }
         Err(_) if read_org_disabled_marker(&marker).as_deref() == Some(identity.as_str()) => {
             return Ok(());
         }
-        Err(_) => {}
+        Err(_) => remembered_policy(support_dir, &identity, None),
+    };
+    // An inventory is nothing but names, and building one launches MCP servers.
+    if !policy.names() {
+        return Ok(());
     }
 
     let path = cache_path(support_dir, source);
@@ -3390,6 +3413,7 @@ done
         Disabled,
         Error,
         UploadError,
+        NamesOff,
     }
 
     /// Mock backend accepting exactly `count` requests, dispatching by path:
@@ -3451,8 +3475,12 @@ done
                         mode => (
                             "200 OK",
                             format!(
-                                r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{}}}"#,
-                                matches!(mode, HintMode::Enabled | HintMode::UploadError)
+                                r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{},"session_titles_enabled":{}}}"#,
+                                matches!(
+                                    mode,
+                                    HintMode::Enabled | HintMode::UploadError | HintMode::NamesOff
+                                ),
+                                !matches!(mode, HintMode::NamesOff)
                             ),
                         ),
                     }
@@ -3500,6 +3528,73 @@ done
             support_dir,
             None,
         )
+    }
+
+    fn remember_names_on(support_dir: &Path, device: &LocalDeviceBinding, base: &str) {
+        let hint = crate::snapshot_client::decode_activity_hint(json!({
+            "source": "claude_code", "server_time": "2099-01-01T00:00:00Z",
+            "record_count_15m": 0, "record_count_24h": 0,
+            "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
+            "recommended_scan_after": "2099-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        remembered_policy(
+            support_dir,
+            &destination_identity(device, "otm_test", base),
+            Some(&hint),
+        );
+    }
+
+    /// With Readable labels off no MCP server is launched: the marker for an
+    /// org opt-out stays unset because the org did not opt out.
+    #[test]
+    fn harvest_source_collects_nothing_while_names_are_off() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-names-off");
+        // token + hint; no inventory POST.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 2, HintMode::NamesOff);
+        let client = SnapshotApiClient::new(base.clone());
+
+        run_harvest(
+            &client,
+            &cc_device("device_test"),
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("harvest stays quiet");
+
+        server.join().expect("server thread");
+        assert_eq!(inventory_post_count(&captured.lock().unwrap()), 0);
+        assert!(!cache_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+        assert!(!org_disabled_marker_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A failed hint with nothing remembered reads as names off.
+    #[test]
+    fn harvest_source_collects_nothing_on_hint_failure_without_a_known_policy() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-unknown-policy");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 2, HintMode::Error);
+        let client = SnapshotApiClient::new(base.clone());
+
+        run_harvest(
+            &client,
+            &cc_device("device_test"),
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("harvest tolerates hint outage");
+
+        server.join().expect("server thread");
+        assert_eq!(inventory_post_count(&captured.lock().unwrap()), 0);
+        let _ = fs::remove_dir_all(&home);
     }
 
     fn inventory_post_count(requests: &[String]) -> usize {
@@ -3676,6 +3771,7 @@ done
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
         let (base, server) = mock_backend(captured.clone(), 3, HintMode::Error);
         let client = SnapshotApiClient::new(base.clone());
+        remember_names_on(&support_dir, &cc_device("device_new"), &base);
 
         run_harvest(
             &client,

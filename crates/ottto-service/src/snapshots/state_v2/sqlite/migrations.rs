@@ -4,7 +4,14 @@
 use super::*;
 
 pub(super) const REVISION: u32 = 1;
-pub(super) const WRITER_CAPABILITY: u64 = 2;
+// Append one line per bump; two PRs appending the same number conflict by design.
+const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
+    (1, "original state v2 writer"),
+    (2, "kind-introduction layouts"),
+    (3, "tail store"),
+];
+pub(super) const WRITER_CAPABILITY: u64 =
+    WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;
 struct Step {
     to: u32,
     apply: fn(&Connection) -> Result<()>,
@@ -132,6 +139,36 @@ pub(super) fn run(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [format] format ledgers are consecutive and cover every catalogue kind.
+    #[test]
+    fn format_bump_ledgers_are_consecutive_and_cover_catalogue() {
+        use super::super::super::catalogue;
+
+        for (index, (layout, _)) in catalogue::LAYOUTS_HISTORY.iter().enumerate() {
+            assert_eq!(*layout, u32::try_from(index + 1).unwrap());
+        }
+        for (index, (capability, _)) in WRITER_CAPABILITIES_HISTORY.iter().enumerate() {
+            assert_eq!(*capability, u64::try_from(index + 1).unwrap());
+        }
+        assert_eq!(
+            catalogue::LAYOUT,
+            catalogue::LAYOUTS_HISTORY.last().unwrap().0
+        );
+        assert_eq!(
+            WRITER_CAPABILITY,
+            WRITER_CAPABILITIES_HISTORY.last().unwrap().0
+        );
+        // Tail kinds use TAIL_LAYOUT; graph kinds use their catalogue entry.
+        for kind in catalogue::OWNED
+            .iter()
+            .map(|(kind, _)| kind)
+            .chain(catalogue::TAIL_KINDS.iter())
+        {
+            assert!(catalogue::introduced(kind).unwrap() <= catalogue::LAYOUT);
+        }
+    }
+
     /// [format] shipped revision fixtures match fresh and refuse old writers.
     #[test]
     fn shipped_revision_fixtures_match_fresh_and_refuse_old_writers() {

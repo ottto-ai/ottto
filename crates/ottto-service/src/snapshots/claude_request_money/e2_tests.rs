@@ -4514,6 +4514,7 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
                     std::slice::from_ref(&response),
                 )
             };
+            crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &key);
             assert_eq!(
                 fold(&parse_copy(&index)).entity.removed_requests,
                 1,

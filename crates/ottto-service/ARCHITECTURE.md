@@ -43,8 +43,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   save. Exact local receipts settle record custody, never upload acknowledgement. Restore validates
   source, key, context, scope, format, file certificate and committed index evidence before bounded
   content replay and Tail. Refusals use counted recovery or hold without changing accepted usage.
-  Byte budgets pace writes and replay; deferred work stays discoverable. Consent-gated local-only
-  fields stay in the record and never enter diagnostics or uploads from the store. Erasure unlinks
+  Byte budgets pace writes and replay; deferred work stays discoverable. Skill labels stay in
+  private local records independently of upload settings and never enter diagnostics or uploads
+  from the store. Erasure unlinks
   records and syncs the directory under the existing writer lock; failures are counted and retried.
 - The two stores join by key digest and hold no references into each other.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
@@ -77,6 +78,8 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
   checkpoints can run.
 - Durability stays at `FULL`. Erasing data leaves nothing readable in the database, WAL or SHM
   files.
+- Complete valid saves commit above aggregate charged-work targets. The 32 MiB target sizes the
+  next collection page; crossing 256 MiB emits a counts-only alarm without refusing the save.
 
 ## One generic path per source
 
@@ -108,7 +111,7 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 - **Restart restore** (`snapshots/restart_restore.rs`) defaults OFF. Its process-fixed policy
   requires the `restart_restore_enabled` marker and `DISCOVERY_DEPENDENCY_READY`. That constant is
   false in this build, so the marker cannot turn it ON until the discovery dependency is implemented
-  and the constant flips. OFF disables ordinary record reads, writes, repair and GC; consent/source
+  and the constant flips. OFF disables ordinary record reads, writes, repair and GC; source
   erasure and counted deletion of outgrown v1 records remain active. The former v1 warm-restore
   route is removed: files use no-record acquisition, with a paced Full on growth when needed.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
@@ -121,5 +124,9 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 Transcripts never leave the machine. Logs, diagnostics and status carry counts, never transcript
 text, paths or raw identifiers; types holding local-only text don't derive `Debug`. Identity is
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
-Erasure (consent off, retirement, source removal, forget installation, uninstall) reaches every
+What a privacy setting removes from an upload is decided in `upload_policy.rs`, or by the builders
+that read its settings; it never refuses a body, and hashes are computed afterwards from what is
+sent.
+The Companion session list uses local titles and workspace labels before upload filtering.
+Erasure (retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).

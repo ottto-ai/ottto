@@ -4698,6 +4698,7 @@ impl SharedCache {
             Ok(None),
         );
         if !restart_restore::enabled() {
+            self.clear_retired_claude_bodies(writer, snapshot_source);
             // The committed save, not the working index, owns quiet-marker
             // settlement even without a record. Keep the ordinary second CAS.
             let source = durable_source(snapshot_source)?;
@@ -4758,6 +4759,39 @@ impl SharedCache {
         );
         lease.release();
         result
+    }
+
+    /// Retired Claude v1 bodies hold the old unkeyed session context digest.
+    /// Disk only: nothing reads them, so no parse is dropped and no file re-read.
+    fn clear_retired_claude_bodies<W: SingleWriter>(
+        &self,
+        writer: &W,
+        snapshot_source: SnapshotSource,
+    ) {
+        if snapshot_source != SnapshotSource::ClaudeCode
+            || self.off_exception(snapshot_source) != Ok(true)
+        {
+            return;
+        }
+        let (Some(source), Some(mut stores)) = (durable_source(snapshot_source), self.durable())
+        else {
+            return;
+        };
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
+        };
+        let Ok(report) = slot.store.clear_retired_bodies(writer) else {
+            return;
+        };
+        if report.cleared + report.failed > 0 {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &serde_json::json!({
+                    "retired_bodies_cleared": report.cleared,
+                    "retired_bodies_clear_failed": report.failed,
+                }),
+            );
+        }
     }
 
     fn erase_private_labels<W: SingleWriter>(
