@@ -1655,6 +1655,161 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
     );
 }
 
+// Reproduce main's first-terminal scheduling effects only in this reference
+// fixture: its automatic Full cleared progress and discarded pending. The
+// ordinary body builder, identity fold, exact ACK validator and save remain
+// the same production paths. No production read cause is added.
+fn source_t2_ordinary_reference() -> RearmFixture {
+    let mut reference = c1a_fixture("source-t2-ordinary-reference");
+    reference.owned_base_preparation = true;
+    reference.native_file_limit = 2;
+    c1a_add_family_request_identity(&reference);
+    crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
+        crate::snapshots::claude_request_identity::COLLECTOR,
+        || {
+            latch_contract_generation(&reference, 0);
+            let mut index = ScanIndex::load(&reference.index_path).unwrap();
+            for entry in index.files.values_mut() {
+                entry.source_file_fingerprint.clear();
+            }
+            index.claude_usage_family_pending.clear();
+            index.save(&reference.index_path).unwrap();
+            reference.list_held(&[REARM_ROOT, REARM_SIBLING]);
+            latch_contract_generation(&reference, 10);
+        },
+    );
+    reference
+}
+
+fn source_t2_placement(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for bucket in body["usage_buckets"].as_array().unwrap() {
+        for row in bucket["model_usage"].as_array().unwrap() {
+            assert!(
+                row.get("identity_parts").is_none(),
+                "single-account fixture"
+            );
+            let evidence = row["evidence_ref"]
+                .as_u64()
+                .map(|at| &body["request_evidence"][at as usize]);
+            let mut placement = serde_json::json!({
+                "hour": bucket["bucket_start"], "model": row["model"],
+                "account": row["account_identifier_hash"],
+                "organization": evidence.map(|e| &e["provider_workspace_hash"]),
+            });
+            for field in [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_5m_tokens",
+                "cache_creation_1h_tokens",
+                "reasoning_output_tokens",
+                "unattributed_total_tokens",
+                "request_count",
+                "auth_mode",
+                "billing_channel",
+                "billing_provider",
+                "gateway_provider",
+                "model_provider",
+                "subscription_product",
+                "cost_usd",
+                "input_cost_usd",
+                "output_cost_usd",
+                "cache_read_cost_usd",
+                "cache_creation_cost_usd",
+            ] {
+                placement[field] = row[field].clone();
+            }
+            rows.push(placement);
+        }
+    }
+    rows.sort_by_key(serde_json::Value::to_string);
+    rows
+}
+
+fn source_t2_quantify_forward_only(fixture: &RearmFixture) {
+    let reference = source_t2_ordinary_reference();
+    let current = ScanIndex::load(&fixture.index_path).unwrap();
+    let main = ScanIndex::load(&reference.index_path).unwrap();
+    let actual = fixture.body_trace.borrow();
+    let base = reference.body_trace.borrow();
+    let sessions = [
+        rearm_member_session(None),
+        rearm_member_session(Some(REARM_AGENTS[0])),
+        rearm_member_session(Some(REARM_AGENTS[1])),
+        REARM_SIBLING.to_owned(),
+    ];
+    for (ordinal, session) in sessions.iter().enumerate() {
+        let a = &actual.finalizer_bodies[session];
+        let b = &base.finalizer_bodies[session];
+        let counts = |body: &serde_json::Value| {
+            [
+                "request_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_5m_tokens",
+                "cache_creation_1h_tokens",
+                "reasoning_output_tokens",
+                "unattributed_total_tokens",
+            ]
+            .map(|field| body[field].as_u64().unwrap_or_default())
+        };
+        let custody = |fixture: &RearmFixture,
+                       index: &ScanIndex,
+                       trace: &RearmBodyTrace,
+                       body: &serde_json::Value| {
+            let key = if session == REARM_SIBLING {
+                c1b_sibling_path(fixture)
+            } else {
+                let agent = REARM_AGENTS.iter().find(|agent| session.ends_with(**agent));
+                fixture.member_path(agent.copied())
+            }
+            .to_string_lossy()
+            .into_owned();
+            let saved = serde_json::to_value(index).unwrap();
+            let entities = saved["file_snapshot_fingerprints"][&key]
+                .as_array()
+                .unwrap();
+            let fingerprint = body["snapshot_fingerprint"].as_str().unwrap();
+            let entry = &saved["files"][&key];
+            [
+                entities.len() as u64,
+                u64::from(entities.iter().any(|fp| fp == fingerprint)),
+                u64::from(
+                    index
+                        .accepted_snapshot_fingerprints_for_test()
+                        .contains(fingerprint),
+                ),
+                u64::from(
+                    trace.strict_ack_witnesses[session] == trace.finalizer_witnesses[session],
+                ),
+                entry["effective_upload_body_witness_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ]
+        };
+        let ac = custody(fixture, &current, &actual, a);
+        let bc = custody(&reference, &main, &base, b);
+        let placed = source_t2_placement(a) == source_t2_placement(b);
+        eprintln!("CENSUS_EXIT_T2 role={ordinal} main_counts={:?} forward_counts={:?} placement_equal={placed} main_custody={bc:?} forward_custody={ac:?} semantic_key_equal={} additive_key_equal={}",
+            counts(b), counts(a), a["snapshot_fingerprint"] == b["snapshot_fingerprint"],
+            actual.strict_ack_witnesses[session] == base.strict_ack_witnesses[session]);
+        assert_eq!(counts(a), counts(b), "forward-only totals role={ordinal}");
+        assert_eq!(
+            counts(a),
+            if ordinal == 0 {
+                [2, 20, 20, 0, 0, 0, 0, 0]
+            } else {
+                [1, 10, 10, 0, 0, 0, 0, 0]
+            }
+        );
+        assert!(placed, "forward-only placement role={ordinal}");
+        assert_eq!(ac, bc, "forward-only custody role={ordinal}");
+        assert_eq!(ac, [1, 1, 1, 1, 3], "one exact accepted entity per file");
+    }
+}
+
 // Finish the invariant/current-contract G first while F remains
 // owed. The next debt retry carries G, but must read and ACK F's new body.
 #[test]
@@ -1688,6 +1843,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 },
             );
         }
+        source_t2_quantify_forward_only(&fixture);
         let old_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
         for session in [REARM_ROOT, REARM_SIBLING] {
             assert_ne!(
