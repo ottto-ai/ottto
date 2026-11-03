@@ -65,6 +65,15 @@
   reads a merge-queue run (a train PR's members are its `train: merge #<n>`
   commits). `detect <pr>`
   tells from the diff alone whether a PR needs macOS evidence (exit 10).
+- Merge-queue and dispatch test runs retry flakes; pull-request runs never do.
+  `scripts/ci_runtime_tests.py --retry-failed 1` re-runs up to 3 failed tests
+  alone, once each, after the suite. A test that passes then prints `FLAKY`,
+  appears in the step summary and a `flaky-tests-*` artifact, and no longer
+  fails the run. Money suites, the layout receipt and clippy are never retried.
+  `mac_batch.py report` lists FLAKY tests without blaming a PR, and a FLAKY
+  macOS-only test is not evidence for its PR. The daily `Flaky test report` job
+  (`scripts/flaky_tests.py`) warns about any test that was flaky 3 or more times
+  in 7 days: open an issue for that test's owner. A retry is not a fix.
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
   ready, waits until the pull-request checks on the PR's head commit pass
   (`ci.yml`: `Public surface checks`, `Rust advisory audit`, `Dependency review`,

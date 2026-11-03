@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import signal
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name('ci_runtime_tests.py').resolve()
 spec = importlib.util.spec_from_file_location('ci_runtime_tests', SCRIPT)
@@ -141,6 +143,101 @@ class SummaryTests(unittest.TestCase):
             ['b::flaky: did not pass (FAILED)', 'c::skipped: did not pass (ignored)', 'receipt: did not pass (not run)'],
         )
 
+
+class RetryTests(unittest.TestCase):
+    LIB = '     Running unittests src/lib.rs (target/debug/deps/ottto_service-89abcdef)\n'
+    CLI = '     Running tests/cli.rs (target/debug/deps/cli-0123abcd)\n'
+
+    @staticmethod
+    def summary(passed, failed):
+        return f'test result: FAILED. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n'
+
+    def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary]):
+        return runner.retry_plan([(lines, scope_of)], set(required), limit)
+
+    def test_failed_names_map_to_their_binary(self):
+        lines = [self.LIB, 'test a::one ... FAILED\n', 'test a::two ... ok\n', self.summary(1, 1),
+                 self.CLI, 'test case ... FAILED\n', self.summary(0, 1),
+                 '   Doc-tests ottto_service\n', 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n']
+        self.assertEqual(self.plan(lines), ([('a::one', ['ottto_service-89abcdef']), ('case', ['cli-0123abcd'])], None))
+
+    def test_retries_nothing_it_cannot_tie_to_a_name(self):
+        cases = {
+            'crash': [self.LIB, 'test a::one ... FAILED\n'],
+            'count mismatch': [self.LIB, 'test a::one ... FAILED\n', self.summary(0, 2)],
+            'doc-test': ['   Doc-tests ottto_core\n', self.summary(1, 1)],
+            'no names': ['error: could not compile\n'],
+        }
+        for label, lines in cases.items():
+            with self.subTest(label):
+                plan, reason = self.plan(lines)
+                self.assertEqual(plan, [])
+                self.assertTrue(reason)
+        plan, reason = self.plan([self.LIB, 'test a::one ... FAILED\n', self.summary(0, 1)], scope_of=lambda _b: None)
+        self.assertIn('unknown test binary', reason)
+
+    def test_limit_money_and_receipts_are_never_retried(self):
+        four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4)]
+        self.assertIn('over the retry limit', self.plan(four)[1])
+        self.assertEqual(len(self.plan(four, limit=4)[0]), 4)
+        for name in ('snapshot_sync::claude_money_e2_pipeline_tests::x', 'snapshots::state_v2_money_tests::y',
+                     'a::money_equivalence_tests::m::z', 'layout::receipt'):
+            with self.subTest(name):
+                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1)]
+                plan, reason = self.plan(lines, required=['layout::receipt'])
+                self.assertEqual(plan, [])
+                self.assertIn('never retried', reason)
+
+    def test_binaries_from_cargo_json(self):
+        def artifact(kind, name, exe, test=True):
+            return runner.json.dumps({'reason': 'compiler-artifact', 'manifest_path': '/w/c/Cargo.toml',
+                                      'target': {'kind': kind, 'name': name}, 'profile': {'test': test},
+                                      'executable': exe})
+        output = '\n'.join([
+            artifact(['lib'], 'c', '/w/target/debug/deps/c-1'),
+            artifact(['test'], 'cli', '/w/target/debug/deps/cli-2'),
+            artifact(['bin'], 'tool', '/w/target/debug/deps/tool-3'),
+            artifact(['bin'], 'tool', '/w/target/debug/tool', test=False),
+            '{"reason": "build-finished", "success": true}',
+            'not json',
+        ])
+        self.assertEqual(runner.test_binaries(output), {
+            'c-1': ['--manifest-path', '/w/c/Cargo.toml', '--lib'],
+            'cli-2': ['--manifest-path', '/w/c/Cargo.toml', '--test', 'cli'],
+            'tool-3': ['--manifest-path', '/w/c/Cargo.toml', '--bin', 'tool'],
+        })
+
+    def test_retry_passes_kills_on_timeout_and_reports(self):
+        lock = threading.Lock()
+
+        def fake_cargo(tmp, body):
+            # Stands in for cargo; ignores the `test <scope> -- ...` arguments.
+            path = Path(tmp) / 'cargo'
+            path.write_text(f'#!{sys.executable}\n{body}\n', encoding='utf-8')
+            path.chmod(0o755)
+            return str(path)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
+            passed = runner.retry_alone(fake_cargo(tmp, 'print("test a::b ... ok")'), 'a::b', ['--lib'], 30, lock)
+            failed = runner.retry_alone(fake_cargo(tmp, 'print("test a::b ... FAILED"); raise SystemExit(101)'),
+                                        'a::b', ['--lib'], 30, lock)
+            started = time.monotonic()
+            hung = runner.retry_alone(fake_cargo(tmp, 'import time; time.sleep(60)'), 'a::b', ['--lib'], 1, lock)
+        self.assertTrue(passed)
+        self.assertFalse(failed)
+        self.assertFalse(hung)
+        self.assertLess(time.monotonic() - started, 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'flaky.json'
+            out = io.StringIO()
+            # Keep the real CI step summary clean.
+            with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+                runner.record_flaky([('a::b', 1)], str(path), (2, 3))
+            record = runner.json.loads(path.read_text())
+        self.assertEqual(record['shard'], '2/3')
+        self.assertEqual(record['flaky'], [{'test': 'a::b', 'retry': 1}])
+        self.assertEqual(runner.libtest_log.flaky(out.getvalue().splitlines()), {'a::b'})
 
 
 class WatchdogTests(unittest.TestCase):

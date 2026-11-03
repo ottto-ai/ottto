@@ -155,10 +155,22 @@ jobs:
         # --require-pass is the layout coverage receipt: with
         # OTTTO_REQUIRE_LAYOUT=1 that test passes only on a validated layout,
         # and the step fails unless it printed "... ok" (not ignored, not absent).
+        # Queue and dispatch runs re-run up to 3 failed tests alone once; one
+        # that passes then is reported FLAKY and uploaded below. Money suites
+        # and the layout receipt are never retried (scripts/ci_runtime_tests.py).
         run: >-
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1
           --require-pass heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt
           ${{ github.event_name != 'schedule' && '--no-fail-fast' || '' }}
+          ${{ (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') && '--retry-failed 1 --flaky-json flaky-tests.json' || '' }}
+
+      - name: Upload flaky tests
+        if: ${{ !cancelled() && hashFiles('flaky-tests.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flaky-tests-macos-${{ github.run_attempt }}
+          retention-days: 14
+          path: flaky-tests.json
 
       - name: Filtered Rust tests (partial pre-check)
         if: env.OTTTO_CI_TEST_FILTER != ''
@@ -188,6 +200,30 @@ jobs:
     runs-on: macos-15
     env: *rust-contract-env
     steps: *rust-contract-steps
+
+  flaky-report:
+    # Daily: a test that passed only on retry 3+ times in 7 days needs an
+    # issue for its owner (scripts/flaky_tests.py; warnings, never red).
+    name: Flaky test report
+    if: github.event_name == 'schedule'
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Count flaky tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=0
+          python3 scripts/flaky_tests.py --repo "$GITHUB_REPOSITORY" --annotate | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          test "$status" -eq 0 || test "$status" -eq 3
 
   public-surface:
     if: ${{ !github.event.pull_request.draft && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin)) }}

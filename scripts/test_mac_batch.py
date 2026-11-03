@@ -313,6 +313,9 @@ class MacBatchTests(unittest.TestCase):
         red_fmt = [{"name": "Rust format", "conclusion": "failure"}]
         mac_ok = "test tests::ignored_off_mac ... ok"
         mac_red = "test tests::ignored_off_mac ... FAILED"
+        retried = "ci_runtime_tests: FLAKY {} (failed, then passed alone on retry 1)"
+        other_flaky = "\n".join([mac_ok, "test tests::other ... FAILED", retried.format("tests::other")])
+        mac_flaky = "\n".join([mac_red, retried.format("tests::ignored_off_mac")])
         cases = [
             # name, job conclusion, steps, log, #4 head, verdicts, exit code
             ("green", "success", tests, mac_ok, self.heads[4], ("CLEARED", "CLEARED"), 0),
@@ -320,6 +323,9 @@ class MacBatchTests(unittest.TestCase):
             ("mac test did not run", "success", tests, "", self.heads[4], ("NO-EVIDENCE", "CLEARED"), 5),
             ("failed before tests", "failure", red_fmt, "", self.heads[4], ("NO-EVIDENCE", "NO-EVIDENCE"), 5),
             ("head moved", "success", tests, mac_ok, moved, ("CLEARED", "STALE"), 5),
+            # Fail-then-pass on retry blames nobody, but is no macOS-only evidence.
+            ("other test flaky", "success", tests, other_flaky, self.heads[4], ("CLEARED", "CLEARED"), 0),
+            ("own test flaky", "success", tests, mac_flaky, self.heads[4], ("NO-EVIDENCE", "CLEARED"), 5),
         ]
         for name, conclusion, steps, log, head4, verdicts, code in cases:
             with self.subTest(name):
@@ -331,6 +337,9 @@ class MacBatchTests(unittest.TestCase):
                 self.assertEqual(rc, code, out)
                 for number, verdict in zip((3, 4), verdicts):
                     self.assertIn(f"#{number} {verdict} (", out)
+                if "FLAKY" in log:
+                    self.assertNotIn("\nFAILED ", out)
+                    self.assertIn("FLAKY tests::", out)
 
     def test_report_merge_queue_train(self):
         # A queued train PR: members come from its "train: merge #<n>" commits.

@@ -138,8 +138,19 @@ jobs:
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        # Same split as the macOS job (scripts/ci_runtime_tests.py).
-        run: python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast --shard ${{ matrix.shard }}/3
+        # Same split as the macOS job (scripts/ci_runtime_tests.py), and the
+        # same retry of up to 3 failed tests on dispatch runs (train checks).
+        run: >-
+          python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast --shard ${{ matrix.shard }}/3
+          ${{ github.event_name == 'workflow_dispatch' && '--retry-failed 1 --flaky-json flaky-tests.json' || '' }}
+
+      - name: Upload flaky tests
+        if: ${{ !cancelled() && hashFiles('flaky-tests.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flaky-tests-linux-${{ matrix.shard }}-${{ github.run_attempt }}
+          retention-days: 14
+          path: flaky-tests.json
 
       # Includes ottto-connector-testkit's first_party_sources contract tests.
       - name: Connector tests

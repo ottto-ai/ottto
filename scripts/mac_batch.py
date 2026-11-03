@@ -759,6 +759,11 @@ class TestLog:
 def parse_log(text: str) -> TestLog:
     lines = [PREFIX_RE.sub("", raw) for raw in text.splitlines()]
     log = TestLog(libtest_log.results(lines), libtest_log.panics(lines))
+    # Failed, then passed alone on retry (ci_runtime_tests.py --retry-failed):
+    # not a failure to attribute, and not macOS-only evidence either.
+    for name in libtest_log.flaky(lines):
+        if log.results.get(name) == "FAILED":
+            log.results[name] = "FLAKY"
     for line in lines:
         m = RERUN_RE.search(line)
         if m:
@@ -910,6 +915,8 @@ def cmd_report(r: Runner, a: argparse.Namespace) -> int:
     if log.failed_binaries:
         print("stopped at failing test binary: " + "; ".join(log.failed_binaries)
               + " (later test binaries and steps did not run)")
+    for name in sorted(n for n, st in log.results.items() if st == "FLAKY"):
+        print(f"FLAKY {name}: failed, then passed alone on retry; not counted as a failure")
     for at in attributions:
         tier, prs = at.top
         if not prs:
