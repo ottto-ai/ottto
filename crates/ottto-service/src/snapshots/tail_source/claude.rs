@@ -10,9 +10,9 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
-    read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages,
+    hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
+    DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, HDigest, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
