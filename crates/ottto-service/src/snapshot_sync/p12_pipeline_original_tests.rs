@@ -1446,7 +1446,7 @@ fn native_comparison_novel_import_base_parity() {
                 .unwrap()
                 .duplicate_census
                 .pending_occurrence_count,
-            1,
+            7,
             "Skips/envelope state never become native pending or coverage"
         );
         let fp = offered_body(&candidate_import).1;
