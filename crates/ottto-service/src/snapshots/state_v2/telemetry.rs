@@ -113,13 +113,7 @@ pub(super) struct Stage {
 impl Stage {
     pub(super) fn new(kind: Kind) -> Self {
         if matches!(kind, Kind::Hydrate) {
-            // The first adopted load has no active runtime at prepare entry.
-            // Start its v2 window here, after publication has been verified.
-            if !PASS.with(|pass| pass.borrow().started) {
-                pass_start();
-            }
-            PASS.with(|pass| pass.borrow_mut().active = true);
-            initialize_pass();
+            start_hydrate();
         }
         Self {
             kind,
@@ -156,6 +150,7 @@ impl Stage {
                         peak,
                         cpu_us: cpu,
                         wall_us: Some(self.probe.wall_us()),
+                        ..Default::default()
                     },
                 );
             }
@@ -166,6 +161,47 @@ impl Stage {
 impl Drop for Stage {
     fn drop(&mut self) {
         self.record();
+    }
+}
+
+fn start_hydrate() {
+    // The first adopted load has no active runtime at prepare entry.
+    // Start its v2 window here, after publication has been verified.
+    if !PASS.with(|pass| pass.borrow().started) {
+        pass_start();
+    }
+    PASS.with(|pass| pass.borrow_mut().active = true);
+    initialize_pass();
+}
+/// Instantaneous counts-only checkpoints; CPU is cumulative process CPU, so
+/// adjacent readings can be subtracted even across ACK work outside hydrate.
+pub(super) fn hydrate_checkpoint(
+    name: &'static str,
+    save_digests: usize,
+    cx: Option<&kinds::KindCx>,
+) {
+    start_hydrate();
+    let current = crate::local_resource_diagnostics::state_v2_memory();
+    let process_cpu_us = crate::local_resource_diagnostics::state_v2_cpu_us();
+    if let Ok(mut stats) = stats().lock() {
+        stats.stage_memory.insert(
+            name,
+            MemoryWindow {
+                current,
+                process_cpu_us,
+                save_digests: Some(save_digests),
+                // Hydrate-owned maps; no key/value walks or serialized size estimates.
+                kind_cx_entries: cx.map(|cx| {
+                    cx.presence.len()
+                        + cx.account_ids.len()
+                        + cx.digests.len()
+                        + cx.cold_rolled.len()
+                        + cx.compaction.done.len()
+                }),
+                ..Default::default()
+            },
+        );
+        crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
 
@@ -262,6 +298,7 @@ pub(in super::super) fn phase(name: &'static str) {
                 peak: Default::default(),
                 cpu_us: None,
                 wall_us: None,
+                ..Default::default()
             },
         );
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -393,10 +430,16 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
     Some(bytes)
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct MemoryWindow {
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_digests: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind_cx_entries: Option<usize>,
     /// Process CPU and wall across the stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_us: Option<u64>,
@@ -432,6 +475,7 @@ impl Drop for Window {
                     peak,
                     cpu_us: cpu,
                     wall_us: Some(self.probe.wall_us()),
+                    ..Default::default()
                 },
             );
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -501,6 +545,69 @@ pub(super) fn row_cap_save() {
 #[cfg(test)]
 mod ops_tests {
     use super::*;
+
+    /// [behaviour] Cold and reused loads emit the hydrate checkpoints in order.
+    #[test]
+    fn hydrate_checkpoints_follow_load_order() {
+        let root = crate::test_scratch::canonical_private_dir("hydrate-checkpoints");
+        let parent = root.join("snapshots/destinations").join("a".repeat(64));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("claude_code-test-scan-index.json");
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        for cold in [true, false] {
+            pass_start();
+            let (loaded, records) = crate::local_resource_diagnostics::capture(|| {
+                if cold {
+                    super::super::money_test_support::publish(
+                        &ScanIndex::default(),
+                        &path,
+                        &progress,
+                    )
+                } else {
+                    ScanIndex::load(&path).unwrap()
+                }
+            });
+            let mut previous = None;
+            for name in [
+                "hydrate_route_entry",
+                "hydrate_after_ack",
+                "hydrate_entry",
+                "hydrate_after_decode",
+                "hydrate_after_baseline",
+                "hydrate_exit",
+            ] {
+                let position = records
+                    .iter()
+                    .position(|record| {
+                        record["stage"] == "claude_state_v2"
+                            && record["counts"]["stage_memory"][name].is_object()
+                    })
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                assert!(
+                    previous.is_none_or(|previous| position > previous),
+                    "{name}"
+                );
+                previous = Some(position);
+                let sample = &records[position]["counts"]["stage_memory"][name];
+                assert!(sample["current"].is_object());
+                assert!(sample["save_digests"].is_u64());
+                if name == "hydrate_after_baseline" || name == "hydrate_exit" {
+                    assert!(sample["save_digests"].as_u64().unwrap() > 0);
+                    assert!(sample["kind_cx_entries"].is_u64());
+                }
+                if cfg!(any(target_os = "macos", target_os = "linux")) {
+                    assert!(sample["process_cpu_us"].is_u64());
+                }
+            }
+            drop(loaded);
+        }
+        super::super::erase_tree(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// [regress] Nested growth custody loads preserve measurements already
     /// accumulated by the enclosing preparation/acquisition pass.
