@@ -522,7 +522,7 @@ fn removal_over_an_unreadable_head_sets_it_aside_and_commits() {
     assert!(index.files.contains_key(SIBLING));
     let marker = tail_set_aside(&index, FILE).unwrap().unwrap();
     assert_eq!(marker.cause, SetAsideCause::Row);
-    let error = load_head(&index, FILE, REVISION).unwrap_err();
+    let error = load_head(&index, FILE, REVISION).err().unwrap();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "kept");
 }
 
