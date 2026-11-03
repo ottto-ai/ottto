@@ -1542,15 +1542,20 @@ fn codec_page(
 #[test]
 fn an_unrouted_codec_source_keeps_no_ram_copy() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
     let source = SnapshotSource::ClaudeCode;
     let fixture = ScanFixture::new(source);
     let cache = Arc::new(sampled_scan::SharedCache::default());
     fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
+    let before = unrouted();
     let ((index, modes), first) = observe(|| codec_page(&fixture, &cache, ScanIndex::default()));
     assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
     assert_eq!(modes, (1, 0, 0), "first read");
+    assert_eq!(unrouted(), before, "a new file is no unrouted growth");
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
     let ((_, modes), next) = observe(|| codec_page(&fixture, &cache, index));
+    assert!(unrouted() > before, "the growth Full is counted by why");
     assert_eq!(
         first.insert_admitted, 0,
         "no copy is admitted (modes {modes:?})"

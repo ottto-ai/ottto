@@ -33706,6 +33706,15 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                // No database route (v1, a paused import, no support dir): a
+                // codec source keeps no RAM copy either, so its growth reads Full.
+                #[cfg(unix)]
+                if tail_route.is_none()
+                    && tail_source::has_codec(source)
+                    && index.files.contains_key(&key)
+                {
+                    tail_source::counters::bump(source, "tail_bootstrap_full", "unrouted");
+                }
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
