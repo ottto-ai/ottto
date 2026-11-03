@@ -450,6 +450,16 @@ pub(crate) fn claude_usage_iteration_model_differs() {
     cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
 }
 
+/// Counts per numeric key the Claude usage parser does not read, per observed
+/// usage line; rereads count again. Only the lifecycle registry atomics are
+/// updated.
+pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -1024,8 +1034,23 @@ fn process_sample() -> Option<ProcessSample> {
     None
 }
 
+/// Current retained refusal exposure. No history, buckets, timer or retention.
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct RefusalExposure {
+    pub(crate) owed_entities: usize,
+    pub(crate) held_terminal_entities: usize,
+    pub(crate) known_requests: u64,
+    pub(crate) known_tokens: u64,
+    pub(crate) unknown_request_entities: usize,
+    pub(crate) unknown_token_entities: usize,
+    pub(crate) unknown_age_entities: usize,
+    pub(crate) oldest_age_seconds: u64,
+}
+crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_entities, known_requests, known_tokens, unknown_request_entities, unknown_token_entities, unknown_age_entities, oldest_age_seconds);
+
 #[derive(Debug)]
 pub(crate) struct Probe {
+    pub(crate) refusal_exposure: Option<RefusalExposure>,
     withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
@@ -1084,6 +1109,7 @@ impl Probe {
     }
     pub(crate) fn start() -> Self {
         Self {
+            refusal_exposure: None,
             withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
@@ -1114,6 +1140,8 @@ impl Probe {
     ) {
         #[derive(Serialize)]
         struct Counts {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             collection: CollectionCounts,
             #[serde(flatten)]
@@ -1195,6 +1223,7 @@ impl Probe {
             } else {
                 self.page_events.with_current().retained_cache_only()
             },
+            refusal_exposure: self.refusal_exposure,
             collection: counts,
             pending,
             identity: if claude {
@@ -1336,13 +1365,32 @@ pub(crate) fn source_prepare<T>(
 
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
+#[cfg(test)]
 pub(crate) fn source_finish<T>(
     source: &str,
     v2_active: bool,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let probe = Probe::start();
-    let footprint = footprint::Stage::begin();
+    source_finish_inner(source, v2_active, None, inner)
+}
+pub(crate) fn source_finish_with_refusals<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: RefusalExposure,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    source_finish_inner(source, v2_active, Some(exposure), inner)
+}
+fn source_finish_inner<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: Option<RefusalExposure>,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut window = StageWindow::begin(source, "source_finish");
+    if let Some(exposure) = exposure {
+        window.set_refusal_exposure(exposure);
+    }
     let v2_active = source == "claude_code" && v2_active;
     let v2_window = v2_active
         .then(crate::snapshots::state_v2_finish_window)
@@ -1352,14 +1400,7 @@ pub(crate) fn source_finish<T>(
     if v2_active {
         crate::snapshots::state_v2_post_pass_observed();
     }
-    emit(&Record {
-        schema_version: SCHEMA_VERSION,
-        process_id: std::process::id(),
-        stage: "source_finish",
-        source: Source::from_slug(source),
-        observation: probe.stage_observation(footprint.as_ref()),
-        counts: EmptyCounts {},
-    });
+    drop(window);
     result
 }
 /// Named footprint window inside a source stage. One record with empty counts
@@ -1373,6 +1414,9 @@ pub(crate) struct StageWindow {
     first_read_bytes: Option<u64>,
 }
 impl StageWindow {
+    pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
+        self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
+    }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         Self {
             stage,
@@ -1414,6 +1458,9 @@ impl Drop for StageWindow {
         });
         #[derive(Serialize)]
         struct Counts {
+            // Zero exposure is stored as None and stays off the record.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             jsonl: Option<jsonl::Counts>,
             #[serde(flatten)]
@@ -1426,6 +1473,7 @@ impl Drop for StageWindow {
             source: self.source,
             observation,
             counts: Counts {
+                refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 first_read,
             },
@@ -1461,7 +1509,12 @@ impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
 fn wall_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
-fn emit_stage(stage: &'static str, source: Source, observation: impl FnOnce() -> Observation) {
+fn emit_stage(
+    stage: &'static str,
+    source: Source,
+    refusal_exposure: Option<RefusalExposure>,
+    observation: impl FnOnce() -> Observation,
+) {
     if std::thread::panicking() {
         return;
     }
@@ -1471,7 +1524,7 @@ fn emit_stage(stage: &'static str, source: Source, observation: impl FnOnce() ->
         stage,
         source,
         observation: observation(),
-        counts: EmptyCounts {},
+        counts: StageCounts { refusal_exposure },
     });
 }
 /// Named window summed over repeated steps inside a source stage: one record
@@ -1508,7 +1561,7 @@ impl StageSum {
 }
 impl Drop for StageSum {
     fn drop(&mut self) {
-        emit_stage(self.stage, self.source, || {
+        emit_stage(self.stage, self.source, None, || {
             let mut observation = Observation::point();
             observation.wall_elapsed_us = self.wall_us;
             observation.shared_process_cpu_delta_us = self.cpu_us;
@@ -1547,7 +1600,10 @@ pub(crate) fn codex_census_fence(
 }
 
 #[derive(Serialize)]
-struct EmptyCounts {}
+struct StageCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_exposure: Option<RefusalExposure>,
+}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -3226,9 +3282,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields, the Codex tier field and the Claude iteration
-        // model field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2474);
+        // The four Pi fields, the Codex tier field and the two Claude usage
+        // fields stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2523);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

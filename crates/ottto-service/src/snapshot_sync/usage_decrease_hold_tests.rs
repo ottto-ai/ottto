@@ -173,7 +173,7 @@ fn hold_ack_contract_is_declared_only_on_claude_literal_batches() {
 }
 
 #[test]
-fn ack_accepts_non_permanent_only_for_declared_literal_holds() {
+fn ack_preserves_known_hold_contracts_and_accepts_unknown_non_permanent_reasons() {
     let literal = vec![item(0, true), item(1, true)];
     let mixed = vec![item(0, true), item(1, false)];
     for (source, items, rejected, valid) in [
@@ -191,12 +191,12 @@ fn ack_accepts_non_permanent_only_for_declared_literal_holds() {
             true,
         ),
         (SnapshotSource::ClaudeCode, &literal, (0, HELD, true), true),
-        // Every other reason stays permanent-only.
+        // New vocabulary is an ordinary per-entity hold; known reasons keep their contracts.
         (
             SnapshotSource::ClaudeCode,
             &literal,
             (0, "other", false),
-            false,
+            true,
         ),
         (
             SnapshotSource::ClaudeCode,
@@ -208,7 +208,7 @@ fn ack_accepts_non_permanent_only_for_declared_literal_holds() {
             SnapshotSource::ClaudeCode,
             &literal,
             (0, "usage_decrease_future", false),
-            false,
+            true,
         ),
         // A hold must name a literal body of a declaring batch.
         (SnapshotSource::ClaudeCode, &mixed, (1, HELD, false), false),
@@ -399,4 +399,69 @@ fn non_literal_hold_is_an_invalid_ack_and_checkpoints_nothing() {
     assert_eq!(accepted, 0);
     assert!(ledger.accepted_fingerprints.is_empty());
     assert!(ledger.quarantined_fingerprints.is_empty());
+}
+
+/// [regress] Unknown non-permanent vocabulary owes only its rejected entity;
+/// accepted siblings settle normally. Unknown permanent handling is unchanged.
+#[test]
+#[serial_test::serial(client_report)]
+fn unknown_non_permanent_rejection_settles_accepted_siblings() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let items = (0..3).map(|i| item(i, false)).collect::<Vec<_>>();
+    let refused = &items[0].snapshot_fingerprint;
+    for permanent in [false, true] {
+        let mut ledger = progress();
+        let mut accepted = 0;
+        let outcome = upload(
+            &items,
+            "unknown-entity-rejection",
+            &mut ledger,
+            &mut accepted,
+            |batch| {
+                ack(
+                    batch,
+                    &[(at(batch, refused), "future_entity_rejection", permanent)],
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            if permanent {
+                ResumableUploadResult::Rejected { count: 1 }
+            } else {
+                ResumableUploadResult::Deferred { count: 1 }
+            }
+        );
+        assert_eq!(accepted, 2);
+        assert_eq!(ledger.accepted_fingerprints.len(), 2);
+        for sibling in &items[1..] {
+            assert_eq!(
+                ledger
+                    .accepted_body_witnesses
+                    .get(&sibling.snapshot_fingerprint),
+                Some(&snapshot_upload_body_witness(sibling))
+            );
+        }
+        assert!(!ledger.accepted_fingerprints.contains(refused));
+        assert_eq!(ledger.quarantined_fingerprints.len(), 1);
+        assert_eq!(ledger.permanent_rejections.contains_key(refused), permanent);
+        assert_eq!(
+            ledger.quarantined_fingerprints[refused].disposition,
+            if permanent {
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            } else {
+                SnapshotQuarantineDisposition::RetryPending
+            }
+        );
+        assert_eq!(
+            ledger.quarantined_fingerprints[refused]
+                .upload_body_witness
+                .as_deref(),
+            Some(snapshot_upload_body_witness(&items[0]).as_str())
+        );
+    }
 }

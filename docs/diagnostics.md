@@ -1719,6 +1719,17 @@ differs from the line's model (a refusal fallback's declined first attempt, whic
 is billed at the line's model); rereads count again. It is a cumulative
 saturating process total with no path or session id, and it never affects money.
 
+## Claude usage keys the parser does not read
+
+`usage_unknown_numeric_key` in `process_retained_cache_lifecycle_totals` counts
+each numeric key the Claude usage parser does not read, in `usage`,
+`usage.cache_creation`, `usage.output_tokens_details` and the same three levels of
+each `usage.iterations[]` entry. Non-numeric values and deeper objects are not
+counted. A non-zero value means a new numeric usage field is not reaching money.
+Counts are per parsed usage line, not per unique request; rereads count again. It
+is a cumulative saturating process total with no key name, path or session id,
+and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
@@ -2230,7 +2241,11 @@ proved rows sent with different proof.
 Each source emits one `local_resources` `freshness_alarm` point when a root walk
 ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
 `now - live mtime` over indexed files whose live listing stamp differs from the
-stored settled stamp, and `changed_files` and `over_6h_files` count them.
+stored settled stamp, and over discovered files with no index entry yet, and
+`changed_files` and `over_6h_files` count them. `never_indexed_files` counts the
+second group; their age is a lower bound, since only the latest write is known.
+It takes the read filters: a file outside the discovery window and a Codex archive
+(its own archive debt) stay out.
 Members of an `UnprovenTerminal` Claude usage-authority family are reported
 apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
 hold keeps the pre-growth stamp and no read reaches the growth, so they are real

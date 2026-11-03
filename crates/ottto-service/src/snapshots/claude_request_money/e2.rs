@@ -2972,11 +2972,19 @@ fn attach_one(
     // Keep the existing wire bucket activity clock. Identity independently
     // folds own-request clocks after attachment; observer time never decides
     // the local current account.
+    let observed = rfc3339_unix_nanos(&row.observed_at);
     let at = (reported.0 .0 != estimated.0 .0)
-        .then(|| rfc3339_unix_nanos(&row.observed_at))
+        .then_some(observed)
         .flatten();
     fold.entity
         .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
+    // The request's activity time is the later of its transcript and row
+    // clocks, so it never moves back when its evidence moves from the side
+    // row to the transcript. Only the entity clock: hours, buckets and owner
+    // clocks keep the transcript's.
+    if let Some(observed) = observed {
+        fold.entity.activity_nanos = fold.entity.activity_nanos.max(observed);
+    }
     // A copied marker's lent account follows its request to the reported slot.
     if let Some(lent) = fold
         .accounts
@@ -4448,6 +4456,10 @@ mod tests;
 #[cfg(test)]
 #[path = "e2_holder_redrift_tests.rs"]
 mod holder_redrift_tests;
+
+#[cfg(test)]
+#[path = "e2_activity_clock_tests.rs"]
+mod activity_clock_tests;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.

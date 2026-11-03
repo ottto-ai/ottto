@@ -87,6 +87,7 @@ struct RejectedUsageEvidence {
     machine_ref: String,
     reason: RejectedUsageReason,
     permanent: bool,
+    /// Optional classification keeps the persisted reason vocabulary compatible.
     exclusive_usage_contract: bool,
     // request, input, output, cache_read, cache_creation_5m,
     // cache_creation_1h, reasoning_output, unattributed_total.
@@ -119,15 +120,10 @@ pub(crate) enum RejectedUsageReason {
 }
 
 impl RejectedUsageReason {
-    /// The backend already holds an equal-or-better (authority downgrade) or
-    /// newer (stale older upload) accepted record for this entity. Refusing
-    /// the body loses no usage the server does not already own.
+    /// Stale refusals additionally need their retained recording metadata;
+    /// the wire reason alone cannot distinguish legacy owed records.
     pub(crate) fn is_dominated(self) -> bool {
-        matches!(
-            self,
-            RejectedUsageReason::UsageAccountingAuthorityDowngrade
-                | RejectedUsageReason::AcceptedLogStaleOlderUpload
-        )
+        matches!(self, RejectedUsageReason::UsageAccountingAuthorityDowngrade)
     }
 
     pub(crate) fn from_wire(reason: &str) -> Self {
