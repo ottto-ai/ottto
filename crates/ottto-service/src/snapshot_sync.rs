@@ -12555,9 +12555,11 @@ fn report_status_with_fresh_relay_token(
     Ok(())
 }
 
-/// Last reported (enabled, error code) per source slot.
-static SOURCE_STATUS_LOGS: Mutex<[Option<(bool, Option<String>)>; 3]> =
-    Mutex::new([None, None, None]);
+/// Last reported status log line per source slot.
+static SOURCE_STATUS_LOGS: Mutex<[Option<StatusLogLine>; 3]> = Mutex::new([None, None, None]);
+
+/// Enabled flag and closed error-code slug of one terminal status report.
+type StatusLogLine = (bool, Option<String>);
 
 /// A policy stop before scanning: withdraw this source's manifest, clear its
 /// active sessions, then report `status` with the manifest withdrawn.
