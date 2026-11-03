@@ -1902,6 +1902,19 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
 
 fn source_t2_carried_g_arm(upload: RearmUpload, keep_held: bool) {
     let mut fixture = source_t2_forward_only_fixture();
+    // This migration test starts with the older daemon's ordinary history.
+    // O1 keeps the earlier body, so construct that starting state through the
+    // existing explicit replay operation. The separate placement test keeps
+    // the original forward-only setup and its unchanged organization guard.
+    crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
+        crate::snapshots::claude_request_identity::COLLECTOR,
+        || {
+            let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+            assert!(index.prepare_historical_replay("source-t2-ordinary-history".into()));
+            index.save(&fixture.index_path).unwrap();
+            latch_contract_generation(&fixture, 10);
+        },
+    );
     let old_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
     for session in [REARM_ROOT, REARM_SIBLING] {
         assert_ne!(
