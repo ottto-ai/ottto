@@ -10,8 +10,8 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    encode, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes, put_fields,
-    read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
+    capability_hour, encode, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
+    put_fields, read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
     DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Dec, Durable, HDigest, Refuse};
@@ -337,11 +337,6 @@ impl TailSource for Claude {
     ) -> Result<(), LiveLoadError> {
         Ok(())
     }
-}
-
-/// A capability bucket's start: the first part of its key.
-fn capability_hour(key: &(String, String, String)) -> &str {
-    &key.0
 }
 
 #[cfg(test)]
