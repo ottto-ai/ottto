@@ -660,8 +660,10 @@ fn account_attribution(
         ));
     }
     if let Some(account_hash) = snapshot_account_hash {
+        let workspace = codex_creator_workspace(snapshot, &account_hash);
         return Some(attribution_from_account_hash(
             account_hash,
+            workspace,
             status,
             "snapshot_account_identity",
         ));
@@ -905,18 +907,38 @@ fn lineage_account_attribution(
         .unwrap_or(EvidenceResolution::Missing)
 }
 
+/// The workspace a Codex session's own creator record names, only when that
+/// record names the account its rows are already bound to. The bound session
+/// owner carries the same pair; this is no second way to name a session.
+fn codex_creator_workspace(snapshot: &SnapshotItem, account_hash: &str) -> Option<String> {
+    snapshot
+        .session_account_evidence
+        .as_ref()
+        .filter(|evidence| {
+            evidence.evidence_source == "codex_creator_header:v1"
+                && evidence.account_identifier_hash.as_deref() == Some(account_hash)
+        })
+        .and_then(|evidence| evidence.provider_workspace_hash.clone())
+}
+
 fn attribution_from_account_hash(
     account_hash: String,
+    workspace: Option<String>,
     status: &AgentStatusSnapshot,
     source: &str,
 ) -> AccountAttribution {
     let matching_observation = status.plan_observations.iter().find(|observation| {
         observation.account_identifier_hash.as_deref() == Some(account_hash.as_str())
+            && workspace.as_deref().map_or(true, |workspace| {
+                observation.organization_identifier_hash.as_deref() == Some(workspace)
+            })
     });
     AccountAttribution {
         account_identifier_hash: Some(account_hash),
-        organization_identifier_hash: matching_observation
-            .and_then(|observation| observation.organization_identifier_hash.clone()),
+        organization_identifier_hash: workspace.or_else(|| {
+            matching_observation
+                .and_then(|observation| observation.organization_identifier_hash.clone())
+        }),
         subscription_product: matching_observation
             .and_then(|observation| observation.subscription_product.clone()),
         source: source.to_string(),
@@ -2259,6 +2281,43 @@ mod tests {
             active.account_attribution_source.as_deref(),
             Some("snapshot_account_identity")
         );
+    }
+
+    /// A Codex row bound to an account shows the workspace its own creator
+    /// record names for that account. A creator record naming another account
+    /// lends nothing.
+    #[test]
+    fn codex_bound_account_shows_its_creator_workspace() {
+        let mut snapshot = test_snapshot("creator", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("slot-b".into());
+        snapshot.usage_buckets[0].model_usage[0].account_identifier_hash = Some("slot-b".into());
+        let creator = |account: &str| crate::snapshots::SessionAccountEvidence {
+            provider: "openai",
+            account_identifier_hash: Some(account.into()),
+            provider_workspace_hash: Some(format!("{account}-workspace")),
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "codex_creator_header:v1",
+            identity_disposition: None,
+            source_created_at: None,
+        };
+        let mut status = test_status();
+        status.source = ottto_protocol::SourceKind::Codex;
+        for (creator_account, workspace) in [("slot-b", Some("slot-b-workspace")), ("slot-a", None)]
+        {
+            snapshot.session_account_evidence = Some(creator(creator_account));
+            let active =
+                active_session_from_snapshot(SnapshotSource::Codex, &snapshot, Some(&status));
+            assert_eq!(active.account_identifier_hash.as_deref(), Some("slot-b"));
+            assert_eq!(
+                active.organization_identifier_hash.as_deref(),
+                workspace,
+                "{creator_account}"
+            );
+            assert_eq!(
+                active.account_attribution_source.as_deref(),
+                Some("snapshot_account_identity")
+            );
+        }
     }
 
     #[test]

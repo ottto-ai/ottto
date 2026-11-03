@@ -168,6 +168,7 @@ pub(crate) use claude_context_file_birth::{
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
 mod codex_root_copies;
+pub(crate) mod codex_slot_naming;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
@@ -48879,6 +48880,28 @@ impl ScanIndex {
         codex_homes: &[crate::agent_status::CodexHomeBinding],
         mixed: &claude_request_accounts::MixedUploads,
     ) -> BTreeSet<String> {
+        self.bind_session_accounts_with_slots(
+            source,
+            machine_id,
+            snapshots,
+            codex_homes,
+            &mut codex_slot_naming::CreatorSlotNaming::default(),
+            mixed,
+        )
+    }
+
+    /// [`Self::bind_session_accounts_with_mixed`], where a Codex session whose
+    /// rows record no login mode is also proven by its own creator record
+    /// matching one registered subscription slot in `slots`.
+    pub(crate) fn bind_session_accounts_with_slots(
+        &mut self,
+        source: SnapshotSource,
+        machine_id: &str,
+        snapshots: &mut [SnapshotItem],
+        codex_homes: &[crate::agent_status::CodexHomeBinding],
+        slots: &mut codex_slot_naming::CreatorSlotNaming,
+        mixed: &claude_request_accounts::MixedUploads,
+    ) -> BTreeSet<String> {
         let mut deferred = BTreeSet::new();
         for item in snapshots {
             let session_id = &item.source_session_id;
@@ -48886,10 +48909,42 @@ impl ScanIndex {
             let existing = self.session_account_bindings.get(&key);
             match source {
                 SnapshotSource::Codex => {
-                    if !codex_rows_prove_oauth(item) {
+                    // Rows proving OAuth keep today's owner path. Rows that
+                    // record no login mode at all are proven only by the
+                    // creator record's single subscription slot, which names
+                    // the session. Any other recorded mode stays unnamed.
+                    let creator_slot = if codex_rows_prove_oauth(item) {
+                        None
+                    } else if !codex_rows_record_no_login_mode(item) {
                         set_session_account_hash(item, None);
                         continue;
-                    }
+                    } else if existing.is_some_and(|owner| {
+                        codex_slot_naming::creator_pair(item).is_some_and(|(account, workspace)| {
+                            owner.account_identifier_hash == account
+                                && owner
+                                    .workspace_identifier_hash
+                                    .as_deref()
+                                    .map_or(true, |bound| bound == workspace)
+                        })
+                    }) {
+                        // This creator record already named the session: its
+                        // retained owner stands, as on the OAuth path, and a
+                        // later slot read failure never strips it.
+                        None
+                    } else {
+                        match slots.owner(item) {
+                            Some(owner) => {
+                                if existing.is_none() {
+                                    slots.counts.named += 1;
+                                }
+                                Some(owner)
+                            }
+                            None => {
+                                set_session_account_hash(item, None);
+                                continue;
+                            }
+                        }
+                    };
                     // An explicit creator-negative is a source decision, not
                     // the legacy absence of an optional witness. Neither a
                     // cached owner nor today's home login can override it.
@@ -48907,9 +48962,9 @@ impl ScanIndex {
                         set_session_account_hash(item, None);
                         continue;
                     }
-                    let owner = existing
-                        .cloned()
-                        .or_else(|| self.codex_owner_for_item(item, codex_homes));
+                    let owner = existing.cloned().or_else(|| {
+                        creator_slot.or_else(|| self.codex_owner_for_item(item, codex_homes))
+                    });
                     if let Some(owner) = owner {
                         self.session_account_bindings
                             .entry(key.clone())
@@ -55453,6 +55508,19 @@ impl ScanIndex {
             })
             .map(|disposition| &disposition.loss)
     }
+}
+
+/// Codex rollouts do not record a login mode: every row, and at least one,
+/// carries none. Any recorded mode is evidence the creator record cannot
+/// override.
+fn codex_rows_record_no_login_mode(item: &SnapshotItem) -> bool {
+    let mut rows = item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter()),
+    );
+    rows.next().is_some_and(|row| row.auth_mode.is_none())
+        && rows.all(|row| row.auth_mode.is_none())
 }
 
 fn codex_rows_prove_oauth(item: &SnapshotItem) -> bool {
@@ -81112,6 +81180,219 @@ mod tests {
         let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
 
         assert!(error.contains("model rows do not match"), "{error}");
+    }
+
+    /// [regress] Codex rollouts record no login mode. A session is named by the
+    /// single registered slot its own creator pair matches when that slot's
+    /// saved login is a subscription login: by that slot, never by the home it
+    /// was found in. Every refusal names nothing (not even by home), and rows
+    /// that prove OAuth themselves keep today's home owner.
+    #[test]
+    fn codex_creator_pair_names_its_single_subscription_slot_not_the_home() {
+        use codex_slot_naming::{
+            CreatorSlotNaming, CreatorSlotNamingCounts, RegisteredSlotLogin, SlotLoginRefusal,
+        };
+        let home_a = PathBuf::from("/synthetic/codex-slot-a");
+        let home_binding = crate::agent_status::CodexHomeBinding {
+            home: home_a.clone(),
+            account_identifier_hash: "slot-a".into(),
+            workspace_identifier_hash: "slot-a-workspace".into(),
+            auth_modified_at: UNIX_EPOCH,
+        };
+        let slot = |account: &str, login| RegisteredSlotLogin {
+            account_identifier_hash: account.into(),
+            workspace_identifier_hash: format!("{account}-workspace"),
+            login,
+        };
+        let creator = |account: Option<&str>, disposition| SessionAccountEvidence {
+            provider: "openai",
+            account_identifier_hash: account.map(str::to_string),
+            provider_workspace_hash: account.map(|account| format!("{account}-workspace")),
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "codex_creator_header:v1",
+            identity_disposition: disposition,
+            source_created_at: None,
+        };
+        let key = sha256_hex(&["session_owner:v1", "machine", "creator-session"]);
+        let bind = |evidence: SessionAccountEvidence,
+                    slots: Vec<RegisteredSlotLogin>,
+                    (row_mode, bucket_mode): (Option<&str>, Option<&str>),
+                    cached: Option<&str>| {
+            let mut index = ScanIndex::default();
+            let mut item = valid_v6_batch_request().snapshots.remove(0);
+            item.source_session_id = "creator-session".into();
+            item.source_started_at = Some("2026-10-05T00:00:00Z".into());
+            item.source_file_fingerprint = Some("creator-file".into());
+            for row in &mut item.model_usage {
+                row.auth_mode = row_mode.map(str::to_string);
+            }
+            for row in item
+                .usage_buckets
+                .iter_mut()
+                .flat_map(|bucket| bucket.model_usage.iter_mut())
+            {
+                row.auth_mode = bucket_mode.map(str::to_string);
+            }
+            item.session_account_evidence = Some(evidence.clone());
+            let mut entry = manifest_index_entry(None);
+            entry.source_file_fingerprint = "creator-file".into();
+            index.files.insert(
+                local_index_key(&home_a.join("sessions/rollout.jsonl")),
+                entry,
+            );
+            if let Some(cached) = cached {
+                index.session_account_bindings.insert(
+                    key.clone(),
+                    SessionAccountBinding {
+                        account_identifier_hash: cached.into(),
+                        workspace_identifier_hash: None,
+                    },
+                );
+            }
+            let mut naming = CreatorSlotNaming::new(slots);
+            assert!(index
+                .bind_session_accounts_with_slots(
+                    SnapshotSource::Codex,
+                    "machine",
+                    std::slice::from_mut(&mut item),
+                    std::slice::from_ref(&home_binding),
+                    &mut naming,
+                    &Default::default(),
+                )
+                .is_empty());
+            assert_eq!(
+                item.session_account_evidence.as_ref(),
+                Some(&evidence),
+                "evidence is sent unchanged"
+            );
+            assert!(
+                item.model_usage
+                    .iter()
+                    .all(|row| row.auth_mode.as_deref() == row_mode),
+                "no login mode is written onto rows"
+            );
+            (
+                exact_session_account_hash(&item),
+                index.session_account_bindings.get(&key).cloned(),
+                naming.counts,
+            )
+        };
+        let compliant = || vec![slot("slot-a", Ok(())), slot("slot-b", Ok(()))];
+        let counted = |cause: &str| {
+            let mut counts = CreatorSlotNamingCounts::default();
+            match cause {
+                "named" => counts.named = 1,
+                "no_match" => counts.no_match = 1,
+                "multi_match" => counts.multi_match = 1,
+                "mode_unreadable" => counts.mode_unreadable = 1,
+                "not_forced_chatgpt" => counts.not_forced_chatgpt = 1,
+                "api_key" => counts.api_key = 1,
+                _ => unreachable!("{cause}"),
+            }
+            counts
+        };
+
+        // Found in slot A's home, created by slot B's login: named B, never A.
+        let (named, binding, counts) = bind(
+            creator(Some("slot-b"), None),
+            compliant(),
+            (None, None),
+            None,
+        );
+        assert_eq!(named.as_deref(), Some("slot-b"));
+        assert_eq!(
+            binding,
+            Some(SessionAccountBinding {
+                account_identifier_hash: "slot-b".into(),
+                workspace_identifier_hash: Some("slot-b-workspace".into()),
+            })
+        );
+        assert_eq!(counts, counted("named"));
+
+        // Each refusal of the matched slot names nothing, and never falls back
+        // to the home it was found in.
+        for (refusal, cause) in [
+            (SlotLoginRefusal::ModeUnreadable, "mode_unreadable"),
+            (SlotLoginRefusal::NotForcedChatgpt, "not_forced_chatgpt"),
+            (SlotLoginRefusal::ApiKey, "api_key"),
+        ] {
+            let slots = vec![slot("slot-a", Ok(())), slot("slot-b", Err(refusal))];
+            let (named, binding, counts) =
+                bind(creator(Some("slot-b"), None), slots, (None, None), None);
+            assert_eq!((named, binding), (None, None), "{refusal:?}");
+            assert_eq!(counts, counted(cause), "{refusal:?}");
+        }
+        let (named, binding, counts) = bind(
+            creator(Some("slot-b"), None),
+            vec![slot("slot-a", Ok(()))],
+            (None, None),
+            None,
+        );
+        assert_eq!((named, binding), (None, None), "no matching slot");
+        assert_eq!(counts, counted("no_match"));
+        let (named, binding, counts) = bind(
+            creator(Some("slot-b"), None),
+            vec![slot("slot-b", Ok(())), slot("slot-b", Ok(()))],
+            (None, None),
+            None,
+        );
+        assert_eq!((named, binding), (None, None), "several matching slots");
+        assert_eq!(counts, counted("multi_match"));
+        let (named, binding, counts) = bind(
+            creator(None, Some("missing")),
+            compliant(),
+            (None, None),
+            None,
+        );
+        assert_eq!((named, binding), (None, None), "creator-negative");
+        assert_eq!(counts, CreatorSlotNamingCounts::default());
+
+        // Rows proving OAuth keep today's path: the home owner, uncounted.
+        let (named, _, counts) = bind(
+            creator(Some("slot-b"), None),
+            compliant(),
+            (Some("oauth"), Some("oauth")),
+            None,
+        );
+        assert_eq!(named.as_deref(), Some("slot-a"));
+        assert_eq!(counts, CreatorSlotNamingCounts::default());
+        // Any recorded mode other than OAuth, or OAuth beside unrecorded rows,
+        // is evidence the creator record never overrides.
+        for modes in [
+            (Some("api_key"), Some("api_key")),
+            (Some("oauth"), Some("api_key")),
+            (Some("oauth"), None),
+        ] {
+            let (named, binding, counts) =
+                bind(creator(Some("slot-b"), None), compliant(), modes, None);
+            assert_eq!((named, binding), (None, None), "{modes:?}");
+            assert_eq!(counts, CreatorSlotNamingCounts::default(), "{modes:?}");
+        }
+
+        // A retained owner is never rewritten by a later creator proof, and
+        // the session is not counted as named by its creator record.
+        let (named, binding, counts) = bind(
+            creator(Some("slot-b"), None),
+            compliant(),
+            (None, None),
+            Some("slot-a"),
+        );
+        assert_eq!(named.as_deref(), Some("slot-a"));
+        assert_eq!(
+            binding.map(|binding| binding.account_identifier_hash),
+            Some("slot-a".into())
+        );
+        assert_eq!(counts, CreatorSlotNamingCounts::default());
+        // An owner this creator record already named stands when a later
+        // scan cannot check the slot (here: no slots read at all).
+        let (named, _, counts) = bind(
+            creator(Some("slot-b"), None),
+            Vec::new(),
+            (None, None),
+            Some("slot-b"),
+        );
+        assert_eq!(named.as_deref(), Some("slot-b"));
+        assert_eq!(counts, CreatorSlotNamingCounts::default());
     }
 
     #[test]
