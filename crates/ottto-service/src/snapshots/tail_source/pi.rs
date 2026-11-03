@@ -9,11 +9,11 @@
 //! header line is inside the certificate's head sample, so a changed header
 //! fails the certificate and reads Full.
 use super::{
-    encode, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes, put_fields,
-    read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
-    DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
+    read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
+    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
-use crate::durable_tail_codec::{Dec, Durable, HDigest, Refuse};
+use crate::durable_tail_codec::{Durable, HDigest, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -196,25 +196,17 @@ impl TailSource for Pi {
         if acc.codex_agent_label.is_some() {
             return Err(Refuse::NonEmpty("SnapshotAccumulator.codex_agent_label"));
         }
-        let scalars = (
-            view.recognized_usage_drop_count,
-            view.positive_recognized_usage_count,
-            view.positive_usage_evidence,
-        );
         let fork = acc.seen_pi_usage_keys.fork_parts();
-        encode(|e| {
-            // Opening-call file paths are content: the opening-settings fact
-            // stores them by call id.
-            e.with_moved_field("OpeningCall.files", |e| {
-                id.put(e)?;
-                certificate.put(e)?;
-                view.report.put(e)?;
-                scalars.put(e)?;
-                put_fields(acc, e)?;
+        encode_envelope(
+            view,
+            certificate,
+            id,
+            |_| Ok(()),
+            |e| {
                 acc.accepted_usage_totals.put(e)?;
                 fork.put(e)
-            })
-        })
+            },
+        )
     }
 
     fn encode_pages(
@@ -240,18 +232,13 @@ impl TailSource for Pi {
         head: &[u8],
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
-        if revision != Self::REDUCTION_REVISION {
-            return Err(ReconstructCause::Incompatible);
-        }
-        let mut d = Dec::new(head);
-        HeadIdentity::take(&mut d)?;
-        let certificate = DurableCertificate::take(&mut d)?;
-        let report = JsonlReadReport::take(&mut d)?;
-        let scalars = <(usize, usize, bool)>::take(&mut d)?;
-        let mut acc = take_fields(&mut d)?;
-        let accepted = UsageTotals::take(&mut d)?;
-        let (has_parent, header_nanos) = <(bool, Option<i128>)>::take(&mut d)?;
-        d.finish()?;
+        let (mut acc, (), (accepted, (has_parent, header_nanos)), decoded) =
+            decode_envelope::<Self, _, _>(
+                revision,
+                head,
+                |_| Ok(()),
+                |d| Ok((UsageTotals::take(d)?, <(bool, Option<i128>)>::take(d)?)),
+            )?;
         // Only a header that names a parent records its time.
         if !has_parent && header_nanos.is_some() {
             return Err(ReconstructCause::Corrupt);
@@ -259,11 +246,7 @@ impl TailSource for Pi {
         acc.accepted_usage_totals = accepted;
         acc.seen_pi_usage_keys = PiLedger::from_parts(BTreeMap::new(), has_parent, header_nanos);
         *into = acc;
-        Ok(DecodedHead {
-            certificate,
-            report,
-            scalars,
-        })
+        Ok(decoded)
     }
 
     fn decode_page(
