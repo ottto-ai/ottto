@@ -1107,6 +1107,8 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
     sampled_scan::set_test_now(Some(due + 1));
     let index_path = fixture.dir.join("held-reservation-index.json");
     for turn in 0..2 {
+        // Each turn is a later visit: the walk lists the grown held file again.
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         let committed = index.clone();
         let order = Arc::new(Mutex::new(Vec::new()));
         let observed_order = order.clone();

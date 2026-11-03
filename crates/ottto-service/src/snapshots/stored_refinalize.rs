@@ -54,6 +54,12 @@ pub(super) fn withhold_for_native(
     pending: &PendingIndexFinalization,
     reason: CandidateParseReason,
 ) {
+    // The withheld body carried the end of this file's copy hold, so the owed
+    // native read decides again, or the hold restarts and the body never goes.
+    let file = claude_money_birth_store::location_key(&pending.index_key);
+    if index.claude_copy_removals.hold_ended(file) {
+        index.claude_copy_removals.owe_last_hold(file);
+    }
     if let Some(entry) = index.files.get_mut(&pending.index_key) {
         entry.last_snapshot_fingerprint = pending.previous_snapshot_fingerprint.clone();
         entry.last_upload_body_witness = pending.previous_upload_body_witness.clone();

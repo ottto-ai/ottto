@@ -119,7 +119,10 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
                 SnapshotSource::ClaudeCode,
                 &mut disk_page.index,
             );
-            priors = [next.clone(), full.index, next];
+            // The cold arm reads the same committed prior: its own unACKed
+            // lineage, republished on a new route, holds a growth claim bound
+            // to the old one (as `restart_between_pages`).
+            priors = [next.clone(), next.clone(), next];
         }
         assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
     });
