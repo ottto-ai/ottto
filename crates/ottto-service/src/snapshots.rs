@@ -34955,32 +34955,6 @@ pub fn parse_pi_jsonl_file(
     collected_at: &str,
     source_file_fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
-    parse_pi_jsonl_file_with_attribution(path, collected_at, source_file_fingerprint, None)
-}
-
-#[cfg(test)]
-fn parse_pi_jsonl_file_with_attribution(
-    path: &Path,
-    collected_at: &str,
-    source_file_fingerprint: String,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<Vec<SnapshotItem>> {
-    parse_pi_jsonl_file_with_diagnostics(
-        path,
-        collected_at,
-        source_file_fingerprint,
-        attribution_context,
-    )
-    .map(|parsed| parsed.snapshots)
-}
-
-#[cfg(test)]
-fn parse_pi_jsonl_file_with_diagnostics(
-    path: &Path,
-    collected_at: &str,
-    source_file_fingerprint: String,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -34990,8 +34964,9 @@ fn parse_pi_jsonl_file_with_diagnostics(
         None,
         None,
         None,
-        attribution_context,
+        None,
     )
+    .map(|parsed| parsed.snapshots)
 }
 
 #[cfg(test)]
@@ -39701,8 +39676,6 @@ pub(crate) struct PiLedger {
 /// fork time. The fork owns only what happened at or after its header time.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct PiFork {
-    /// Persisted (N): the header named a parent.
-    has_parent: bool,
     /// Persisted (L): the local-only header time, unix nanos; `None` when the header
     /// time is missing or invalid, which counts every entry.
     header_nanos: Option<i128>,
@@ -39721,9 +39694,7 @@ impl std::fmt::Debug for PiLedger {
 
 impl std::fmt::Debug for PiFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PiFork")
-            .field("has_parent", &self.has_parent)
-            .finish()
+        f.debug_struct("PiFork").finish_non_exhaustive()
     }
 }
 
@@ -39759,11 +39730,11 @@ impl PiLedger {
         &mut self.usage_keys
     }
 
-    /// The persisted fork values: (`has_parent`, header time).
+    /// The persisted fork values: (the header named a parent, header time).
     pub(crate) fn fork_parts(&self) -> (bool, Option<i128>) {
         self.fork
             .as_deref()
-            .map_or((false, None), |fork| (fork.has_parent, fork.header_nanos))
+            .map_or((false, None), |fork| (true, fork.header_nanos))
     }
 
     /// The ledger a Pi Tail head restores: no keys yet (its pages follow)
@@ -39775,12 +39746,7 @@ impl PiLedger {
     ) -> Self {
         Self {
             usage_keys,
-            fork: has_parent.then(|| {
-                Box::new(PiFork {
-                    has_parent,
-                    header_nanos,
-                })
-            }),
+            fork: has_parent.then(|| Box::new(PiFork { header_nanos })),
         }
     }
 
@@ -39791,7 +39757,6 @@ impl PiLedger {
             return;
         }
         self.fork = Some(Box::new(PiFork {
-            has_parent: true,
             header_nanos: pi_timestamp_value(value.get("timestamp"))
                 .as_deref()
                 .and_then(pi_timestamp_nanos),
@@ -82540,7 +82505,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
         }
     }
 }
-crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos);
+crate::heap_layout_bound::fields!(PiFork; header_nanos);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,
