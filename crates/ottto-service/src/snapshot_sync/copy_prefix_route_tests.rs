@@ -159,17 +159,34 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         input_clock(&path);
         let mut reads = Vec::new();
         let mut posts = Vec::new();
+        let mut pages = Vec::new();
+        let mut removed_on = None;
         for page in 1..=4 {
-            let base = (page == 3).then(|| prior.clone());
+            let base = prior.clone();
             disk.begin(&scanner, SnapshotSource::ClaudeCode);
             let mut p = c.raw(&scanner, prior, 100, true, &[]);
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
-            if let Some(mut base) = base {
+            let copy = body(&p, COPY).map(|copy| (copy.request_count, copy.removed_request_count));
+            pages.push(format!(
+                "page {page}: modes {:?}, sessions {:?}, copy {copy:?}",
+                p.modes,
+                p.scan
+                    .snapshots
+                    .iter()
+                    .map(|item| &item.source_session_id[..4])
+                    .collect::<Vec<_>>()
+            ));
+            if page > 1
+                && removed_on.is_none()
+                && copy.is_some_and(|(_, removed)| removed == Some(2))
+            {
+                removed_on = Some(page);
                 // The copy's prefix is removed, and the body equals a cold Full
                 // of the copy on the same accepted state: a new owner with no
                 // entry for the copy reads it whole beside the accepted holder.
+                let mut base = base;
                 let key = path.to_str().unwrap();
                 base.files.remove(key);
                 base.file_snapshot_fingerprints.remove(key);
@@ -178,12 +195,6 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
                 let mut cold = c.raw(&E2ScanFixture::default(), base, 100, true, hint);
                 cold.enrich(&c);
                 cold.finish();
-                assert!(
-                    body(&p, COPY).is_some() && body(&cold, COPY).is_some(),
-                    "page 3 and the cold arm both send the copy (modes {:?}, {:?})",
-                    p.modes,
-                    cold.modes
-                );
                 money_oracle::assert_equivalent(
                     &route(Mode::ColdFull, &cold),
                     &route(Mode::DiskRestore, &p),
@@ -209,10 +220,10 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             "the holder is read at most once more after it earns its receipt: {reads:?}"
         );
         assert_eq!(
-            (&reads[2..], &posts[..]),
-            (&[false, false][..], &[1_usize, 0, 1, 0][..]),
-            "pages 3-4 never read the holder; only pages 1 and 3 POST \
-             (reads {reads:?}, posts {posts:?})"
+            (&reads[2..], &posts[..], removed_on),
+            (&[false, false][..], &[1_usize, 0, 1, 0][..], Some(3)),
+            "pages 3-4 never read the holder; only pages 1 and 3 POST, page 3 \
+             the copy with its prefix removed (reads {reads:?}, posts {posts:?}, {pages:#?})"
         );
     });
 }
