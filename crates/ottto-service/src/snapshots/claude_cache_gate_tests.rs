@@ -139,6 +139,56 @@ fn admitted_file_ships_cache_rows_for_its_own_requests_only() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// [money] The strict owned-start arm takes the same copy filter. A fork
+/// marker proves the owned start; the copied prefix the parser keeps
+/// (unmarked, days before the file's birth) has a break of its own. Only
+/// the own suffix ships rows; without the filter the prefix break would
+/// ship too.
+#[test]
+fn strict_owned_start_ships_cache_rows_for_its_own_suffix_only() {
+    let dir = temp_dir("claude-cache-gate-strict-owned");
+    let now = OffsetDateTime::now_utc();
+    let forked = cached(ROOT, "req_f0", &stamp(now, COPIED - 10), 90_000).replacen(
+        "\"type\":\"assistant\",",
+        &format!(
+            "\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"{OTHER_ROOT}\",\"messageUuid\":\"m-0\"}},"
+        ),
+        1,
+    );
+    let lines = [
+        forked,
+        cached(ROOT, "req_c1", &stamp(now, COPIED), 90_000),
+        cached(ROOT, "req_c2", &stamp(now, COPIED + 1), 0),
+        cached(ROOT, "req_c3", &stamp(now, COPIED + 2), 90_000),
+        cached(ROOT, "req_a1", &stamp(now, -30), 90_000),
+        cached(ROOT, "req_a2", &stamp(now, -29), 0),
+        cached(ROOT, "req_a3", &stamp(now, -28), 90_000),
+    ];
+    let (path, parsed) = root_session(&dir, ROOT, &lines);
+    assert!(parsed.claude_context_curve_owned_start_proven);
+    let mut items = vec![parsed.clone()];
+    let mut index = indexed(&[&path], false);
+    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let item = items.remove(0);
+    assert_eq!(disposition.posture_admission(ROOT), Some("strict"));
+    assert_eq!(item.claude_file_birth_verdict(), None);
+    assert_eq!(affected(&item), ["req_a2"]);
+    assert!(
+        named(&item).iter().all(|id| id.starts_with("req_a")),
+        "no copied request in any slot: {:?}",
+        named(&item)
+    );
+    // Control: the same requests without the filter ship the prefix break.
+    let mut unfiltered = item.clone();
+    unfiltered.cache_observations = Some(cache_wire(
+        ROOT,
+        parsed.cache_requests.iter(),
+        parsed.cache_requests_complete,
+    ));
+    assert!(affected(&unfiltered).contains(&"req_c2".to_string()));
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// [money] A resumed root copies its original's requests with their
 /// timestamps. Folded on one page, each request ships once: the copy's
 /// rows are its own, and the original's rows equal its rows alone.
