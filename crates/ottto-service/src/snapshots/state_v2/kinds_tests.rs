@@ -1651,3 +1651,62 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
 
 #[path = "codex_archive_kinds_tests.rs"]
 mod codex_archive_tests;
+
+/// Stores `row` (exact 0.1.215 serialized shape) as `kind`'s field row of an
+/// otherwise current store, then reads it back through the production
+/// hydrate (mapper::field_read -> mapper::read -> codec::exact_json).
+fn hydrate_with_shipped_row(kind: &str, row: serde_json::Value) -> Result<ScanIndex> {
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    mapper::put(&mut tx, &mapper::key(kind, "", 0).unwrap(), &row).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    hydrate(&mut db, Scratch::binding()).map(|(index, _)| index)
+}
+fn shipped_traversal(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+    let mut traversal = serde_json::to_value(fixture().traversal).unwrap();
+    edit(&mut traversal["counts"]);
+    traversal
+}
+
+/// [regress] 0.1.215 writes `upload_context_proof.direction` every source
+/// cycle (383f8bca6 upload_context_receipt.rs:920-934); #1287 retired it as a
+/// decode-only placeholder. The real v2 read path must still decode it.
+#[test]
+fn shipped_0_1_215_upload_context_proof_direction_hydrates() {
+    let row = serde_json::json!({
+        "direction": {
+            "policy": [true, true, false, false, false],
+            "context": "c".repeat(64),
+            "previous_context": null,
+            "last_change_mask": 0
+        }
+    });
+    if let Err(e) = hydrate_with_shipped_row("v1_field.upload_context_proof", row) {
+        panic!("0.1.215 direction refused: {e:#}");
+    }
+}
+
+/// [regress] 0.1.212-0.1.215 persist nonzero
+/// `counts.caps.inventory_hold_keys_discarded` (removed by #1290).
+#[test]
+fn shipped_0_1_215_traversal_caps_inventory_hold_keys_discarded_hydrates() {
+    let row = shipped_traversal(|counts| {
+        counts["caps"] = serde_json::json!({ "inventory_hold_keys_discarded": 3 });
+    });
+    if let Err(e) = hydrate_with_shipped_row("scan_state.traversal", row) {
+        panic!("0.1.215 inventory_hold_keys_discarded refused: {e:#}");
+    }
+}
+
+/// [regress] 0.1.208-0.1.215 persist nonzero
+/// `counts.listing_owed_pace_evicted` (removed by #1290).
+#[test]
+fn shipped_0_1_215_traversal_listing_owed_pace_evicted_hydrates() {
+    let row = shipped_traversal(|counts| {
+        counts["listing_owed_pace_evicted"] = 2.into();
+    });
+    if let Err(e) = hydrate_with_shipped_row("scan_state.traversal", row) {
+        panic!("0.1.215 listing_owed_pace_evicted refused: {e:#}");
+    }
+}
