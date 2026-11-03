@@ -127,27 +127,84 @@ pub(super) fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8], cap: u64) ->
 /// `strict_json` plus value equality, sharing one parse of each side. Also
 /// returns the value's compact serialization, which the equality check proved.
 pub(super) fn exact_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<(T, Vec<u8>)> {
-    let mut de = serde_json::Deserializer::from_slice(json);
-    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
-    de.end()?;
-    let original: serde_json::Value = serde_json::from_slice(json)?;
+    let (value, observed, original, retired) = guarded::<T>(json)?;
     let canonical = serde_json::to_vec(&value)?;
     let restored: serde_json::Value = serde_json::from_slice(&canonical)?;
     key_coverage(&original, &restored, &observed, &mut Vec::new())?;
     ensure!(original == restored, "state_v2_noncanonical_value");
-    Ok((value, canonical))
+    // A dropped retired leaf leaves the stored row unlike the value; commit the
+    // seed to the stored bytes so the next save rewrites the row without it.
+    Ok((value, if retired { json.to_vec() } else { canonical }))
 }
 /// Existing v1 deserializers include opaque RawValue and flatten boundaries.
 /// Validate the consumed key coverage too, so those boundaries cannot hide an
 /// ignored field. Values are never compared: v1's intentional defaults stand.
 pub(super) fn strict_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<T> {
-    let mut de = serde_json::Deserializer::from_slice(json);
-    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
-    de.end()?;
-    let before: serde_json::Value = serde_json::from_slice(json)?;
+    let (value, observed, before, _) = guarded::<T>(json)?;
     let after: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&value)?)?;
     key_coverage(&before, &after, &observed, &mut Vec::new())?;
     Ok(value)
+}
+/// The one ledger of leaves a shipped writer stored that the current types
+/// retired, per row type, by path from the row root. Decode drops each before
+/// the strict and exact checks (v2 reads and v1 import); nothing writes one
+/// again. Any other unknown or noncanonical key still refuses.
+fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
+    use std::any::type_name;
+    let row = type_name::<T>();
+    if row == type_name::<crate::snapshots::upload_context_receipt::ProofState>() {
+        // 0.1.215 writes it every source cycle; #1287 retired it.
+        &[&["direction"]]
+    } else if row == type_name::<Option<crate::snapshots::ScanTraversalCheckpoint>>() {
+        // 0.1.208-0.1.215 stored each while nonzero; #1290 retired them.
+        &[
+            &["counts", "listing_owed_pace_evicted"],
+            &["counts", "caps", "inventory_hold_keys_discarded"],
+        ]
+    } else {
+        &[]
+    }
+}
+/// The guarded decode both checks share, of the input without retired leaves.
+/// Also returns that input's value and whether a retired leaf was dropped.
+fn guarded<T: DeserializeOwned>(
+    json: &[u8],
+) -> Result<(T, super::ignored::Observed, serde_json::Value, bool)> {
+    fn object<'v>(
+        value: &'v mut serde_json::Value,
+        path: &[&str],
+    ) -> Option<&'v mut serde_json::Map<String, serde_json::Value>> {
+        path.iter()
+            .try_fold(value, |v, k| v.get_mut(*k))?
+            .as_object_mut()
+    }
+    let mut input: serde_json::Value = serde_json::from_slice(json)?;
+    let mut retired = false;
+    for path in retired_leaves::<T>() {
+        let (key, parents) = path.split_last().expect("nonempty path");
+        let Some(parent) = object(&mut input, parents) else {
+            continue;
+        };
+        if parent.remove(*key).is_none() {
+            continue;
+        }
+        retired = true;
+        // `caps` is omitted when empty, so a retired leaf can be its last.
+        if let (true, [grand @ .., last]) = (parent.is_empty(), parents) {
+            if let Some(map) = object(&mut input, grand) {
+                map.remove(*last);
+            }
+        }
+    }
+    let stripped = if retired {
+        Some(serde_json::to_vec(&input)?)
+    } else {
+        None
+    };
+    let mut de = serde_json::Deserializer::from_slice(stripped.as_deref().unwrap_or(json));
+    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
+    de.end()?;
+    Ok((value, observed, input, retired))
 }
 fn key_coverage(
     before: &serde_json::Value,
@@ -361,6 +418,28 @@ mod tests {
         let proof = strict_json::<ProofState>(old).unwrap();
         assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
     }
+    /// [behaviour] An older build's traversal row holding the counters #1290
+    /// retired loads, re-encodes without them, and seeds the stored bytes so
+    /// the next save rewrites the row; a live sibling counter stays.
+    #[test]
+    fn retired_traversal_counters_load_and_reencode_without_them() {
+        use crate::snapshots::ScanTraversalCheckpoint as Checkpoint;
+        let current = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["counts"]["listing_owed_pace_evicted"] = 3.into();
+        row["counts"]["caps"] = serde_json::json!({"inventory_hold_keys_discarded": 4});
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Option<Checkpoint>>(&old).unwrap();
+        let reencoded = serde_json::to_vec(&loaded).unwrap();
+        assert_eq!(reencoded, serde_json::to_vec(&current).unwrap());
+        assert_eq!(seed, old);
+        assert!(strict_json::<Option<Checkpoint>>(&old).is_ok());
+        row["counts"]["caps"]["parent_ref_refusals"] = 5.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, _) = exact_json::<Option<Checkpoint>>(&old).unwrap();
+        let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
+        assert_eq!(caps, &serde_json::json!({"parent_ref_refusals": 5}));
+    }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
@@ -502,6 +581,42 @@ mod alias_tests {
             let index = strict_json::<ScanIndex>(&raw).unwrap();
             let folder = &index.claude_folder_login_ledger["folder"];
             assert_eq!(qualify(folder, &owner).is_some(), qualifies);
+        }
+    }
+
+    /// [format] v1 import inventory admits each leaf a shipped writer stored
+    /// and the ledger retired, and still refuses an unknown sibling beside it.
+    #[test]
+    fn inventory_admits_retired_leaves_and_refuses_unknown_siblings() {
+        let traversal = serde_json::to_value(Some(
+            crate::snapshots::claude_family_census_shadow_tests::traversal(),
+        ))
+        .unwrap();
+        let mut pace = traversal.clone();
+        pace["counts"]["listing_owed_pace_evicted"] = 2.into();
+        let mut hold = traversal;
+        hold["counts"]["caps"] = serde_json::json!({"inventory_hold_keys_discarded": 3});
+        let proof = serde_json::json!({"direction": {
+            "policy": [true, true, false, false, false], "context": "c".repeat(64),
+            "previous_context": null, "last_change_mask": 0
+        }});
+        for (field, value, parent) in [
+            ("upload_context_proof", proof, ""),
+            ("traversal", pace, "/counts"),
+            ("traversal", hold, "/counts/caps"),
+        ] {
+            let mut root = serde_json::json!({"files": {}});
+            root[field] = value;
+            let raw = serde_json::to_vec(&root).unwrap();
+            assert_eq!(inventory(raw.as_slice()), Ok(()), "{field}{parent}");
+            root[field]
+                .pointer_mut(parent)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .insert("future_unknown".into(), 1.into());
+            let raw = serde_json::to_vec(&root).unwrap();
+            let refused = inventory(raw.as_slice());
+            assert_eq!(refused, Err(Pause::Unknown), "{field}{parent}");
         }
     }
 
