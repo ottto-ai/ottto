@@ -4540,10 +4540,9 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
     /// The request roots of this pass's whole corpus, from the cross-root
     /// evidence the strict read built root by root.
-    cross_request_roots: Option<&'a RequestRootIndex>,
-    /// Without cross-root evidence: the request roots of the loaded rows,
-    /// built on the first request without rows of its own, so a pass whose
-    /// requests all have their own rows never pays for it.
+    cross_request_roots: Option<&'a super::claude_cross_root_evidence::RequestRootJoins>,
+    /// Test-only reachable fallback for the whole-corpus oracle: request roots
+    /// of the loaded rows, built on the first request without rows of its own.
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
@@ -4746,9 +4745,11 @@ impl<'a> ScanEvidence<'a> {
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
     fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
-        let roots = match self.cross_request_roots {
-            Some(roots) => roots,
-            None => self.request_roots.get_or_init(|| {
+        if let Some(roots) = self.cross_request_roots {
+            return roots.get(request_id);
+        }
+        self.request_roots
+            .get_or_init(|| {
                 let mut ids_by_root = BTreeMap::<&str, Vec<&str>>::new();
                 for &(root, id) in self.requests.keys().chain(self.owners.keys()) {
                     ids_by_root.entry(root).or_default().push(id);
@@ -4759,9 +4760,8 @@ impl<'a> ScanEvidence<'a> {
                 }
                 roots.finish();
                 roots
-            }),
-        };
-        roots.get(request_id)
+            })
+            .get(request_id)
     }
 
     /// Adds this scan's status-coverage copy: the `transcript_email` window

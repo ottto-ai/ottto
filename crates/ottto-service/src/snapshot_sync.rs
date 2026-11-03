@@ -10006,8 +10006,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
         }))
         .collect::<BTreeSet<_>>();
-    let mut cross =
-        crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(support_dir);
+    let mut cross = crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(
+        support_dir,
+        &scan_result.snapshots,
+    );
     let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
     // veto (never prove) the file birth rule.
@@ -10128,10 +10130,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
         }
+        cross_window.time(|| {
+            cross.add_root(
+                &root_session_id,
+                api.evidence.get(&root_session_id),
+                trace.evidence.get(&root_session_id),
+                &api_request_ids,
+                &trace_request_ids,
+            )
+        });
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
-        cross_window
-            .time(|| cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref()));
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
