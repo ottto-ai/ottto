@@ -34008,14 +34008,16 @@ impl OwnedSourceScan {
                 .filter(|_| !parser.reader.reader.is_compressed())
             {
                 let key = local_index_key(&candidate.path);
-                // A codec source's continuation is its committed Tail, never
-                // a RAM copy.
+                // On a Tail route the continuation is the committed Tail,
+                // never a RAM copy. Off one, a codec source keeps its RAM
+                // copy, as its retention does.
                 #[cfg(unix)]
                 let tail_route = tail_source::tail_route(source, index);
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
-                let taken = (!tail_source::has_codec(source))
+                let taken = tail_route
+                    .is_none()
                     .then(|| context.cache.take(&key).map(Box::new))
                     .flatten();
                 #[cfg(not(unix))]
