@@ -3157,9 +3157,10 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
 /// queued, the Codex rotation alternated freshness (F) and census (C) turns
 /// and never ran an ordinary one, so a header-validated archive and a plain
 /// re-read, both queued non-members, were never selected. While such work
-/// waits, the turn a freshness page owes now alternates census (C) and
-/// ordinary (O): F O F C. Fresh keeps every second selecting page, and
-/// ordinary and census work are each served within 4 selecting pages.
+/// waits, the turn a freshness page owes now alternates census (C) and a
+/// dedicated ordinary turn (O): F O F C. Fresh keeps every second selecting
+/// page; ordinary and census work are each served within 4 selecting pages,
+/// and O reads the owed re-read despite a census backlog over one page.
 /// Control: with no ordinary-only work the order stays F C F C.
 #[test]
 #[cfg_attr(
@@ -3281,8 +3282,23 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         }
         assert_eq!(kinds, ['F', 'C', 'F', 'C']);
 
-        // A plain non-member re-read and a hinted non-member archive.
+        // A plain non-member re-read, owed a read (its fingerprint is gone),
+        // and a hinted non-member archive, queued behind a census backlog
+        // larger than one page's read budget.
+        index
+            .files
+            .get_mut(&reread_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
         let traversal = index.traversal.as_mut().unwrap();
+        let backlog = traversal
+            .pending_candidates
+            .iter()
+            .filter(|candidate| candidate.census_member)
+            .map(|candidate| fs::metadata(&candidate.path).unwrap().len())
+            .sum::<u64>();
+        assert!(backlog > 2 * budget, "census backlog {backlog} B");
         for (path, watcher_hint) in [(&reread, false), (&archive, true)] {
             traversal.pending_candidates.push_back(ScanTraversalPath {
                 scan_root: scan_root.clone(),
@@ -3295,15 +3311,21 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         // after census serves it on page 6, and census returns on page 8.
         let mut kinds = Vec::new();
         let mut pages = Vec::new();
+        let mut reread_read = Vec::new();
         for page in 5..=8 {
             let (next, kind, flags) = turn(index, page);
             index = next;
             kinds.push(kind);
             pages.push(flags);
+            reread_read.push(!index.files[&reread_key].source_file_fingerprint.is_empty());
         }
         assert_eq!(kinds, ['F', 'O', 'F', 'C']);
+        // The ordinary turn selects only its own work, so the census backlog
+        // cannot spend its budget: the owed re-read is read on page 6.
         assert_eq!(pages[1].get(&reread_key), Some(&(false, false)));
         assert_eq!(pages[1].get(&archive_key), Some(&(false, true)));
+        assert!(pages[1].values().all(|(member, _)| !member));
+        assert_eq!(reread_read, [false, true, true, true]);
         assert!(ids
             .iter()
             .any(|id| pages[3].contains_key(&local_index_key(&fixture.file(id)))));

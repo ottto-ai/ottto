@@ -27147,11 +27147,11 @@ impl OwnedSourceScan {
         // starves it; always putting it first can starve the census instead.
         // Continuations never select new work. A hint alone does not trigger
         // a read: all selected paths still pass the unchanged candidate gate.
-        // The turn a freshness page owes alternates census and ordinary work
-        // while queued work neither dedicated turn selects (archives, plain
-        // re-reads, audits) waits: on its ordinary turn neither dedicated
-        // turn runs, so the ordinary selection below does. F C F O; with no
-        // such work it stays F C F C. Fresh keeps its cadence. Order only.
+        // The turn a freshness page owes alternates census (C) and ordinary
+        // (O) work while queued work neither of those selects waits: F C F O;
+        // with no such work it stays F C F C. Fresh keeps its cadence. An
+        // ordinary turn is dedicated too: due audits, then queued non-member,
+        // non-fresh paths (archives, plain re-reads). Order only.
         let ordinary_turn = source == SnapshotSource::Codex
             && selection_limit > 0
             && traversal.codex_freshness_yield
@@ -27181,12 +27181,29 @@ impl OwnedSourceScan {
                 note_codex_census_turn(&traversal.scan_roots, census_page);
             }
         }
-        if freshness_page || census_page {
+        if freshness_page || census_page || ordinary_turn {
             let limit = if freshness_page {
                 selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             } else {
                 selection_limit
             };
+            let ordinary_only = |candidate: &ScanTraversalPath| {
+                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+            };
+            if ordinary_turn {
+                traversal.pending_candidates.retain(|candidate| {
+                    let due = pending_paths.len() < limit
+                        && index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .is_some_and(|entry| entry.audit_requires_full(audit_now))
+                        && ordinary_only(candidate);
+                    if due {
+                        pending_paths.push(candidate.clone());
+                    }
+                    !due
+                });
+            }
             // Rotate the original queue once without allocating another
             // backlog-sized container. Keep unselected paths in FIFO order.
             for _ in 0..traversal.pending_candidates.len() {
@@ -27196,9 +27213,11 @@ impl OwnedSourceScan {
                 let eligible = pending_paths.len() < limit
                     && if freshness_page {
                         codex_fresh_data_pending(&candidate, &index.files)
-                    } else {
+                    } else if census_page {
                         candidate.census_member
                             && !codex_fresh_data_pending(&candidate, &index.files)
+                    } else {
+                        ordinary_only(&candidate)
                     };
                 if eligible {
                     pending_paths.push(candidate);
@@ -27224,7 +27243,7 @@ impl OwnedSourceScan {
         // Dedicated turns select only their own work, plus any retry riders:
         // new hinted members, audits or old groups cannot consume the other
         // turn's allowance.
-        let selection_limit = if freshness_page || census_page {
+        let selection_limit = if freshness_page || census_page || ordinary_turn {
             pending_paths.len()
         } else {
             selection_limit
