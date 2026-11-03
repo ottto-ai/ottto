@@ -147,6 +147,15 @@ product = require_string(manifest.get("product"), "manifest.product")
 channel = require_string(manifest.get("channel"), "manifest.channel")
 version = require_string(manifest.get("version"), "manifest.version")
 commit = require_string(manifest.get("commit"), "manifest.commit")
+materials = require_object(manifest.get("supply_chain"), "manifest.supply_chain").get("materials")
+app_source_commits = [
+    material.get("commit")
+    for material in (materials if isinstance(materials, list) else [])
+    if isinstance(material, dict) and material.get("kind") == "git_subtree"
+]
+if len(app_source_commits) != 1:
+    die("manifest must record exactly one app source commit in supply_chain.materials")
+app_source_commit = require_string(app_source_commits[0], "manifest app source commit")
 min_protocol_version = manifest.get("min_protocol_version")
 if product != "ottto-local-platform":
     die(f"expected product=ottto-local-platform, got {product}")
@@ -177,6 +186,7 @@ evidence = {
         "channel": channel,
         "version": version,
         "commit": commit,
+        "app_source_commit": app_source_commit,
         "sha256": manifest_sha,
     },
     "environment": {

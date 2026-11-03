@@ -301,13 +301,10 @@ fn placement_only_entry(entry: &Value) -> bool {
         || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
-    hex(&digest(
+    digest_hex::encode(&digest(
         key,
         json!(["claude_accepted_identity_buckets:v2", session]),
     ))
-}
-fn hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The domain of the local `session_context` change detector.
@@ -363,7 +360,7 @@ pub(super) fn unbind_test_session_context_key() {
 /// The sentence's HMAC-SHA-256 under the bound key; `None` without one.
 pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
     let key = with_session_context_key(|bound| bound.clone().flatten())?;
-    Some(hex(&digest(
+    Some(digest_hex::encode(&digest(
         &key,
         json!([SESSION_CONTEXT_DOMAIN, sentence]),
     )))

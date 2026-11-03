@@ -51,9 +51,9 @@ cat > "$app_contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>
   <string>Ottto</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0-stable-candidate.1</string>
+  <string>0.1.0-rc1</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0-stable-candidate.1</string>
+  <string>0.1.0-rc1</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 </dict>
@@ -83,8 +83,8 @@ jq -n '{
   checked_at: "2026-05-21T00:00:00Z",
   wait_seconds: 1,
   bundle_id: "net.ottto.Companion",
-  bundle_version: "0.1.0-stable-candidate.1",
-  bundle_short_version: "0.1.0-stable-candidate.1",
+  bundle_version: "0.1.0-rc1",
+  bundle_short_version: "0.1.0-rc1",
   executable_name: "Ottto",
   process_survived_wait: true,
   crash_reports: []
@@ -93,7 +93,7 @@ jq -n '{
 write_candidate_manifest() {
   local channel="$1"
   local manifest="$2"
-  local version="0.1.0-stable-candidate.1"
+  local version="0.1.0-rc1"
   local prefix="https://install.ottto.net/ottto-local-platform/releases/$channel/$version"
 
   jq -n \
@@ -187,8 +187,8 @@ write_candidate_manifest() {
           checked_at: "2026-05-21T00:00:00Z",
           wait_seconds: 1,
           bundle_id: "net.ottto.Companion",
-          bundle_version: "0.1.0-stable-candidate.1",
-          bundle_short_version: "0.1.0-stable-candidate.1",
+          bundle_version: "0.1.0-rc1",
+          bundle_short_version: "0.1.0-rc1",
           executable_name: "Ottto",
           process_survived_wait: true,
           crash_reports: [],
@@ -278,7 +278,8 @@ jq -e \
   --arg candidate_sha "$candidate_sha" \
   '.local_platform.runtime == "ottto-service"
    and .local_platform.service_label == "net.ottto.service"
-   and .local_platform.version == "0.1.0-stable-candidate.1"
+   and .candidate_manifest.app_source_commit == "123456abcdef123456abcdef123456abcdef1234"
+   and .local_platform.version == "0.1.0-rc1"
    and .local_platform.release_channel == "stable-candidate"
    and .local_platform.protocol_version == 15
    and .local_platform.release_manifest_sha256 == $candidate_sha
@@ -325,6 +326,13 @@ jq \
    | .operator_notes = ["redacted stable-candidate RC evidence"]' \
   "$template_evidence" > "$passed_evidence"
 "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$passed_evidence" >/dev/null
+
+bad_app_commit_evidence="$TMP_DIR/bad-app-commit-stable-candidate-rc-qa.json"
+jq '.candidate_manifest.app_source_commit = "999999abcdef123456abcdef123456abcdef1234"' \
+  "$passed_evidence" > "$bad_app_commit_evidence"
+expect_failure "evidence app source commit mismatch rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_app_commit_evidence"
+grep -q "evidence stable-candidate app_source_commit does not match" /tmp/macos-public-rc-gate.out
 
 expect_failure "stale protocol stable-candidate manifest rejected" \
   "$GATE" --candidate-manifest "$stale_protocol_manifest" --evidence "$passed_evidence"

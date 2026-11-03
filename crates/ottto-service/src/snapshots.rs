@@ -3040,10 +3040,7 @@ fn codex_parent_side_verdict(parsed: &ParsedJsonlFile) -> SideVerdict {
 /// U1a-2a: the verdict without P's lineage term, for the invalid-census keep
 /// only. It discounts the ownership hold that lineage itself sets
 /// (`defer_parent_resolution`), so a real downgrade still overwrites.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "first production caller is the side writers")
-)]
+#[cfg(test)]
 fn codex_parent_side_verdict_without_lineage(parsed: &ParsedJsonlFile) -> SideVerdict {
     let held = !parsed.report.complete()
         || parsed.recognized_usage_drop_count > 0
@@ -5812,11 +5809,6 @@ fn claude_stale_pending_matches_witness(
             })
 }
 
-/// Content-free count of red retry starts that kept every stale family re-arm
-/// because the carry check was not admitted under its scratch budget.
-static CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 #[cfg(test)]
 thread_local! {
     static REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST: std::cell::Cell<bool> =
@@ -6395,8 +6387,6 @@ fn claude_fence_closed_retry_carry_observed(
         .count();
     if !claude_stale_family_carry_scratch_admitted(index, stale, legacy_witness_count) {
         diagnostics.reject(StaleCarryRejection::OrdinaryScratch, stale.len());
-        CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS_FOR_TEST
             .with(|cell| cell.set(cell.get().saturating_add(1)));
@@ -6746,12 +6736,6 @@ fn claude_full_rearm_window_note_stale_rearm(
     }
 }
 
-/// Content-free count of families a red retry start did not carry because
-/// their worst-case cancellation was not funded under the parked budget, so
-/// they keep BASE's whole-family re-arm.
-static CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 #[cfg(test)]
 thread_local! {
     static CLAUDE_STALE_FAMILY_CARRY_FUNDING_BUDGET_FOR_TEST: std::cell::Cell<Option<usize>> =
@@ -6859,8 +6843,6 @@ fn fund_claude_family_carry_cancellations(
     if unfunded == 0 {
         return replay;
     }
-    CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES
-        .fetch_add(unfunded, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     CLAUDE_STALE_FAMILY_CARRY_UNFUNDED_FAMILIES_FOR_TEST
         .with(|cell| cell.set(cell.get().saturating_add(unfunded)));
@@ -6870,11 +6852,6 @@ fn fund_claude_family_carry_cancellations(
     );
     replay
 }
-
-/// Content-free count of carried families a resumed page uncarried because
-/// it could not fund their replay buffer again.
-static CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -6951,8 +6928,6 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
     }
     carry.capped_roots.clear();
     carry.roots.clear();
-    CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES
-        .fetch_add(roots_count, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES_FOR_TEST
         .with(|cell| cell.set(cell.get().saturating_add(roots_count)));
@@ -6968,23 +6943,6 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
     );
     !passed
 }
-
-/// Content-free count of carried families whose carry a member parse
-/// cancelled within the retry window.
-static CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Content-free count of carried families whose member was parsed on the page
-/// that ends the walk after another member was already passed, so the carry
-/// stays and the family takes the ordinary path (the held path).
-static CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Content-free count of carry cancellations that found their carry-time
-/// funding missing and took the defensive reset; the carry never stays. Not
-/// expected: the carry funded every cancel it admitted.
-static CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -7124,7 +7082,6 @@ fn cancel_claude_family_carry_for_member_parse(
         }
     }
     if walk_done && passed > 0 {
-        CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         CLAUDE_STALE_FAMILY_CARRY_TERMINAL_HOLDS_FOR_TEST
             .with(|cell| cell.set(cell.get().saturating_add(1)));
@@ -7151,7 +7108,6 @@ fn cancel_claude_family_carry_for_member_parse(
     }
     let (rearmed, requeued) =
         replay_and_rearm_claude_family(index, root_session_id, &member_key, page, false);
-    CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATIONS_FOR_TEST
         .with(|cell| cell.set(cell.get().saturating_add(1)));
@@ -7177,8 +7133,6 @@ fn claude_family_carry_defensive_reset(
 ) {
     let (rearmed, requeued) =
         replay_and_rearm_claude_family(index, root_session_id, parsed_key, page, true);
-    CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     CLAUDE_STALE_FAMILY_CARRY_CANCELLATION_REFUSALS_FOR_TEST
         .with(|cell| cell.set(cell.get().saturating_add(1)));
@@ -9340,7 +9294,7 @@ pub(crate) struct ClaudeNativeObservations {
     index_generation: u64,
 }
 
-#[allow(dead_code, reason = "inactive driver's pre-offer path not wired yet")]
+#[cfg(test)]
 pub(crate) fn record_claude_native_observations(
     scan: &SourceScanResult,
     index: &mut ScanIndex,
@@ -53395,7 +53349,19 @@ pub(crate) fn claude_registration_display_title(value: String) -> Option<String>
     normalize_display_title(value, "custom_title")
 }
 
+/// A Codex prompt-prefix label is already a bounded prefix, so it takes the
+/// shared first-prompt rule without the full-prompt role rewrite and size gate.
+pub(crate) fn prompt_prefix_display_title(value: String) -> Option<String> {
+    first_prompt_title(SnapshotSource::Codex, &value, false)
+}
+
 fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
+    first_prompt_title(source, &value, true)
+}
+
+/// The one first-prompt title rule. `full_prompt` adds the Codex role rewrite
+/// and the 80-char / 12-word gate that only a whole first message needs.
+fn first_prompt_title(source: SnapshotSource, value: &str, full_prompt: bool) -> Option<String> {
     let raw = value.trim();
     if raw.is_empty()
         || contains_blocked_prompt_fragment(raw)
@@ -53403,7 +53369,7 @@ fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<S
     {
         return None;
     }
-    if source == SnapshotSource::Codex {
+    if full_prompt && source == SnapshotSource::Codex {
         if let Some(role_title) = agent_role_prompt_display_title(raw) {
             return Some(role_title);
         }
@@ -53416,7 +53382,9 @@ fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<S
         (!trimmed.is_empty()).then_some(trimmed)
     })?;
     let normalized = normalize_title(first_line.to_string())?;
-    if normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12 {
+    if full_prompt
+        && (normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12)
+    {
         return None;
     }
     normalize_display_title(normalized, "first_prompt")
