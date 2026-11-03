@@ -1,9 +1,9 @@
 //! Claude's continuation from the state database. RAM keeps no Claude
 //! reduction on a database route: a read that continues a file loads its
 //! committed Tail head, checks the head's identity, then the file against the
-//! head's certificate, then streams the pages, validates the decoded state,
-//! and re-derives the content fields from the file at their marks, checking
-//! each against its stored digest.
+//! head's certificate, then streams the pages (the session facts among
+//! them), and validates the decoded state. Content is never read back from
+//! the file: a quiet restart reads 0 transcript bytes.
 //!
 //! Each load counts once in `tail_db_loads{source, outcome}`. Stored state
 //! that cannot be reused is a counted reconstruction (`tail_reconstruct`) and
@@ -15,7 +15,6 @@ use super::claude::Claude;
 use super::counters;
 use super::seam::TailBase;
 use super::{HeadIdentity, ReconstructCause, TailSource};
-use crate::snapshots::sampled_jsonl::durable::Decoded;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::{self, Hold};
 use crate::snapshots::*;
@@ -119,12 +118,9 @@ pub(super) fn load<S: TailSource>(
     };
     // (outcome, cause, counted reconstruction, load)
     let (outcome, cause, reconstruct, load) = match stored::<S>(index, key, id, held, scope) {
-        Ok((taken, base, rederive_bytes)) => {
+        Ok((taken, base)) => {
             let base = (!set_aside(index, key)).then_some(base);
-            point(
-                "tail_db_loads",
-                serde_json::json!({"outcome": "hit", "rederive_bytes": rederive_bytes}),
-            );
+            point("tail_db_loads", serde_json::json!({"outcome": "hit"}));
             counters::bump("tail_db_loads", "hit");
             return Load::Reused(taken, base);
         }
@@ -190,18 +186,15 @@ pub(super) fn load<S: TailSource>(
     load
 }
 
-fn not_rederivable<E>(_: E) -> Miss {
-    Miss::Reconstruct(ReconstructCause::NotRederivable)
-}
-
-/// The stored reduction, its base and the re-derived bytes, or why not.
+/// The stored reduction and its base, or why not. The session facts load
+/// here, with the pages, only for a read that continues the file.
 fn stored<S: TailSource>(
     index: &ScanIndex,
     key: &str,
     id: &HeadIdentity,
     held: &mut File,
     scope: &Scope,
-) -> Result<(Box<Taken<CachedJsonlReduction>>, TailBase, u64), Miss> {
+) -> Result<(Box<Taken<CachedJsonlReduction>>, TailBase), Miss> {
     let head = match state_v2::load_head(index, key, S::REDUCTION_REVISION) {
         Ok(Some(head)) => head,
         Ok(None) => return Err(Miss::NoHead),
@@ -237,13 +230,6 @@ fn stored<S: TailSource>(
     let table = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
     let reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
-    let content = Decoded::stored(reduction, decoded.rederive);
-    let plan = content
-        .rederive_plan_within(u64::MAX, u64::MAX)
-        .map_err(not_rederivable)?;
-    let (reduction, receipt, _) = content
-        .rederive_content_planned(held, &plan)
-        .map_err(not_rederivable)?;
     let taken = Taken {
         modified_hint: checkpoint.modified_hint(),
         retained: Retained {
@@ -253,13 +239,12 @@ fn stored<S: TailSource>(
         finalization_charge: 0,
         e2_held_new_file: false,
     };
-    Ok((
-        Box::new(taken),
-        base,
-        receipt.head_bytes + receipt.line_bytes,
-    ))
+    Ok((Box::new(taken), base))
 }
 
+#[cfg(test)]
+#[path = "facts_tests.rs"]
+mod facts_tests;
 #[cfg(test)]
 #[path = "floor_tests.rs"]
 mod floor_tests;

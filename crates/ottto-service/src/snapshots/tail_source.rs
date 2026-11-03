@@ -29,6 +29,9 @@ pub(in crate::snapshots) struct CollectionSpec {
     /// Staged with its table entry even when empty, so a load can tell an
     /// empty collection from a missing one.
     pub(in crate::snapshots) required: bool,
+    /// Its pages hold private strings: a rewrite or removal of a committed
+    /// page stages `Change::DropsPrivate`, so the old value is purged (F3).
+    pub(in crate::snapshots) private: bool,
 }
 
 /// Why stored state cannot be reused. Each is a counted reconstruction,
@@ -45,8 +48,6 @@ pub(in crate::snapshots) enum ReconstructCause {
     Revision,
     /// The head was written for another route, scan root or path.
     Identity,
-    /// A re-derived content field no longer matches its stored digest.
-    NotRederivable,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -56,7 +57,6 @@ impl ReconstructCause {
             Self::Incomplete => "incomplete",
             Self::Revision => "revision",
             Self::Identity => "identity",
-            Self::NotRederivable => "not_rederivable",
         }
     }
 }
@@ -135,8 +135,6 @@ pub(in crate::snapshots) struct DecodedHead {
     pub(in crate::snapshots) certificate: DurableCertificate,
     pub(in crate::snapshots) report: JsonlReadReport,
     pub(in crate::snapshots) scalars: (usize, usize, bool),
-    /// Digests of the re-derived (`X`) fields, checked after re-derivation.
-    pub(in crate::snapshots) rederive: sampled_jsonl::durable::Rederive,
 }
 
 // The checkpoint as the head stores it: samples as offset and SHA-256 only.

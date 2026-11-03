@@ -125,8 +125,8 @@ fn load(
 }
 
 /// [format] Every Claude field home round-trips: head scalars and lineage,
-/// paged collections across page boundaries, and content re-derived at its
-/// marks (opening-call files by call id). Finish and live fields stay out.
+/// paged collections across page boundaries, and content as session facts
+/// only (opening-call files by call id). Finish and live fields stay out.
 #[test]
 fn every_claude_field_home_round_trips_through_head_and_pages() {
     let (mut reduction, certificate) = parse(&lines(300));
@@ -175,49 +175,57 @@ fn every_claude_field_home_round_trips_through_head_and_pages() {
             Collection::ChangedFiles,
             Collection::CapabilityHours,
             Collection::Compactions,
+            Collection::SessionFacts,
         ]
         .map(pages),
-        [2, 2, 1, 5, 2]
+        [2, 2, 1, 5, 2, 4]
     );
-    for value in std::iter::once(&staged.head).chain(staged.pages.values()) {
-        for content in [
-            "please review".as_bytes(),
-            b"/tmp/tail-claude",
-            b"Review the change",
-            b"CANARY_OPEN_FILE",
-        ] {
-            assert!(!value.windows(content.len()).any(|window| window == content));
+    let contents: [&[u8]; 4] = [
+        b"please review",
+        b"/tmp/tail-claude",
+        b"Review the change",
+        b"CANARY_OPEN_FILE",
+    ];
+    let holds =
+        |value: &[u8], content: &[u8]| value.windows(content.len()).any(|window| window == content);
+    for (key, value) in std::iter::once((None, &staged.head))
+        .chain(staged.pages.iter().map(|(key, value)| (Some(key), value)))
+    {
+        if key.is_some_and(|(collection, _)| *collection == Collection::SessionFacts) {
+            continue;
         }
+        for content in contents {
+            assert!(!holds(value, content), "content outside the session facts");
+        }
+    }
+    // Title, first prompt, workspace, opening settings: each in its own slot.
+    for (slot, content) in contents.into_iter().enumerate() {
+        let slot = [1, 2, 0, 3][slot];
+        assert!(holds(
+            &staged.pages[&(Collection::SessionFacts, slot)],
+            content
+        ));
     }
 
     let mut loaded = acc.clone();
     let head = load(&staged, &mut loaded).unwrap();
     assert_eq!(head.certificate, certificate);
     assert_eq!(
-        head.rederive,
-        rederive_digests(acc, u64::MAX, u64::MAX).unwrap()
+        (&loaded.title, &loaded.workspace_path),
+        (&acc.title, &acc.workspace_path)
     );
-    assert!(loaded.title.is_none() && loaded.workspace_path.is_none());
     assert_eq!(
-        loaded.session_start.call_files_for_test("toolu_open"),
-        Some(&[][..])
+        (&loaded.first_prompt_material, &loaded.first_prompt_title),
+        (&acc.first_prompt_material, &acc.first_prompt_title)
     );
-    assert_eq!(loaded.claude_fork_parent, acc.claude_fork_parent);
-    assert!(loaded.provider_skills.contains(SKILL));
-
-    // Re-derivation restores the content; the restored state then encodes to
-    // exactly the stored head and pages.
-    loaded.title = acc.title.clone();
-    loaded.first_prompt_title = acc.first_prompt_title.clone();
-    loaded.first_prompt_material = acc.first_prompt_material.clone();
-    loaded.workspace_path = acc.workspace_path.clone();
-    loaded
-        .session_start
-        .adopt_durable_content(&mut acc.session_start.clone());
     assert_eq!(
         loaded.session_start.call_files_for_test("toolu_open"),
         acc.session_start.call_files_for_test("toolu_open")
     );
+    assert_eq!(loaded.claude_fork_parent, acc.claude_fork_parent);
+    assert!(loaded.provider_skills.contains(SKILL));
+
+    // The loaded state encodes to exactly the stored head and pages.
     let view = PreFinalization::new(&loaded, &head.report, head.scalars);
     let again =
         stage_full::<Claude>(&view, &head.certificate, &identity("session.jsonl", false)).unwrap();

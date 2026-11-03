@@ -370,10 +370,9 @@ they reset at process start and never decide anything.
 | Counter | Unit / meaning |
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head; the file waits and census stays red), `error`. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `not_rederivable`. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read; the release gate. |
 | `tail_bootstrap_full{no_head}` | A file's first read, apart from reconstruction. |
-| `tail_rederive_bytes{ok,mismatch}` | Actual bytes re-read to check stored content digests, including failures. |
 | `tail_replay_bytes{full,tail}` | Native reduction bytes. |
 | `tail_validation_bytes{source}` | Sample and guard bytes, apart from native. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
@@ -402,7 +401,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
 | `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
 | `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing`, `behind_accepted` | `tail_db_loads{held}` and census-red; the floor keeps `accepted_body_floor` custody |
-| `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | `tail_rederive_bytes` |
+| `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
 | `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `tail_validation_bytes` |
 | Sampled native bytes | `tail_replay_bytes`, `tail_bootstrap_full` |
 | `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage`, `tail_stage_dropped`, `tail_publish{dropped}` |
@@ -413,7 +412,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
 
 Not built, and so absent from the counters: `tail_candidate_owed`,
-`tail_set_aside_probe` and `tail_rederive_lines`.
+`tail_set_aside_probe`.
 
 ### Claude Census Retirement Overlap
 

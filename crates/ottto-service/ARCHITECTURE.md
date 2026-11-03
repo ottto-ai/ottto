@@ -40,8 +40,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   metadata publish together; loading stays read-only and idle maintenance owns reclaim.
 - **Claude continuation** (`snapshots/tail_source/`, `durable_tail_codec.rs`): a completed read stages
   its running reduction into the state database; the pass's save commits it with the index. A later
-  read loads the committed head, checks identity and the file certificate, streams the pages and
-  re-derives content fields against their digests. A refusal is a counted Full; only a newer build's
+  read loads the committed head, checks identity and the file certificate, and streams the pages,
+  session facts (title, first prompt, workspace, opening settings) among them: no transcript byte is
+  read back for content. A refusal is a counted Full; only a newer build's
   head holds. Codex and Pi keep RAM reductions and read Full after a restart. Each pass removes the
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
   retried, never via full erasure.

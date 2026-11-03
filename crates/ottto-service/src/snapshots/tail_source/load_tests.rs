@@ -1,5 +1,6 @@
 //! The Claude load on real committed Tail state: a restart continues past the
-//! sealed offset with the cold Full's body, a quiet restart reads nothing,
+//! sealed offset with the cold Full's body (its session facts from the
+//! database), a quiet restart reads nothing,
 //! damaged or missing state is a counted reconstruction, a Tail-only failure
 //! resumes from the committed head, absence retires, an identity mismatch
 //! retires before reuse, and a newer build's head holds.
@@ -99,6 +100,14 @@ pub(super) fn cold(route: &Route, path: &Path) -> Value {
     let (parser, mode, start) = read(route, path, None);
     assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
     test_finish_items(parser, path, SnapshotSource::ClaudeCode)
+}
+
+/// The cold Full's PRE-finalization state.
+pub(super) fn cold_accumulator(route: &Route, path: &Path) -> SnapshotAccumulator {
+    let (parser, mode, _) = read(route, path, None);
+    assert!(matches!(mode, ReadMode::Full(_)));
+    let acc: &SnapshotAccumulator = &parser.accumulator;
+    acc.clone()
 }
 
 /// [money] A restart loads the committed head, reads only past the sealed

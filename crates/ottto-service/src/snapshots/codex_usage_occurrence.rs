@@ -63,15 +63,6 @@ impl CodexCounting {
         }
     }
 
-    pub(super) fn content_scratch(&self) -> Self {
-        Self {
-            evidence: self.evidence,
-            cutover_unix_ms: self.cutover_unix_ms,
-            version: self.version,
-            reducer: (self.version == Some(CountingVersion::V2)).then(Box::default),
-        }
-    }
-
     /// Local, content-free receipts for the diagnostics owner to fold in
     /// before the accumulator is consumed (no consumer yet: activation gate).
     #[cfg_attr(not(test), allow(dead_code))]

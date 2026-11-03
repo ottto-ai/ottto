@@ -11,9 +11,12 @@
 //! writes nothing. A `Log` collection never reorders committed pages:
 //! elements new since the base follow them, sorted among themselves (the
 //! accumulator's sets keep no arrival order), filling the last committed page
-//! while it has room. A full encode writes each `Log` sorted. Without a base
-//! (a Full read, or a retry of a set-aside file) the stage is a `Reset` that
-//! replaces every stored row.
+//! while it has room. A full encode writes each `Log` sorted. A committed page
+//! of another shape that the new encode no longer holds is obsolete. A
+//! rewritten or obsolete page of a private collection (the session facts)
+//! stages `DropsPrivate`, so its old value is purged. Without a base (a Full
+//! read, or a retry of a set-aside file) the stage is a `Reset` that replaces
+//! every stored row.
 use super::{stage_full, CollectionSpec, HeadIdentity, ReconstructCause, TailSource};
 use crate::durable_tail_codec::Refuse;
 use crate::snapshots::sampled_jsonl::CompletedNativeAcquisition;
@@ -255,13 +258,31 @@ impl TailBase {
                 Some((_, log)) => log_pages::<S>(acc, spec, log)?,
                 None => S::encode_pages(acc, spec.collection)?,
             };
-            for (page, bytes) in pages {
-                if self.committed((spec.collection, page)) != Some(&page_digest(&bytes)) {
-                    staged.pages.insert((spec.collection, page), bytes);
+            let mut rewritten = false;
+            if log.is_none() {
+                let held: BTreeSet<u64> = pages.iter().map(|(page, _)| *page).collect();
+                for &((collection, page), _) in &self.pages {
+                    if collection == spec.collection && !held.contains(&page) {
+                        staged.obsolete.insert((collection, page));
+                        rewritten = true;
+                    }
                 }
             }
+            for (page, bytes) in pages {
+                match self.committed((spec.collection, page)) {
+                    Some(digest) if *digest == page_digest(&bytes) => continue,
+                    Some(_) => rewritten = true,
+                    None => {}
+                }
+                staged.pages.insert((spec.collection, page), bytes);
+            }
+            if rewritten && spec.private {
+                staged.change = Change::DropsPrivate;
+            }
         }
-        let changed = !staged.pages.is_empty() || page_digest(&staged.head) != self.head;
+        let changed = !staged.pages.is_empty()
+            || !staged.obsolete.is_empty()
+            || page_digest(&staged.head) != self.head;
         if self.migrate && !changed {
             super::counters::bump("tail_head_migrated", S::SOURCE.api_slug());
         }

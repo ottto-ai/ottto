@@ -1,19 +1,19 @@
 //! The Claude Code Tail codec.
 //!
 //! Head: the identity, the checkpoint certificate, the read report and the
-//! three reduction scalars, the response selectors, every accumulator field
-//! stored by its class, and the digests of the re-derived fields. Pages: the
-//! responses (each beside its key, so the index re-derives), the capability
-//! tool uses, the changed-file hashes, the hourly capability buckets and the
-//! compaction observations. Finish-only and live fields are never stored;
-//! content (`X`) is re-derived from the file and hash-checked, including each
-//! opening call's file paths by call id. Skill labels are stored as they are.
+//! three reduction scalars, the response selectors and every accumulator
+//! field stored by its class. Pages: the responses (each beside its key, so
+//! the index re-derives), the capability tool uses, the changed-file hashes,
+//! the hourly capability buckets, the compaction observations and the session
+//! facts. Finish-only and live fields are never stored. Content (`X`: title,
+//! first prompt, workspace, opening settings with each opening call's file
+//! paths by call id) is a session fact, never read back from the file. Skill
+//! labels are stored as they are.
 use super::{
     encode, fixed_pages, page_bytes, read_page, slot_start, CollectionSpec, DecodedHead,
     HeadIdentity, ReconstructCause, TailSource,
 };
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
-use crate::snapshots::sampled_jsonl::durable::{rederive_digests, Rederive};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -21,39 +21,134 @@ use crate::transcript_acquisition::DurableCertificate;
 const RESPONSES_G: u32 = 256;
 const LOG_G: u32 = 256;
 const COMPACTIONS_G: u32 = 64;
+/// One fact per page, at its kind's position.
+const FACTS_G: u32 = 1;
 
-const COLLECTIONS: [CollectionSpec; 5] = [
+const COLLECTIONS: [CollectionSpec; 6] = [
     CollectionSpec {
         collection: Collection::Responses,
         shape: PageShape::Slot,
         g: RESPONSES_G,
         required: true,
+        private: false,
     },
     CollectionSpec {
         collection: Collection::ToolUses,
         shape: PageShape::Log,
         g: LOG_G,
         required: true,
+        private: false,
     },
     CollectionSpec {
         collection: Collection::ChangedFiles,
         shape: PageShape::Log,
         g: LOG_G,
         required: true,
+        private: false,
     },
     CollectionSpec {
         collection: Collection::CapabilityHours,
         shape: PageShape::Hour,
         g: 0,
         required: true,
+        private: false,
     },
     CollectionSpec {
         collection: Collection::Compactions,
         shape: PageShape::Slot,
         g: COMPACTIONS_G,
         required: true,
+        private: false,
+    },
+    CollectionSpec {
+        collection: Collection::SessionFacts,
+        shape: PageShape::Slot,
+        g: FACTS_G,
+        required: true,
+        private: true,
     },
 ];
+
+/// The session facts (D168-1): content the head never carries, one element
+/// per page at the kind's position, `[kind][version][value]`. A slot is
+/// rewritten when its fact changes. A kind or version this build does not
+/// know is incompatible: new ones come with a reduction revision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fact {
+    Title = 0,
+    FirstPrompt = 1,
+    Workspace = 2,
+    OpeningSettings = 3,
+}
+const FACTS: [Fact; 4] = [
+    Fact::Title,
+    Fact::FirstPrompt,
+    Fact::Workspace,
+    Fact::OpeningSettings,
+];
+const FACT_VERSION: u64 = 1;
+
+impl Fact {
+    fn present(self, acc: &SnapshotAccumulator) -> bool {
+        match self {
+            Self::Title => acc.title.is_some(),
+            Self::FirstPrompt => {
+                acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some()
+            }
+            Self::Workspace => acc.workspace_path.is_some(),
+            Self::OpeningSettings => acc.session_start.has_opening_fact(),
+        }
+    }
+
+    fn put(self, acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
+        e.varint(self as u64)?;
+        e.varint(FACT_VERSION)?;
+        match self {
+            Self::Title => acc.title.put(e),
+            Self::FirstPrompt => {
+                acc.first_prompt_material.put(e)?;
+                acc.first_prompt_title.put(e)
+            }
+            Self::Workspace => acc.workspace_path.put(e),
+            Self::OpeningSettings => acc.session_start.put_opening_fact(e),
+        }
+    }
+
+    /// One fact page into a decoded head's state.
+    fn take(
+        page: u64,
+        bytes: &[u8],
+        into: &mut SnapshotAccumulator,
+    ) -> Result<(), ReconstructCause> {
+        let fact = usize::try_from(page)
+            .ok()
+            .and_then(|at| FACTS.get(at).copied())
+            .ok_or(ReconstructCause::Incompatible)?;
+        let mut d = Dec::new(bytes);
+        if d.varint()? != page {
+            return Err(ReconstructCause::Corrupt);
+        }
+        if d.varint()? != FACT_VERSION {
+            return Err(ReconstructCause::Incompatible);
+        }
+        match fact {
+            Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
+            Self::FirstPrompt => {
+                into.first_prompt_material = <Option<String> as Durable>::take(&mut d)?;
+                into.first_prompt_title = <Option<String> as Durable>::take(&mut d)?;
+            }
+            Self::Workspace => into.workspace_path = <Option<PathBuf> as Durable>::take(&mut d)?,
+            Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
+        }
+        d.finish()?;
+        // A stored slot holds its fact: an empty one is corrupt.
+        if fact.present(into) {
+            Ok(())
+        } else {
+            Err(ReconstructCause::Corrupt)
+        }
+    }
+}
 
 // Artifacts are head data: collected whatever the upload toggle says, and
 // filtered only when an item is built.
@@ -80,7 +175,8 @@ macro_rules! head_fields {
 // tool uses, changed files, capability buckets, compactions), finish-only
 // fields (usage ids and occurrences, money, cache observations and requests,
 // usage buckets and totals), live fields (Desktop identity and spawn lineage,
-// account hash) and the Pi ledger. `X` fields are re-derived.
+// account hash) and the Pi ledger. `X` fields are session facts, except the
+// Codex agent label, which a Claude parse never sets.
 head_fields! {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
@@ -230,7 +326,6 @@ head_fields! {
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
-    D durable_marks: crate::durable_tail_codec::DurableMarks,
 }
 
 /// The Claude Code source: a marker type, never a value.
@@ -251,6 +346,7 @@ impl TailSource for Claude {
             Collection::ChangedFiles => acc.activity_changed_file_hashes.len(),
             Collection::CapabilityHours => acc.activity_capability_buckets.len(),
             Collection::Compactions => acc.claude_compaction_observations.len(),
+            Collection::SessionFacts => FACTS.iter().filter(|fact| fact.present(acc)).count(),
             _ => 0,
         }) as u64
     }
@@ -338,23 +434,24 @@ impl TailSource for Claude {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse> {
         let acc = view.accumulator;
-        let rederive = rederive_digests(acc, u64::MAX, u64::MAX)?;
+        if acc.codex_agent_label.is_some() {
+            return Err(Refuse::NonEmpty("SnapshotAccumulator.codex_agent_label"));
+        }
         let scalars = (
             view.recognized_usage_drop_count,
             view.positive_recognized_usage_count,
             view.positive_usage_evidence,
         );
         encode(|e| {
-            // Opening-call file paths are content: the session-start digest
-            // covers them by call id and re-derivation restores them.
+            // Opening-call file paths are content: the opening-settings fact
+            // stores them by call id.
             e.with_moved_field("OpeningCall.files", |e| {
                 id.put(e)?;
                 certificate.put(e)?;
                 view.report.put(e)?;
                 scalars.put(e)?;
                 acc.claude_responses.selectors.put(e)?;
-                put_fields(acc, e)?;
-                rederive.put(e)
+                put_fields(acc, e)
             })
         })
     }
@@ -401,6 +498,11 @@ impl TailSource for Claude {
                 COMPACTIONS_G,
                 |observation, e| observation.put(e),
             ),
+            Collection::SessionFacts => FACTS
+                .into_iter()
+                .filter(|fact| fact.present(acc))
+                .map(|fact| Ok((fact as u64, encode(|e| fact.put(acc, e))?)))
+                .collect(),
             _ => Ok(Vec::new()),
         }
     }
@@ -420,7 +522,6 @@ impl TailSource for Claude {
         let scalars = <(usize, usize, bool)>::take(&mut d)?;
         let selectors = ClaudeSelectorTable::take(&mut d)?;
         let mut acc = take_fields(&mut d)?;
-        let rederive = Rederive::take(&mut d)?;
         d.finish()?;
         acc.claude_responses.selectors = selectors;
         *into = acc;
@@ -428,7 +529,6 @@ impl TailSource for Claude {
             certificate,
             report,
             scalars,
-            rederive,
         })
     }
 
@@ -486,6 +586,7 @@ impl TailSource for Claude {
                     Ok(())
                 })
             }
+            Collection::SessionFacts => Fact::take(page, bytes, into),
             _ => Err(ReconstructCause::Corrupt),
         }
     }

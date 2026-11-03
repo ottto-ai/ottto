@@ -16,8 +16,8 @@
 //!   Dropped on identity failure and erased with
 //!   its record. Never exposed in logs, diagnostics, status, support bundles or
 //!   error text; single use, restoring only the same approved upload/state.
-//! - `X` content (text, paths). Never encoded. Restored by re-derivation from
-//!   the file itself and verified by hash, else the entry reads in Full;
+//! - `X` content (text, paths). Never encoded in its type's body: a Tail
+//!   source stores it as session facts (`tail.page.session_facts`), apart;
 //! - `E` must be empty in the retained copy. A non-empty value refuses the
 //!   record, and the entry reads in Full;
 //! - `I` a live input re-injected every pass. Never encoded;
@@ -50,8 +50,6 @@ pub(crate) enum Refuse {
     TooLarge,
     /// The output sink could not accept the encoded bytes.
     WriteFailed,
-    /// An `X` field cannot be re-derived from the file under the bound.
-    NotRederivable(&'static str),
     /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
     /// SHA-256 or HMAC value).
     NotDigest(&'static str),
@@ -1715,72 +1713,6 @@ macro_rules! durable_enum {
 }
 pub(crate) use durable_enum;
 
-/// Where each re-derived (`X`) field was last assigned, as absolute byte
-/// offsets in the transcript (`N`). Restore re-reads the file only up to these
-/// lines and checks each re-derived value against its stored hash.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DurableMarks {
-    /// End of the last line that set the first prompt material or title.
-    pub(crate) first_prompt: Option<u64>,
-    /// End of the line that set the workspace path.
-    pub(crate) workspace: Option<u64>,
-    /// End of the last line that assigned the Codex agent label.
-    pub(crate) agent_label: Option<u64>,
-    /// The last line that changed the title: (offset, length).
-    pub(crate) title_line: Option<(u64, u64)>,
-    /// A re-derived field was assigned by a line whose position was unknown.
-    pub(crate) unknown: bool,
-}
-durable_struct!(DurableMarks {
-    N first_prompt: Option<u64>,
-    N workspace: Option<u64>,
-    N agent_label: Option<u64>,
-    N title_line: Option<(u64, u64)>,
-    N unknown: bool,
-});
-impl crate::heap_layout_bound::HeapLayoutBound for DurableMarks {
-    const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
-    // Plain integers: no heap, one walker visit for the whole struct.
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
-
-impl DurableMarks {
-    /// Records the current line's end as the latest assignment.
-    /// An unknown position clears the mark: the field is then not
-    /// re-derivable and its entry reads in Full.
-    pub(crate) fn note_end(&mut self, mark: fn(&mut Self) -> &mut Option<u64>) {
-        let line = current_line();
-        *mark(self) = line.map(|(offset, len)| offset.saturating_add(len));
-        self.unknown |= line.is_none();
-    }
-    pub(crate) fn note_title_line(&mut self) {
-        let line = current_line();
-        self.title_line = line;
-        self.unknown |= line.is_none();
-    }
-}
-
-thread_local! {
-    /// The physical line the JSONL reader is applying: (offset, length) in
-    /// the file. `None` outside a positioned read.
-    static LINE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
-}
-
-/// Runs `apply` with `line` as the current line, then restores the previous.
-pub(crate) fn with_line<T>(line: Option<(u64, u64)>, apply: impl FnOnce() -> T) -> T {
-    let previous = LINE.with(|cell| cell.replace(line));
-    let out = apply();
-    LINE.with(|cell| cell.set(previous));
-    out
-}
-
-pub(crate) fn current_line() -> Option<(u64, u64)> {
-    LINE.with(std::cell::Cell::get)
-}
-
 #[cfg(test)]
 thread_local! {
     /// Byte spans of `L` fields in the bodies this thread encoded, with the
@@ -2228,7 +2160,6 @@ mod tests {
         round(ProbeKind::Unit);
         round(ProbeKind::Pair(7, "payload".into()));
         round(ProbeKind::Named { at: 9 });
-        round(DurableMarks::default());
         round(Digests::default());
         for bad in [
             "abc".to_string(),

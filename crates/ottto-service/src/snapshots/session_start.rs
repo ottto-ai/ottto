@@ -508,11 +508,6 @@ pub(super) struct SessionStartState {
     shell_moved: bool,
     /// An opening Claude response spanned several requests.
     collapsed_requests: bool,
-    /// End offset of the last line applied while the window was open (the
-    /// line that froze it, once frozen), when the reader knew it. The opening
-    /// content (durable warm-cache) equals a re-parse of the file through
-    /// it; `None` after any line at an unknown position.
-    content_end: Option<u64>,
 }
 
 crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
@@ -530,7 +525,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeBlob {
     N parts: [u64; PARTS],
     N unmeasurable: bool,
     // A reversible rolling digest of instruction text (F1): content, never
-    // stored; re-derived with the opening content and hash-verified.
+    // in a record body; stored with the opening-settings session fact.
     X config_digest: Option<ConfigDigest>,
 });
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
@@ -564,7 +559,7 @@ crate::durable_tail_codec::durable_struct!(OpeningFileState {
     N client_loaded: [bool; 2],
     N truncated: [bool; 2],
 });
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, content_end);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 crate::durable_tail_codec::durable_struct!(SessionStartState {
     U client_version: Option<String>,
     N user_turns: u8,
@@ -593,7 +588,6 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N held_bytes: usize,
     N shell_moved: bool,
     N collapsed_requests: bool,
-    N content_end: Option<u64>,
 });
 
 impl SessionStartState {
@@ -617,7 +611,6 @@ impl SessionStartState {
     }
 
     fn freeze(&mut self) {
-        self.note_line_applied();
         self.frozen = true;
         if !self.parts_closed {
             self.parts_closed = true;
@@ -634,90 +627,90 @@ impl SessionStartState {
         self.recount_held();
     }
 
-    /// After each applied line, while the window is open, the end of
-    /// that line: the opening content is final through it.
-    pub(super) fn note_line_applied(&mut self) {
-        if !self.frozen {
-            self.content_end = crate::durable_tail_codec::current_line()
-                .map(|(offset, len)| offset.saturating_add(len));
-        }
-    }
-
-    /// Durable warm-cache reuse: the digest of the opening content a
-    /// record never carries (instruction text, the Codex prelude with its cwd
-    /// and AGENTS.md, opening file paths), or `None` when there is none. It
-    /// is re-derived by re-parsing the file head through `content_end`, which
-    /// must be known and within `bound`.
-    pub(super) fn durable_content_digest(
-        &self,
-        bound: u64,
-    ) -> Result<Option<([u8; 32], u64)>, crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::Refuse;
-        if self.instructions.is_none()
-            && self.codex_prelude.is_none()
-            && self.files.is_empty()
-            && self.config_digest.is_none()
-            && self
+    /// Whether there is opening content a record body never carries (`X`:
+    /// instruction text, the Codex prelude, opening files with their paths,
+    /// config digests, each opening call's file paths).
+    pub(super) fn has_opening_fact(&self) -> bool {
+        self.instructions.is_some()
+            || self.codex_prelude.is_some()
+            || !self.files.is_empty()
+            || self.config_digest.is_some()
+            || self
                 .claude_blobs
                 .values()
-                .all(|blob| blob.config_digest.is_none())
-            && self.calls.values().all(|call| call.files.is_empty())
-        {
-            return Ok(None);
-        }
-        let end = self
-            .content_end
-            .filter(|end| *end <= bound)
-            .ok_or(Refuse::NotRederivable("SessionStartState.content_end"))?;
-        Ok(Some((self.durable_content_hash()?, end)))
+                .any(|blob| blob.config_digest.is_some())
+            || self.calls.values().any(|call| !call.files.is_empty())
     }
 
-    /// The opening content's digest alone, for a head re-parse (which has no
-    /// line positions) to compare with the recorded one.
-    pub(super) fn durable_content_hash(
+    /// The opening-settings session fact (D168-1): that content, beside the
+    /// record body that keeps its keys (blob and call ids, in key order).
+    /// The Codex prelude has no fact encoding yet: refused, never dropped.
+    pub(super) fn put_opening_fact(
         &self,
-    ) -> Result<[u8; 32], crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::{Durable, Enc};
-        let mut e = Enc::hash("ottto-dt-rederive:session_start:v3");
-        self.instructions.put(&mut e)?;
-        self.codex_prelude.put(&mut e)?;
-        self.files.put(&mut e)?;
-        self.config_digest.put(&mut e)?;
-        // The blobs' own digests, by key (their keys and parts are stored).
+        e: &mut crate::durable_tail_codec::Enc<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::{Durable, Refuse};
+        if self.codex_prelude.is_some() {
+            return Err(Refuse::NonEmpty("SessionStartState.codex_prelude"));
+        }
+        let digest = |digest: &Option<ConfigDigest>| digest.map(|d| (d.a, d.b, d.len));
+        self.instructions.put(e)?;
+        digest(&self.config_digest).put(e)?;
+        e.varint(self.files.len() as u64)?;
+        for (path, file) in &self.files {
+            path.put(e)?;
+            file.put(e)?;
+            file.repo_path.put(e)?;
+        }
         e.varint(self.claude_blobs.len() as u64)?;
         for blob in self.claude_blobs.values() {
-            blob.config_digest.put(&mut e)?;
+            digest(&blob.config_digest).put(e)?;
         }
-        // Each opening call's file paths, by call id (the ids are stored).
         e.varint(self.calls.len() as u64)?;
         for call in self.calls.values() {
-            e.varint(call.files.len() as u64)?;
-            for file in &call.files {
-                e.len_prefixed(file.as_bytes())?;
-            }
+            call.files.put(e)?;
         }
-        Ok(e.finish_hash())
+        Ok(())
     }
 
-    /// Moves the re-derived opening content from a head re-parse.
-    pub(super) fn adopt_durable_content(&mut self, from: &mut Self) {
-        self.instructions = from.instructions.take();
-        self.codex_prelude = from.codex_prelude.take();
-        self.files = std::mem::take(&mut from.files);
-        self.config_digest = from.config_digest.take();
-        for (key, blob) in &mut self.claude_blobs {
-            blob.config_digest = from
-                .claude_blobs
-                .get_mut(key)
-                .and_then(|from| from.config_digest.take());
+    /// Restores the opening-settings fact into a decoded body: its blob and
+    /// call keys must be the ones the fact was written beside.
+    pub(super) fn take_opening_fact(
+        &mut self,
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        use crate::durable_tail_codec::{Corrupt, Durable};
+        let digest =
+            |d: &mut crate::durable_tail_codec::Dec<'_>| {
+                Ok::<_, Corrupt>(
+                    <Option<(u64, u64, u64)> as Durable>::take(d)?
+                        .map(|(a, b, len)| ConfigDigest { a, b, len }),
+                )
+            };
+        self.instructions = <Option<String> as Durable>::take(d)?;
+        self.config_digest = digest(d)?;
+        self.files = BTreeMap::new();
+        for _ in 0..d.varint()? {
+            let path = String::take(d)?;
+            let mut file = OpeningFileState::take(d)?;
+            file.repo_path = <Option<String> as Durable>::take(d)?;
+            if self.files.insert(path, file).is_some() {
+                return Err(Corrupt);
+            }
         }
-        for (id, call) in &mut self.calls {
-            call.files = from
-                .calls
-                .get_mut(id)
-                .map(|from| std::mem::take(&mut from.files))
-                .unwrap_or_default();
+        if d.varint()? != self.claude_blobs.len() as u64 {
+            return Err(Corrupt);
         }
+        for blob in self.claude_blobs.values_mut() {
+            blob.config_digest = digest(d)?;
+        }
+        if d.varint()? != self.calls.len() as u64 {
+            return Err(Corrupt);
+        }
+        for call in self.calls.values_mut() {
+            call.files = Vec::<String>::take(d)?;
+        }
+        Ok(())
     }
 
     /// An opening call holding `files`, as a read in the window records it.
@@ -732,15 +725,6 @@ impl SessionStartState {
     #[cfg(test)]
     pub(super) fn call_files_for_test(&self, id: &str) -> Option<&[String]> {
         self.calls.get(id).map(|call| call.files.as_slice())
-    }
-
-    /// Where the opening content is final (`content_end`), when known.
-    pub(super) fn durable_content_end(&self) -> Option<u64> {
-        self.content_end
-    }
-
-    pub(super) fn content_window_open(&self) -> bool {
-        !self.frozen
     }
 
     fn charge(&mut self, bytes: usize) -> bool {
@@ -3279,8 +3263,8 @@ mod tests {
     /// F1: `ConfigDigest` is a reversible rolling digest of instruction text,
     /// so it is content (`X`) on both sources: an encoded record carries none
     /// of its state (the body equals the body of the same state with every
-    /// config digest cleared), a decoded record has none, and the head
-    /// re-parse brings it back so the content hash verifies.
+    /// config digest cleared), a decoded record has none, and the Claude
+    /// opening-settings fact brings it back with the opening content.
     #[test]
     fn config_digest_is_content_and_never_reaches_a_record_body() {
         use crate::durable_tail_codec::{Dec, Durable, Enc};
@@ -3317,7 +3301,6 @@ mod tests {
             let digest = state
                 .config_digest
                 .unwrap_or_else(|| panic!("{name}: instruction text folds a config digest"));
-            let recorded = state.durable_content_hash().unwrap();
             let encoded = body(&state);
             for word in [digest.a, digest.b] {
                 assert!(
@@ -3345,13 +3328,27 @@ mod tests {
                     .all(|blob| blob.config_digest.is_none()),
                 "{name}"
             );
-            decoded.adopt_durable_content(&mut build());
+            if name == "codex" {
+                // The prelude has no fact encoding yet: refused, never dropped.
+                assert!(state.put_opening_fact(&mut Enc::bytes(1 << 20)).is_err());
+                continue;
+            }
+            assert!(state.has_opening_fact(), "{name}");
+            let mut e = Enc::bytes(1 << 20);
+            state.put_opening_fact(&mut e).unwrap();
+            let fact = e.into_bytes();
+            let mut d = Dec::new(&fact);
+            decoded.take_opening_fact(&mut d).unwrap();
+            d.finish().unwrap();
             assert_eq!(
                 decoded.config_digest.map(ConfigDigest::to_bytes),
                 Some(digest.to_bytes()),
                 "{name}"
             );
-            assert_eq!(decoded.durable_content_hash().unwrap(), recorded, "{name}");
+            let mut again = Enc::bytes(1 << 20);
+            decoded.put_opening_fact(&mut again).unwrap();
+            assert_eq!(again.into_bytes(), fact, "{name}");
+            assert_eq!(body(&decoded), encoded, "{name}");
         }
     }
 }
