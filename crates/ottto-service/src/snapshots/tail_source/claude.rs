@@ -109,7 +109,18 @@ impl Fact {
                 acc.first_prompt_material.put(e)?;
                 acc.first_prompt_title.put(e)
             }
-            Self::Workspace => acc.workspace_path.put(e),
+            // A path never enters a record body (`PathBuf` refuses outside
+            // hashing); the workspace path is a parsed JSON string, stored so.
+            Self::Workspace => acc
+                .workspace_path
+                .as_ref()
+                .map(|path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
+                })
+                .transpose()?
+                .put(e),
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
         }
     }
@@ -137,7 +148,9 @@ impl Fact {
                 into.first_prompt_material = <Option<String> as Durable>::take(&mut d)?;
                 into.first_prompt_title = <Option<String> as Durable>::take(&mut d)?;
             }
-            Self::Workspace => into.workspace_path = <Option<PathBuf> as Durable>::take(&mut d)?,
+            Self::Workspace => {
+                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
+            }
             Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
         }
         d.finish()?;

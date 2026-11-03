@@ -78,6 +78,10 @@ pub(in crate::snapshots) fn forget_ram_for_test(path: &Path) {
 }
 /// A debt-only change of one file, committed with the next save or at exit. It
 /// never publishes the file's graph progress and never clears its marker.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn observe_tail(
     path: &Path,
     key: &str,
@@ -90,6 +94,10 @@ pub(in crate::snapshots) fn observe_tail(
 }
 /// The caller's authorised final disposition of the file's whole debt: its
 /// revisions go and its marker clears; a head left with no reduction goes too.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn dispose_tail(
     path: &Path,
     key: &str,
@@ -104,6 +112,10 @@ pub(in crate::snapshots) fn dispose_tail(
 /// is erased with the next save. A file that still held unaccepted revisions
 /// adds one to `tail_discovery.deleted_unaccepted_files` and contributes its
 /// oldest known change to `deleted_unaccepted_oldest_at`; `index` saves both.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn erase_tail(
     path: &Path,
     index: &mut ScanIndex,
@@ -156,6 +168,10 @@ pub(in crate::snapshots) fn load_tail(
 }
 /// `head`'s revisions by id, one short read transaction; same outcomes as
 /// `load_tail`, and a metadata-only head has them too.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
+)]
 pub(in crate::snapshots) fn load_revisions(
     index: &ScanIndex,
     key: &str,
