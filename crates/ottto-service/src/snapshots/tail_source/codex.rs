@@ -633,7 +633,7 @@ impl TailSource for Codex {
             live.codex_sidecar_projected_next_ordinal,
         ) {
             (Some(_), None) => return Err(LiveLoadError::Unavailable),
-            (Some(stored), Some(fresh)) if fresh < stored => return Err(incompatible),
+            (Some(made_under), Some(now)) if now < made_under => return Err(incompatible),
             _ => {}
         }
         install_parent(stored, live)?;
@@ -764,3 +764,7 @@ impl Trailer {
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
     }
 }
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+pub(in crate::snapshots) mod tests;
