@@ -354,6 +354,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         token(10)
     );
     fs::write(&f.path, &prefix).unwrap();
+    #[cfg(target_os = "macos")]
+    let original_birth =
+        crate::transcript_acquisition::birth_unix_nanos(&fs::metadata(&f.path).unwrap());
     let (mut index, baseline, _, _) = f.page(source, ScanIndex::default());
     assert_eq!(baseline.snapshots.len(), 1, "real indexed Codex prefix");
     fs::OpenOptions::new()
@@ -363,6 +366,14 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .write_all(token(20).as_bytes())
         .unwrap();
     f.age(91); // age BEFORE binding the completion; no artificial stale witness
+    let aged_metadata = fs::metadata(&f.path).unwrap();
+    let aged_modified = aged_metadata.modified().unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(crate::transcript_acquisition::birth_clamped(
+        original_birth,
+        crate::transcript_acquisition::birth_unix_nanos(&aged_metadata),
+        &aged_metadata,
+    ));
     let key = local_index_key(&f.path);
     let mut candidate = candidate_from_traversal_path(
         source,
@@ -723,7 +734,15 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .unwrap()
         .write_all(b"\n")
         .unwrap();
-    f.age(91);
+    // The unterminated read cannot replace the original prefix head. Keep
+    // the backdate that its shared certificate's birth_clamped check admits:
+    // a second age() would move mtime past APFS's already-clamped birth.
+    File::options()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_modified(aged_modified)
+        .unwrap();
     let (caught, scan, reads, rows) = f.page(source, index);
     assert!(
         !rows

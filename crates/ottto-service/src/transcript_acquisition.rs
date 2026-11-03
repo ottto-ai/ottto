@@ -1595,7 +1595,7 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 /// a replacement; the samples, checked next, still decide its content. Linux
 /// keeps birth constant, so this never applies there.
 #[cfg(unix)]
-fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
+pub(crate) fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
     let modified = metadata
         .modified()
         .ok()

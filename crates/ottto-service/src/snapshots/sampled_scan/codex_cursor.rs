@@ -3901,7 +3901,7 @@ fn evict_lru_parent_witnesses(cursor: &mut CursorState, deficit: usize) -> bool 
         first = false;
         !entry.witnesses.entries.is_empty()
     });
-    evicted > 0 || cursor.parents.len() < before
+    freed > 0 || cursor.parents.len() < before
 }
 
 /// PR-P: the extra charge of a namespace entry: none when it exists for this

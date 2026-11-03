@@ -12885,11 +12885,13 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
 }
 
 /// [money] An active-bound cursor keeps its file scope, resumes and publishes
-/// what a cold read does. Codex keeps its retained graph after a native
-/// publication; the restart-record store's no-record mode, which dropped it,
-/// is gone.
+/// what a cold read does. Its certified prefix is staged as a Tail head;
+/// a codec source keeps no retained graph after native publication.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "validated native cursor layout"
+)]
 fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     if !crate::test_isolation::run_here() {
         return;
@@ -12899,6 +12901,7 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     let (_, oracle) = page(&fixture, ScanIndex::default(), None);
     assert!(!oracle.snapshots.is_empty());
     let cache = Arc::new(SharedCache::default());
+    let key = local_index_key(&fixture.file(SESSION));
     with_test_limits(2048, 1024, 64, || {
         let (mut index, first) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
         assert!(first.snapshots.is_empty());
@@ -12919,13 +12922,11 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
                 assert_eq!(fingerprints(&scan), fingerprints(&oracle));
                 assert!(counter(&cache, |c| c.jobs_resumed) > 0);
                 assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                let certificate = head(&index, &key).expect("the certified prefix is staged");
+                assert_eq!(certificate.sealed_offset, fixture.len(SESSION));
                 assert!(
-                    cache
-                        .retained()
-                        .unwrap()
-                        .peek(&local_index_key(&fixture.file(SESSION)))
-                        .is_some(),
-                    "a native Codex publication keeps its retained graph"
+                    cache.take(&key).is_none(),
+                    "a codec source keeps no RAM copy"
                 );
                 return;
             }
