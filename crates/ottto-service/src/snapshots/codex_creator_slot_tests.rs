@@ -34,6 +34,7 @@ fn creator(account: Option<&str>, disposition: Option<&'static str>) -> SessionA
 /// has not emitted a snapshot before. Returns the session's account, its
 /// retained binding and the scan's creator counts.
 fn bind(
+    file_name: &str,
     evidence: SessionAccountEvidence,
     slots: &[(String, String, usize)],
     (row_mode, bucket_mode): (Option<&str>, Option<&str>),
@@ -63,7 +64,7 @@ fn bind(
     item.session_account_evidence = Some(evidence.clone());
     let mut entry = manifest_index_entry(None);
     entry.source_file_fingerprint = "creator-file".into();
-    let file = local_index_key(&Path::new(HOME_A).join("sessions/rollout.jsonl"));
+    let file = local_index_key(&Path::new(HOME_A).join("sessions").join(file_name));
     index.files.insert(file.clone(), entry);
     if uploaded {
         let emitted = BTreeSet::from(["earlier-unknown-revision".to_string()]);
@@ -116,6 +117,7 @@ fn counted(cause: Option<usize>) -> [u64; 9] {
 fn codex_creator_pair_names_its_single_subscription_slot() {
     let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
     let named = bind(
+        "rollout.jsonl",
         creator(Some("slot-a"), None),
         &slots,
         (None, None),
@@ -138,11 +140,28 @@ fn codex_creator_pair_names_its_single_subscription_slot() {
 fn codex_session_uploaded_unknown_stays_unknown_as_it_grows() {
     let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
     let named = bind(
+        "rollout.jsonl",
         creator(Some("slot-b"), None),
         &slots,
         (None, None),
         None,
         true,
+    );
+    assert_eq!(named, (None, None, counted(Some(PREVIOUSLY_UPLOADED))));
+}
+
+/// [regress] Compression gives an uploaded rollout a new path with empty
+/// emission history. It stays Unknown and mints no owner despite an eligible slot.
+#[test]
+fn codex_compressed_rollout_without_emission_history_stays_unknown() {
+    let slots = [slot("slot-a", NAMED)];
+    let named = bind(
+        "rollout.jsonl.zst",
+        creator(Some("slot-a"), None),
+        &slots,
+        (None, None),
+        None,
+        false,
     );
     assert_eq!(named, (None, None, counted(Some(PREVIOUSLY_UPLOADED))));
 }
@@ -153,6 +172,7 @@ fn codex_session_uploaded_unknown_stays_unknown_as_it_grows() {
 fn codex_creator_pair_names_its_slot_never_the_home_it_was_found_in() {
     let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
     let named = bind(
+        "rollout.jsonl",
         creator(Some("slot-b"), None),
         &slots,
         (None, None),
@@ -218,7 +238,7 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
         ("multi match", b_b, MULTI_MATCH),
     ] {
         let positive = creator(Some("slot-b"), None);
-        let (named, _, counts) = bind(positive, &slots, (None, None), None, false);
+        let (named, _, counts) = bind("rollout.jsonl", positive, &slots, (None, None), None, false);
         let expected = (cause == NAMED).then_some("slot-b");
         let counts_and_name = (named.as_deref(), counts);
         assert_eq!(counts_and_name, (expected, counted(Some(cause))), "{label}");
@@ -254,7 +274,14 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
         ("retained", with_b(API_KEY), b, none, b, b, None),
     ] {
         let evidence = creator(account, account.is_none().then_some("missing"));
-        let (named, _, counts) = bind(evidence, &slots, modes, cached, cached.is_some());
+        let (named, _, counts) = bind(
+            "rollout.jsonl",
+            evidence,
+            &slots,
+            modes,
+            cached,
+            cached.is_some(),
+        );
         let counts_and_name = (named.as_deref(), counts);
         assert_eq!(counts_and_name, (expected, counted(cause)), "{label}");
     }
