@@ -19,6 +19,8 @@ impl Drop for Clock {
 
 #[test]
 fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tails() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -207,6 +209,8 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
 
 #[test]
 fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -357,6 +361,8 @@ fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
 
 #[test]
 fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -572,6 +578,8 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
 
 #[test]
 fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1522,6 +1530,8 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
 /// Moved from the retired store's writer-fault rows; the index decides alone.
 #[test]
 fn staged_quiet_retirement_commits_only_with_its_second_save() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

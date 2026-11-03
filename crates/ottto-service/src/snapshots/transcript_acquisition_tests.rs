@@ -1720,6 +1720,8 @@ fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
 /// reduction, and must not insert one of its own.
 #[test]
 fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1850,6 +1852,8 @@ fn step_until(
 /// (no release unless it borrows more than its reduction).
 #[test]
 fn sampled_unsampled_native_refusal_guard_matrix() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
