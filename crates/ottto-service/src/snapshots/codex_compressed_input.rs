@@ -1827,8 +1827,9 @@ pub(in crate::snapshots) mod tests {
         serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
     }
 
-    /// [money] Standalone native ownership reads once. Every claimant, parent,
-    /// damaged header and unresolved root is owed without a Full decode.
+    /// [money] Standalone native ownership reads once. Ordinary forks reach
+    /// the shared parser and fail closed without a bound parent ledger;
+    /// claimants, damaged headers and unresolved roots owe no Full decode.
     /// Paid damaged-header attempts retain their cause and deadline across
     /// funded/unfunded passes and restart without physical re-reads.
     #[test]
@@ -1916,7 +1917,17 @@ pub(in crate::snapshots) mod tests {
             let key = local_index_key(&f.0);
             if let Some(cause) = cause {
                 assert_eq!(index.archives[&key].owed_cause(), Some(cause), "{case}");
-                assert_eq!(full_decodes(&logs), 0, "{case}");
+                assert_eq!(
+                    full_decodes(&logs),
+                    usize::from(matches!(case, "parent" | "stale-parent")),
+                    "{case}"
+                );
+                if matches!(case, "parent" | "stale-parent") {
+                    assert!(
+                        result.snapshots.is_empty(),
+                        "held fork emits no copied prefix: {case}"
+                    );
+                }
                 assert_eq!(
                     result.unreadable_path_count, 0,
                     "archive debt stays out of plain errors"
@@ -2017,6 +2028,140 @@ pub(in crate::snapshots) mod tests {
                 assert_eq!(result.snapshots[0].input_tokens, 750);
                 assert_eq!(full_decodes(&logs), 1);
             }
+        }
+    }
+    /// [regress] Non-ledger children use the shared ownership parser even
+    /// after restart from an old parent-held header. Plain/archive money and
+    /// placement agree; ordinal children never charge the inherited prefix.
+    #[test]
+    fn archive_nonledger_children_resume_through_shared_ownership() {
+        use sampled_scan::transition_fixture::{money_oracle, scan_money, Mode, RouteResult};
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in ["subagent", "ordinal", "history_base"] {
+            let mut rows: Vec<Value> = String::from_utf8(synthetic_rollout())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            rows[0]["payload"]["id"] = json!(owner);
+            rows[0]["timestamp"] = json!("2026-10-07T09:59:00Z");
+            rows[0]["payload"]["creator_user_id"] = json!("synthetic-user");
+            rows[0]["payload"]["creator_account_id"] = json!("synthetic-workspace");
+            match kind {
+                "subagent" => {
+                    rows[0]["payload"]["source"] = json!({"subagent": {
+                        "thread_spawn": {"parent_thread_id": "unresolved-parent"}
+                    }});
+                }
+                "ordinal" => {
+                    rows[0]["payload"]["parent_thread_id"] = json!("unresolved-parent");
+                    rows[0]["payload"]["subagent_history_start_ordinal"] = json!(2);
+                    for (ordinal, row) in rows.iter_mut().enumerate() {
+                        row["ordinal"] = json!(ordinal);
+                    }
+                }
+                "history_base" => {
+                    rows[0]["payload"]["history_base"] = json!({"thread_id": "unresolved-parent"});
+                }
+                _ => unreachable!(),
+            }
+            let bytes = rows
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>();
+            let mut f =
+                ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+            let path =
+                f.0.parent()
+                    .unwrap()
+                    .join(format!("rollout-{owner}.jsonl.zst"));
+            fs::rename(&f.0, &path).unwrap();
+            f.0 = path;
+            let key = local_index_key(&f.0);
+            let mut old = ScanIndex::default();
+            let mut evidence = ArchiveEvidence::from_metadata(fs::metadata(&f.0).unwrap()).unwrap();
+            evidence.owner = Some(owner.into());
+            evidence.work.as_mut().unwrap().header = Some(Box::new(
+                ValidatedHeader::from_line(rows[0].to_string().as_bytes()).unwrap(),
+            ));
+            assert_eq!(
+                evidence.header().unwrap().parent.as_deref(),
+                Some("unresolved-parent")
+            );
+            evidence.transition(ArchiveTransition::Correctness(
+                CodexZstCause::ParentLedgerUnbound,
+            ));
+            old.archives.insert(key.clone(), evidence);
+            let (index, result, logs) = run_archive(
+                &f,
+                saved(&old),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            assert_eq!(full_decodes(&logs), 1, "{kind}");
+            assert_eq!(result.snapshots.len(), 1, "{kind}");
+            assert_ne!(
+                index.archives[&key].owed_cause(),
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            assert!(index.codex_parent_ownership_ledgers.is_empty());
+            assert_eq!(
+                result.snapshots[0].input_tokens,
+                if kind == "ordinal" { 650 } else { 750 }
+            );
+            assert_eq!(
+                result.snapshots[0].request_count,
+                if kind == "ordinal" { 2 } else { 3 }
+            );
+
+            // Use the same logical path and ordinary parser on uncompressed
+            // bytes. The production oracle normalizes physical fingerprints.
+            let plain = fixture(bytes.as_bytes(), ".jsonl");
+            let mut file = File::open(&plain.0).unwrap();
+            let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+            let mut parser = codex_parser(OpenedInput::plain(file), &f.0);
+            sampled_scan::configure_tier_replay(&mut parser, &f.candidate(), &old);
+            codex_counting_version::configure_singleton(&mut parser, &f.candidate(), &old);
+            while !parser.step().unwrap() {}
+            let parsed = parser
+                .finish(
+                    &expected,
+                    &f.0,
+                    NOW,
+                    "plain-fixture".into(),
+                    Some(&CodexTitleMetadata::default()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(parsed.complete());
+            let mut items = parsed.snapshots;
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                &mut items,
+                SnapshotUploadPolicy::default(),
+            );
+            assert_eq!(
+                items[0].session_account_evidence.is_some(),
+                kind != "history_base"
+            );
+            let mut batch = crate::snapshots::tests::valid_v6_batch_request();
+            batch.source = SnapshotSource::Codex.api_slug().into();
+            batch.snapshots = items.clone();
+            let cold = RouteResult::emitted(
+                Mode::ColdFull,
+                SnapshotSource::Codex,
+                vec![serde_json::to_vec(&batch).unwrap()],
+                &items,
+            );
+            let actual = scan_money(SnapshotSource::Codex, &index, &result);
+            money_oracle::assert_placement_equivalent(&cold, &actual);
+            assert_eq!(
+                cold.normalized, actual.normalized,
+                "plain/archive money: {kind}"
+            );
         }
     }
     /// [format] Saved header and page-wide Full reservations precede body

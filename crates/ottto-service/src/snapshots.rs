@@ -28616,7 +28616,6 @@ impl OwnedSourceScan {
                             &identified_candidates,
                             inventory,
                             &codex_page,
-                            codex_parent_ownership_ledgers.as_ref(),
                         );
                         pending!();
                     }
@@ -33969,7 +33968,6 @@ impl OwnedSourceScan {
                     &opened_file,
                     codex_join_inventory.as_ref(),
                     &codex_page,
-                    codex_parent_ownership_ledgers.as_ref(),
                 ) {
                     pending!();
                 }
