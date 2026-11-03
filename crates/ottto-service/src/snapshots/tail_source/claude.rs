@@ -170,6 +170,10 @@ impl TailSource for Claude {
                 "compaction_timestamps",
                 !acc.compaction_timestamps.is_empty(),
             ),
+            (
+                "codex_dictionary_slots",
+                !acc.codex_dictionary_slots.is_empty(),
+            ),
         ]
         .into_iter()
         .find_map(|(field, set)| set.then_some(field))
