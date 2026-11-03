@@ -6,6 +6,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod jsonl;
+
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
 /// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
 /// test-only `observe` seam.
@@ -164,6 +166,7 @@ macro_rules! codex_cursor_events {
 pub(crate) use codex_cursor_events;
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod change_reason;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
@@ -695,7 +698,8 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const UNSELECTED_REASONS: usize = PAGE_SELECTION_START + 4;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
+const UNSELECTED_REASONS: usize = change_reason::END;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -705,9 +709,13 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
         const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
+fn source_slot(source: &str) -> Option<usize> {
+    ["claude_code", "codex", "pi"]
+        .iter()
+        .position(|s| *s == source)
+}
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
-    let sources = ["claude_code", "codex", "pi"];
-    let Some(slot) = sources.iter().position(|s| *s == source) else {
+    let Some(slot) = source_slot(source) else {
         return 0;
     };
     #[cfg(test)]
@@ -1182,6 +1190,7 @@ impl Probe {
             page_selection: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
+        let jsonl = jsonl::take(source);
         let counts = Counts {
             line_delivery: self
                 .line_delivery
@@ -1248,6 +1257,23 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
+        // Own record, so the page line stays under its size bound (§13).
+        if let Some(change_reasons) = change_reason::drain(source) {
+            #[derive(Serialize)]
+            struct Counts {
+                change_reasons: change_reason::Page,
+            }
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_change_reasons",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: Counts { change_reasons },
+            });
+        }
+        jsonl.emit_page_lines(source);
+        jsonl.alarm_on_consecutive_failures(source);
     }
 }
 
@@ -1405,6 +1431,7 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    jsonl: Option<jsonl::Scope>,
     first_read_bytes: Option<u64>,
 }
 impl StageWindow {
@@ -1417,8 +1444,15 @@ impl StageWindow {
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            jsonl: None,
             first_read_bytes: None,
         }
+    }
+    /// A window that also scopes and reports JSONL line scalars for `source`.
+    pub(crate) fn begin_jsonl(source: &str, stage: &'static str) -> Self {
+        let mut window = Self::begin(source, stage);
+        window.jsonl = Some(jsonl::Scope::begin(source));
+        window
     }
     pub(crate) fn first_read(
         source: crate::snapshots::SnapshotSource,
@@ -1439,13 +1473,19 @@ impl Drop for StageWindow {
             return;
         }
         let observation = self.probe.stage_observation(self.footprint.as_ref());
-        let mut counts = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
+        let first_read = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
             serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
                 "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
         });
-        // Zero exposure is stored as None and stays off the record.
-        if let Some(exposure) = self.probe.refusal_exposure {
-            counts["refusal_exposure"] = serde_json::json!(exposure);
+        #[derive(Serialize)]
+        struct Counts {
+            // Zero exposure is stored as None and stays off the record.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
+            #[serde(flatten)]
+            jsonl: Option<jsonl::Counts>,
+            #[serde(flatten)]
+            first_read: serde_json::Value,
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
@@ -1453,7 +1493,11 @@ impl Drop for StageWindow {
             stage: self.stage,
             source: self.source,
             observation,
-            counts,
+            counts: Counts {
+                refusal_exposure: self.probe.refusal_exposure,
+                jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
+                first_read,
+            },
         });
     }
 }

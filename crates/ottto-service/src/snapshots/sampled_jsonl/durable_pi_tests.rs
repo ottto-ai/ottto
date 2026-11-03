@@ -313,12 +313,12 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
         assert!(row.representation(format, &pin).is_none());
     }
     assert!(row.representation(3, &[0; 32]).is_none());
-    let bytes = encode_body(&original, RECORD_BYTES, 1024 * 1024).unwrap();
+    let bytes = encode_body(&original, RECORD_BYTES).unwrap();
     assert_eq!(bytes, unbounded_body(&original));
     assert_eq!((row.verify)(&mut Dec::new(&bytes)), Ok(()));
     let decoded = decode_body(&bytes, SnapshotSource::Pi).unwrap();
     assert_eq!(
-        encode_body(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
+        encode_body(&decoded.reduction, RECORD_BYTES).unwrap(),
         bytes
     );
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -327,14 +327,8 @@ fn pi_registered_body_rows_preserve_populated_body_bytes() {
         let bytes = unbounded_body(&mismatch);
         assert!(super::super::take_registered(&mut Dec::new(&bytes), SnapshotSource::Pi).is_err());
     }
-    let plan = BodyEncoding::new(
-        &original.accumulator,
-        &original.report,
-        (1, 2, true),
-        1024 * 1024,
-        true,
-    )
-    .unwrap();
+    let plan =
+        BodyEncoding::new(&original.accumulator, &original.report, (1, 2, true), true).unwrap();
     let len = plan.count(RECORD_BYTES).unwrap();
     let mut streamed = Vec::new();
     assert_eq!(plan.write(&mut streamed, len).unwrap(), bytes.len());
@@ -417,13 +411,13 @@ fn pi_registered_bounded_decode_charges_the_shared_graph_and_ledger() {
     use crate::durable_tail_store::{ActiveLease, DurableSource, LeaseWait};
     let original = reduction(ledger());
     let row = DurableSource::Pi.properties();
-    let bytes = encode_body(&original, RECORD_BYTES, 1024 * 1024).unwrap();
+    let bytes = encode_body(&original, RECORD_BYTES).unwrap();
     let LeaseWait::Granted(mut lease) = ActiveLease::acquire("pi") else {
         panic!("isolated active lease");
     };
     let decoded = (row.decode_bounded)(&bytes, SnapshotSource::Pi, &mut lease).unwrap();
     assert_eq!(
-        encode_body(&decoded.reduction, RECORD_BYTES, 1024 * 1024).unwrap(),
+        encode_body(&decoded.reduction, RECORD_BYTES).unwrap(),
         bytes
     );
     drop(decoded);

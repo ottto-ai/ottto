@@ -351,160 +351,180 @@ fn unsupported_layout_lossy_read_carries_debt_through_failed_gc_and_restart() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    with_test_line_cap(64 * 1024, || {
-        with_unsupported_layout_for_test(|| {
-            let f = Fixture::new();
-            let mut initial = f.scan(ScanIndex::default(), None).index;
-            initial.save(&f.index_path()).unwrap();
-            let due = sampled_scan::now_seconds() + 60;
-            let record = f.seed_record_with_debt(&initial, Some(due));
-            let original = fs::read(&record).unwrap();
-            use std::io::Write;
-            // Retryable malformed JSON quarantines the whole entity. Use the
-            // existing terminal over-cap case, which settles healthy siblings but
-            // cannot verify their source history. Charges retain the production cap.
-            let mut transcript = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
-            transcript
-                .write_all(&vec![b'x'; jsonl_line_cap() + 1])
-                .unwrap();
-            transcript.write_all(b"\n").unwrap();
-            transcript.write_all(Fixture::line(2).as_bytes()).unwrap();
-            drop(transcript);
+    with_unsupported_layout_for_test(|| {
+        let f = Fixture::new();
+        let mut initial = f.scan(ScanIndex::default(), None).index;
+        initial.save(&f.index_path()).unwrap();
+        let due = sampled_scan::now_seconds() + 60;
+        let record = f.seed_record_with_debt(&initial, Some(due));
+        let original = fs::read(&record).unwrap();
+        use std::io::Write;
+        // A current valid read followed by a historical persisted loss marker.
+        // GC must preserve the saved carrier independently of the old refusal.
+        let mut transcript = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
+        transcript
+            .write_all(
+                json!({"type":"ignored", "padding":"x".repeat(65537)})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        transcript.write_all(b"\n").unwrap();
+        transcript.write_all(Fixture::line(2).as_bytes()).unwrap();
+        drop(transcript);
 
-            let cache = f.cache();
-            let mut read = f.scan(initial, Some(cache.clone()));
-            assert_eq!(read.modes, (1, 0, 0));
-            assert_eq!(read.bytes, fs::metadata(&f.path).unwrap().len());
-            assert_eq!(read.scan.over_line_cap_count, 1);
-            assert_eq!(read.scan.terminal_over_line_cap_count, 1);
-            assert_eq!(read.scan.malformed_json_line_count, 0);
-            assert_eq!(read.scan.snapshots.len(), 1);
-            assert_eq!(read.scan.snapshots[0].input_tokens, 300);
-            let cold = f.scan(ScanIndex::default(), None);
-            assert_eq!(cold.scan.snapshots.len(), 1);
-            assert_eq!(
-                snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
-                snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0])
-            );
-            assert_eq!(
-                snapshot_upload_body_witness(&read.scan.snapshots[0]),
-                snapshot_upload_body_witness(&cold.scan.snapshots[0])
-            );
-            let key = f.key();
-            let carrier = read.index.files[&key]
-                .unverified_deadline()
-                .expect("lossy selection cannot discharge A's audit debt");
-            assert!(carrier > 0 && carrier <= due);
-            let (counts, _) = cache.durable_counters(SOURCE).unwrap();
-            assert_eq!(counts.ineligible["restore_unavailable.layout"], 1);
-            assert_eq!(
-                counts.ineligible["restore_unavailable.layout.read_failed"],
-                1
-            );
+        let cache = f.cache();
+        let mut read = f.scan(initial, Some(cache.clone()));
+        assert_eq!(read.modes, (1, 0, 0));
+        assert_eq!(read.bytes, fs::metadata(&f.path).unwrap().len());
+        assert_eq!(read.scan.over_line_cap_count, 0);
+        assert_eq!(read.scan.terminal_over_line_cap_count, 0);
+        assert_eq!(read.scan.malformed_json_line_count, 0);
+        assert_eq!(read.scan.snapshots.len(), 1);
+        assert_eq!(read.scan.snapshots[0].input_tokens, 300);
+        let cold = f.scan(ScanIndex::default(), None);
+        assert_eq!(cold.scan.snapshots.len(), 1);
+        assert_eq!(
+            snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
+            snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0])
+        );
+        assert_eq!(
+            snapshot_upload_body_witness(&read.scan.snapshots[0]),
+            snapshot_upload_body_witness(&cold.scan.snapshots[0])
+        );
+        let key = f.key();
+        // A valid read now settles verified and may retire A without a carrier.
+        // The carrier rule below guards a historical lossy settlement.
+        cache.settle_layout_unverified_for_test(SOURCE, &key);
+        // Checked historical completed-loss marker, independent of current parsing.
+        read.index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .scan_identity_version =
+            Some(serde_json::from_str(r#""semantic_sync:v2+sampled_unverified:v2:1:c""#).unwrap());
+        read.index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .set_unverified_deadline(due);
+        let carrier = read.index.files[&key]
+            .unverified_deadline()
+            .expect("lossy selection cannot discharge A's audit debt");
+        assert!(carrier > 0 && carrier <= due);
+        let (counts, _) = cache.durable_counters(SOURCE).unwrap();
+        assert_eq!(counts.ineligible["restore_unavailable.layout"], 1);
+        assert_eq!(
+            counts
+                .ineligible
+                .get("restore_unavailable.layout.read_failed")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
 
-            // Without a persisted carrier, even an actual lossy read is not
-            // authority to delete the only remaining evidence of audit debt.
-            let mut missing_carrier = read.index.clone();
-            missing_carrier
-                .files
-                .get_mut(&key)
-                .unwrap()
-                .scan_identity_version = None;
-            missing_carrier.save(&f.index_path()).unwrap();
+        // Without a persisted carrier, even an actual lossy read is not
+        // authority to delete the only remaining evidence of audit debt.
+        let mut missing_carrier = read.index.clone();
+        missing_carrier
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .scan_identity_version = None;
+        missing_carrier.save(&f.index_path()).unwrap();
+        cache
+            .durable_gc(f.writer, SOURCE, &missing_carrier)
+            .unwrap();
+        assert_eq!(fs::read(&record).unwrap(), original);
+        assert_eq!(
             cache
-                .durable_gc(f.writer, SOURCE, &missing_carrier)
-                .unwrap();
-            assert_eq!(fs::read(&record).unwrap(), original);
-            assert_eq!(
-                cache
-                    .durable_counters(SOURCE)
-                    .unwrap()
-                    .1
-                    .restore_unavailable_layout_gc,
-                0
-            );
-
-            // The negative-control save advanced the real CAS generation.
-            // Reject the stale writer, then carry only this read's audit debt
-            // into the freshly loaded index; never manufacture a generation.
-            assert_eq!(
-                read.index.save(&f.index_path()).unwrap_err().to_string(),
-                "local snapshot scan index changed concurrently"
-            );
-            let mut current = ScanIndex::load(&f.index_path()).unwrap();
-            assert_eq!(current.generation, missing_carrier.generation);
-            assert_eq!(
-                current.files[&key].source_file_fingerprint,
-                read.index.files[&key].source_file_fingerprint
-            );
-            current
-                .files
-                .get_mut(&key)
+                .durable_counters(SOURCE)
                 .unwrap()
-                .carry_sampled_audit(&read.index.files[&key]);
-            assert_eq!(current.files[&key].unverified_deadline(), Some(carrier));
-            read.index = current;
-            finalize_scan_after_policy_with_body_witness(
-                SOURCE,
-                &mut read.scan,
-                &mut read.index,
-                snapshot_upload_body_witness,
-            );
-            read.index.save(&f.index_path()).unwrap();
-            let committed = ScanIndex::load(&f.index_path()).unwrap();
-            assert_eq!(committed.files[&key].unverified_deadline(), Some(carrier));
+                .1
+                .restore_unavailable_layout_gc,
+            0
+        );
 
-            struct ResetUnlink;
-            impl Drop for ResetUnlink {
-                fn drop(&mut self) {
-                    store::test_hooks::set_before_unlink(None);
-                }
+        // The negative-control save advanced the real CAS generation.
+        // Reject the stale writer, then carry only this read's audit debt
+        // into the freshly loaded index; never manufacture a generation.
+        assert_eq!(
+            read.index.save(&f.index_path()).unwrap_err().to_string(),
+            "local snapshot scan index changed concurrently"
+        );
+        let mut current = ScanIndex::load(&f.index_path()).unwrap();
+        assert_eq!(current.generation, missing_carrier.generation);
+        assert_eq!(
+            current.files[&key].source_file_fingerprint,
+            read.index.files[&key].source_file_fingerprint
+        );
+        current
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .carry_sampled_audit(&read.index.files[&key]);
+        assert_eq!(current.files[&key].unverified_deadline(), Some(carrier));
+        read.index = current;
+        finalize_scan_after_policy_with_body_witness(
+            SOURCE,
+            &mut read.scan,
+            &mut read.index,
+            snapshot_upload_body_witness,
+        );
+        read.index.save(&f.index_path()).unwrap();
+        let committed = ScanIndex::load(&f.index_path()).unwrap();
+        assert_eq!(committed.files[&key].unverified_deadline(), Some(carrier));
+
+        struct ResetUnlink;
+        impl Drop for ResetUnlink {
+            fn drop(&mut self) {
+                store::test_hooks::set_before_unlink(None);
             }
-            let reset = ResetUnlink;
-            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let seen = attempts.clone();
-            store::test_hooks::set_before_unlink(Some(Box::new(move |_| {
-                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(std::io::Error::from_raw_os_error(libc::EIO))
-            })));
-            assert!(cache.durable_gc(f.writer, SOURCE, &committed).is_err());
-            assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
-            drop(reset);
-            assert_eq!(fs::read(&record).unwrap(), original);
-            assert_eq!(
-                cache
-                    .durable_counters(SOURCE)
-                    .unwrap()
-                    .1
-                    .restore_unavailable_layout_gc,
-                0
-            );
+        }
+        let reset = ResetUnlink;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        store::test_hooks::set_before_unlink(Some(Box::new(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })));
+        assert!(cache.durable_gc(f.writer, SOURCE, &committed).is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(reset);
+        assert_eq!(fs::read(&record).unwrap(), original);
+        assert_eq!(
+            cache
+                .durable_counters(SOURCE)
+                .unwrap()
+                .1
+                .restore_unavailable_layout_gc,
+            0
+        );
 
-            cache.durable_gc(f.writer, SOURCE, &committed).unwrap();
-            assert!(!record.exists());
-            assert_eq!(
-                cache
-                    .durable_counters(SOURCE)
-                    .unwrap()
-                    .1
-                    .restore_unavailable_layout_gc,
-                1
-            );
-            let restarted_index = ScanIndex::load(&f.index_path()).unwrap();
-            assert_eq!(
-                restarted_index.files[&key].unverified_deadline(),
-                Some(carrier)
-            );
-            let restarted = f.cache();
-            restarted
-                .durable_gc(f.writer, SOURCE, &restarted_index)
-                .unwrap();
-            assert_eq!(
-                restarted_index.files[&key].unverified_deadline(),
-                Some(carrier)
-            );
-        })
-    });
+        cache.durable_gc(f.writer, SOURCE, &committed).unwrap();
+        assert!(!record.exists());
+        assert_eq!(
+            cache
+                .durable_counters(SOURCE)
+                .unwrap()
+                .1
+                .restore_unavailable_layout_gc,
+            1
+        );
+        let restarted_index = ScanIndex::load(&f.index_path()).unwrap();
+        assert_eq!(
+            restarted_index.files[&key].unverified_deadline(),
+            Some(carrier)
+        );
+        let restarted = f.cache();
+        restarted
+            .durable_gc(f.writer, SOURCE, &restarted_index)
+            .unwrap();
+        assert_eq!(
+            restarted_index.files[&key].unverified_deadline(),
+            Some(carrier)
+        );
+    })
 }
 
 /// Retryable JSON corruption withholds a replacement; it may neither emit $0

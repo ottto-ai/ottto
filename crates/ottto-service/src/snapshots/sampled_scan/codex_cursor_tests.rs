@@ -42,12 +42,8 @@ impl Drop for Temp {
     }
 }
 
-fn limits(cursor: u64, singleton: u64, skip_chunk: usize) -> Limits {
-    Limits {
-        cursor,
-        singleton,
-        skip_chunk,
-    }
+fn limits(cursor: u64, singleton: u64, _skip_chunk: usize) -> Limits {
+    Limits { cursor, singleton }
 }
 
 #[test]
@@ -188,68 +184,6 @@ fn reader_input() -> (Vec<u8>, u64, u64) {
     (input, second, frozen)
 }
 
-#[test]
-fn cursor_reader_chunks_overlong_skip_and_freezes_extent() {
-    let (input, second, frozen) = reader_input();
-    let mut reader =
-        BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 64, false);
-    reader.set_chunked_skip(32);
-    // The frozen extent cuts the fourth record five bytes in.
-    reader.set_extent_limit(frozen + 5);
-    let mut seen = Vec::new();
-    assert_eq!(
-        reader.step(|value| seen.push(value.clone())).unwrap(),
-        JsonlReaderStep::Line
-    );
-    assert_eq!(reader.last_complete_line_end(), 8);
-    assert!(!reader.lossy_prefix());
-    let mut partials = 0;
-    loop {
-        match reader.step(|value| seen.push(value.clone())).unwrap() {
-            JsonlReaderStep::Partial => {
-                partials += 1;
-                // A paused skip delivers and counts nothing.
-                assert_eq!(reader.report.physical_line_count, 1);
-                assert!(reader.buf.len() <= 64);
-                // The paused skip holds no prefix byte.
-                assert!(reader.buf.is_empty());
-                if partials == 1 {
-                    // Pause-time shrink (parent ACK): a grown buffer is cut
-                    // back to `max(len, 64 KiB)` with every live byte and the
-                    // skip state kept; the slot charge walks the actual
-                    // capacity, which the rest of this read then reuses.
-                    reader.buf.reserve(1 << 20);
-                    let live = reader.buf.clone();
-                    shrink_paused_buffer(&mut reader.buf);
-                    assert_eq!(reader.buf, live);
-                    assert!(reader.skipping.is_some());
-                    assert!(reader.buf.capacity() >= live.len().max(PAUSED_BUFFER_BYTES));
-                    assert!(reader.buf.capacity() < 1 << 20);
-                }
-            }
-            JsonlReaderStep::Line => break,
-            JsonlReaderStep::Complete(_) => panic!("overlong line must finish"),
-        }
-    }
-    assert!(partials > 0, "the skip paused at least once");
-    assert_eq!(reader.last_complete_line_end(), second);
-    assert_eq!(reader.report.over_line_cap_count, 1);
-    assert!(reader.lossy_prefix());
-    assert_eq!(
-        reader.step(|value| seen.push(value.clone())).unwrap(),
-        JsonlReaderStep::Line
-    );
-    assert!(matches!(
-        reader.step(|value| seen.push(value.clone())).unwrap(),
-        JsonlReaderStep::Complete(_)
-    ));
-    assert!(reader.sealed_fragment());
-    assert_eq!(reader.consumed_bytes(), frozen + 5);
-    assert_eq!(reader.last_complete_line_end(), frozen);
-    assert_eq!(reader.report.physical_line_count, 3);
-    assert_eq!(seen, vec![json!({"n":1}), json!({"n":2})]);
-}
-
 /// At sealed cursor completion a final record
 /// without its newline at or before the frozen extent is never parsed,
 /// counted or certified, even when no byte beyond the extent is visible.
@@ -260,15 +194,14 @@ fn sealed_completion_withholds_unterminated_record_even_at_end_of_file() {
     let sealed = input.len() as u64;
     input.extend_from_slice(b"{\"n\":3}");
     let read = |extent: Option<u64>| {
-        let mut reader =
-            BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 64, false);
+        let mut reader = BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()));
         if let Some(extent) = extent {
             reader.set_extent_limit(extent);
         }
         let mut seen = Vec::new();
         loop {
             match reader.step(|value| seen.push(value.clone())).unwrap() {
-                JsonlReaderStep::Line | JsonlReaderStep::Partial => {}
+                JsonlReaderStep::Line => {}
                 JsonlReaderStep::Complete(report) => return (seen, report, reader),
             }
         }
@@ -361,18 +294,16 @@ fn lossy_identity_grant_revalidates_held_object_and_selected_path() {
 }
 
 #[test]
-fn chunked_reader_matches_unchunked_reader_without_extent() {
+/// [behaviour] Read-buffer windows preserve complete records and byte accounting.
+fn read_buffer_windows_preserve_complete_records_without_extent() {
     let (input, _, _) = reader_input();
-    let read = |chunked: bool| {
+    let read = |capacity: usize| {
         let mut reader =
-            BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 64, true);
-        if chunked {
-            reader.set_chunked_skip(32);
-        }
+            BoundedJsonlReader::new(BufReader::with_capacity(capacity, input.as_slice()));
         let mut seen = Vec::new();
         loop {
             match reader.step(|value| seen.push(value.clone())).unwrap() {
-                JsonlReaderStep::Line | JsonlReaderStep::Partial => {}
+                JsonlReaderStep::Line => {}
                 JsonlReaderStep::Complete(report) => {
                     assert!(!reader.sealed_fragment());
                     return (seen, report, reader.consumed_bytes());
@@ -380,13 +311,13 @@ fn chunked_reader_matches_unchunked_reader_without_extent() {
             }
         }
     };
-    let chunked = read(true);
-    assert_eq!(chunked, read(false));
+    let chunked = read(16);
+    assert_eq!(chunked, read(1024));
     assert_eq!(chunked.2, input.len() as u64);
     assert_eq!(chunked.1.physical_line_count, 4);
 }
 
-/// An overlong Codex row whose capped prefix carries the salvage envelope.
+/// A Codex row spanning several input-buffer windows.
 fn overlong_envelope_row() -> Vec<u8> {
     format!(
         "{{\"timestamp\":\"2026-10-07T10:30:00Z\",\"ordinal\":7,\"type\":\"response_item\",\"payload\":\"{}\"}}",
@@ -397,7 +328,7 @@ fn overlong_envelope_row() -> Vec<u8> {
 
 /// A withheld final record applied at a genuine EOF matches a
 /// read without an extent applying its trailing line, for a valid, a
-/// malformed and an overlong record (whose salvage was taken early).
+/// malformed and larger record.
 #[test]
 fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     for last in [
@@ -409,9 +340,8 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
         input.extend_from_slice(&last);
         let read = |cursor: bool| {
             let mut reader =
-                BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 96, true);
+                BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()));
             if cursor {
-                reader.set_chunked_skip(32);
                 reader.set_extent_limit(input.len() as u64);
             }
             let mut seen = Vec::new();
@@ -430,54 +360,6 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
         };
         assert_eq!(read(true), read(false));
     }
-}
-
-/// A paused cursor skip holds no prefix byte, so a pause never
-/// charges the salvage prefix, and its salvage (taken from the capped
-/// prefix when the skip first paused) is the envelope an unchunked read
-/// takes at the newline, value for value.
-#[test]
-fn paused_overlong_skip_salvages_early_with_identical_output() {
-    let mut input = codex_line(json!({"n": 1}));
-    input.extend(overlong_envelope_row());
-    input.push(b'\n');
-    input.extend(codex_line(json!({"n": 2})));
-    let read = |chunked: bool| {
-        let mut reader =
-            BoundedJsonlReader::new(BufReader::with_capacity(16, input.as_slice()), 96, true);
-        if chunked {
-            reader.set_chunked_skip(32);
-        }
-        let mut seen = Vec::new();
-        let mut partials = 0;
-        loop {
-            match reader.step(|value| seen.push(value.clone())).unwrap() {
-                JsonlReaderStep::Partial => {
-                    partials += 1;
-                    assert!(reader.skipping.is_some());
-                    assert!(reader.buf.is_empty(), "no prefix byte is held");
-                }
-                JsonlReaderStep::Line => {}
-                JsonlReaderStep::Complete(report) => return (seen, report, partials),
-            }
-        }
-    };
-    let (chunked, chunked_report, partials) = read(true);
-    let (unchunked, unchunked_report, unchunked_partials) = read(false);
-    assert!(partials > 0, "the skip paused");
-    assert_eq!(unchunked_partials, 0);
-    assert_eq!(chunked, unchunked);
-    assert_eq!(chunked_report, unchunked_report);
-    assert_eq!(chunked_report.over_line_cap_count, 1);
-    assert_eq!(
-        chunked,
-        vec![
-            json!({"n": 1}),
-            json!({"timestamp": "2026-10-07T10:30:00Z",
-                "type": "oversized_payload_skipped", "ordinal": 7}),
-            json!({"n": 2}),
-        ]
-    );
 }
 
 fn disclosure() -> Disclosure {
@@ -2756,196 +2638,6 @@ fn grown_unterminated_last_record_stays_withheld() {
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
     });
-}
-
-/// A lossy cursor job whose file grew past its
-/// frozen extent publishes UNCERTIFIED through its same-object identity
-/// proof: main's semantic output for the object it read, the original debt
-/// and age kept, no checkpoint, copy or verification. Before the grant its
-/// `finish` refused (`jobs_finish_failed`). The loss is an overlong line
-/// (terminal salvage loss main publishes; a malformed line is retryable and
-/// main publishes nothing). Controls: a replaced path or a shrunk file
-/// publishes nothing from that attempt.
-///
-/// `stable` (AD-1's named lossy-stable residual control, design §3.2): the
-/// same lossy job on an unchanged file refuses as `Lossy` before AD-1's
-/// verify-at-commit arm. It publishes uncertified, keeps its due marker, and
-/// is re-read in full every later census generation (one cursor job each,
-/// never certified). Disclosed residual: lossy keeps its obligation.
-#[test]
-fn lossy_grown_job_publishes_uncertified_through_same_object_identity() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
-    let now = 1_900_000_000_u64;
-    let due = now + 100;
-    let mut overlong = br#"{"timestamp":"2026-10-07T10:30:00Z","type":"event_msg","payload":{"type":"agent_message","message":""#.to_vec();
-    overlong.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
-    overlong.extend_from_slice(b"\"}}\n");
-    for case in ["grow", "replace", "shrink", "stable"] {
-        clock.set(now);
-        let fixture = ScanRoot::new(20);
-        fixture.append(SESSION, &overlong);
-        for n in 21..=40 {
-            fixture.append(SESSION, &token_line(n));
-        }
-        let path = fixture.file(SESSION);
-        let key = local_index_key(&path);
-        // A recorded entry that owes `due`; an append then selects the file.
-        let (mut seeded, _) = page(
-            &fixture,
-            ScanIndex::default(),
-            Some(Arc::new(SharedCache::default())),
-        );
-        seeded
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .set_unverified_deadline(due);
-        fixture.append(SESSION, &token_line(41));
-        // Main's sampled lossy read of the same object from the same index.
-        let (main_index, main) = page(
-            &fixture,
-            seeded.clone(),
-            Some(Arc::new(SharedCache::default())),
-        );
-        assert!(!main.snapshots.is_empty(), "main publishes terminal loss");
-        let deadline = |index: &ScanIndex| {
-            index
-                .files
-                .get(&key)
-                .and_then(ScanIndexEntry::unverified_deadline)
-        };
-        assert_eq!(deadline(&main_index), Some(due), "main keeps the debt");
-        let cache = Arc::new(SharedCache::default());
-        with_test_limits(2048, 1024, 64, || {
-            let (mut index, first) = page(&fixture, seeded.clone(), Some(Arc::clone(&cache)));
-            assert!(first.snapshots.is_empty(), "{case}: paused");
-            assert_eq!(
-                counter(&cache, |c| c.jobs_paused),
-                1,
-                "{case}: {}",
-                counters(&cache)
-            );
-            match case {
-                "grow" => fixture.append(SESSION, &token_line(42)),
-                "stable" => {}
-                "replace" => {
-                    let replacement = path.with_extension("replacement");
-                    fs::copy(&path, &replacement).unwrap();
-                    OpenOptions::new()
-                        .append(true)
-                        .open(&replacement)
-                        .unwrap()
-                        .write_all(&token_line(42))
-                        .unwrap();
-                    fs::rename(&replacement, &path).unwrap();
-                }
-                _ => OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .unwrap()
-                    .set_len(fixture.len(SESSION) / 2)
-                    .unwrap(),
-            }
-            let ended = |cache: &SharedCache| match case {
-                "grow" | "stable" => {
-                    counter(cache, |c| c.jobs_uncertified + c.jobs_finish_failed) > 0
-                }
-                "replace" => counter(cache, |c| c.jobs_unavailable_ended) > 0,
-                _ => counter(cache, |c| c.jobs_invalidated) > 0,
-            };
-            let mut ending = None;
-            for _ in 0..64 {
-                let (next, scan, _) = page_steps(
-                    &fixture,
-                    index,
-                    Some(Arc::clone(&cache)),
-                    "cursor-fixture",
-                    NOW,
-                    |_| {},
-                    10_000,
-                );
-                index = next;
-                if ended(&cache) {
-                    ending = Some(scan);
-                    break;
-                }
-                assert!(
-                    scan.snapshots.is_empty(),
-                    "{case}: a paused job publishes nothing"
-                );
-            }
-            let ending = ending.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
-            assert_eq!(counter(&cache, |c| c.jobs_finish_failed), 0, "{case}");
-            assert_eq!(counter(&cache, |c| c.jobs_certified), 0, "{case}");
-            assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
-            if case != "grow" && case != "stable" {
-                assert!(ending.snapshots.is_empty(), "{case}: nothing published");
-                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 0, "{case}");
-                return;
-            }
-            assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
-            assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0, "{case}");
-            assert_eq!(
-                fingerprints(&ending),
-                fingerprints(&main),
-                "{case}: main's semantic output for the object read"
-            );
-            assert_eq!(
-                deadline(&index),
-                Some(due),
-                "{case}: original debt and age kept"
-            );
-            if case != "stable" {
-                return;
-            }
-            // Later generations past the due marker: every one re-reads the
-            // unchanged file in full and keeps the deadline (no AD-1 clear).
-            let mut later = due;
-            let mut page_number = 0;
-            for generation in 1..=3 {
-                later += interval + 1;
-                clock.set(later);
-                let started = counter(&cache, |c| c.jobs_started);
-                let uncertified = counter(&cache, |c| c.jobs_uncertified);
-                let mut reread = false;
-                for _ in 0..64 {
-                    page_number += 1;
-                    let (next, _, _) = page_steps(
-                        &fixture,
-                        index,
-                        Some(Arc::clone(&cache)),
-                        "cursor-fixture",
-                        &collected_at(page_number),
-                        |_| {},
-                        10_000,
-                    );
-                    index = next;
-                    if counter(&cache, |c| c.jobs_uncertified) > uncertified {
-                        reread = true;
-                        break;
-                    }
-                }
-                assert!(reread, "generation {generation}: {}", counters(&cache));
-                assert_eq!(
-                    counter(&cache, |c| c.jobs_started),
-                    started + 1,
-                    "generation {generation}: one full re-read"
-                );
-                assert_eq!(counter(&cache, |c| c.jobs_certified), 0);
-                assert_eq!(counter(&cache, |c| c.jobs_finish_failed), 0);
-                assert!(cache.retained_checkpoint(&key).is_none(), "no copy");
-                assert_eq!(
-                    deadline(&index),
-                    Some(due),
-                    "generation {generation}: the deadline never moves"
-                );
-            }
-        });
-    }
 }
 
 /// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
@@ -6628,51 +6320,6 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
     assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
 }
 
-/// T2: a held fork with a terminal over-line-cap line (one line past
-/// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
-/// `over_line_cap` and the terminal trio included, equals a cold read.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
-    let home = CreatedThreadHome::new(10, true);
-    let mut row = format!(
-        "{{\"timestamp\":\"{}\",\"type\":\"response_item\",\"payload\":\"",
-        bounded_rfc3339_millis(home.base_ms + 7_000).unwrap()
-    )
-    .into_bytes();
-    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
-    row.extend_from_slice(b"\"}\n");
-    OpenOptions::new()
-        .append(true)
-        .open(&home.path)
-        .unwrap()
-        .write_all(&row)
-        .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
-    assert_eq!(held.over_line_cap_count, 1, "{}", counters(&cache));
-    assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        1,
-        "{}",
-        counters(&cache)
-    );
-    let (index, quiet) = home.generation(index, &cache, 1);
-    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    let cold = home.oracle(1).1;
-    assert_eq!(replayed_census(&quiet), replayed_census(&cold));
-    assert_eq!(quiet.over_line_cap_count, 1);
-    assert_eq!(
-        quiet.terminal_over_line_cap_count,
-        held.terminal_over_line_cap_count
-    );
-    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
-}
-
 /// T3: a non-monotone hold (`AwaitingLegacyTrigger`: a subagent fork with
 /// copied usage and no trigger turn) is memoized at its read end: unchanged
 /// it hits exactly; grown, it is an exact-stamp miss and is read again. Its
@@ -9168,7 +8815,7 @@ fn parent_debt(scan: &SourceScanResult) -> u64 {
         + causes[CodexParentUnresolvable::ParentLossy.index()]
 }
 
-/// One line past `MAX_JSONL_LINE_BYTES` (an image row) appended to `path`:
+/// One line past `16_777_216` (an image row) appended to `path`:
 /// a terminal over-line-cap loss, so a complete parse of the file records a
 /// terminal disposition and publishes no ledger.
 fn append_oversized_line(path: &Path) {
@@ -9176,7 +8823,7 @@ fn append_oversized_line(path: &Path) {
         \"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\
         \"image_url\":\""
         .to_vec();
-    row.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+    row.extend(std::iter::repeat_n(b'x', 16_777_216 + 1));
     row.extend_from_slice(b"\"}]}}\n");
     OpenOptions::new()
         .append(true)
@@ -9184,66 +8831,6 @@ fn append_oversized_line(path: &Path) {
         .unwrap()
         .write_all(&row)
         .unwrap();
-}
-
-/// P-T34: event (c). P's only rollout ends in a terminal
-/// over-line-cap line, so its one complete parse records a terminal
-/// disposition and no ledger. When C requests P, the unchanged P is skipped
-/// and witnessed `ParentLossy` at its probed identity instead of being read
-/// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
-/// nothing is read.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    append_oversized_line(&home.fixture.file(PARENT));
-    let parent = file_name(&home.fixture.file(PARENT));
-    let lossy = only(CodexParentUnresolvable::ParentLossy, 1);
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut parent_parses = 0;
-    let mut held_at = None;
-    let mut history = Vec::new();
-    for n in 0..6 {
-        let ((next, scan), parsed) = parses(|| home.generation(index, &cache, n));
-        index = next;
-        parent_parses += parsed.iter().filter(|name| **name == parent).count();
-        history.push(format!(
-            "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
-            parent_causes(&scan),
-            restarts_in_scope(&scan)
-        ));
-        assert!(session_usage(&scan, CHILD).is_empty(), "{history:#?}");
-        if held_at.is_some() {
-            assert!(parsed.is_empty(), "{history:#?}");
-            assert_eq!(parent_causes(&scan), lossy, "{history:#?}");
-        } else if parent_causes(&scan) == lossy {
-            held_at = Some(n);
-        }
-    }
-    let held_at =
-        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(&cache)));
-    assert!(held_at <= 2, "{history:#?}");
-    assert_eq!(parent_parses, 1, "{history:#?}");
-    assert!(index
-        .terminal_jsonl_dispositions
-        .contains_key(&local_index_key(&home.fixture.file(PARENT))));
-    assert!(index.codex_parent_ownership_refs.contains(PARENT));
-    assert!(!index
-        .codex_parent_ownership_ledgers
-        .get(PARENT)
-        .is_some_and(|ledger| ledger.scan_complete));
-    let witness = witness_of(&cache, "cursor-fixture", PARENT);
-    assert!(
-        witness.as_ref().is_some_and(|witness| witness.cause
-            == CodexParentUnresolvable::ParentLossy
-            && witness.identity.is_some()
-            && witness.waits_on.is_none()),
-        "{witness:?}"
-    );
 }
 
 /// P-T34's duplicate-copy leg: a lossy P is read once and recorded with a
@@ -9261,7 +8848,7 @@ fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs macOS heap layout"
 )]
-fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
+fn duplicated_large_parent_is_never_witnessed_parent_lossy() {
     const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
     let fixture = ScanRoot::with_sessions(&[]);
     fs::write(fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
@@ -9272,7 +8859,7 @@ fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
         index = fixture_generation(&fixture, &cache, index, n).0;
     }
     assert!(
-        index
+        !index
             .terminal_jsonl_dispositions
             .contains_key(&local_index_key(&fixture.file(PARENT))),
         "{}",
@@ -9899,19 +9486,6 @@ fn proof_take_is_mine_busy_stale_or_mismatched() {
     let ((), counts) = observe(|| lease.finish());
     assert_eq!(proof_drops(counts), 0);
     assert_eq!(cache.proof_suspended_for_test(), None);
-}
-
-/// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context
-/// and the job's walked charge.
-#[test]
-fn proof_room_keeps_the_headroom() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let context = zero_context(&Arc::new(SharedCache::default()), "ns-a");
-    let resident = crate::heap_layout_bound::bound(&context, state_bytes()).unwrap();
-    let exact = state_bytes() - resident - PROOF_STEP_HEADROOM_BYTES;
-    assert_eq!(proof_room(&context), Some(exact));
 }
 
 /// ss-6: the retained insert reserves main's cursor term, so its decision is

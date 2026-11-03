@@ -312,7 +312,7 @@ impl Rig {
     }
 }
 
-/// Keep readable native A while main's real terminal-loss settlement records B.
+/// Keep readable native A beside a historical persisted terminal-loss extent B.
 /// Repair only the terminal row, adding healthy usage on the same object: A < C < B.
 fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
     let mut rig = Rig::new(SnapshotSource::ClaudeCode, "m3-due-lossy-shrink");
@@ -335,10 +335,12 @@ fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
         .append(true)
         .open(&path)
         .unwrap()
-        .write_all(&("x".repeat(jsonl_line_cap() + 1) + "\n").into_bytes())
+        .write_all(
+            &(json!({"type":"ignored", "padding":"x".repeat(65537)}).to_string() + "\n")
+                .into_bytes(),
+        )
         .unwrap();
-    // No store slot here: an actual Full records the lossy extent without
-    // replacing A or inventing a checkpoint, scope, receipt or accepted body.
+    // Read current metadata without a native store; then decode historical loss provenance.
     let (index, _) = scan(
         rig.source,
         &rig.sessions,
@@ -348,6 +350,9 @@ fn lossy_shrink_rig() -> (Rig, Vec<u8>) {
     );
     rig.index = index;
     let key = rig.key(SESSION_A);
+    // Historical persisted completed-loss provenance; new reads have no size loss.
+    rig.index.files.get_mut(&key).unwrap().scan_identity_version =
+        Some(serde_json::from_str(r#""semantic_sync:v2+sampled_unverified:v2:1:c""#).unwrap());
     assert!(rig.index.files[&key].has_unverified_source());
     let b = rig.index.files[&key].size_bytes;
     assert_eq!(b, fs::metadata(&path).unwrap().len());
@@ -408,7 +413,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    with_test_line_cap(64 * 1024, || {
+    {
         let (mut rig, record) = lossy_shrink_rig();
         let key = rig.key(SESSION_A);
         let corrected = rig.pass();
@@ -437,7 +442,7 @@ fn m3_due_matching_record_lossy_shrink_full_verifies_once_across_restart() {
         assert_eq!(quiet.published(SESSION_A), 0);
         assert_eq!(owed_shrink_fulls(&quiet), 0);
         assert_eq!(owed_shrink_completed_fulls(&quiet), 0);
-    });
+    };
 }
 
 /// [regress] Due lossy-shrink recovery verifies once and retains the accepted floor.
@@ -447,7 +452,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    with_test_line_cap(64 * 1024, || {
+    {
         for (control, expected_counter) in [
             ("verified_extent", "accepted_body_floor"),
             ("future_revision", "stale_hold"),
@@ -546,7 +551,7 @@ fn m3_due_shrink_floor_controls_and_aged_held_growth_preserve_catchup() {
             rig.restart();
             assert_eq!(rig.pass().full(), 0);
         }
-    });
+    };
 }
 
 struct ClearFaults;

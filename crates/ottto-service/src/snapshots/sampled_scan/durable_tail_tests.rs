@@ -78,12 +78,7 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
         let taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
         assert!(taken.durable.is_empty());
         let address = &*taken as *const _ as usize;
-        let body = codec::encode(
-            &taken.retained.state,
-            store::BODY_BYTES,
-            jsonl_line_cap() as u64,
-        )
-        .unwrap();
+        let body = codec::encode(&taken.retained.state, store::BODY_BYTES).unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let mut parser = owned_parser(SnapshotSource::ClaudeCode, &path, file);
         let debt = (reason == "audit").then_some(AuditDebt {
@@ -109,12 +104,7 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
         let original = rejected.taken.unwrap();
         assert_eq!(&*original as *const _ as usize, address);
         assert_eq!(
-            codec::encode(
-                &original.retained.state,
-                store::BODY_BYTES,
-                jsonl_line_cap() as u64
-            )
-            .unwrap(),
+            codec::encode(&original.retained.state, store::BODY_BYTES).unwrap(),
             body
         );
         assert_eq!(parser.reader.consumed_bytes(), 0, "0 body bytes");
@@ -135,12 +125,7 @@ fn assert_cold_full_body(path: &Path, body: &[u8], source: SnapshotSource, scope
     ));
     while !cold.step().unwrap() {}
     assert_eq!(
-        codec::encode(
-            &cold.durable_test_reduction_copy(),
-            store::RECORD_BYTES,
-            jsonl_line_cap() as u64
-        )
-        .unwrap(),
+        codec::encode(&cold.durable_test_reduction_copy(), store::RECORD_BYTES).unwrap(),
         body
     );
     let checkpoint = match cold
@@ -1029,7 +1014,7 @@ fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     );
     let scope = Scope("aggregate-file".into());
     let (reduction, _) = native_record_of(&path, &scope, SnapshotSource::Codex);
-    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
     assert!(
         body.len() >= 1024 * 1024,
         "the real open-call id is retained"
@@ -1850,7 +1835,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
         .unwrap()
         .binding;
         let (reduction, checkpoint) = native_record(&path, &scope);
-        let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let body = codec::encode(&reduction, store::RECORD_BYTES).unwrap();
         let mut store = fixture::store(&index_path, durable_source(source).unwrap());
         store
             .write_after_save(
@@ -2647,12 +2632,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         let (reduction, checkpoint) = native_record(&path, &namespace);
         if arm == "codec" {
             assert!(matches!(
-                codec::encode_permitted(
-                    &reduction,
-                    store::RECORD_BYTES,
-                    jsonl_line_cap() as u64,
-                    true
-                ),
+                codec::encode_permitted(&reduction, store::RECORD_BYTES, true),
                 Err(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
             ));
         }
@@ -3676,8 +3656,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
                 acquisition: fixture_acquisition(source),
                 binding,
                 certificate: certificate(&path, &scope),
-                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
-                    .unwrap(),
+                body: codec::encode(&reduction, store::RECORD_BYTES).unwrap(),
                 allowlist: codec::allowlist_digest(source),
             }],
         )
@@ -3780,8 +3759,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
                 acquisition: fixture_acquisition(source),
                 binding: expected.binding,
                 certificate: certificate(&path, &scope),
-                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
-                    .unwrap(),
+                body: codec::encode(&reduction, store::RECORD_BYTES).unwrap(),
                 allowlist: codec::allowlist_digest(source)
             }]
         )
@@ -3840,18 +3818,8 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
     retail_reads();
     while !parser.step().unwrap() {}
     assert_eq!(retail_reads(), vec![(accepted_end, 3, 0)]);
-    let native = codec::encode(
-        &parser.durable_test_reduction_copy(),
-        store::RECORD_BYTES,
-        jsonl_line_cap() as u64,
-    )
-    .unwrap();
-    let cold = codec::encode(
-        &native_record(&path, &scope).0,
-        store::RECORD_BYTES,
-        jsonl_line_cap() as u64,
-    )
-    .unwrap();
+    let native = codec::encode(&parser.durable_test_reduction_copy(), store::RECORD_BYTES).unwrap();
+    let cold = codec::encode(&native_record(&path, &scope).0, store::RECORD_BYTES).unwrap();
     assert_eq!(
         native, cold,
         "native reduction, distinct from the emitted-money oracle"
@@ -4144,7 +4112,7 @@ fn other_source_restore_after_return_release(
         effective_revision(source),
         &acquired::ImmutableCounting::from_reduction(&reduction).unwrap(),
     );
-    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
     let mut disk = fixture::store(&index_path, ds);
     assert_eq!(
         disk.write_after_save(
@@ -4187,12 +4155,7 @@ fn other_source_restore_after_return_release(
             .into_test_option()
             .expect("other-source actual cold restore after terminal release");
         assert_eq!(
-            codec::encode(
-                &restored.retained.state,
-                store::BODY_BYTES,
-                jsonl_line_cap() as u64
-            )
-            .unwrap(),
+            codec::encode(&restored.retained.state, store::BODY_BYTES).unwrap(),
             body
         );
         drop(restored);
@@ -5183,12 +5146,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
             acquisition: fixture_acquisition(source),
             binding,
             certificate: certificate(&path, &scope),
-            body: codec::encode(
-                &native_record(&path, &scope).0,
-                store::RECORD_BYTES,
-                jsonl_line_cap() as u64,
-            )
-            .unwrap(),
+            body: codec::encode(&native_record(&path, &scope).0, store::RECORD_BYTES).unwrap(),
             allowlist: codec::allowlist_digest(source),
         }],
     )
@@ -6885,7 +6843,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
         source,
         binding,
         certificate(&path, &scope),
-        codec::encode(&native, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap(),
+        codec::encode(&native, store::RECORD_BYTES).unwrap(),
     );
     let mut disk = fixture::store(&index_path, DurableSource::ClaudeCode);
     assert_eq!(
@@ -7630,7 +7588,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
     let cache = fixture::cache(source, &index_path, &namespace, false);
     let admit = |fingerprint: &str| {
         let (reduction, checkpoint) = counted_codex_record_of(&path, &scope);
-        let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+        let body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
         assert!(cache.insert_admitted(
             key.clone(),
             native_v3_completion(&cache, &path, source, reduction, checkpoint),
@@ -7762,12 +7720,7 @@ fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_f
         panic!("expected actual disk restore");
     };
     assert_eq!(
-        codec::encode(
-            &taken.retained.state,
-            store::BODY_BYTES,
-            jsonl_line_cap() as u64
-        )
-        .unwrap(),
+        codec::encode(&taken.retained.state, store::BODY_BYTES).unwrap(),
         body
     );
     assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
@@ -8112,13 +8065,7 @@ fn consent_off_preserves_pl_records_and_key_absence_still_erases() {
                         Some(1),
                     );
                 }
-                let body = codec::encode_permitted(
-                    &reduction,
-                    store::RECORD_BYTES,
-                    jsonl_line_cap() as u64,
-                    true,
-                )
-                .unwrap();
+                let body = codec::encode_permitted(&reduction, store::RECORD_BYTES, true).unwrap();
                 assert_eq!(codec::body_has_skill_labels(source, &body), Ok(true));
                 let mut disk = DurableTailStore::new(dir.clone(), ds);
                 disk.mark_private_labels(lock, key).unwrap();
@@ -11383,12 +11330,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
         .unwrap()
         .write_all(prompt.as_bytes())
         .unwrap();
-    let body = codec::encode(
-        &native_record(&path, &scope).0,
-        store::BODY_BYTES,
-        jsonl_line_cap() as u64,
-    )
-    .unwrap();
+    let body = codec::encode(&native_record(&path, &scope).0, store::BODY_BYTES).unwrap();
     assert!(codec::decode(&body, source)
         .unwrap()
         .without_rederive()
@@ -11426,12 +11368,7 @@ fn certificate_io_precedes_decode_and_rederive_refusals() {
     lease.release();
     // Empty obligations are a positive decode, but never bypass certificate IO.
     native_fixture(&path);
-    record.record.body = codec::encode(
-        &native_record(&path, &scope).0,
-        store::BODY_BYTES,
-        jsonl_line_cap() as u64,
-    )
-    .unwrap();
+    record.record.body = codec::encode(&native_record(&path, &scope).0, store::BODY_BYTES).unwrap();
     record.record.certificate = certificate(&path, &scope);
     assert!(codec::decode(&record.record.body, source)
         .unwrap()
@@ -11609,8 +11546,7 @@ fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_p
             let key = local_index_key(&path);
             let cache = fixture::cache(source, &index_path, &namespace, false);
             let (reduction, checkpoint) = native_record_of(&path, &scope, source);
-            let expected_body =
-                codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+            let expected_body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
             assert!(cache.insert_admitted(
                 key.clone(),
                 native_v3_completion(&cache, &path, source, reduction, checkpoint),
@@ -11715,10 +11651,9 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
     let source = SnapshotSource::Codex;
     let namespace = Scope("dt-budget".into());
     let scope = Scope("dt-budget-file".into());
-    let cap = jsonl_line_cap() as u64;
     let body_of = |path: &Path| {
         let (reduction, checkpoint) = native_record_of(path, &scope, source);
-        let body = codec::encode(&reduction, store::RECORD_BYTES, cap).unwrap();
+        let body = codec::encode(&reduction, store::RECORD_BYTES).unwrap();
         (reduction, checkpoint, body)
     };
     let entry = |path: &Path, fingerprint: &str| -> ScanIndexEntry {
@@ -12034,12 +11969,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
                 acquisition: fixture_acquisition(source),
                 binding,
                 certificate: certificate(&path, &scope),
-                body: codec::encode(
-                    &native_record(&path, &scope).0,
-                    store::RECORD_BYTES,
-                    jsonl_line_cap() as u64,
-                )
-                .unwrap(),
+                body: codec::encode(&native_record(&path, &scope).0, store::RECORD_BYTES).unwrap(),
                 allowlist: codec::allowlist_digest(source),
             }],
         )
@@ -12146,7 +12076,7 @@ fn v3_counting_provenance_comes_from_each_decoded_reduction() {
             .unwrap();
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
-        let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let body = codec::encode(&reduction, store::RECORD_BYTES).unwrap();
         let key = local_index_key(&path);
         let namespace = Scope("counting-namespace".into());
         let index_path = root.join("index.json");
