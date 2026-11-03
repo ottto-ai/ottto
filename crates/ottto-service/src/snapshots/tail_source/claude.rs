@@ -220,6 +220,10 @@ impl TailSource for Claude {
         if acc.codex_agent_label.is_some() {
             return Err(Refuse::NonEmpty("SnapshotAccumulator.codex_agent_label"));
         }
+        // A Claude parse never holds the Codex prelude; its fact is Codex's.
+        if acc.session_start.has_codex_prelude() {
+            return Err(Refuse::NonEmpty("SessionStartState.codex_prelude"));
+        }
         let scalars = (
             view.recognized_usage_drop_count,
             view.positive_recognized_usage_count,
