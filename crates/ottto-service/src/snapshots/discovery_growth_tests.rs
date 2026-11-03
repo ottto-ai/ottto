@@ -440,6 +440,54 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         encoded["files"][&key].get("codex_fragment").is_none(),
         "RAM only"
     );
+    // Main reloads the index every pass (snapshot_sync's per-pass load) and
+    // never serializes the RAM-only fragment custody, so each reloaded pass
+    // re-reads the fragment only: a Tail from the committed prefix, bounded
+    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
+    // The existing repeat counter counts each such pass, and the withheld
+    // record adds no usage. These passes run before the metadata-only change
+    // below, as production's re-read sees an unchanged file: once reloaded,
+    // the entry has no fragment record to adopt a stored ctime against.
+    let bound = index.clone();
+    let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
+    let baseline_input: u64 = baseline.snapshots.iter().map(|s| s.input_tokens).sum();
+    for pass in 0..2 {
+        let (next, scan, reads, rows) = f.page(source, index);
+        let modes = reads.0.lock().unwrap().0.clone();
+        let repeats = rows
+            .iter()
+            .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
+            .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "CODEX_FRAGMENT_REREAD pass={pass} scanned={} reads={modes:?} fragment_bytes={fragment_bytes} repeats={repeats:?}",
+            scan.scanned_file_count
+        );
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "pass {pass}: the reloaded pass re-reads the fragment"
+        );
+        assert_eq!(
+            modes,
+            vec![growth_mode()],
+            "pass {pass}: one read, never a Full"
+        );
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(
+                repeats,
+                vec![(json!(1), Some(fragment_bytes))],
+                "pass {pass}: one fragment-only Tail, byte-bounded to the fragment"
+            );
+        }
+        assert!(
+            scan.snapshots
+                .iter()
+                .all(|snapshot| snapshot.input_tokens <= baseline_input),
+            "pass {pass}: the withheld record adds no usage"
+        );
+        assert!(next.files[&key].has_unverified_source());
+        index = next;
+    }
     // Metadata-only change: the certified prefix still names the observed EOF,
     // so ctime adoption must use that extent, not just the committed prefix.
     use std::os::unix::fs::PermissionsExt;
@@ -451,10 +499,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        discovery_retention!(index),
+        discovery_retention!(bound),
     )
     .unwrap();
-    let entry = &index.files[&key];
+    let entry = &bound.files[&key];
     assert_ne!(
         entry.size_bytes, metadata_only.size_bytes,
         "certified prefix"
@@ -477,7 +525,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "the adopted trigger keeps known_fragment bound to the sampled fingerprint"
     );
     assert_eq!(
-        index.candidate_decision_with_reason(&metadata_only),
+        bound.candidate_decision_with_reason(&metadata_only),
         (CandidateDecision::Skip, None),
         "metadata alone cannot select TranscriptChanged or another acquisition"
     );
@@ -485,7 +533,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     // neither growth nor owed growth.
     let metadata = fs::metadata(&f.path).unwrap();
     let page = discovery_growth::Page::default();
-    let retention = discovery_retention!(index, &page);
+    let retention = discovery_retention!(bound, &page);
     retention.observe_stamped_growth(
         &f.path,
         metadata.len(),
@@ -507,67 +555,12 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .iter()
         .any(|row| row.to_string().contains("\"grown\":1")));
     assert_eq!(
-        page.counts(&index, now)
+        page.counts(&bound, now)
             .discovery_retained_grown_fate
             .still_retained,
         0,
         "known fragment is excluded from growth population"
     );
-    // Main reloads the index every pass (snapshot_sync's per-pass load) and
-    // never serializes the RAM-only fragment custody, so each reloaded pass
-    // re-reads the fragment only: a Tail from the committed prefix, bounded
-    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
-    // The withheld record adds no usage.
-    let bound = index.clone();
-    let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
-    let baseline_input: u64 = baseline.snapshots.iter().map(|s| s.input_tokens).sum();
-    for pass in 0..2 {
-        let (next, scan, reads, rows) = f.page(source, index);
-        let modes = reads.0.lock().unwrap().0.clone();
-        assert!(
-            modes.iter().all(|mode| *mode == growth_mode()),
-            "pass {pass}: never a Full: {modes:?}"
-        );
-        assert!(
-            scan.scanned_file_count <= 1 && modes.len() <= 1,
-            "pass {pass}: at most the one fragment re-read"
-        );
-        let repeats = rows
-            .iter()
-            .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
-            .map(|repeat| {
-                assert_eq!(repeat["files"], json!(1), "pass {pass}");
-                repeat["bytes"].as_u64().unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            repeats.iter().all(|bytes| *bytes == fragment_bytes),
-            "pass {pass}: byte-bounded to the fragment ({fragment_bytes}): {repeats:?}"
-        );
-        if pass == 0 {
-            assert_eq!(
-                scan.scanned_file_count, 1,
-                "the reloaded pass re-reads the fragment"
-            );
-            assert_eq!(modes, vec![growth_mode()]);
-            if crate::heap_layout_bound::layout_supported() {
-                assert_eq!(repeats, vec![fragment_bytes], "one fragment-only Tail");
-            }
-        }
-        eprintln!(
-            "CODEX_FRAGMENT_REREAD pass={pass} reads={} fragment_bytes={fragment_bytes} repeat_bytes={}",
-            modes.len(),
-            repeats.iter().sum::<u64>()
-        );
-        assert!(
-            scan.snapshots
-                .iter()
-                .all(|snapshot| snapshot.input_tokens <= baseline_input),
-            "pass {pass}: the withheld record adds no usage"
-        );
-        assert!(next.files[&key].has_unverified_source());
-        index = next;
-    }
     // Portable completion seam: two ordinary index reloads lose only the RAM
     // witness. A real revalidated Tail plan/native reader consumes the known
     // fragment only. This does not claim a native cache-owner test on Linux.
