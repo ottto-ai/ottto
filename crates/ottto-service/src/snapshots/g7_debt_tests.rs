@@ -188,8 +188,8 @@ impl Fixture {
     }
 }
 
-/// [regress] Arm 1: debt is persisted, so a restart and a failed pass keep the
-/// earliest change. An unchanged, read file with no exact receipt is held debt
+/// [regress] Arm 1, with the never-indexed alarm: debt is persisted, so a
+/// restart and a failed pass keep the earliest change. An unchanged, read file with no exact receipt is held debt
 /// (a stamp match is not acceptance), bootstrapped as a lower bound. A file
 /// that was never indexed is unread debt at its disk size, with a lower-bound
 /// age; outside the discovery window it stays out, and deleted before any ACK
@@ -223,6 +223,7 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
         assert_eq!(debt["outstanding_files"], 2, "{store:?}");
         assert_eq!(debt["held_files"], 1);
         assert_eq!(debt["unread_bytes"], 70);
+        assert_eq!(debt["never_indexed_files"], 1);
         assert_eq!(debt["over_6h_files"], 2);
         assert_eq!(debt["oldest_age_lower_bound"], true);
         assert_eq!(debt["no_upload_required_files"], excluded);
@@ -246,6 +247,7 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
             "outstanding_files",
             "held_files",
             "unread_bytes",
+            "never_indexed_files",
             "over_6h_files",
             "oldest_age_lower_bound",
             "no_upload_required_files",
@@ -264,6 +266,7 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
         std::fs::remove_file(&never).unwrap();
         let row = f.walk();
         assert_eq!(row["debt"]["outstanding_files"], 1);
+        assert_eq!(row["debt"]["never_indexed_files"], 0);
         assert_eq!(row["debt"]["deleted_unaccepted_files"], 1);
         f.save();
         assert!(committed(&f.index, &never).is_empty());

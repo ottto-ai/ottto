@@ -2238,35 +2238,35 @@ or rewrite adds a revision timed at the live mtime, and only the file's own
 matched exact upload receipt retires it, and only the prefix it covers (a newer
 suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
 receipt elsewhere retires nothing. A rewritten file folds its old debt into the
-new object with the earliest time. Files never indexed count with a lower-bound
-age, and Codex archives count by compressed size; outside the discovery window no
-new debt starts. `outstanding_files` counts every owed file, `held_files` those
-whose debt is read or held rather than unread (every hold reason counts alike),
-`unread_bytes` the bytes no read reached, `over_6h_files` those whose oldest owed
-change is more than 21,600 seconds old, and `oldest_age_s` the oldest of those
-ages, with `oldest_age_lower_bound` true when that age is a lower bound or some
-debt has no known age. `no_upload_required_files` counts this walk's files that
-owe nothing by per-file evidence: a confirmed-empty file or an empty archive at
-its stamp, and a Claude subagent journal, which the snapshot rule excludes from
-upload. `deleted_unaccepted_files` is the cumulative count of files erased while
-still owed: a complete walk erases the debt of a file it no longer lists and
-whose index entry is gone. `last_complete_discovery_at` is the Unix time a walk
-that covered every root without a listing error last began. `debt.alarm` is true
-when a file is over 6 h, when any debt has no known age, or when there has been
-no complete discovery in 6 h.
-
-Members of an `UnprovenTerminal` Claude usage-authority family with debt are
-also reported apart, in `authority_terminal_files` and
+new object with the earliest time. Codex archives count by compressed size, and
+outside the discovery window no new debt starts. `outstanding_files` counts every
+owed file, `held_files` those whose debt is read or held rather than unread
+(every hold reason counts alike), `unread_bytes` the bytes no read reached, and
+`never_indexed_files` this walk's owed files with no index entry yet (archives
+aside), whose age is a lower bound. `over_6h_files` counts those whose oldest
+owed change is more than 21,600 seconds old, and `oldest_age_s` is the oldest of
+those ages, with `oldest_age_lower_bound` true when that age is a lower bound or
+some debt has no known age. `no_upload_required_files` counts this walk's files
+that owe nothing by per-file evidence: a confirmed-empty file or an empty archive
+at its stamp, and a Claude subagent journal, which the snapshot rule excludes
+from upload. `deleted_unaccepted_files` is the cumulative count of files erased
+while still owed: a complete walk erases the debt of a file it no longer lists
+and whose index entry is gone. `last_complete_discovery_at` is the Unix time a
+walk that covered every root without a listing error or an unconfirmed missing
+directory last began. Members of an `UnprovenTerminal` Claude usage-authority
+family with debt are also reported apart, in `authority_terminal_files` and
 `authority_terminal_oldest_age_s`: their hold keeps the pre-growth stamp and no
 read reaches the growth, so they are real unuploaded data, never counted as
-accepted or $0. `alarm` is true when `debt.alarm` is, when `debt` is `null`, or
-when `authority_terminal_files` is above 0 at any age, which lasts until their
-debt settles. With `basis: "walk"` the row is the walk just ended; a failed pass
-may never reach the walk, so with `basis: "last_walk"` it carries this process's
-last walk aggregate re-aged, with no authority-terminal counts, and before this
-process's first walk end `debt` is `null` and `alarm` is true. Only the walk in
-progress is process-local, so a walk resumed after a restart erases nothing and
-records no complete discovery. The row carries counts only.
+accepted or $0. `alarm`, and `debt.alarm` without the last two causes, is true
+when a file is over 6 h, when any debt has no known age, when there has been no
+complete discovery in 6 h, when `debt` is `null`, or when
+`authority_terminal_files` is above 0 at any age. With `basis: "walk"` the row is
+the walk just ended; a failed pass may never reach the walk, so with
+`basis: "last_walk"` it carries this process's last walk aggregate re-aged, with
+no authority-terminal counts, and before this process's first walk end `debt` is
+`null`. Only the walk in progress is process-local, so a walk resumed after a
+restart erases nothing and records no complete discovery. The row carries counts
+only.
 
 ### Money freshness (Claude queue and replay)
 

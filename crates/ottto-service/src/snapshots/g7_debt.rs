@@ -360,6 +360,8 @@ pub(super) struct Report {
     /// The oldest known first change, and whether it is a lower bound.
     oldest: Option<(u64, bool)>,
     unknown_age_files: u64,
+    /// Owed files this walk listed that have no index entry (archives aside).
+    never_indexed_files: u64,
     no_upload_required_files: u64,
     deleted_unaccepted_files: u64,
     last_complete_discovery_at: Option<u64>,
@@ -374,6 +376,7 @@ impl Report {
         over_6h_files: 0,
         oldest: None,
         unknown_age_files: 0,
+        never_indexed_files: 0,
         no_upload_required_files: 0,
         deleted_unaccepted_files: 0,
         last_complete_discovery_at: None,
@@ -408,7 +411,7 @@ impl Report {
                 .last_complete_discovery_at
                 .map_or(true, |at| over_alarm_age(now_ms, at))
     }
-    /// The ten per-source fields; `null` when storage could not be read.
+    /// The per-source fields; `null` when storage could not be read.
     pub(super) fn fields(&self, now_ms: u64) -> serde_json::Value {
         if !self.available {
             return serde_json::Value::Null;
@@ -421,6 +424,7 @@ impl Report {
             "oldest_age_s": self.oldest.map(|(at, _)| now_ms.saturating_sub(at) / 1000),
             "oldest_age_lower_bound": self.oldest.is_some_and(|(_, lower)| lower)
                 || self.unknown_age_files > 0,
+            "never_indexed_files": self.never_indexed_files,
             "no_upload_required_files": self.no_upload_required_files,
             "deleted_unaccepted_files": self.deleted_unaccepted_files,
             "last_complete_discovery_at": self.last_complete_discovery_at.map(|at| at / 1000),
@@ -719,7 +723,11 @@ impl<'a> Page<'a> {
         debt: FileDebt,
         no_upload_required: bool,
     ) {
+        // The one never-indexed count: owed, no index entry, not an archive.
+        let never_indexed =
+            debt.owed && !codex_archive_path(path) && !index.files.contains_key(&key);
         let walk = &mut self.fold.debt;
+        walk.sums.never_indexed_files += u64::from(never_indexed);
         walk.listed.insert(key);
         walk.sums.add(debt, self.now_ms);
         walk.sums.no_upload_required_files += u64::from(no_upload_required);
