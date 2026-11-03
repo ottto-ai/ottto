@@ -555,6 +555,11 @@ fn hour_pages<K: Durable, V: Durable>(
         .collect()
 }
 
+/// A capability bucket's start: the first part of its key.
+fn capability_hour(key: &(String, String, String)) -> &str {
+    &key.0
+}
+
 /// One stored `Hour` page into `map`. An entry off its own hour's page, or a
 /// key stored twice, is corrupt.
 fn read_hour_page<K: Durable + Ord, V: Durable>(
