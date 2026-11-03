@@ -2166,7 +2166,15 @@ fn native_comparison_window_proof_membership_empty_or_context_change_withdraws()
             }
             _ => page.index.active_upload_context_fingerprint = Some("changed-context".into()),
         }
+        let certified = page.window.certified_member_count();
         page.window.retain_current(&page.index);
+        if control == 3 {
+            // A delivery context selects no read: the certified skips stay.
+            assert!(certified > 0);
+            assert_eq!(page.window.certified_member_count(), certified);
+            assert!(!page.window.root_revoked_for_test(&fixture.parent));
+            continue;
+        }
         assert_eq!(page.window.certified_member_count(), 0);
         assert!(page.window.root_revoked_for_test(&fixture.parent));
     }

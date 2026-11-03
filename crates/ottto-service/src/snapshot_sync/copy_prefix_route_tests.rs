@@ -125,13 +125,17 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 }
 
 /// [regress] A holder whose page was never delivered owes its upload-context
-/// proof, as a production file without a receipt does. Re-read beside a new
-/// copy of its prefix, its identical body is offered and exact-ACKed and it
-/// earns its receipt. A family re-arm on that page may clear its revision for
-/// one forced reparse, so it is read at most once more; the restored revision
-/// lets the receipt prove, and later pages neither read nor POST anything.
+/// proof, as a production file without a receipt does. That proof alone
+/// selects no read: the holder is never read, stays owed and never becomes an
+/// accepted origin (e2.rs `origin_accepted`). The new copy therefore holds its
+/// copied prefix for the bounded prefix hold (copy_removals.rs `advance_hold`,
+/// `HOLD_PASSES` = 3): page 1 emits only its own turn, page 2 re-parses it
+/// from the pending hold (snapshots.rs `claude_copy_removals.pending`) with
+/// an identical body and no POST, page 3 expires the hold and emits the
+/// restored prefix once (e2.rs `defer_prefix`), and page 4 is quiet. The
+/// never-delivered holder's requests are counted once, in the copy.
 #[test]
-fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
+fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
     // As every owner of this harness: commits persist durable records.
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("never_delivered_holder_reread_bound") {
@@ -152,35 +156,32 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         input_clock(&path);
         let mut reads = Vec::new();
         let mut posts = Vec::new();
+        let mut copy_requests = Vec::new();
         for page in 1..=4 {
             disk.begin(&scanner, SnapshotSource::ClaudeCode);
             let mut p = c.raw(&scanner, prior, 100, true, &[]);
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
-            let sent = deliver_counting(&mut p);
-            posts.push(sent);
-            if page == 1 {
-                assert!(reads[0], "the owed holder is re-read beside the new copy");
-                assert!(
-                    upload_context_receipt_earned_for_test(&p.index, &holder),
-                    "page 1 earns the holder's receipt"
-                );
-            }
-            let owed = upload_context_owed_for_test(&p.index, &holder);
+            copy_requests.push(
+                p.scan
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == COPY)
+                    .map(|item| item.request_count),
+            );
+            posts.push(deliver_counting(&mut p));
+            assert!(
+                upload_context_owed_for_test(&p.index, &holder),
+                "page {page}: the holder's proof stays owed, paid by its next read"
+            );
             prior = disk.commit(&p.cache, SnapshotSource::ClaudeCode, &mut p.index);
-            if page >= 2 {
-                assert!(!owed, "page {page}: the holder owes its proof again");
-            }
         }
-        assert!(
-            reads[1..].iter().filter(|read| **read).count() <= 1,
-            "the holder is read at most once more after it earns its receipt: {reads:?}"
-        );
+        assert_eq!(reads, [false; 4], "the owed holder is never read");
         assert_eq!(
-            (&reads[2..], &posts[2..]),
-            (&[false, false][..], &[0_usize, 0][..]),
-            "pages 3-4 read and POST nothing (reads {reads:?}, posts {posts:?})"
+            (posts.as_slice(), copy_requests.as_slice()),
+            (&[1_usize, 0, 1, 0][..], &[Some(1), None, Some(3), None][..]),
+            "own turn, held, expired prefix once, quiet"
         );
     });
 }

@@ -1,5 +1,5 @@
-//! A setting or capability flip is delivery debt, never a transcript read.
-//! Synthetic inputs.
+//! A setting or capability flip is delivery debt, never a transcript read:
+//! it applies from a file's next ordinary read on. Synthetic inputs.
 use super::*;
 use crate::snapshots::privacy_flip_modes::{all, link, Flip, Mode, FLIPS};
 use serde_json::Value;
@@ -152,8 +152,16 @@ impl Fixture {
             writeln!(file, "{line}").unwrap();
         }
     }
-    fn read_owed(&self) -> bool {
-        self.index.file_context_read_owed(&self.key())
+    /// A probe walk selects no transcript read: no Full, no Tail, no byte.
+    /// The index is restored, so the probe settles nothing.
+    fn reads_nothing(&mut self) -> bool {
+        let committed = self.index.clone();
+        let walked = self.flip_walk(SnapshotUploadPolicy::default(), None);
+        self.index = committed;
+        walked.modes.0 == 0
+            && walked.modes.1 == 0
+            && walked.bytes == 0
+            && walked.scan.snapshots.is_empty()
     }
     fn debt(&self) -> bool {
         self.index
@@ -214,26 +222,28 @@ fn flip_reads_and_sends_nothing_on_unchanged_files() {
                 if changed && bit.0 != "copy" {
                     assert!(f.debt(), "{label}: the flip owes delivery");
                 }
-                assert!(!f.read_owed(), "{label}");
+                assert!(f.reads_nothing(), "{label}");
                 f.assert_quiet();
                 f.restart(after);
-                assert!(!f.read_owed(), "{label}: after a restart");
+                assert!(f.reads_nothing(), "{label}: after a restart");
                 f.assert_quiet();
             }
         }
     }
 }
 
-/// [money] T6: the operator's scoped copy-prefix re-read still owes its read
-/// when only the copy mode moved; the broadened gate does not swallow it.
+/// [money] T6: a copy-mode flip reads nothing, and neither does the operator's
+/// copy-prefix mark alone: the scoped re-read is owed through the body-witness
+/// revision the request re-owes (the copy-prefix route tests), not through
+/// the delivery context.
 #[test]
-fn copy_prefix_reread_mode_debt_still_selects() {
+fn copy_prefix_reread_mode_flip_reads_nothing() {
     let mut f = settled(SnapshotSource::ClaudeCode, mode(false));
     f.flip_to(Mode {
         copy: true,
         ..mode(false)
     });
-    assert!(!f.read_owed(), "an unaffected file");
+    assert!(f.reads_nothing(), "an unaffected file");
     let key = f.key();
     let marks = f
         .index
@@ -242,14 +252,14 @@ fn copy_prefix_reread_mode_debt_still_selects() {
     f.index
         .claude_money_birth_store
         .set_money_marks(&key, marks | claude_copy_prefix_reread::REOWED);
-    assert!(f.read_owed(), "a requested re-read under another mode");
+    assert!(f.reads_nothing(), "a mode mark alone selects no read");
 }
 
-/// [money] T4: one entity shared by two files. A read of the untouched file
-/// depends on the body delivered for it, not on the context: the same body
-/// acknowledged through the alias under B selects nothing in A -> B -> A, and
-/// other additive evidence, which keeps the entity's hash, selects it at the
-/// next flip.
+/// [money] T4: one entity shared by two files. Its proof follows the body
+/// delivered for it: the same body acknowledged through the alias under B
+/// keeps the untouched file owing delivery only in A -> B -> A. Additive
+/// evidence through the alias, which keeps the entity's hash, selects no read
+/// of the untouched file either: settings are forward-only.
 #[test]
 fn shared_entity_body_not_context_decides_the_untouched_alias() {
     let mut f = Fixture::new(SnapshotSource::Pi);
@@ -320,7 +330,6 @@ fn shared_entity_body_not_context_decides_the_untouched_alias() {
 
     // Under B the alias is read and acknowledged; the untouched file is not.
     f.flip(flipped(mode(false), &FLIPS[0]).policy);
-    assert!(!f.index.file_context_read_owed(&untouched));
     let committed = f.index.clone();
     let b = f.index.active_upload_context_fingerprint.clone().unwrap();
     f.uploader.activate(f.source, b, &mut f.index);
@@ -328,19 +337,10 @@ fn shared_entity_body_not_context_decides_the_untouched_alias() {
         .send(f.source, &mut f.index, &committed, &alias_items)
         .unwrap();
     assert!(!f.index.file_upload_context_requires_adoption(&alias));
-    assert!(
-        !f.index.file_context_read_owed(&untouched),
-        "the shared entity was sent under B with the same body"
-    );
 
     f.flip(all(false));
     assert!(
-        !f.index.file_context_read_owed(&alias),
-        "the alias owes delivery only"
-    );
-    assert!(
-        f.index.file_upload_context_requires_adoption(&untouched)
-            && !f.index.file_context_read_owed(&untouched),
+        f.index.file_upload_context_requires_adoption(&untouched),
         "B's stamp owes delivery, and the body it proves is the delivered one"
     );
 
@@ -368,8 +368,8 @@ fn shared_entity_body_not_context_decides_the_untouched_alias() {
     );
     f.flip(flipped(mode(false), &FLIPS[0]).policy);
     assert!(
-        f.index.file_context_read_owed(&untouched),
-        "the same flip that was quiet above selects: the delivered body moved"
+        f.reads_nothing(),
+        "the delivered body moved, and the flip still reads neither file"
     );
 }
 
@@ -474,15 +474,15 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         ] {
             assert_eq!(receipt, Some(tier_receipt()), "{source:?}: untouched");
         }
-        assert!(!f.read_owed(), "{source:?}");
+        assert!(f.reads_nothing(), "{source:?}");
         f.assert_quiet();
     }
 }
 
-/// [money] T7: context-only debt leaves a member independently accepted for
-/// every flip, under whichever context its entities were sent; an entity sent
-/// since with another body does not. A file still under its own base has no
-/// context-only debt: that is the scoped copy-prefix read.
+/// [money] T7: upload-context debt never refuses an independently accepted
+/// member: for every flip, under whichever context or body its entities were
+/// stamped since, the member stays current (settings are forward-only). Its
+/// ACKs still decide: without them it is not accepted.
 #[test]
 fn context_only_debt_keeps_consumers_current() {
     for bit in &FLIPS {
@@ -492,18 +492,18 @@ fn context_only_debt_keeps_consumers_current() {
             claude_stale_member_independently_accepted(&f.index, &key, &f.index.files[&key])
         };
         assert!(accepted(&f), "{}: positive control, exact ACK", bit.0);
-        let base = f.index.copy_prefix_base_upload_context.clone();
         f.flip_to(flipped(mode(false), bit));
         assert!(accepted(&f), "{}", bit.0);
-        let base_moved = f.index.copy_prefix_base_upload_context != base;
         for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
             stamp.context_fingerprint = "f".repeat(64);
         }
-        assert_eq!(accepted(&f), base_moved, "{}: another context", bit.0);
+        assert!(accepted(&f), "{}: another context", bit.0);
         for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
             stamp.body_witness = "f".repeat(64);
         }
-        assert!(!accepted(&f), "{}: sent since with another body", bit.0);
+        assert!(accepted(&f), "{}: sent since with another body", bit.0);
+        f.index.accepted_snapshot_fingerprints.clear();
+        assert!(!accepted(&f), "{}: negative control, no ACK", bit.0);
     }
 }
 

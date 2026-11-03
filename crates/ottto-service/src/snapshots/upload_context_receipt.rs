@@ -370,12 +370,6 @@ impl ScanIndex {
         !self.receipt_matches(key, entry)
     }
 
-    /// The selection and "is this file current" gate: a file whose only debt is
-    /// its delivery context owes no read. It pays on its next ordinary read.
-    pub(super) fn file_context_read_owed(&self, key: &str) -> bool {
-        self.file_upload_context_requires_adoption(key) && !self.context_only_debt(key)
-    }
-
     /// The durable stamp of each entity this file covers; `None` for one
     /// without a stamp.
     fn covered_stamps<'a>(
@@ -414,14 +408,13 @@ impl ScanIndex {
             && proof.replay_generation == self.historical_replay_generation
     }
 
-    /// The file's receipt proves these exact bytes at this replay epoch, and the
-    /// bodies stamped for every entity it covers are the body set it delivered.
-    /// A delivery context is never asked: settings and capabilities apply from
-    /// the next body on. An entity sent since with another body selects, under
-    /// any context. A receipt of the active base in another money mode is the
-    /// operator's scoped copy-prefix re-read, not context debt. A file without
-    /// its entity set, or with an unstamped entity, selects as before; only a
-    /// confirmed-empty file covers nothing.
+    /// Count-only: the file's receipt proves these exact bytes at this replay
+    /// epoch, and the bodies stamped for every entity it covers are the body
+    /// set it delivered. A delivery context is never asked: settings and
+    /// capabilities apply from the next body on, and no debt selects a read.
+    /// A receipt of the active base in another money mode is the operator's
+    /// scoped copy-prefix re-read, not context debt. Only a confirmed-empty
+    /// file covers nothing.
     fn context_only_debt(&self, key: &str) -> bool {
         let Some(entry) = self.files.get(key) else {
             return false;
@@ -544,43 +537,6 @@ impl ScanIndex {
             && proof.replay_generation == self.historical_replay_generation
             && proof.entity_stamps.get(entity).is_some_and(|stamp| {
                 stamp.context_fingerprint == context && stamp.body_witness == body
-            })
-    }
-
-    pub(super) fn file_upload_context_backoff_holds(&self, candidate: &CandidateFile) -> bool {
-        if !self.file_upload_context_enabled() {
-            return false;
-        }
-        let key = local_index_key(&candidate.path);
-        self.files.get(&key).is_some_and(|entry| {
-            entry.source_file_fingerprint == candidate.source_file_fingerprint
-                && entry.size_bytes == candidate.size_bytes
-                && entry.modified_unix_seconds == candidate.modified_unix_seconds
-                && entry
-                    .modified_unix_nanos
-                    .map_or(true, |nanos| nanos == candidate.modified_unix_nanos)
-        }) && self
-            .file_snapshot_fingerprints
-            .get(&key)
-            .is_some_and(|entities| {
-                !entities.is_empty()
-                    && entities
-                        .iter()
-                        .any(|entity| self.quarantined_snapshot_fingerprints.contains_key(entity))
-                    && entities.iter().all(|entity| {
-                        self.accepted_snapshot_fingerprints.contains(entity)
-                            || self
-                                .quarantined_snapshot_fingerprints
-                                .get(entity)
-                                .is_some_and(|record| {
-                                    self.active_quarantine_witness
-                                        .as_ref()
-                                        .is_some_and(|active| {
-                                            record.witness.same_retry_contract_any_context(active)
-                                        })
-                                        && !self.quarantine_retry_selects_file(entity, &key)
-                                })
-                    })
             })
     }
 
