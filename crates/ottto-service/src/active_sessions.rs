@@ -1401,6 +1401,7 @@ mod tests {
             (Codex, None, "exec", clean, shown),
             (Codex, None, "exec", "You are a release worker", None),
             (Codex, None, "exec", "Continue the same session", None),
+            (Codex, None, "exec", "Read AGENTS.md instructions", None),
             (Codex, Some("Native"), "exec", clean, Some("Native")),
             (Codex, None, "subagent", clean, None),
             (ClaudeCode, None, "cli", clean, None),

@@ -53418,14 +53418,19 @@ pub(crate) fn claude_registration_display_title(value: String) -> Option<String>
     normalize_display_title(value, "custom_title")
 }
 
+/// A Codex prompt-prefix label is already a bounded prefix, so it takes the
+/// shared first-prompt rule without the full-prompt role rewrite and size gate.
 pub(crate) fn prompt_prefix_display_title(value: String) -> Option<String> {
-    if looks_like_resume_boilerplate(&value.trim().to_ascii_lowercase()) {
-        return None;
-    }
-    normalize_display_title(value, "first_prompt")
+    first_prompt_title(SnapshotSource::Codex, &value, false)
 }
 
 fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
+    first_prompt_title(source, &value, true)
+}
+
+/// The one first-prompt title rule. `full_prompt` adds the Codex role rewrite
+/// and the 80-char / 12-word gate that only a whole first message needs.
+fn first_prompt_title(source: SnapshotSource, value: &str, full_prompt: bool) -> Option<String> {
     let raw = value.trim();
     if raw.is_empty()
         || contains_blocked_prompt_fragment(raw)
@@ -53433,7 +53438,7 @@ fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<S
     {
         return None;
     }
-    if source == SnapshotSource::Codex {
+    if full_prompt && source == SnapshotSource::Codex {
         if let Some(role_title) = agent_role_prompt_display_title(raw) {
             return Some(role_title);
         }
@@ -53446,7 +53451,9 @@ fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<S
         (!trimmed.is_empty()).then_some(trimmed)
     })?;
     let normalized = normalize_title(first_line.to_string())?;
-    if normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12 {
+    if full_prompt
+        && (normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12)
+    {
         return None;
     }
     normalize_display_title(normalized, "first_prompt")
