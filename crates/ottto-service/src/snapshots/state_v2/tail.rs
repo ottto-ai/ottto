@@ -22,8 +22,10 @@ const SET_ASIDE: &str = "tail.set_aside";
 const INLINE: u32 = 1;
 /// The row holds (length, fragment count, SHA-256); `tail.frag` holds the bytes.
 const FRAGMENTED: u32 = 2;
+/// The row holds one zstd frame, expanding to at most one raw fragment.
+const ZSTD_INLINE: u32 = 3;
 pub(super) fn version_supported(version: u32) -> bool {
-    version == INLINE || version == FRAGMENTED
+    matches!(version, INLINE | FRAGMENTED | ZSTD_INLINE)
 }
 pub(super) fn owned(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name().starts_with("tail."))
@@ -276,19 +278,9 @@ pub(super) struct TailStage {
     debt: BTreeMap<Vec<u8>, Debt>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
-    /// Every Tail row of every file goes, debt included (`erase_every`).
-    every: bool,
     peak_bytes: u64,
 }
 impl TailStage {
-    /// Account removal: every `tail.*` row of the route, of any file and kind,
-    /// debt and markers included. Graph, index and census rows stay.
-    pub(super) fn erase_every() -> Self {
-        Self {
-            every: true,
-            ..Default::default()
-        }
-    }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]
     pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
@@ -302,7 +294,6 @@ impl TailStage {
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
-            && !self.every
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         self.replace_observation(key, observation);
@@ -429,6 +420,24 @@ fn put(tx: &mut dyn Transaction, key: &RowKey, version: u32, value: &[u8]) -> Re
         value,
     })
 }
+fn put_inline(tx: &mut dyn Transaction, key: &RowKey, value: &[u8]) -> Result<Header> {
+    let stored = codec::encode(value)?;
+    let version = if stored.len() < value.len() {
+        ZSTD_INLINE
+    } else {
+        INLINE
+    };
+    put(tx, key, version, &stored)
+}
+fn read_inline(tx: &mut dyn Transaction, header: &Header) -> Result<Vec<u8>> {
+    let mut stored = Vec::with_capacity(header.len as usize);
+    tx.read_value(header, &mut stored)?;
+    match header.value_version {
+        INLINE => Ok(stored),
+        ZSTD_INLINE => codec::expand_frame(&stored, FRAG_BYTES as u64),
+        _ => bail!("state_v2_tail_value_shape"),
+    }
+}
 fn position(header: &Header) -> Result<u64> {
     match &header.key {
         RowKey::Record { position, .. } => Ok(*position),
@@ -499,13 +508,13 @@ fn write_value(
     if value.len() > FRAG_BYTES {
         let key = frag_key(file, owner, page);
         for part in value.chunks(FRAG_BYTES) {
-            put(tx, &row(FRAG, &key, fragments)?, INLINE, part)?;
+            put_inline(tx, &row(FRAG, &key, fragments)?, part)?;
             fragments += 1;
         }
     }
     delete_fragments(tx, file, owner, page, fragments)?;
     if fragments == 0 {
-        return put(tx, row_key, INLINE, value);
+        return put_inline(tx, row_key, value);
     }
     let mut envelope = Vec::with_capacity(48);
     envelope.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -520,11 +529,11 @@ fn read_value(
     page: u64,
     header: &Header,
 ) -> Result<Vec<u8>> {
+    if header.value_version != FRAGMENTED {
+        return read_inline(tx, header);
+    }
     let mut stored = Vec::with_capacity(header.len as usize);
     tx.read_value(header, &mut stored)?;
-    if header.value_version == INLINE {
-        return Ok(stored);
-    }
     let mut envelope = Reader(&stored);
     let len = u64::from_be_bytes(envelope.take()?);
     let fragments = u64::from_be_bytes(envelope.take()?);
@@ -535,7 +544,7 @@ fn read_value(
         let fragment = tx
             .get(&row(FRAG, &key, number)?)?
             .context("state_v2_tail_membership")?;
-        tx.read_value(&fragment, &mut value)?;
+        value.extend_from_slice(&read_inline(tx, &fragment)?);
     }
     ensure!(
         value.len() as u64 == len && Sha256::digest(&value).as_slice() == digest,
@@ -873,9 +882,7 @@ pub(super) fn read_set_aside(tx: &mut dyn Transaction, file: &[u8]) -> Result<Op
     let Some(header) = tx.get(&set_aside_key(file)?)? else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
-    tx.read_value(&header, &mut bytes)?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(serde_json::from_slice(&read_inline(tx, &header)?)?))
 }
 
 /// Whether there was anything to delete. Removal owes a physical purge.
@@ -932,23 +939,6 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result
         purge(tx, gone.collect())?;
     }
 }
-/// Every row of every Tail kind, read from headers alone: no head is decoded,
-/// so a damaged or future one never vetoes it. The number of rows removed.
-fn erase_every(tx: &mut dyn Transaction) -> Result<u64> {
-    let mut erased = 0;
-    for name in catalogue::TAIL_KINDS {
-        let kind = RecordKind::parse(name)?;
-        loop {
-            let rows = tx.scan_kind(&kind, None, HEADER_PAGE)?;
-            let count = rows.len() as u64;
-            if !purge(tx, rows)? {
-                break;
-            }
-            erased += count;
-        }
-    }
-    Ok(erased)
-}
 /// The file's committed revision rows, from headers alone.
 fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
     let kind = RecordKind::parse(REVISION)?;
@@ -986,8 +976,6 @@ struct Applied {
     disposed_absence: u64,
     disposed_settled: u64,
     erased: u64,
-    /// Rows removed by an `erase_every` stage.
-    erased_rows: u64,
 }
 impl Applied {
     fn absorb(&mut self, one: Self) {
@@ -1262,12 +1250,7 @@ fn mark_set_aside(tx: &mut dyn Transaction, file: &[u8], cause: SetAsideCause) -
             first_seen_unix_seconds: now,
         },
     };
-    put(
-        tx,
-        &set_aside_key(file)?,
-        INLINE,
-        &serde_json::to_vec(&marker)?,
-    )?;
+    put_inline(tx, &set_aside_key(file)?, &serde_json::to_vec(&marker)?)?;
     telemetry::event(
         "tail_set_aside",
         &serde_json::json!({
@@ -1388,9 +1371,6 @@ pub(super) fn apply(
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
     }
-    if stage.is_some_and(|stage| stage.every) {
-        applied.erased_rows = erase_every(tx)?;
-    }
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);
     }
@@ -1447,3 +1427,7 @@ pub(super) fn commit_exit(
         _ => bail!(Hold::ReloadRequired),
     }
 }
+
+#[cfg(test)]
+#[path = "tail_value_tests.rs"]
+mod value_tests;

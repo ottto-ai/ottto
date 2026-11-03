@@ -256,6 +256,24 @@ impl TailSource for Codex {
         .find_map(|(field, set)| set.then_some(field))
     }
 
+    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
+        match collection {
+            Collection::ChangedFiles => changed_files::keys(acc),
+            _ => Vec::new(),
+        }
+    }
+
+    fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        changed_files::page(keys)
+    }
+
+    fn log_page_keys(
+        _collection: Collection,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, ReconstructCause> {
+        changed_files::page_keys(bytes)
+    }
+
     fn encode_head(
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,

@@ -736,7 +736,25 @@ fn other_page_observing_raw(
     prior: ScanIndex,
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // A codec source's page continues from its owner's route, as Claude's do.
+    let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+        source,
+        Some(scanner.cache.as_ref()),
+        prior,
+    );
     other_page_with_slots(c, scanner, source, prior, &[], before_finalize)
+}
+
+/// A page that reads a fixture route's graph unrouted: it stages no Tail, as
+/// a build without the source's codec.
+fn other_page_unrouted(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, None, prior);
+    other_page_with_slots(c, scanner, source, prior, &[], |_| {})
 }
 
 /// [`other_page_observing_raw`], binding accounts with these registered Codex
@@ -1134,7 +1152,7 @@ fn pi_disk_corpus(
     let path = c.root.join("session.jsonl");
     std::fs::write(&path, initial).unwrap();
     input_clock(&path);
-    let mut disk = Disk::new(&c);
+    let mut disk = Disk::with_route(&c, SnapshotSource::Pi);
     let scanner = disk.owner(SnapshotSource::Pi);
     let (mut index, scan, modes) =
         other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
@@ -1154,6 +1172,14 @@ fn pi_grow(path: &Path, value: Value) {
     input_clock(path);
 }
 
+/// Every arm's next prior: the restart arm's committed index, as Claude's
+/// rows use. Pi keeps no RAM reduction on its Tail route, so the retained
+/// owner continues from the committed heads too, and the cold arm's own
+/// lineage would hold a growth claim bound to the old graph.
+fn pi_committed(next: ScanIndex) -> [ScanIndex; 3] {
+    [next.clone(), next.clone(), next]
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PiLedgerStep {
     Emit(u64, u64),
@@ -1171,6 +1197,7 @@ impl PiLedgerStep {
     }
 }
 
+#[track_caller]
 fn pi_ledger_totals(items: &[SnapshotItem]) -> (u64, u64) {
     assert_eq!(items.len(), 1, "ledger fixture has one cumulative session");
     (
@@ -1283,9 +1310,11 @@ impl PiPageExpect<'_> {
     }
 }
 
-// Return each arm's own finished index, so a later page cannot borrow another
-// arm's settlement. Quarantined files have no emitted body; compare their
-// disposition and retryability instead of inventing a successful upload.
+// Return each arm's own finished index. Callers continue every arm from the
+// restart arm's committed index (`pi_committed`): on the Tail route the arms
+// share one saved graph and differ in what they recompute from it.
+// Quarantined files have no emitted body; compare their disposition and
+// retryability instead of inventing a successful upload.
 fn pi_pages(
     proof: &mut PiProof,
     c: &Corpus,
@@ -1314,14 +1343,10 @@ fn pi_pages(
     let (full_index, full, mode) = page(&E2ScanFixture::default(), full_prior);
     assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
     let (disk_index, restored, mode) = page(restart, disk_prior);
-    // Pi keeps its RAM reduction until S2c: a new owner reads what grew Full.
+    // A new owner continues from the same committed Tail heads.
     assert_eq!(
         mode,
-        if proof.sampled {
-            (disk_mode.0 + disk_mode.1, 0, disk_mode.2)
-        } else {
-            (0, 0, 0)
-        },
+        if proof.sampled { disk_mode } else { (0, 0, 0) },
         "Pi restarted acquisition"
     );
     for scan in [&tail, &restored] {
@@ -1373,7 +1398,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
     for value in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let ([tail, full, mut restored], scan) = pi_pages(
+        let ([_, _, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
@@ -1382,7 +1407,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
             PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
         );
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = [tail, full, next];
+        priors = pi_committed(next);
         last = Some(scan);
     }
     let scan = last.expect("fixture must cross a seal");
@@ -1406,23 +1431,23 @@ fn pi_ledger_splits(
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
-    // The shared initial prefix is accepted by all three arms. Check cold and
-    // recordless restart against the retained arm's actual captured body too.
-    for initial_scanner in [E2ScanFixture::default(), disk.owner(SnapshotSource::Pi)] {
-        let (_, scan, _) = PiLedgerCheck {
-            step: initial,
-            accepted: &[],
-        }
-        .page(&c, &initial_scanner, ScanIndex::default());
-        assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
+    // The shared initial prefix is accepted by all three arms. Check a cold
+    // Full against the retained arm's actual captured body too. A restarted
+    // owner continues from the committed graph, never a default one: with no
+    // head it is this cold Full, and pi_pages restarts it on every step.
+    let (_, scan, _) = PiLedgerCheck {
+        step: initial,
+        accepted: &[],
     }
+    .page(&c, &E2ScanFixture::default(), ScanIndex::default());
+    assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
     let mut priors = [prior.clone(), prior.clone(), prior];
-    let mut ram_mode = (0, 1, 0);
-    // pi_pages compares the replayed suffix's emitted wire to cold Full.
+    // pi_pages compares the replayed suffix's emitted wire to cold Full. A
+    // dropped conflict keeps its predecessor head: the next read Tails from it.
     for (value, step) in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let ([tail, full, mut restored], scan) = pi_pages(
+        let ([_, _, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
@@ -1433,19 +1458,14 @@ fn pi_ledger_splits(
                     step,
                     accepted: &accepted,
                 }),
-                ..PiPageExpect::modes(ram_mode, (0, 1, 0))
+                ..PiPageExpect::modes((0, 1, 0), (0, 1, 0))
             },
         );
         if matches!(step, PiLedgerStep::Emit(..)) {
             accepted = scan.snapshots;
         }
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = [tail, full, next];
-        ram_mode = if matches!(step, PiLedgerStep::ConflictDrop(..)) {
-            (1, 0, 0)
-        } else {
-            (0, 1, 0)
-        };
+        priors = pi_committed(next);
     }
     assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
     proof.finish();
@@ -1863,15 +1883,21 @@ fn pi_lifecycle_case(name: &str) {
                 "2026-10-27T06:01:00Z",
             ),
         );
-        let (mut down, scan, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+        // The older build has no Pi codec: it reads the growth Full, stages
+        // no Tail and commits its index on the same route, so the committed
+        // heads stay those of the first page.
+        let (mut down, scan, mode) =
+            other_page_unrouted(&c, &scanner, SnapshotSource::Pi, prior.clone());
         assert_eq!(
             mode,
             if proof.sampled { (1, 0, 0) } else { (0, 0, 0) },
             "{name}"
         );
         proof.capture(&scan);
-        down.save(&disk.index).unwrap();
-        let committed = ScanIndex::load(&disk.index).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut down, &prior);
+        let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut down);
+        // The reupgraded build is a new process on the committed route.
+        scanner = disk.owner(SnapshotSource::Pi);
         [committed.clone(), committed.clone(), committed]
     } else if rewrite {
         [prior.clone(), prior.clone(), prior]
@@ -1915,7 +1941,7 @@ fn pi_lifecycle_case(name: &str) {
         let restart = disk.owner(SnapshotSource::Pi);
         let ram_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
         let disk_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
-        let ([tail, full, mut restored], scan) = pi_pages(
+        let ([_, _, mut restored], scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
@@ -1930,7 +1956,7 @@ fn pi_lifecycle_case(name: &str) {
             break;
         }
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = [tail, full, next];
+        priors = pi_committed(next);
     }
     proof.finish();
 }
@@ -1986,7 +2012,7 @@ fn pi_acquisition_metadata_changes() {
         modified
     );
     let restart = disk.owner(SnapshotSource::Pi);
-    let ([tail, full, mut restored], _) = pi_pages(
+    let ([_, _, mut restored], _) = pi_pages(
         &mut proof,
         &c,
         &scanner,
@@ -2002,12 +2028,12 @@ fn pi_acquisition_metadata_changes() {
         .set_modified(modified + std::time::Duration::from_secs(2))
         .unwrap();
     let restart = disk.owner(SnapshotSource::Pi);
-    let ([tail, full, mut restored], _) = pi_pages(
+    let ([_, _, mut restored], _) = pi_pages(
         &mut proof,
         &c,
         &scanner,
         &restart,
-        [tail, full, next],
+        pi_committed(next),
         PiPageExpect::modes((1, 0, 0), (1, 0, 0)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
@@ -2026,7 +2052,7 @@ fn pi_acquisition_metadata_changes() {
         &c,
         &scanner,
         &restart,
-        [tail, full, next],
+        pi_committed(next),
         PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
     );
     proof.finish();

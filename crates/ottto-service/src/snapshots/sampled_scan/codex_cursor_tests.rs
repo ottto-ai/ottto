@@ -899,9 +899,8 @@ fn head(index: &ScanIndex, key: &str) -> Option<crate::transcript_acquisition::D
 }
 
 /// A Pi transcript of `messages` usage lines under its own scan root, removed
-/// on drop. Pi has no Tail codec yet, so it keeps its reduction in RAM
-/// (`keeps_ram`): its read is the production retained copy that a Codex
-/// cursor charge, decoder claim or insert meets in the one shared cache.
+/// on drop. All sources now have codecs; cache mechanism tests explicitly
+/// admit its native reduction below instead of relying on a RAM-only source.
 struct PiRoot {
     _dir: Temp,
     root: PathBuf,
@@ -937,49 +936,54 @@ impl PiRoot {
     }
 }
 
-/// One production Pi page in `cache`'s cursor-fixture namespace.
-fn pi_page(pi: &PiRoot, index: ScanIndex, cache: &Arc<SharedCache>) -> ScanIndex {
-    let mut scan = OwnedSourceScan::new(
+/// Exercise the existing native copy/admission mechanism directly. Production
+/// scans now persist every source's Tail head and retain no RAM reduction.
+fn retain_fixture_copy(pi: &PiRoot, cache: &Arc<SharedCache>) {
+    use crate::snapshots::sampled_scan::transition_fixture::native_cold;
+    let context = zero_context(cache, "cursor-fixture");
+    let now = super::super::now_seconds();
+    let mut parser = native_cold::parser(
         SnapshotSource::Pi,
-        std::slice::from_ref(&pi.root),
-        index,
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
-    loop {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete {
-                mut index, scan, ..
-            } => {
-                accept_after_policy(SnapshotSource::Pi, &scan, &mut index);
-                return index;
-            }
-        }
-    }
+        &pi.file(),
+        File::open(pi.file()).unwrap(),
+        apply_pi_line,
+    );
+    assert!(matches!(
+        parser
+            .prepare_acquisition(None, &context.namespace, None, now)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
+    while !parser.step().unwrap() {}
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
+    super::super::retire_proof_beside_copy(Some(&context), budget, step);
+    let completed = parser
+        .retain_reduction(
+            &context.namespace,
+            now,
+            super::super::RetainBudget::granted_unclassified(budget),
+        )
+        .unwrap()
+        .expect("a complete native fixture");
+    assert_eq!(
+        completed.checkpoint.sealed_offset(),
+        fs::metadata(pi.file()).unwrap().len()
+    );
+    assert!(completed.reduction.is_some(), "a budgeted native copy");
+    assert!(cache.insert_admitted(pi.key(), completed, 0));
 }
 
-/// Pages `pi` until `cache` retains its copy; returns its key.
+/// Admit `pi`'s native copy through the cache mechanism; returns its key.
 fn pi_retained(pi: &PiRoot, cache: &Arc<SharedCache>) -> String {
+    retain_fixture_copy(pi, cache);
     let key = pi.key();
-    let mut index = ScanIndex::default();
-    for _ in 0..8 {
-        index = pi_page(pi, index, cache);
-        if cache.retained_checkpoint(&key).is_some() {
-            return key;
-        }
-    }
-    panic!("a retained Pi copy: {}", counters(cache));
+    assert!(cache.retained_checkpoint(&key).is_some());
+    key
 }
 
 /// #641's admission setup: a real Codex cursor job paged to its certified end
 /// (cursor state and optional header facts), beside a real retained copy.
-/// A codec source keeps no RAM copy, so the copy is Pi's; returns its key.
+/// The retained Pi copy is admitted by the cache fixture; returns its key.
 fn certified_beside_a_retained_copy(cache: &Arc<SharedCache>) -> String {
     let fixture = ScanRoot::new(40);
     let mut index = ScanIndex::default();
@@ -10079,9 +10083,8 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
 /// and retires a suspended proof only over what both shares leave of the
 /// room: a third of the state budget is retired before the clone; one that
 /// fits beside the finish/output share and the 8 MiB-capped copy is kept.
-/// Either way the whole fits `state_bytes()` at the clone. The read is Pi's:
-/// a codec source keeps no RAM copy, so only a RAM source's completion clones
-/// one.
+/// Either way the whole fits `state_bytes()` at the clone. The cache fixture
+/// directly exercises the copy mechanism: all source scans now use codecs.
 #[test]
 fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -10105,7 +10108,7 @@ fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
             proof_job("ns-a", "/idx/a.json", "inc-1", bytes)
         ));
         super::super::copy_retire_probe();
-        let (_, counts) = observe(|| pi_page(&pi, ScanIndex::default(), &cache));
+        let (_, counts) = observe(|| retain_fixture_copy(&pi, &cache));
         assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
         assert!(cache.take(&pi.key()).is_some(), "the copy is retained");
         let probe = super::super::copy_retire_probe().expect("probed");
@@ -12291,7 +12294,7 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
         let cache = Arc::new(SharedCache::default());
         let key = local_index_key(&primary.file(SESSION));
         // The primary continues from its head on its route (a codec source
-        // keeps no RAM copy); the other retained copy is a RAM source's.
+        // keeps no RAM copy); the cache fixture admits the other copy.
         let mut index = ScanIndex::default();
         for _ in 0..64 {
             let (next, _) = page(&primary, routed(index, &cache), Some(Arc::clone(&cache)));
@@ -12366,8 +12369,8 @@ fn decoder_least_budget(cache: &SharedCache) -> usize {
 }
 
 /// A cache warmed by real pages: optional header facts from a certified
-/// Codex cursor job, beside a retained copy (a RAM source's: a codec source
-/// keeps none). Returns the copy's key.
+/// Codex cursor job, beside a native copy admitted by the cache fixture.
+/// Production source scans keep none. Returns the copy's key.
 fn warm_decoder_cache() -> (Arc<SharedCache>, String) {
     let cache = Arc::new(SharedCache::default());
     let key = certified_beside_a_retained_copy(&cache);

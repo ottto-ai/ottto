@@ -16,6 +16,7 @@ pub(in crate::snapshots) mod claude;
 pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
+pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
@@ -32,7 +33,10 @@ macro_rules! with_codec {
                 type $s = codex::Codex;
                 $arm
             }
-            SnapshotSource::Pi => $none,
+            SnapshotSource::Pi => {
+                type $s = pi::Pi;
+                $arm
+            }
         }
     };
 }
@@ -367,40 +371,20 @@ pub(in crate::snapshots) trait TailSource {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse>;
     /// A `Log` collection's elements, in its full encode's (sorted) order.
-    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
-        match collection {
-            Collection::ChangedFiles => changed_files::keys(acc),
-            _ => Vec::new(),
-        }
+    /// A codec without a `Log` collection keeps the defaults.
+    fn log_keys(_acc: &SnapshotAccumulator, _collection: Collection) -> Vec<&String> {
+        Vec::new()
     }
     /// One `Log` page holding `keys`, in this order.
-    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        match collection {
-            Collection::ChangedFiles => changed_files::page(keys),
-            _ => page_bytes(keys.iter(), |key, e| key.put(e)),
-        }
+    fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        page_bytes(keys.iter(), |key, e| key.put(e))
     }
     /// A stored `Log` page's elements, in stored order.
     fn log_page_keys(
-        collection: Collection,
-        bytes: &[u8],
+        _collection: Collection,
+        _bytes: &[u8],
     ) -> Result<Vec<String>, ReconstructCause> {
-        match collection {
-            Collection::ChangedFiles => changed_files::page_keys(bytes),
-            _ => {
-                let g = Self::collections()
-                    .iter()
-                    .find(|spec| spec.collection == collection)
-                    .ok_or(ReconstructCause::Corrupt)?
-                    .g;
-                let mut keys = Vec::new();
-                read_page(bytes, g, |d| {
-                    keys.push(String::take(d)?);
-                    Ok(())
-                })?;
-                Ok(keys)
-            }
-        }
+        Err(ReconstructCause::Corrupt)
     }
     /// Every page of `collection`, by position.
     fn encode_pages(
@@ -431,11 +415,15 @@ pub(in crate::snapshots) trait TailSource {
     /// before the load publishes it as reused. `live` is the read's fresh
     /// accumulator, configured before any line (traces, parent ledgers and
     /// proof, sidecar projection, counting rule); a load never parses with it.
+    /// By default a source's live inputs join at finish, never into the
+    /// stored state.
     fn install_live(
-        stored: &mut SnapshotAccumulator,
-        fresh: &CandidateFile,
-        live: &SnapshotAccumulator,
-    ) -> Result<(), LiveLoadError>;
+        _stored: &mut SnapshotAccumulator,
+        _fresh: &CandidateFile,
+        _live: &SnapshotAccumulator,
+    ) -> Result<(), LiveLoadError> {
+        Ok(())
+    }
 
     /// After every page: each declared collection's stored geometry and
     /// element count against the decoded state, then the source's facts.

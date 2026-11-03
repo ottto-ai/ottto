@@ -62,6 +62,25 @@ fn restart_append_and_skill_labels_match_full() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 300);
     let sealed = len(&path);
+    let mut db_path = route.path.as_os_str().to_owned();
+    db_path.push(".v2.sqlite");
+    let db = rusqlite::Connection::open_with_flags(
+        Path::new(&db_path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let compressed: u64 = db
+        .query_row(
+            "SELECT count(*) FROM records WHERE kind LIKE 'tail.%' AND value_version=3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        compressed > 0,
+        "restart/append fixture must exercise compression"
+    );
+    drop(db);
     route.index = ScanIndex::load(&route.path).unwrap();
     append(&path, 300);
     let cold = full(&route, &path);

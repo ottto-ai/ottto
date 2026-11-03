@@ -1,16 +1,12 @@
 //! The Claude Tail codec on real parses of synthetic transcripts: every field
 //! home round-trips, missing state is an incomplete reconstruction, skill
 //! labels are data, and the head identity binds no delivery input.
-use super::super::seam::TailBase;
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction};
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
-use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
-use crate::snapshots::state_v2::{Change, StagedFile};
-use crate::transcript_acquisition::{ReadMode, Scope};
+use crate::snapshots::state_v2::StagedFile;
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-const NOW: u64 = 1_790_000_000;
 const SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555777";
 /// Non-ASCII, and longer than the record store's 96-byte label bound.
 const SKILL: &str = "ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé";
@@ -56,30 +52,13 @@ pub(in crate::snapshots) fn lines(responses: usize) -> Vec<String> {
     lines
 }
 
-/// A cold positioned Full read: the PRE-finalization reduction and the
-/// checkpoint's certificate.
 fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ottto-tail-claude-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session.jsonl");
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-    let scope = Scope("tail-claude-codec".into());
-    let mut parser = fixture::parser(
+    parse_lines(
         SnapshotSource::ClaudeCode,
-        &path,
-        File::open(&path).unwrap(),
         apply_claude_code_line,
-    );
-    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
-    assert!(matches!(mode, ReadMode::Full(_)));
-    let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
-    std::fs::remove_dir_all(&dir).unwrap();
-    (reduction, checkpoint.durable_certificate(0).unwrap())
+        lines,
+        "session.jsonl",
+    )
 }
 
 fn identity(file: &str, capture: bool) -> HeadIdentity {
@@ -93,47 +72,8 @@ fn identity(file: &str, capture: bool) -> HeadIdentity {
     )
 }
 
-/// A complete stage: an empty base's `Reset`.
-fn stage_full(
-    view: &PreFinalization<'_>,
-    certificate: &DurableCertificate,
-    id: &HeadIdentity,
-) -> StagedFile {
-    TailBase::default()
-        .stage::<Claude>(view, certificate, id, Change::Reset)
-        .unwrap()
-        .expect("a reset always stages")
-}
-
 fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
-    let (acc, report, scalars) = reduction.finish_view();
-    let view = PreFinalization::new(acc, report, scalars);
-    stage_full(&view, certificate, &identity("session.jsonl", false))
-}
-
-fn copy(staged: &StagedFile) -> StagedFile {
-    StagedFile {
-        revision: staged.revision,
-        head: staged.head.clone(),
-        collections: staged.collections.clone(),
-        pages: staged.pages.clone(),
-        obsolete: staged.obsolete.clone(),
-        change: staged.change,
-    }
-}
-
-/// Head first, then every page in key order, then the codec contract.
-/// `into` is replaced whole by the head.
-fn load(
-    staged: &StagedFile,
-    into: &mut SnapshotAccumulator,
-) -> Result<DecodedHead, ReconstructCause> {
-    let head = Claude::decode_head(staged.revision, &staged.head, into)?;
-    for (&(collection, page), bytes) in &staged.pages {
-        Claude::decode_page(collection, page, bytes, into)?;
-    }
-    Claude::validate_loaded(into, &staged.collections)?;
-    Ok(head)
+    stage_reduction::<Claude>(reduction, certificate, &identity("session.jsonl", false))
 }
 
 /// [format] Every Claude field home round-trips: head scalars and lineage,
@@ -220,7 +160,7 @@ fn every_claude_field_home_round_trips_through_head_and_pages() {
     }
 
     let mut loaded = acc.clone();
-    let head = load(&staged, &mut loaded).unwrap();
+    let head = load::<Claude>(&staged, &mut loaded).unwrap();
     assert_eq!(head.certificate, certificate);
     assert_eq!(
         (&loaded.title, &loaded.workspace_path),
@@ -239,7 +179,7 @@ fn every_claude_field_home_round_trips_through_head_and_pages() {
 
     // The loaded state encodes to exactly the stored head and pages.
     let view = PreFinalization::new(&loaded, &head.report, head.scalars);
-    let again = stage_full(&view, &head.certificate, &identity("session.jsonl", false));
+    let again = stage_full::<Claude>(&view, &head.certificate, &identity("session.jsonl", false));
     assert_eq!(
         (
             again.revision,
@@ -273,7 +213,7 @@ fn missing_stored_state_is_an_incomplete_reconstruction() {
     let load_edited = |edit: &dyn Fn(&mut StagedFile)| {
         let mut edited = copy(&staged);
         edit(&mut edited);
-        load(&edited, &mut acc.clone()).map(|_| ())
+        load::<Claude>(&edited, &mut acc.clone()).map(|_| ())
     };
     assert_eq!(load_edited(&|_| {}), Ok(()));
     assert_eq!(
@@ -322,10 +262,10 @@ fn missing_stored_state_is_an_incomplete_reconstruction() {
         .keys()
         .any(|(collection, _)| *collection == Collection::Compactions));
     let mut edited = copy(&staged);
-    load(&edited, &mut acc.clone()).unwrap();
+    load::<Claude>(&edited, &mut acc.clone()).unwrap();
     edited.collections.remove(&Collection::Compactions);
     assert_eq!(
-        load(&edited, &mut acc.clone()).map(|_| ()),
+        load::<Claude>(&edited, &mut acc.clone()).map(|_| ()),
         Err(ReconstructCause::Incomplete)
     );
 }
@@ -343,7 +283,7 @@ fn skill_labels_round_trip_as_data() {
     let staged = stage(&reduction, &certificate);
     let (acc, _, _) = reduction.finish_view();
     let mut loaded = acc.clone();
-    load(&staged, &mut loaded).unwrap();
+    load::<Claude>(&staged, &mut loaded).unwrap();
     assert!(acc.provider_skills.contains(SKILL) && acc.activity_skills.len() > 33);
     assert_eq!(loaded.provider_skills, acc.provider_skills);
     assert_eq!(loaded.activity_skills, acc.activity_skills);

@@ -453,15 +453,15 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - `ottto logout --forget-installation --confirm` is the explicit destructive
   reset path. It first disconnects this Mac in Ottto and releases its server
   registration, exactly like an ordinary logout, then clears installation id,
-  active and prior credentials, setup bindings, destination receipt namespaces,
-  and first-sweep progress together, while leaving Codex, Claude Code, and Pi
-  source data untouched. It requires an active Ottto connection. The account
+  active and prior credentials and setup bindings, while keeping collected local
+  state (scan indexes, receipts and first-sweep progress) and leaving Codex,
+  Claude Code, and Pi source data untouched. It requires an active Ottto connection. The account
   scope is derived from the Mac and its macOS user, so it is not cleared and
   is the same after the reset. Restart the daemon before pairing so it creates
   a fresh installation identity. Because replacement credentials use a new destination
   namespace, ordinary replacement never reuses the old destination's receipts;
-  it creates clean receipt and first-sweep state for the new destination while
-  preserving the stable `otm_…` machine identity.
+  it creates new receipt state for the new destination while preserving the
+  stable `otm_…` machine identity.
 - `ottto logout --local-only --forget-installation --confirm` is the emergency
   variant for when Ottto cannot be reached. It performs the same local reset
   without contacting Ottto, so the server registration is not released: this

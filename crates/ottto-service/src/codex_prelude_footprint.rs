@@ -73,7 +73,7 @@ const COMBINED_CHAIN_NAME: &str = "AGENTS.md (chain)";
 /// backend owns the character-to-token ratio and converts on admission.
 /// Category `pct` is 0 for the same reason.
 const COUNTER_SOURCE: &str = "codex_rollout_prelude_chars_v1";
-const STATE_DIR: &str = "codex_session_start";
+pub(crate) const STATE_DIR: &str = "codex_session_start";
 const LOCAL_DISABLE_ENV: &str = "OTTTO_CODEX_SESSION_START_HARVEST_DISABLED";
 
 // -------------------------------------------------------------------------

@@ -11,8 +11,8 @@
 //! labels are stored as they are.
 use super::{
     capability_hour, changed_files, decode_envelope, encode_envelope, fact_count, fact_pages,
-    fixed_pages, hour_pages, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
-    DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    fixed_pages, hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start,
+    CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
@@ -130,6 +130,28 @@ impl TailSource for Claude {
             Collection::ChangedFiles => changed_files::keys(acc),
             _ => Vec::new(),
         }
+    }
+
+    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        match collection {
+            Collection::ChangedFiles => changed_files::page(keys),
+            _ => page_bytes(keys.iter(), |id, e| id.put(e)),
+        }
+    }
+
+    fn log_page_keys(
+        collection: Collection,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, ReconstructCause> {
+        if collection == Collection::ChangedFiles {
+            return changed_files::page_keys(bytes);
+        }
+        let mut keys = Vec::new();
+        read_page(bytes, LOG_G, |d| {
+            keys.push(String::take(d)?);
+            Ok(())
+        })?;
+        Ok(keys)
     }
 
     fn encode_head(
@@ -262,16 +284,6 @@ impl TailSource for Claude {
     /// an HMAC under the attribution key (#1255).
     fn key_epoch() -> Option<[u8; 32]> {
         claude_request_identity::session_context_key_epoch()
-    }
-
-    /// Claude's live inputs (Desktop identity and lineage, account, sidecar
-    /// evidence) join at finish, never into the stored state.
-    fn install_live(
-        _stored: &mut SnapshotAccumulator,
-        _fresh: &CandidateFile,
-        _live: &SnapshotAccumulator,
-    ) -> Result<(), LiveLoadError> {
-        Ok(())
     }
 }
 

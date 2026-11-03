@@ -3016,7 +3016,10 @@ mod audit_retirement_tests;
 
 /// [regress] A new file was incorrectly counted as a recordless content change.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn pi_new_file_reads_once_without_transitional_full_count() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let source = SnapshotSource::Pi;
