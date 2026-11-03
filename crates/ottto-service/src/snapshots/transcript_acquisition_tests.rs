@@ -3103,7 +3103,7 @@ fn whole_large_usage_line_is_published_for_each_source() {
         assert_eq!(scan.snapshots[0].output_tokens, 10);
         let counts = observations
             .iter()
-            .filter(|row| row["stage"] == "native_collection_page")
+            .filter(|row| row["stage"] == "native_collection_jsonl_lines")
             .map(|row| &row["counts"])
             .find(|counts| counts["max_line_bytes"].as_u64() > Some(16 * 1024 * 1024))
             .unwrap();

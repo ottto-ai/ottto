@@ -1111,15 +1111,12 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             page_selection: BTreeMap<&'static str, u64>,
             #[serde(flatten)]
-            jsonl: jsonl::Counts,
-            #[serde(flatten)]
             file_reads: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             hold_wake: BTreeMap<&'static str, u64>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            change_reasons: Option<change_reason::Page>,
         }
         let claude = source == "claude_code";
+        let jsonl = jsonl::take(source);
         let counts = Counts {
             line_delivery: self
                 .line_delivery
@@ -1153,7 +1150,6 @@ impl Probe {
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             page_selection: drain(source, &PAGE_SELECTION),
-            jsonl: jsonl::take(source),
             file_reads: drain(source, &FILE_READS),
             hold_wake: drain(
                 source,
@@ -1162,7 +1158,6 @@ impl Probe {
                     ("oldest_expired_secs", HOLD_WAKE_START + 1),
                 ],
             ),
-            change_reasons: change_reason::drain(source),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
@@ -1196,6 +1191,22 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
+        // Own records, so the page line stays under its size bound (§13).
+        if let Some(change_reasons) = change_reason::drain(source) {
+            #[derive(Serialize)]
+            struct Counts {
+                change_reasons: change_reason::Page,
+            }
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_change_reasons",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: Counts { change_reasons },
+            });
+        }
+        jsonl.emit_page_lines(source);
     }
 }
 

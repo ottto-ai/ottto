@@ -151,12 +151,12 @@ payloads, credentials or backend response bodies.
 
 Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
 `max_line_bytes` and `max_line_buffer_bytes` (line-buffer capacity, not RSS or
-an upper bound) are scalars on `native_collection_page`;
-`context_composition_read` carries them too. 16 MiB is only a release point: a
-completed record above it frees its line buffer; byte targets yield between
-records. The former `native_collection_jsonl_lines` record, its
-`lines_over_16_mib` count and `jsonl_repeat_parse_failure_alarm` are retired;
-malformed/UTF-8 lines stay counted by the existing read report.
+an upper bound) go in their own `native_collection_jsonl_lines` record right
+after `native_collection_page`; `context_composition_read` carries them inline.
+16 MiB is only a release point: a completed record above it frees its line
+buffer; byte targets yield between records. The former `lines_over_16_mib`
+count and `jsonl_repeat_parse_failure_alarm` are retired; malformed/UTF-8 lines
+stay counted by the existing read report.
 
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
@@ -893,10 +893,11 @@ bounded-lifetime release remains a SOURCE follow-up.
 
 ## Change Reason Counters
 
-Each source's `native_collection_page` line carries `counts.change_reasons`
-when any count is nonzero (the former separate `native_change_reasons` line is
-retired): nonzero counts of why a body was read or uploaded, by one first
-cause. They are local diagnostics only; they gate, cap and upload nothing.
+After each source's `native_collection_page` line, a `native_change_reasons`
+line carries `counts.change_reasons` when any count is nonzero (its own line
+keeps the page line under its size bound): nonzero counts of why a body was
+read or uploaded, by one first cause. They are local diagnostics only; they
+gate, cap and upload nothing.
 
 - **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
@@ -918,7 +919,7 @@ cause. They are local diagnostics only; they gate, cap and upload nothing.
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
 
-Upload counts land on the source's next page line.
+Upload counts land on the line after the source's next page line.
 
 ## Context Footprint Discovery
 

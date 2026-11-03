@@ -10,6 +10,24 @@ pub(crate) struct Counts {
     max_line_buffer_bytes: u64,
 }
 
+impl Counts {
+    /// The page's line sizes as their own record after `native_collection_page`,
+    /// which keeps that line under its size bound. Nothing when every size is zero.
+    pub(super) fn emit_page_lines(&self, source: &str) {
+        if self.max_line_bytes == 0 && self.max_line_buffer_bytes == 0 {
+            return;
+        }
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: "native_collection_jsonl_lines",
+            source: Source::from_slug(source),
+            observation: Observation::point(),
+            counts: self,
+        });
+    }
+}
+
 const NO_COUNTS: Counts = Counts {
     max_line_bytes: 0,
     max_line_buffer_bytes: 0,
