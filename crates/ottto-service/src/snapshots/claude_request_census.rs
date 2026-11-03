@@ -994,7 +994,7 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(FAMILY_WALK) {
             return None;
         }
-        self.walk_transcript_holders(deadline, |_, member, record| {
+        self.walk_transcript_holders(Some(deadline), |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
                 return;
             };
@@ -1016,17 +1016,18 @@ impl ClaudeRequestCensus {
     /// the record proves anything (current revision, other session, earlier
     /// birth). The same walk as `family_transcript_holders`, across
     /// families. None when `deadline` passes: the caller cannot decide.
+    /// Without a deadline the walk always completes.
     pub(crate) fn main_transcript_holders<'a>(
         &'a self,
         wanted: &[u64],
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut visit: impl FnMut(&'a str, &'a str, &'a ClaudeRequestCensusRecord, &[u64]),
     ) -> Option<()> {
         if wanted.is_empty() {
             return Some(());
         }
         #[cfg(test)]
-        if walk_deadline_forced(MAIN_WALK) {
+        if deadline.is_some() && walk_deadline_forced(MAIN_WALK) {
             return None;
         }
         let mut hits = Vec::new();
@@ -1046,7 +1047,7 @@ impl ClaudeRequestCensus {
     /// None when `deadline` passes (checked every 256 records).
     fn walk_transcript_holders<'a>(
         &'a self,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut visit: impl FnMut(
             &'a str,
             super::ClaudeIndexPathMemberRef<'a>,
@@ -1054,7 +1055,9 @@ impl ClaudeRequestCensus {
         ),
     ) -> Option<()> {
         for (position, (key, record)) in self.records().enumerate() {
-            if position % 256 == 255 && std::time::Instant::now() >= deadline {
+            if position % 256 == 255
+                && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
                 return None;
             }
             if let Some(member) = super::claude_index_path_member_ref(Path::new(key)) {

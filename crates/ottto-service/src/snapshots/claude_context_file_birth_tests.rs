@@ -1100,6 +1100,7 @@ fn remembered_tripwire_fails_closed_when_full() {
         &reports.0,
         &reports.1,
         &veto_rows,
+        |_| true,
     );
     let mut counts = ClaudeContextFileBirthCounts::default();
     let mut held = third.clone();
@@ -1789,6 +1790,7 @@ fn claude_backfill_stop_latches_until_restart() {
         &reports.0,
         &reports.1,
         &veto_rows,
+        |_| true,
     );
     let mut counts = ClaudeContextFileBirthCounts::default();
     let verdict = claude_context_file_birth::admit_claude_file_birth_posture(

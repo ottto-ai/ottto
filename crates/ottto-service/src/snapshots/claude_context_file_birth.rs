@@ -666,20 +666,26 @@ impl ClaudeTelemetryTripwire {
         api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
         trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
         veto_api_rows: &ClaudeVetoApiRows,
+        joins: impl Fn(&str) -> bool,
     ) -> Self {
         let rows = || {
             let api = api_report
                 .evidence
                 .iter()
                 .chain(veto_api_rows)
+                .filter(|(root, _)| joins(root))
                 .flat_map(|(root, rows)| {
                     rows.iter()
                         .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
                 });
-            let trace = trace_report.evidence.iter().flat_map(|(root, rows)| {
-                rows.iter()
-                    .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
-            });
+            let trace = trace_report
+                .evidence
+                .iter()
+                .filter(|(root, _)| joins(root))
+                .flat_map(|(root, rows)| {
+                    rows.iter()
+                        .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+                });
             api.chain(trace)
                 .filter_map(|(root, session_id, request_id)| {
                     TelemetryRow::of(root, session_id, request_id)

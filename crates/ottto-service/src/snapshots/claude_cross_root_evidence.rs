@@ -1,11 +1,13 @@
 //! The cross-root answers of one Claude local-evidence pass, gathered root by
-//! root while the strict read streams the corpus. Only the page's own roots
-//! keep their rows; every other root's rows are dropped right after they are
-//! added here. Each answer equals the one a pass holding every root's rows
-//! gives: the same rows, the same sorted root order, the same first refusal.
+//! root while the strict read streams the pass's scope. Only the page's own
+//! roots keep their rows; every other root's rows are dropped right after they
+//! are added here. Each answer equals the one a pass holding every scope
+//! root's rows gives: the same rows, the same sorted root order, the same
+//! first refusal.
 
 use super::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
-use super::{claude_earliest_request, ClaudeLegacyRequestOwners, SnapshotItem};
+use super::claude_request_census::claude_request_hash;
+use super::{claude_earliest_request, ClaudeLegacyRequestOwners, ScanIndex, SnapshotItem};
 use crate::claude_local_otel::{
     claude_pair_generation, ClaudeLocalOtelEvidence, ClaudePairGeneration,
     ClaudeTraceOwnershipEvidence,
@@ -71,9 +73,153 @@ impl RequestRootJoins {
     }
 }
 
+/// What a root read this pass may answer. Every answer but the terminal's own
+/// sees the same roots on every pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootRole {
+    /// A terminal's other pending root: only the terminal's earliest-request
+    /// and proof answers.
+    TerminalOnly,
+    /// Another session whose transcript holds a page request: request joins
+    /// and the file birth tripwire.
+    Holder,
+    /// A page root, a named fork parent or a witness's legacy owner: every
+    /// answer, the legacy request owners included.
+    Owner,
+}
+
+impl RootRole {
+    /// Request joins (a) and the file birth tripwire (d).
+    pub(crate) fn joins(self) -> bool {
+        self != Self::TerminalOnly
+    }
+
+    /// The legacy request owners (c).
+    pub(crate) fn legacy(self) -> bool {
+        self == Self::Owner
+    }
+}
+
+/// The roots one pass reads side files for, and which other sessions own a
+/// page request. Root ids stay in memory only: no `Debug`, never logged.
+#[derive(Default)]
+pub(crate) struct EvidenceScope {
+    roles: BTreeMap<String, RootRole>,
+    /// Census hash of a page request without an own API row: the sessions
+    /// whose MAIN transcript holds it.
+    holders: BTreeMap<u64, BTreeSet<String>>,
+    /// Page root: the sessions its files' `fork-context-ref` lines name.
+    parents: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl EvidenceScope {
+    /// Each page file's named fork parent, by the file's family root.
+    pub(crate) fn fork_parents(items: &[SnapshotItem]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|item| {
+                let parent = item.claude_money.as_deref()?.fork_parent()?;
+                Some((
+                    super::claude_snapshot_family_root_ref(item).to_owned(),
+                    parent.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// `kept`: the page's own roots. `api`: the page's API read, by root. One
+    /// census walk, with no deadline (in memory, no I/O), names the holders
+    /// of the page requests that have no API row of their own.
+    pub(crate) fn of_page(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        kept: &BTreeSet<String>,
+        fork_parents: Vec<(String, String)>,
+        api: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+        terminal: bool,
+    ) -> Self {
+        let mut scope = Self::default();
+        let mut owners = kept.clone();
+        owners.extend(super::claude_witness_legacy_owner_roots(index, kept).cloned());
+        for (root, parent) in fork_parents {
+            if parent != root {
+                owners.insert(parent.clone());
+                scope.parents.entry(root).or_default().insert(parent);
+            }
+        }
+        let own = api
+            .iter()
+            .flat_map(|(root, rows)| {
+                rows.iter()
+                    .map(move |row| (root.as_str(), row.request_id.as_str()))
+            })
+            .collect::<BTreeSet<_>>();
+        let own = &own;
+        let mut wanted = items
+            .iter()
+            .flat_map(|item| {
+                let root = super::claude_snapshot_family_root_ref(item);
+                super::claude_request_money::e2::item_request_ids(item)
+                    .filter(move |id| !own.contains(&(root, id.as_str())))
+                    .map(|id| claude_request_hash(id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let holders = &mut scope.holders;
+        let complete = index.claude_request_census.main_transcript_holders(
+            &wanted,
+            None,
+            |_, holder, _, hits| {
+                for &hash in hits {
+                    holders.entry(hash).or_default().insert(holder.to_owned());
+                }
+            },
+        );
+        debug_assert!(complete.is_some(), "a walk without a deadline completes");
+        scope.roles = owners
+            .into_iter()
+            .map(|root| (root, RootRole::Owner))
+            .collect();
+        for holder in scope.holders.values().flatten() {
+            scope
+                .roles
+                .entry(holder.clone())
+                .or_insert(RootRole::Holder);
+        }
+        if terminal {
+            for root in super::claude_pending_family_session_ids(index) {
+                scope.roles.entry(root).or_insert(RootRole::TerminalOnly);
+            }
+        }
+        scope
+    }
+
+    /// The test reference: every given root answers everything, as a pass
+    /// over every side-file root would.
+    #[cfg(test)]
+    pub(crate) fn every(roots: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            roles: roots
+                .into_iter()
+                .map(|root| (root, RootRole::Owner))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Every root to read, in sorted order.
+    pub(crate) fn roots(&self) -> impl Iterator<Item = &String> {
+        self.roles.keys()
+    }
+}
+
 /// Root ids and request strings stay in memory only: no `Debug`, never logged.
 pub(crate) struct CrossRootEvidence {
     support_dir: PathBuf,
+    /// The roots this pass reads and the owners it names.
+    scope: EvidenceScope,
     /// Every root added, by ordinal; tripwire rows name their root this way.
     roots: Vec<String>,
     /// (a) Exact cross-root answers for the page's possible request lookups.
@@ -91,9 +237,10 @@ pub(crate) struct CrossRootEvidence {
 }
 
 impl CrossRootEvidence {
-    pub(crate) fn new(support_dir: &Path, items: &[SnapshotItem]) -> Self {
+    pub(crate) fn new(support_dir: &Path, items: &[SnapshotItem], scope: EvidenceScope) -> Self {
         Self {
             support_dir: support_dir.to_path_buf(),
+            scope,
             roots: Vec::new(),
             // Includes copied/excluded ids and occurrence-only keys. These
             // cover transcript grouping, reconciliation and activity inputs.
@@ -111,6 +258,31 @@ impl CrossRootEvidence {
         }
     }
 
+    /// A root outside the scope (none is read) answers as a page root.
+    pub(crate) fn role(&self, root: &str) -> RootRole {
+        self.scope
+            .roles
+            .get(root)
+            .copied()
+            .unwrap_or(RootRole::Owner)
+    }
+
+    /// The other sessions the scope names as owners of `request_id` in a file
+    /// under `root`: the census holders and the file's named fork parents.
+    pub(crate) fn named_owners<'s>(
+        &'s self,
+        root: &'s str,
+        request_id: &str,
+    ) -> impl Iterator<Item = &'s String> + 's {
+        let held = (!self.scope.holders.is_empty())
+            .then(|| self.scope.holders.get(&claude_request_hash(request_id)))
+            .flatten();
+        held.into_iter()
+            .chain(self.scope.parents.get(root))
+            .flatten()
+            .filter(move |owner| owner.as_str() != root)
+    }
+
     fn ordinal(&mut self, root: &str) -> u32 {
         let ordinal = self.roots.len() as u32;
         self.roots.push(root.to_owned());
@@ -120,6 +292,9 @@ impl CrossRootEvidence {
     /// API rows of a root whose pair is missing or unhealthy. They only veto
     /// the file birth rule (d); no other answer sees them.
     pub(crate) fn add_vetoing_api(&mut self, root: &str, api: &[ClaudeLocalOtelEvidence]) {
+        if !self.role(root).joins() {
+            return;
+        }
         let ordinal = self.ordinal(root);
         self.add_tripwire_rows(ordinal, root, api.iter().map(api_row_ids));
     }
@@ -134,21 +309,24 @@ impl CrossRootEvidence {
         api_ids: &BTreeSet<&str>,
         trace_ids: &BTreeSet<&str>,
     ) {
+        let role = self.role(root);
         let ordinal = self.ordinal(root);
         let api_rows = api.map_or(&[][..], Vec::as_slice);
         let trace_rows = trace.map_or(&[][..], Vec::as_slice);
-        self.request_roots.add_root(ordinal, api_ids, trace_ids);
-        if let Some(api) = api {
+        if role.joins() {
+            self.request_roots.add_root(ordinal, api_ids, trace_ids);
+            self.add_tripwire_rows(
+                ordinal,
+                root,
+                api_rows
+                    .iter()
+                    .map(api_row_ids)
+                    .chain(trace_rows.iter().map(trace_row_ids)),
+            );
+        }
+        if let Some(api) = api.filter(|_| role.legacy()) {
             self.legacy_request_owners.add_root(root, api, trace);
         }
-        self.add_tripwire_rows(
-            ordinal,
-            root,
-            api_rows
-                .iter()
-                .map(api_row_ids)
-                .chain(trace_rows.iter().map(trace_row_ids)),
-        );
         if let Some(earliest) = claude_earliest_request(api_rows) {
             self.earliest_requests.insert(root.to_owned(), earliest);
         }
@@ -340,7 +518,8 @@ mod tests {
                 .remove(0)
             },
         );
-        let mut cross = CrossRootEvidence::new(&dir, std::slice::from_ref(&item));
+        let mut cross =
+            CrossRootEvidence::new(&dir, std::slice::from_ref(&item), EvidenceScope::default());
         // No healthy root claims this request. The vetoing row is independent
         // of ownership demand and must not become a foreign-owner answer.
         cross.add_vetoing_api(

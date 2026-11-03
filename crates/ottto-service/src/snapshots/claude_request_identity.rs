@@ -4061,7 +4061,11 @@ pub(crate) fn reconcile_request_accounts(
             if blocked {
                 carry.block(occurrence.usage.request_count);
             }
-            let account = if blocked {
+            // The classifier's IncompleteEvidence for an unreadable named
+            // owner: no marker, carry, start or binding fills it.
+            let unreadable_owner =
+                telemetry.is_none() && evidence.owner_unreadable(root, request.as_str());
+            let account = if blocked || unreadable_owner {
                 None
             } else if preserve_org {
                 own_marker.and_then(|run| run.account.clone())
@@ -4691,11 +4695,14 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 pub(crate) struct ScanEvidence<'a> {
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
-    /// The request roots of this pass's whole corpus, from the cross-root
-    /// evidence the strict read built root by root.
-    cross_request_roots: Option<&'a super::claude_cross_root_evidence::RequestRootJoins>,
+    /// This pass's scope and the cross-root answers the strict read built
+    /// root by root over it.
+    cross: Option<&'a super::claude_cross_root_evidence::CrossRootEvidence>,
+    /// The request roots come from `cross`, not from the loaded rows.
+    streamed: bool,
     /// Test-only reachable fallback for the whole-corpus oracle: request roots
-    /// of the loaded rows, built on the first request without rows of its own.
+    /// of the loaded rows whose role joins, built on the first request without
+    /// rows of its own.
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
@@ -4812,14 +4819,44 @@ impl<'a> ScanEvidence<'a> {
         evidence
     }
 
-    /// The whole corpus's cross-root answers, for a pass whose reports hold
-    /// only the page roots: request roots.
+    /// The scope's cross-root answers, for a pass whose reports hold only the
+    /// page roots: request roots and named owners.
     pub(crate) fn with_cross_root(
         mut self,
         cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
     ) -> Self {
-        self.cross_request_roots = Some(&cross.request_roots);
+        self.cross = Some(cross);
+        self.streamed = true;
         self
+    }
+
+    /// The whole-corpus oracle: its reports hold every scope root's rows, and
+    /// the scope still says which root may answer what.
+    pub(crate) fn with_scope(
+        mut self,
+        cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
+    ) -> Self {
+        self.cross = Some(cross);
+        self
+    }
+
+    /// What `root`'s rows may answer this pass (every answer without a scope).
+    pub(crate) fn scope_role(&self, root: &str) -> super::claude_cross_root_evidence::RootRole {
+        self.cross.map_or(
+            super::claude_cross_root_evidence::RootRole::Owner,
+            |cross| cross.role(root),
+        )
+    }
+
+    /// The scope names another session as this request's owner (a census
+    /// holder or the file's fork parent) whose side files could not be read.
+    /// Only for a request with no API row of its own.
+    pub(crate) fn owner_unreadable(&self, root: &str, request_id: &str) -> bool {
+        self.cross.is_some_and(|cross| {
+            cross
+                .named_owners(root, request_id)
+                .any(|owner| self.unhealthy_roots.contains(owner))
+        })
     }
 
     pub(crate) fn with_unhealthy_reasons(
@@ -4863,14 +4900,16 @@ impl<'a> ScanEvidence<'a> {
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
     fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
-        if let Some(roots) = self.cross_request_roots {
-            return roots.get(request_id);
+        if let Some(cross) = self.cross.filter(|_| self.streamed) {
+            return cross.request_roots.get(request_id);
         }
         self.request_roots
             .get_or_init(|| {
                 let mut ids_by_root = BTreeMap::<&str, Vec<&str>>::new();
                 for &(root, id) in self.requests.keys().chain(self.owners.keys()) {
-                    ids_by_root.entry(root).or_default().push(id);
+                    if self.scope_role(root).joins() {
+                        ids_by_root.entry(root).or_default().push(id);
+                    }
                 }
                 let mut roots = RequestRootIndex::default();
                 for (ordinal, ids) in (0..).zip(ids_by_root.into_values()) {
@@ -5113,6 +5152,11 @@ pub(crate) fn classify_ref<'k>(
                     Some(owner) if owner_is_foreign(owner, facts) => Refusal::ForeignOwner,
                     Some(_) => Refusal::IncompleteEvidence,
                 });
+            }
+            // An owner the scope names but could not read leaves the request
+            // unproven: the copy's markers never claim it.
+            if evidence.owner_unreadable(facts.root, facts.request_id) {
+                return Refused(Refusal::IncompleteEvidence);
             }
             // Rows are keyed by trace root: a fork or resume copy holds its
             // original's request with the original's rows under another root.

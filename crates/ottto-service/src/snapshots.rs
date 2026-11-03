@@ -9241,6 +9241,17 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .collect()
 }
 
+/// The legacy copied-prefix owners that the witnesses of `roots` name.
+pub(crate) fn claude_witness_legacy_owner_roots<'i>(
+    index: &'i ScanIndex,
+    roots: &'i BTreeSet<String>,
+) -> impl Iterator<Item = &'i String> + 'i {
+    roots
+        .iter()
+        .filter_map(|root| index.claude_usage_family_witnesses.get(root))
+        .flat_map(|witness| witness.legacy_owner_roots.iter())
+}
+
 /// Replace transcript-only Claude usage with the exact union of transcript
 /// responses and locally reported API-request occurrences, but only after a
 /// complete filesystem census and an exact enhanced-trace ownership join.
@@ -9654,7 +9665,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         _ if !reports_healthy => None,
         ClaudeEvidenceRows::Whole(_) => {
             whole_ownership = classify_claude_legacy_request_owners(
-                api_report.evidence.iter(),
+                api_report.evidence.iter().filter(|(root, _)| {
+                    identity.map_or(true, |evidence| evidence.scope_role(root).legacy())
+                }),
                 &trace_report.evidence,
             );
             Some(whole_ownership.as_ref().map_err(|refusal| *refusal))
@@ -10057,6 +10070,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 api_report,
                 trace_report,
                 veto_api_rows,
+                |root| identity.map_or(true, |evidence| evidence.scope_role(root).joins()),
             )
         }
         ClaudeEvidenceRows::Streamed(cross) => cross.tripwire(snapshots, max_pending_occurrences),
@@ -20578,7 +20592,9 @@ impl SnapshotAccumulator {
                     .checked_add(".jsonl".len())?
                     .checked_mul(8)?,
                 _ => 0,
-            });
+            })
+            // The fold's own copy of that name.
+            .checked_add(self.claude_fork_parent.as_deref().map_or(0, str::len))?;
         claude_request_money::e2::FileFold::finish_heap_bound(
             &claude_request_money::e2::FoldShape {
                 responses: keys.responses,

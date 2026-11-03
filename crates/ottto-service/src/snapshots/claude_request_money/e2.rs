@@ -410,6 +410,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         accounts,
         prefix: _,
         folder_trace,
+        fork_parent,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -429,6 +430,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *telemetry = Default::default();
     *accounts = None;
     *folder_trace = None;
+    *fork_parent = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -928,8 +930,11 @@ pub(crate) struct FileFold {
     prefix: PrefixTally,
     /// Which file this fold read, for the folder ledger; set as it becomes an item.
     pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
+    /// The one session this file's `fork-context-ref` line names, whatever
+    /// copy route the page takes: the page's evidence scope reads its pair.
+    fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace, fork_parent]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1158,6 +1163,7 @@ impl FileFold {
             accounts: None,
             prefix: PrefixTally::default(),
             folder_trace: None,
+            fork_parent: None,
         };
         fold.spend(started);
         fold
@@ -1232,6 +1238,10 @@ impl FileFold {
                 .contains(&super::super::claude_request_census::claude_request_hash(
                     request_id,
                 ))
+    }
+
+    pub(crate) fn fork_parent(&self) -> Option<&str> {
+        self.fork_parent.as_deref()
     }
 
     pub(crate) fn is_skipped(&self, sequence: u64) -> bool {
@@ -1406,6 +1416,9 @@ impl FileFold {
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
+        self.fork_parent = fork_parent
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned);
         self.decide_native(context, markers, fork_parent);
         if self.proof.is_none() {
             self.proof = context
@@ -2688,7 +2701,7 @@ fn decide_holders(
     let store = &index.claude_money_birth_store;
     let walked = index.claude_request_census.main_transcript_holders(
         &union,
-        Instant::now() + SIDE_CALL_DEADLINE,
+        Some(Instant::now() + SIDE_CALL_DEADLINE),
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).

@@ -9971,10 +9971,19 @@ thread_local! {
 }
 
 // Test seam for the streamed-evidence equality arm: its reference keeps every
-// root's rows and folds them whole, as one pass over every root would.
+// scope root's rows and folds them whole, as one pass over every root would.
 #[cfg(test)]
 thread_local! {
     static WHOLE_CORPUS_EVIDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam for the scope's reference: the next enrichment on this thread
+// reads these roots (beside the page's own) and lets each answer everything,
+// as a pass over every side-file root would.
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_ROOTS: std::cell::RefCell<Option<BTreeSet<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn whole_corpus_evidence() -> bool {
@@ -10043,6 +10052,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
+    // The named fork parents, whatever route the copy decisions take.
+    let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
+        &scan_result.snapshots,
+    );
     // `e2`: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
     crate::snapshots::claude_request_money::e2::decide_page_copies(
@@ -10093,12 +10106,41 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     });
     let telemetry_read_failed = stats.effort_evidence_load_failed;
-    let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+    // Only the page's own roots keep their rows (both root spellings, so a
+    // page family can never lose its own rows).
+    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
-        .chain(crate::snapshots::claude_pending_family_session_ids(index))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+        .chain(scan_result.snapshots.iter().filter_map(|item| {
+            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
+        }))
+        .collect::<BTreeSet<_>>();
+    // Summed CPU/wall sub-windows of evidence_read: the scope's census walk
+    // and the cross-root summary build, and strict per-root decode. One
+    // record each per pass.
+    let mut cross_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
+    // Side files are read for this page's scope only: its own roots, their
+    // named fork parents and witnesses' legacy owners, and the sessions whose
+    // transcripts hold a page request with no API row of its own. A terminal
+    // also reads the other pending roots, for its own answers only.
+    let scope = cross_window.time(|| {
+        crate::snapshots::claude_cross_root_evidence::EvidenceScope::of_page(
+            &scan_result.snapshots,
+            index,
+            &kept_roots,
+            fork_parents,
+            &api_read.evidence,
+            census_complete,
+        )
+    });
+    #[cfg(test)]
+    let scope = match REFERENCE_ROOTS.with(std::cell::RefCell::take) {
+        Some(roots) => crate::snapshots::claude_cross_root_evidence::EvidenceScope::every(
+            kept_roots.iter().cloned().chain(roots),
+        ),
+        None => scope,
+    };
+    let usage_roots = scope.roots().cloned().collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
@@ -10169,18 +10211,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
-    // Only the page's own roots keep their rows (both root spellings, so a
-    // page family can never lose its own rows). Every root read adds its
-    // cross-root answers first, so the fold sees the whole corpus's answers.
-    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
-        .into_iter()
-        .chain(scan_result.snapshots.iter().filter_map(|item| {
-            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
-        }))
-        .collect::<BTreeSet<_>>();
+    // Every root read adds its cross-root answers first, so the fold sees
+    // the scope's answers.
     let mut cross = crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(
         support_dir,
         &scan_result.snapshots,
+        scope,
     );
     let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
@@ -10194,7 +10230,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     for root in unpaired {
         if let Some(rows) = api_read.evidence.remove(&root) {
             cross.add_vetoing_api(&root, &rows);
-            if let Some(veto_api_rows) = whole_corpus.as_mut() {
+            let joins = cross.role(&root).joins();
+            if let Some(veto_api_rows) = whole_corpus.as_mut().filter(|_| joins) {
                 veto_api_rows.insert(root, rows);
             }
         }
@@ -10211,12 +10248,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
-    // Summed CPU/wall sub-windows of evidence_read: strict per-root decode and
-    // the cross-root summary build. One record each per pass.
     let mut decode_window =
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
-    let mut cross_window =
-        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
         let (generation, mut api, mut trace) = decode_window.time(|| {
@@ -10246,7 +10279,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 cross.add_vetoing_api(&root_session_id, &rows);
-                if let Some(veto_api_rows) = whole_corpus.as_mut() {
+                let joins = cross.role(&root_session_id).joins();
+                if let Some(veto_api_rows) = whole_corpus.as_mut().filter(|_| joins) {
                     veto_api_rows.insert(root_session_id.clone(), rows);
                 }
             }
@@ -10396,7 +10430,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
         );
         let evidence = match &whole_corpus {
-            Some(_) => evidence,
+            Some(_) => evidence.with_scope(&cross),
             None => evidence.with_cross_root(&cross),
         };
         evidence
@@ -23209,6 +23243,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
+        }
+        mod scoped_cross_root_tests {
+            include!("snapshot_sync/scoped_cross_root_tests.rs");
         }
     }
     mod p12_pipeline_original_tests {
