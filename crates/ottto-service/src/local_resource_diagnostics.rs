@@ -640,8 +640,6 @@ pub(crate) struct CapCounts {
     pub price_trace_row_limit_hits: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub parent_ref_refusals: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub inventory_hold_keys_discarded: u64,
 }
 impl CapCounts {
     pub(crate) fn is_empty(&self) -> bool {
@@ -654,7 +652,6 @@ impl CapCounts {
             &mut self.parent_signature_clear_events,
             &mut self.price_trace_row_limit_hits,
             &mut self.parent_ref_refusals,
-            &mut self.inventory_hold_keys_discarded,
         ]
         .into_iter()
         .enumerate()
@@ -676,7 +673,7 @@ impl CapCounts {
     }
 }
 
-crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals, inventory_hold_keys_discarded);
+crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals);
 
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -696,7 +693,7 @@ pub(crate) enum UnselectedReason {
     WithheldAbsenceAmbiguous = 18,
 }
 const CAP_EVENT_START: usize = 19;
-const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
+const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
 const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
 const UNSELECTED_REASONS: usize = change_reason::END;

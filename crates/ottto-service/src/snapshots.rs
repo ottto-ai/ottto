@@ -1098,9 +1098,8 @@ pub(crate) fn provider_context_bucket(
         "short"
     })
 }
-// Generous ceilings: scanning is incremental (per-file fingerprint) and
-// streaming, so a larger history is a one-time backfill cost with bounded
-// memory. The finite caps still guard a pathological ~/.codex.
+// Per-page read budget, not a history bound: discovery queues every file in
+// the window into the durable traversal and the rest continues next page.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 // Directory discovery has its own hard per-tick budget. Candidate parsing was
 // already capped, but recursively walking an arbitrarily large tree before
@@ -1114,8 +1113,6 @@ pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
 /// A re-listing pass queues an owed file whose stamp is unchanged at most
 /// once per this interval.
 const LISTING_OWED_PACE_SECONDS: u64 = 6 * 60 * 60;
-/// Bound on `ScanTraversalCheckpoint::listing_owed_requeued_unix_seconds`.
-const MAX_LISTING_OWED_PACES: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// The retry attempt at which the exponential delay reaches its ceiling
@@ -2778,10 +2775,6 @@ struct ScanTraversalCounts {
     /// once per file per `LISTING_OWED_PACE_SECONDS`.
     #[serde(skip_serializing_if = "is_zero_u64")]
     listing_owed_requeued: u64,
-    /// Pacing stamps dropped because the map reached its bound; each lets
-    /// its file be re-queued before six hours.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    listing_owed_pace_evicted: u64,
     /// Diagnostic only: paced growth reads deferred until their claim ages
     /// out. Never an unreadable path, a retryable problem or an error.
     #[serde(skip_serializing_if = "is_zero_u64")]
@@ -2954,8 +2947,7 @@ struct ScanTraversalCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listing_started_unix_seconds: Option<u64>,
     /// Owed files with an unchanged stamp that a re-listing pass queued,
-    /// with that pass's start. Bounded: past the bound the oldest stamp is
-    /// dropped, so the bound can only bring a re-queue forward.
+    /// with that pass's start. Stamps older than the pace are pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
 }
@@ -3009,9 +3001,6 @@ impl ScanTraversalResidue {
             && self.codex_inventory_hold.is_none()
     }
 }
-
-/// Upper bound on each key set of a `CodexInventoryHold`.
-const MAX_CODEX_INVENTORY_HOLD_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 
 /// Codex candidates a page held only because its header inventory was
 /// incomplete, with the evidence that made it incomplete.
@@ -45951,28 +45940,8 @@ fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool
         return false;
     }
     paced.retain(|_, at| fresh(at));
-    traversal.counts.listing_owed_pace_evicted +=
-        trim_listing_owed_paces(paced, MAX_LISTING_OWED_PACES - 1);
     paced.insert(key.to_owned(), now);
     true
-}
-
-/// Drops the oldest pacing stamps until at most `bound` remain, so a bound
-/// can only bring a re-queue forward. Returns how many were dropped.
-fn trim_listing_owed_paces(paces: &mut BTreeMap<String, u64>, bound: usize) -> u64 {
-    let excess = paces.len().saturating_sub(bound);
-    if excess == 0 {
-        return 0;
-    }
-    let mut by_age = paces
-        .iter()
-        .map(|(key, at)| (*at, key.clone()))
-        .collect::<Vec<_>>();
-    by_age.sort_unstable();
-    for (_, key) in by_age.into_iter().take(excess) {
-        paces.remove(&key);
-    }
-    excess as u64
 }
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
@@ -46028,7 +45997,7 @@ fn enqueue_watcher_hints(
         .iter()
         .filter(|p| !codex_archive_path(p))
         .chain(hinted_paths.iter().filter(|p| codex_archive_path(p)));
-    for path in ordered.take(MAX_BACKFILL_FILES_PER_SOURCE) {
+    for path in ordered {
         if !transcript_path_admitted(source, path)
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
@@ -46319,7 +46288,6 @@ fn requeue_unindexed_observed(source: SnapshotSource, index: &mut ScanIndex) {
                 && fs::symlink_metadata(key)
                     .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         })
-        .take(MAX_BACKFILL_FILES_PER_SOURCE)
         .cloned()
         .collect::<Vec<_>>();
     let traversal = index.traversal.as_mut().expect("traversal checked above");
@@ -46362,26 +46330,6 @@ fn record_codex_inventory_hold(
             .map(|(key, witness)| (key.clone(), witness.clone())),
     );
     hold.outside_roster.extend(outside_roster);
-    if hold.owed.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-        || hold.refused_headers.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-        || hold.outside_roster.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
-    {
-        // Count distinct discarded keys across the three overlapping sets.
-        let keys = hold.owed.len()
-            + hold
-                .refused_headers
-                .keys()
-                .filter(|key| !hold.owed.contains(*key))
-                .count()
-            + hold
-                .outside_roster
-                .keys()
-                .filter(|key| !hold.owed.contains(*key) && !hold.refused_headers.contains_key(*key))
-                .count();
-        CapCounts::record("codex", 5, keys as u64);
-        // Past the bound only the next walk re-selects them, as before.
-        traversal.residue.codex_inventory_hold = None;
-    }
 }
 
 /// Queue the candidates of a `CodexInventoryHold` again once its evidence
@@ -46603,7 +46551,6 @@ fn advance_bounded_directory_traversal_with_budget(
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
-            saved.listing_owed_pace_evicted = counts.listing_owed_pace_evicted;
             saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
         }
@@ -84744,7 +84691,7 @@ crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_fi
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, listing_owed_pace_evicted, growth_deferred);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

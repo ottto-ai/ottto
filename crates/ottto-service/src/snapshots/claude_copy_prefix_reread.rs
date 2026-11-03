@@ -86,10 +86,7 @@ fn plan(mut members: Vec<Member>, window_days: u64, nonce: Option<String>) -> Re
         window_days <= BACKFILL_WINDOW_DAYS,
         "window exceeds existing policy"
     );
-    ensure!(
-        !members.is_empty() && members.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
-        "scope exceeds existing file bound"
-    );
+    ensure!(!members.is_empty(), "scope requires files");
     ensure!(
         members
             .iter()
@@ -261,10 +258,7 @@ pub fn run(
     window_days: u64,
 ) -> Result<Estimate> {
     let paths: Vec<PathBuf> = bounded_json(scope)?;
-    ensure!(
-        !paths.is_empty() && paths.len() <= MAX_BACKFILL_FILES_PER_SOURCE,
-        "scope exceeds existing file bound"
-    );
+    ensure!(!paths.is_empty(), "scope requires files");
     ensure!(
         paths
             .iter()
