@@ -962,7 +962,10 @@ local diagnostics only; they gate, cap and upload nothing.
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
   `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
   `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
-  a changed body with no tag; never guessed).
+  a changed body with no tag; never guessed). `privacy_off_erase` is an
+  upload-context read of a delivered file after the latest sharing-policy change
+  this daemon process saw turned a flag off. No direction is persisted, so after
+  a restart such reads count as `admin_other`.
 - **`upload`** (per entity, once per page): `entities`, `accepted` (stored or
   unchanged ACK), `usage_identical`, `money_changed_or_unknown` (`accepted` minus
   `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
