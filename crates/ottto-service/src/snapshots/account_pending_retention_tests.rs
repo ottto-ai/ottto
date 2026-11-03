@@ -40,7 +40,8 @@ fn cold(mut index: ScanIndex) -> ScanIndex {
         let stored = windows.len() as u64;
         let mut fold = account_pending_retention::ColdFold::default();
         windows.into_iter().for_each(|window| fold.push(window));
-        pending.previous_windows = fold.finish((stored != 0).then_some(stored));
+        let current_end = &pending.current.census_window_end;
+        pending.previous_windows = fold.finish((stored != 0).then_some(stored), current_end);
     }
     index
 }
@@ -116,8 +117,10 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Any evidence change in the middle of the archive: only the newest window
+/// stays, since it names every member.
 #[test]
-fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
+fn account_window_collapse_keeps_the_newest_across_evidence_changes() {
     let (dir, root, base) = retention_fixture();
     for change in [
         "account",
@@ -179,15 +182,7 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
         let collapsed = index.claude_account_family_pending[&root]
             .previous_windows
             .resident();
-        assert_eq!(
-            collapsed,
-            &[
-                original[2].clone(),
-                original[5].clone(),
-                original[8].clone()
-            ],
-            "{change}"
-        );
+        assert_eq!(collapsed, &[original[8].clone()], "{change}");
         let once = index.claude_account_family_pending.clone();
         index.collapse_account_pending_windows();
         assert_eq!(index.claude_account_family_pending, once);
@@ -196,14 +191,13 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] A v1 or resident history with the former rule's second endpoints
-/// and census-completion flips collapses to each run's newest window, with
-/// the same summary, scheduling and retirement as the uncollapsed history,
-/// resident and cold. The completion flag of an archived window splits no
-/// run. An account change only in older windows still retires; an
-/// unconfirmed member only in them still holds.
+/// [money] A v1 or resident history with census-completion flips collapses
+/// to the newest window and each member's newest, with the same summary,
+/// scheduling and retirement as the uncollapsed history, resident and cold.
+/// An account change only in older windows still retires; an unconfirmed
+/// member only in them keeps its newest window and still holds.
 #[test]
-fn account_window_collapse_keeps_each_runs_newest_across_completion_flips() {
+fn account_window_collapse_keeps_each_members_newest_across_completion_flips() {
     let (dir, root, base) = retention_fixture();
     for change in ["account", "absent"] {
         let mut before = base.clone();
@@ -235,16 +229,13 @@ fn account_window_collapse_keeps_each_runs_newest_across_completion_flips() {
         let mut after = before.clone();
         after.collapse_account_pending_windows();
         let pending = &after.claude_account_family_pending[&root];
+        let kept: &[usize] = if change == "absent" { &[7, 8] } else { &[8] };
+        let kept: Vec<_> = kept.iter().map(|&at| original[at].clone()).collect();
+        assert_eq!(pending.previous_windows.resident(), &kept, "{change}");
         assert_eq!(
-            pending.previous_windows.resident(),
-            &[
-                original[5].clone(),
-                original[7].clone(),
-                original[8].clone()
-            ],
-            "{change}"
+            after.claude_account_window_retention.windows_collapsed,
+            9 - kept.len() as u64
         );
-        assert_eq!(after.claude_account_window_retention.windows_collapsed, 6);
         assert_eq!(after.claude_account_window_retention.roots_refused, 0);
         assert!(
             pending.history_summary()
@@ -287,8 +278,8 @@ fn account_window_unsafe_boundaries_are_untouched() {
             .previous_windows
             .resident_mut()[2]
             .census_window_end = boundary.into();
-        // Cold arm: never walked, nothing changes; `uncollapsed` counts the
-        // interior windows of equal-evidence runs, boundaries unchecked.
+        // Cold arm: never walked, nothing changes, and the count names no
+        // removal, so compaction never reads the family.
         for (cold_arm, mut index) in [(false, index.clone()), (true, cold(index))] {
             let before = index.claude_account_family_pending.clone();
             index.collapse_account_pending_windows();
@@ -299,7 +290,7 @@ fn account_window_unsafe_boundaries_are_untouched() {
             let uncollapsed = index.claude_account_family_pending[&root]
                 .previous_windows
                 .uncollapsed();
-            assert_eq!(uncollapsed != 0, cold_arm);
+            assert_eq!(uncollapsed, 0);
         }
     }
     fs::remove_dir_all(dir).unwrap();
@@ -515,10 +506,12 @@ fn placement(mut index: ScanIndex, root: &str) -> Placement {
     )
 }
 
-/// [money] Placement parity, two-endpoint retention vs one window per run.
-/// Literal legacy histories keep both endpoints of each run, splitting on
-/// completion flips. Check written-out newest-only results from `archive` and
-/// load collapse, then compare real placement through resident and cold views.
+/// [money] Placement parity: legacy histories (both endpoints of each run,
+/// split on completion flips) vs the rollover rule (one window per run) vs
+/// the load walk and v2 compaction (the newest and each member's newest).
+/// Two accounts throughout; the alternating rows have no equal neighbours,
+/// so only the winner count makes their cold family drain. Retirement,
+/// scheduling and placement match through resident and cold views.
 #[test]
 fn account_window_placement_parity_with_two_endpoint_retention() {
     let (dir, root, base) = retention_fixture();
@@ -558,7 +551,7 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
         .insert("unconfirmed-absent".into(), requests);
     absent.evidence_request_count += 1;
     assert!(claude_family_request_ids_are_disjoint(&absent));
-    for (history, windows, newest, retires) in [
+    for (history, windows, runs, kept, retires) in [
         (
             "repeats_flips_a_b_a",
             // Old: A[0,2], incomplete A[3], A[4], B[5,7], A[8,9].
@@ -573,24 +566,42 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
                 a(9),
             ],
             vec![a(4), b(7), a(9)],
+            vec![a(9)],
             true,
         ),
         (
             "invalid_switch_mid",
             vec![a(0), a(2), invalid(3), invalid(5), a(6), a(8)],
             vec![a(2), invalid(5), a(8)],
+            vec![a(8)],
             true,
         ),
         (
             "invalid_switch_last",
             vec![a(0), a(2), invalid(3), invalid(5)],
             vec![a(2), invalid(5)],
+            vec![invalid(5)],
             false,
         ),
         (
             "absent_older",
             vec![a(0), a(2), absent.clone(), a(4), a(6)],
-            vec![a(2), absent, a(6)],
+            vec![a(2), absent.clone(), a(6)],
+            vec![absent, a(6)],
+            false,
+        ),
+        (
+            "alternating_accounts",
+            vec![a(0), b(1), a(2), b(3), a(4)],
+            vec![a(0), b(1), a(2), b(3), a(4)],
+            vec![a(4)],
+            true,
+        ),
+        (
+            "alternating_ending_b",
+            vec![a(0), b(1), a(2), b(3)],
+            vec![a(0), b(1), a(2), b(3)],
+            vec![b(3)],
             false,
         ),
     ] {
@@ -617,7 +628,7 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
             pending.archive(old, true);
         }
         assert_eq!(pending.census_window_end, current_end);
-        assert_eq!(pending.previous_windows.resident(), &newest, "{history}");
+        assert_eq!(pending.previous_windows.resident(), &runs, "{history}");
         let mut new_collapsed = legacy.clone();
         new_collapsed.collapse_account_pending_windows();
         assert_eq!(
@@ -628,20 +639,20 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
             new_collapsed.claude_account_family_pending[&root]
                 .previous_windows
                 .resident(),
-            &newest,
+            &kept,
             "{history}"
         );
 
         let summary = legacy.claude_account_family_pending[&root].history_summary();
         let (reopened, counts) = state_v2::compact_reopened_for_test(&legacy);
-        assert_eq!(counts["windows_removed"], windows.len() - newest.len());
+        assert_eq!(counts["windows_removed"], windows.len() - kept.len());
         assert_eq!(counts["families_done"], 1);
         assert_eq!(counts["families_refused"], 0);
         assert_eq!(
             reopened.claude_account_family_pending[&root]
                 .previous_windows
                 .resident(),
-            &newest
+            &kept
         );
         let expected = placement(legacy.clone(), &root);
         assert_eq!(!expected.1, retires, "nonvacuous {history}");

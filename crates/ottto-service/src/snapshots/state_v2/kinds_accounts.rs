@@ -525,13 +525,14 @@ pub(super) fn hydrate_filtered(
         }
         count += 1;
         let (current_id, archived) = ids.split_last().context("accounts_current")?;
+        let current = window(tx, &family, *current_id, seed.as_deref_mut(), &mut seen)?;
         let previous_windows = if cold {
             // One decoded window at a time: fold it, keep its digest, drop it.
             let mut fold = ColdFold::default();
             for id in archived {
                 fold.push(window(tx, &family, *id, seed.as_deref_mut(), &mut seen)?);
             }
-            fold.finish(archived.last().copied())
+            fold.finish(archived.last().copied(), &current.census_window_end)
         } else {
             let mut windows = Vec::new();
             for id in archived {
@@ -539,7 +540,6 @@ pub(super) fn hydrate_filtered(
             }
             ArchivedWindows::Resident(windows)
         };
-        let current = window(tx, &family, *current_id, seed.as_deref_mut(), &mut seen)?;
         let h = tx
             .get(&mapper::key("account.absent_members", &family, 1)?)?
             .context("accounts_missing_absent")?;

@@ -1172,11 +1172,11 @@ fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
     }
 }
 
-/// [money] A family the checked summary refuses keeps every row and is
-/// settled for the session, so it cannot hold the allowance on every save.
+/// [money] A family whose boundaries the plan refuses counts no removal, so
+/// compaction never reads it and cannot spend the allowance on it every pass.
 #[test]
 #[serial_test::serial]
-fn cold_compaction_settles_a_refused_family_for_the_session() {
+fn cold_compaction_never_reads_a_family_the_plan_refuses() {
     let (_scratch, mut db) = Scratch::live_store();
     let mut original = fixture();
     let pending = original
@@ -1201,21 +1201,19 @@ fn cold_compaction_settles_a_refused_family_for_the_session() {
             .previous_windows
             .uncollapsed()
     };
-    assert_eq!(uncollapsed(&graph), 2);
+    assert_eq!(uncollapsed(&graph), 0);
     let previous = baseline(&graph, &mut cx).unwrap();
     let before = previous.rows.clone();
     let saved = import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
     assert_eq!(
         (
             cx.compaction.counts.families_refused,
-            cx.compaction.counts.windows_removed
+            cx.compaction.counts.windows_removed,
+            cx.compaction.counts.families_done
         ),
-        (1, 0)
+        (0, 0, 0)
     );
     assert_eq!(saved.rows, before);
-    assert_eq!(uncollapsed(&graph), 0);
-    import::save(&mut db, &identity, saved, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(cx.compaction.counts.families_refused, 0);
 }
 
 /// [format] stale generation or future writer refuses before saving.

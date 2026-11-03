@@ -1,6 +1,6 @@
-//! Keep the newest window of each run of consecutive windows with equal
-//! strict evidence. Boundaries remain separate from the consumer projection;
-//! current is never collapsed.
+//! Keep only the archived windows retirement reads: the newest, and each
+//! member's newest. A rollover replaces an equal-evidence predecessor; the
+//! load walk and v2 compaction drop the rest. Current is never collapsed.
 use super::{
     rfc3339_unix_seconds, ClaudeAccountFamilyPending, ClaudeAccountFamilyPendingWindow,
     ClaudeAccountRequestSet, ScanIndex,
@@ -146,8 +146,8 @@ impl ArchivedWindows {
         matches!(self, Self::Resident(windows) if windows.is_empty())
     }
 
-    /// Windows older than their equal-evidence run's newest, boundaries
-    /// unchecked; a cold archive is never walked.
+    /// Stored windows the compaction plan would remove; a cold archive is
+    /// never walked.
     pub(super) fn uncollapsed(&self) -> usize {
         match self {
             Self::Resident(_) => 0,
@@ -250,31 +250,37 @@ impl ColdWindows {
     }
 }
 /// Streams one family's stored archive, oldest first, into a cold archive.
-/// Only the previous window is held, to count equal-evidence runs.
+/// No window is held: the summary alone names the windows compaction keeps.
 #[derive(Default)]
 pub(super) struct ColdFold {
     cold: ColdWindows,
-    last: Option<ClaudeAccountFamilyPendingWindow>,
+    /// A boundary was unparsable or not after the previous one.
+    unordered: bool,
 }
 impl ColdFold {
     pub(super) fn push(&mut self, window: ClaudeAccountFamilyPendingWindow) {
+        let newest = self.cold.summary.newest_boundary;
         self.cold.summary.fold(&window);
+        self.unordered |= self.cold.summary.newest_boundary <= newest;
         self.cold.stored += 1;
-        let same = self
-            .last
-            .as_ref()
-            .is_some_and(|last| last.strict_evidence() == window.strict_evidence());
-        if same {
-            self.cold.uncollapsed += 1;
-        }
-        self.last = Some(window);
     }
 
-    pub(super) fn finish(self, last_id: Option<u64>) -> ArchivedWindows {
-        ArchivedWindows::Cold(Box::new(ColdWindows {
-            last_id,
-            ..self.cold
-        }))
+    /// The plan keeps the summary's distinct winning boundaries and the
+    /// newest one. Boundaries it refuses count no removal, so compaction
+    /// never reads a family it would refuse.
+    pub(super) fn finish(mut self, last_id: Option<u64>, current_end: &str) -> ArchivedWindows {
+        let summary = &self.cold.summary;
+        if !self.unordered && summary.newest_boundary < rfc3339_unix_seconds(current_end) {
+            let kept: std::collections::BTreeSet<u64> = summary
+                .latest
+                .values()
+                .map(|(boundary, ..)| *boundary)
+                .chain(summary.newest_boundary)
+                .collect();
+            self.cold.uncollapsed = self.cold.stored - kept.len();
+        }
+        self.cold.last_id = last_id;
+        ArchivedWindows::Cold(Box::new(self.cold))
     }
 }
 
@@ -368,16 +374,21 @@ fn collapse_plan(
         }
         previous = Some(time);
     }
-    // Boundaries are strictly increasing, so a run's newest window carries
-    // every member's winning evidence for that run.
-    let mut retained = Vec::new();
+    // Boundaries are strictly increasing, so a member's last window is its
+    // winner and the last window is the newest; no other window wins
+    // anything the summary reads.
+    let mut newest = BTreeMap::new();
     for (at, window) in windows.iter().enumerate() {
-        if windows.get(at + 1).map_or(true, |next| {
-            next.strict_evidence() != window.strict_evidence()
-        }) {
-            retained.push(at);
+        for member in window.members.keys() {
+            newest.insert(member, at);
         }
     }
+    let mut retained: Vec<usize> = newest
+        .into_values()
+        .chain(windows.len().checked_sub(1))
+        .collect();
+    retained.sort_unstable();
+    retained.dedup();
     Some(retained)
 }
 
@@ -643,6 +654,68 @@ mod tests {
             .map(|(minute, account)| rolled_window(minute as u32, true, account))
             .collect();
         assert_eq!(roll_through(&sequence, 0), sequence[..3].to_vec());
+    }
+
+    /// `rolled_window` with these members, each carrying its request set.
+    fn members_window(
+        minute: u32,
+        account: char,
+        members: &[&str],
+    ) -> ClaudeAccountFamilyPendingWindow {
+        let mut window = rolled_window(minute, false, account);
+        let requests = window.member_requests.remove("member").unwrap();
+        window.members = members.iter().map(|m| (m.to_string(), 1)).collect();
+        window.member_requests = members
+            .iter()
+            .map(|m| (m.to_string(), requests.clone()))
+            .collect();
+        window
+    }
+
+    /// [behaviour] Equal and unequal neighbours, two accounts and three
+    /// members: the plan keeps the newest window and each member's newest,
+    /// the summary retirement reads is unchanged, and the cold count names
+    /// the same removals without walking the archive.
+    #[test]
+    fn compaction_keeps_only_the_newest_and_each_members_newest_window() {
+        let w = members_window;
+        let archive = vec![
+            w(0, 'a', &["x"]),
+            w(1, 'a', &["x"]),
+            w(2, 'b', &["x", "y"]),
+            w(3, 'b', &["y"]),
+            w(4, 'a', &["z"]),
+            w(5, 'a', &["z"]),
+            w(6, 'b', &["y"]),
+        ];
+        let current_end = w(9, 'a', &["d"]).census_window_end;
+        let mut windows = archive.clone();
+        let retained = checked_collapse(&mut windows, &current_end);
+        assert_eq!(retained, Some(vec![2, 5, 6]));
+        assert_eq!(windows, [2, 5, 6].map(|at| archive[at].clone()));
+        assert!(HistorySummary::from_windows(&windows) == HistorySummary::from_windows(&archive));
+        let mut fold = ColdFold::default();
+        archive.iter().cloned().for_each(|window| fold.push(window));
+        assert_eq!(fold.finish(Some(7), &current_end).uncollapsed(), 4);
+    }
+
+    /// [behaviour] Two archived windows at one boundary: the plan is refused,
+    /// every window stays, and the cold count names no removal.
+    #[test]
+    fn a_boundary_tie_refuses_the_plan_and_deletes_nothing() {
+        let mut archive: Vec<_> = ['a', 'b', 'a']
+            .into_iter()
+            .enumerate()
+            .map(|(minute, account)| members_window(minute as u32, account, &["x"]))
+            .collect();
+        archive[1].census_window_end = archive[0].census_window_end.clone();
+        let current_end = members_window(9, 'a', &["x"]).census_window_end;
+        let mut windows = archive.clone();
+        assert_eq!(checked_collapse(&mut windows, &current_end), None);
+        assert_eq!(windows, archive);
+        let mut fold = ColdFold::default();
+        archive.into_iter().for_each(|window| fold.push(window));
+        assert_eq!(fold.finish(Some(3), &current_end).uncollapsed(), 0);
     }
 
     #[test]
