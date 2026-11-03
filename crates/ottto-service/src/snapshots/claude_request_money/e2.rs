@@ -48,34 +48,19 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Revision 3 keeps a listed family, and
-/// every family while the list pauses adoption, on ordinary (pre-`e2`)
-/// money. With the gate on, `e2` applies to every other family; a family it
-/// does not apply to behaves exactly as gate off (no fold, so no literal).
+/// Revision 3 keeps a listed family on ordinary (pre-`e2`) money. With the
+/// gate on, `e2` applies to every other family, also while the list pauses
+/// adoption: a pause holds adoption only, never emission. A family it does
+/// not apply to behaves exactly as gate off (no fold, so no literal).
 pub(crate) fn family_applies(index: &ScanIndex, root: &str, subagent_stem: Option<&str>) -> bool {
-    applies_unless_listed(
-        index,
-        index
-            .claude_reemission_exclusions
-            .excludes(root, subagent_stem),
-    )
+    !index
+        .claude_reemission_exclusions
+        .excludes(root, subagent_stem)
 }
 
 /// `family_applies` for the family of the file a parse opened.
 pub(in crate::snapshots) fn file_applies(context: &ReadContext<'_>) -> bool {
-    applies_unless_listed(
-        context.index,
-        claude_index_path_member_ref(context.path).is_some_and(|member| {
-            context
-                .index
-                .claude_reemission_exclusions
-                .excludes(member.root, member.subagent_stem)
-        }),
-    )
-}
-
-fn applies_unless_listed(index: &ScanIndex, listed: bool) -> bool {
-    !listed && !index.claude_reemission_exclusions.pauses_adoption()
+    !context.index.claude_family_listed(context.path)
 }
 // Synthetic transcripts are created when a test runs, after their records'
 // fixed timestamps, so `e2` would read every record as copied in. A fixture

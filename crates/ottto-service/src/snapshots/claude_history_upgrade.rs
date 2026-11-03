@@ -31,10 +31,11 @@
 //! The parse reason is a diagnostic only; no decision here reads it.
 //!
 //! Under a revision whose policy row denies the request-owned literal
-//! (revision 3), a listed family, or any family while
-//! the list is paused, still emits its ordinary body on a genuine change, as
-//! today. Only items carrying `claude_request_owned_usage:v1` are removed,
-//! and the file never stamps that revision, so it stays owed and gated.
+//! (revision 3), a listed family still emits its ordinary body on a genuine
+//! change, as today. Only items carrying `claude_request_owned_usage:v1` are
+//! removed, and the file never stamps that revision, so it stays owed and
+//! gated. A paused list holds adoption only: owed history waits, while a
+//! genuine change of an unlisted family emits as under an installed list.
 //!
 //! The only writers of a file's stored revision are
 //! `stamp_effective_upload_body_witness_revision` (raise) and
@@ -65,8 +66,8 @@ pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usag
 const OWED_WITHOUT_LIST_ALARM_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
-/// What a listed family (or, while the list is paused, any family) may emit
-/// when it is parsed as ordinary sync under one revision.
+/// What a listed family may emit when it is parsed as ordinary sync under
+/// one revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ListedEmission {
     /// Its whole body, as today.
@@ -79,10 +80,9 @@ pub(super) enum ListedEmission {
 /// What one active revision allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RevisionPolicy {
-    /// A listed family's (or, while the list is paused, any family's)
-    /// ordinary sync, a genuine change included. Revision 2 adds only
-    /// context numbers; revision 3 adds request-owned money, which listed
-    /// roots must never emit (F3, Amendment 14).
+    /// A listed family's ordinary sync, a genuine change included. Revision
+    /// 2 adds only context numbers; revision 3 adds request-owned money,
+    /// which listed roots must never emit (F3, Amendment 14).
     pub(super) listed_emission: ListedEmission,
     /// Before the list was ever installed, history born before this second,
     /// or at an unknown time, is held under this revision (F4b).
@@ -295,10 +295,9 @@ pub(crate) enum HistoryDecision {
     Owed,
     /// Owed (or a listed change) and held: no body of this file is emitted.
     Held(HistoryHold),
-    /// Ordinary sync of a listed family (or of any family while the list is
-    /// paused) under a revision that denies the request-owned literal: the
-    /// ordinary body emits, literal items are removed, and the file does not
-    /// stamp the active revision.
+    /// Ordinary sync of a listed family under a revision that denies the
+    /// request-owned literal: the ordinary body emits, literal items are
+    /// removed, and the file does not stamp the active revision.
     LiteralDenied,
 }
 
@@ -474,15 +473,13 @@ pub(super) fn decide(
     size_bytes: u64,
 ) -> HistoryDecision {
     let policy = revision_policy(inputs.active_revision);
-    // Under a paused list no family can be shown unlisted (F3).
-    let maybe_listed = inputs.listed || inputs.exclusions.pauses_adoption();
     let decision = match kind {
         HistoryKind::Settled | HistoryKind::Fresh | HistoryKind::Changed => match policy {
             None if inputs.listed => HistoryDecision::Held(HistoryHold::UngatedRevision),
             Some(RevisionPolicy {
                 listed_emission: ListedEmission::WithoutRequestOwnedLiteral,
                 ..
-            }) if maybe_listed => HistoryDecision::LiteralDenied,
+            }) if inputs.listed => HistoryDecision::LiteralDenied,
             _ => HistoryDecision::NotOwed,
         },
         HistoryKind::Owed => {
@@ -877,9 +874,8 @@ pub(crate) fn request_owned_family_root(item: &super::SnapshotItem) -> Option<&s
     is_request_owned_literal(item).then(|| super::claude_snapshot_family_root_ref(item))
 }
 
-/// True when `revision`'s row denies listed (or, while the list is paused,
-/// all) families the request-owned literal. A revision with no row denies it
-/// (fail closed).
+/// True when `revision`'s row denies listed families the request-owned
+/// literal. A revision with no row denies it (fail closed).
 pub(super) fn denies_request_owned_literal(revision: u64) -> bool {
     revision_policy(revision).map_or(true, |row| {
         row.listed_emission == ListedEmission::WithoutRequestOwnedLiteral
@@ -896,8 +892,8 @@ pub(super) enum LiteralGuard {
     /// No literal item, or the literal's revision is active and no family
     /// is listed.
     Open,
-    /// The active revision is below the literal's (S-726-1) or has no row,
-    /// or the list is paused (every family may be listed): no literal passes.
+    /// The active revision is below the literal's (S-726-1) or has no row:
+    /// no literal passes.
     DenyAll,
     /// Only literals of these indexed source files, none of them in a listed
     /// family, pass. An unknown or unindexed source fails closed.
@@ -935,7 +931,7 @@ impl LiteralGuard {
         // it (revision 3), nor under a revision with no row.
         let literal_row = revision_policy(active_revision)
             .is_some_and(|row| row.listed_emission == ListedEmission::WithoutRequestOwnedLiteral);
-        if !literal_row || list.pauses_adoption() {
+        if !literal_row {
             return Self::DenyAll;
         }
         let literal_sources = items
@@ -1451,6 +1447,58 @@ mod tests {
         });
     }
 
+    const PAUSED: [ListState; 4] = [
+        ListState::Unreadable,
+        ListState::MissingAfterInstall,
+        ListState::MarkerUnwritable,
+        ListState::ClosureOverflow,
+    ];
+
+    /// [money] A paused list holds adoption only (G1, G2, G4): owed history
+    /// is held, while a genuine change or a new file decides exactly as under
+    /// the installed list, listed or not.
+    #[test]
+    fn a_paused_list_holds_owed_history_and_decides_changes_as_installed() {
+        with_max_gated_claude_revision(3, || {
+            let list = installed("");
+            for paused in PAUSED {
+                let paused_list = list.clone().with_state_for_test(paused);
+                for kind in [HistoryKind::Fresh, HistoryKind::Changed] {
+                    for listed in [false, true] {
+                        assert_eq!(
+                            decide(
+                                kind,
+                                &inputs(&paused_list, listed, 3),
+                                &mut HistoryPage::default(),
+                                "k",
+                                1
+                            ),
+                            decide(
+                                kind,
+                                &inputs(&list, listed, 3),
+                                &mut HistoryPage::default(),
+                                "k",
+                                1
+                            ),
+                            "{paused:?} {kind:?} listed={listed}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    decide(
+                        HistoryKind::Owed,
+                        &inputs(&paused_list, false, 3),
+                        &mut HistoryPage::default(),
+                        "k",
+                        1
+                    ),
+                    HistoryDecision::Held(HistoryHold::ListPaused),
+                    "{paused:?}"
+                );
+            }
+        });
+    }
+
     /// The literal guard reads the active row, the list and
     /// the index, never this cycle's decisions; unknown sources fail closed.
     #[test]
@@ -1491,14 +1539,14 @@ mod tests {
                 LiteralGuard::Open,
                 "a list never installed lists nothing"
             );
-            for paused in [
-                ListState::Unreadable,
-                ListState::MissingAfterInstall,
-                ListState::MarkerUnwritable,
-                ListState::ClosureOverflow,
-            ] {
-                let paused = ReemissionExclusions::default().with_state_for_test(paused);
-                assert_eq!(guard(3, &paused), LiteralGuard::DenyAll);
+            // A pause holds adoption only: a paused list without digests
+            // lists nothing, and one that kept its digests denies exactly
+            // what it denies installed.
+            for paused in PAUSED {
+                let empty = ReemissionExclusions::default().with_state_for_test(paused);
+                assert_eq!(guard(3, &empty), LiteralGuard::Open, "{paused:?}");
+                let kept = populated.clone().with_state_for_test(paused);
+                assert_eq!(guard(3, &kept), guard(3, &populated), "{paused:?}");
             }
             let only = guard(3, &populated);
             assert_eq!(

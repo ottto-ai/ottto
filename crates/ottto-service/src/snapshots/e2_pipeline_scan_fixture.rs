@@ -727,16 +727,16 @@ pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
     fs::write(path, lines).unwrap();
 }
 
-/// A real fail-closed exclusion-list result, scoped to this fixture index.
+/// Ordinary (pre-`e2`) money for every family, scoped to this fixture index:
+/// the list names every family.
 pub(crate) fn ordinary_index(mut index: ScanIndex) -> ScanIndex {
-    index.claude_reemission_exclusions = claude_reemission_exclusions::ReemissionExclusions::parse(
-        b"malformed synthetic exclusion input",
-    );
+    index.claude_reemission_exclusions =
+        claude_reemission_exclusions::ReemissionExclusions::listing_every_family_for_test();
     index
 }
 
-/// Ordinary-money parser fixture through the existing native parser and real
-/// paused-adoption input. No alternate resolver or money builder.
+/// Ordinary-money parser fixture through the existing native parser, every
+/// family listed. No alternate resolver or money builder.
 pub(crate) fn parse_ordinary(
     path: &Path,
     at: &str,
@@ -781,11 +781,4 @@ pub(super) fn parse_ordinary_with_metadata(
             }),
         )
         .map(|parsed| parsed.snapshots)
-}
-
-/// Persist a real malformed-list input to exercise fail-closed ordinary money.
-pub(crate) fn pause_adoption(support: &Path) {
-    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }
