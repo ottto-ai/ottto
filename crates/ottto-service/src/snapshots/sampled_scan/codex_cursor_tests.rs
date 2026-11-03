@@ -865,6 +865,139 @@ fn fingerprints(scan: &SourceScanResult) -> Vec<String> {
         .collect()
 }
 
+/// `index` on `cache`'s fixture route, saved and reloaded as the daemon does
+/// between passes. Codex has a Tail codec, so it keeps no RAM copy
+/// (`keeps_ram`): a routed page continues from its head on the route.
+fn routed(index: ScanIndex, cache: &SharedCache) -> ScanIndex {
+    crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+        SnapshotSource::Codex,
+        Some(cache),
+        index,
+    )
+}
+
+/// `key`'s Codex head certificate on `index`'s route (this pass's staged
+/// head, else the committed one): the continuation a retained checkpoint was.
+fn head(index: &ScanIndex, key: &str) -> Option<crate::transcript_acquisition::DurableCertificate> {
+    use crate::snapshots::tail_source::{codex::Codex, TailSource};
+    let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(index)?;
+    let (revision, body) = match crate::snapshots::state_v2::staged_head_for_test(&route, key) {
+        Some(staged) => staged,
+        None => {
+            let head = crate::snapshots::state_v2::load_head(index, key, Codex::REDUCTION_REVISION)
+                .ok()??;
+            (head.revision, head.body)
+        }
+    };
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Some(
+        Codex::decode_head(revision, &body, &mut acc)
+            .ok()?
+            .certificate,
+    )
+}
+
+/// A Pi transcript of `messages` usage lines under its own scan root, removed
+/// on drop. Pi has no Tail codec yet, so it keeps its reduction in RAM
+/// (`keeps_ram`): its read is the production retained copy that a Codex
+/// cursor charge, decoder claim or insert meets in the one shared cache.
+struct PiRoot {
+    _dir: Temp,
+    root: PathBuf,
+}
+impl PiRoot {
+    fn new(messages: usize) -> Self {
+        let dir = Temp::new("pi", b"");
+        fs::remove_file(&dir.0).unwrap();
+        let root = dir.0.join("home/.pi/agent/sessions");
+        fs::create_dir_all(&root).unwrap();
+        let mut body = codex_line(json!({"type": "session", "version": 3,
+            "id": "native-tail-fixture", "timestamp": "2026-10-07T10:00:00Z",
+            "cwd": "/synthetic/pi"}));
+        for id in 0..messages {
+            body.extend(codex_line(
+                crate::snapshots::transcript_acquisition_tests::usage(
+                    SnapshotSource::Pi,
+                    100 + id as u64,
+                    id,
+                    "fixture-model",
+                ),
+            ));
+        }
+        let fixture = Self { _dir: dir, root };
+        fs::write(fixture.file(), body).unwrap();
+        fixture
+    }
+    fn file(&self) -> PathBuf {
+        self.root.join("native-tail-fixture.jsonl")
+    }
+    fn key(&self) -> String {
+        local_index_key(&self.file())
+    }
+}
+
+/// One production Pi page in `cache`'s cursor-fixture namespace.
+fn pi_page(pi: &PiRoot, index: ScanIndex, cache: &Arc<SharedCache>) -> ScanIndex {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Pi,
+        std::slice::from_ref(&pi.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                accept_after_policy(SnapshotSource::Pi, &scan, &mut index);
+                return index;
+            }
+        }
+    }
+}
+
+/// Pages `pi` until `cache` retains its copy; returns its key.
+fn pi_retained(pi: &PiRoot, cache: &Arc<SharedCache>) -> String {
+    let key = pi.key();
+    let mut index = ScanIndex::default();
+    for _ in 0..8 {
+        index = pi_page(pi, index, cache);
+        if cache.retained_checkpoint(&key).is_some() {
+            return key;
+        }
+    }
+    panic!("a retained Pi copy: {}", counters(cache));
+}
+
+/// #641's admission setup: a real Codex cursor job paged to its certified end
+/// (cursor state and optional header facts), beside a real retained copy.
+/// A codec source keeps no RAM copy, so the copy is Pi's; returns its key.
+fn certified_beside_a_retained_copy(cache: &Arc<SharedCache>) -> String {
+    let fixture = ScanRoot::new(40);
+    let mut index = ScanIndex::default();
+    for _ in 0..64 {
+        let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(cache)), "cursor-fixture");
+        index = next;
+        if counter(cache, |c| c.jobs_certified) == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        counter(cache, |c| c.jobs_certified),
+        1,
+        "{}",
+        counters(cache)
+    );
+    pi_retained(&PiRoot::new(8), cache)
+}
+
 #[test]
 fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1020,9 +1153,10 @@ fn uncached_scan_never_pages() {
     assert_eq!(fingerprints(&scaled), fingerprints(&full));
 }
 
-/// Sealed-prefix retention covers cursor jobs too: a Codex fork whose
-/// ownership boundary is in-file (`Ordinal`) keeps its certified prefix, then
-/// tails from it with the output of an unpaged full read.
+/// Sealed-prefix continuation covers cursor jobs too: a Codex fork whose
+/// ownership boundary is in-file (`Ordinal`) stages its certified prefix as
+/// its head on its route, then tails from it with the output of an unpaged
+/// full read.
 #[test]
 fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1054,7 +1188,7 @@ fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
         let mut index = ScanIndex::default();
         let mut certified = false;
         for _ in 0..64 {
-            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, scan) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 assert!(!scan.snapshots.is_empty(), "the certified read publishes");
@@ -1069,16 +1203,21 @@ fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
             counters(&cache)
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
-        let prefix = cache.retained_checkpoint(&key).unwrap_or_else(|| {
-            panic!("the fork's sealed prefix is retained: {}", counters(&cache))
+        let prefix = head(&index, &key).unwrap_or_else(|| {
+            panic!("the fork's sealed prefix is its head: {}", counters(&cache))
         });
-        assert!(prefix.sealed_offset() <= fixture.len(SESSION));
+        assert!(prefix.sealed_offset <= fixture.len(SESSION));
         fixture.append(SESSION, &ordinal_token(81));
-        let (_, tail, modes) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        let (next, tail, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
         assert_eq!(modes, (0, 1), "the append tails from the sealed prefix");
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
-        let tailed = cache.retained_checkpoint(&key).expect("tail retained");
-        assert_eq!(tailed.sealed_offset(), fixture.len(SESSION));
+        let tailed = head(&next, &key).expect("tail head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
         tail
     });
     let (_, full) = page(&fixture, ScanIndex::default(), None);
@@ -1145,8 +1284,12 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             clock.set(now);
             let started = counter(&cache, |c| c.jobs_started);
             let open_length = fixture.len(SESSION);
-            let (next, scan, _) =
-                page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            let (next, scan, _) = page_in(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            );
             index = next;
             if counter(&cache, |c| c.jobs_started) > started {
                 opened = Some((now, open_length));
@@ -1161,16 +1304,15 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             now += 10;
         }
         let (t_start, open_length) = opened.expect("a cursor job opened");
-        let certified = cache
-            .retained_checkpoint(&key)
-            .unwrap_or_else(|| panic!("certified prefix retained: {}", counters(&cache)));
+        let certified = head(&index, &key)
+            .unwrap_or_else(|| panic!("certified prefix head: {}", counters(&cache)));
         // (i) `[0, s)` with `s <= L0`, verified at the read's start.
         assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
         assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
-        assert!(certified.sealed_offset() <= open_length);
-        assert!(certified.sealed_offset() < fixture.len(SESSION));
-        assert_eq!(certified.last_full_verified(), t_start);
-        assert_eq!(certified.audit_debt(), None);
+        assert!(certified.sealed_offset <= open_length);
+        assert!(certified.sealed_offset < fixture.len(SESSION));
+        assert_eq!(certified.verified_unix_seconds, t_start);
+        assert_eq!(certified.audit_debt_unix_seconds, None);
         // Appends during the job were never marked read: the path stays
         // pending as a watcher hint (C7) and the next page tails from `s`.
         assert_eq!(pending_hint(&index, &path), Some(true));
@@ -1178,13 +1320,18 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         next_line += 1;
         now += 10;
         clock.set(now);
-        let (_, scan, modes) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
         // (ii) a tail from `s` while the deadline permits.
         assert_eq!(modes, (0, 1));
         assert!(!scan.snapshots.is_empty());
-        let tailed = cache.retained_checkpoint(&key).expect("tail retained");
-        assert_eq!(tailed.sealed_offset(), fixture.len(SESSION));
-        assert_eq!(tailed.last_full_verified(), t_start);
+        let tailed = head(&next, &key).expect("tail head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
+        assert_eq!(tailed.verified_unix_seconds, t_start);
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
 
         // (iii) scaled `L > L_max` for two large files, both appended every
@@ -1207,7 +1354,8 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             let certified = counter(&cache, |c| c.jobs_certified);
             let paused = cache.cursor_job_key();
             let lengths = sessions.map(|session| fixture.len(session));
-            let retained = keys.clone().map(|key| cache.retained_checkpoint(&key));
+            index = routed(index, &cache);
+            let retained = keys.clone().map(|key| head(&index, &key));
             let (next, scan, modes) = page_at(
                 &fixture,
                 index,
@@ -1220,15 +1368,18 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                 tails += modes.1;
                 for (key, prior) in keys.iter().zip(&retained) {
                     let Some(prior) = prior else { continue };
-                    let Some(next) = cache.retained_checkpoint(key) else {
+                    let Some(next) = head(&index, key) else {
                         continue;
                     };
-                    if next.sealed_offset() > prior.sealed_offset() {
+                    if next.sealed_offset > prior.sealed_offset {
                         assert!(!scan.snapshots.is_empty(), "completed Tail publishes");
-                        assert_eq!(next.last_full_verified(), prior.last_full_verified());
-                        assert_eq!(next.audit_debt(), prior.audit_debt(), "no audit credit");
-                        if now >= prior.last_full_verified() + interval {
-                            overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset()));
+                        assert_eq!(next.verified_unix_seconds, prior.verified_unix_seconds);
+                        assert_eq!(
+                            next.audit_debt_unix_seconds, prior.audit_debt_unix_seconds,
+                            "no audit credit"
+                        );
+                        if now >= prior.verified_unix_seconds + interval {
+                            overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset));
                         }
                     }
                 }
@@ -1243,23 +1394,20 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                 // A job spans pages, so the completed one was paused before.
                 let key = paused.expect("a paused job completed");
                 let (t_start, open_length) = opened[&key];
-                let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
+                let checkpoint = head(&index, &key).expect("certificate");
                 assert!(
                     !scan.snapshots.is_empty(),
                     "each audit completion publishes"
                 );
-                assert!(checkpoint.sealed_offset() <= open_length);
+                assert!(checkpoint.sealed_offset <= open_length);
                 // No deadline reset: verified at read start, still due.
-                assert_eq!(checkpoint.last_full_verified(), t_start);
-                assert_eq!(
-                    checkpoint.audit_debt().map(|debt| debt.due_unix_seconds),
-                    Some(t_start + interval)
-                );
+                assert_eq!(checkpoint.verified_unix_seconds, t_start);
+                assert_eq!(checkpoint.audit_debt_unix_seconds, Some(t_start + interval));
                 let due = index.files[&key]
                     .audit_obligation(now)
                     .map(|debt| debt.due_unix_seconds);
                 assert!(due.is_some_and(|due| due <= t_start + interval && due <= now));
-                completions.push((key, now, checkpoint.sealed_offset()));
+                completions.push((key, now, checkpoint.sealed_offset));
             } else if modes.1 == 0 {
                 assert!(scan.snapshots.is_empty(), "paused job publishes nothing");
             }
@@ -2235,9 +2383,10 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
 }
 
 /// Pages one cursor job to its certified end, `I/2` apart, from census
-/// generation `page_number + 1`. With `append_mid_read`, the file grows
-/// after the job's first page. Returns the index, the clock at the job's
-/// open and at its commit, and the opening page's full reads by reason.
+/// generation `page_number + 1`, each page on `cache`'s route. With
+/// `append_mid_read`, the file grows after the job's first page. Returns the
+/// index, the clock at the job's open and at its commit, and the opening
+/// page's full reads by reason.
 fn certify_job(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
@@ -2257,7 +2406,7 @@ fn certify_job(
         let started = counter(cache, |c| c.jobs_started);
         let (next, scan, selections) = page_selections(
             fixture,
-            index,
+            routed(index, cache),
             Some(Arc::clone(cache)),
             "cursor-fixture",
             &collected_at(*page_number),
@@ -2309,7 +2458,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// page budget is read by a cursor job that outlives the audit interval
 /// (`I/2` per page). Its complete read of the unchanged object verifies at
 /// commit: no overdue audit, no marker (a seeded past-due one is cleared),
-/// and the retained copy is verified at the commit clock. `grown` (AD-T7):
+/// and its head is verified at the commit clock. `grown` (AD-T7):
 /// an append after the job's first page keeps the grown arm (overdue, due
 /// marker); the next generation's audit of the now stable file converges.
 ///
@@ -2317,7 +2466,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
 /// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
 /// is selected. After R2's gate removal, a later append reuses the
-/// retained checkpoint as Tail even beyond `commit + I`.
+/// head as Tail even beyond `commit + I`.
 #[test]
 fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2344,8 +2493,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             assert!(entry.audit_requires_full(now));
         }
         let cache = Arc::new(SharedCache::default());
-        // The limits under which this fixture's certified cursor read is
-        // retained (`tail_eof_record_adding_first_priority_tier_…`).
+        // The limits under which this fixture's certified cursor read stages
+        // its head (`tail_eof_record_adding_first_priority_tier_…`).
         with_test_limits(2048, 8192, 64, || {
             let mut page_number = 0;
             let (next, opened, committed, reasons) = certify_job(
@@ -2368,18 +2517,21 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             if case == "grown" {
                 // AD-T7: the grown arm, as before AD-1.
                 assert_eq!(counter(&cache, |c| c.audit_overdue), 1, "{case}");
-                let retained = cache.retained_checkpoint(&key).expect("grown prefix");
-                assert_eq!(retained.last_full_verified(), opened, "{case}");
+                let grown = head(&index, &key).expect("grown prefix");
+                assert_eq!(grown.verified_unix_seconds, opened, "{case}");
                 assert_eq!(
                     index.files[&key].unverified_deadline(),
                     Some(opened + interval),
                     "{case}: due marker"
                 );
                 // Keep AD-1's stable Full-completion control distinct from
-                // R2's valid-checkpoint Tail case below. No RAM state survives
-                // this explicit eviction; missing state determines the reason.
-                cache.clear();
-                assert!(cache.retained_checkpoint(&key).is_none());
+                // R2's valid-checkpoint Tail case below. No continuation
+                // survives this explicit release and head retirement; missing
+                // state determines the reason.
+                crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+                    &cache, &index,
+                );
+                assert!(head(&index, &key).is_none());
                 let (next, opened, committed, reasons) = certify_job(
                     &fixture,
                     &cache,
@@ -2408,10 +2560,10 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 !index.files[&key].has_unverified_source(),
                 "{case}: verified, no marker"
             );
-            let retained = cache.retained_checkpoint(&key).expect("complete copy");
-            assert_eq!(retained.last_full_verified(), committed, "{case}");
-            assert_eq!(retained.audit_debt(), None, "{case}");
-            assert_eq!(retained.sealed_offset(), fixture.len(SESSION), "{case}");
+            let complete = head(&index, &key).expect("complete head");
+            assert_eq!(complete.verified_unix_seconds, committed, "{case}");
+            assert_eq!(complete.audit_debt_unix_seconds, None, "{case}");
+            assert_eq!(complete.sealed_offset, fixture.len(SESSION), "{case}");
             // Later generations past `commit + I`: the scheduler's `Skip`.
             for _ in 0..3 {
                 now += interval + 1;
@@ -2426,7 +2578,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 );
                 let (next, scan, selections) = page_selections(
                     &fixture,
-                    index,
+                    routed(index, &cache),
                     Some(Arc::clone(&cache)),
                     "cursor-fixture",
                     &collected_at(page_number),
@@ -2439,8 +2591,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 assert_eq!(selections.unchanged, 0, "{case}: not an acquisition");
             }
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
-            // A valid retained checkpoint is not reread for its age: the
-            // next append selects Tail even after the old audit horizon.
+            // A valid head is not reread for its age: the next append
+            // selects Tail even after the old audit horizon.
             assert!(now >= committed + interval);
             let before = fixture.len(SESSION);
             fixture.append(SESSION, &token_line(90));
@@ -2449,7 +2601,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             page_number += 1;
             let (next, scan, selections) = page_selections(
                 &fixture,
-                index,
+                routed(index, &cache),
                 Some(Arc::clone(&cache)),
                 "cursor-fixture",
                 &collected_at(page_number),
@@ -2476,16 +2628,15 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 !scan.snapshots.is_empty(),
                 "{case}: Tail publishes the append"
             );
-            let tailed = cache.retained_checkpoint(&key).expect("Tail retained");
-            assert_eq!(tailed.sealed_offset(), fixture.len(SESSION), "{case}");
-            assert!(tailed.sealed_offset() > retained.sealed_offset(), "{case}");
+            let tailed = head(&next, &key).expect("Tail head");
+            assert_eq!(tailed.sealed_offset, fixture.len(SESSION), "{case}");
+            assert!(tailed.sealed_offset > complete.sealed_offset, "{case}");
             assert_eq!(
-                tailed.last_full_verified(),
-                committed,
+                tailed.verified_unix_seconds, committed,
                 "{case}: no audit credit"
             );
             assert_eq!(
-                tailed.audit_debt().map(|debt| debt.due_unix_seconds),
+                tailed.audit_debt_unix_seconds,
                 Some(committed + interval),
                 "{case}: original verification determines debt, not Tail time"
             );
@@ -2515,15 +2666,20 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
         let cache = Arc::new(SharedCache::default());
         let mut index = ScanIndex::default();
         for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            let (next, _, _) = page_in(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            );
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 break;
             }
         }
         assert!(
-            cache.retained_checkpoint(&key).is_some(),
-            "a retained prefix makes the next read a tail: {}",
+            head(&index, &key).is_some(),
+            "a prefix head makes the next read a tail: {}",
             counters(&cache)
         );
         // A tail larger than the singleton budget (a cursor job) whose last,
@@ -2550,7 +2706,7 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
         for page_number in 1..=64 {
             let (next, scan, modes) = page_at(
                 &fixture,
-                index,
+                routed(index, &cache),
                 Some(Arc::clone(&cache)),
                 "cursor-fixture",
                 &collected_at(page_number),
@@ -2585,7 +2741,8 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
 
 /// A file that grew during the job keeps its unterminated record
 /// withheld (the held FD is no longer the opened object); the next page
-/// tails it from `s`, so it is counted once, after its newline.
+/// tails it from `s` (the job's head on its route), so it is counted once,
+/// after its newline.
 #[test]
 fn grown_unterminated_last_record_stays_withheld() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2600,7 +2757,7 @@ fn grown_unterminated_last_record_stays_withheld() {
         let mut index = ScanIndex::default();
         let mut appended = false;
         for _ in 0..64 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, _) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 break;
@@ -2623,7 +2780,7 @@ fn grown_unterminated_last_record_stays_withheld() {
         let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
         let mut last_published = None;
         for _ in 0..4 {
-            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, scan) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if !scan.snapshots.is_empty() {
                 last_published = Some(fingerprints(&scan));
@@ -7376,20 +7533,11 @@ fn hopeless_admission_evicts_nothing() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
             .retained;
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
@@ -7462,20 +7610,11 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
             .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
@@ -7842,11 +7981,10 @@ const WITNESS_NAMESPACES: [&str; 2] = ["witness-namespace-1", "witness-namespace
 const WITNESS_KEYS: [&str; 2] = ["parent-a", "parent-b"];
 
 /// #641's `hopeless_admission_evicts_nothing` setup with witnesses: a real
-/// certified retained copy, `floor` and `empty` measured with no copy, no
-/// provenance and no witnesses, then two provenance entries and two
-/// witnesses in each of two namespaces (namespace 1 strictly older).
+/// retained copy beside a certified cursor job, `floor` and `empty` measured
+/// with no copy, no provenance and no witnesses, then two provenance entries
+/// and two witnesses in each of two namespaces (namespace 1 strictly older).
 struct WitnessAdmission {
-    _fixture: ScanRoot,
     cache: Arc<SharedCache>,
     key: String,
     members: Vec<CandidateFile>,
@@ -7855,20 +7993,11 @@ struct WitnessAdmission {
 }
 
 fn witness_admission() -> WitnessAdmission {
-    let fixture = ScanRoot::new(40);
-    let key = local_index_key(&fixture.file(SESSION));
     let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for _ in 0..64 {
-        let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-        index = next;
-        if counter(&cache, |c| c.jobs_certified) == 1 {
-            break;
-        }
-    }
+    let key = certified_beside_a_retained_copy(&cache);
     let copy = cache
         .take(&key)
-        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+        .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
         .retained;
     let floor = admission_floor(&cache);
     let empty = cursor_without_header_facts(&cache);
@@ -7901,7 +8030,6 @@ fn witness_admission() -> WitnessAdmission {
         cache.with_cursor(|cursor| cursor.rotation.page += 1);
     }
     WitnessAdmission {
-        _fixture: fixture,
         cache,
         key,
         members,
@@ -9457,17 +9585,8 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
@@ -9476,7 +9595,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
                 unsealed: false,
             }
         };
-        let copy = cache.take(&key).expect("a certified copy").retained;
+        let copy = cache.take(&key).expect("a retained copy").retained;
         cache.insert(key.clone(), completed(copy), 0);
         let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
@@ -9696,17 +9815,8 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
@@ -9715,7 +9825,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
                 unsealed: false,
             }
         };
-        let copy = cache.take(&key).expect("a certified copy").retained;
+        let copy = cache.take(&key).expect("a retained copy").retained;
         cache.insert(key.clone(), completed(copy), 0);
         let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
@@ -9819,9 +9929,10 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
 
 /// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
 /// nothing keep a suspended proof of a third of the state budget; the page
-/// whose completion retains the certified copy retires it before the clone:
+/// whose completion clones the certified prefix retires it before the clone:
 /// the walk's resident + the proof left there (none) + the active + both
-/// shares fit `state_bytes()`.
+/// shares fit `state_bytes()`. On its route the prefix is the file's head;
+/// a codec source keeps no RAM copy.
 #[test]
 fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -9842,8 +9953,15 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
         let mut index = ScanIndex::default();
         let mut certified = false;
         for _ in 0..64 {
-            let ((next, _, _), counts) =
-                observe(|| page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture"));
+            let on_route = routed(index, &cache);
+            let ((next, _, _), counts) = observe(|| {
+                page_in(
+                    &fixture,
+                    on_route,
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                )
+            });
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 assert_eq!(cache.proof_suspended_for_test(), None);
@@ -9857,7 +9975,14 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
             );
         }
         assert!(certified, "precondition: the job certified");
-        assert!(cache.take(&key).is_some(), "the certified copy is retained");
+        assert!(
+            head(&index, &key).is_some(),
+            "the certified prefix is staged"
+        );
+        assert!(
+            cache.take(&key).is_none(),
+            "a codec source keeps no RAM copy"
+        );
         let probe = super::super::copy_retire_probe().expect("probed");
         assert!(probe.budget > 0);
         assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
@@ -9912,7 +10037,9 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
 /// and retires a suspended proof only over what both shares leave of the
 /// room: a third of the state budget is retired before the clone; one that
 /// fits beside the finish/output share and the 8 MiB-capped copy is kept.
-/// Either way the whole fits `state_bytes()` at the clone.
+/// Either way the whole fits `state_bytes()` at the clone. The read is Pi's:
+/// a codec source keeps no RAM copy, so only a RAM source's completion clones
+/// one.
 #[test]
 fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -9929,24 +10056,16 @@ fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
     assert!(room / 2 > ENTRY_BYTES + (2 << 20), "precondition: {room}");
     let beside = room / 2 - ENTRY_BYTES - (1 << 20) - fixed;
     for (bytes, retired) in [(state_bytes() / 3, true), (beside, false)] {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
+        let pi = PiRoot::new(40);
         let cache = Arc::new(SharedCache::default());
         assert!(suspend(
             &cache,
             proof_job("ns-a", "/idx/a.json", "inc-1", bytes)
         ));
         super::super::copy_retire_probe();
-        let (_, counts) = observe(|| {
-            page_in(
-                &fixture,
-                ScanIndex::default(),
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-            )
-        });
+        let (_, counts) = observe(|| pi_page(&pi, ScanIndex::default(), &cache));
         assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
-        assert!(cache.take(&key).is_some(), "the copy is retained");
+        assert!(cache.take(&pi.key()).is_some(), "the copy is retained");
         let probe = super::super::copy_retire_probe().expect("probed");
         assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
         assert!(probe.fits(), "{probe:?}");
@@ -12076,29 +12195,21 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
         let primary = ScanRoot::new(40);
-        let peer = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
         let key = local_index_key(&primary.file(SESSION));
-        let peer_key = local_index_key(&peer.file(SESSION));
+        // The primary continues from its head on its route (a codec source
+        // keeps no RAM copy); the other retained copy is a RAM source's.
         let mut index = ScanIndex::default();
-        for fixture in [&primary, &peer] {
-            let mut warm = ScanIndex::default();
-            for _ in 0..64 {
-                let (next, _) = page(fixture, warm, Some(Arc::clone(&cache)));
-                warm = next;
-                if cache
-                    .retained_checkpoint(&local_index_key(&fixture.file(SESSION)))
-                    .is_some()
-                {
-                    break;
-                }
-            }
-            if std::ptr::eq(fixture, &primary) {
-                index = warm;
+        for _ in 0..64 {
+            let (next, _) = page(&primary, routed(index, &cache), Some(Arc::clone(&cache)));
+            index = next;
+            if head(&index, &key).is_some() {
+                break;
             }
         }
-        assert!(cache.retained_checkpoint(&key).is_some());
-        assert!(cache.retained_checkpoint(&peer_key).is_some());
+        assert!(head(&index, &key).is_some());
+        let peer = PiRoot::new(8);
+        let peer_key = pi_retained(&peer, &cache);
         let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
         let archive = Temp::new("decoder-floor", &bytes);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
@@ -12113,7 +12224,6 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 .unwrap()
                 .is_none());
             assert_eq!(cache.cursor_reserved(), 0);
-            assert!(cache.retained_checkpoint(&key).is_some());
             assert!(cache.retained_checkpoint(&peer_key).is_some());
         });
         with_test_state_budget(budget, || {
@@ -12122,8 +12232,9 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 .unwrap();
             input.read_exact(&mut [0; 1]).unwrap();
             primary.append(SESSION, &token_line(41));
+            let mut index = routed(index, &cache);
             index.traversal = None;
-            let (_, scan, modes) =
+            let (next, scan, modes) =
                 page_in(&primary, index, Some(Arc::clone(&cache)), "cursor-fixture");
             assert_eq!(
                 modes,
@@ -12135,7 +12246,11 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 cache.retained_checkpoint(&peer_key).is_some(),
                 "decoder causes no extra eviction"
             );
-            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(
+                head(&next, &key).map(|head| head.sealed_offset),
+                Some(primary.len(SESSION)),
+                "the primary Tail stages its append"
+            );
             assert_eq!(cache.cursor_reserved(), credit);
             input.close();
         });
@@ -12157,18 +12272,12 @@ fn decoder_least_budget(cache: &SharedCache) -> usize {
         + 2 * super::super::side_ledger::SIDE_LEDGER_BYTES
 }
 
-/// A cache warmed by real pages: a retained copy and optional header facts.
-fn warm_decoder_cache(fixture: &ScanRoot) -> (Arc<SharedCache>, String) {
+/// A cache warmed by real pages: optional header facts from a certified
+/// Codex cursor job, beside a retained copy (a RAM source's: a codec source
+/// keeps none). Returns the copy's key.
+fn warm_decoder_cache() -> (Arc<SharedCache>, String) {
     let cache = Arc::new(SharedCache::default());
-    let key = local_index_key(&fixture.file(SESSION));
-    let mut index = ScanIndex::default();
-    for _ in 0..64 {
-        let (next, _) = page(fixture, index, Some(Arc::clone(&cache)));
-        index = next;
-        if cache.retained_checkpoint(&key).is_some() {
-            break;
-        }
-    }
+    let key = certified_beside_a_retained_copy(&cache);
     assert!(cache.retained_checkpoint(&key).is_some());
     assert!(
         cache
@@ -12225,8 +12334,7 @@ fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let resident = cache.cursor_resident();
         let cursor = cursor_without_header_facts(&cache);
         let headers = resident - cursor;
@@ -12286,8 +12394,7 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let job = cache.cursor_reserve(1024 * 1024).expect("a job's charge");
         let budget = decoder_least_budget(&cache);
         let archive = synthetic_archive("decoder-over-room");
@@ -12325,8 +12432,7 @@ fn decoder_eviction_keeps_a_suspended_proof_and_join_state() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         assert!(suspend(
             &cache,
             proof_job("cursor-fixture", "/idx/a.json", "inc-1", 4096)
@@ -12412,8 +12518,7 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let (root, paths) = owed_archives("decoder-next-pass", 1);
         let archive_key = local_index_key(&paths[0]);
         let mut index = ScanIndex::default();
@@ -12467,8 +12572,7 @@ fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, _) = warm_decoder_cache(&fixture);
+        let (cache, _) = warm_decoder_cache();
         let copies = cache.retained().unwrap().entry_count();
         let (root, paths) = owed_archives("decoder-near-full", 3);
         let mut index = ScanIndex::default();
@@ -12513,17 +12617,8 @@ fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
-        let key = local_index_key(&fixture.file(SESSION));
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
-            index = next;
-            if cache.retained_checkpoint(&key).is_some() {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache.take(&key).expect("real retained reduction").retained;
         // Two real reductions with large synthetic keys warm > 8 MiB, while
         // each entry remains under ENTRY_BYTES. The graph is measured normally.

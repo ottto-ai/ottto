@@ -30,7 +30,9 @@
 //! (`cache_policy_r0_regime_b_*`, fillers ranked two days back) are
 //! diagnostics, not acceptance: they print R0's probe and decision. A Claude
 //! tail proves its release with its measured X_out (M-a, without Q-PR15's
-//! guard); a Codex tail keeps `F_prev` and the guard. G3 is
+//! guard); every other source's tail keeps `F_prev` and the guard. A codec
+//! source (Claude, Codex) keeps no RAM reduction copy, so the scan-driven
+//! tails here are Pi's, the one source on the RAM path until S2c. G3 is
 //! unchanged. The decision matrix, the counters and
 //! the visit-limited active pin evict-to-fit on a non-F tail (a comparison
 //! target), each with a shape-F control that releases nothing;
@@ -109,7 +111,12 @@ impl ScanFixture {
                 "native-tail-fixture.jsonl",
                 json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}}),
             ),
-            _ => unreachable!(),
+            SnapshotSource::Pi => (
+                dir.join("home/.pi/agent/sessions"),
+                "native-tail-fixture.jsonl",
+                json!({"type":"session", "version":3, "id":"native-tail-fixture",
+                    "timestamp":"2026-10-07T10:00:00Z", "cwd":"/synthetic/pi"}),
+            ),
         };
         fs::create_dir_all(&root).unwrap();
         let fixture = Self {
@@ -439,9 +446,9 @@ struct FullCache {
 }
 
 /// `older_tail` pins the tailed file's mtime two days back, below every
-/// filler's rank.
+/// filler's rank. The tailed file is Pi's: a codec source keeps no RAM copy.
 fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
-    full_cache_in(SnapshotSource::Codex, older_tail, None)
+    full_cache_in(SnapshotSource::Pi, older_tail, None)
 }
 
 /// `full_cache_with_retained_file` for a `source` file, with the fillers'
@@ -525,13 +532,13 @@ fn append_padded_usage_at(tailed: &ScanFixture, id: usize) {
         "type": "synthetic-padding",
         "text": "x".repeat(TAIL_PADDING_BYTES),
     }));
-    tailed.append(&usage(SnapshotSource::Codex, 140 + id as u64, id, MODEL));
+    tailed.append(&usage(SnapshotSource::Pi, 140 + id as u64, id, MODEL));
 }
 
 /// `full_cache_with_retained_file`, then `append` to the file and read the
 /// append as a tail that meets a zero copy budget at a step start.
 fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBesideFullCache {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     let FullCache {
         cache,
         tailed,
@@ -577,7 +584,7 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
 
 /// G3, priority (design §5c G3; §3a rank; §2 L1).
 ///
-/// A Claude entry ranked older than everything else in the cache (mtime two
+/// A Pi entry ranked older than everything else in the cache (mtime two
 /// days back) is read as a tail beside four newer filler entries that fill
 /// the cache. Its appended long record meets a zero copy budget. That
 /// overflow is the tail's native line buffer; its borrowed state already fit
@@ -628,7 +635,7 @@ fn tail_growth_records() -> usize {
 /// The tailed file's append for test (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
-    tailed.append_usage(SnapshotSource::Codex, 1..1 + tail_growth_records());
+    tailed.append_usage(SnapshotSource::Pi, 1..1 + tail_growth_records());
 }
 
 /// Test (ii), corrected.
@@ -715,7 +722,7 @@ fn tail_active(full: &FullCache, older_tail: bool) -> OwnedSourceScan {
 /// `tail_active`, with the tailed file's mtime set to `modified` after the
 /// append.
 fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     full.tailed.append(&usage(source, 140, 1, MODEL));
     if let Some(modified) = modified {
         full.tailed.set_modified(modified);
@@ -899,7 +906,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     if unexecuted("M1_hot_tail") {
         return;
     }
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     let FullCache {
         cache,
         tailed,
@@ -1423,7 +1430,7 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
     let now = unix_now();
     let tail_modified = now - 600;
     let run = m_a_tail(
-        SnapshotSource::Codex,
+        SnapshotSource::Pi,
         now - OLD_SECONDS,
         tail_modified,
         &[],
@@ -1441,17 +1448,18 @@ fn cache_policy_m_a_failed_gate_releases_nothing() {
     assert_no_victims(&run, "failed stamp gate");
 }
 
-/// M-a T10, Codex's explicit residual: a Codex completion keeps
-/// `K = max(C, F_prev)` and the Q-PR15 guard whatever X_out says; M-a's
-/// proof never runs for it.
+/// M-a T10, the explicit residual (`x_out_for`: every source but Claude): a
+/// Pi completion keeps `K = max(C, F_prev)` and the Q-PR15 guard whatever
+/// X_out says; M-a's proof never runs for it. Was Codex's row; a codec
+/// source keeps no RAM copy, and Pi takes the same legacy decision.
 #[test]
-fn cache_policy_m_a_codex_keeps_the_legacy_release() {
+fn cache_policy_m_a_pi_keeps_the_legacy_release() {
     if unexecuted("M_a_T10") {
         return;
     }
     let now = unix_now();
     let run = m_a_tail(
-        SnapshotSource::Codex,
+        SnapshotSource::Pi,
         now - OLD_SECONDS,
         now - 600,
         &[],

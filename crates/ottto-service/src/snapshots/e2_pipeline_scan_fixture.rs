@@ -230,7 +230,8 @@ pub(crate) fn continuation_for_test(
 ) -> Option<Continuation> {
     let certificate = match source {
         SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
-        SnapshotSource::Codex | SnapshotSource::Pi => {
+        SnapshotSource::Codex => head_certificate::<tail_source::codex::Codex>(index, key)?,
+        SnapshotSource::Pi => {
             return cache
                 .retained_checkpoint(key)
                 .map(|checkpoint| Continuation {
@@ -274,38 +275,15 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     }
 }
 
-thread_local! {
-    static CODEX_UNROUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// While held, this thread's Codex fixture pages stay off a V2 route: the
-/// RAM path a Codex index keeps until its route publishes (`keeps_ram`; an
-/// index with no storage binding or an unpublished import has no route,
-/// `state_v2::runtime_path`). For RAM retention tests whose fixtures and
-/// expectations are Codex's.
-pub(crate) struct CodexUnrouted(bool);
-impl CodexUnrouted {
-    pub(crate) fn hold() -> Self {
-        Self(CODEX_UNROUTED.with(|unrouted| unrouted.replace(true)))
-    }
-}
-impl Drop for CodexUnrouted {
-    fn drop(&mut self) {
-        CODEX_UNROUTED.with(|unrouted| unrouted.set(self.0));
-    }
-}
-
 /// A scan fixture's page of a source with a Tail codec continues from its
 /// owner's route; with no cache it reads a fixture route unrouted. Other
-/// sources, and Codex under `CodexUnrouted`, are left alone.
+/// sources are left alone.
 pub(crate) fn route_for_test(
     source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    if !tail_source::has_codec(source)
-        || (source == SnapshotSource::Codex && CODEX_UNROUTED.with(std::cell::Cell::get))
-    {
+    if !tail_source::has_codec(source) {
         return index;
     }
     let Some(cache) = cache else {
