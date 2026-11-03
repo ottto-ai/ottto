@@ -1573,12 +1573,11 @@ fn an_unrouted_codec_source_keeps_no_ram_copy() {
 /// [regress] A codec source's route that cannot be read now (a poisoned
 /// session: `DbUnavailable`) is kept as an error, never read as "no route":
 /// the file is held for its next selection, unread, and RAM is no fallback
-/// (conformance B2). The page holds before it reaches the candidate, so the
-/// per-file `tail_db_loads{held}` count is printed, not asserted.
+/// (conformance B2). The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    use crate::snapshots::e2_pipeline_scan_fixture::{route_for_test, tail_counter_for_test};
+    use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1593,12 +1592,7 @@ fn a_codec_route_error_holds_the_file_without_ram() {
         crate::snapshots::state_v2::poison_route_for_test(&index);
         assert!(super::tail_source::tail_route(source, &index).is_err());
         assert!(!super::tail_source::keeps_ram(source));
-        let held = tail_counter_for_test("tail_db_loads", "held");
         let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
-        eprintln!(
-            "ROUTE_ERROR_HOLD {source:?} held={} modes={modes:?}",
-            tail_counter_for_test("tail_db_loads", "held") - held
-        );
         assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");
         assert_eq!(
             index.files[&key].size_bytes, size,

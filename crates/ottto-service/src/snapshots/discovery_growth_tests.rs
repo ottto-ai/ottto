@@ -513,10 +513,6 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
             .collect::<Vec<_>>();
         let emitted = usage(&scan.snapshots);
-        eprintln!(
-            "CODEX_FRAGMENT_REREAD pass={pass} scanned={} reads={modes:?} fragment_bytes={fragment_bytes} repeats={repeats:?} usage={emitted:?} first_pass={first_pass:?}",
-            scan.scanned_file_count
-        );
         if pass == 0 {
             // The first reloaded pass: one ordinary fragment-only Tail. It
             // counts the complete record and records the full length.
@@ -773,11 +769,6 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     } else {
         scan.clone()
     };
-    eprintln!(
-        "CODEX_FRAGMENT_CATCH_UP snapshots={} usage={:?}",
-        scan.snapshots.len(),
-        usage(&emitted.snapshots)
-    );
     let (cold_index, cold) = cold_full(&emitted.snapshots[0].collected_at);
     if !scan.snapshots.is_empty() {
         // Whole-body equality with a cold ordinary Full, not token-only equality.
