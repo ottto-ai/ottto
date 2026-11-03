@@ -37,6 +37,15 @@ pub(crate) fn codex_evidence(
     index: &super::super::ScanIndex,
     scan: &super::super::SourceScanResult,
 ) -> Value {
+    codex_evidence_of_items(index, &scan.snapshots)
+}
+
+/// [`codex_evidence`] for a driver that holds the emitted items without a
+/// scan result (the Tail transition rows' native finishes).
+pub(crate) fn codex_evidence_of_items(
+    index: &super::super::ScanIndex,
+    items: &[SnapshotItem],
+) -> Value {
     json!({
         "TierReplay": index.files.iter().map(|(key, entry)| (key.clone(), json!({
             "applied": entry.codex_applied_tier_receipt,
@@ -45,7 +54,7 @@ pub(crate) fn codex_evidence(
             "owner": entry.codex_protected_owner,
             "v2": entry.codex_counting_v2,
         }))).collect::<BTreeMap<_, _>>(),
-        "token_count": scan.snapshots.iter().map(|item| (item.source_session_id.clone(), json!([
+        "token_count": items.iter().map(|item| (item.source_session_id.clone(), json!([
             item.input_tokens, item.output_tokens, item.cache_read_tokens,
             item.reasoning_output_tokens, item.request_count,
         ]))).collect::<BTreeMap<_, _>>(),
