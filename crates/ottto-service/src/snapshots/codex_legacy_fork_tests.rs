@@ -223,6 +223,13 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     // The RAM page's ACK lands; a restart over it is quiet: no byte read,
     // no file opened, no body emitted.
     accept(&mut ram_index, &ram_scan);
+    crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+        &mut ram_index,
+        source,
+        std::slice::from_ref(&c.root),
+        "2026-10-27T08:00:00Z",
+        183,
+    );
     let settled = disk.commit(&scanner.cache, source, &mut ram_index);
     assert!(acked(&settled, &ram_scan), "the grown page's ACK is saved");
     let restarted = disk.owner(source);
@@ -230,6 +237,11 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     let ((_, quiet_restart, quiet_modes), consumed) =
         fixture::observe_consumed(|| page(&restarted, settled));
     assert!(quiet_restart.snapshots.is_empty(), "no re-emission");
+    assert_eq!(
+        crate::snapshots::all_transcript_opens_for_test() - opens,
+        0,
+        "the saved indexed walk needs no transcript identity reads"
+    );
     let measured = (crate::snapshots::all_transcript_opens_for_test() == opens).then_some(0);
     let mut quiet = RouteResult::emitted(Mode::Restart, source, Vec::new(), &[]);
     quiet.modes = quiet_modes;

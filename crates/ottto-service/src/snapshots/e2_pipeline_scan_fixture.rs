@@ -304,6 +304,27 @@ pub(crate) fn route_for_test(
     routed_for_test(cache, index, &dir)
 }
 
+/// The saved, already-indexed walk used by a quiet restart. Like the
+/// discovery-growth fixture, it keeps the roster across the restart; only
+/// unchanged members already represented by the committed index are drained.
+pub(crate) fn retain_indexed_walk_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    collected_at: &str,
+    backfill_window_days: u64,
+) {
+    ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    advance_bounded_directory_traversal(source, index, backfill_window_days, None);
+    let walk = index.traversal.as_ref().expect("indexed walk");
+    assert!(walk.pending_directories.is_empty(), "the walk is complete");
+    for candidate in &walk.pending_candidates {
+        let metadata = std::fs::symlink_metadata(&candidate.path).unwrap();
+        assert!(index.listing_unchanged(&candidate.path, &metadata));
+    }
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+}
+
 /// The time a fixture's next visit is taken to come after its last. The
 /// fixtures' `collected_at` never moves, so a kept generation's metadata
 /// re-listing (`LISTING_INTERVAL_SECONDS`) and its owed-file pace
