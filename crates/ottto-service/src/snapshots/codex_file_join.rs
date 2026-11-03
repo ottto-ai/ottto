@@ -277,6 +277,14 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
         .ok()
         .map(|metadata| metadata_witness(&metadata))
 }
+/// The session id the file's owning header names now: the lineage a stored
+/// Tail head continues (D131), read as the inventory reads it.
+#[cfg(unix)]
+pub(super) fn header_owner(candidate: &CandidateFile) -> Result<String> {
+    read_header_settled(candidate)
+        .0
+        .map(|(header, _)| header.owner)
+}
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
