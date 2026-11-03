@@ -437,7 +437,11 @@ fn systemic_failure_commits_neither_file_nor_marker() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| sqlite::cap_pages(db));
-    let long = vec![1_u8; 1024 * 1024];
+    // This disk-full control must require space even with compression active.
+    use sha2::{Digest, Sha256};
+    let long: Vec<u8> = (0..32_768_u64)
+        .flat_map(|n| Sha256::digest(n.to_be_bytes()))
+        .collect();
     stage_tail(
         &f.path,
         FILE,

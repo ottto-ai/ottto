@@ -18,7 +18,7 @@ fn random(len: usize) -> Vec<u8> {
 #[test]
 fn inline_threshold_and_physical_digest() {
     let scratch = crate::test_scratch::ScratchDir::canonical("tail-inline-codec");
-    let mut db = sqlite::Sqlite::create_import(&scratch.join("index.sqlite")).unwrap();
+    let mut db = sqlite::Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let key = row("tail.page.responses", b"file", 0).unwrap();
     for len in [511, 512, 513] {
@@ -56,7 +56,7 @@ fn inline_threshold_and_physical_digest() {
 #[test]
 fn raw_fragment_geometry_and_manifest_integrity() {
     let scratch = crate::test_scratch::ScratchDir::canonical("tail-fragment-codec");
-    let mut db = sqlite::Sqlite::create_import(&scratch.join("index.sqlite")).unwrap();
+    let mut db = sqlite::Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let key = row("tail.page.responses", b"file", 0).unwrap();
     for len in [FRAG_BYTES - 1, FRAG_BYTES, FRAG_BYTES + 1] {
@@ -116,7 +116,7 @@ fn raw_fragment_geometry_and_manifest_integrity() {
 #[test]
 fn unchanged_compressed_rewrite_does_not_churn_rows() {
     let scratch = crate::test_scratch::ScratchDir::canonical("tail-no-churn");
-    let path = scratch.join("index.sqlite");
+    let path = scratch.join("index.v2.sqlite.import");
     let mut db = sqlite::Sqlite::create_import(&path).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
