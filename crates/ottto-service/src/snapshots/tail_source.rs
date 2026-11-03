@@ -177,6 +177,11 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// receipt's prefix is reproduced (D168): a counted replay, never a load
     /// outcome or a failure after a head.
     TierPrefixReplay,
+    /// TEMPORARY (until the Codex D134 re-placement rows): a Codex head made
+    /// under another account scope. A Codex creator witness is carried in the
+    /// stored state, not re-derived at finish, so the head keeps main's RAM
+    /// binding to the scope it was read under (parity, not a new Full cause).
+    ContextChanged,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -189,6 +194,7 @@ impl ReconstructCause {
             Self::KeyEpoch => "key_epoch",
             Self::GroupReplay => "group_replay",
             Self::TierPrefixReplay => "tier_prefix_replay",
+            Self::ContextChanged => "codex_scope",
         }
     }
 }
@@ -872,4 +878,5 @@ head_fields! {
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
     I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
+    I codex_account_scope: Option<String>,
 }

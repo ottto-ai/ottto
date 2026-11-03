@@ -174,6 +174,7 @@ impl TailSource for Claude {
                 "codex_dictionary_slots",
                 !acc.codex_dictionary_slots.is_empty(),
             ),
+            ("codex_account_scope", acc.codex_account_scope.is_some()),
         ]
         .into_iter()
         .find_map(|(field, set)| set.then_some(field))

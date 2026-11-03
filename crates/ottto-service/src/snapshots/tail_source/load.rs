@@ -305,7 +305,13 @@ pub(super) fn load<S: TailSource>(
                 let _ = state_v2::retire_tail(route, [key.to_owned()]);
                 point("tail_identity_failure", serde_json::json!({"files": 1}));
             }
-            let outcome = if cause == ReconstructCause::KeyEpoch {
+            // A key rotation, or a Codex account-scope change (TEMPORARY,
+            // D134: main's RAM path reads that Full with no alarm), is an
+            // explicit action, not a failure.
+            let outcome = if matches!(
+                cause,
+                ReconstructCause::KeyEpoch | ReconstructCause::ContextChanged
+            ) {
                 "miss"
             } else {
                 "error"
@@ -322,7 +328,8 @@ pub(super) fn load<S: TailSource>(
         // A head was read and could not be reused; the release gate reads
         // these apart from a file's first read. A key change is an explicit
         // action, counted apart from both.
-        let explicit_action = cause == ReconstructCause::KeyEpoch.label();
+        let explicit_action = cause == ReconstructCause::KeyEpoch.label()
+            || cause == ReconstructCause::ContextChanged.label();
         let after_head = !matches!(cause, "no_head" | "unreadable") && !explicit_action;
         let bytes = held.metadata().map_or(0, |metadata| metadata.len());
         point(
