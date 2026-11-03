@@ -70524,11 +70524,21 @@ mod tests {
             "requestId":"copied-request", "message":{"id":"copied-message", "model":"claude-opus-4-8",
             "usage":{"input_tokens":100,"output_tokens":50}}});
         fs::write(&path, format!("{prefix}{owned_start}\n{record}\n")).unwrap();
-        let mut item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
-            &path,
-            "2026-09-30T10:05:00Z",
-            "f".repeat(64),
-            metadata,
+        // Born before its first line, as a fork's file is; the test file
+        // system's birth (now) would make both responses copied.
+        let born = OffsetDateTime::parse("2026-09-30T09:58:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp_nanos() as u64;
+        let mut item = crate::snapshots::claude_history_upgrade::with_staged_births_for_test(
+            BTreeMap::from([(local_index_key(&path), born)]),
+            || {
+                crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
+                    &path,
+                    "2026-09-30T10:05:00Z",
+                    "f".repeat(64),
+                    metadata,
+                )
+            },
         )
         .unwrap()
         .remove(0);
