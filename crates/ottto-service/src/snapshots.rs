@@ -52973,9 +52973,14 @@ impl ScanIndex {
             .into_iter()
             .filter(|key| !self.files.contains_key(*key))
         {
+            // A codec source keeps no resident copy: its committed head
+            // carries the totals when the codec stores them.
+            let usage = cache.and_then(|cache| cache.resident_usage(source, key));
+            #[cfg(unix)]
+            let usage = usage.or_else(|| tail_source::stored_usage(source, self, key));
             crate::local_resource_diagnostics::unacked_usage_lost_to_deletion(
                 source.api_slug(),
-                cache.and_then(|cache| cache.resident_usage(source, key)),
+                usage,
             );
         }
     }

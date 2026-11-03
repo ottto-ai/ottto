@@ -71,6 +71,28 @@ pub(in crate::snapshots) fn load_candidate(
     )
 }
 
+/// `key`'s accepted usage on its committed head, as (requests, tokens), for
+/// a codec that stores usage before finish. `None`: no readable head, or a
+/// codec whose usage folds only at finish (its totals are unknown, not zero).
+pub(in crate::snapshots) fn stored_usage(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<(u64, u64)> {
+    with_codec!(source, S => stored_usage_of::<S>(index, key), _ => None)
+}
+
+fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, u64)> {
+    if !S::USAGE_BEFORE_FINISH {
+        return None;
+    }
+    let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
+    let mut acc = SnapshotAccumulator::new(S::SOURCE);
+    S::decode_head(head.revision, &head.body, &mut acc).ok()?;
+    let totals = &acc.accepted_usage_totals;
+    Some((totals.request_count, totals.total_tokens()))
+}
+
 /// `source`'s pending Tail write for one completion, through its codec.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn pending(
@@ -270,6 +292,9 @@ pub(in crate::snapshots) trait TailSource {
     const SOURCE: SnapshotSource;
     /// Bumped only when the meaning of the parse-time reduction changes.
     const REDUCTION_REVISION: u32;
+    /// The head stores the accepted usage totals: usage is accepted while the
+    /// file is read, not folded at finish.
+    const USAGE_BEFORE_FINISH: bool = false;
     fn collections() -> &'static [CollectionSpec];
     /// How many elements of `collection` the accumulator holds.
     fn elements(acc: &SnapshotAccumulator, collection: Collection) -> u64;

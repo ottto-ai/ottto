@@ -786,6 +786,29 @@ fn other_page_observing_raw(
         Some(scanner.cache.as_ref()),
         prior,
     );
+    scan_page(c, scanner, source, prior, before_finalize)
+}
+
+/// A page that reads a fixture route's graph unrouted: it stages no Tail, as
+/// a build without the source's codec.
+fn other_page_unrouted(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let prior =
+        crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(source, None, prior);
+    scan_page(c, scanner, source, prior, |_| {})
+}
+
+fn scan_page(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+    before_finalize: impl FnOnce(&[SnapshotItem]),
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
@@ -1197,6 +1220,7 @@ impl PiLedgerStep {
     }
 }
 
+#[track_caller]
 fn pi_ledger_totals(items: &[SnapshotItem]) -> (u64, u64) {
     assert_eq!(items.len(), 1, "ledger fixture has one cumulative session");
     (
@@ -1224,6 +1248,15 @@ impl PiLedgerCheck<'_> {
             other_page_observing_raw(c, scanner, SnapshotSource::Pi, prior, |items| {
                 candidates = items.to_vec();
             });
+        // Printed only when the test fails: the page each assertion judges.
+        eprintln!(
+            "pi ledger page: {:?} modes={modes:?} emitted={} candidates={} noop={} dropped={}",
+            self.step,
+            scan.snapshots.len(),
+            candidates.len(),
+            scan.semantic_noop_count,
+            scan.dropped_usage_record_count,
+        );
         match self.step {
             PiLedgerStep::Emit(..) => {
                 assert_eq!(pi_ledger_totals(&scan.snapshots), self.step.totals());
@@ -1425,6 +1458,7 @@ fn pi_ledger_splits(
     final_totals: (u64, u64),
 ) {
     let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    eprintln!("pi ledger case: {name}");
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
@@ -1880,15 +1914,21 @@ fn pi_lifecycle_case(name: &str) {
                 "2026-10-27T06:01:00Z",
             ),
         );
-        let (mut down, scan, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+        // The older build has no Pi codec: it reads the growth Full, stages
+        // no Tail and commits its index on the same route, so the committed
+        // heads stay those of the first page.
+        let (mut down, scan, mode) =
+            other_page_unrouted(&c, &scanner, SnapshotSource::Pi, prior.clone());
         assert_eq!(
             mode,
             if proof.sampled { (1, 0, 0) } else { (0, 0, 0) },
             "{name}"
         );
         proof.capture(&scan);
-        down.save(&disk.index).unwrap();
-        let committed = ScanIndex::load(&disk.index).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut down, &prior);
+        let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut down);
+        // The reupgraded build is a new process on the committed route.
+        scanner = disk.owner(SnapshotSource::Pi);
         [committed.clone(), committed.clone(), committed]
     } else if rewrite {
         [prior.clone(), prior.clone(), prior]
