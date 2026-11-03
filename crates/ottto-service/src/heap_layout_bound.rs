@@ -188,7 +188,8 @@ impl<T: HeapLayoutBound> HeapLayoutBound for std::cell::OnceCell<T> {
         Some(())
     }
 }
-impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
+/// `Vec` and `VecDeque`: one capacity-sized buffer plus each element's heap.
+macro_rules! sequence { ($($s:ident),*) => { $(impl<T: HeapLayoutBound> HeapLayoutBound for $s<T> {
     fn stable_heap(&self) -> bool {
         self.iter().all(HeapLayoutBound::stable_heap)
     }
@@ -212,31 +213,8 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
         }
         Some(())
     }
-}
-impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
-    fn stable_heap(&self) -> bool {
-        self.iter().all(HeapLayoutBound::stable_heap)
-    }
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(self.capacity().checked_mul(size_of::<T>())?)?;
-        if !T::INLINE_ONLY {
-            for x in self {
-                x.heap_bound(c)?;
-            }
-        }
-        Some(())
-    }
-    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(self.capacity().checked_mul(size_of::<T>())?)?;
-        if !T::INLINE_ONLY {
-            if size_of::<T>() == 0 && !self.is_empty() {
-                return None;
-            }
-            completed_elements(self.iter(), c)?;
-        }
-        Some(())
-    }
-}
+})*}; }
+sequence!(Vec, VecDeque);
 /// The bytes `tree_nodes` charges per entry: one full node (see there).
 pub(crate) fn tree_node_bytes<K, V>() -> Option<usize> {
     256usize
