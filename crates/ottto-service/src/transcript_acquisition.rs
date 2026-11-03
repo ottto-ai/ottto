@@ -429,6 +429,25 @@ pub(crate) struct PrefixSeal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audit_debt_unix_seconds: Option<u64>,
 }
+#[cfg(unix)]
+crate::durable_tail_codec::durable_struct!(FileStamp {
+    N length: u64,
+    N device: u64,
+    N inode: u64,
+    N modified: (i64, i64),
+    N changed: (i64, i64),
+});
+#[cfg(unix)]
+crate::durable_tail_codec::durable_struct!(PrefixSeal {
+    D stamp: FileStamp,
+    N scope: String,
+    N sample_len: u32,
+    H head_sha256: String,
+    H boundary_sha256: String,
+    N verified_unix_seconds: u64,
+    N sealed_unix_seconds: u64,
+    N audit_debt_unix_seconds: Option<u64>,
+});
 
 impl PrefixSeal {
     pub(crate) fn sealed_offset(&self) -> u64 {
@@ -636,6 +655,21 @@ pub(crate) enum ReadMode {
     Tail,
     Unchanged,
 }
+
+#[cfg(unix)]
+crate::durable_tail_codec::durable_enum!(FullReason {
+    0 => StateMissing,
+    1 => AuditDue,
+    2 => ClockChanged,
+    3 => ScopeChanged,
+    4 => InvalidCheckpoint,
+    5 => Replaced,
+    6 => Shrunk,
+    7 => SameSizeEdit,
+    8 => HeadChanged,
+    9 => BoundaryChanged,
+    10 => UnsupportedIdentity,
+});
 
 impl FullReason {
     pub(crate) fn slot(self) -> usize {
