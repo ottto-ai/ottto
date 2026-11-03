@@ -252,11 +252,76 @@ fn first_walk_after_restart_reports_the_durable_age_across_pages() {
         let rows = alarm_rows(&rows);
         assert_eq!(rows.len(), 1, "one row per walk");
         assert!(rows[0]["age_s"].as_u64().unwrap() > 6 * DAY);
-        assert_eq!(rows[0]["changed_files"], 1);
-        assert_eq!(rows[0]["over_6h_files"], 1);
+        // `grown`, plus `unindexed`, which has no entry yet.
+        assert_eq!(rows[0]["changed_files"], 2);
+        assert_eq!(rows[0]["over_6h_files"], 2);
+        assert_eq!(rows[0]["never_indexed_files"], 1);
         assert_eq!(rows[0]["authority_terminal_files"], 0);
         assert_eq!(rows[0]["basis"], "walk");
         assert_eq!(rows[0]["alarm"], true);
+    }
+}
+
+/// [regress] Discovered transcripts that were never indexed sat over 6 h while the
+/// alarm read false. A file outside the discovery window, which is never read, stays
+/// out, and an indexed file still counts only while its stamp differs.
+#[test]
+fn never_indexed_file_over_6h_alarms_until_indexed() {
+    for source in [
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Pi,
+    ] {
+        let scratch = crate::test_scratch::ScratchDir::new("freshness-alarm-never-indexed");
+        let root = scratch.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (never, settled, outside) = (
+            root.join("never.jsonl"),
+            root.join("settled.jsonl"),
+            root.join("outside.jsonl"),
+        );
+        for file in [&never, &settled, &outside] {
+            std::fs::write(file, b"{}\n").unwrap();
+        }
+        age_a_week(&never);
+        age_a_week(&settled);
+        std::fs::File::options()
+            .write(true)
+            .open(&outside)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
+            .unwrap();
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert(local_index_key(&settled), stored_entry(&settled));
+        let walk = |index: &mut ScanIndex| {
+            start_walk(source, &root, index);
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                advance_bounded_directory_traversal_with_budget(
+                    source,
+                    index,
+                    BACKFILL_WINDOW_DAYS,
+                    16,
+                    None,
+                    None,
+                )
+            });
+            alarm_rows(&rows)[0].clone()
+        };
+        let row = walk(&mut index);
+        assert_eq!(row["never_indexed_files"], 1);
+        assert_eq!(row["changed_files"], 1);
+        assert_eq!(row["over_6h_files"], 1);
+        assert!(row["age_s"].as_u64().unwrap() > 6 * DAY);
+        assert_eq!(row["alarm"], true);
+        index
+            .files
+            .insert(local_index_key(&never), stored_entry(&never));
+        let row = walk(&mut index);
+        assert_eq!(row["never_indexed_files"], 0);
+        assert_eq!(row["changed_files"], 0);
+        assert_eq!(row["alarm"], false);
     }
 }
 

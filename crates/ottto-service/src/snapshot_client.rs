@@ -874,11 +874,18 @@ pub struct SnapshotEntityRejection {
 
 impl SnapshotEntityRejection {
     /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
-    /// this body for review. Only these reasons may be non-permanent.
+    /// this body for review. These known holds require their declared contract.
     pub(crate) fn usage_decrease_hold(&self) -> bool {
         matches!(
             self.safe_reason(),
             USAGE_DECREASE_HELD_FOR_REVIEW | USAGE_DECREASE_REFUSED_AFTER_REVIEW
+        )
+    }
+
+    pub(crate) fn ordinary_retryable(&self) -> bool {
+        matches!(
+            self.safe_reason(),
+            "accepted_log_stale_older_mixed" | "other"
         )
     }
 
@@ -890,6 +897,7 @@ impl SnapshotEntityRejection {
             "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
             "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
             "accepted_log_stale_older_upload" => "accepted_log_stale_older_upload",
+            "accepted_log_stale_older_mixed" => "accepted_log_stale_older_mixed",
             "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
             "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
             "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
@@ -1063,7 +1071,11 @@ impl SnapshotBatchResponse {
     /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
     fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
-        for rejection in self.rejected_entities.iter().filter(|r| !r.permanent) {
+        for rejection in self
+            .rejected_entities
+            .iter()
+            .filter(|r| !r.permanent && r.usage_decrease_hold())
+        {
             let held_literal = declared
                 && request.snapshots.iter().any(|item| {
                     item.source_session_id == rejection.source_session_id
@@ -1223,7 +1235,10 @@ impl SnapshotBatchResponse {
                 retained_proof_missing: Vec::new(),
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent && !rejection.usage_decrease_hold() {
+            if !rejection.permanent
+                && !rejection.usage_decrease_hold()
+                && !rejection.ordinary_retryable()
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(

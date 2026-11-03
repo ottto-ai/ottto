@@ -59,6 +59,7 @@ pub(crate) mod continuation;
 mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
+mod stale_owed;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -267,10 +268,7 @@ fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem
     if progress.active_reason_reoffers.get(fingerprint) == Some(&witness) {
         return false;
     }
-    progress
-        .permanent_rejections
-        .get(fingerprint)
-        .is_some_and(|record| record.body_witness == witness)
+    progress.refused_body(fingerprint, &witness)
         || (!progress.active_quarantine_retries.contains(fingerprint)
             && progress
                 .quarantined_fingerprints
@@ -398,6 +396,8 @@ pub(crate) fn retained_refusal_settles_for_test(
         fingerprint.into(),
         PermanentSnapshotRejection {
             body_witness: body.into(),
+            exposure: None,
+            revisions: BTreeMap::new(),
             reason: crate::upload_receipts::RejectedUsageReason::Other,
             reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {
                 retry_after_unix_seconds: deadline,
@@ -1530,6 +1530,15 @@ struct PermanentSnapshotRejection {
         deserialize_with = "reason_reoffer::deserialize"
     )]
     reoffer: Option<reason_reoffer::RefusalReoffer>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stale_owed::decode_exposure"
+    )]
+    exposure: Option<stale_owed::Exposure>,
+    /// Exact older revisions remain with their existing refusal owner.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    revisions: BTreeMap<String, PermanentSnapshotRejection>,
 }
 
 mod ack_retention;
@@ -1900,8 +1909,15 @@ impl SnapshotUploadProgress {
             &mut self.quarantined_fingerprints,
             index_quarantine,
         );
-        for record in self.quarantined_fingerprints.values_mut() {
-            contract_retry_changed |= crate::snapshots::terminal_contract_retry::exhaust(record);
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            if !self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(PermanentSnapshotRejection::has_stale_debt)
+            {
+                contract_retry_changed |=
+                    crate::snapshots::terminal_contract_retry::exhaust(record);
+            }
         }
         // The server-permanent exact-body fact dominates an older index timer.
         // Keep the index-facing disposition truthful as well as suppressing I/O.
@@ -1916,7 +1932,9 @@ impl SnapshotUploadProgress {
                 .permanent_rejections
                 .get(fingerprint)
                 .is_some_and(|permanent| {
-                    record.upload_body_witness.as_deref() == Some(permanent.body_witness.as_str())
+                    !permanent.owed()
+                        && record.upload_body_witness.as_deref()
+                            == Some(permanent.body_witness.as_str())
                 })
             {
                 record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
@@ -1950,10 +1968,11 @@ impl SnapshotUploadProgress {
                 !self
                     .permanent_rejections
                     .get(*fingerprint)
-                    .is_some_and(|permanent| {
-                        record.upload_body_witness.as_deref()
-                            == Some(permanent.body_witness.as_str())
-                    })
+                    .is_some_and(PermanentSnapshotRejection::has_stale_debt)
+                    && !record
+                        .upload_body_witness
+                        .as_deref()
+                        .is_some_and(|body| self.refused_body(fingerprint, body))
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && ((record.contract_retry_claims.is_none()
                         && !record.witness.same_retry_contract(active)
@@ -2065,7 +2084,9 @@ impl SnapshotUploadProgress {
         for (fingerprint, refusal) in &mut self.permanent_rejections {
             // Known reasons are never re-offered; only the old `other`
             // vocabulary can carry this reason or a legacy record of it.
-            if refusal.reason != crate::upload_receipts::RejectedUsageReason::Other {
+            if refusal.has_stale_debt()
+                || refusal.reason != crate::upload_receipts::RejectedUsageReason::Other
+            {
                 continue;
             }
             let retry_after = match refusal.reoffer {
@@ -2124,51 +2145,64 @@ impl SnapshotUploadProgress {
         changed
     }
 
-    /// Runtime-only exact-body cooldown view (fingerprint -> refused body
-    /// witness) of this prepared cycle: a retained exact-body RetryPending
-    /// conflict whose refusal holds a validated daily re-offer reservation
-    /// and no lease this cycle. Without that lease the exact body cannot be
-    /// sent, so its ordinary retry timer alone must not re-read an unchanged
-    /// file. Due records waiting for budget stay in the view. Missing,
-    /// malformed or classified extensions grant nothing. Bounded by the
-    /// refusal ledger; the reservation remains the sole durable schedule.
-    fn reason_reoffer_cooldowns(&self, now: u64) -> BTreeMap<String, String> {
+    /// Extend the existing cooldown view with stale debt. Its input-only hold
+    /// survives old terminal dispositions, witness revisions and later ACKs;
+    /// those facts do not prove that the retained refusal is covered.
+    fn reason_reoffer_cooldowns(
+        &self,
+        now: u64,
+    ) -> BTreeMap<String, crate::snapshots::ReasonReofferCooldown> {
         use reason_reoffer::RefusalReoffer;
         let latest = reason_reoffer::latest_valid_deadline(now);
         self.permanent_rejections
             .iter()
-            .filter(|(fingerprint, refusal)| {
-                refusal.reason == crate::upload_receipts::RejectedUsageReason::Other
-                    && matches!(
-                        refusal.reoffer,
-                        Some(
-                            RefusalReoffer::OriginalPair { .. }
-                                | RefusalReoffer::LegacyOther { .. }
+            .filter_map(|(fingerprint, owner)| {
+                let stale = std::iter::once(owner)
+                    .chain(owner.revisions.values())
+                    .find(|r| r.owed());
+                if let Some(refusal) = stale {
+                    return Some((
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown {
+                            body_witness: refusal.body_witness.clone(),
+                            input_change_only: true,
+                        },
+                    ));
+                }
+                let eligible =
+                    owner.reason == crate::upload_receipts::RejectedUsageReason::Other
+                        && matches!(
+                            owner.reoffer,
+                            Some(
+                                RefusalReoffer::OriginalPair { .. }
+                                    | RefusalReoffer::LegacyOther { .. }
+                            )
                         )
+                        && owner
+                            .reoffer
+                            .and_then(RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline <= latest)
+                        && !self.active_reason_reoffers.contains_key(fingerprint)
+                        && !self.active_quarantine_retries.contains(fingerprint)
+                        && !self.accepted_fingerprints.contains(fingerprint)
+                        && self
+                            .quarantined_fingerprints
+                            .get(fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && self.active_quarantine_witness.as_ref().is_some_and(
+                                        |active| record.witness.same_retry_contract(active),
+                                    )
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(owner.body_witness.as_str())
+                            });
+                eligible.then(|| {
+                    (
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown::from(owner.body_witness.clone()),
                     )
-                    && refusal
-                        .reoffer
-                        .and_then(RefusalReoffer::retry_after)
-                        .is_some_and(|retry_after| retry_after <= latest)
-                    && !self.active_reason_reoffers.contains_key(*fingerprint)
-                    && !self.active_quarantine_retries.contains(*fingerprint)
-                    && !self.accepted_fingerprints.contains(*fingerprint)
-                    && self
-                        .quarantined_fingerprints
-                        .get(*fingerprint)
-                        .is_some_and(|record| {
-                            record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                && self
-                                    .active_quarantine_witness
-                                    .as_ref()
-                                    .is_some_and(|active| {
-                                        record.witness.same_retry_contract(active)
-                                    })
-                                && record.upload_body_witness.as_deref()
-                                    == Some(refusal.body_witness.as_str())
-                        })
+                })
             })
-            .map(|(fingerprint, refusal)| (fingerprint.clone(), refusal.body_witness.clone()))
             .collect()
     }
 
@@ -2384,14 +2418,15 @@ impl SnapshotUploadProgress {
         if self
             .permanent_rejections
             .get(fingerprint)
-            .is_some_and(|record| record.body_witness == body_witness)
+            .is_some_and(|record| record.refused_body(body_witness))
         {
             // Only this exact body's own re-offer lease passes suppression.
-            return self
-                .active_reason_reoffers
-                .get(fingerprint)
-                .map(String::as_str)
-                != Some(body_witness);
+            return self.owed_stale_body(fingerprint, body_witness)
+                || self
+                    .active_reason_reoffers
+                    .get(fingerprint)
+                    .map(String::as_str)
+                    != Some(body_witness);
         }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
@@ -2449,7 +2484,19 @@ impl SnapshotUploadProgress {
         {
             self.reason_reoffer_counts.accepted += 1;
         }
-        self.permanent_rejections.remove(fingerprint);
+        if let Some(mut refusal) = self.permanent_rejections.remove(fingerprint) {
+            refusal.revisions.remove(body_witness);
+            if refusal.body_witness == body_witness {
+                if let Some((_, mut remaining)) = refusal.revisions.pop_first() {
+                    remaining.revisions = refusal.revisions;
+                    self.permanent_rejections
+                        .insert(fingerprint.into(), remaining);
+                }
+            } else if refusal.owed() || !refusal.revisions.is_empty() {
+                self.permanent_rejections
+                    .insert(fingerprint.into(), refusal);
+            }
+        }
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -2610,11 +2657,20 @@ impl SnapshotUploadProgress {
                     .max(crate::snapshots::terminal_contract_retry::current_contract())
             },
         );
-        let failed_reconstruction_count = existing
-            .map(|record| record.failed_reconstruction_count.saturating_add(1))
-            .unwrap_or(1)
-            .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
-        let disposition = if failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        let stale_owed = self.owed_stale_body(fingerprint, body_witness);
+        // A refused stale body owes an answer; it spends no reconstruction
+        // exhaustion budget. Keep the existing RetryPending decoder contract.
+        let failed_reconstruction_count = if stale_owed {
+            1
+        } else {
+            existing
+                .map(|record| record.failed_reconstruction_count.saturating_add(1))
+                .unwrap_or(1)
+                .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES)
+        };
+        let disposition = if !stale_owed
+            && failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+        {
             if existing.map_or(0, |record| record.failed_reconstruction_count)
                 < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
             {
@@ -2664,6 +2720,9 @@ impl SnapshotUploadProgress {
         }
         self.quarantine_body(fingerprint, body_witness);
         let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
+        // Current servers prove coverage before issuing a permanent stale
+        // refusal. Fresh exposure records its recording generation; no legacy
+        // record receives that marker without a new server answer.
         record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
         record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
         record.retry_after_unix_seconds = 0;
@@ -2682,12 +2741,15 @@ impl SnapshotUploadProgress {
         } else {
             None
         };
+        let revisions = self.retained_revisions(fingerprint, body_witness);
         self.permanent_rejections.insert(
             fingerprint.to_string(),
             PermanentSnapshotRejection {
                 body_witness: body_witness.to_string(),
                 reason: persisted_reason,
                 reoffer,
+                exposure: Some(stale_owed::Exposure::new(current_unix_seconds())),
+                revisions,
             },
         );
         self.active_reason_reoffers.remove(fingerprint);
@@ -2711,10 +2773,12 @@ impl SnapshotUploadProgress {
         // A validated unchanged answer for a re-offered refused body replaces
         // that refusal's verdict. Retire it, so its reason schedules no more
         // offers; the hold below keeps the no-body-stored disclosure.
-        if self
-            .permanent_rejections
-            .get(fingerprint)
-            .is_some_and(|refusal| refusal.body_witness == body_witness)
+        let stale_owed = self.owed_stale_body(fingerprint, body_witness);
+        if !stale_owed
+            && self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(|refusal| refusal.body_witness == body_witness)
         {
             self.permanent_rejections.remove(fingerprint);
         }
@@ -2724,7 +2788,10 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("quarantine just recorded");
-        if self.context_resend.is_candidate(fingerprint) {
+        if stale_owed {
+            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            record.contract_retry_claims = None;
+        } else if self.context_resend.is_candidate(fingerprint) {
             // Current-context not_stored re-offers retain ordinary retry custody.
             // Exponential 6h/12h, capped by the existing 12h decoder bound.
             if record.disposition == SnapshotQuarantineDisposition::RetryPending {
@@ -2798,6 +2865,10 @@ impl SnapshotUploadProgress {
         let before = self.quarantined_fingerprints.clone();
         for (fingerprint, record) in &mut self.quarantined_fingerprints {
             if !current.contains(fingerprint)
+                && !self
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(PermanentSnapshotRejection::has_stale_debt)
                 && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
             {
                 record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
@@ -4306,6 +4377,7 @@ struct PermanentRefusalCounts {
     total: usize,
     /// Refusals the backend already dominates with an accepted record.
     dominated: usize,
+    exposure: crate::local_resource_diagnostics::RefusalExposure,
 }
 
 impl PermanentRefusalCounts {
@@ -4315,7 +4387,10 @@ impl PermanentRefusalCounts {
     /// own result, so the older refusal then counts as other.
     fn of(progress: &SnapshotUploadProgress) -> Self {
         progress.permanent_rejections.iter().fold(
-            Self::default(),
+            Self {
+                exposure: progress.refusal_exposure(current_unix_seconds()),
+                ..Self::default()
+            },
             |mut counts, (fingerprint, refusal)| {
                 counts.total += 1;
                 if Self::is_dominated(progress, fingerprint, refusal) {
@@ -4345,7 +4420,11 @@ impl PermanentRefusalCounts {
         fingerprint: &str,
         refusal: &PermanentSnapshotRejection,
     ) -> bool {
-        refusal.reason.is_dominated()
+        (refusal.reason.is_dominated() || (refusal.is_stale() && refusal.exposure.is_some()))
+            && !refusal
+                .revisions
+                .values()
+                .any(PermanentSnapshotRejection::owed)
             && progress
                 .quarantined_fingerprints
                 .get(fingerprint)
@@ -4380,41 +4459,45 @@ fn log_retained_permanent_refusals(
     settled_residue: bool,
 ) {
     let line = (retained, authority_downgrades, settled_residue);
-    let changed = match SOURCE_REFUSAL_LOGS
+    let previous = SOURCE_REFUSAL_LOGS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
-    {
-        Ok(mut logged) => logged.insert(source.api_slug(), line) != Some(line),
-        Err(_) => true,
-    };
-    if !changed || retained.dominated == 0 {
+        .ok()
+        .and_then(|mut logged| logged.insert(source.api_slug(), line));
+    if previous == Some(line) {
         return;
     }
+    if previous.is_some_and(|p| retained.exposure.owed_entities > p.0.exposure.owed_entities) {
+        eprintln!("ottto-service: refusal exposure alarm source={} reason=accepted_log_stale_older_upload owed_entities={} oldest_age_seconds={}", source.api_slug(), retained.exposure.owed_entities, retained.exposure.oldest_age_seconds);
+    }
     eprintln!(
-        "local snapshot sync retains {} dominated ({} usage_accounting_authority_downgrade, {} \
-         accepted_log_stale_older_upload) and {} other permanent refusal(s) for {}{}",
+        "local snapshot sync retains {} dominated ({} usage_accounting_authority_downgrade) \
+         and {} other permanent refusal(s) for {}{}; reason=accepted_log_stale_older_upload \
+         owed_entities={} known_requests={} known_tokens={} unknown_request_entities={} \
+         unknown_token_entities={} unknown_age_entities={} oldest_age_seconds={}",
         retained.dominated,
         authority_downgrades,
-        retained.dominated - authority_downgrades,
         retained.total - retained.dominated,
         source.api_slug(),
         if settled_residue {
             "; reported as settled residue the backend already owns"
         } else {
             ""
-        }
+        },
+        retained.exposure.owed_entities,
+        retained.exposure.known_requests,
+        retained.exposure.known_tokens,
+        retained.exposure.unknown_request_entities,
+        retained.exposure.unknown_token_entities,
+        retained.exposure.unknown_age_entities,
+        retained.exposure.oldest_age_seconds,
     );
 }
 
-/// Terminal state for a cycle that ends with deferred or refused entities.
-///
-/// A settled cycle whose every retained permanent refusal is dominated lost
-/// no usage the backend does not already own. It reports `Success`: each
-/// refused body is still bound to, and disclosed through, its terminal
-/// quarantine record, so the receipt builder names it as settled
-/// `census_residue` under the backend's admission and in the legacy shape
-/// otherwise. No refused body becomes accepted. Any other refusal, a hold, a
-/// conflict, or a refusal whose entity has a pending newer body is unchanged.
+/// Status only: an otherwise settled cycle with dominated or stale-owed
+/// refusals remains successful. Existing residue counters keep their receipt
+/// shape; stale debt remains owed in custody and diagnostics, never accepted.
+/// Other refusals and unsettled transport retain their existing status.
 fn refused_entity_state(
     permanent: bool,
     refusals: PermanentRefusalCounts,
@@ -4423,7 +4506,7 @@ fn refused_entity_state(
     if permanent
         && upload_fully_settled
         && refusals.total > 0
-        && refusals.dominated == refusals.total
+        && refusals.dominated + refusals.exposure.owed_entities == refusals.total
     {
         CollectorState::Success
     } else {
@@ -5303,10 +5386,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             ))
         });
         let v2_active = crate::snapshots::state_v2_growth_retention_active(&completed.1);
-        let finished =
-            crate::local_resource_diagnostics::source_finish(source.api_slug(), v2_active, || {
-                self.finish_completed(completed)
-            });
+        let exposure = completed.1.refusal_exposure;
+        let finished = crate::local_resource_diagnostics::source_finish_with_refusals(
+            source.api_slug(),
+            v2_active,
+            exposure,
+            || self.finish_completed(completed),
+        );
         if let Some(ticket) = continuation_ticket {
             continuation::after_ordinary_codex_page(ticket, self.codex_started, finished.is_ok());
         }
@@ -6843,6 +6929,8 @@ fn prepare_sync_source_inner(
     }
     let quarantine_retry_paths =
         save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
+    index.refusal_exposure = upload_progress.refusal_exposure(current_unix_seconds());
+    index.refusal_exposure.held_terminal_entities = index.snapshot_unproven_terminal_count();
     if !quarantine_retry_paths.is_empty() {
         crate::local_resource_diagnostics::traversal_point(
             "quarantine_retry",
@@ -6910,12 +6998,11 @@ fn prepare_sync_source_inner(
     let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
-    // A replay re-reads everything and neither re-offers nor defers.
-    index.activate_reason_reoffer_cooldowns(if backfill_pending {
-        BTreeMap::new()
-    } else {
-        upload_progress.reason_reoffer_cooldowns(reoffer_now)
-    });
+    let mut cooldowns = upload_progress.reason_reoffer_cooldowns(reoffer_now);
+    if backfill_pending {
+        cooldowns.retain(|_, cooldown| cooldown.input_change_only);
+    }
+    index.activate_reason_reoffer_cooldowns(cooldowns);
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -9046,10 +9133,18 @@ fn finish_sync_source(
     );
     upload_progress
         .permanent_rejections
-        .retain(|fingerprint, _| current_entities.contains(fingerprint));
+        .retain(|fingerprint, refusal| {
+            refusal.has_stale_debt() || current_entities.contains(fingerprint)
+        });
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
+    log_retained_permanent_refusals(
+        source,
+        retained_refusals,
+        retained_downgrades,
+        upload_fully_settled,
+    );
     upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, &index);
     upload_progress.retire_planned_acks_after_index_save(
         &index,
@@ -9066,14 +9161,6 @@ fn finish_sync_source(
             permanent_refusals,
             upload_fully_settled,
         );
-        if resolved_permanent_rejections {
-            log_retained_permanent_refusals(
-                source,
-                retained_refusals,
-                retained_downgrades,
-                matches!(state, CollectorState::Success),
-            );
-        }
         // The uploader drained its frozen, scan-capped queue before returning
         // `Deferred`, and the index above now owns both accepted siblings and
         // entity quarantine. Surface the conflict only after those
@@ -9171,10 +9258,26 @@ fn save_terminal_contract_claims_for_scan(
     progress: &SnapshotUploadProgress,
     index_path: &Path,
 ) -> Result<Vec<PathBuf>> {
-    if index.merge_terminal_contract_claims(&progress.quarantined_fingerprints) {
+    let mut changed = index.merge_terminal_contract_claims(&progress.quarantined_fingerprints);
+    for (fingerprint, record) in &progress.quarantined_fingerprints {
+        if record
+            .upload_body_witness
+            .as_deref()
+            .is_some_and(|body| progress.owed_stale_body(fingerprint, body))
+            && index.quarantined_snapshot_fingerprints.get(fingerprint) != Some(record)
+        {
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fingerprint.clone(), record.clone());
+            changed = true;
+        }
+    }
+    if changed {
         index.save(index_path)?;
     }
-    Ok(index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone()))
+    let paths =
+        index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone());
+    Ok(paths)
 }
 
 /// Prepare the disposable upload ledger against the durable scan-index replay.
@@ -11097,9 +11200,10 @@ where
                         &body_witness(item),
                         rejection.safe_reason(),
                     );
+                    progress.note_refused_exposure(item_fingerprint, item);
                 } else {
-                    // A validated money-decrease hold: the backend kept the
-                    // old head. Retry this or a newer body like a conflict.
+                    // Any validated non-permanent answer keeps only this
+                    // entity owed. Accepted siblings settle independently.
                     progress.quarantine_retryable_body(
                         item_fingerprint,
                         &body_witness(item),
@@ -11332,7 +11436,7 @@ where
             progress
                 .permanent_rejections
                 .get(*fingerprint)
-                .is_some_and(|record| record.body_witness == **body)
+                .is_some_and(|record| record.body_witness == **body && !record.owed())
                 && !progress
                     .quarantined_fingerprints
                     .get(*fingerprint)
@@ -24754,7 +24858,7 @@ mod head_conflict_answer_tests;
 #[path = "snapshot_sync/head_conflict_released_progress_fixture.rs"]
 mod head_conflict_released_progress_fixture;
 
-crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
 crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);

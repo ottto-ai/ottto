@@ -3586,6 +3586,22 @@ pub(crate) struct UploadAckRetirementHandoff {
     pub pending_bodies: BTreeMap<String, String>,
 }
 
+/// Runtime refusal custody; stale debt permits acquisition only after input changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasonReofferCooldown {
+    pub(crate) body_witness: String,
+    pub(crate) input_change_only: bool,
+}
+impl From<String> for ReasonReofferCooldown {
+    fn from(body_witness: String) -> Self {
+        Self {
+            body_witness,
+            input_change_only: false,
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ReasonReofferCooldown; body_witness, input_change_only);
+
 /// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
 /// each new field's save rule there (serde `skip_serializing*` keys here are inert).
 #[derive(Debug, Clone, Deserialize)]
@@ -4017,6 +4033,8 @@ pub struct ScanIndex {
     /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(crate) refusal_exposure: crate::local_resource_diagnostics::RefusalExposure,
     /// Runtime-only: this index's path was loaded in this process with no
     /// verified prior history (missing, quarantined, or generation 0 with no
     /// files), so a census absence there is not positive and retires nothing.
@@ -4029,13 +4047,12 @@ pub struct ScanIndex {
     /// that value's exact round-trip/default semantics.
     #[serde(skip)]
     claude_rebuild_read_load_eligible: bool,
-    /// Runtime-only exact-body cooldowns (fingerprint -> refused body
-    /// witness) from the upload ledger: a retained conflict whose refused
-    /// body waits for its reserved daily re-offer. Its ordinary retry timer
-    /// alone never re-reads an unchanged file. Never persisted; never
-    /// acceptance evidence. Bounded by the refusal ledger.
+    /// Runtime-only refusal cooldowns from the upload ledger: ordinary exact
+    /// bodies await their reserved re-offer; stale debt permits new input only.
+    /// Neither a timer nor a revision grants stale debt a read. Never persisted
+    /// or acceptance evidence; uses the existing refusal incidence.
     #[serde(skip)]
-    reason_reoffer_cooldowns: BTreeMap<String, String>,
+    reason_reoffer_cooldowns: BTreeMap<String, ReasonReofferCooldown>,
     /// Claude only: the last moment this destination is known to have
     /// received history, recorded when a Mac with prior history loads a fresh
     /// index, a replay drops its entries, or a pre-gate index is first loaded
@@ -4428,6 +4445,7 @@ impl Default for ScanIndex {
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
             terminal_contract_retries: BTreeMap::new(),
+            refusal_exposure: Default::default(),
             claude_history_unverified_in_process: false,
             claude_rebuild_read_load_eligible: false,
             reason_reoffer_cooldowns: BTreeMap::new(),
@@ -26935,6 +26953,8 @@ impl OwnedSourceScan {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
             .with_withheld_memo(owned_index.withheld_memo.clone());
+        resource_probe.refusal_exposure = (owned_index.refusal_exposure != Default::default())
+            .then_some(owned_index.refusal_exposure);
         let index = &mut owned_index;
         if source == SnapshotSource::ClaudeCode {
             // Restore population disclosure even before a restarted/evicted
@@ -33257,6 +33277,11 @@ impl OwnedSourceScan {
             {
                 decision = CandidateDecision::Parse;
             }
+            let stale_input_held = index.stale_refusal_holds_unchanged_input(&candidate);
+            if stale_input_held {
+                decision = CandidateDecision::Skip;
+                parse_reason = None;
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -33273,7 +33298,10 @@ impl OwnedSourceScan {
             // exit.
             let mut side_plan = None;
             let mut codex_selected_by = None;
-            if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
+            if source == SnapshotSource::Codex
+                && decision == CandidateDecision::Skip
+                && !stale_input_held
+            {
                 let shared = codex_parent_ownership_ledgers.as_ref();
                 let owed = codex_parent_reparse_owed_ids(index, shared, &candidate.path);
                 if owed.is_empty()
@@ -33405,7 +33433,7 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
-            let decision = if codex_archive_path(&candidate.path) {
+            let decision = if codex_archive_path(&candidate.path) && !stale_input_held {
                 CandidateDecision::Parse
             } else {
                 decision
@@ -45240,6 +45268,14 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
                 continue;
             }
+            // Inside the window and unread: outstanding. Archives keep their own
+            // debt.
+            if !codex_archive_path(&path) && !index.files.contains_key(&local_index_key(&path)) {
+                freshness.never_indexed_file(
+                    index.authority_terminal_member(&path),
+                    listed_at.saturating_sub(modified_unix_seconds),
+                );
+            }
             let mut owed_unchanged = false;
             if relisting {
                 let key = local_index_key(&path);
@@ -50242,11 +50278,14 @@ impl ScanIndex {
     /// Arm this cycle's exact-body cooldown view (fingerprint -> refused
     /// body witness), read from the prepared upload ledger after its leases
     /// and any clock re-clamp. Replaces the previous view and its counts.
-    pub(crate) fn activate_reason_reoffer_cooldowns(
+    pub(crate) fn activate_reason_reoffer_cooldowns<T: Into<ReasonReofferCooldown>>(
         &mut self,
-        cooldowns: BTreeMap<String, String>,
+        cooldowns: BTreeMap<String, T>,
     ) {
-        self.reason_reoffer_cooldowns = cooldowns;
+        self.reason_reoffer_cooldowns = cooldowns
+            .into_iter()
+            .map(|(fp, cooldown)| (fp, cooldown.into()))
+            .collect();
     }
 
     /// True when this entity's ordinary retry is only the retained conflict
@@ -50254,6 +50293,13 @@ impl ScanIndex {
     /// re-reading the unchanged file cannot send it. A lease, an acceptance,
     /// another body or a changed quarantine witness keeps the retry.
     fn reason_reoffer_cooldown_defers(&self, fingerprint: &str) -> bool {
+        if self
+            .reason_reoffer_cooldowns
+            .get(fingerprint)
+            .is_some_and(|c| c.input_change_only)
+        {
+            return true;
+        }
         !self.reason_reoffer_retries.contains_key(fingerprint)
             && !self.accepted_snapshot_fingerprint_recorded(fingerprint)
             && self
@@ -50262,7 +50308,8 @@ impl ScanIndex {
                 .zip(self.quarantined_snapshot_fingerprints.get(fingerprint))
                 .is_some_and(|(body_witness, record)| {
                     record.disposition == SnapshotQuarantineDisposition::RetryPending
-                        && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
+                        && record.upload_body_witness.as_deref()
+                            == Some(body_witness.body_witness.as_str())
                         && self
                             .active_quarantine_witness
                             .as_ref()
@@ -50302,7 +50349,14 @@ impl ScanIndex {
         if !unchanged {
             if let Some(fingerprints) = self.file_snapshot_fingerprints.get(&key) {
                 for fingerprint in fingerprints {
-                    self.reason_reoffer_cooldowns.remove(fingerprint);
+                    if !skipped
+                        || !self
+                            .reason_reoffer_cooldowns
+                            .get(fingerprint)
+                            .is_some_and(|c| c.input_change_only)
+                    {
+                        self.reason_reoffer_cooldowns.remove(fingerprint);
+                    }
                 }
             }
         }
@@ -50318,7 +50372,7 @@ impl ScanIndex {
     ) -> bool {
         self.reason_reoffer_cooldowns
             .get(fingerprint)
-            .is_some_and(|witness| witness == body)
+            .is_some_and(|cooldown| cooldown.body_witness == body)
             && self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
@@ -52553,6 +52607,7 @@ impl ScanIndex {
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
             terminal_contract_retries: self.terminal_contract_retries.clone(),
+            refusal_exposure: self.refusal_exposure,
             claude_history_unverified_in_process: self.claude_history_unverified_in_process,
             claude_rebuild_read_load_eligible: self.claude_rebuild_read_load_eligible,
             reason_reoffer_cooldowns: self.reason_reoffer_cooldowns.clone(),
@@ -53131,6 +53186,34 @@ impl ScanIndex {
             })
     }
 
+    /// Use the existing physical listing stamp, independent of parser, upload
+    /// context or retry revisions. A refusal grants no transcript read.
+    fn stale_refusal_holds_unchanged_input(&self, candidate: &CandidateFile) -> bool {
+        let key = local_index_key(&candidate.path);
+        self.file_snapshot_fingerprints
+            .get(&key)
+            .is_some_and(|fps| {
+                fps.iter().any(|fp| {
+                    self.reason_reoffer_cooldowns
+                        .get(fp)
+                        .is_some_and(|c| c.input_change_only)
+                })
+            })
+            && self.files.get(&key).is_some_and(|entry| {
+                let modified = Some(candidate.modified_unix_nanos);
+                let stored = entry.modified_unix_nanos.or_else(|| {
+                    modified.filter(|nanos| nanos / 1_000_000_000 == entry.modified_unix_seconds)
+                });
+                entry.same_stamp_with_mtime(
+                    stored,
+                    candidate.size_bytes,
+                    modified,
+                    Some(candidate.fingerprint_birth_nanos),
+                    codex_fragment::Stamp::candidate(candidate),
+                )
+            })
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         self.candidate_decision_with_reason(candidate).0
     }
@@ -53256,6 +53339,9 @@ impl ScanIndex {
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
+            return (CandidateDecision::Skip, None);
+        }
+        if self.stale_refusal_holds_unchanged_input(candidate) {
             return (CandidateDecision::Skip, None);
         }
         if self

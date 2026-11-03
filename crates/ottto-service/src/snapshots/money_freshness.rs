@@ -8,9 +8,10 @@ use serde::Serialize;
 const ALARM_AFTER: u64 = 6 * 60 * 60;
 
 /// One root walk's fold of indexed files whose live stamp differs from the
-/// stored settled stamp. A walk spans passes and every pass reloads the index,
-/// so the fold stays in this process until the walk ends. Its inputs are
-/// durable: only a restart mid-walk loses the pages already walked.
+/// stored settled stamp, and of discovered files with no index entry yet. A
+/// walk spans passes and every pass reloads the index, so the fold stays in
+/// this process until the walk ends. Its inputs are durable: only a restart
+/// mid-walk loses the pages already walked.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WalkFold {
     age_s: u64,
@@ -18,6 +19,7 @@ pub(super) struct WalkFold {
     over_6h_files: u64,
     authority_terminal_files: u64,
     authority_terminal_oldest_age_s: u64,
+    never_indexed_files: u64,
 }
 impl WalkFold {
     const EMPTY: Self = Self {
@@ -26,6 +28,7 @@ impl WalkFold {
         over_6h_files: 0,
         authority_terminal_files: 0,
         authority_terminal_oldest_age_s: 0,
+        never_indexed_files: 0,
     };
 
     pub(super) fn resume(source: SnapshotSource) -> Self {
@@ -43,6 +46,14 @@ impl WalkFold {
             self.changed_files += 1;
             self.over_6h_files += u64::from(age_s > ALARM_AFTER);
         }
+    }
+
+    /// A discovered file inside the window with no index entry is outstanding
+    /// like a changed one. Its age is a lower bound: with no stored stamp,
+    /// only the latest write is known.
+    pub(super) fn never_indexed_file(&mut self, authority_terminal: bool, age_s: u64) {
+        self.never_indexed_files += 1;
+        self.changed_file(authority_terminal, age_s);
     }
 
     pub(super) fn page_end(self, source: SnapshotSource, walk_ended: bool) {
@@ -89,6 +100,7 @@ fn emit(source: SnapshotSource, age_s: Option<u64>, fold: WalkFold, basis: &'sta
             "over_6h_files": fold.over_6h_files,
             "authority_terminal_files": fold.authority_terminal_files,
             "authority_terminal_oldest_age_s": fold.authority_terminal_oldest_age_s,
+            "never_indexed_files": fold.never_indexed_files,
             "basis": basis,
             "alarm": age_s.map_or(true, |age| age > ALARM_AFTER)
                 || fold.authority_terminal_files > 0,
