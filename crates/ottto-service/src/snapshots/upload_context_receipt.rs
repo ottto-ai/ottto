@@ -72,11 +72,41 @@ pub(crate) struct ProofState {
     replay_generation: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+    /// Absent in state written before the change-reason counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direction: Option<ContextDirection>,
+}
+
+/// Which way the upload policy last moved, for the change-reason counts
+/// only: never a gate. Local scheduling data; booleans and digests only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextDirection {
+    /// Titles, workspace labels, artifacts, attribution, attribution labels.
+    policy: [bool; 5],
+    context: Option<String>,
+    /// The active context before the latest policy change.
+    previous_context: Option<String>,
+    /// The `policy` booleans that latest change flipped.
+    last_change_mask: u8,
 }
 
 impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
         self.inputs.is_none() && self.entity_stamps.is_empty()
+    }
+
+    /// A receipt under the context the latest policy change replaced, when
+    /// that change turned a sharing flag off.
+    pub(super) fn privacy_turned_off_since(&self, receipt_context: Option<&str>) -> bool {
+        self.direction.as_ref().is_some_and(|direction| {
+            let off = direction
+                .policy
+                .iter()
+                .enumerate()
+                .any(|(bit, on)| !on && direction.last_change_mask & (1 << bit) != 0);
+            off && receipt_context.is_some()
+                && direction.previous_context.as_deref() == receipt_context
+        })
     }
 }
 
@@ -743,6 +773,7 @@ impl ScanIndex {
         &mut self,
         source: SnapshotSource,
         inputs: ContextInputs,
+        policy: SnapshotUploadPolicy,
     ) {
         if let Some(previous) = self
             .upload_context_proof
@@ -772,6 +803,29 @@ impl ScanIndex {
             );
         }
         self.upload_context_proof.inputs = Some(inputs);
+        let policy = [
+            policy.session_titles_enabled,
+            policy.workspace_labels_enabled,
+            policy.session_artifacts_enabled,
+            policy.session_attribution_enabled,
+            policy.session_attribution_labels_enabled,
+        ];
+        let context = self.active_upload_context_fingerprint.clone();
+        let mut direction = self
+            .upload_context_proof
+            .direction
+            .take()
+            .unwrap_or_default();
+        let flipped = (0..policy.len())
+            .filter(|bit| direction.policy[*bit] != policy[*bit])
+            .fold(0u8, |mask, bit| mask | (1 << bit));
+        if flipped != 0 && direction.context.is_some() {
+            direction.previous_context = direction.context.take();
+            direction.last_change_mask = flipped;
+        }
+        direction.policy = policy;
+        direction.context = context;
+        self.upload_context_proof.direction = Some(direction);
     }
 
     /// Gates nothing: files still owing their own proof, for census lines.
@@ -856,6 +910,7 @@ impl ScanIndex {
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness);
 crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
-crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, direction);
+crate::heap_layout_bound::fields!(ContextDirection; policy, context, previous_context, last_change_mask);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);
