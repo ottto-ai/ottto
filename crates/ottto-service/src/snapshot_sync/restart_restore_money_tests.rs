@@ -756,6 +756,19 @@ fn other_page_observing_raw(
     prior: ScanIndex,
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    other_page_with_slots(c, scanner, source, prior, &[], before_finalize)
+}
+
+/// [`other_page_observing_raw`], binding accounts with these registered Codex
+/// slots as the daemon's sync does.
+fn other_page_with_slots(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    source: SnapshotSource,
+    prior: ScanIndex,
+    slots: &[(String, String, usize)],
+    before_finalize: impl FnOnce(&[SnapshotItem]),
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
@@ -763,7 +776,14 @@ fn other_page_observing_raw(
         prior,
         true,
     );
-    index.bind_session_accounts(source, "e2-synthetic-machine", &mut scan.snapshots, &[]);
+    index.bind_session_accounts_with_mixed(
+        source,
+        "e2-synthetic-machine",
+        &mut scan.snapshots,
+        &[],
+        (slots, &mut [0; 9]),
+        &Default::default(),
+    );
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     before_finalize(&scan.snapshots);
     finalize_scan_after_policy(source, &mut scan, &mut index);

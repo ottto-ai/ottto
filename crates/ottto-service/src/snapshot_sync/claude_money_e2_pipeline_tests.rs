@@ -267,6 +267,7 @@ impl Page {
             "e2-synthetic-machine",
             &mut self.scan.snapshots,
             &[],
+            (&[], &mut [0; 9]),
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred);
@@ -3195,6 +3196,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     #[cfg(unix)]
     mod durable_transition_pi_tests {
         include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
+    }
+    #[cfg(unix)]
+    mod codex_creator_slot_oracle_tests {
+        include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
     }
 }
 

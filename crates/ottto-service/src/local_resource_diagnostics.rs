@@ -550,8 +550,8 @@ struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_records_max_per_response: u64,
 }
-pub(crate) fn is_zero(value: &u64) -> bool {
-    *value == 0
+pub(crate) fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 struct ClaudeRecordCounters {
     half: std::sync::atomic::AtomicU64,

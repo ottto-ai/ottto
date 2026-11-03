@@ -228,6 +228,7 @@ fn census_pre_hold_bodies_born(
         PIPELINE_MACHINE_ID,
         &mut scan.snapshots,
         &[],
+        (&[], &mut [0; 9]),
         &disposition.mixed_uploads,
     );
     disposition.defer_sessions(deferred);
