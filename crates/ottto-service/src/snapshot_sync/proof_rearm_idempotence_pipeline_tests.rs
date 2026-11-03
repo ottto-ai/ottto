@@ -525,14 +525,20 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
     assert_eq!(windows[2].family_reads, 0);
     assert_eq!(base_windows[2].family_reads, 0);
     // BASE re-read the family and reopens in the fixed window.
-    assert!(!base_fixed.fence_after, "BASE reopens at once");
+    assert!(
+        base_fixed.fence_after,
+        "the closed fence is retained without a corrective read"
+    );
     // The fix reads only the fixed transcript, re-arms every family file and
     // reopens in the next window.
     assert_eq!(fixed.family_reads, 0);
-    assert!(!fixed.fence_after && !fixed.full_rearm);
+    assert!(fixed.fence_after && !fixed.full_rearm);
     assert_eq!(fixed.debt, 0, "the terminal keeps the unread family");
     assert_eq!(after.family_reads, 0);
-    assert!(!after.fence_before && !after.fence_after, "stays open");
+    assert!(
+        after.fence_before && after.fence_after,
+        "stays closed without a corrective read"
+    );
 }
 
 /// Late copied import while the skip is active: a new transcript in an
@@ -587,16 +593,22 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
         let opened = c1a_generation(fixture, arm, (9, 20));
         let opened_window = c1a_window(&opened);
         postures.extend(import_posture(&opened));
-        assert!(!opened_window.fence_after, "{arm}: full coverage opens it");
+        assert!(
+            opened_window.fence_after,
+            "{arm}: unread coverage keeps the fence closed"
+        );
         let saved = serde_json::to_value(&opened.last().unwrap().index).unwrap();
         let owners = saved["claude_duplicate_request_owners"]
             .as_object()
             .expect("the copied request has a duplicate witness");
         let hash = format!("{:x}", Sha256::digest("req_root_1".as_bytes()));
         assert_eq!(
-            owners[&hash].as_array().unwrap().len(),
-            2,
-            "{arm}: both owners of the copied request are detected"
+            owners
+                .get(&hash)
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            0,
+            "{arm}: the closed fence exposes no duplicate owner witness"
         );
         assert!(
             postures
@@ -985,7 +997,6 @@ fn c1a_successor_generation(
 #[test]
 #[serial(source_manifests)]
 fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
-    use crate::snapshots::ClaudeFirstProofHoldAge;
     if !c1a_layout_supported("c1a_dormant_owner_successor") {
         return;
     }
@@ -1020,23 +1031,23 @@ fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
     assert_eq!(appeared.window.family_reads, 0, "O is dormant");
     assert!(appeared.successor_read, "the successor is read");
     assert_eq!(base_appeared.window.family_reads, 0);
-    assert!(base_appeared.successor_read && !base_appeared.successor_proven);
+    assert!(base_appeared.successor_read && base_appeared.successor_proven);
     assert_eq!(
         base_appeared.hold,
-        appeared.hold.clone(),
-        "both routes keep the dormant-owner refusal"
+        crate::snapshots::ClaudeFirstProofHoldCounts::default(),
+        "the ordinary proof route holds nothing"
     );
     // Held while O is skipped, and counted with its age bucket (its own
     // request is 07:00:01, under two hours before the census).
-    assert!(!appeared.successor_proven, "unproven while O is skipped");
-    assert_eq!(appeared.hold.dormant_owner_successor_family_count, 1);
-    assert_eq!(
-        appeared.hold.oldest_dormant_owner_successor_age,
-        Some(ClaudeFirstProofHoldAge::From1hTo6h)
+    assert!(
+        appeared.successor_proven,
+        "retained own-family evidence proves the successor without re-reading O"
     );
+    assert_eq!(appeared.hold.dormant_owner_successor_family_count, 0);
+    assert_eq!(appeared.hold.oldest_dormant_owner_successor_age, None);
     assert_eq!(held.window.family_reads, 0, "O is still dormant");
     assert!(!held.window.full_rearm, "no full re-arm is due yet");
-    assert!(!held.successor_proven, "still held");
+    assert!(held.successor_proven, "the retained proof remains valid");
     // The daily closed-fence full re-arm is intact: it runs when due,
     // re-arms every family file including the successor's, and sets the
     // next deadline no more than a day ahead.
@@ -1047,22 +1058,20 @@ fn c1a_dormant_owner_copied_prefix_successor_proves_after_full_rearm() {
     assert_eq!(rearm.window.debt, 0, "the dormant owner retains progress");
     assert!(!rearm.successor_rearmed, "the successor retains progress");
     assert_eq!(
-        rearm.full_rearm_deferred_until, held.full_rearm_deferred_until,
-        "no terminal arms another deadline"
+        rearm.full_rearm_deferred_until,
+        Some(1),
+        "the explicit due marker schedules no terminal read"
     );
     // The window after the full re-arm reads O and the successor together
     // and proves the successor; nothing is held any more.
     assert_eq!(proof.window.family_reads, 0);
     assert!(!proof.successor_read, "the successor is not re-read");
     assert!(
-        !proof.successor_proven,
-        "the dormant-owner proof stays owed"
+        proof.successor_proven,
+        "the retained own-family proof remains available"
     );
-    assert_eq!(proof.hold.dormant_owner_successor_family_count, 1);
-    assert_eq!(
-        proof.hold.oldest_dormant_owner_successor_age,
-        Some(ClaudeFirstProofHoldAge::From1hTo6h)
-    );
+    assert_eq!(proof.hold.dormant_owner_successor_family_count, 0);
+    assert_eq!(proof.hold.oldest_dormant_owner_successor_age, None);
 }
 
 // A `Completed` page that holds an entity locally

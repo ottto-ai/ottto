@@ -10979,7 +10979,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 for &(hash, ordinal) in &cross.request_roots.0 {
                     let root = cross.roots[ordinal as usize].as_str();
                     if vanished_set.contains(root) {
-                        sidecar_roots.entry(hash).or_default().insert(root);
+                        sidecar_roots
+                            .entry(lenient_decode::repair_key(
+                                &claude_request_identity::digest_hex::encode(&hash),
+                            ))
+                            .or_default()
+                            .insert(root);
                     }
                 }
             }
@@ -10998,7 +11003,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 {
                     if vanished_set.contains(root) {
                         sidecar_roots
-                            .entry(Sha256::digest(id.as_bytes()).into())
+                            .entry(lenient_decode::repair_key(&format!(
+                                "{:x}",
+                                Sha256::digest(id.as_bytes())
+                            )))
                             .or_default()
                             .insert(root);
                     }

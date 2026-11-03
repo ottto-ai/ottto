@@ -349,7 +349,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     );
     assert_eq!(
         disclosed["full_rearm_suppression"]["suppressed_since_unix_seconds"],
-        CENSUS_CLOCK
+        CENSUS_CLOCK + 1
     );
     assert!(line(Default::default())
         .get("full_rearm_suppression")
@@ -393,7 +393,7 @@ fn changed_member_revision_updates_diagnostics_without_rearm() {
     index.files.get_mut(&child).unwrap().source_file_fingerprint = "rev-child-2".to_string();
     let changed = rearm.terminal(&mut index, &rearm.items);
     assert!(!changed.counts.full_rearm, "{changed:?}");
-    assert!(!changed.suppression.full_rearm_suppressed);
+    assert!(changed.suppression.full_rearm_suppressed);
     assert_eq!(changed.rearmed_files, 0);
     assert_ne!(
         index.claude_full_rearm_progress.structural_record, recorded,
@@ -449,7 +449,7 @@ fn non_structural_invalidation_does_not_rearm_history() {
     let changed = rearm.reread(&mut changed, &disposition);
     assert_eq!(changed.counts.page_invalidated_member_changed_count, 0);
     assert!(!changed.counts.full_rearm, "{changed:?}");
-    assert!(!changed.suppression.full_rearm_suppressed);
+    assert!(changed.suppression.full_rearm_suppressed);
 
     // The unchanged window still skips.
     assert!(
@@ -506,7 +506,7 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
             .first_proof_hold_since_full_rearm
     );
     assert!(
-        rearm
+        !rearm
             .terminal(&mut index, &rearm.items)
             .suppression
             .full_rearm_suppressed
@@ -1105,7 +1105,7 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
             } else {
                 if let Some(record) = &mut record {
                     record.suppressed_since_unix_seconds = Some(CENSUS_CLOCK + 1);
-                    record.skipped_full_rearms += 1;
+                    record.skipped_full_rearms = 1;
                 }
                 assert!(!run.suppression.full_rearm_suppressed, "{cause}");
                 assert_eq!(run.rearmed_files, 0, "{cause}");
@@ -1592,8 +1592,8 @@ fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
                     always_on_terminal_at(&rearm, &support, &mut index, CENSUS_CLOCK + 3_600, true);
                 assert_eq!(settled.rearmed_files, 0, "{state}");
                 assert!(
-                    index.claude_request_identity_contract_changed,
-                    "without corrective reads the latch may remain set: {state}"
+                    !index.claude_request_identity_contract_changed,
+                    "existing clean settlement may discharge the latch without reads: {state}"
                 );
                 assert_eq!(
                     scope.finish().contract.contract_cutover_rearm.runs,

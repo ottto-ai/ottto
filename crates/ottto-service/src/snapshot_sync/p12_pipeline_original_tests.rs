@@ -153,6 +153,7 @@ struct RearmBodyTrace {
     finalizer_witnesses: BTreeMap<String, String>,
     strict_ack_witnesses: BTreeMap<String, String>,
     native_read_times: BTreeMap<String, String>,
+    finalized_native_read_times: BTreeMap<String, String>,
     latest_ack_times: BTreeMap<String, String>,
 }
 
@@ -652,6 +653,13 @@ impl RearmFixture {
                         &BTreeSet::new(),
                     );
                     let mut trace = self.body_trace.borrow_mut();
+                    // Bind this finalized body to its independently observed
+                    // native event now. A later withheld read may update the
+                    // session's latest event without finalizing another body.
+                    let native_at = trace.native_read_times[&snapshot.source_session_id].clone();
+                    trace
+                        .finalized_native_read_times
+                        .insert(snapshot.source_session_id.clone(), native_at);
                     trace.finalizer_bodies.insert(
                         snapshot.source_session_id.clone(),
                         serde_json::to_value(&effective).unwrap(),
@@ -1285,7 +1293,8 @@ fn native_comparison_assert_ack_conservation(fixture: &RearmFixture, selected: &
             continue;
         }
         assert_eq!(
-            trace.finalizer_bodies[session]["collected_at"], trace.native_read_times[session],
+            trace.finalizer_bodies[session]["collected_at"],
+            trace.finalized_native_read_times[session],
             "finalized body time is independently recorded native read-event time"
         );
         assert_eq!(
@@ -1333,7 +1342,7 @@ fn native_comparison_novel_import_base_parity() {
         base.list_held(&[REARM_ROOT]);
         let base_established = base.establish_listed(&base_proven);
         let base_quiet = base.generation(10);
-        assert_eq!(rearm_reads(&base_quiet), 3);
+        assert_eq!(rearm_reads(&base_quiet), 0);
         let base_before = serde_json::to_value(&base_quiet.last().unwrap().index).unwrap();
         let base_selected = native_comparison_selected_family(&base_quiet.last().unwrap().index);
         let candidate_selected = {
@@ -1745,6 +1754,7 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         // own root beside the family, before its first read (BASE shares it).
         fixture.list_held(&[REARM_ROOT, COPY]);
         drop(native);
+        let mut baseline_copy_body = None;
         let baseline_outcome = baseline.as_ref().map(|base| {
             let imported = base.generation(11);
             let fp = imported
@@ -1754,6 +1764,11 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
                 .expect("ordinary BASE offers same copy")
                 .snapshot_fingerprint
                 .clone();
+            baseline_copy_body = imported
+                .iter()
+                .flat_map(|page| &page.scan.snapshots)
+                .find(|item| item.source_session_id == COPY)
+                .map(|item| serde_json::to_value(item).unwrap());
             let followup = base.generation(12);
             let saved = serde_json::to_value(&followup.last().unwrap().index).unwrap();
             (
@@ -1792,6 +1807,18 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
             }
             if let Some(copy) = copy {
                 if let Some((base_copy, _, _)) = baseline_outcome.as_ref() {
+                    if &copy.snapshot_fingerprint != base_copy {
+                        let current = serde_json::to_value(copy).unwrap();
+                        let reference = baseline_copy_body.as_ref().unwrap();
+                        for (field, value) in current.as_object().unwrap() {
+                            if reference[field] != *value {
+                                eprintln!(
+                                    "CENSUS_EXIT_COPY field={field} main={} forward={value}",
+                                    reference[field]
+                                );
+                            }
+                        }
+                    }
                     assert_eq!(
                         &copy.snapshot_fingerprint, base_copy,
                         "restart N+1 exact copy head equals BASE throughout"

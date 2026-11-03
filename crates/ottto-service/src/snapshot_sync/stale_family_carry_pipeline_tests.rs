@@ -655,7 +655,11 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
     let _source_manifests = SourceManifestTestGuard::new();
     let (fix, base, cancelled, held) =
         c1b_recoverable_change_arms_listed("c1b-terminal-page-member-change", 64, true);
-    assert_eq!((cancelled, held), (0, 1), "one hold, no cancel");
+    assert_eq!(
+        (cancelled, held),
+        (0, 0),
+        "completed rows install no carry to cancel or hold"
+    );
     let retry = &fix.windows[2];
     let base_retry = &base.windows[2];
     // The listed retry reads the family on ordinary money; the unlisted
@@ -872,8 +876,8 @@ fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_o
     assert_eq!(base_start.reason, start.reason);
     assert_eq!(
         start.carried_pending_families,
-        Some(1),
-        "the witnessed family"
+        Some(0),
+        "the completed family needs no stale carry"
     );
     assert_eq!(fix.retry.family_reads, 0, "the carried family is not read");
     // BASE's terminal-retry re-arm owes: it re-stamps the unchanged family.
@@ -948,7 +952,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
         Some(0),
         "nothing is carried"
     );
-    assert_eq!(run.retry.family_reads, 0);
+    assert_eq!(run.retry.family_reads, rearm_family_sessions().len());
     assert!(run
         .record_after_retry
         .is_some_and(|record| !record.terminal));

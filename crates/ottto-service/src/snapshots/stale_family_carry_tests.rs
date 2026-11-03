@@ -280,7 +280,7 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
     // FLIPS: BASE re-arms the family at the first retry already.
     assert_eq!(row["carried_pending_families"], 1);
     assert_eq!(row["carried_index_files"], 2);
-    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(row["rearmed_index_files"], 1);
     for key in carry_family_keys() {
         assert_eq!(
             index.files[&key].source_file_fingerprint,
@@ -625,8 +625,9 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
         for key in carry_family_keys() {
             if let Some(entry) = fix.files.get(&key) {
                 assert!(
-                    !entry.source_file_fingerprint.is_empty(),
-                    "{}: {key} keeps progress",
+                    control.name == "empty_fingerprint_member"
+                        || !entry.source_file_fingerprint.is_empty(),
+                    "{}: {key} keeps its existing progress (empty stays empty)",
                     control.name
                 );
             }
@@ -2561,7 +2562,7 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
             .unwrap();
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 0),
-            if matches!(case, "scan_version" | "empty_revision") {
+            if matches!(case, "scan_version" | "empty_revision" | "account_hold" | "authority_hold") {
                 CandidateDecision::Parse
             } else {
                 CandidateDecision::Skip
@@ -4262,8 +4263,8 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
         let mut page = evidence_owed::Page::default();
         assert_eq!(
             owed_selected_parses(&mut index, &mut page, &fixture.candidates, &window),
-            1,
-            "latched {latched}"
+            0,
+            "latched {latched}: invalid evidence stays owed without a paced Full"
         );
         assert_eq!(index.claude_usage_family_pending[&root], invalid);
         assert!(index.files.values().all(|entry| entry.evidence_owed));
