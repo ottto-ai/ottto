@@ -3,6 +3,7 @@
 //! only its slot and purges the old value, and a long first prompt goes
 //! through the store's fragments and loads back whole.
 use super::super::claude::tests::lines;
+use super::super::claude::Claude;
 use super::super::seam::tests::{route, Route};
 use super::tests::{cold_accumulator, committed, counted, loaded, read};
 use super::*;

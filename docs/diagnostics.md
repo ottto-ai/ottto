@@ -376,11 +376,11 @@ they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
-| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, or a live input not available now; the file waits and census stays red), `error`. The traversal point of a hit also carries `head_bytes` and `page_bytes` read from the database. |
+| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know (cause `future_fact`), or a live input not available now; the file waits and census stays red), `error`. The traversal point of a hit also carries `head_bytes` and `page_bytes` read from the database. |
 | `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: its point says `explicit_action`, and it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
-| `tail_bootstrap_full{no_head}` | A file's first read, apart from reconstruction. |
+| `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
 | `tail_replay_bytes{full,tail}` | Native reduction bytes. |
 | `tail_validation_bytes{sample}` | Sample and guard bytes, apart from native. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
@@ -1803,65 +1803,6 @@ and drops the split on save; re-upgrade preserves S as all-unattributed, without
 backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
-
-The shared six-hour Full pace also owns structural active-budget fallback.
-`degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
-`[event delta, source process total]` on the same alarm carrier. The source
-leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
-successful restore. `pace_evicted` has one immediate alarm owner and a per-source
-process total; post-save alarms never emit its delta again:
-at capacity the oldest stamp is evicted, the new key is enrolled and the read
-is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
-These are RAM-only counters and stamps; restart can admit one extra growth
-Full. Structural Full publishes without a replacement retained reduction.
-The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
-seven-day sanity maximum expires toward reading. Codex page/cursor deferral
-consumes no structural allowance; the stamp is enrolled at acquisition start.
-Whole-file size no longer bypasses recovery pacing. The legacy `near_cap`
-recovery annotation remains zero; transcripts have no whole-file admission cap.
-
-The replay reads at most a 1 MiB head and one title line of at most 1 MiB.
-An enforced seeded JSON builder admits at most 8,388,608 bytes of Value-owned
-requested allocations per line, prepaid on the existing active lease. Decoded
-raw-value magic keys refuse to the counted growth Full; no partial parse is
-adopted. Shared native content helpers rebuild the projection, and all recorded
-content digests must match before any fields move. `rederive_fence_mismatch`
-is an alarm: any nonzero value needs investigation. No content enters diagnostics.
-
-`rederive_head_reads` and `rederive_head_bytes` are process totals; the latter
-includes title input and partial reads. Use daily byte deltas for replay cost.
-`rederive_line_peak_bytes` records exact metered line high-water, alongside the
-active-lease high-water (which survives refunds) and stage footprint samples.
-`rederive_refused` counts failures after input by content class.
-`rederive_unsupported` names fixed boundary/mark/title refusal classes.
-`resource_full.decode` keeps decode refusals separate from certificate edits.
-Success receipts count successful restores separately from physical input;
-do not add the two byte counters together.
-
-A replay attempt is remembered by predecessor extent, not exact generation.
-A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours.
-There is no size-based extra read. Budget contention waits without a Full; after six hours its counted
-`rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
-overflow permits at most one extra head per evicted extent and alarms
-`pace_evicted`. Discovery custody survives pace eviction independently.
-
-Fence and certificate-edit retirement is bound to a verified predecessor.
-`rederive_retire.{retired,superseded,retry}` describes writer outcomes; missing
-binding authority is counted as `rederive_retire_unproven` or
-`rederive_retire_unfunded` and never grants deletion. Unlink's directory-sync
-obligation survives an absent path and is retried at saves. Pending receipts
-and unknown survivors remain protected. Retirement never creates an ACK.
-Missing retirement authority also emits `retire_exact_held{edge}`, where `edge`
-is `metadata`, `accepted_object`, `independent_edit` or `scoped_certificate`.
-The predecessor and discovery hold remain. `retire_exact_held_exit` names an
-existing exit: `revalidated_retire_exact` means a later eligible verified read
-can reacquire the witness for the post-save writer; `native_replacement_receipt`
-means a later native acquisition must commit its exact replacement receipt
-(`receipt_acquisition`/`discharge_owed`, which release restore-pending discovery).
-Conflicting retained predecessors also require their existing writer/receipt
-settlement before another witness can be installed. A failed stat/read is never
-proven absence; unlink's pending directory sync stays in key custody.
 
 ## Codex state-only identity coverage
 

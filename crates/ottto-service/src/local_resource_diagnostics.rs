@@ -317,7 +317,6 @@ const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
     CodexZstCause::ProofParentUnsupported,
     CodexZstCause::ProofChildUnsupported,
     CodexZstCause::ParentSideUnsupported,
-    CodexZstCause::DurableTailUnsupported,
     CodexZstCause::GroupProbeUnsupported,
     CodexZstCause::GroupReadUnsupported,
     CodexZstCause::ParentLedgerUnbound,

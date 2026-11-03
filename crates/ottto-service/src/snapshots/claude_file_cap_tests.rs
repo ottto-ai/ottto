@@ -327,7 +327,7 @@ fn former_caps_admit_usage_and_tail_for_all_sources() {
             &mut ScanCensus::default(),
             None,
             BACKFILL_WINDOW_DAYS,
-            &mut CandidateDiscovery::new(&mut ScanIndex::default(), None, None),
+            &mut CandidateDiscovery::new(&mut ScanIndex::default(), None),
         )
         .unwrap();
         assert_eq!(
