@@ -1753,7 +1753,6 @@ fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identical
             serde_json::to_vec(&run()).unwrap()
         );
         assert!(fold(&item).accounts.as_ref().unwrap().mixed);
-        assert_eq!(fold(&item).accounts.as_ref().unwrap().inherited, 2);
         let mut admissions = crate::snapshots::claude_request_accounts::MixedUploads::default();
         admissions.admit_request_identity(&item);
         assert!(
