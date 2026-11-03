@@ -103,7 +103,6 @@ fn page(
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -521,7 +520,10 @@ fn due_side_read_preserves_future_exact_body_cooldown_and_settlement() {
         .quarantined_snapshot_fingerprints
         .insert(fingerprint.clone(), record.clone());
     settled.activate_quarantine_witness_for_test(SnapshotSource::Codex);
-    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(fingerprint.clone(), body.into())]));
+    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(
+        fingerprint.clone(),
+        body.to_string(),
+    )]));
     assert!(settled.reason_reoffer_conflict_is_deferred(&fingerprint, body));
     assert_eq!(settled.reason_reoffer_cooldown_deferred_count(), 1);
     let mut treated = settled.clone();

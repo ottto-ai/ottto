@@ -1310,7 +1310,7 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
         crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
         crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
     );
-    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
     // One terminal pass over `index`, then contract 5 under its ownership.
     let run = |mut index: ScanIndex| {
         let mut items = parse();
@@ -3111,7 +3111,6 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
             "2026-10-29T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
         )
         .unwrap(),
     );
@@ -3165,7 +3164,6 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
             &format!("2026-10-29T12:0{minute}:00Z"),
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
         )
         .unwrap();
         finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);

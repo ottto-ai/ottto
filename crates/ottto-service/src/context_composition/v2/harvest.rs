@@ -57,10 +57,9 @@ use super::{
     REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
-use crate::snapshot_client::{
-    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
-};
+use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
+use crate::upload_policy::FootprintRules;
 use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -73,6 +72,53 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
     support_dir.join("context_composition").join(STATE_DIR)
+}
+
+/// Source removal: every file this source owns in the composition state, shared
+/// counts-only run records and opt-out markers kept. A running worker holds the
+/// lease and is finishing its run, so busy is an error the erase turn retries.
+pub(crate) fn erase_source_state(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    let dir = state_dir(support_dir);
+    let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
+    let label = agent_source_label(source);
+    let prefixes = [
+        format!("{label}-"),
+        format!("index-{label}."),
+        format!("install-{label}."),
+    ];
+    for folder in [
+        dir.join("scopes"),
+        dir.join("quarantined-scopes"),
+        dir.join("quarantine"),
+        dir,
+    ] {
+        if !folder.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&folder)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        super::checkpoint::sync_dir(&folder)?;
+    }
+    Ok(())
+}
+
+/// Forget: the whole composition state. Opt-out markers live one folder up.
+pub(crate) fn erase_all_state(support_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(state_dir(support_dir)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -553,8 +599,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             .issue_relay_token(&device, &device_secret, snapshot_source)
             .ok();
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
-        let mut labels_enabled = workspace_labels_allowed(None);
-        let mut details_enabled = false;
+        let mut fetched = None;
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
@@ -564,10 +609,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
-                    labels_enabled = workspace_labels_allowed(Some(&hint));
-                    details_enabled = super::upload::details_enabled(
-                        hint.context_composition_details_contract.as_deref(),
-                    );
+                    fetched = Some(hint);
                 }
                 Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
                     health.remove(agent_source_label(snapshot_source));
@@ -579,6 +621,10 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             health.remove(agent_source_label(snapshot_source));
             continue;
         }
+        let rules = FootprintRules::for_pass(support_dir, &destination, fetched.as_ref());
+        let details_enabled = fetched.as_ref().is_some_and(|hint| {
+            super::upload::details_enabled(hint.context_composition_details_contract.as_deref())
+        });
         let mut uploader = relay_token.map(|token| ClientUploader {
             client: &client,
             relay_token: token,
@@ -587,8 +633,9 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             uploader: uploader as &mut dyn Uploader,
             machine_id: &machine_id,
             destination: &destination,
-            labels_enabled,
+            policy: rules.policy,
             details_enabled,
+            names_withheld: rules.names_withheld,
         });
         let agent = agent_source_label(snapshot_source);
         health.set(HealthEntry::started(agent, OffsetDateTime::now_utc()));
@@ -681,7 +728,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} archived_unpinned={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} archived_unpinned={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -697,7 +744,6 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         lines.lines,
         lines.prefix_skipped,
         lines.classifier_skipped,
-        lines.too_long,
         lines.bad_lines,
         lines.dropped_calls,
         lines.dropped_items,
@@ -1250,6 +1296,13 @@ pub(super) fn run_source(
     roots: &[PathBuf],
     target: Option<UploadTarget>,
 ) -> SourceStats {
+    let _read_window = crate::local_resource_diagnostics::StageWindow::begin_jsonl(
+        match source {
+            Source::Claude => "claude_code",
+            Source::Codex => "codex",
+        },
+        "context_composition_read",
+    );
     let started = Instant::now();
     let cpu_started = thread_cpu_micros();
     let mut stats = run_source_inner(run, source, roots, target);
@@ -2614,7 +2667,7 @@ fn upload_other_scopes(
             .filter(|ack| ack.destination == target.destination);
         let due = ack.as_ref().map_or(true, |ack| {
             ack.generation < generation
-                || ack.details_enabled != target.details_enabled
+                || ack.upload_shape_changed(target)
                 || run.now.unix_timestamp() - ack.posted_at >= super::UPLOAD_STALENESS_SECS
         });
         if !due {

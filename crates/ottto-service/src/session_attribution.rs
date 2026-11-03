@@ -219,10 +219,9 @@ impl SessionAttributionContext {
         };
         let external_schedulers =
             crate::external_scheduler_attribution::ExternalSchedulerInventory::cached(home, &key);
-        // Gated with everything else in this constructor: launch-event intake
-        // rides the same `session_attribution_enabled` policy and the same
-        // backend-issued key epoch that already govern every attribution fact.
-        // Attribution off means the drop directory is not even listed.
+        // Facts from these events ride the same `session_attribution_enabled`
+        // policy and key epoch as every attribution fact. With no context the
+        // scan holds its own inventory, for its source fingerprint only.
         let launch_events = crate::launch_events::LaunchEventInventory::cached(home);
         Some(Self {
             key,
@@ -237,31 +236,8 @@ impl SessionAttributionContext {
         self.launch_events.expire_for_test();
     }
 
-    pub(crate) fn launches_prepared(&self, workers: &[String]) -> bool {
-        self.launch_events.prepared(workers)
-    }
-
-    pub(crate) fn prepare_launch_step(&self, workers: &[String]) -> Result<bool, ()> {
-        self.launch_events.prepare_step(workers)
-    }
-
-    pub(crate) fn launch_witness(&self, workers: &[String]) -> Option<String> {
-        let mut hasher = Sha256::new();
-        let mut any = false;
-        for worker in workers {
-            if let Some(event) = self.launch_events.matching(worker) {
-                any = true;
-                hasher.update(event.controller_session_ref.as_bytes());
-                hasher.update([0]);
-                hasher.update(event.worker_session_ref.as_bytes());
-                hasher.update([0]);
-                hasher.update(event.workflow_ref.as_deref().unwrap_or("").as_bytes());
-                hasher.update([0]);
-                hasher.update(event.agent_kind.as_bytes());
-                hasher.update([0]);
-            }
-        }
-        any.then(|| format!("{:x}", hasher.finalize()))
+    pub(crate) fn launch_events(&self) -> &crate::launch_events::LaunchEventInventory {
+        &self.launch_events
     }
 
     /// Direct lineage facts for a worker session an instrumented launcher

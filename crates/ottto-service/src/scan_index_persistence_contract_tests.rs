@@ -110,7 +110,7 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         ))
         .unwrap();
     let source = durable::DurableSource::ClaudeCode;
-    let allowlist: [u8; 32] = "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2"
+    let allowlist: [u8; 32] = "cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3"
         .as_bytes()
         .chunks_exact(2)
         .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())

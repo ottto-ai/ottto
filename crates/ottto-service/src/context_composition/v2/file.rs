@@ -39,7 +39,6 @@ pub(super) struct LineStats {
     pub(super) lines: u64,
     pub(super) prefix_skipped: u64,
     pub(super) bad_lines: u64,
-    pub(super) too_long: u64,
     pub(super) classifier_skipped: u64,
     pub(super) dropped_calls: u64,
     pub(super) dropped_items: u64,
@@ -284,7 +283,6 @@ pub(super) fn read_lines(
         };
         match event {
             None => break,
-            Some(LineEvent::TooLong) => out.stats.too_long += 1,
             Some(LineEvent::Line(line)) => match source {
                 Source::Claude => claude::handle_line(out, state, line),
                 Source::Codex => codex::handle_line(out, state, line),
@@ -322,14 +320,7 @@ fn head_scan(
     }
     let file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut reader = LineReader::with_buffer(
-        file,
-        0,
-        len.min(HEAD_BYTES).min(byte_limit),
-        false,
-        HEAD_LINE_GUARD,
-        8192,
-    )?;
+    let mut reader = LineReader::with_buffer(file, 0, len.min(HEAD_BYTES).min(byte_limit), 8192)?;
     let mut lines = 0usize;
     while lines < HEAD_LINES {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -340,8 +331,11 @@ fn head_scan(
         }
         match reader.next_event()? {
             None => break,
-            Some(LineEvent::TooLong) => continue,
             Some(LineEvent::Line(line)) => {
+                // Preserve the existing display-only head-probe policy.
+                if line.len() > HEAD_LINE_GUARD {
+                    continue;
+                }
                 if let Ok(text) = std::str::from_utf8(line) {
                     let text = text.trim();
                     if !text.is_empty() {

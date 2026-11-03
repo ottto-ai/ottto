@@ -56,7 +56,8 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    load_head, load_tail, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
+    retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
@@ -64,7 +65,9 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
     reason = "the acquisition cutover consumes these staged types"
 )]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
+    NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile,
+    TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
@@ -327,7 +330,9 @@ pub(super) trait Transaction {
     ) -> Result<Result<()>>;
     /// An opaque value this transaction replaced or deleted may have held a
     /// private string: require the existing physical purge at commit.
-    fn mark_erasure(&mut self) -> Result<()>;
+    /// `bookkeeping`: only freshness bookkeeping rows went, so the purge's own
+    /// epoch rows are bookkeeping too.
+    fn mark_erasure(&mut self, bookkeeping: bool) -> Result<()>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
@@ -349,7 +354,9 @@ fn integrity(hash: sha2::Sha256) -> [u8; 16] {
         .try_into()
         .expect("fixed digest width")
 }
-fn value_cap(key: &RowKey) -> u64 {
+/// Sizing target of one row's logical JSON: `row_cap` reports percent of it
+/// and alarms at 75%. Mutable rows past their 1 MiB target still commit.
+fn value_target(key: &RowKey) -> u64 {
     match key {
         RowKey::Meta(_) => CONTROL_BYTES,
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
@@ -365,6 +372,14 @@ fn value_cap(key: &RowKey) -> u64 {
         }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
+    }
+}
+/// Admission and decode bound, moved together so a row this build commits
+/// also decodes on it: the physical row limit for mutable rows, else the target.
+fn value_cap(key: &RowKey) -> u64 {
+    match value_target(key) {
+        MUTABLE_VALUE_BYTES => VALUE_BYTES,
+        target => target,
     }
 }
 fn admit_key(key: &RowKey) -> Result<()> {

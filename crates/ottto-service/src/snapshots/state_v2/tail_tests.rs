@@ -1,10 +1,12 @@
 //! The Tail store over the real route: published fixtures, real saves and the
 //! real exit guard. Claude and Codex share every path here; none is per source.
 use super::super::tail::{
-    Change, Collection, CollectionMeta, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
+    Observation, Representation, SetAsideCause, Shape, StagedFile, TailHead,
 };
 use super::tail_route::{
-    load_head, load_tail, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
+    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
 };
 use super::tests::{load_with, save_with, save_with_mode, with_session_db, Fixture, G};
 use super::*;
@@ -291,14 +293,25 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     .unwrap();
     save_with(&f.path, &mut index).unwrap();
 
-    let oversized = vec![1_u8; 4 * 1024 * 1024];
+    // Refused by key admission after the reset's purge and the first page's write.
     let bad = || StagedFile {
         change: Change::Reset,
         ..staged(
             b"new",
             &[
                 (Collection::Responses, 0, b"new"),
-                (Collection::Responses, 1, &oversized),
+                (Collection::Responses, i64::MAX as u64 + 1, b"refused"),
+            ],
+        )
+    };
+    let large = vec![1_u8; 4 * 1024 * 1024];
+    let good = || StagedFile {
+        change: Change::Reset,
+        ..staged(
+            b"new",
+            &[
+                (Collection::Responses, 0, b"new"),
+                (Collection::Responses, 1, &large),
             ],
         )
     };
@@ -323,7 +336,6 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
         assert_eq!(family.map(|family| family.hash_member_count()), Some(1));
     };
     for attempts in 1..=2 {
-        with_session_db(&index, |db| sqlite::set_save_ceiling(db, 1024 * 1024));
         advance(&mut index);
         stage_tail(&f.path, FILE, bad()).unwrap();
         stage_tail(
@@ -356,7 +368,7 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     }
 
     advance(&mut index);
-    stage_tail(&f.path, FILE, bad()).unwrap();
+    stage_tail(&f.path, FILE, good()).unwrap();
     save_with(&f.path, &mut index).unwrap();
     let index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(index.files.get(FILE).unwrap().size_bytes, 8);
@@ -364,7 +376,7 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
     shared_committed(&index);
     let (head, pages) = read(&index, FILE).unwrap();
     assert_eq!(head.unwrap().body, b"new");
-    assert_eq!(pages[&(Collection::Responses, 1)], oversized);
+    assert_eq!(pages[&(Collection::Responses, 1)], large);
     assert!(
         tail_set_aside(&index, FILE).unwrap().is_none(),
         "retry clears"
@@ -449,6 +461,71 @@ fn systemic_failure_commits_neither_file_nor_marker() {
     assert!(tail_set_aside(&index, SIBLING).unwrap().is_none());
 }
 
+/// [regress] A failed debt write never fails the save: it rolls back alone and
+/// sets the file aside, the graph and its receipts commit, and the next
+/// observation writes the debt.
+#[test]
+fn debt_write_failure_never_fails_the_save() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let receipt = "b".repeat(64);
+    index.files.insert(FILE.into(), progress_row());
+    index.accepted_snapshot_fingerprints.insert(receipt.clone());
+    // An unknown revision id refuses this file's debt write.
+    let mut refused = observation(&[b"debt"]);
+    refused.resolved.insert(99);
+    observe_tail(&f.path, SIBLING, refused).unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert!(stage_empty(&f.path));
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.generation, G + 1);
+    assert!(index.files.contains_key(FILE));
+    assert!(index.accepted_snapshot_fingerprints.contains(&receipt));
+    assert!(load_head(&index, SIBLING, REVISION).unwrap().is_none());
+    let marker = tail_set_aside(&index, SIBLING).unwrap().unwrap();
+    assert_eq!(marker.cause, SetAsideCause::Row);
+
+    observe_tail(&f.path, SIBLING, observation(&[b"debt"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(
+        revisions(&index, SIBLING),
+        BTreeMap::from([(0, b"debt".to_vec())])
+    );
+}
+
+/// [regress] F4 on implicit retirement: removing the progress row of a file
+/// whose head this build cannot read sets the key aside instead of retiring
+/// it, and the save commits.
+#[test]
+fn removal_over_an_unreadable_head_sets_it_aside_and_commits() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.files.insert(FILE.into(), progress_row());
+    save_with(&f.path, &mut index).unwrap();
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tail::future_head_for_test(&mut tx, FILE.as_bytes()).unwrap();
+        assert_eq!(
+            tx.commit(G + 1, G + 2),
+            DurableCommitOutcome::Committed(G + 2)
+        );
+    });
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.files.remove(FILE);
+    index.files.insert(SIBLING.into(), progress_row());
+    save_with(&f.path, &mut index).unwrap();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.generation, G + 3);
+    assert!(!index.files.contains_key(FILE));
+    assert!(index.files.contains_key(SIBLING));
+    let marker = tail_set_aside(&index, FILE).unwrap().unwrap();
+    assert_eq!(marker.cause, SetAsideCause::Row);
+    let error = load_head(&index, FILE, REVISION).err().unwrap();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "kept");
+}
+
 /// [format] The exit commit is G to G+1 behind ACK recovery; only that confirmed
 /// generation moves the session, so stale siblings refuse and a fresh load reads.
 #[test]
@@ -497,7 +574,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(3)
+            Some(4)
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -575,7 +652,10 @@ fn exit_commit_outcomes_reload_and_older_layouts_are_not_raised() {
     assert!(read(&reloaded, FILE).unwrap().0.is_some());
     save_with(&f.path, &mut reloaded).unwrap();
     with_session_db(&reloaded, |db| {
-        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
+        assert_eq!(
+            db.read_control::<u32>("catalogue_layout").unwrap(),
+            Some(catalogue::LAYOUT)
+        );
     });
 }
 
@@ -619,6 +699,7 @@ fn split_reads_head_keys_late_kinds_and_bootstrap_reset() {
         Collection::CodexActiveTurns,
         Collection::CodexOpenCalls,
         Collection::CodexNameCounts,
+        Collection::SessionFacts,
     ];
     let pages = kinds.map(|collection| (collection, 0, b"page".as_slice()));
     let reset = StagedFile {
@@ -678,6 +759,387 @@ fn split_reads_head_keys_late_kinds_and_bootstrap_reset() {
     .unwrap_err();
     assert_eq!(stale.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
     assert_eq!(visits, 0);
+
+    // A long fact fragments, and its owner sorts after the revisions': a retire
+    // that keeps the debt still takes the fact's fragments and only those.
+    let long = long_value();
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"head", &[(Collection::SessionFacts, 0, &long)])
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    observe_tail(&f.path, FILE, observation(&[long.as_slice()])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(frag_rows(&index), 4);
+    let (_, pages) = read(&index, FILE).unwrap();
+    assert_eq!(pages[&(Collection::SessionFacts, 0)], long);
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(rows(&index, "tail.page.session_facts", FILE).is_empty());
+    assert_eq!(frag_rows(&index), 2, "only the kept revision's fragments");
+    assert_eq!(revisions(&index, FILE)[&0], long);
+}
+
+fn revisions(index: &ScanIndex, key: &str) -> BTreeMap<u64, Vec<u8>> {
+    let head = load_head(index, key, REVISION).unwrap().unwrap();
+    let mut found = BTreeMap::new();
+    load_revisions(index, key, &head, |id, value| {
+        found.insert(id, value);
+        Ok(())
+    })
+    .unwrap();
+    found
+}
+fn observation(added: &[&[u8]]) -> Observation {
+    Observation {
+        summary: DebtSummary {
+            earliest_unacked_change_at: Some(7_000),
+            lower_bound: true,
+            reason_bits: 0b101,
+            disposition: None,
+        },
+        added: added.iter().map(|value| value.to_vec()).collect(),
+        ..Default::default()
+    }
+}
+
+/// [format] A layout-4 store: a Tail-only exit commit, debt included, never
+/// stamps layout 5; the next full save upgrades it with the new roots. The first
+/// commit fences capability-3 writers out.
+#[test]
+fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    let new_roots: Vec<RowKey> = catalogue::LAYOUTS
+        .iter()
+        .filter(|(_, _, layout)| *layout == 5)
+        .map(|(kind, _, _)| mapper::key(kind, "", 0).unwrap())
+        .collect();
+    assert_eq!(new_roots.len(), 2);
+    with_session_db(&index, |db| {
+        for key in &new_roots {
+            sqlite::delete_row_for_test(db, key);
+        }
+        db.control("catalogue_layout", &4_u32).unwrap();
+    });
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(index.claude_folder_login_ledger.is_empty());
+    assert_eq!(index.tail_discovery, Default::default());
+    stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
+    observe_tail(&f.path, FILE, observation(&[b"debt"])).unwrap();
+    BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
+    let mut reloaded = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&reloaded, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
+        // Capability 3 refuses any store whose minimum is above it.
+        assert_eq!(
+            db.read_control::<u64>("minimum_writer_capability").unwrap(),
+            Some(4)
+        );
+    });
+    assert_eq!(revisions(&reloaded, FILE).len(), 1);
+    save_with(&f.path, &mut reloaded).unwrap();
+    with_session_db(&reloaded, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(5));
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for key in &new_roots {
+            assert!(tx.get(key).unwrap().is_some(), "{key:?}");
+        }
+    });
+}
+
+/// [behaviour] Debt outlives its reduction: observations never clear the marker;
+/// reset merges committed debt; retire keeps it under a metadata-only head that
+/// never loads pages; disposal leaves nothing. A future envelope holds.
+#[test]
+fn debt_survives_reset_and_retire_until_disposed() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    stage_tail(
+        &f.path,
+        FILE,
+        staged(b"head", &[(Collection::Responses, 0, b"page")]),
+    )
+    .unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    set_aside_tail(&f.path, FILE, SetAsideCause::Encode).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+
+    observe_tail(&f.path, FILE, observation(&[b"r0", b"r1"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(
+        tail_set_aside(&index, FILE).unwrap().is_some(),
+        "debt keeps it"
+    );
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(!head.metadata_only);
+    assert_eq!(head.common.debt, observation(&[]).summary);
+    assert_eq!(head.common.next_revision_id, 2);
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec()), (1, b"r1".to_vec())])
+    );
+
+    let reset = StagedFile {
+        change: Change::Reset,
+        ..staged(b"fresh", &[(Collection::Requests, 0, b"fresh")])
+    };
+    stage_tail(&f.path, FILE, reset).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "replaced");
+    let (head, pages) = read(&index, FILE).unwrap();
+    assert_eq!(head.unwrap().common.debt, observation(&[]).summary);
+    assert_eq!(pages.len(), 1);
+    assert_eq!(revisions(&index, FILE).len(), 2, "reset kept the debt");
+
+    set_aside_tail(&f.path, FILE, SetAsideCause::Encode).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    retire_tail(&f.path, [FILE.to_owned()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(
+        tail_set_aside(&index, FILE).unwrap().is_some(),
+        "retiring with debt neither replaces nor disposes"
+    );
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only && head.body.is_empty());
+    assert_eq!(head.common.next_revision_id, 2);
+    let mut visits = 0;
+    let refused = load_tail(&index, FILE, &head, |_, _, _| {
+        visits += 1;
+        Ok(())
+    });
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "state_v2_tail_metadata_only"
+    );
+    assert_eq!(visits, 0);
+    assert!(rows(&index, "tail.page.requests", FILE).is_empty());
+    assert!(tail_head_keys(&index).unwrap().contains(FILE));
+
+    let mut settle = observation(&[b"r2"]);
+    settle.resolved.insert(0);
+    settle.replaced.insert(1, b"r1x".to_vec());
+    observe_tail(&f.path, FILE, settle).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(1, b"r1x".to_vec()), (2, b"r2".to_vec())])
+    );
+    assert_eq!(
+        erasure_marks(&index),
+        1,
+        "settled and overwritten debt purge"
+    );
+
+    dispose_tail(&f.path, FILE, Disposition::Settled).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, FILE), 0, "no reduction, no debt");
+    assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "disposed");
+
+    // An unknown revision id fails this file alone: set aside, nothing written.
+    let mut unknown = observation(&[]);
+    unknown.resolved.insert(99);
+    observe_tail(&f.path, FILE, unknown).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert!(
+        tail_set_aside(&index, FILE).unwrap().is_some(),
+        "unknown id"
+    );
+    assert!(load_head(&index, FILE, REVISION).unwrap().is_none());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let error = tail::retire_future_head_for_test(&mut tx, FILE.as_bytes()).unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+    });
+
+    // A newer envelope, code or flag holds; never a default.
+    let common = Common {
+        representation: Representation::Archive,
+        ..Default::default()
+    };
+    let encoded = tail::encode_head(REVISION, &Default::default(), &common, None).unwrap();
+    assert!(tail::decode_head(&encoded).is_ok());
+    for (at, value) in [(5, 2), (6, 4), (24, 3), (30, 4)] {
+        let mut newer = encoded.clone();
+        newer[at] = value;
+        let error = tail::decode_head(&newer).err().unwrap();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "{at}");
+    }
+}
+
+/// [behaviour] Only a Tail head holds a reduction: neither side of the codec
+/// accepts another, and an observation leaving Tail drops reduction and pages.
+#[test]
+fn reduction_requires_tail_representation() {
+    let archive = Common {
+        representation: Representation::Archive,
+        ..Default::default()
+    };
+    let refused = tail::encode_head(REVISION, &Default::default(), &archive, Some(b"body"));
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "state_v2_tail_value_shape"
+    );
+    let mut bytes = tail::encode_head(
+        REVISION,
+        &Default::default(),
+        &Common::default(),
+        Some(b"body"),
+    )
+    .unwrap();
+    assert!(tail::decode_head(&bytes).is_ok());
+    bytes[6] = Representation::Archive as u8;
+    let error = tail::decode_head(&bytes).err().unwrap();
+    assert_eq!(error.to_string(), "state_v2_tail_value_shape");
+
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let page = long_value();
+    for key in [FILE, SIBLING] {
+        stage_tail(
+            &f.path,
+            key,
+            staged(b"head", &[(Collection::Requests, 0, page.as_slice())]),
+        )
+        .unwrap();
+    }
+    save_with(&f.path, &mut index).unwrap();
+
+    let leaves_tail = |added: &[&[u8]]| Observation {
+        representation: Representation::Archive,
+        ..observation(added)
+    };
+    observe_tail(&f.path, FILE, leaves_tail(&[b"r0"])).unwrap();
+    observe_tail(&f.path, SIBLING, leaves_tail(&[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only && head.body.is_empty());
+    assert_eq!(head.common.representation, Representation::Archive);
+    assert!(rows(&index, "tail.page.requests", FILE).is_empty());
+    assert_eq!(frag_rows(&index), 0);
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec())])
+    );
+    assert_eq!(all_tail_rows(&index, SIBLING), 0, "no reduction, no debt");
+}
+
+/// [format] A file with no reduction keeps its header facts in the head, and the
+/// stored stamp still proves the same object and content. Envelope 1 written
+/// before the member existed is the same bytes, and decodes to none.
+#[test]
+fn inventory_facts_need_no_reduction_and_old_envelope_has_none() {
+    let mut old = vec![0, 0, 0, REVISION as u8, 0, 1, Representation::Tail as u8];
+    old.extend_from_slice(&[0; 24]);
+    assert_eq!(
+        tail::encode_head(REVISION, &Default::default(), &Common::default(), None).unwrap(),
+        old
+    );
+    assert_eq!(tail::decode_head(&old).unwrap().common.inventory, None);
+
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let file = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+    let facts = InventoryFacts {
+        owner: "owner-id".into(),
+        created_unix_ms: Some(-5),
+        stamp: crate::snapshots::sampled_scan::codex_cursor::OpenStamp::of(&file).content_stamp(),
+        read_bytes: 412,
+    };
+    let with_facts = |added: &[&[u8]]| Observation {
+        inventory: Some(facts.clone()),
+        ..observation(added)
+    };
+    observe_tail(&f.path, FILE, with_facts(&[])).unwrap();
+    observe_tail(&f.path, SIBLING, with_facts(&[b"r0"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only && head.body.is_empty());
+    let stored = head.common.inventory.unwrap();
+    assert_eq!(stored, facts);
+    let now = crate::transcript_acquisition::FileStamp::capture(file).unwrap();
+    assert!(stored.stamp.matches_acquisition(&now));
+
+    // A reduction stage keeps them; only the source's bytes change.
+    stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(head.body, b"head");
+    assert_eq!(head.common.inventory.as_ref(), Some(&facts));
+
+    // Retiring keeps them under kept debt; absence and plain retirement end them.
+    retire_tail(&f.path, [FILE.to_string(), SIBLING.to_string()]).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, FILE), 0, "no debt");
+    let head = load_head(&index, SIBLING, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(head.common.inventory.as_ref(), Some(&facts));
+    dispose_tail(&f.path, SIBLING, Disposition::Absence).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(all_tail_rows(&index, SIBLING), 0, "absent");
+}
+
+/// [behaviour] Scope erasure is not a reset: every row and the marker go, and
+/// files that held unaccepted debt add to a count that survives the erasure.
+#[test]
+fn erasure_deletes_debt_and_counts_unaccepted_files() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.tail_discovery.deleted_unaccepted_oldest_at, None);
+    stage_tail(
+        &f.path,
+        FILE,
+        staged(b"head", &[(Collection::Responses, 0, b"page")]),
+    )
+    .unwrap();
+    observe_tail(&f.path, FILE, observation(&[b"debt"])).unwrap();
+    stage_tail(&f.path, SIBLING, staged(b"sibling", &[])).unwrap();
+    set_aside_tail(
+        &f.path,
+        "/synthetic/tail/staged.jsonl",
+        SetAsideCause::Encode,
+    )
+    .unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let mut pending = observation(&[b"new"]);
+    pending.summary.earliest_unacked_change_at = Some(3_000);
+    observe_tail(&f.path, "/synthetic/tail/staged.jsonl", pending).unwrap();
+
+    erase_tail(&f.path, &mut index, [FILE.to_owned()]).unwrap();
+    assert_eq!(index.tail_discovery.deleted_unaccepted_files, 1);
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(7_000)
+    );
+
+    let keys = [FILE, SIBLING, "/synthetic/tail/staged.jsonl"].map(str::to_owned);
+    erase_tail(&f.path, &mut index, keys.clone()).unwrap();
+    erase_tail(&f.path, &mut index, keys.clone()).unwrap();
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_files, 2,
+        "once each"
+    );
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(3_000)
+    );
+    save_with(&f.path, &mut index).unwrap();
+    for key in &keys {
+        assert_eq!(all_tail_rows(&index, key), 0, "{key}");
+        assert!(tail_set_aside(&index, key).unwrap().is_none());
+    }
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.tail_discovery.deleted_unaccepted_files, 2);
+    assert_eq!(
+        index.tail_discovery.deleted_unaccepted_oldest_at,
+        Some(3_000)
+    );
 }
 
 /// A published store whose head, page and live WAL hold these literals in the

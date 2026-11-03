@@ -97,8 +97,6 @@ struct IdentityPipelineCycle {
     prepared_before_body: bool,
     body: Vec<u8>,
     snapshots: Vec<SnapshotItem>,
-    /// The scan index before finish's evidence stage.
-    scanned_index: ScanIndex,
     /// The same cycle on the ordinary path, without early prepared evidence.
     dark_oracle: Vec<u8>,
 }
@@ -159,7 +157,6 @@ fn identity_pipeline_cycle(
             preparation.backfill_pending,
         ),
         MAX_BACKFILL_FILES_PER_SOURCE,
-        preparation.upload_policy.session_artifacts_enabled,
         Some(&support),
         &[],
         false,
@@ -175,7 +172,6 @@ fn identity_pipeline_cycle(
     };
     apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
     let (preparation, mut index, mut scan) = collect_native_preparation_with_rotation(preparation);
-    let scanned_index = index.clone();
     let prepared_before_body = preparation.prepared_claude_evidence.is_some();
     apply_claude_local_evidence_to_scan_with_prepared(
         &support,
@@ -187,7 +183,6 @@ fn identity_pipeline_cycle(
         prepared_before_body,
         body: serde_json::to_vec(&scan.snapshots).expect("serialize body"),
         snapshots: scan.snapshots,
-        scanned_index,
         dark_oracle: serde_json::to_vec(&oracle_scan.snapshots).expect("serialize oracle"),
     })
 }
@@ -288,10 +283,6 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
         assert!(
             item.claude_org_markers.is_some(),
             "{name}: markers captured"
-        );
-        assert!(
-            identity::desktop_census(&cycle.scanned_index).is_some(),
-            "{name}: census witness"
         );
         // Even a settled pass withdraws marker-only tags. Nothing is refused
         // and usage is unchanged.

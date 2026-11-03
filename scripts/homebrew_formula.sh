@@ -242,7 +242,7 @@ class Ottto < Formula
       "#{Dir.home}/Library/Application Support/Ottto/ottto-service.sock",
     ]
     keep_alive true
-    environment_variables PATH: std_service_path_env
+    environment_variables PATH: std_service_path_env, MallocLargeCache: "0"
     log_path "#{Dir.home}/Library/Logs/Ottto/ottto-service.log"
     error_log_path "#{Dir.home}/Library/Logs/Ottto/ottto-service.error.log"
   end

@@ -6,6 +6,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod jsonl;
+
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
 /// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
 /// test-only `observe` seam.
@@ -164,6 +166,7 @@ macro_rules! codex_cursor_events {
 pub(crate) use codex_cursor_events;
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod change_reason;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
@@ -317,7 +320,7 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded = 16,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 17,
-    // Optional plain header occupancy refused an otherwise fundable decoder.
+    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
     #[serde(rename = "decoder_refused_header_occupancy")]
     DecoderRefusedHeaderOccupancy = 18,
     #[serde(rename = "CompressedFamilyUnproven")]
@@ -335,22 +338,94 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
-    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+/// Every counted cause; the length is checked against `__Count`.
+const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+    CodexZstCause::ReplayNotAuthorized,
+    CodexZstCause::ProofParentUnsupported,
+    CodexZstCause::ProofChildUnsupported,
+    CodexZstCause::ParentSideUnsupported,
+    CodexZstCause::DurableTailUnsupported,
+    CodexZstCause::GroupProbeUnsupported,
+    CodexZstCause::GroupReadUnsupported,
+    CodexZstCause::ParentLedgerUnbound,
+    CodexZstCause::PhysicalOffsetUnsupported,
+    CodexZstCause::AdmissionRefused,
+    CodexZstCause::DecodeFailed,
+    CodexZstCause::OwnerUnproven,
+    CodexZstCause::OutputHeld,
+    CodexZstCause::DecodedOverLimit,
+    CodexZstCause::HeaderInvalid,
+    CodexZstCause::CorrectionUnapplied,
+    CodexZstCause::HeaderUnfunded,
+    CodexZstCause::CompatibilityUnfunded,
+    CodexZstCause::DecoderRefusedHeaderOccupancy,
+    CodexZstCause::FamilyUnproven,
+    CodexZstCause::ArchiveEquivalenceUnproven,
+];
+struct CodexZstRefused {
+    counters: [AtomicU64; CODEX_ZST_CAUSES],
+    /// The counters' sum at the last flush.
+    flushed: AtomicU64,
+}
+impl CodexZstRefused {
+    const fn new() -> Self {
+        Self {
+            counters: [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES],
+            flushed: AtomicU64::new(0),
+        }
+    }
+}
+#[cfg(not(test))]
+static CODEX_ZST_REFUSED: CodexZstRefused = CodexZstRefused::new();
+#[cfg(test)]
+thread_local! {
+    static CODEX_ZST_REFUSED: CodexZstRefused = const { CodexZstRefused::new() };
+}
+fn with_codex_zst_refused<T>(f: impl FnOnce(&CodexZstRefused) -> T) -> T {
+    #[cfg(test)]
+    {
+        CODEX_ZST_REFUSED.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CODEX_ZST_REFUSED)
+    }
+}
 
+/// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
-    let counter = &CODEX_ZST_REFUSED[cause as usize];
-    let previous = counter
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-        .unwrap_or_else(|n| n);
-    traversal_point(
-        "codex_zst_refused",
-        "codex",
-        &BTreeMap::from([(
+    with_codex_zst_refused(|refused| {
+        let _ = refused.counters[cause as usize]
+            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
+/// One sparse line of the non-zero cumulative counters, only when their sum
+/// moved since the last flush.
+pub(crate) fn codex_zst_refused_flush() {
+    let counts = with_codex_zst_refused(|refused| {
+        let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
+            .into_iter()
+            .map(|cause| (cause, refused.counters[cause as usize].load(Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        let total = counts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        (refused.flushed.swap(total, Relaxed) != total).then_some(counts)
+    });
+    if let Some(counts) = counts {
+        traversal_point(
             "codex_zst_refused",
-            BTreeMap::from([(cause, previous.saturating_add(1))]),
-        )]),
-    );
+            "codex",
+            &BTreeMap::from([("codex_zst_refused", counts)]),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_refused_count(cause: CodexZstCause) -> u64 {
+    with_codex_zst_refused(|refused| refused.counters[cause as usize].load(Relaxed))
 }
 
 /// Counts per observed usage line, before response deduplication and timestamp
@@ -367,6 +442,23 @@ pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
 /// not; rereads count again. Only the lifecycle registry atomics are updated.
 pub(crate) fn codex_non_default_thread_tier() {
     cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
+/// Counts per observed Claude usage line with an `iterations[]` entry naming
+/// another model than the line; rereads count again. Only the lifecycle
+/// registry atomics are updated.
+pub(crate) fn claude_usage_iteration_model_differs() {
+    cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
+}
+
+/// Counts per numeric key the Claude usage parser does not read, per observed
+/// usage line; rereads count again. Only the lifecycle registry atomics are
+/// updated.
+pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
 }
 
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
@@ -403,6 +495,46 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
         "codex",
         &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
     );
+}
+
+/// Sidecar read attempts and actual input bytes since the last Claude page.
+/// Repeated reads count again; missing/refused files add nothing. No identities.
+/// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
+#[derive(Default, Serialize)]
+struct ClaudeSidecarReparse {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_sidecar_reparse_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_sidecar_reparse_bytes: u64,
+}
+#[cfg(not(test))]
+static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_SIDECAR_REPARSE.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_SIDECAR_REPARSE)
+    }
+}
+pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    with_claude_sidecar_reparse(|counts| {
+        for (counter, delta) in counts.iter().zip([files, bytes]) {
+            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+        }
+    });
+}
+fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
+    with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
+        claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
+        claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+    })
 }
 
 /// Nonzero-only counters on the existing native_collection_page line. They
@@ -560,15 +692,14 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
-    Size,
-    /// The subset of size skips whose key holds a withheld-account revision.
-    WithheldOversized,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
-const UNSELECTED_REASONS: usize = UNACKED_LOST_START + 4;
+const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
+const UNSELECTED_REASONS: usize = change_reason::END;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -578,9 +709,13 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
         const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
+fn source_slot(source: &str) -> Option<usize> {
+    ["claude_code", "codex", "pi"]
+        .iter()
+        .position(|s| *s == source)
+}
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
-    let sources = ["claude_code", "codex", "pi"];
-    let Some(slot) = sources.iter().position(|s| *s == source) else {
+    let Some(slot) = source_slot(source) else {
         return 0;
     };
     #[cfg(test)]
@@ -612,6 +747,29 @@ pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u
         });
     }
 }
+/// One page's selection, counted after it was made; never a gate input.
+#[derive(Clone, Copy)]
+pub(crate) enum PageSelection {
+    /// Queued paths the page took.
+    Selected,
+    /// The selected paths whose index entry is re-armed (owed).
+    OwedSelected,
+    /// Selected paths that ended as a Skip (unchanged or confirmed empty).
+    Skipped,
+    /// Claude roots put back at the queue front to wait for their family.
+    DeferredRoots,
+}
+pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
+    source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+const PAGE_SELECTION: [(&str, usize); 4] = [
+    ("selected", PAGE_SELECTION_START),
+    ("owed_selected", PAGE_SELECTION_START + 1),
+    ("skipped", PAGE_SELECTION_START + 2),
+    ("deferred_roots", PAGE_SELECTION_START + 3),
+];
 const UNACKED_LOST: [(&str, usize); 4] = [
     ("files", UNACKED_LOST_START),
     ("requests", UNACKED_LOST_START + 1),
@@ -882,8 +1040,23 @@ fn process_sample() -> Option<ProcessSample> {
     None
 }
 
+/// Current retained refusal exposure. No history, buckets, timer or retention.
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct RefusalExposure {
+    pub(crate) owed_entities: usize,
+    pub(crate) held_terminal_entities: usize,
+    pub(crate) known_requests: u64,
+    pub(crate) known_tokens: u64,
+    pub(crate) unknown_request_entities: usize,
+    pub(crate) unknown_token_entities: usize,
+    pub(crate) unknown_age_entities: usize,
+    pub(crate) oldest_age_seconds: u64,
+}
+crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_entities, known_requests, known_tokens, unknown_request_entities, unknown_token_entities, unknown_age_entities, oldest_age_seconds);
+
 #[derive(Debug)]
 pub(crate) struct Probe {
+    pub(crate) refusal_exposure: Option<RefusalExposure>,
     withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
@@ -942,6 +1115,7 @@ impl Probe {
     }
     pub(crate) fn start() -> Self {
         Self {
+            refusal_exposure: None,
             withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
@@ -958,11 +1132,7 @@ impl Probe {
         observation
     }
     fn observation(&self) -> Observation {
-        Observation::between(
-            self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            self.process,
-            process_sample(),
-        )
+        Observation::between(wall_us(self.started), self.process, process_sample())
     }
     #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
@@ -976,6 +1146,8 @@ impl Probe {
     ) {
         #[derive(Serialize)]
         struct Counts {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             collection: CollectionCounts,
             #[serde(flatten)]
@@ -984,6 +1156,8 @@ impl Probe {
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
+            #[serde(flatten)]
+            sidecar_reparse: Option<ClaudeSidecarReparse>,
             #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
@@ -1012,8 +1186,11 @@ impl Probe {
             withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            page_selection: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
+        let jsonl = jsonl::take(source);
         let counts = Counts {
             line_delivery: self
                 .line_delivery
@@ -1046,11 +1223,13 @@ impl Probe {
                 })
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
+            page_selection: drain(source, &PAGE_SELECTION),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
                 self.page_events.with_current().retained_cache_only()
             },
+            refusal_exposure: self.refusal_exposure,
             collection: counts,
             pending,
             identity: if claude {
@@ -1058,6 +1237,7 @@ impl Probe {
             } else {
                 Default::default()
             },
+            sidecar_reparse: claude.then(take_claude_sidecar_reparse),
             caps: if claude {
                 take_claude_record_caps()
             } else {
@@ -1077,6 +1257,23 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
+        // Own record, so the page line stays under its size bound (§13).
+        if let Some(change_reasons) = change_reason::drain(source) {
+            #[derive(Serialize)]
+            struct Counts {
+                change_reasons: change_reason::Page,
+            }
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_change_reasons",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: Counts { change_reasons },
+            });
+        }
+        jsonl.emit_page_lines(source);
+        jsonl.alarm_on_consecutive_failures(source);
     }
 }
 
@@ -1189,13 +1386,32 @@ pub(crate) fn source_prepare<T>(
 
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
+#[cfg(test)]
 pub(crate) fn source_finish<T>(
     source: &str,
     v2_active: bool,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let probe = Probe::start();
-    let footprint = footprint::Stage::begin();
+    source_finish_inner(source, v2_active, None, inner)
+}
+pub(crate) fn source_finish_with_refusals<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: RefusalExposure,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    source_finish_inner(source, v2_active, Some(exposure), inner)
+}
+fn source_finish_inner<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: Option<RefusalExposure>,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut window = StageWindow::begin(source, "source_finish");
+    if let Some(exposure) = exposure {
+        window.set_refusal_exposure(exposure);
+    }
     let v2_active = source == "claude_code" && v2_active;
     let v2_window = v2_active
         .then(crate::snapshots::state_v2_finish_window)
@@ -1205,14 +1421,7 @@ pub(crate) fn source_finish<T>(
     if v2_active {
         crate::snapshots::state_v2_post_pass_observed();
     }
-    emit(&Record {
-        schema_version: SCHEMA_VERSION,
-        process_id: std::process::id(),
-        stage: "source_finish",
-        source: Source::from_slug(source),
-        observation: probe.stage_observation(footprint.as_ref()),
-        counts: EmptyCounts {},
-    });
+    drop(window);
     result
 }
 /// Named footprint window inside a source stage. One record with empty counts
@@ -1222,15 +1431,40 @@ pub(crate) struct StageWindow {
     source: Source,
     probe: Probe,
     footprint: Option<footprint::Stage>,
+    jsonl: Option<jsonl::Scope>,
+    first_read_bytes: Option<u64>,
 }
 impl StageWindow {
+    pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
+        self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
+    }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         Self {
             stage,
             source: Source::from_slug(source),
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
+            jsonl: None,
+            first_read_bytes: None,
         }
+    }
+    /// A window that also scopes and reports JSONL line scalars for `source`.
+    pub(crate) fn begin_jsonl(source: &str, stage: &'static str) -> Self {
+        let mut window = Self::begin(source, stage);
+        window.jsonl = Some(jsonl::Scope::begin(source));
+        window
+    }
+    pub(crate) fn first_read(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| {
+            let mut window = Self::begin(source.api_slug(), "first_read");
+            window.first_read_bytes = Some(bytes);
+            window
+        })
     }
 }
 impl Drop for StageWindow {
@@ -1238,15 +1472,81 @@ impl Drop for StageWindow {
         if std::thread::panicking() {
             return;
         }
+        let observation = self.probe.stage_observation(self.footprint.as_ref());
+        let first_read = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
+            serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
+                "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
+        });
+        #[derive(Serialize)]
+        struct Counts {
+            // Zero exposure is stored as None and stays off the record.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
+            #[serde(flatten)]
+            jsonl: Option<jsonl::Counts>,
+            #[serde(flatten)]
+            first_read: serde_json::Value,
+        }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
-            counts: EmptyCounts {},
+            observation,
+            counts: Counts {
+                refusal_exposure: self.probe.refusal_exposure,
+                jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
+                first_read,
+            },
         });
     }
+}
+/// Process high-water file sizes, without paths or read admission decisions.
+pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LARGEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let slot = match source {
+        crate::snapshots::SnapshotSource::ClaudeCode => 0,
+        crate::snapshots::SnapshotSource::Codex => 1,
+        crate::snapshots::SnapshotSource::Pi => 2,
+    };
+    let previous = LARGEST[slot].fetch_max(bytes, Ordering::Relaxed);
+    if bytes > previous {
+        traversal_point(
+            "file_size",
+            source.api_slug(),
+            &serde_json::json!({"largest_file_bytes": bytes, "file_over_1gib": bytes > 1024 * 1024 * 1024}),
+        );
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
+    }
+}
+
+fn wall_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn emit_stage(
+    stage: &'static str,
+    source: Source,
+    refusal_exposure: Option<RefusalExposure>,
+    observation: impl FnOnce() -> Observation,
+) {
+    if std::thread::panicking() {
+        return;
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source,
+        observation: observation(),
+        counts: StageCounts { refusal_exposure },
+    });
 }
 /// Named window summed over repeated steps inside a source stage: one record
 /// with summed wall time and process CPU, and no footprint fields. Empty
@@ -1271,11 +1571,7 @@ impl StageSum {
         let started = Instant::now();
         let before = process_sample();
         let result = step();
-        let delta = Observation::between(
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-            before,
-            process_sample(),
-        );
+        let delta = Observation::between(wall_us(started), before, process_sample());
         self.wall_us = self.wall_us.saturating_add(delta.wall_elapsed_us);
         self.cpu_us = self
             .cpu_us
@@ -1286,19 +1582,11 @@ impl StageSum {
 }
 impl Drop for StageSum {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-        let mut observation = Observation::point();
-        observation.wall_elapsed_us = self.wall_us;
-        observation.shared_process_cpu_delta_us = self.cpu_us;
-        emit(&Record {
-            schema_version: SCHEMA_VERSION,
-            process_id: std::process::id(),
-            stage: self.stage,
-            source: self.source,
-            observation,
-            counts: EmptyCounts {},
+        emit_stage(self.stage, self.source, None, || {
+            let mut observation = Observation::point();
+            observation.wall_elapsed_us = self.wall_us;
+            observation.shared_process_cpu_delta_us = self.cpu_us;
+            observation
         });
     }
 }
@@ -1333,7 +1621,10 @@ pub(crate) fn codex_census_fence(
 }
 
 #[derive(Serialize)]
-struct EmptyCounts {}
+struct StageCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_exposure: Option<RefusalExposure>,
+}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -1597,6 +1888,20 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Content-free allocator launch configuration, called once before serving.
+pub fn log_startup_resources() {
+    let value = std::env::var_os("MallocLargeCache");
+    traversal_point(
+        "startup",
+        "unknown",
+        &serde_json::json!({
+            "malloc_large_cache_set": value.is_some(),
+            "malloc_large_cache": value.as_deref().and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok()),
+        }),
+    );
+}
+
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
@@ -2109,6 +2414,23 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    /// [behaviour] Startup settings use the versioned content-free diagnostic carrier.
+    #[test]
+    fn startup_resources_use_the_shared_carrier() {
+        let (_, rows) = super::capture(super::log_startup_resources);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], std::process::id());
+        assert_eq!(row["stage"], "startup");
+        assert_eq!(row["source"], "unknown");
+        let counts = row["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert!(counts["malloc_large_cache_set"].is_boolean());
+        let value = &counts["malloc_large_cache"];
+        assert!(value.is_null() || value.is_u64());
+    }
+
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
@@ -2154,6 +2476,41 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn sidecar_reparse_counts_are_sparse_exact_and_drained_per_page() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        // Drain earlier fixture activity on this test thread.
+        take_claude_sidecar_reparse();
+        let (_, rows) = capture(|| {
+            Probe::start().collection("claude_code", collection());
+            claude_sidecar_reparse(2, 123);
+            Probe::start().collection("claude_code", collection());
+            Probe::start().collection("claude_code", collection());
+        });
+        for row in [&rows[0], &rows[2]] {
+            for key in [
+                "claude_sidecar_reparse_files",
+                "claude_sidecar_reparse_bytes",
+            ] {
+                assert!(row["counts"].get(key).is_none());
+            }
+        }
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_files"], 2);
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_bytes"], 123);
+        let maximum = serde_json::to_value(ClaudeSidecarReparse {
+            claude_sidecar_reparse_files: u64::MAX,
+            claude_sidecar_reparse_bytes: u64::MAX,
+        })
+        .unwrap();
+        assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
+        assert_eq!(maximum["claude_sidecar_reparse_bytes"], u64::MAX);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2946,8 +3303,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields and the Codex tier field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2421);
+        // The four Pi fields, the Codex tier field and the two Claude usage
+        // fields stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2523);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
@@ -3425,15 +3783,20 @@ pub(crate) fn scan_index_repair_required(
 /// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
 /// can contribute. Peaks are 50-ms observations, not hard memory bounds.
 pub(crate) struct StateV2Probe {
+    started: Instant,
     footprint: Option<footprint::Stage>,
     cpu: Option<ProcessSample>,
 }
 impl StateV2Probe {
     pub(crate) fn begin() -> Self {
         Self {
+            started: Instant::now(),
             footprint: footprint::Stage::begin(),
             cpu: process_sample(),
         }
+    }
+    pub(crate) fn wall_us(&self) -> u64 {
+        wall_us(self.started)
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         self.footprint

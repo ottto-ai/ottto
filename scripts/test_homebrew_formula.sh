@@ -144,6 +144,8 @@ assert_contains "$formula" 'resource "ottto-service" do'
 assert_contains "$formula" 'url "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-service-macos-arm64.zip"'
 assert_contains "$formula" "sha256 \"$DAEMON_SHA\""
 assert_contains "$formula" 'bin.install daemons.fetch(0) => "ottto-service"'
+# [behaviour] Homebrew supplies the allocator setting before starting the daemon.
+assert_contains "$formula" 'environment_variables PATH: std_service_path_env, MallocLargeCache: "0"'
 assert_contains "$formula" 'name macos: "net.ottto.service"'
 assert_contains "$formula" 'brew services start ottto'
 assert_contains "$formula" 'brew update && brew upgrade ottto'

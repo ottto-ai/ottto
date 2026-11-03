@@ -1,4 +1,3 @@
-use crate::claude_status_coverage::Observation as CoverageObservation;
 use crate::locked_state_dir::open_private_lock_file;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
@@ -271,6 +270,38 @@ struct CodexHomeSlot {
     ownership: CodexAccountSlotOwnershipV1,
     home: PathBuf,
     registered_binding: Option<(String, String)>,
+}
+
+impl CodexHomeSlot {
+    /// A home seen only through a running Codex process: read like an account
+    /// home, but not registered.
+    fn process_home(home: PathBuf) -> Self {
+        Self {
+            slot_id: "process_home".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home,
+            registered_binding: None,
+        }
+    }
+
+    /// A registered Ottto account slot's login may be refreshed by the limits
+    /// probe; the default home and a home seen only through a running Codex
+    /// process (no registered binding) are a person's own logins.
+    fn login_refresh(&self) -> CodexLoginRefresh {
+        match (self.ownership, &self.registered_binding) {
+            (CodexAccountSlotOwnershipV1::Managed, Some(_)) => CodexLoginRefresh::WhenLapsing,
+            _ => CodexLoginRefresh::Never,
+        }
+    }
+}
+
+/// Whether the limits probe may force a refresh of a home's login: only for
+/// an Ottto account slot, and then only while it lapses
+/// ([`codex_probe_refresh_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginRefresh {
+    Never,
+    WhenLapsing,
 }
 
 struct CodexSlotCandidate {
@@ -2271,6 +2302,8 @@ fn read_registered_codex_home_for_setup(
                 captured_at,
                 home,
                 CodexHomeTrust::Managed,
+                // `home` is an Ottto account slot's, resolved by the store.
+                CodexLoginRefresh::WhenLapsing,
                 CodexQuotaRead::Provider,
             )
         });
@@ -2385,6 +2418,7 @@ fn collect_codex_home_candidate(
         expires_at.to_string(),
         &slot.home,
         home_trust,
+        slot.login_refresh(),
         quota_read,
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
@@ -3199,6 +3233,7 @@ fn collect_codex_status_for_home(
     expires_at: String,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     quota_read: CodexQuotaRead,
 ) -> (
     AgentStatusSnapshot,
@@ -3294,7 +3329,7 @@ fn collect_codex_status_for_home(
     );
     let mut strong_identity = None;
     let mut probe_failed = false;
-    match collect_codex_usage_for_home(codex_home, home_trust, quota_read) {
+    match collect_codex_usage_for_home(codex_home, home_trust, login_refresh, quota_read) {
         Ok(usage) => {
             if usage.credential_read_failed {
                 append_codex_credential_read_failed_diagnostic(&mut snapshot);
@@ -3463,20 +3498,24 @@ fn collect_codex_status_for_home(
 fn collect_codex_usage_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     quota_read: CodexQuotaRead,
 ) -> Result<CodexUsageProbe, codex_saved_quota::CodexQuotaFailure> {
     match quota_read {
         CodexQuotaRead::Saved => {
             codex_saved_quota::serve_saved(codex_home, home_trust, current_unix_seconds())
         }
-        CodexQuotaRead::Provider => {
-            codex_saved_quota::read_provider_and_save(codex_home, home_trust, |_, _| true)
-                .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
-                .map_err(|message| codex_saved_quota::CodexQuotaFailure {
-                    message,
-                    at_epoch_seconds: current_unix_seconds(),
-                })
-        }
+        CodexQuotaRead::Provider => codex_saved_quota::read_provider_and_save(
+            codex_home,
+            home_trust,
+            login_refresh,
+            |_, _| true,
+        )
+        .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
+        .map_err(|message| codex_saved_quota::CodexQuotaFailure {
+            message,
+            at_epoch_seconds: current_unix_seconds(),
+        }),
     }
 }
 
@@ -3486,8 +3525,9 @@ fn collect_codex_usage_for_home(
 fn read_codex_usage_from_provider(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
 ) -> Result<CodexUsageProbe, String> {
-    collect_codex_app_server_usage_for_home(codex_home, home_trust)
+    collect_codex_app_server_usage_for_home(codex_home, home_trust, login_refresh)
 }
 
 fn stamp_codex_meter_identity(snapshot: &mut AgentStatusSnapshot) {
@@ -4088,10 +4128,7 @@ fn resolve_claude_default_home_owner(
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
     // The same gates as a background usage read, "Background limit refresh"
     // included, and never for a lapsed token: no call means unproven.
-    let may_call = !refresh_pending
-        && !claude_oauth_usage_network_disabled()
-        && !claude_pass_saved_only()
-        && !claude_background_read_withheld();
+    let may_call = !refresh_pending && claude_owner_call_allowed();
     let owner = stable
         .credential
         .access_token
@@ -4176,6 +4213,7 @@ fn collect_claude_status(
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
+    note_claude_folder_owner(&ClaudeConfigDirSlot::Default, &local, None);
     let mut login_state = local.state;
     let default_live = local.live_login();
     // "Keep my Claude accounts signed in": the default login gets the same
@@ -4864,8 +4902,6 @@ fn collect_claude_status_snapshots(
     custom_descriptors.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
     let (custom_descriptors, overflow_descriptors) =
         bounded_claude_custom_descriptors(custom_descriptors);
-    let coverage_dirs = crate::claude_status_coverage::enabled()
-        .then(|| claude_status_coverage_dirs(&custom_descriptors, &overflow_descriptors));
     for descriptor in overflow_descriptors {
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
@@ -4876,7 +4912,6 @@ fn collect_claude_status_snapshots(
                 crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
-                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 continue;
             }
             Some(
@@ -4884,7 +4919,6 @@ fn collect_claude_status_snapshots(
                 | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
-                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
                 continue;
             }
@@ -4897,7 +4931,6 @@ fn collect_claude_status_snapshots(
             upkeep_consent,
             &captured_at,
             &expires_at,
-            |observation| note_claude_status_coverage(&descriptor, &captured_at, observation),
         );
         match step {
             ClaudeSlotCollectionStep::PreGateRefused(status)
@@ -4936,12 +4969,6 @@ fn collect_claude_status_snapshots(
                 slot_states.insert(descriptor.slot_id, status);
             }
         }
-    }
-    if let Some(dirs) = &coverage_dirs {
-        crate::claude_status_coverage::retain_registered(
-            dirs.iter().map(String::as_str),
-            &home_dir().join(".claude"),
-        );
     }
     let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {
@@ -5821,20 +5848,6 @@ fn coherent_claude_provider_observed_at(snapshot: &AgentStatusSnapshot) -> Strin
         .to_string()
 }
 
-/// Every registered custom folder for the status-coverage feed. Slots past
-/// collection capacity are still registered: their transcripts must never
-/// read as never-registered.
-fn claude_status_coverage_dirs(
-    collected: &[ClaudeConfigSlotDescriptorV1],
-    overflow: &[ClaudeConfigSlotDescriptorV1],
-) -> Vec<String> {
-    collected
-        .iter()
-        .chain(overflow)
-        .filter_map(|descriptor| descriptor.config_dir.clone())
-        .collect()
-}
-
 fn bounded_claude_custom_descriptors(
     mut descriptors: Vec<ClaudeConfigSlotDescriptorV1>,
 ) -> (
@@ -5957,14 +5970,13 @@ enum ClaudeSlotCollectionStep {
 
 /// Gate, read, upkeep, resolve, gate again and call usage for one registered
 /// slot. A slot that stops before the usage call has its passive sign-in run
-/// ended here, and `note_coverage` hears each result at the point it is known.
+/// ended here.
 fn collect_registered_claude_slot_step(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
     upkeep_consent: bool,
     captured_at: &str,
     expires_at: &str,
-    note_coverage: impl Fn(CoverageObservation<'_>),
 ) -> ClaudeSlotCollectionStep {
     let slot_id = descriptor.slot_id.as_str();
     // Another account signed in to this slot: no upkeep, CLI, usage call,
@@ -5974,7 +5986,8 @@ fn collect_registered_claude_slot_step(
         Ok(expected) => expected,
         Err(status) => {
             claude_oauth_end_slot_run(slot_id);
-            note_coverage(CoverageObservation::Unavailable);
+            // Another account here is exactly what the folder ledger records.
+            note_refused_claude_slot(descriptor);
             return ClaudeSlotCollectionStep::PreGateRefused(status);
         }
     };
@@ -5987,6 +6000,13 @@ fn collect_registered_claude_slot_step(
     let local = network_enabled
         .then(|| read_registered_claude_slot_locally(descriptor))
         .flatten();
+    if let (Some(local), Some(binding), Some(slot)) = (
+        local.as_ref(),
+        expected_binding.as_ref(),
+        claude_config_slot_for_descriptor(descriptor),
+    ) {
+        note_claude_folder_owner(&slot, local, Some(binding));
+    }
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
@@ -6002,7 +6022,6 @@ fn collect_registered_claude_slot_step(
     );
     if !upkeep.proceed_with_collection {
         claude_oauth_end_slot_run(slot_id);
-        note_coverage(CoverageObservation::Unavailable);
         let result_observed_at = upkeep.result_observed_at.clone();
         let paused = upkeep.paused_awaiting_claude_refresh;
         let mut status = if paused {
@@ -6026,11 +6045,6 @@ fn collect_registered_claude_slot_step(
         Ok(resolved) => resolved,
         Err(failure) => {
             claude_oauth_end_slot_run(slot_id);
-            note_coverage(match failure {
-                ClaudeSlotProbeFailure::SignedOutByCli
-                | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
-                _ => CoverageObservation::Unavailable,
-            });
             return ClaudeSlotCollectionStep::Stopped(registered_claude_failure_status(
                 descriptor,
                 failure,
@@ -6047,15 +6061,10 @@ fn collect_registered_claude_slot_step(
         captured_at,
     ) {
         claude_oauth_end_slot_run(slot_id);
-        note_coverage(CoverageObservation::Unavailable);
         return ClaudeSlotCollectionStep::Stopped(status);
     }
     let account_hash = resolved.account_identifier_hash.clone();
     let organization_hash = resolved.organization_identifier_hash.clone();
-    note_coverage(CoverageObservation::Qualified {
-        login: &account_hash,
-        org: &organization_hash,
-    });
     let access_token = resolved.credential.access_token.take();
     let credential_available = access_token.is_some();
     let outcome = collect_claude_oauth_usage_with_credential(
@@ -6131,14 +6140,12 @@ pub(crate) fn collect_registered_claude_slot_status(
     }
     let previous_states = read_persisted_claude_slot_collection_state();
     let previous = previous_states.slots.get(slot_id);
-    // This path keeps no status coverage: only the bulk pass feeds it.
     let step = collect_registered_claude_slot_step(
         &descriptor,
         previous,
         upkeep_consent,
         &captured_at,
         &expires_at,
-        |_| {},
     );
     match step {
         ClaudeSlotCollectionStep::PreGateRefused(mut status) => {
@@ -6649,6 +6656,99 @@ fn registered_slot_refresh(
             crate::claude_refresher::maybe_refresh(&descriptor.slot_id, &slot, live, consent)
         }
         _ => crate::claude_refresher::RefreshDecision::NotNeeded,
+    }
+}
+
+/// The background gates every owner-profile call shares ("Background limit
+/// refresh" included).
+fn claude_owner_call_allowed() -> bool {
+    !claude_oauth_usage_network_disabled()
+        && !claude_pass_saved_only()
+        && !claude_background_read_withheld()
+}
+
+/// Reports one folder's login to the recorded-login ledger, in memory. Reads no
+/// extra file. At most one profile call per token on the default folder, only
+/// while the capability is on and the folder can still qualify, never a login
+/// change, and under the same background gates as every other Claude read.
+fn note_claude_folder_owner(
+    slot: &ClaudeConfigDirSlot,
+    local: &ClaudeSlotLocalRead,
+    registered: Option<&ClaudeSlotAccountBinding>,
+) {
+    use crate::claude_status_coverage as coverage;
+    use crate::snapshots::claude_folder_login as folder;
+    let config_dir = slot
+        .config_dir()
+        .map_or_else(|| home_dir().join(".claude"), PathBuf::from);
+    let home = folder::folder_key(&config_dir);
+    let strong = |account: &Option<ClaudeCliOauthAccount>| {
+        account
+            .as_ref()
+            .and_then(claude_strong_oauth_identity_hashes)
+    };
+    let cached = strong(&local.initial_oauth_account)
+        .filter(|pair| strong(&local.final_oauth_account).as_ref() == Some(pair));
+    let email = cached
+        .as_ref()
+        .and(local.final_oauth_account.as_ref())
+        .and_then(|account| account.email_address.as_deref())
+        .filter(|email| !email.trim().is_empty());
+    let report = match registered {
+        Some(binding) => {
+            let pair = (
+                binding.account_identifier_hash.clone(),
+                binding.organization_identifier_hash.clone(),
+            );
+            coverage::OwnerReport {
+                slot: true,
+                other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
+                pair: cached.is_some().then_some(pair),
+                proven: None,
+                email: None,
+            }
+        }
+        None => {
+            let token = match &local.credential {
+                ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
+                _ => None,
+            };
+            let may_call = coverage::proof_wanted(&home)
+                && matches!(local.state, ClaudeLocalLoginState::AccessValid)
+                && claude_owner_call_allowed();
+            coverage::OwnerReport {
+                slot: false,
+                pair: cached,
+                proven: token
+                    .and_then(|token| claude_token_owner::proven_owner(token, may_call))
+                    .map(|owner| (owner.account_hash, owner.organization_hash)),
+                email: None,
+                other_account: false,
+            }
+        }
+    };
+    coverage::observe_with_email(home, report, email);
+}
+
+/// A refused slot: only another strong account in it reaches the ledger. An
+/// unreadable login or approval proves nothing.
+fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
+    use crate::claude_status_coverage as coverage;
+    use crate::snapshots::claude_folder_login as folder;
+    if !claude_slot_login_unapproved(descriptor) || claude_slot_local_login(descriptor).is_none() {
+        return;
+    }
+    if let Some(config_dir) = claude_config_slot_for_descriptor(descriptor)
+        .and_then(|slot| slot.config_dir().map(PathBuf::from))
+    {
+        coverage::observe(
+            folder::folder_key(&config_dir),
+            coverage::OwnerReport {
+                slot: true,
+                other_account: true,
+                ..coverage::OwnerReport::default()
+            },
+        );
     }
 }
 
@@ -14096,24 +14196,6 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
-/// Status-coverage feed: this slot's already-qualified hashes, or
-/// that the pass has none. Returns nothing, so the feed cannot change status.
-fn note_claude_status_coverage(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-    captured_at: &str,
-    observation: CoverageObservation<'_>,
-) {
-    if crate::claude_status_coverage::enabled() {
-        crate::claude_status_coverage::observe(
-            &descriptor.slot_id,
-            descriptor.config_dir.as_deref(),
-            &home_dir().join(".claude"),
-            captured_at,
-            observation,
-        );
-    }
-}
-
 /// Multi-account collection never assigns full meters through organization or
 /// email fallback. Both provider UUIDs must be present and independently
 /// hashed before a window or credit can leave the machine.
@@ -15971,6 +16053,7 @@ fn subscription_period_timestamp(value: &Value, key: &str) -> Option<String> {
 fn collect_codex_app_server_usage_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
 ) -> Result<CodexUsageProbe, String> {
     let now = current_unix_seconds();
     let needs_details =
@@ -15983,25 +16066,29 @@ fn collect_codex_app_server_usage_for_home(
             codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
         };
     let started = Instant::now();
-    let observation =
-        match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
-            Ok(observation) => observation,
-            Err(message) => {
-                eprintln!(
-                    "{}",
-                    codex_probe_failure_log_line(
-                        &message,
-                        codex_home,
-                        started.elapsed(),
-                        current_unix_seconds(),
-                    )
-                );
-                // No reading at all: the detail back-off still applies to the
-                // account last validated at this home.
-                codex_credit_grants::record_session_failure(codex_home, now);
-                return Err(message);
-            }
-        };
+    let observation = match call_codex_app_server_rate_limits_for_home(
+        codex_home,
+        home_trust,
+        login_refresh,
+        &needs_details,
+    ) {
+        Ok(observation) => observation,
+        Err(message) => {
+            eprintln!(
+                "{}",
+                codex_probe_failure_log_line(
+                    &message,
+                    codex_home,
+                    started.elapsed(),
+                    current_unix_seconds(),
+                )
+            );
+            // No reading at all: the detail back-off still applies to the
+            // account last validated at this home.
+            codex_credit_grants::record_session_failure(codex_home, now);
+            return Err(message);
+        }
+    };
     let probe = codex_usage_probe_from_app_server_observation(observation);
     if let Some(identity) = probe.identity.as_ref() {
         codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
@@ -16333,14 +16420,20 @@ fn with_codex_app_server_test_timeouts<T>(
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     needs_details: CodexNeedsDetails<'_>,
 ) -> Result<CodexAppServerObservation, String> {
     use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
     let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
     let started = Instant::now();
     let mut run = CodexAppServerRun::default();
-    let result =
-        run_codex_app_server_rate_limits_for_home(codex_home, home_trust, needs_details, &mut run);
+    let result = run_codex_app_server_rate_limits_for_home(
+        codex_home,
+        home_trust,
+        login_refresh,
+        needs_details,
+        &mut run,
+    );
     if run.spawned {
         let result_class = match &result {
             Ok(_) => CallResult::Ok,
@@ -16366,9 +16459,49 @@ fn call_codex_app_server_rate_limits_for_home(
     result
 }
 
+/// How far ahead of its lapse the probe refreshes an account home's login: the
+/// longest gap between two reads of a home, so the claimed workspace does not
+/// lapse before the next read. A lapse alone does not bring that read forward.
+const CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS: u64 = codex_saved_quota::UNUSED_REFRESH_SECONDS;
+
+/// Why the probe forces a token refresh in `account/read`, or `None` to leave
+/// the login as it is. Only an Ottto account slot's home
+/// ([`CodexLoginRefresh::WhenLapsing`]) is refreshed, and only when its
+/// claimed binding has lapsed, lapses within
+/// [`CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS`] or has no readable expiry:
+/// Codex does not persist a refresh of its own for that, so the workspace
+/// would stay unconfirmed. The default home, and a home seen only through a
+/// running Codex process, hold a person's own login and are never refreshed
+/// here.
+fn codex_probe_refresh_reason(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
+    now: u64,
+) -> Option<&'static str> {
+    if login_refresh == CodexLoginRefresh::Never || home_trust != CodexHomeTrust::Managed {
+        return None;
+    }
+    let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => return None,
+        Err(_) => return Some("unreadable"),
+    };
+    match codex_credential_claim_lapses_at(&credentials) {
+        None => Some("lapsed_or_unknown"),
+        Some(lapses_at)
+            if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
+        {
+            Some("lapses_soon")
+        }
+        Some(_) => None,
+    }
+}
+
 fn run_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     needs_details: CodexNeedsDetails<'_>,
     run: &mut CodexAppServerRun,
 ) -> Result<CodexAppServerObservation, String> {
@@ -16444,12 +16577,19 @@ fn run_codex_app_server_rate_limits_for_home(
         }
     });
     let initialized = serde_json::json!({"method": "initialized"});
-    // Codex refreshes its own login when the token nears expiry; the probe
-    // never forces a refresh on top of that.
+    let refresh_reason = codex_probe_refresh_reason(
+        codex_home,
+        home_trust,
+        login_refresh,
+        current_unix_seconds(),
+    );
+    if let Some(reason) = refresh_reason {
+        eprintln!("codex usage probe: forcing account home login refresh reason={reason}");
+    }
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": false}
+        "params": {"refreshToken": refresh_reason.is_some()}
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it.
@@ -16717,6 +16857,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
     call_codex_app_server_rate_limits_for_home(
         &default_codex_home(),
         CodexHomeTrust::ProviderDefault,
+        CodexLoginRefresh::Never,
         &|_, _, _| false,
     )
     .map(|observation| observation.rate_limits)
@@ -19524,8 +19665,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 mod tests {
     use super::*;
 
-    mod status_coverage_feed;
-
     /// The account resolution `collect_claude_status` performs, for tests that
     /// exercise the OAuth path directly.
     fn claude_oauth_account_identifier_hash() -> String {
@@ -21636,40 +21775,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    #[serial]
-    fn status_coverage_registers_slots_past_collection_capacity() {
-        use crate::claude_status_coverage::{self as coverage, Registration};
-        let default_dir = Path::new("/tmp/claude-default/.claude");
-        let registration = |dirs: &[String], dir: &str| {
-            coverage::clear_global_for_test();
-            coverage::retain_registered(dirs.iter().map(String::as_str), default_dir);
-            coverage::snapshot()
-                .expect("feed available")
-                .registration(&coverage::home_key(Path::new(dir)), u64::MAX)
-        };
-        for count in [9, 12] {
-            let (collected, overflow) =
-                bounded_claude_custom_descriptors((0..count).map(test_slot_descriptor).collect());
-            let dirs = claude_status_coverage_dirs(&collected, &overflow);
-            assert_eq!(dirs.len(), count, "overflow folders are fed too");
-            for index in 0..count {
-                // Past the ledger cap a folder may be forgotten, never proven absent.
-                assert_ne!(
-                    registration(&dirs, &format!("/tmp/claude-slot-{index}")),
-                    Registration::NeverRegistered
-                );
-            }
-            let unregistered = registration(&dirs, "/tmp/claude-slot-unregistered");
-            if count <= coverage::MAX_SLOTS {
-                assert_eq!(unregistered, Registration::NeverRegistered, "control");
-            } else {
-                assert_eq!(unregistered, Registration::Unknown);
-            }
-        }
-        coverage::clear_global_for_test();
-    }
-
     /// Synthetic Claude and Codex agent-status snapshots exactly as the
     /// collector uploads them: the real account-to-plan-observation copy, the
     /// real hash function, then the protocol backend redaction. The backend
@@ -22707,6 +22812,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         );
 
@@ -23044,6 +23150,7 @@ for line in sys.stdin:
         collect_codex_usage_for_home(
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         )
         .expect("setup read");
@@ -23092,6 +23199,7 @@ for line in sys.stdin:
                 "2026-08-26T00:15:00Z".to_string(),
                 &home,
                 CodexHomeTrust::ProviderDefault,
+                CodexLoginRefresh::Never,
                 CodexQuotaRead::Provider,
             )
         };
@@ -23876,6 +23984,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         );
 
@@ -23960,16 +24069,9 @@ for line in sys.stdin:
         .is_none());
     }
 
-    /// [behaviour] The probe starts Codex with its home-writing startup
-    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
-    /// keys and keeps stdin open for the asynchronous default-home answer.
-    /// Both home modes share the builder that always sends refreshToken:false.
-    #[test]
-    #[serial]
-    fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
-        let dir = std::env::temp_dir().join(format!("ottto-app-server-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    /// A fake `codex` in `dir` that answers the limits probe and appends each
+    /// `account/read` `refreshToken` value to `dir/refresh.log`.
+    fn write_fake_codex_app_server(dir: &Path) {
         let helper = dir.join("fake_codex.py");
         std::fs::write(
             &helper,
@@ -23992,8 +24094,9 @@ for line in sys.stdin:
         print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
     if '"id":"ottto_account"' in line:
         account_read = True
-        if json.loads(line).get("params", {}).get("refreshToken") is not False:
-            sys.exit(4)
+        refresh = json.loads(line).get("params", {}).get("refreshToken")
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh.log"), "a") as log:
+            log.write(json.dumps(refresh) + "\n")
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     if "account/rateLimits/read" in line:
         if not account_read:
@@ -24016,6 +24119,19 @@ for line in sys.stdin:
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+    }
+
+    /// [behaviour] The probe starts Codex with its home-writing startup
+    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
+    /// keys and keeps stdin open for the asynchronous default-home answer.
+    /// The default home never forces a token refresh.
+    #[test]
+    #[serial]
+    fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
+        let dir = std::env::temp_dir().join(format!("ottto-app-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        write_fake_codex_app_server(&dir);
 
         let _guard =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
@@ -24032,7 +24148,92 @@ for line in sys.stdin:
                 .and_then(Value::as_u64),
             Some(2)
         );
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(refreshes.lines().collect::<Vec<_>>(), ["false"]);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// [regress] A registered account slot whose login has lapsed is
+    /// refreshed by the limits probe, and one with a live login is not, so its
+    /// workspace stays confirmed; Codex 0.163 does not persist a refresh of its
+    /// own. A home seen only through a running Codex process (a person's own
+    /// `CODEX_HOME`) is never refreshed. Control: the default home is never
+    /// refreshed, even with a lapsed login.
+    #[test]
+    #[serial]
+    fn codex_probe_refreshes_only_a_lapsing_registered_slot_login() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-app-server-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        write_fake_codex_app_server(&dir);
+        let _guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let home_with_login = |label: &str, expires_at: i64| {
+            let home = crate::test_scratch::ScratchDir::canonical(label);
+            let token = synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            );
+            let auth = home.join("auth.json");
+            std::fs::write(
+                &auth,
+                serde_json::json!({"tokens": {"access_token": token, "id_token": token}})
+                    .to_string(),
+            )
+            .expect("auth fixture");
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+                .expect("auth mode");
+            home
+        };
+        let lapsed = home_with_login("codex-refresh-lapsed", now - 60);
+        let live = home_with_login("codex-refresh-live", now + 3600);
+        let registered = |home: PathBuf| CodexHomeSlot {
+            slot_id: "synthetic-slot".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home,
+            registered_binding: Some((
+                "synthetic-account-hash".to_string(),
+                "synthetic-workspace-hash".to_string(),
+            )),
+        };
+        let default_home = CodexHomeSlot {
+            slot_id: "default".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Default,
+            home: lapsed.to_path_buf(),
+            registered_binding: None,
+        };
+        for (slot, trust) in [
+            (registered(lapsed.to_path_buf()), CodexHomeTrust::Managed),
+            (registered(live.to_path_buf()), CodexHomeTrust::Managed),
+            (
+                CodexHomeSlot::process_home(lapsed.to_path_buf()),
+                CodexHomeTrust::Managed,
+            ),
+            (default_home, CodexHomeTrust::ProviderDefault),
+        ] {
+            call_codex_app_server_rate_limits_for_home(
+                &slot.home,
+                trust,
+                slot.login_refresh(),
+                &|_, _, _| false,
+            )
+            .expect("rate limits");
+        }
+
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(
+            refreshes.lines().collect::<Vec<_>>(),
+            ["true", "false", "false", "false"],
+            "lapsed registered slot, live registered slot, lapsed process-only home, \
+             lapsed default home (control)"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -24173,7 +24374,12 @@ for line in sys.stdin:
             .expect("fake codex mode");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
-        call_codex_app_server_rate_limits_for_home(&home, CodexHomeTrust::Managed, &|_, _, _| false)
+        call_codex_app_server_rate_limits_for_home(
+            &home,
+            CodexHomeTrust::Managed,
+            CodexLoginRefresh::Never,
+            &|_, _, _| false,
+        )
     }
 
     fn assert_no_provider_text(message: &str) {

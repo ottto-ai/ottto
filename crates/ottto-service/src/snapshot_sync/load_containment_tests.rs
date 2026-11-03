@@ -37,7 +37,6 @@ fn lc_scan_page(
         LC_COLLECTED_AT,
         crate::snapshots::BACKFILL_WINDOW_DAYS,
         10,
-        false,
     )
     .expect("scan synthetic source files before finalization");
     if let Some(target) = scan

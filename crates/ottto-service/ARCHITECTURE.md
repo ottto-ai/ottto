@@ -27,6 +27,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
   accepted, and parts the server did accept stay recorded.
 
+Stale-older refusals from current servers mean the server already holds the
+newer usage. Earlier refusals stay counted as owed, with their dispositions
+unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
+use retained bodies; transcripts are read again only for changed input. Unknown
+non-permanent reasons hold their entity without invalidating sibling ACKs. See
+[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
@@ -78,6 +85,8 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
   checkpoints can run.
 - Durability stays at `FULL`. Erasing data leaves nothing readable in the database, WAL or SHM
   files.
+- Complete valid saves commit above aggregate charged-work targets. The 32 MiB target sizes the
+  next collection page; crossing 256 MiB emits a counts-only alarm without refusing the save.
 
 ## One generic path per source
 
@@ -122,6 +131,16 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 Transcripts never leave the machine. Logs, diagnostics and status carry counts, never transcript
 text, paths or raw identifiers; types holding local-only text don't derive `Debug`. Identity is
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
+What a privacy setting removes from an upload is decided in `upload_policy.rs`, or by the builders
+that read its settings; it never refuses a body, and hashes are computed afterwards from what is
+sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+
+Local collection never depends on an upload setting. No read-side identity (file scope, Codex
+group scope, traversal, memos, tier receipts, archives) includes a setting, the attribution key, a
+server capability or the replay directive; the upload filter applies them at send. Delivery proofs
+keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
+file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
+applies to bodies from then on, never retroactively.

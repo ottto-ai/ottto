@@ -119,7 +119,7 @@ fn head_mark(mark: Option<u64>, field: &'static str) -> Result<u64, Refuse> {
         .ok_or(Refuse::NotRederivable(field))
 }
 
-fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive, Refuse> {
+fn rederive_digests(acc: &SnapshotAccumulator) -> Result<Rederive, Refuse> {
     let marks = acc.durable_marks;
     let mut out = Rederive::default();
     if acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some() {
@@ -144,7 +144,6 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
     if acc.title.is_some() {
         marks
             .title_line
-            .filter(|(_, len)| *len <= line_cap)
             .ok_or(Refuse::NotRederivable("SnapshotAccumulator.title"))?;
         out.title = Some(title_digest(acc)?);
     }
@@ -154,21 +153,16 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
 /// The record body for a retained reduction, or why it is not persisted.
 /// Only Claude Code and Codex entries are persisted.
 #[cfg(test)]
-pub(crate) fn encode(
-    reduction: &CachedJsonlReduction,
-    limit: usize,
-    line_cap: u64,
-) -> Result<Vec<u8>, Refuse> {
+pub(crate) fn encode(reduction: &CachedJsonlReduction, limit: usize) -> Result<Vec<u8>, Refuse> {
     crate::durable_tail_store::DurableSource::from_snapshot(reduction.accumulator.source)
         .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
-    encode_body(reduction, limit, line_cap)
+    encode_body(reduction, limit)
 }
 
 #[cfg(test)]
 pub(in crate::snapshots) fn encode_body(
     reduction: &CachedJsonlReduction,
     limit: usize,
-    line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
     let CachedJsonlReduction {
         accumulator: acc,
@@ -186,7 +180,6 @@ pub(in crate::snapshots) fn encode_body(
             *positive_usage_evidence,
         ),
         limit,
-        line_cap,
     )
 }
 
@@ -224,7 +217,6 @@ impl<'a> BodyEncoding<'a> {
         accumulator: &'a SnapshotAccumulator,
         report: &'a JsonlReadReport,
         scalars: (usize, usize, bool),
-        line_cap: u64,
         skill_labels_enabled: bool,
     ) -> Result<Self, Refuse> {
         if !skill_labels_enabled
@@ -248,7 +240,7 @@ impl<'a> BodyEncoding<'a> {
             accumulator,
             report,
             scalars,
-            rederive: rederive_digests(accumulator, line_cap)?,
+            rederive: rederive_digests(accumulator)?,
         })
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
@@ -283,9 +275,8 @@ pub(in crate::snapshots) fn encode_parts(
     report: &JsonlReadReport,
     scalars: (usize, usize, bool),
     limit: usize,
-    line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let plan = BodyEncoding::new(acc, report, scalars, line_cap, true)?;
+    let plan = BodyEncoding::new(acc, report, scalars, true)?;
     let len = plan.count(limit)?;
     let mut out = Vec::with_capacity(len);
     plan.write(&mut out, len)?;
@@ -296,11 +287,10 @@ pub(in crate::snapshots) fn encode_parts(
 pub(in crate::snapshots) fn encode_permitted(
     reduction: &CachedJsonlReduction,
     limit: usize,
-    line_cap: u64,
     enabled: bool,
 ) -> Result<Vec<u8>, Refuse> {
     let (acc, report, scalars) = reduction.finish_view();
-    let plan = BodyEncoding::new(acc, report, scalars, line_cap, enabled)?;
+    let plan = BodyEncoding::new(acc, report, scalars, enabled)?;
     let len = plan.count(limit)?;
     let mut out = Vec::with_capacity(len);
     plan.write(&mut out, len)?;
@@ -577,12 +567,7 @@ pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -
         positive_recognized_usage_count: sum as usize,
         positive_usage_evidence: false,
     };
-    encode(
-        &reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        1024 * 1024,
-    )
-    .unwrap()
+    encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
 }
 
 #[cfg(test)]
@@ -597,10 +582,5 @@ pub(crate) fn store_skill_fixture_body_for_source(source: SnapshotSource) -> Vec
         .reduction
         .accumulator
         .note_provider_skill(Some("SyntheticPurgeLabel".into()));
-    encode(
-        &decoded.reduction,
-        crate::durable_tail_store::RECORD_BYTES,
-        1024 * 1024,
-    )
-    .unwrap()
+    encode(&decoded.reduction, crate::durable_tail_store::RECORD_BYTES).unwrap()
 }

@@ -556,7 +556,8 @@ fn h359_all_dominated_rejected_reports_the_settled_residue_state() {
         refusals,
         PermanentRefusalCounts {
             total: 2,
-            dominated: 2
+            dominated: 2,
+            ..PermanentRefusalCounts::default()
         }
     );
     assert_eq!(
@@ -1932,7 +1933,8 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
         refusals,
         PermanentRefusalCounts {
             total: 2,
-            dominated: 1
+            dominated: 1,
+            ..PermanentRefusalCounts::default()
         }
     );
     assert_eq!(
@@ -1950,7 +1952,8 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
         PermanentRefusalCounts::of(&ledger),
         PermanentRefusalCounts {
             total: 2,
-            dominated: 2
+            dominated: 2,
+            ..PermanentRefusalCounts::default()
         }
     );
 }

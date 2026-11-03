@@ -789,7 +789,7 @@ fn f6_forget(
         .insert("uncommitted".into(), index.files["committed"].clone());
     // Even a mutated live graph cannot add an uncommitted key to membership.
     assert_eq!(live().digests, BTreeSet::from([digest]));
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    fill_session(&mut index);
     assert!(save_with(&f.path, &mut index).is_err());
     let held = live();
     assert!(!held.complete);
@@ -1642,14 +1642,22 @@ mod hydrate_parity {
     }
 }
 
-/// [format] ceiling reloads the prior generation halves then retries and grows back.
+/// One file-entities value past the physical row limit, so value admission
+/// refuses the save; mutable rows past their 1 MiB target still commit.
+pub(super) fn over_row_limit() -> BTreeSet<String> {
+    BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
+}
+
+/// [format] value admission reloads the prior generation halves then retries and grows back.
 #[test]
-fn ceiling_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
+fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index
+        .file_snapshot_fingerprints
+        .insert("oversize".into(), over_row_limit());
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -1701,7 +1709,9 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
-    with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index
+        .file_snapshot_fingerprints
+        .insert("oversize".into(), over_row_limit());
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
     let current = load_with(&f.path, false).unwrap().unwrap();
@@ -1937,7 +1947,6 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
             "2050-10-31T12:00:00Z",
             30,
             10,
-            false,
         )
         .unwrap()
     };
@@ -2016,7 +2025,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                     &at(now),
                     30,
                     10,
-                    false,
                 )
                 .unwrap();
             }
@@ -2027,7 +2035,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                 &at(now),
                 30,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -2157,7 +2164,6 @@ fn expired_growth_claim_rides_the_next_selecting_page() {
             &at(now),
             30,
             1,
-            false,
         )
         .unwrap()
     };
@@ -2227,5 +2233,51 @@ fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
             !fence::sibling(&f.path, suffix).exists(),
             "OFF created {suffix}"
         );
+    }
+}
+
+/// [format] Legacy refusal debt survives exact decoding and ordinary save removes it on native and imported stores.
+#[test]
+fn retired_file_size_debt_clears_through_normal_save_and_reopen() {
+    for native in [false, true] {
+        let f = Fixture::new();
+        let traversal = serde_json::from_value(serde_json::json!({
+            "context_fingerprint":"synthetic", "census_window_end":"2026-10-27T08:00:00Z",
+            "scan_roots":[], "pending_directories":[], "pending_candidates":[], "observed_index_keys":[],
+            "reconciliation_upper_bound":null, "reconciliation_after":null, "reconciliation_started":false,
+            "oversized_discovery":{"synthetic_path_hash":{"content_hash":"synthetic_content_hash","observations":1}},
+            "counts":{"oversized_file_count":1}
+        })).unwrap();
+        let pre = ScanIndex {
+            traversal: Some(traversal),
+            ..ScanIndex::default()
+        };
+        if native {
+            f.import_graph(Some(&pre));
+            fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        } else {
+            fs::write(&f.path, serde_json::to_vec(&pre).unwrap()).unwrap();
+        }
+        let mut index = ScanIndex::load_for_snapshot_source(
+            &f.path,
+            crate::snapshots::SnapshotSource::ClaudeCode,
+            &f.support,
+        )
+        .unwrap();
+        assert!(index.v2().persistence_v2.is_some());
+        let assert_cleared = |index: &ScanIndex| {
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(traversal.oversized_discovery.is_empty());
+            assert_eq!(traversal.counts.oversized_file_count, 0);
+        };
+        assert_cleared(&index);
+        assert!(save_with(&f.path, &mut index).unwrap());
+        with_session_db(&index, |db| {
+            let (stored, _) = import::hydrate_context(db).unwrap();
+            assert_cleared(&stored);
+        });
+        drop(index);
+        let reopened = load_with(&f.path, false).unwrap().unwrap();
+        assert_cleared(&reopened);
     }
 }

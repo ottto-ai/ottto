@@ -77,6 +77,26 @@ impl Fixture {
                 paths.push(path);
             }
         }
+        let label = match source {
+            SnapshotSource::ClaudeCode => "claude-code",
+            _ => "codex",
+        };
+        let composition = self.support.join("context_composition/v2");
+        for name in [
+            format!("index-{label}.json"),
+            format!("index-{label}.json.1.2.tmp"),
+            format!("install-{label}.json"),
+            format!("scopes/{label}-scope.json"),
+            format!("scopes/{label}-scope.upload.json"),
+            format!("scopes/{label}-scope.totals.1.zst"),
+            format!("quarantined-scopes/{label}-scope.json"),
+            format!("quarantine/{label}-scope-1/{label}-scope.json"),
+        ] {
+            let path = composition.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, CANARY).unwrap();
+            paths.push(path);
+        }
         paths
     }
     /// One Claude session with two priced requests; the source already on v2.
@@ -103,7 +123,11 @@ impl Fixture {
     }
 }
 
-fn cold_full(root: &PathBuf, now: &str, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+pub(super) fn cold_full(
+    root: &PathBuf,
+    now: &str,
+    index: ScanIndex,
+) -> (ScanIndex, SourceScanResult) {
     let source = SnapshotSource::ClaudeCode;
     let mut scan = OwnedSourceScan::new(
         source,
@@ -112,7 +136,6 @@ fn cold_full(root: &PathBuf, now: &str, index: ScanIndex) -> (ScanIndex, SourceS
         now,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -165,6 +188,14 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
     let codex = f.canaries(SnapshotSource::Codex);
     let claude = f.canaries(SnapshotSource::ClaudeCode);
     let rows = f.destination.join("claude_code-rows-scan-index.json");
+    let composition = f.support.join("context_composition");
+    let shared = [
+        composition.join("v2/run.json"),
+        composition.join("disabled"),
+    ];
+    for path in &shared {
+        fs::write(path, CANARY).unwrap();
+    }
     let (root, now) = f.transcript();
     let (index, _) = cold_full(&root, &now, ScanIndex::default());
     let live = state_v2::money_test_support::publish(&index, &rows, &progress_bytes());
@@ -183,6 +214,7 @@ fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
     assert_eq!(f.erase(SnapshotSource::Codex), 0);
     assert_gone(&codex);
     assert_kept(&claude);
+    assert_kept(&shared);
     let marker = source_marker(&f.support, SnapshotSource::Codex);
     assert_eq!(marker.as_deref(), Some("done"));
     assert_eq!(source_marker(&f.support, SnapshotSource::ClaudeCode), None);
@@ -385,4 +417,85 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
         enabled_snapshot_sources_in(&device(), &f.support),
         vec![SnapshotSource::ClaudeCode],
     );
+}
+
+const LOGIN_ADDRESS: &str = "one@example.test";
+
+/// A held key, one report email under it and one retained parse.
+fn hold_login_address_state(f: &Fixture) {
+    use crate::claude_status_coverage as coverage;
+    coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    coverage::observe_with_email(
+        "folder".into(),
+        coverage::OwnerReport::default(),
+        Some(LOGIN_ADDRESS),
+    );
+    assert!(coverage::snapshot()["folder"].email.is_some());
+    let (root, _) = f.transcript();
+    let (retained, _, _) = crate::snapshots::claude_response_compaction_tests::acquire_items(
+        &root.join(format!("{SESSION}.jsonl")),
+        None,
+        100,
+    );
+    assert!(f
+        .cache
+        .retained()
+        .unwrap()
+        .insert("retained".into(), retained.unwrap()));
+}
+
+fn assert_login_address_state_gone(f: &Fixture) {
+    use crate::claude_status_coverage as coverage;
+    assert_eq!(coverage::address_digest(LOGIN_ADDRESS), None);
+    assert_eq!(coverage::snapshot()["folder"].email, None);
+    assert!(f.cache.retained().unwrap().victims().is_empty());
+}
+
+/// [privacy] Source-off ends everything kept of a recorded login address.
+#[test]
+fn source_off_erase_clears_the_login_address() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    hold_login_address_state(&f);
+    let kept = f.canaries(SnapshotSource::ClaudeCode);
+    disable_snapshot_source(&f.support, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert_gone(&kept);
+    assert_login_address_state_gone(&f);
+}
+
+/// [privacy] Account removal erases the durable records, with no live device,
+/// and keeps the rest of the index so history is not replayed. Once only.
+#[test]
+fn account_removal_erase_clears_the_login_address_only() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    hold_login_address_state(&f);
+    let stable = f
+        .support
+        .join("snapshots/claude_code-scan-index-v3.durable-tail");
+    fs::create_dir_all(&stable).unwrap();
+    fs::write(stable.join("record.rec"), CANARY).unwrap();
+    let (mut tails, kept): (Vec<_>, Vec<_>) = f
+        .canaries(SnapshotSource::ClaudeCode)
+        .into_iter()
+        .partition(|path| path.to_string_lossy().ends_with(".durable-tail"));
+    assert_eq!(tails.len(), 1);
+    tails.push(stable);
+    let other = f.canaries(SnapshotSource::Codex);
+
+    crate::snapshot_sync::owe_login_address_erase(&f.support).unwrap();
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert_gone(&tails);
+    assert_kept(&kept);
+    assert_kept(&other);
+    assert_login_address_state_gone(&f);
+
+    hold_login_address_state(&f);
+    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
+    assert!(crate::claude_status_coverage::address_digest(LOGIN_ADDRESS).is_some());
 }

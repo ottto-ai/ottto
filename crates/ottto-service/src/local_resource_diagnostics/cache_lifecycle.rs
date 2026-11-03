@@ -54,6 +54,10 @@ sparse_lifetime_counters! {
     pi_fork_copies_skipped_tokens: PiForkCopiesSkippedTokens,
     // Codex thread-settings snapshots asking for a non-default tier.
     codex_non_default_thread_tier: CodexNonDefaultThreadTier,
+    // Claude usage lines with an `iterations[]` entry naming another model.
+    usage_iteration_model_differs: UsageIterationModelDiffers,
+    // Claude usage numeric keys the parser does not read.
+    usage_unknown_numeric_key: UsageUnknownNumericKey,
 }
 
 pub(crate) fn snapshot() -> Counts {

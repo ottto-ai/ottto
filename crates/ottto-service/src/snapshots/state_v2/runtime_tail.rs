@@ -1,6 +1,8 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
-use super::super::tail::{Collection, SetAside, SetAsideCause, StagedFile, TailHead, TailStage};
+use super::super::tail::{
+    Collection, Disposition, Observation, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
+};
 use super::*;
 
 /// Staged state never declines; a later completion of the file merges into it.
@@ -34,6 +36,69 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
+/// A debt-only change of one file, committed with the next save or at exit; a
+/// later one of the same file before then replaces it. It never publishes the
+/// file's graph progress and never clears its marker.
+pub(in crate::snapshots) fn observe_tail(
+    path: &Path,
+    key: &str,
+    observation: Observation,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe(key, observation);
+        Ok(())
+    })
+}
+/// `observe_tail` for many files at once: one stage report, not one per file.
+pub(in crate::snapshots) fn observe_tails(
+    path: &Path,
+    observations: Vec<(String, Observation)>,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe_all(observations);
+        Ok(())
+    })
+}
+/// The caller's authorised final disposition of the file's whole debt: its
+/// revisions go and its marker clears; a head left with no reduction goes too.
+pub(in crate::snapshots) fn dispose_tail(
+    path: &Path,
+    key: &str,
+    disposition: Disposition,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.dispose(key, disposition);
+        Ok(())
+    })
+}
+/// Source withdrawal or a foreign scope: every Tail row of `keys`, debt included,
+/// is erased with the next save. A file that still held unaccepted revisions
+/// adds one to `tail_discovery.deleted_unaccepted_files` and contributes its
+/// oldest known change to `deleted_unaccepted_oldest_at`; `index` saves both.
+pub(in crate::snapshots) fn erase_tail(
+    path: &Path,
+    index: &mut ScanIndex,
+    keys: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    for key in keys {
+        let committed = read_txn(index, |tx| {
+            super::super::tail::erasure_debt(tx, key.as_bytes())
+        })?
+        .0;
+        let (counted, oldest) = with_state(path, |state| Ok(state.tail.erase(&key, committed)))?;
+        if counted {
+            let discovery = &mut index.tail_discovery;
+            discovery.deleted_unaccepted_files =
+                discovery.deleted_unaccepted_files.saturating_add(1);
+            discovery.deleted_unaccepted_oldest_at = discovery
+                .deleted_unaccepted_oldest_at
+                .into_iter()
+                .chain(oldest)
+                .min();
+        }
+    }
+    Ok(())
+}
 /// One file's committed head, on the graph's authenticated session; no page is
 /// visited. A future revision holds; a lower one is the caller's to decide.
 pub(in crate::snapshots) fn load_head(
@@ -59,6 +124,25 @@ pub(in crate::snapshots) fn load_tail(
     })?;
     telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
     Ok(())
+}
+/// `head`'s revisions by id, one short read transaction; same outcomes as
+/// `load_tail`, and a metadata-only head has them too.
+pub(in crate::snapshots) fn load_revisions(
+    index: &ScanIndex,
+    key: &str,
+    head: &TailHead,
+    mut visit: impl FnMut(u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    read_txn_at(index, |tx, stamp| {
+        super::super::tail::load_revisions(tx, key.as_bytes(), head, stamp.0, &mut visit)
+    })
+}
+/// The route of `index`'s live session, for a caller holding only the graph:
+/// `None` for a v1 graph, which has no Tail store.
+pub(in crate::snapshots) fn tail_route_path(
+    index: &ScanIndex,
+) -> Result<Option<std::path::PathBuf>> {
+    runtime_path(index)
 }
 /// Every key with a committed head, this route's graph generation, keys only.
 pub(in crate::snapshots) fn tail_head_keys(

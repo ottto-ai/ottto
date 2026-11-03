@@ -181,7 +181,6 @@ impl PiLiveFixture {
             "2026-10-06T10:05:00Z",
             30,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            false,
         )
         .unwrap();
         apply_upload_policy(
@@ -615,7 +614,6 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
         "2026-10-06T10:06:00Z",
         30,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        false,
     )
     .unwrap();
     assert!(scan.snapshots.is_empty());
@@ -644,7 +642,6 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                 "2026-10-06T10:05:00Z",
                 30,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                false,
             )
             .unwrap();
             apply_upload_policy(
@@ -805,7 +802,6 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             "2026-10-06T10:06:00Z",
             30,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            false,
         )
         .unwrap();
         assert!(scan.snapshots.is_empty());

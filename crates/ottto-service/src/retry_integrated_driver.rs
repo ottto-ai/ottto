@@ -318,7 +318,6 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
                 "2026-10-05T00:00:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 100,
-                true,
             )
         },
     )

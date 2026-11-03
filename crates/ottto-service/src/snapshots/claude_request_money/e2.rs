@@ -14,7 +14,7 @@ use super::super::claude_request_identity::{
     self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
 };
 use super::super::{
-    claude_api_cache_creation, claude_api_matches_transcript_occurrence,
+    claude_api_cache_creation, claude_api_matches_transcript_occurrence, claude_family_root_path,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
     claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
@@ -231,11 +231,15 @@ enum CopyProof {
     /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
     /// With the index key of the original its `fork-context-ref` line names.
     Holders(Option<String>),
+    /// A subagent's family root (its index key): a forked subagent repeats
+    /// the parent's last response as its first line, so that first response
+    /// counts once, at the root, when the root holds its request id.
+    Family(String),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Twin(key) | Self::Holders(Some(key)) => key.heap_bound(c),
+            Self::Twin(key) | Self::Holders(Some(key)) | Self::Family(key) => key.heap_bound(c),
             Self::Holders(None) => c.add(0),
         }
     }
@@ -396,6 +400,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         telemetry,
         accounts,
         prefix: _,
+        folder_trace,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -414,6 +419,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
+    *folder_trace = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -911,8 +917,10 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
+    /// Which file this fold read, for the folder ledger; set as it becomes an item.
+    pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1032,6 +1040,7 @@ impl FileFold {
             ambiguous,
             accounts,
             proof,
+            crate::snapshots::claude_folder_login::FolderTrace::finish_heap_bound(),
         ] {
             out = out.checked_add(bytes)?;
         }
@@ -1139,6 +1148,7 @@ impl FileFold {
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
+            folder_trace: None,
         };
         fold.spend(started);
         fold
@@ -1230,6 +1240,23 @@ impl FileFold {
         !occurrence.usage.is_zero()
             && self.money_birth.copied_with_slack(at, SLACK) == Some(true)
             && !self.is_skipped(occurrence.sequence)
+    }
+
+    /// Whether this file holds a prefix from elsewhere: a response older than
+    /// its birth, a held pre-birth range, or a birth inherited across a move.
+    pub(crate) fn copied_or_moved<'a>(
+        &self,
+        mut occurrences: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
+    ) -> bool {
+        !self.skipped.is_empty()
+            || matches!(
+                (self.money_birth.birth_nanos(), self.physical),
+                (Some(effective), Some(physical)) if effective != physical
+            )
+            || occurrences.any(|occurrence| {
+                let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
+                self.money_birth.copied_with_slack(at, SLACK) == Some(true)
+            })
     }
 
     /// `placed` is the native finalizer's own placement of this response
@@ -1371,6 +1398,14 @@ impl FileFold {
     ) {
         let started = Instant::now();
         self.decide_native(context, markers, fork_parent);
+        if self.proof.is_none() {
+            self.proof = context
+                .and_then(|context| {
+                    let member = claude_index_path_member_ref(context.path)?;
+                    claude_family_root_path(context.path, member.root)
+                })
+                .map(|root| CopyProof::Family(local_index_key(&root)));
+        }
         // The fold lives until the page finishes: keep no parse-time slack.
 
         self.skipped.shrink_to_fit();
@@ -1562,6 +1597,30 @@ impl FileFold {
         )
     }
 
+    /// The family root counts this request: move it from its estimated grain
+    /// to the removal and skip it, so attach finds the root alone. A grain
+    /// that cannot give it back leaves it counted.
+    fn drop_family_duplicate(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
+        let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+        let requests = occurrence.usage.request_count;
+        let account = self
+            .accounts
+            .as_ref()
+            .and_then(|accounts| accounts.account(occurrence.sequence));
+        let Some(key) = self.occurrence_key(occurrence) else {
+            return;
+        };
+        if !self
+            .entity
+            .take_estimated(&(key, None, account), &tokens, requests)
+        {
+            return;
+        }
+        self.entity.removed.add(&tokens);
+        self.entity.removed_requests += requests;
+        self.skip(occurrence.sequence);
+    }
+
     /// One held copy whose proof failed counts after all: from the removal
     /// back to its estimated grain, disclosed.
     fn restore_one(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
@@ -1638,6 +1697,12 @@ impl FileFold {
                 .entity
                 .fail_certificate(CertificateFailure::IdlessRestoration),
         }
+    }
+
+    /// Skip one response that is not skipped yet.
+    fn skip(&mut self, sequence: u64) {
+        let at = self.skipped.partition_point(|(_, end)| *end <= sequence);
+        self.skipped.insert(at, (sequence, sequence + 1));
     }
 
     fn unskip(&mut self, sequence: u64) {
@@ -1802,7 +1867,7 @@ fn membership_hash(request_id: &str) -> u64 {
 
 /// One item's request ids: its request set, then the occurrence keys outside
 /// it. Both are sorted, so one merge walk replaces a set lookup per key.
-fn item_request_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> {
+pub(crate) fn item_request_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> {
     let mut ids = item.claude_usage_request_ids.iter().peekable();
     item.claude_usage_request_ids
         .iter()
@@ -1946,6 +2011,7 @@ pub(crate) fn decide_page_copies(
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
             Some(CopyProof::Holders(_)) => holders.push(at),
+            Some(CopyProof::Family(root)) => decide_family(items, at, &root, index),
             None => {}
         }
     }
@@ -2141,38 +2207,102 @@ fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> O
         })
 }
 
-fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
-    let location = Some(Located(location_key(witness)));
-    let session = &items[at].source_session_id;
-    // The witness's parse on this page is its current revision by construction.
+/// A file's request ids at its current revision: its parse on this page
+/// (current by construction), else its census record while that still
+/// proves the file.
+enum Witness<'a> {
+    Page(&'a BTreeSet<String>),
+    Census(&'a super::super::claude_request_census::ClaudeRequestCensusRecord),
+}
+impl Witness<'_> {
+    fn holds(&self, request_id: &str) -> bool {
+        match self {
+            Self::Page(ids) => ids.contains(request_id),
+            Self::Census(record) => record.holds_hash(claude_request_hash(request_id)),
+        }
+    }
+}
+
+/// `key`'s current witness: `session`'s parse at that path on this page,
+/// else its census record. None: the file is not read at its current
+/// revision (or has no scan state).
+fn current_witness<'a>(
+    items: &'a [SnapshotItem],
+    session: &str,
+    key: &str,
+    index: &'a ScanIndex,
+) -> Option<Witness<'a>> {
+    let location = Some(Located(location_key(key)));
     let on_page = items.iter().find(|item| {
-        &item.source_session_id == session
+        item.source_session_id == session
             && item
                 .claude_money
                 .as_deref()
                 .is_some_and(|fold| fold.location == location)
     });
-    let uncovered = match on_page {
-        Some(original) => Some(
-            skipped_ids(&items[at])
-                .filter(|id| !original.claude_usage_request_ids.contains(*id))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
+    match on_page {
+        Some(item) => Some(Witness::Page(&item.claude_usage_request_ids)),
         None => index
             .claude_request_census
-            .get(witness)
-            .filter(|record| scan_evidence(index, witness, record) == Evidence::Current)
-            .map(|record| {
-                skipped_ids(&items[at])
-                    .filter(|id| !record.holds_hash(claude_request_hash(id)))
-                    .cloned()
-                    .collect()
-            }),
-    };
+            .get(key)
+            .filter(|record| scan_evidence(index, key, record) == Evidence::Current)
+            .map(Witness::Census),
+    }
+}
+
+fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
+    let session = &items[at].source_session_id;
+    let uncovered = current_witness(items, session, witness, index).map(|witness| {
+        skipped_ids(&items[at])
+            .filter(|id| !witness.holds(id))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     match uncovered {
         Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
         None => hold_copies(&mut items[at], "held_twin_unproven"),
+    }
+}
+
+/// A forked subagent's first line repeats the parent's last response: the
+/// subagent's first response counts once, at the root, when the root's
+/// current witness holds its request id. A root not read at its current
+/// revision leaves it counted (no hold, counted as deferred); the
+/// subagent's next page decides again.
+fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &ScanIndex) {
+    let item = &items[at];
+    let first = item
+        .claude_usage_occurrences
+        .iter()
+        .min_by_key(|(_, occurrence)| occurrence.sequence);
+    let Some((id, sequence)) = first.map(|(id, occurrence)| (id.clone(), occurrence.sequence))
+    else {
+        return;
+    };
+    let root = claude_snapshot_family_root_ref(item);
+    let copied = match current_witness(items, root, root_key, index) {
+        Some(witness) => witness.holds(&id),
+        None => {
+            let deferred = index
+                .claude_request_census
+                .get(root_key)
+                .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
+            record_counts(Counts::one(29, u64::from(deferred)));
+            diag("family_copy_deferred", u64::from(deferred));
+            false
+        }
+    };
+    // The proof is this fold's, so the fold is present.
+    let SnapshotItem {
+        claude_money: Some(fold),
+        claude_usage_occurrences,
+        ..
+    } = &mut items[at]
+    else {
+        return;
+    };
+    if copied && !fold.is_skipped(sequence) {
+        fold.drop_family_duplicate(&claude_usage_occurrences[&id]);
     }
 }
 
@@ -2972,11 +3102,19 @@ fn attach_one(
     // Keep the existing wire bucket activity clock. Identity independently
     // folds own-request clocks after attachment; observer time never decides
     // the local current account.
+    let observed = rfc3339_unix_nanos(&row.observed_at);
     let at = (reported.0 .0 != estimated.0 .0)
-        .then(|| rfc3339_unix_nanos(&row.observed_at))
+        .then_some(observed)
         .flatten();
     fold.entity
         .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
+    // The request's activity time is the later of its transcript and row
+    // clocks, so it never moves back when its evidence moves from the side
+    // row to the transcript. Only the entity clock: hours, buckets and owner
+    // clocks keep the transcript's.
+    if let Some(observed) = observed {
+        fold.entity.activity_nanos = fold.entity.activity_nanos.max(observed);
+    }
     // A copied marker's lent account follows its request to the reported slot.
     if let Some(lent) = fold
         .accounts
@@ -3653,10 +3791,16 @@ pub(crate) fn side_calls_page(
     unresolved
 }
 
-/// Every path component of the directories the traversal queued but has not
+/// Every path component of the directories the census walk queued but has not
 /// listed. A family's member transcripts live under `<root>/subagents/`; the
 /// root file being on a page means its own directory was listed, so the
 /// family's directory is still to be listed exactly when `<root>` is here.
+/// A re-listing pass's directories (not census members) are left out, so
+/// their roots do not wait. That pass starts only once the walk's directory
+/// queue is empty, so the two never share it. Its members are NOT guaranteed
+/// observed: a directory or member created after the walk is unknown until
+/// listed. Once a member is listed, the observed-index (`unread_members`)
+/// and family-census guards still apply.
 fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
@@ -3668,6 +3812,7 @@ fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
 fn directory_names(queued: &VecDeque<ScanTraversalPath>) -> BTreeSet<String> {
     queued
         .iter()
+        .filter(|directory| directory.census_member)
         .flat_map(|directory| directory.path.components())
         .filter_map(|component| match component {
             std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
@@ -3699,6 +3844,11 @@ pub(in crate::snapshots) fn defer_roots_of_queued_families(
         });
     *selected = kept;
     diag("deferred_root_queued_family", deferred.len() as u64);
+    crate::local_resource_diagnostics::page_selection(
+        "claude_code",
+        crate::local_resource_diagnostics::PageSelection::DeferredRoots,
+        deferred.len() as u64,
+    );
     let locations = deferred
         .iter()
         .map(|candidate| location_key(&local_index_key(&candidate.path)))
@@ -4332,8 +4482,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     "copy_prefix_late_origin_removed",
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
+    // A forked subagent's first-line copy counted because its root was not
+    // read at its current revision; its next page decides again.
+    "family_copy_deferred",
 ];
-const COUNT_LEN: usize = 29;
+const COUNT_LEN: usize = 30;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4407,7 +4560,7 @@ impl Counts {
         all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..28) by `n`.
+    /// One enable-readiness counter (index 24..29) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;
@@ -4443,6 +4596,14 @@ mod tests;
 #[cfg(test)]
 #[path = "e2_holder_redrift_tests.rs"]
 mod holder_redrift_tests;
+
+#[cfg(test)]
+#[path = "e2_family_duplicate_tests.rs"]
+mod family_duplicate_tests;
+
+#[cfg(test)]
+#[path = "e2_activity_clock_tests.rs"]
+mod activity_clock_tests;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.

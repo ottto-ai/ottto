@@ -37,6 +37,7 @@ mod upload;
 
 pub use harvest::run_context_composition_worker;
 pub(super) use harvest::spawn_v2_sync;
+pub(crate) use harvest::{erase_all_state, erase_source_state};
 
 use std::time::Duration;
 

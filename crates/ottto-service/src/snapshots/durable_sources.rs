@@ -68,7 +68,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         state_v2: true,
         write_format: 3,
         representations: &representations(
-            "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
+            "cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3",
         ),
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
@@ -85,7 +85,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         state_v2: true,
         write_format: 3,
         representations: &representations(
-            "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
+            "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189",
         ),
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,
@@ -102,7 +102,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         state_v2: true,
         write_format: 3,
         representations: &representations(
-            "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
+            "10a14138dc3d8c6c41f499fb728e96b9755ab21b87b7e850386a2c39a513f527",
         ),
         #[cfg(unix)]
         decode_bounded: durable::decode_body_bounded,

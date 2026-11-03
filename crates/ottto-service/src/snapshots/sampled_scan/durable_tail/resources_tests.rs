@@ -79,7 +79,6 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
             "2026-10-20T12:00:00Z",
             365,
             100,
-            false,
             Some(&scratch),
             &[],
             false,

@@ -691,7 +691,6 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         "2026-10-22T00:00:00Z",
         BACKFILL_WINDOW_DAYS,
         4,
-        false,
     )
     .unwrap();
     scan.snapshots = vec![snapshot];
@@ -1568,6 +1567,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "accepted_rebuild_last_alarm_unix_seconds"
             | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
+            "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
+            "tail_discovery" => serde_json::json!({"deleted_unaccepted_files": 1}),
             "upload_context_fingerprint"
             | "codex_parent_proof_cursor"
             | "codex_parent_side_cursor"
@@ -1605,6 +1606,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                     *name,
                     "reread_guard"
                         | "upload_context_fingerprint"
+                        | "claude_desktop_census_witness"
                         | "claude_desktop_store_inventory"
                         | "context_curve_capability_enabled"
                         | "context_curve_replay_epoch"
@@ -1617,6 +1619,28 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
     assert!(decoded.decode_holds.is_empty());
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
+}
+
+/// [format] An older index holding the retired Desktop census witness still
+/// loads on every decoder; the slot is dropped and never written again.
+#[test]
+fn retired_desktop_census_witness_decodes_and_drops() {
+    let _on = RestartRestoreForTest::enabled();
+    let current = serde_json::to_value(fixture()).unwrap();
+    assert!(current.get("claude_desktop_census_witness").is_none());
+    let mut older = current.clone();
+    older["claude_desktop_census_witness"] = serde_json::json!({
+        "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
+    });
+    let bytes = serde_json::to_vec(&older).unwrap();
+    let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+    let streaming =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    for decoded in [native, streaming, bounded] {
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
+    }
 }
 
 /// [format] historical named and positional writers preserve appended v1 fields.
@@ -1636,6 +1660,9 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
@@ -1763,6 +1790,9 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
@@ -1809,7 +1839,9 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[89], "archives");
     assert_eq!(fields[90], "archive_deferred_alarm_count");
     assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
-    assert_eq!(fields.len(), 92);
+    assert_eq!(fields[92], "claude_folder_login_ledger");
+    assert_eq!(fields[93], "tail_discovery");
+    assert_eq!(fields.len(), 94);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1838,6 +1870,9 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -1986,7 +2021,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 "2026-10-22T00:01:00Z",
                 BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
                 None,
                 &[],
                 false,
@@ -2030,7 +2064,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     "2026-10-22T00:01:00Z",
                     BACKFILL_WINDOW_DAYS,
                     MAX_BACKFILL_FILES_PER_SOURCE,
-                    true,
                     None,
                     &[],
                     false,
@@ -2124,7 +2157,6 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                         "2026-10-22T00:03:00Z",
                         BACKFILL_WINDOW_DAYS,
                         MAX_BACKFILL_FILES_PER_SOURCE,
-                        true,
                         None,
                         &[],
                         false,
@@ -3871,6 +3903,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
             identity_basis: claude_request_identity::TELEMETRY.to_owned(),
             provider_workspace_hash: Some("d".repeat(64)),
             account_source: None,
+            sole_login_witness: None,
         });
         let tags = as_json(&item.request_evidence);
         let mut items = [item];
@@ -4061,6 +4094,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     }
 }
 
+/// [format] Legacy count slots survive load/save while retired refusal counts become zero.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
@@ -4106,6 +4140,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
+        // Load retires only this decoded legacy value; neighboring positional counts survive.
+        expected["oversized_file_count"] = serde_json::json!(0);
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
@@ -4186,7 +4222,7 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "claude_desktop_store_sweep_had_errors",
             "claude_desktop_identity_census_complete",
             "claude_desktop_lineage_census_complete",
-            "claude_desktop_census_witness",
+            "claude_desktop_census_witness", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "claude_desktop_store_retry_attempt",
             "claude_desktop_store_retry_not_before_unix_seconds",
             "resume_after_path",
@@ -4228,6 +4264,28 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "archives",
             "archive_deferred_alarm_count",
             "copy_prefix_last_accepted_nonce",
+            "claude_folder_login_ledger",
+            "tail_discovery",
         ]
     );
+}
+
+#[test]
+fn folder_login_ledger_old_state_loads_empty_and_damage_never_refuses() {
+    let read = |bytes: &[u8]| {
+        lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap()
+    };
+    assert!(read(br#"{"files":{}}"#)
+        .claude_folder_login_ledger
+        .is_empty());
+    assert_eq!(
+        read(br#"{"files":{},"claude_folder_login_ledger":17}"#).claude_folder_login_ledger,
+        crate::snapshots::claude_folder_login::damaged_ledger(),
+        "damage can never un-stick a mixed folder"
+    );
+    let kept = read(
+        br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":true}}}"#,
+    );
+    assert_eq!(kept.claude_folder_login_ledger.len(), 1);
+    assert!(kept.claude_folder_login_ledger.contains_key("folder"));
 }

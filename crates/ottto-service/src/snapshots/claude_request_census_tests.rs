@@ -153,7 +153,7 @@ fn write_census_corpus(root: &Path) {
             ),
         ],
     );
-    // Terminal line loss over the line cap.
+    // A large valid line must preserve census completeness.
     census_write(
         root,
         "canary-over-line-cap.jsonl",
@@ -167,7 +167,7 @@ fn write_census_corpus(root: &Path) {
             ),
             census_user_line(
                 "canary-over-line-cap",
-                &"x".repeat(MAX_JSONL_LINE_BYTES + 1024),
+                &"x".repeat(16_777_216 + 1024),
             ),
         ],
     );
@@ -270,7 +270,7 @@ fn expected_census_table() -> BTreeMap<String, CanaryRow> {
             vec!["req_idless_1"],
         ),
         ("canary-invalid-fork.jsonl", "lossy", vec!["req_badfork_1"]),
-        ("canary-over-line-cap.jsonl", "lossy", vec!["req_cap_1"]),
+        ("canary-over-line-cap.jsonl", "exact", vec!["req_cap_1"]),
         ("canary-path.jsonl", "exact", vec!["req_alias_1"]),
         ("canary-progressive.jsonl", "exact", vec!["req_prog"]),
         (
@@ -381,7 +381,6 @@ fn census_scan(root: &Path, index: &mut ScanIndex, collected_at: &str) -> Source
         collected_at,
         365,
         1_000,
-        true,
     )
     .expect("scan synthetic Claude corpus")
 }
@@ -1384,7 +1383,6 @@ fn census_failed_read_invalidates_old_record() {
         SECOND_WINDOW,
         365,
         100,
-        true,
         None,
         &[],
         false,
@@ -1933,7 +1931,6 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
             FIRST_WINDOW,
             365,
             1_000,
-            true,
             None,
             &[],
             false,

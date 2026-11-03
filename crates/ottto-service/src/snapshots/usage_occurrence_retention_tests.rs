@@ -53,7 +53,6 @@ fn parsed_items(rows: &[Value]) -> Vec<SnapshotItem> {
         None,
         None,
         None,
-        true,
         None,
     )
     .unwrap();

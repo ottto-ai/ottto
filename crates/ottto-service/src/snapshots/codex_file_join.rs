@@ -545,9 +545,6 @@ impl HeaderInventory {
                 for path in self.archive_pending.iter().take(MAX_HEADER_FILES) {
                     let key = local_index_key(path);
                     if let Ok(meta) = fs::symlink_metadata(path) {
-                        if index.archive_size_refused(path, meta.len()) {
-                            continue;
-                        }
                         if let Ok(stamp) = FileStamp::capture(meta.clone()) {
                             if index.archives.get(&key).map_or(true, |old| {
                                 old.stamp
@@ -569,7 +566,6 @@ impl HeaderInventory {
                             let paced = a.header_paced();
                             let w = a.work.get_or_insert_with(Box::default);
                             if w.header.is_none() && !paced {
-                                w.header_attempts = w.header_attempts.saturating_add(1);
                                 w.header_retry_after = 0;
                                 w.reservation = ArchiveReservation::HeaderSave;
                                 index.archive_pass.dirty = true;
@@ -946,6 +942,8 @@ pub(super) const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 pub struct AppliedTierReceipt {
     version: u16,
     derivation: String,
+    /// The delivery context it was written under, kept for older readers. Never
+    /// compared: no setting or capability changes which tier a record carries.
     scope: String,
     records: usize,
     prefix_digest: String,
@@ -989,10 +987,18 @@ impl AppliedTierReceipt {
         }
         bytes.0
     }
+    /// What a parse reads of this receipt: everything but the delivery context
+    /// it was written under.
+    pub(in crate::snapshots) fn parse_input(&self) -> String {
+        serde_json::to_string(&Self {
+            scope: String::new(),
+            ..self.clone()
+        })
+        .unwrap_or_else(|_| "unserializable".to_owned())
+    }
     pub(super) fn covered_by(&self, previous: &Self) -> bool {
         self.version == previous.version
             && self.derivation == previous.derivation
-            && self.scope == previous.scope
             && self
                 .tiers
                 .iter()
@@ -1042,7 +1048,6 @@ impl TierReplay {
         let invalid = previous.as_ref().is_some_and(|receipt| {
             receipt.version != RECEIPT_VERSION
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
-                || receipt.scope != scope
                 || receipt.records == 0
                 || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
                 || receipt.tiers.len() > MAX_APPLIED_TIERS
@@ -2000,14 +2005,12 @@ pub(super) mod tests {
             metadata: &metadata,
             traces,
             ledgers: None,
-            artifacts: false,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
             metadata: &metadata,
             attribution: None,
-            artifacts: false,
             live_scope: &no_scope,
         };
         for _ in 0..10_000 {
@@ -2255,7 +2258,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             limit,
-            false,
             None,
             &[],
             false,
@@ -2622,7 +2624,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2800,7 +2801,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2833,7 +2833,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -2928,7 +2927,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             2,
-            false,
             None,
             &[],
             false,
@@ -3031,7 +3029,6 @@ pub(super) mod tests {
             RETAINED_AT,
             7,
             10,
-            false,
             None,
             hints,
             false,
@@ -3401,7 +3398,6 @@ pub(super) mod tests {
             "2026-10-06T23:00:00Z",
             7,
             3,
-            false,
             None,
             &[],
             false,
@@ -3504,7 +3500,7 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn missing_protected_receipt_rewrite_scope_change_or_cap_holds_correction() {
+    fn missing_protected_receipt_rewrite_or_cap_holds_correction_but_scope_does_not() {
         let rows = member("owner", "r", 100, 100);
         let mut replay = TierReplay::new(None, false, "scope".into());
         for row in &rows {
@@ -3517,16 +3513,16 @@ pub(super) mod tests {
             .is_err());
         let mut changed = rows.clone();
         changed[0]["payload"]["id"] = json!("other");
-        for (rows, scope) in [
-            (changed.as_slice(), "scope"),
-            (rows.as_slice(), "other-scope"),
+        for (rows, scope, holds) in [
+            (changed.as_slice(), "scope", true),
+            (rows.as_slice(), "other-scope", false),
         ] {
             let mut replay = TierReplay::new(Some(receipt.clone()), true, scope.into());
             for row in rows {
                 replay.observe(row);
             }
             replay.admitted(Some(("a".repeat(64), "derived_from_logs_2".into())));
-            assert!(replay.finish().is_err());
+            assert_eq!(replay.finish().is_err(), holds, "{scope}");
         }
         let mut replay = TierReplay::new(None, false, "scope".into());
         for i in 0..=MAX_APPLIED_TIERS {
@@ -3977,7 +3973,6 @@ pub(super) mod tests {
                 None,
                 traces.clone(),
                 None,
-                false,
                 None,
             )
             .unwrap();
@@ -4024,9 +4019,9 @@ pub(super) mod tests {
                 _ => panic!("the legacy group boots"),
             }
         }
-        assert!(context.launches_prepared(&workers));
+        assert!(context.launch_events().prepared(&workers));
         context.expire_launch_lookup_for_test();
-        assert!(!context.launches_prepared(&workers));
+        assert!(!context.launch_events().prepared(&workers));
         let events = root.join(".ottto/launch-events/processed");
         fs::create_dir_all(&events).unwrap();
         for n in 1..=600 {
@@ -4052,7 +4047,6 @@ pub(super) mod tests {
                 metadata: &metadata,
                 traces: None,
                 ledgers: None,
-                artifacts: false,
                 index: &previous,
             })
             .unwrap();
@@ -4060,7 +4054,6 @@ pub(super) mod tests {
         let inputs = StepInputs {
             metadata: &metadata,
             attribution: Some(&context),
-            artifacts: false,
             live_scope: &no_scope,
         };
         let (mut steps, mut yields) = (0, 0);
@@ -4091,7 +4084,7 @@ pub(super) mod tests {
             "completed members must not be read twice"
         );
         assert_eq!(job.group.as_mut().unwrap().take_legacy_baselines().len(), 2);
-        assert!(context.launches_prepared(&workers));
+        assert!(context.launch_events().prepared(&workers));
         fs::remove_dir_all(root).unwrap();
     }
 

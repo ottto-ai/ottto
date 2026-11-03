@@ -208,7 +208,6 @@ impl ArchiveWork {
             self.reservation,
             ArchiveReservation::HeaderSave | ArchiveReservation::HeaderReady
         ) {
-            self.header_attempts = self.header_attempts.saturating_sub(1);
             self.header_retry_after = 0;
             self.reservation = ArchiveReservation::None;
         }
@@ -844,9 +843,7 @@ impl super::ScanIndex {
         use super::*;
         let key = local_index_key(&candidate.path);
         let meta = std::fs::symlink_metadata(&candidate.path)?;
-        if self.archive_size_refused(&candidate.path, meta.len()) {
-            return Ok(HeaderRead::Deferred);
-        }
+
         let stamp = crate::transcript_acquisition::FileStamp::capture(meta.clone())?;
         if self.archives.get(&key).map_or(true, |a| {
             a.stamp
@@ -881,7 +878,7 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Deferred);
         }
         self.archive_pass.started = true;
-        // An attempt is spent only once a funded reader is about to read.
+        // An attempt is spent only once a funded reader exists, below.
         let file = match open_candidate_beneath_root(candidate) {
             Ok(file) => file,
             Err(error) => {
@@ -906,6 +903,7 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Deferred);
         };
         if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+            w.header_attempts = w.header_attempts.saturating_add(1);
             w.reservation = ArchiveReservation::None;
         }
         input = input.header_only();
@@ -1333,7 +1331,6 @@ pub(in crate::snapshots) mod tests {
             Some(&CodexTitleMetadata::default()),
             None,
             None,
-            false,
         )
         .unwrap()
     }
@@ -1725,7 +1722,6 @@ pub(in crate::snapshots) mod tests {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -2130,7 +2126,7 @@ pub(in crate::snapshots) mod tests {
                                 .work
                                 .as_mut()
                                 .unwrap();
-                            assert_eq!(w.header_attempts, 1);
+                            assert_eq!(w.header_attempts, 0, "reserved, not read");
                             assert!(w.reservation == ArchiveReservation::None);
                             assert!(w.header_retry_after > sampled_scan::now_seconds());
                             w.header_retry_after = 0;
@@ -3093,10 +3089,11 @@ pub(in crate::snapshots) mod tests {
         );
     }
 
-    /// [money] Correction debt alarms once per context transition, and the
-    /// accepted head never grants a new archive Full on policy/replay churn.
+    /// [money] Correction debt alarms once per replay transition, and the
+    /// accepted head never grants a new archive Full on replay churn. A
+    /// setting or capability change holds no correction at all.
     #[test]
-    fn archive_context_change_holds_correction_without_regrant() {
+    fn archive_replay_holds_correction_without_regrant_but_context_does_not() {
         let _lock = DECODER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3126,8 +3123,8 @@ pub(in crate::snapshots) mod tests {
             );
         }
         let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
-            batch.hold_archive_corrections(None);
-            batch.hold_archive_corrections(None);
+            batch.hold_archive_corrections();
+            batch.hold_archive_corrections();
         });
         assert_eq!(batch.archive_owed_count(), 4);
         assert_eq!(
@@ -3137,9 +3134,14 @@ pub(in crate::snapshots) mod tests {
                 .count(),
             1
         );
-        for replay in [false, true] {
-            // No source-wide context is adopted (retired): each archive
-            // marker's own context decides the correction hold below.
+        let mut flipped = index.clone();
+        let owed = flipped.archive_owed_count();
+        let (_, logs) = crate::local_resource_diagnostics::capture(|| {
+            flipped.activate_file_upload_context(SnapshotSource::Codex, "changed".into())
+        });
+        assert_eq!(flipped.archive_owed_count(), owed);
+        assert!(!logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
+        {
             let mut durable = index.clone();
             let checkpoint = fixture(b"", ".json");
             fs::remove_file(&checkpoint.0).unwrap();
@@ -3148,12 +3150,7 @@ pub(in crate::snapshots) mod tests {
             let mut changed = ScanIndex::load(&checkpoint.0).unwrap();
             let (_, logs) = crate::local_resource_diagnostics::capture(|| {
                 for _ in 0..2 {
-                    if replay {
-                        changed.prepare_historical_replay("changed".into());
-                    } else {
-                        changed
-                            .activate_file_upload_context(SnapshotSource::Codex, "changed".into());
-                    }
+                    changed.prepare_historical_replay("changed".into());
                 }
             });
             assert_eq!(changed.archive_owed_count(), 1);
@@ -3258,7 +3255,6 @@ pub(in crate::snapshots) mod tests {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -3408,7 +3404,8 @@ pub(in crate::snapshots) mod tests {
     }
 
     /// [money] An exact archive ACK on an incomplete initial census keeps its
-    /// own context across reload; later acquisitions retain the new context.
+    /// own context across reload; later acquisitions retain the new context. A
+    /// context change re-owes no archive.
     #[test]
     fn archive_context_is_per_marker_before_source_context_promotion() {
         let _lock = DECODER_TEST_LOCK
@@ -3496,21 +3493,11 @@ pub(in crate::snapshots) mod tests {
             let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
                 index.activate_file_upload_context(SnapshotSource::Codex, "changed".into())
             });
-            assert_eq!(
-                alarms
-                    .iter()
-                    .filter(|l| l["stage"] == "durable_tail_alarm")
-                    .count(),
-                usize::from(phase == "first")
-            );
-            assert!(!alarms
-                .iter()
-                .any(|l| l["stage"] == "codex_zst_input" || l["stage"] == "codex_zst_inventory"));
-            assert_eq!(index.archive_owed_count(), 1);
-            assert_eq!(
-                index.archives[&local_index_key(&f.0)].owed_cause(),
-                Some(CodexZstCause::CorrectionUnapplied)
-            );
+            assert!(!alarms.iter().any(|l| l["stage"] == "durable_tail_alarm"
+                || l["stage"] == "codex_zst_input"
+                || l["stage"] == "codex_zst_inventory"));
+            assert_eq!(index.archive_owed_count(), 0);
+            assert_eq!(index.archives[&local_index_key(&f.0)].owed_cause(), None);
             if phase == "changed" {
                 let b = f.0.parent().unwrap().join("rollout-new.jsonl.zst");
                 assert!(matches!(
@@ -3525,74 +3512,26 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
-    /// [off=main] A cold oversized archive is archive-only debt; the plain
-    /// census and real source finish still complete, with a transition alarm.
+    /// [regress] Compressed byte length never refuses an archive before decoder admission.
     #[test]
-    #[serial_test::serial]
-    #[serial_test::serial(source_cadences, source_manifests, client_report)]
-    fn cold_oversized_archive_keeps_plain_finish_and_disclosed_custody() {
-        let _lock = DECODER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f =
+    fn archive_over_the_former_file_limit_reaches_opened_identity() {
+        let fixture =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let bytes = former_file_cap(SnapshotSource::Codex) + 1;
         File::options()
             .write(true)
-            .open(&f.0)
+            .open(&fixture.0)
             .unwrap()
-            .set_len(max_jsonl_file_bytes(SnapshotSource::Codex) + 1)
+            .set_len(bytes)
             .unwrap();
-        let plain = f.0.parent().unwrap().join("rollout-plain.jsonl");
-        fs::write(
-            &plain,
-            String::from_utf8(synthetic_rollout())
-                .unwrap()
-                .replace("compressed-fixture", "plain"),
-        )
-        .unwrap();
-        let mut candidate = f.candidate();
-        let error =
+        let mut candidate = fixture.candidate();
+        let (file, _) =
             open_candidate_file_stat_retained(SnapshotSource::Codex, &mut candidate, None, false)
-                .unwrap_err();
-        assert!(error.get_ref().unwrap().is::<ArchiveAdmissionYield>());
-        let scan = OwnedSourceScan::new(
-            SnapshotSource::Codex,
-            &[f.0.parent().unwrap().to_owned()],
-            ScanIndex::default(),
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            false,
-            None,
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(
-            Arc::new(sampled_scan::SharedCache::default()),
-            Scope("archive-size-test".into()),
-        );
-        let checkpoint = fixture(b"", ".json");
-        fs::remove_file(&checkpoint.0).unwrap();
-        let ((index, mut result), logs) =
-            crate::local_resource_diagnostics::capture(|| finish_selector(scan, &checkpoint.0));
-        assert!(result.census_complete);
-        assert_eq!(result.oversized_file_count, 0);
-        assert_eq!(result.unreadable_path_count, 0);
-        assert!(result.archive_owed_count > 0);
-        assert_eq!(result.snapshots.len(), 1);
-        assert_eq!(result.snapshots[0].input_tokens, 750);
-        assert!(logs.iter().any(|l| l["stage"] == "durable_tail_alarm"));
-        assert!(!logs
-            .iter()
-            .any(|l| l["stage"] == "codex_zst_input" || l["stage"] == "codex_zst_inventory"));
-        let accepted = crate::snapshot_sync::archive_upload_checkpoint(
-            index.clone(),
-            &result,
-            &index,
-            "accept",
-        );
-        result.snapshots.clear();
-        crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(accepted, result, 0);
+                .expect("archive size is not decoder admission");
+        assert_eq!(file.metadata().unwrap().len(), bytes);
+        assert_eq!(candidate.size_bytes, bytes);
+        // This exercises bounded metadata/identity admission only. Appended
+        // sparse padding is not a valid archive and is not sent to the decoder.
     }
 
     /// [format] Unopened header permission is cancelled, an opened attempt stays
@@ -3615,7 +3554,7 @@ pub(in crate::snapshots) mod tests {
             index.archives.insert(key.clone(), a);
             index.disclose_archive_debt();
             let w = index.archives[&key].work.as_ref().unwrap();
-            assert_eq!(w.header_attempts, u64::from(opened));
+            assert_eq!(w.header_attempts, 1, "a cancellation refunds nothing");
             assert_eq!(w.header_retry_after > 0, opened);
             index.archives.clear();
             index.archive_pass.deferred.insert(key.clone());
@@ -3799,7 +3738,6 @@ pub(in crate::snapshots) mod tests {
                 NOW,
                 7,
                 10,
-                false,
                 None,
                 &[],
                 false,

@@ -1,8 +1,8 @@
 //! Codex usage counting V2: one billed request is counted once at its native
 //! usage. Local only: never uploaded except where the upload contract
 //! already carries it; persisted only in the local durable-tail store (raw
-//! response and turn ids are class `L`). Legacy sessions never construct this
-//! state.
+//! response and turn ids are class `L`). A Legacy session constructs it only
+//! for the shared equal-total repeat gate, at its first counted UI line.
 //!
 //! Native `token_usage_record`s are the authority for their turn. Coverage on
 //! the native thread counter (`[before, after)`, six dimensions) decides what
@@ -49,7 +49,9 @@ pub(super) struct CodexCounting {
     evidence: AckEvidence,
     cutover_unix_ms: Option<i64>,
     version: Option<CountingVersion>,
-    /// Boxed: a Legacy decision keeps only the pointer slot.
+    /// Boxed: a Legacy decision keeps only the pointer slot until its first
+    /// counted UI line, then only the repeat gate's state. The version, never
+    /// this slot, decides V2.
     reducer: Option<Box<OccurrenceReducer>>,
 }
 
@@ -116,7 +118,7 @@ impl CodexCounting {
     }
 
     /// Adds this parse's receipts and open-turn debt to the scan's local
-    /// diagnostics. A Legacy decision adds nothing.
+    /// diagnostics. A Legacy decision adds only its repeat drops.
     pub(super) fn fold_receipts(&self, into: &mut CountingV2Receipts) {
         let Some(reducer) = self.reducer.as_deref() else {
             return;
@@ -128,7 +130,10 @@ impl CodexCounting {
             }
         };
         let c = &reducer.counters;
-        count(&mut into.v2_sessions, 1);
+        count(
+            &mut into.v2_sessions,
+            u64::from(self.version == Some(CountingVersion::V2)),
+        );
         count(&mut into.native_counted, c.native_counted);
         count(&mut into.native_not_authority, c.native_not_authority);
         count(&mut into.native_restated, c.native_restated);
@@ -587,6 +592,35 @@ impl OccurrenceReducer {
         self.native_since_prev_ui = false;
     }
 
+    /// This line's UI candidate: parsed `last`/`total` beside the raw pair
+    /// read for it. `None` without `last`, which never matches.
+    fn take_ui_tuple(&mut self, last: Option<UsageTotals>, total: UsageTotals) -> Option<UiTuple> {
+        self.line_ui
+            .take()
+            .zip(last)
+            .map(|((last_t6, total_t6), last)| UiTuple {
+                last,
+                total,
+                last_t6,
+                total_t6,
+            })
+    }
+
+    /// The one equal-total repeat gate (V2 bound turns and Legacy): the same
+    /// `last` and total as the previous UI candidate, with no native between,
+    /// is a re-emission. A decreased total never matches. Counts the drop.
+    fn equal_total_repeat(&mut self, tuple: &Option<UiTuple>, delta: &UsageTotals) -> bool {
+        let repeat = !self.native_since_prev_ui && tuple.is_some() && *tuple == self.prev_ui;
+        if repeat {
+            self.counters.ui_equal_total_repeat += 1;
+            add_t6(
+                &mut self.counters.ui_equal_total_repeat_usage,
+                &totals_t6(delta),
+            );
+        }
+        repeat
+    }
+
     /// Enters a closed id into the filter and, once, into the exact ring.
     fn remember_closed(&mut self, id: String) {
         self.closed_filter
@@ -659,6 +693,21 @@ impl SnapshotAccumulator {
             if version == CountingVersion::V2 {
                 counting.reducer = Some(Box::default());
             }
+        }
+        if counting.version != Some(CountingVersion::V2) {
+            // Legacy keeps only the shared repeat gate's state, allocated at
+            // its first UI line with a nonzero `last` (the first one it
+            // counts). Turns, natives and closures stay V2-only.
+            let line_ui = ui_t6_pair(value);
+            if counting.reducer.is_none()
+                && line_ui.is_some_and(|(last, _)| last.iter().any(|tokens| *tokens != 0))
+            {
+                counting.reducer = Some(Box::default());
+            }
+            if let Some(reducer) = counting.reducer.as_mut() {
+                reducer.line_ui = line_ui;
+            }
+            return;
         }
         let Some(reducer) = counting.reducer.as_mut() else {
             return;
@@ -946,6 +995,29 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
+    /// Legacy's use of the shared repeat gate for a line it would count.
+    /// `true` drops the line. Without the slot (no counted UI line yet) there
+    /// is nothing to repeat. `may_drop` is false for a line dated before the
+    /// forward date: it counts and is not a counted drop, but its tuple is
+    /// still noted.
+    pub(super) fn codex_legacy_ui_repeat(
+        &mut self,
+        last: Option<UsageTotals>,
+        total: UsageTotals,
+        delta: &UsageTotals,
+        may_drop: bool,
+    ) -> bool {
+        let Some(reducer) = self.codex_occurrence() else {
+            return false;
+        };
+        let tuple = reducer.take_ui_tuple(last, total);
+        if may_drop && reducer.equal_total_repeat(&tuple, delta) {
+            return true;
+        }
+        reducer.note_ui(tuple);
+        false
+    }
+
     /// Shared admission decision, with no publication/staging. `false` is
     /// the unbound span admitted before the bound equal-total repeat filter.
     pub(super) fn decide_codex_usage(
@@ -982,29 +1054,13 @@ impl SnapshotAccumulator {
             return None;
         }
         let reducer = self.codex_occurrence()?;
-        let tuple = reducer
-            .line_ui
-            .take()
-            .zip(last_usage)
-            .map(|((last_t6, total_t6), last)| UiTuple {
-                last,
-                total: usage,
-                last_t6,
-                total_t6,
-            });
+        let tuple = reducer.take_ui_tuple(last_usage, usage);
         if reducer.turn.is_none() {
             reducer.counters.ui_in_unbound_span += 1;
             reducer.note_ui(tuple);
             return Some((resolved_model, legacy_delta, false));
         }
-        // Same `last` and same total as the previous UI candidate with
-        // no native between is a re-emission. A decreased total never matches.
-        if !reducer.native_since_prev_ui && tuple.is_some() && tuple == reducer.prev_ui {
-            reducer.counters.ui_equal_total_repeat += 1;
-            add_t6(
-                &mut reducer.counters.ui_equal_total_repeat_usage,
-                &totals_t6(&legacy_delta),
-            );
+        if reducer.equal_total_repeat(&tuple, &legacy_delta) {
             return None;
         }
         reducer.note_ui(tuple);

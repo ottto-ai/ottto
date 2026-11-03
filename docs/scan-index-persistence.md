@@ -30,10 +30,13 @@ allows collection-wide queues to grow without splitting their semantic members.
 Stored bytes still use the same optional zstd codec and `value_chunks` (256 KiB
 per part); compression cannot bypass the logical cap. Other kind caps are
 unchanged, including the existing 8 MiB birth-store allowance. This exception
-does not raise mutable account/usage caps or replace their segmentation policy
-(64 KiB target / 1 MiB segment cap).
+does not replace the mutable account/usage segmentation policy
+(64 KiB target / 1 MiB segment target).
 
-Above-cap values refuse with `state_v2_value_admission`. Before a durable fence,
+Mutable rows (account and usage families included) commit past their 1 MiB sizing
+target up to the 64 MiB physical row limit, and decode under the same bound; the
+target only drives `row_cap_alarm`. Values above a row's physical limit refuse
+with `state_v2_value_admission`. Before a durable fence,
 the existing import pause and alarm retain v1 collection and leave upload progress
 unchanged. After a fence, the existing named storage hold and diagnostics apply;
 no stale-v1 fallback or reset is permitted. See the recovery guidance below.
@@ -576,9 +579,11 @@ target still commits and halves the next page; a collection save under target
 grows it by 25 files up to the requested page. Claim-only saves preserve the page
 limit and any save-pressure hold. Charged work includes old/new values, chunks,
 reference updates, metadata, tombstones and restart staging. More than 256 MiB
-rolls back the whole save, reloads the committed graph and halves the page for a
-retry from committed checkpoints. If a page of one is still too large, the source
-holds with `state_v2_save_oversize` and an alarm. Uploads and ACKs stay fenced
+raises a counts-only alarm; the complete valid delta still commits. A logical
+value-admission failure rolls back the whole save, reloads the committed graph
+and halves the page for a retry from committed checkpoints. If value admission
+still fails at a page of one, the source holds with `state_v2_save_oversize` and
+an alarm. Uploads and ACKs stay fenced
 until a completed native retry and its recovery save succeed. UnACKed file
 entries keep their accepted progress during recovery. That file retries at most
 once per six hours, using the existing durable growth Full claim before payload
@@ -593,8 +598,9 @@ WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect.
 Each save or import that writes rows reports `row_cap_max`, the largest written
-row's logical bytes as a percent of its cap with its kind name, and
-`row_cap_alarm` at 75% or more; digest-unchanged rows are not rewritten or seen.
+row's logical bytes as a percent of its sizing target with its kind name, and
+`row_cap_alarm` at 75% or more, including above 100%, which commits and never
+refuses; digest-unchanged rows are not rewritten or seen.
 
 For an unknown field or other state-v2 load failure, an unpublished source keeps
 collecting through v1 and reports `import_paused` / `import_paused_alarm`.

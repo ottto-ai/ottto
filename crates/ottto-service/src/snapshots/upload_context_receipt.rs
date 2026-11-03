@@ -72,12 +72,66 @@ pub(crate) struct ProofState {
     replay_generation: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+    /// retired_<old>: the change-reason policy direction. Decode-only, so
+    /// state written with it still loads; never written.
+    #[serde(
+        rename = "direction",
+        default,
+        skip_serializing,
+        deserialize_with = "drop_retired_direction"
+    )]
+    retired_direction: (),
+}
+
+/// Reads the retired direction's exact old shape and drops it.
+fn drop_retired_direction<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "retired fields are decoded only for backward compatibility"
+    )]
+    struct Retired {
+        policy: [bool; 5],
+        context: Option<String>,
+        previous_context: Option<String>,
+        last_change_mask: u8,
+    }
+    Retired::deserialize(de).map(drop)
 }
 
 impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
         self.inputs.is_none() && self.entity_stamps.is_empty()
     }
+}
+
+/// The copy-prefix money mode forms of one base: base, resumed-prefix, then
+/// copy-unproven.
+fn mode_family(base: &str) -> [String; 3] {
+    let resumed = crate::snapshot_sync::resumed_prefix_upload_context(base.to_owned(), true);
+    let unproven = crate::snapshot_sync::copy_unproven_upload_context(resumed.clone(), true);
+    [base.to_owned(), resumed, unproven]
+}
+
+/// Two delivery contexts are one family when one is a mode form of the other.
+/// The copy-unproven form of `from` itself is the resumed-prefix form's own
+/// copy-unproven sibling: both are forms of one base.
+fn same_mode_family(left: &str, right: &str) -> bool {
+    let derives = |from: &str, to: &str| {
+        mode_family(from).iter().any(|form| form == to)
+            || crate::snapshot_sync::copy_unproven_upload_context(from.to_owned(), true) == to
+    };
+    derives(left, right) || derives(right, left)
+}
+
+/// The receipt proves this entry's exact bytes at this replay epoch: its source
+/// bytes and, unless the file is confirmed empty, the body set it delivered.
+fn receipt_binds_bytes(entry: &ScanIndexEntry, receipt: &Receipt, empty: bool) -> bool {
+    receipt.replay_generation == RECEIPT_REPLAY_EPOCH
+        && receipt.source_witness == entry.source_file_fingerprint
+        && (empty || entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness))
 }
 
 /// Measured backlog of entities and files that still owe proof under the
@@ -90,6 +144,8 @@ pub(crate) struct OwedCounts {
     pub wrong_context_bytes: u64,
     pub empty_pending_files: u64,
     pub empty_pending_bytes: u64,
+    /// Owed files that owe no read: they pay on their next ordinary read.
+    pub context_only_files: u64,
 }
 
 const OWED_LOG_INTERVAL_SECONDS: u64 = 3_600;
@@ -225,12 +281,9 @@ impl ScanIndex {
     }
 
     fn same_copy_prefix_base(&self, context: &str) -> bool {
-        let Some(base) = self.copy_prefix_base_upload_context.as_ref() else {
-            return false;
-        };
-        let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
-        let wire_on = crate::snapshot_sync::copy_unproven_upload_context(local_on.clone(), true);
-        context == base || context == local_on || context == wire_on
+        self.copy_prefix_base_upload_context
+            .as_ref()
+            .is_some_and(|base| mode_family(base).iter().any(|form| form == context))
     }
 
     pub(crate) fn set_copy_prefix_base_upload_context(&mut self, base: Option<String>) {
@@ -246,9 +299,7 @@ impl ScanIndex {
                 .as_ref()
                 .is_some_and(|receipt| {
                     self.same_copy_prefix_base(&receipt.context_fingerprint)
-                        && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
-                        && receipt.source_witness == entry.source_file_fingerprint
-                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                        && receipt_binds_bytes(entry, receipt, false)
                 })
         })
     }
@@ -272,19 +323,26 @@ impl ScanIndex {
 
     /// Proof bound to THIS file: its context, the replay epoch and the exact
     /// source bytes. A nonempty file also needs its exact final body set.
-    fn receipt_proves(&self, key: &str, entry: &ScanIndexEntry, receipt: &Receipt) -> bool {
+    fn receipt_proves(
+        &self,
+        key: &str,
+        entry: &ScanIndexEntry,
+        receipt: &Receipt,
+        empty: bool,
+    ) -> bool {
         self.proof_context_matches(key, &receipt.context_fingerprint)
-            && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
-            && receipt.source_witness == entry.source_file_fingerprint
+            && receipt_binds_bytes(entry, receipt, empty)
     }
 
+    /// Also refused when an entity it covers was sent since under another
+    /// context: the receipt no longer proves what the server holds.
     fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
         entry
             .upload_context_receipt
             .as_ref()
             .is_some_and(|receipt| {
-                self.receipt_proves(key, entry, receipt)
-                    && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                self.receipt_proves(key, entry, receipt, false)
+                    && !self.covered_entity_sent_elsewhere(key, &receipt.context_fingerprint)
             })
     }
 
@@ -294,7 +352,7 @@ impl ScanIndex {
         entry
             .upload_context_receipt
             .as_ref()
-            .is_some_and(|receipt| self.receipt_proves(key, entry, receipt))
+            .is_some_and(|receipt| self.receipt_proves(key, entry, receipt, true))
     }
 
     /// The one per-file upload-context gate for every source: a file is current
@@ -310,6 +368,77 @@ impl ScanIndex {
             return !self.empty_proof_matches(key, entry);
         }
         !self.receipt_matches(key, entry)
+    }
+
+    /// The selection and "is this file current" gate: a file whose only debt is
+    /// its delivery context owes no read. It pays on its next ordinary read.
+    pub(super) fn file_context_read_owed(&self, key: &str) -> bool {
+        self.file_upload_context_requires_adoption(key) && !self.context_only_debt(key)
+    }
+
+    /// The durable stamp of each entity this file covers; `None` for one
+    /// without a stamp.
+    fn covered_stamps<'a>(
+        &'a self,
+        key: &str,
+    ) -> impl Iterator<Item = Option<&'a EntityStamp>> + 'a {
+        self.file_snapshot_fingerprints
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|entity| self.upload_context_proof.entity_stamps.get(entity))
+    }
+
+    /// An entity this file covers was sent since under a context outside
+    /// `context`'s mode family.
+    fn covered_entity_sent_elsewhere(&self, key: &str, context: &str) -> bool {
+        self.covered_stamps(key)
+            .flatten()
+            .any(|stamp| !same_mode_family(&stamp.context_fingerprint, context))
+    }
+
+    /// The delivered bodies of the entities this file covers, from their durable
+    /// stamps. `None` when one carries no stamp.
+    fn covered_stamp_bodies(&self, key: &str) -> Option<BTreeSet<&str>> {
+        self.covered_stamps(key)
+            .map(|stamp| stamp.map(|stamp| stamp.body_witness.as_str()))
+            .collect()
+    }
+
+    /// The stamp set belongs to this index's destination and replay generation.
+    /// An index lives in one destination's directory; a stamp from another clears
+    /// the set when it is written.
+    fn entity_stamps_fenced(&self) -> bool {
+        let proof = &self.upload_context_proof;
+        proof.destination_namespace_hash.is_some()
+            && proof.replay_generation == self.historical_replay_generation
+    }
+
+    /// The file's receipt proves these exact bytes at this replay epoch, and the
+    /// bodies stamped for every entity it covers are the body set it delivered.
+    /// A delivery context is never asked: settings and capabilities apply from
+    /// the next body on. An entity sent since with another body selects, under
+    /// any context. A receipt of the active base in another money mode is the
+    /// operator's scoped copy-prefix re-read, not context debt. A file without
+    /// its entity set, or with an unstamped entity, selects as before; only a
+    /// confirmed-empty file covers nothing.
+    fn context_only_debt(&self, key: &str) -> bool {
+        let Some(entry) = self.files.get(key) else {
+            return false;
+        };
+        let Some(receipt) = entry.upload_context_receipt.as_ref() else {
+            return false;
+        };
+        let Some(bodies) = self.covered_stamp_bodies(key) else {
+            return false;
+        };
+        let empty = self.confirmed_empty_files.contains(key);
+        receipt_binds_bytes(entry, receipt, empty)
+            && !self.same_copy_prefix_base(&receipt.context_fingerprint)
+            && (empty
+                || (!bodies.is_empty()
+                    && self.entity_stamps_fenced()
+                    && snapshot_file_upload_body_set_hex(bodies) == receipt.body_witness))
     }
 
     /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries
@@ -444,7 +573,11 @@ impl ScanIndex {
                                 .quarantined_snapshot_fingerprints
                                 .get(entity)
                                 .is_some_and(|record| {
-                                    self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                    self.active_quarantine_witness
+                                        .as_ref()
+                                        .is_some_and(|active| {
+                                            record.witness.same_retry_contract_any_context(active)
+                                        })
                                         && !self.quarantine_retry_selects_file(entity, &key)
                                 })
                     })
@@ -743,6 +876,7 @@ impl ScanIndex {
         &mut self,
         source: SnapshotSource,
         inputs: ContextInputs,
+        policy: SnapshotUploadPolicy,
     ) {
         if let Some(previous) = self
             .upload_context_proof
@@ -772,6 +906,20 @@ impl ScanIndex {
             );
         }
         self.upload_context_proof.inputs = Some(inputs);
+        let policy = [
+            policy.session_titles_enabled,
+            policy.workspace_labels_enabled,
+            policy.session_artifacts_enabled,
+            policy.session_attribution_enabled,
+            policy.session_attribution_labels_enabled,
+        ];
+        crate::local_resource_diagnostics::change_reason::upload_policy(
+            source.api_slug(),
+            policy
+                .iter()
+                .enumerate()
+                .fold(0u8, |bits, (bit, on)| bits | (u8::from(*on) << bit)),
+        );
     }
 
     /// Gates nothing: files still owing their own proof, for census lines.
@@ -813,6 +961,7 @@ impl ScanIndex {
             if members.is_empty() || self.receipt_matches(key, entry) {
                 continue;
             }
+            counts.context_only_files += u64::from(self.context_only_debt(key));
             let owed = members.iter().filter(|fp| !stamped(fp.as_str())).count() as u64;
             if receipt.is_some_and(|receipt| {
                 !receipt.body_witness.is_empty() && receipt.context_fingerprint != *expected
@@ -856,6 +1005,6 @@ impl ScanIndex {
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness);
 crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
-crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, retired_direction);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);

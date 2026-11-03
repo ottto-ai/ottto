@@ -459,10 +459,11 @@ fn never_counted_records_are_recognised_at_the_top_level_only() {
 }
 
 #[test]
-fn line_reader_reads_to_length_at_open_and_guards_long_lines() {
+/// [behaviour] Whole lines are retained; a frozen partial line resumes from its start.
+fn line_reader_reads_whole_lines_to_length_at_open() {
     let dir = scratch("composition-v2-reader");
     let path = dir.join("lines.jsonl");
-    let long = "x".repeat(40);
+    let long = "x".repeat(16 * 1024 * 1024 + 1);
     fs::write(&path, format!("a\n{long}\nb\npartial")).unwrap();
     let len = fs::metadata(&path).unwrap().len();
     let collect = |reader: &mut LineReader| {
@@ -470,24 +471,22 @@ fn line_reader_reads_to_length_at_open_and_guards_long_lines() {
         while let Some(event) = reader.next_event().unwrap() {
             out.push(match event {
                 LineEvent::Line(line) => String::from_utf8(line.to_vec()).unwrap(),
-                LineEvent::TooLong => "<too long>".to_string(),
             });
         }
         out
     };
-    let mut reader = LineReader::with_guard(File::open(&path).unwrap(), 0, len, false, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["a", "<too long>", "b"]);
+    let mut reader = LineReader::open(File::open(&path).unwrap(), 0, len, false).unwrap();
+    assert_eq!(collect(&mut reader), ["a", long.as_str(), "b"]);
     // The partial last line stays unread.
     assert_eq!(reader.position(), len - "partial".len() as u64);
 
-    // A long line cut by the length at open keeps skipping in the next read.
-    let mut reader = LineReader::with_guard(File::open(&path).unwrap(), 0, 20, false, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["a", "<too long>"]);
-    assert!(reader.skipping());
+    // A long line cut by the length at open remains unread for the next read.
+    let mut reader = LineReader::open(File::open(&path).unwrap(), 0, 20, false).unwrap();
+    assert_eq!(collect(&mut reader), ["a"]);
+    assert!(!reader.skipping());
     let resume = reader.position();
-    let mut reader =
-        LineReader::with_guard(File::open(&path).unwrap(), resume, len, true, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["b"]);
+    let mut reader = LineReader::open(File::open(&path).unwrap(), resume, len, false).unwrap();
+    assert_eq!(collect(&mut reader), [long.as_str(), "b"]);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -879,8 +878,9 @@ impl Env {
             uploader: capture,
             machine_id: "machine-test",
             destination: "device|machine|api",
-            labels_enabled: true,
+            policy: crate::snapshots::SnapshotUploadPolicy::default(),
             details_enabled: false,
+            names_withheld: false,
         });
         fs::create_dir_all(&self.root).unwrap();
         run_source(&mut run, source, std::slice::from_ref(&self.root), target)
@@ -3134,7 +3134,8 @@ fn check_server_rules(payload: &Value) -> Result<(), String> {
 fn upload_labels_need_a_fetched_hint_that_allows_them() {
     use super::aggregate::Bucket;
     use super::scope::{SavedIdentity, Scope};
-    use crate::snapshot_client::{decode_activity_hint, workspace_labels_allowed};
+    use crate::snapshot_client::decode_activity_hint;
+    use crate::snapshots::SnapshotUploadPolicy;
     let now = base_now();
     let today = day_of(now.date());
     let window = Window::ending(today);
@@ -3162,14 +3163,15 @@ fn upload_labels_need_a_fetched_hint_that_allows_them() {
     };
     scope.agg.days.insert((today, Kind::FilesRead), bucket);
     scope.agg.day_generation.insert(today, 1);
-    let payload = |labels_enabled: bool| {
+    let payload = |policy: SnapshotUploadPolicy| {
         let mut capture = Capture::default();
         let target = UploadTarget {
             uploader: &mut capture,
             machine_id: "machine-test",
             destination: "device|machine|api",
-            labels_enabled,
+            policy,
             details_enabled: false,
+            names_withheld: false,
         };
         let (request, _) =
             super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
@@ -3187,17 +3189,16 @@ fn upload_labels_need_a_fetched_hint_that_allows_them() {
     };
 
     // Policy ON keeps today's labelled payload.
-    let on = payload(workspace_labels_allowed(Some(&hint(true))));
-    assert_eq!(on, payload(true));
+    let on = payload(SnapshotUploadPolicy::from_hint(&hint(true)));
+    assert_eq!(on, payload(SnapshotUploadPolicy::default()));
     assert_eq!(on["workspace_label"], "repo");
     assert_eq!(on["repository_label"], "repo");
     // Policy OFF and a failed hint fetch both withhold every label.
-    let withheld = payload(false);
+    let withheld = payload(SnapshotUploadPolicy::MOST_PRIVATE);
     assert_eq!(
-        payload(workspace_labels_allowed(Some(&hint(false)))),
+        payload(SnapshotUploadPolicy::from_hint(&hint(false))),
         withheld
     );
-    assert_eq!(payload(workspace_labels_allowed(None)), withheld);
     for field in [
         "workspace_label",
         "workspace_label_source",
@@ -3353,8 +3354,9 @@ fn a_maximal_upload_meets_the_server_field_rules() {
         uploader: &mut capture,
         machine_id: "machine-test",
         destination: "device|machine|api",
-        labels_enabled: true,
+        policy: crate::snapshots::SnapshotUploadPolicy::default(),
         details_enabled: false,
+        names_withheld: false,
     };
     let (request, dropped) =
         super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
@@ -4533,5 +4535,7 @@ mod a34;
 
 #[path = "tests/a2.rs"]
 mod a2;
+#[path = "tests/upload_policy_tests.rs"]
+mod upload_policy_tests;
 
 mod details;

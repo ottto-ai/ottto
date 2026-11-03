@@ -118,9 +118,6 @@ pub(super) fn rearm_evidence_lines(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RearmUpload {
     Accept,
-    /// The server sheds the page's first batch; `finish_sync_source` then
-    /// checkpoints only what the durable progress ledger accepted.
-    Shed,
     /// The request was offered, but no response/ACK reached the daemon.
     AckLost,
 }
@@ -357,8 +354,7 @@ impl RearmFixture {
             index.clone(),
             collected_at,
             183,
-            self.native_file_limit,
-            true, // Match the ordinary test scanner's artifact setting.
+            self.native_file_limit, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
             &self.hinted_paths,
             false, // Match its context-curve setting; byte parity includes it.
@@ -766,11 +762,6 @@ impl RearmFixture {
                             Ok(response)
                         }
                     }
-                    RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
-                        status: 503,
-                        retry_after: Some(Duration::from_secs(60)),
-                        code: None,
-                    })),
                     RearmUpload::AckLost => Err(anyhow!(
                         "synthetic request offered; response ACK unavailable"
                     )),
@@ -780,9 +771,6 @@ impl RearmFixture {
         );
         if actual_upload != RearmUpload::Accept {
             match actual_upload {
-                RearmUpload::Shed => {
-                    assert!(matches!(result, Ok(ResumableUploadResult::Shed { .. })))
-                }
                 RearmUpload::AckLost => assert!(result.is_err()),
                 RearmUpload::Accept => unreachable!(),
             }

@@ -131,8 +131,8 @@ impl Hold {
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
     }
-    /// Content-free cause of save pressure: the charged-work ceiling or one
-    /// logical row over its value cap. Both hold as `SaveCeiling`.
+    /// Content-free cause of refused save pressure. Logical value admission
+    /// still holds as `SaveCeiling`; aggregate charged work only alarms.
     fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
         error.chain().find_map(|e| match e.to_string().as_str() {
             "state_v2_save_ceiling" => Some("charged_work"),
@@ -351,6 +351,7 @@ fn load_with_custody(
             .then(telemetry::process_written_bytes)
             .flatten();
         if let Some((identity, db_path)) = pair {
+            telemetry::hydrate_checkpoint("hydrate_route_entry", 0, None);
             load_started = Some(Instant::now());
             state.latched = true;
             telemetry::baseline(path);
@@ -367,9 +368,11 @@ fn load_with_custody(
                         .filter(|stamp| session.identity == identity && session.stamp == *stamp)
                     {
                         super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
+                        telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
                         let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
+                        telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
                         #[cfg(test)]
                         if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
                         {
@@ -384,6 +387,11 @@ fn load_with_custody(
                             // Digest the exact persisted image: a save then
                             // also persists whatever normalization changes.
                             let digests = kinds::baseline(&index, &mut cx)?;
+                            telemetry::hydrate_checkpoint(
+                                "hydrate_after_baseline",
+                                digests.rows.len(),
+                                Some(&cx),
+                            );
                             normalize_hydrated(&mut index, binding.source)?;
                             state.save_digests = Some(digests);
                             // Same session and stamp: rollovers its commits
@@ -393,6 +401,11 @@ fn load_with_custody(
                                 cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                             }
                             session.cx = cx;
+                            telemetry::hydrate_checkpoint(
+                                "hydrate_exit",
+                                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
+                                Some(&session.cx),
+                            );
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
                             state.report_hold();
                             telemetry::event("route", &"v2");
@@ -411,14 +424,22 @@ fn load_with_custody(
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
+            telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
             let (mut index, mut cx) =
                 import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
+            telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
             let stamp = db.stamp().context("state_v2_open_stamp")?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             let digests = kinds::baseline(&index, &mut cx)?;
+            telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
             normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
             state.save_digests = Some(digests);
+            telemetry::hydrate_checkpoint(
+                "hydrate_exit",
+                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
+                Some(&cx),
+            );
             index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
             register(state, &index)?;
             state.report_hold();
@@ -490,10 +511,12 @@ fn normalize_hydrated(
     let slug = source.snapshot().api_slug();
     lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
         lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-            Hold::Future.into()
+            anyhow::Error::from(Hold::Future)
         }
-        error => error.into(),
-    })
+        error => anyhow::Error::from(error),
+    })?;
+    index.clear_retired_file_size_debt();
+    Ok(())
 }
 
 fn pause(state: &mut RouteState, class: Pause) {

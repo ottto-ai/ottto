@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
-const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
+pub(super) const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
 /// Birth of the first file; `complete_api_row` reports this hour.
 const T0: &str = "2026-08-02T07:00:00Z";
 const HOUR: &str = "2026-08-02T07:00:00Z";
@@ -23,7 +23,7 @@ fn at(seconds: i64) -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
 }
-fn line(id: &str, clock: &str, input: u64) -> Value {
+pub(super) fn line(id: &str, clock: &str, input: u64) -> Value {
     json!({"type":"assistant","version":"2.1.309","sessionId":ROOT,"timestamp":clock,
         "requestId":id,"message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
         "usage":{"input_tokens":input,"output_tokens":1}}})
@@ -54,7 +54,12 @@ fn entry() -> ScanIndexEntry {
     )
     .unwrap()
 }
-fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -> SnapshotItem {
+pub(super) fn parse(
+    path: &Path,
+    birth: Option<i128>,
+    index: &ScanIndex,
+    lines: &[Value],
+) -> SnapshotItem {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     let opened = fs::File::open(path).and_then(|file| file.metadata()).ok();
     a.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
@@ -827,13 +832,19 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             )]),
             ..Default::default()
         };
-        for (queued, held) in [
-            (vec![family.clone()], true),
-            (vec![family.join("subagents")], true),
-            (vec![p.parent().unwrap().join("other-session")], false),
-            (vec![], false),
+        // [regress] A re-listing pass's directory (not a census member) holds
+        // nothing: the walk already observed its members.
+        for (queued, census, held) in [
+            (vec![family.clone()], true, true),
+            (vec![family.join("subagents")], true, true),
+            (vec![family.clone()], false, false),
+            (vec![p.parent().unwrap().join("other-session")], true, false),
+            (vec![], true, false),
         ] {
-            let index = queued_traversal(&queued, &[]);
+            let mut index = queued_traversal(&queued, &[]);
+            for directory in &mut index.traversal.as_mut().unwrap().pending_directories {
+                directory.census_member = census;
+            }
             let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
             attach_page(&mut items, &read);
             let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
@@ -917,6 +928,31 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     let mut again = vec![traversal.pending_candidates.pop_front().unwrap()];
     assert!(defer_roots_of_queued_families(&mut again, &mut traversal).is_empty());
     assert_eq!(paths(&again), vec![waiting]);
+}
+
+/// [regress] A root waits only for a family directory the census walk still
+/// queues. A re-listing pass (not a census member) starts after the walk
+/// listed every directory, so its root is read, not put back at the front.
+#[test]
+fn e2_root_waits_only_for_a_census_walk_family_directory() {
+    let project = PathBuf::from("/projects/p");
+    let root = project.join(format!("{ROOT}.jsonl"));
+    for census in [true, false] {
+        let mut traversal = queued_traversal(&[project.join(ROOT).join("subagents")], &[])
+            .traversal
+            .unwrap();
+        traversal.pending_directories[0].census_member = census;
+        let mut selected =
+            vec![serde_json::from_value(json!({"scan_root": "/", "path": &root})).unwrap()];
+        let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+        assert_eq!(deferred.len(), usize::from(census), "census={census}");
+        assert_eq!(selected.len(), usize::from(!census), "census={census}");
+        assert_eq!(
+            traversal.pending_candidates.len(),
+            usize::from(census),
+            "census={census}"
+        );
+    }
 }
 
 #[test]
@@ -1622,7 +1658,7 @@ fn tag_owned_with_fallbacks(
                 .map(|original| (item.source_session_id.clone(), original))
         })
         .collect();
-    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
@@ -2030,8 +2066,7 @@ fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting
         attach_page(&mut items, &read);
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (3, 60));
@@ -2240,8 +2275,7 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
         attach_page(&mut items, &read);
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (2, 30));
@@ -2374,7 +2408,7 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
             let trace = ClaudeTraceOwnershipLoadReport::default();
             side_calls_page(&mut items, &api, &trace, &index);
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
             assert!(items
                 .iter()
@@ -2457,8 +2491,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
         side_calls_page(&mut items, &api, &trace, &index);
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (2, 30));
@@ -2666,7 +2699,7 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
             let api = ClaudeLocalOtelLoadReport::default();
             let trace = ClaudeTraceOwnershipLoadReport::default();
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             let outcome =
                 claude_request_identity::apply_scan(&mut items, &evidence, BTreeMap::new());
             assert_eq!(outcome.ineligible, 1);
@@ -2706,7 +2739,7 @@ fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
             let trace = ClaudeTraceOwnershipLoadReport::default();
             side_calls_page(&mut items, &api, &trace, &index);
             let evidence =
-                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
             assert!(items
                 .iter()
@@ -3057,8 +3090,7 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
         let mut items = vec![item];
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
         let ownership =
             claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
@@ -3120,8 +3152,7 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
         let before = serde_json::to_vec(&items).unwrap();
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        let evidence =
-            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
         let ownership =
             claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
@@ -3644,7 +3675,7 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                 let api = ClaudeLocalOtelLoadReport::default();
                 let trace = ClaudeTraceOwnershipLoadReport::default();
                 let evidence =
-                    claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+                    claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
                 claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
                 side_calls_page(&mut items, &Default::default(), &Default::default(), &index);
                 assert!(items

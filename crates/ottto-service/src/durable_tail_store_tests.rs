@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled body/allowlist; arbitrary test-only representations are U.
 pub(super) fn placeholder_allowlist() -> Digest32 {
-    parse_hex_digest("95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2").unwrap()
+    parse_hex_digest("cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3").unwrap()
 }
 pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     crate::snapshots::durable_store_fixture_body(
@@ -3868,7 +3868,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
             let mut record = pending(b.clone(), certificate(&transcript), n);
             // Existing source-tag2 v1 pin; no private codec module access.
             record.allowlist = parse_hex_digest(
-                "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
+                "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189",
             )
             .unwrap();
             record.body = crate::snapshots::durable_store_fixture_body(
@@ -4791,4 +4791,140 @@ fn retired_label_capable_v1_is_erased_with_failed_unlink_retry() {
         assert!(!target.exists());
         assert!(disk.pending.is_empty());
     }
+}
+
+/// [money] clearing a retired body keeps the repin outcome and is idempotent.
+#[test]
+fn clearing_a_retired_body_keeps_repin_and_is_idempotent() {
+    const CANARY: &[u8] = b"unkeyed-session-context-digest-canary";
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let current = pending(
+        binding("current", "scope", ("current", None)),
+        certificate(&path),
+        1,
+    );
+    let current_key = current.binding.key;
+    store.write_after_save(&lock, 1, 0, vec![current]).unwrap();
+    let current_file = record_file(&store, &current_key);
+    let current_bytes = fs::read(&current_file).unwrap();
+    let retired = |name: &str| {
+        let mut bound = binding("old", "scope", ("old", None));
+        bound.key = key_digest(DurableSource::ClaudeCode, name);
+        let mut record = pending(bound, certificate(&path), 1);
+        record.allowlist =
+            parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c")
+                .unwrap();
+        record.body = CANARY.to_vec();
+        record
+    };
+    let old = retired("synthetic-old.jsonl");
+    let old_file = record_file(&store, &old.binding.key);
+    let old_bytes = pinned_v1_bytes(&old, 1);
+    put_record(&old_file, &old_bytes);
+    // A readable-by-others record is refused and left alone.
+    let open = retired("synthetic-open.jsonl");
+    let open_file = record_file(&store, &open.binding.key);
+    let open_bytes = pinned_v1_bytes(&open, 1);
+    put_record(&open_file, &open_bytes);
+    fs::set_permissions(&open_file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    test_hooks::set_before_access(Some(Box::new(|_, phase| {
+        assert_ne!(phase, "body", "the clear never acquires a body");
+        Ok(())
+    })));
+    let first = store.clear_retired_bodies(&lock);
+    test_hooks::set_before_access(None);
+    assert_eq!(
+        first.unwrap(),
+        RetiredBodyClear {
+            cleared: 1,
+            failed: 1
+        }
+    );
+
+    let cleared = fs::read(&old_file).unwrap();
+    assert!(!cleared.windows(CANARY.len()).any(|part| part == CANARY));
+    assert_eq!(cleared.len(), HEADER_BYTES + TRAILER_BYTES);
+    assert_eq!(cleared[..HEADER_BYTES - 4], old_bytes[..HEADER_BYTES - 4]);
+    assert_eq!(cleared[HEADER_BYTES - 4..HEADER_BYTES], [0; 4]);
+    assert_eq!(
+        cleared[HEADER_BYTES..],
+        Sha256::digest(&cleared[..HEADER_BYTES])[..]
+    );
+    assert_eq!(
+        fs::metadata(&old_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(&open_file).unwrap(), open_bytes);
+    assert_eq!(fs::read(&current_file).unwrap(), current_bytes);
+
+    // Readers: still Missing, by the same cause, so a quiet file is not re-read
+    // and any read starts from a native parse, never a record with no digest.
+    assert!(matches!(store.read(&old.binding.key), ReadOutcome::Missing));
+    assert_eq!(store.missing_cause(&old.binding.key), Some("repin"));
+    let mut cold = scratch.store();
+    assert!(matches!(cold.read(&old.binding.key), ReadOutcome::Missing));
+    assert_eq!(cold.missing_cause(&old.binding.key), Some("repin"));
+
+    // One sweep per process, and a later process finds nothing to do.
+    let stamp = stamp_at(&old_file).unwrap();
+    assert_eq!(
+        store.clear_retired_bodies(&lock).unwrap(),
+        RetiredBodyClear::default()
+    );
+    fs::set_permissions(&open_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut later = scratch.store();
+    assert_eq!(
+        later.clear_retired_bodies(&lock).unwrap(),
+        RetiredBodyClear {
+            cleared: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(stamp_at(&old_file).unwrap(), stamp);
+}
+
+/// [resource] a retired-body sweep spends one inventory page per call.
+#[test]
+fn clearing_retired_bodies_is_paged() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let current = pending(
+        binding("current", "scope", ("current", None)),
+        certificate(&path),
+        1,
+    );
+    store.write_after_save(&lock, 1, 0, vec![current]).unwrap();
+    let mut record = pending(
+        binding("old", "scope", ("old", None)),
+        certificate(&path),
+        1,
+    );
+    record.allowlist =
+        parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c")
+            .unwrap();
+    let total = GC_RECORDS_PER_PASS as u64 + 1;
+    for n in 0..total {
+        record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("old-{n}.jsonl"));
+        put_record(
+            &record_file(&store, &record.binding.key),
+            &pinned_v1_bytes(&record, 1),
+        );
+    }
+    let first = store.clear_retired_bodies(&lock).unwrap();
+    assert_eq!(first.failed, 0);
+    let second = store.clear_retired_bodies(&lock).unwrap();
+    assert_eq!(second.failed, 0);
+    assert!(first.cleared <= GC_RECORDS_PER_PASS as u64);
+    assert!(second.cleared >= 1);
+    assert_eq!(first.cleared + second.cleared, total);
+    assert_eq!(
+        store.clear_retired_bodies(&lock).unwrap(),
+        RetiredBodyClear::default()
+    );
 }

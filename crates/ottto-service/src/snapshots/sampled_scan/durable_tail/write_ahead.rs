@@ -21,16 +21,14 @@ pub(in crate::snapshots) struct LiveFinishView<'a> {
     native: PreFinalization<'a>,
     pub(in crate::snapshots) checkpoint: &'a Checkpoint,
     pub(in crate::snapshots) chain: &'a AcquiredChain,
-    pub(in crate::snapshots) line_cap: u64,
 }
 impl<'a> LiveFinishView<'a> {
     pub(in crate::snapshots) fn new(
         native: PreFinalization<'a>,
         checkpoint: &'a Checkpoint,
         chain: &'a AcquiredChain,
-        line_cap: u64,
     ) -> Result<Self, NotPersisted> {
-        if native.accumulator.source != chain.source() || line_cap == 0 {
+        if native.accumulator.source != chain.source() {
             return Err(NotPersisted::Layout);
         }
         if checkpoint.scope() != chain.file_scope() {
@@ -43,7 +41,6 @@ impl<'a> LiveFinishView<'a> {
             native,
             checkpoint,
             chain,
-            line_cap,
         })
     }
 }
@@ -655,7 +652,6 @@ impl SharedCache {
                 view.native.positive_recognized_usage_count,
                 view.native.positive_usage_evidence,
             ),
-            view.line_cap,
             self.skill_labels_enabled(chain.source()),
         ) {
             Ok(plan) => plan,

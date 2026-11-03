@@ -38,7 +38,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+use super::claude_folder_login::{FolderTrace, QualifiedFolder};
+pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::digest_hex;
+pub(crate) use accepted::keyed_text_digest;
+#[cfg(test)]
+pub(crate) use accepted::session_context_digest;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -142,22 +147,6 @@ impl Drop for PreCutoverEvidenceForTest {
     }
 }
 
-/// `transcript_email` (and its status-coverage feed) needs its own review and
-/// receiver acceptance on top of contract-5 emission. Flipping this is a
-/// separate, parent-owned change.
-pub(crate) const TRANSCRIPT_EMAIL_ENABLED: bool = false;
-
-pub(crate) const fn transcript_email_enabled() -> bool {
-    TRANSCRIPT_EMAIL_ENABLED || cfg!(test)
-}
-
-/// `transcript_sole_login` needs the receiver's time-scoped sole-login body
-/// veto verified as deployed, on top of contract-5 emission. Until then a
-/// qualifying Desktop census still yields org-only (`transcript_org`); the
-/// email gate does not cover this basis. Flipping this is a separate,
-/// parent-owned change.
-pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
-
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
@@ -196,7 +185,12 @@ const MAX_MONEY_PICOS: u128 = 1_000_000_000 * USD_PICO_SCALE;
 
 pub(crate) const TELEMETRY: &str = "telemetry";
 pub(crate) const TELEMETRY_LOGIN: &str = "telemetry_login";
-pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
+/// Retired basis: no build ever emitted it. Still parsed, unchanged, so an
+/// older body or accepted record that names it never fails to decode.
+pub(crate) const LEGACY_TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
+/// A request with no telemetry whose own session recorded its folder's known
+/// login. Placement, never proof.
+pub(crate) const TRANSCRIPT_RECORDED_LOGIN: &str = "transcript_recorded_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
@@ -218,6 +212,12 @@ impl AuthorityKey {
             account_source: self.account_source,
         }
     }
+
+    /// Placement that never proves or freezes a row: a carried account, or one
+    /// named from the session's recorded login.
+    fn placement_only(&self) -> bool {
+        self.account_source.is_some() || self.basis == TRANSCRIPT_RECORDED_LOGIN
+    }
 }
 
 /// `request_evidence` total order: org absent first, org hash, then basis
@@ -235,6 +235,7 @@ impl EvidenceKey {
             identity_basis: self.basis.to_string(),
             provider_workspace_hash: self.org.clone(),
             account_source: self.account_source,
+            sole_login_witness: None,
         }
     }
 }
@@ -254,12 +255,6 @@ pub(crate) enum Refusal {
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
-    /// A recorded email in a registered folder with no usable status history
-    /// for its window (feed failed, never observed, gap, restart, eviction).
-    CoverageUnavailable,
-    /// Status samples span the window but cannot prove continuity, and the
-    /// email is never joined to a login: nothing qualifies `transcript_email`.
-    CoverageUnqualified,
 }
 
 /// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
@@ -774,8 +769,8 @@ impl Grouping {
         self.groups.get(bucket_start)?.get(row_key)
     }
 
-    /// Drops every tag that rests on transcript markers: the org-only and
-    /// sole-login bases, and a marker org joined to login-only telemetry. Their
+    /// Drops every tag that rests on transcript markers: the org-only (and
+    /// legacy sole-login) bases, and a marker org joined to login-only telemetry. Their
     /// usage stays on its row, untagged or login-only; refusals stay.
     fn withdraw_transcript_tags(&mut self) {
         for group in self.groups.values_mut().flat_map(BTreeMap::values_mut) {
@@ -1033,6 +1028,12 @@ fn apply_grouped_with_accepted(
     }
 
     protect_accepted_shares(&mut grouping, accepted);
+    crate::local_resource_diagnostics::change_reason::claude_placement(
+        &item.source_session_id,
+        accepted.filter(|known| !known.incomplete).map(|_| {
+            !grouping.accepted_share_changed.is_empty() || grouping.accepted_rows_vanished > 0
+        }),
+    );
     let prior_refusals = item.request_identity_refusals;
     let mut refusals = prior_refusals;
     let mut over_cap = BTreeSet::new();
@@ -1641,7 +1642,7 @@ fn defer_retained_rows(
                 .by_key
                 .keys()
                 .flatten()
-                .any(|key| key.account_source.is_some())
+                .any(AuthorityKey::placement_only)
             {
                 continue;
             }
@@ -1704,7 +1705,7 @@ fn share_placement(
     key: &AuthorityKey,
 ) -> Option<[u8; 32]> {
     let hash = accepted.authority_hash(key);
-    if key.account_source.is_some() && prior.contains(&None) && !prior.contains(&Some(hash)) {
+    if key.placement_only() && prior.contains(&None) && !prior.contains(&Some(hash)) {
         None
     } else {
         Some(hash)
@@ -2006,7 +2007,8 @@ fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
                                 TELEMETRY => TELEMETRY,
                                 TELEMETRY_LOGIN => TELEMETRY_LOGIN,
                                 TRANSCRIPT_ORG => TRANSCRIPT_ORG,
-                                TRANSCRIPT_SOLE_LOGIN => TRANSCRIPT_SOLE_LOGIN,
+                                TRANSCRIPT_RECORDED_LOGIN => TRANSCRIPT_RECORDED_LOGIN,
+                                LEGACY_TRANSCRIPT_SOLE_LOGIN => LEGACY_TRANSCRIPT_SOLE_LOGIN,
                                 _ => return None,
                             };
                             IdentityRef::Tagged(KeyRef {
@@ -2064,6 +2066,8 @@ fn withdrawn(key: AuthorityKey) -> Option<AuthorityKey> {
     match key.basis {
         TELEMETRY => Some(key),
         TELEMETRY_LOGIN => Some(AuthorityKey { org: None, ..key }),
+        // Rests on the folder's verdict, not on the file's copied markers.
+        TRANSCRIPT_RECORDED_LOGIN => Some(key),
         _ => None,
     }
 }
@@ -2281,7 +2285,24 @@ fn install(
         .enumerate()
         .map(|(position, entry)| (entry.clone(), position as u16))
         .collect::<BTreeMap<_, _>>();
+    // A side run re-installs an already tagged item that has no fold.
+    let recorded_witness = item
+        .claude_money
+        .as_deref()
+        .and_then(|fold| fold.folder_trace.as_deref())
+        .and_then(FolderTrace::qualified)
+        .map(|qualified| qualified.witness.clone())
+        .or_else(|| {
+            item.request_evidence
+                .iter()
+                .find_map(|entry| entry.sole_login_witness.clone())
+        });
     item.request_evidence = evidence.iter().map(EvidenceKey::wire).collect();
+    for entry in &mut item.request_evidence {
+        if entry.identity_basis == TRANSCRIPT_RECORDED_LOGIN {
+            entry.sole_login_witness = recorded_witness.clone();
+        }
+    }
     item.request_identity_refusals = refusals;
     for (row, identity) in item.model_usage.iter_mut().zip(top) {
         set_row(row, identity, &index);
@@ -2854,8 +2875,8 @@ pub(crate) struct OrgMarker {
 }
 
 /// Owned, line-ordered marker state for one file. Only the organization hash
-/// and a local change detector for `session_context` are kept; no email or raw
-/// text is retained or sent.
+/// and a keyed local change detector for `session_context` are kept; no email
+/// or raw text is retained or sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
@@ -2864,12 +2885,56 @@ pub(crate) struct OrgMarkers {
     context_digest: Option<String>,
     context_changed: bool,
     /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one.
+    /// of the first later `session_context` naming a different one. Without a
+    /// key, the second is the first later sentence or the first after a marker:
+    /// it could not be compared, so it counts as different.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
-    /// Status-coverage key of the folder holding this file, bound when the
-    /// item is built and only for a file with a recorded email.
-    home: Option<crate::claude_status_coverage::HomeKey>,
+    /// The keyed digest (`claude_status_coverage::address_digest`) of the one
+    /// address the sentences name, and whether a later one named another. A
+    /// sentence without exactly one well-formed address answers nothing, and
+    /// without the key there is no field. `other_address` with no `address`
+    /// is a scrubbed file: it answers nothing until a whole read.
+    address: Option<String>,
+    other_address: bool,
+}
+
+/// The one address a lowercased `userEmail` sentence names. The wording belongs
+/// to another program: anything but exactly one well-formed address is no answer.
+fn recorded_address(text: &str) -> Option<&str> {
+    let mut words = text.split_whitespace().filter(|word| word.contains('@'));
+    let word = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    let address = word.trim_matches(|c: char| ".,;:!?()<>[]\"'`".contains(c));
+    let (local, domain) = address.split_once('@')?;
+    let well_formed = !local.is_empty()
+        && domain.contains('.')
+        && !domain.contains('@')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.');
+    well_formed.then_some(address)
+}
+
+/// What one file's own lines record about its login, for the folder ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecordedLogin<'m> {
+    pub(crate) email: Option<&'m str>,
+    /// `None` past the marker cap too: that file matches nothing.
+    pub(crate) org: Option<&'m str>,
+    /// Another address or organization, or a malformed organization.
+    pub(crate) contradicted: bool,
+}
+
+/// The hashed organization of a `credential_org` attachment; `None` when blank
+/// or malformed.
+pub(super) fn marker_org_hash(attachment: &Value) -> Option<String> {
+    attachment
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .and_then(crate::claude_local_otel::canonical_uuid)
+        .and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "organization", &uuid))
 }
 
 /// Field check on an already-decoded, owned (non-inherited) Claude line.
@@ -2892,34 +2957,48 @@ pub(crate) fn note_marker_line(
                 .and_then(Value::as_str)
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            // Domain-separated SHA-256 (an H value in the durable store).
-            let digest = format!(
-                "{:x}",
-                sha2::Sha256::new()
-                    .chain_update(b"ottto-claude-org-marker-context:v1\0")
-                    .chain_update(text.as_bytes())
-                    .finalize()
-            );
             let state = markers.get_or_insert_with(Box::default);
-            if state.context_digest.as_deref() != Some(digest.as_str()) {
-                if state.context_digest.is_some() && state.context_flip_position.is_none() {
-                    state.context_flip_position = Some(response_position);
+            match accepted::session_context_digest(&text) {
+                // No key, no field: a sentence that cannot be compared explains
+                // no organization change and ends any earlier email.
+                None => {
+                    state.context_digest = None;
+                    if state.context_position.is_some() || !state.entries.is_empty() {
+                        state.context_flip_position.get_or_insert(response_position);
+                    }
                 }
-                state.context_changed = state.context_digest.is_some() || !state.entries.is_empty();
-                state.context_digest = Some(digest);
+                // An earlier email with no digest (no key then, or scrubbed on a
+                // key change) cannot be compared: this sentence is a fresh
+                // baseline. It explains no organization change and ends that email.
+                Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
+                    let compared = state.context_digest.is_some();
+                    if (compared || state.context_position.is_some())
+                        && state.context_flip_position.is_none()
+                    {
+                        state.context_flip_position = Some(response_position);
+                    }
+                    state.context_changed =
+                        compared || (state.context_position.is_none() && !state.entries.is_empty());
+                    state.context_digest = Some(digest);
+                }
+                Some(_) => {}
             }
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
             }
+            if let Some(address) =
+                recorded_address(&text).and_then(crate::claude_status_coverage::address_digest)
+            {
+                match &state.address {
+                    Some(known) => state.other_address |= *known != address,
+                    // A scrubbed file never takes a new baseline.
+                    None if !state.other_address => state.address = Some(address),
+                    None => {}
+                }
+            }
         }
         Some("credential_org") => {
-            let org = attachment
-                .get("organizationUuid")
-                .and_then(Value::as_str)
-                .and_then(crate::claude_local_otel::canonical_uuid)
-                .and_then(|uuid| {
-                    ottto_core::billing_identity_hash("anthropic", "organization", &uuid)
-                });
+            let org = marker_org_hash(attachment);
             let state = markers.get_or_insert_with(Box::default);
             if state.overflowed {
                 return;
@@ -2950,6 +3029,54 @@ pub(crate) fn note_marker_line(
     }
 }
 
+#[cfg(not(test))]
+static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_context_digest_scrubs<T>(
+    use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CONTEXT_DIGEST_SCRUBS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&CONTEXT_DIGEST_SCRUBS)
+    }
+}
+
+/// This thread's count only, so a test takes no other test's identity counts.
+#[cfg(test)]
+pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
+    with_context_digest_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(not(test))]
+static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_address_scrubs<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        ADDRESS_SCRUBS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&ADDRESS_SCRUBS)
+    }
+}
+#[cfg(test)]
+pub(crate) fn take_address_scrubs_for_test() -> u64 {
+    with_address_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVerdict<'m> {
     None,
@@ -2960,24 +3087,71 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
-    /// Binds the registered-folder key once the item's path is known.
-    pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
-        if self.context_position.is_some() {
-            self.home = crate::claude_status_coverage::transcript_home_key(transcript);
+    /// Ends comparison across a key change, keeping the markers and their
+    /// earlier verdicts. This state exists only once a sentence or marker was
+    /// read, so position 0 stands in when none was recorded: the next sentence
+    /// is a fresh baseline, never a first sentence, and any email stays refused.
+    pub(crate) fn scrub_context_digest(&mut self) {
+        self.context_digest = None;
+        self.context_changed = false;
+        if self.context_position.is_none() {
+            self.context_position = Some(0);
+            self.context_flip_position = Some(0);
+        }
+        with_context_digest_scrubs(|counter| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// Ends login comparison across an address key or capability change. A
+    /// sentence already read went unrecorded or sits under the old key, so a
+    /// file that read one never answers again; a later whole read starts over.
+    /// Markers, positions and verdicts stay, and nothing is re-read.
+    pub(crate) fn scrub_address(&mut self) {
+        if self.context_position.is_none() && self.address.is_none() {
+            return;
+        }
+        self.address = None;
+        self.other_address = true;
+        with_address_scrubs(|counter| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    pub(crate) fn recorded_login(&self) -> RecordedLogin<'_> {
+        let first = self.starting_marker.as_ref();
+        let contradicted = (self.other_address && self.address.is_some())
+            || first.is_some_and(|first| {
+                first.org.is_none() || self.entries.iter().any(|marker| marker.org != first.org)
+            });
+        RecordedLogin {
+            email: self.address.as_deref(),
+            org: first
+                .filter(|_| !self.overflowed)
+                .and_then(|first| first.org.as_deref()),
+            contradicted,
         }
     }
 
-    /// The folder key when one unchanged email precedes the response with
-    /// `sequence` (line order; an email switch at or before it disqualifies).
-    pub(crate) fn email_home(
-        &self,
-        sequence: u64,
-    ) -> Option<&crate::claude_status_coverage::HomeKey> {
-        let precedes = self.context_position.is_some_and(|at| at <= sequence)
-            && self.context_flip_position.map_or(true, |at| at > sequence);
-        (precedes && !self.overflowed)
-            .then_some(self.home.as_ref())
-            .flatten()
+    /// One unchanged email precedes the response with `sequence` (line order;
+    /// an email switch at or before it disqualifies).
+    pub(crate) fn email_precedes(&self, sequence: u64) -> bool {
+        self.context_position.is_some_and(|at| at <= sequence)
+            && self.context_flip_position.map_or(true, |at| at > sequence)
+            && !self.overflowed
+    }
+
+    /// Without a key: a sentence that could not be compared came at or before
+    /// the marker governing `sequence`, so its flip might have been explained.
+    fn flip_unexplained_for_no_key(&self, sequence: u64) -> bool {
+        !accepted::session_context_key_bound()
+            && self.context_flip_position.is_some_and(|sentence| {
+                self.entries
+                    .iter()
+                    .rev()
+                    .find(|marker| marker.position <= sequence)
+                    .is_some_and(|marker| sentence <= marker.position)
+            })
     }
 
     /// The marker governing the response with `sequence`, by line order only.
@@ -3748,6 +3922,19 @@ pub(crate) fn reconcile_request_accounts(
         accounts.inherited = accounts.inherited.saturating_sub(old_identified);
         let mut earlier: Option<(u64, AccountPartition)> = None;
         let mut keys: Vec<Arc<AuthorityKey>> = Vec::new();
+        let recorded_folder = fold
+            .folder_trace
+            .as_deref()
+            .and_then(FolderTrace::qualified)
+            .cloned();
+        let recorded_key = recorded_folder.as_ref().map(|folder| {
+            Arc::new(AuthorityKey {
+                login: Some(folder.login.clone()),
+                org: Some(folder.org.clone()),
+                basis: TRANSCRIPT_RECORDED_LOGIN,
+                account_source: None,
+            })
+        });
         // Recompute local clocks at their final accounts. Id-less records do
         // not prove an exact request identity and cannot decide current login.
         for grain in fold.entity.grains.values_mut() {
@@ -3764,8 +3951,21 @@ pub(crate) fn reconcile_request_accounts(
                 .requests
                 .get(&(root, request.as_str()))
                 .and_then(|row| *row);
-            let identity = request_occurrence_facts(item, request, occurrence, false)
-                .map(|facts| classify_ref(evidence, &facts));
+            let identity = request_occurrence_facts(
+                item,
+                request,
+                occurrence,
+                false,
+                recorded_folder.as_ref(),
+            )
+            .map(|facts| classify_ref(evidence, &facts));
+            let recorded_fill = matches!(
+                identity,
+                Some(IdentityRef::Tagged(KeyRef {
+                    basis: TRANSCRIPT_RECORDED_LOGIN,
+                    ..
+                }))
+            );
             let copy = carry.on && fold.unproven_copy(occurrence);
             // A gap has no telemetry row and no other stream's owner.
             let gap = carry.on
@@ -3888,6 +4088,11 @@ pub(crate) fn reconcile_request_accounts(
                         .or_else(|| accounts.fallback.clone())
                         .or_else(|| accounts.bound.clone()),
                 };
+                // The last arm. A marker fill is org-only and this key names
+                // the same org, so it completes the fill instead of losing it.
+                let fills =
+                    recorded_fill && account.as_ref().map_or(true, |key| key.login.is_none());
+                let account = if fills { recorded_key.clone() } else { account };
                 if own_marker.is_none() && account.is_some() {
                     accounts.inherited = accounts
                         .inherited
@@ -4308,6 +4513,25 @@ pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     IDENTITY_COUNTS[3].store(families, std::sync::atomic::Ordering::Relaxed);
     IDENTITY_COUNTS[4].store(files, std::sync::atomic::Ordering::Relaxed);
 }
+// Thread-local under test: another test's take must not race this count.
+#[cfg(not(test))]
+static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_no_key_flip_refusals<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        NO_KEY_FLIP_REFUSALS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&NO_KEY_FLIP_REFUSALS)
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "budget::Counts::is_empty")]
@@ -4334,6 +4558,17 @@ pub(crate) struct IdentityCounts {
     claude_carry_blocked_no_account_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_carry_skipped_incomplete_transcripts: u64,
+    /// Requests refused as an organization flip with no attribution key to
+    /// compare the sentence before it. At most what a key would have explained.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_no_key_flip_refusals: u64,
+    /// Retained Claude parses scrubbed on an attribution key change.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_context_digest_scrubs: u64,
+    /// Retained Claude parses whose recorded login was scrubbed on an address
+    /// key or capability change.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_login_address_scrubs: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -4356,6 +4591,15 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
         claude_carry_skipped_incomplete_transcripts: incomplete,
+        claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
+        claude_login_address_scrubs: with_address_scrubs(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
+        claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
     }
 }
 
@@ -4438,10 +4682,9 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
     /// The request roots of this pass's whole corpus, from the cross-root
     /// evidence the strict read built root by root.
-    cross_request_roots: Option<&'a RequestRootIndex>,
-    /// Without cross-root evidence: the request roots of the loaded rows,
-    /// built on the first request without rows of its own, so a pass whose
-    /// requests all have their own rows never pays for it.
+    cross_request_roots: Option<&'a super::claude_cross_root_evidence::RequestRootJoins>,
+    /// Test-only reachable fallback for the whole-corpus oracle: request roots
+    /// of the loaded rows, built on the first request without rows of its own.
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
@@ -4461,14 +4704,6 @@ pub(crate) struct ScanEvidence<'a> {
     invalid_logins: BTreeSet<(&'a str, &'a str)>,
     /// Orgs per login, proven by complete telemetry request identity.
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
-    /// Desktop store logins per org, present only under a valid census witness.
-    pub(crate) desktop_census: Option<DesktopCensus>,
-    /// `TRANSCRIPT_SOLE_LOGIN_ENABLED`; off, a sole census login stays org-only.
-    sole_login_enabled: bool,
-    /// This scan's copy of the local status-coverage history.
-    status_coverage: Option<crate::claude_status_coverage::Ledger>,
-    /// Key of the shared default folder, where the email basis never applies.
-    default_home: Option<crate::claude_status_coverage::HomeKey>,
     /// Pre-enrichment native evidence already saved by this scan. Request
     /// telemetry may veto its original org for billing without changing the
     /// unambiguous native account used by local Desktop activity.
@@ -4550,23 +4785,14 @@ pub(crate) fn prove_membership(
     login.is_some()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DesktopCensus {
-    pub(crate) completed_at_unix_seconds: u64,
-    pub(crate) logins_by_org: BTreeMap<String, BTreeSet<String>>,
-}
-
 impl<'a> ScanEvidence<'a> {
     pub(crate) fn new(
         api: &'a ClaudeLocalOtelLoadReport,
         trace: &'a ClaudeTraceOwnershipLoadReport,
         unhealthy_roots: BTreeSet<String>,
-        desktop_census: Option<DesktopCensus>,
     ) -> Self {
         let mut evidence = Self {
             unhealthy_roots,
-            desktop_census,
-            sole_login_enabled: TRANSCRIPT_SOLE_LOGIN_ENABLED,
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
@@ -4644,9 +4870,11 @@ impl<'a> ScanEvidence<'a> {
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
     fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
-        let roots = match self.cross_request_roots {
-            Some(roots) => roots,
-            None => self.request_roots.get_or_init(|| {
+        if let Some(roots) = self.cross_request_roots {
+            return roots.get(request_id);
+        }
+        self.request_roots
+            .get_or_init(|| {
                 let mut ids_by_root = BTreeMap::<&str, Vec<&str>>::new();
                 for &(root, id) in self.requests.keys().chain(self.owners.keys()) {
                     ids_by_root.entry(root).or_default().push(id);
@@ -4657,50 +4885,14 @@ impl<'a> ScanEvidence<'a> {
                 }
                 roots.finish();
                 roots
-            }),
-        };
-        roots.get(request_id)
-    }
-
-    /// Adds this scan's status-coverage copy: the `transcript_email` window
-    /// check, and each qualified status-pass (login, org) pairing as org
-    /// membership. `None` (feed off or failed) adds nothing.
-    pub(crate) fn with_status_coverage(
-        mut self,
-        coverage: Option<crate::claude_status_coverage::Ledger>,
-    ) -> Self {
-        if let Some(coverage) = &coverage {
-            for (login, org) in coverage.pairings() {
-                if !self
-                    .memberships
-                    .get(login)
-                    .is_some_and(|orgs| orgs.contains(org))
-                {
-                    self.memberships
-                        .entry(login.to_string())
-                        .or_default()
-                        .insert(org.to_string());
-                }
-            }
-        }
-        self.status_coverage = coverage;
-        self.default_home = Some(crate::claude_status_coverage::home_key(
-            &crate::agent_status::home_dir().join(".claude"),
-        ));
-        self
+            })
+            .get(request_id)
     }
 
     /// Test-only stand-in for the unruled current-writer witness.
     #[cfg(test)]
     pub(crate) fn with_pending_writer_witnesses(mut self, roots: BTreeSet<String>) -> Self {
         self.pending_writer_witnesses = roots;
-        self
-    }
-
-    /// Test-only stand-in for a verified sole-login body veto.
-    #[cfg(test)]
-    pub(crate) fn with_sole_login_enabled(mut self) -> Self {
-        self.sole_login_enabled = true;
         self
     }
 }
@@ -4722,7 +4914,7 @@ fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<
 }
 
 /// The org of a row whose request identity is complete, as memberships use.
-fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
+pub(super) fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
     row.request_identity
         .as_ref()
         .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
@@ -4745,7 +4937,7 @@ pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> Ac
 
 /// The row's login when the row itself is intact: the legacy account path's capture, count,
 /// fingerprint and account-origin checks. Ownership is checked separately.
-fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a str> {
+pub(super) fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a str> {
     let login = row
         .account_identifier_hash
         .as_deref()
@@ -4803,12 +4995,13 @@ pub(crate) struct RequestFacts<'a> {
     pub(crate) marker: MarkerVerdict<'a>,
     pub(crate) desktop: bool,
     pub(crate) scan_unix_seconds: Option<u64>,
-    /// Registered-folder key when an unchanged email precedes this request.
-    pub(crate) email_home: Option<&'a crate::claude_status_coverage::HomeKey>,
-    pub(crate) session_start_unix_seconds: Option<u64>,
+    /// An unchanged email precedes this request.
+    pub(crate) email_precedes: bool,
     /// Another transcript also carries this request (the pass's duplicate
     /// witness): it is not this transcript's alone.
     pub(crate) duplicated_elsewhere: bool,
+    /// This matched own file's qualified folder, when there is one.
+    pub(crate) recorded_login: Option<&'a QualifiedFolder>,
 }
 
 impl RequestFacts<'_> {
@@ -4920,7 +5113,7 @@ pub(crate) fn classify_ref<'k>(
         None => {
             // A trace that already owns this request outranks the transcript:
             // a foreign, duplicated or unpaired owner refuses and never borrows
-            // this transcript's org or sole login.
+            // this transcript's org.
             if let Some(owner) = evidence.owners.get(&(facts.root, facts.request_id)) {
                 return Refused(match owner {
                     None => Refusal::ConflictingDuplicate,
@@ -4939,7 +5132,7 @@ pub(crate) fn classify_ref<'k>(
             if facts.duplicated_elsewhere {
                 return Refused(Refusal::ConflictingDuplicate);
             }
-            return match transcript_identity(evidence, facts) {
+            return match transcript_identity(facts) {
                 // A carried or missing clock cannot establish attribution.
                 Some(_) if facts.terminal_unix_seconds.is_none() || !facts.event_clock_complete => {
                     Refused(Refusal::BadClock)
@@ -5018,10 +5211,7 @@ fn owner_is_foreign(owner: &ClaudeTraceOwnershipEvidence, facts: &RequestFacts<'
 }
 
 /// Transcript bases for a request with no telemetry row or trace owner.
-fn transcript_identity<'k>(
-    evidence: &'k ScanEvidence<'_>,
-    facts: &RequestFacts<'k>,
-) -> Option<IdentityRef<'k>> {
+fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
         MarkerVerdict::None => return None,
         MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
@@ -5029,117 +5219,28 @@ fn transcript_identity<'k>(
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
     };
-    let sole_login = (facts.desktop && evidence.sole_login_enabled)
-        .then_some(())
-        .and(evidence.desktop_census.as_ref())
-        .filter(|census| {
-            facts
-                .terminal_unix_seconds
-                .is_some_and(|at| census.completed_at_unix_seconds >= at)
-        })
-        .and_then(|census| census.logins_by_org.get(org))
-        .filter(|logins| logins.len() == 1)
-        .and_then(|logins| logins.first());
-    if let Some(refusal) = email_refusal(evidence, facts, org) {
-        return Some(IdentityRef::Refused(refusal));
+    // Both recorded before this request, in this file, unchanged. Desktop stays
+    // pair-only.
+    if let Some(folder) = facts
+        .recorded_login
+        .filter(|folder| folder.org == org && facts.email_precedes && !facts.desktop)
+    {
+        return Some(IdentityRef::Tagged(KeyRef {
+            login: Some(&folder.login),
+            org: Some(&folder.org),
+            basis: TRANSCRIPT_RECORDED_LOGIN,
+            account_source: None,
+        }));
     }
-    Some(IdentityRef::Tagged(match sole_login {
-        Some(login) => KeyRef {
-            login: Some(login),
-            org: Some(org),
-            basis: TRANSCRIPT_SOLE_LOGIN,
-            account_source: None,
-        },
-        None => KeyRef {
-            login: None,
-            org: Some(org),
-            basis: TRANSCRIPT_ORG,
-            account_source: None,
-        },
+    Some(IdentityRef::Tagged(KeyRef {
+        login: None,
+        org: Some(org),
+        basis: TRANSCRIPT_ORG,
+        account_source: None,
     }))
 }
 
-/// `transcript_email` never binds a login. No qualified join from a recorded
-/// email to a login exists, and sampled status coverage cannot prove that the
-/// slot's login ran continuously over [session start − 300 s, request]. So the
-/// basis only decides whether the request keeps its earlier meaning:
-/// - not applicable (`None`, the org-only path stands): the basis compiled
-///   out, Desktop, no unchanged email before the request, the shared default
-///   folder, or a folder proven never registered over the window;
-/// - otherwise refused, never weakened to org-only: the feed unavailable or
-///   not yet run since restart, a removed slot or forgotten registration, an
-///   unknown session start, a conflicting sample, no history spanning the
-///   window, or samples that span it but prove nothing.
-fn email_refusal(
-    evidence: &ScanEvidence<'_>,
-    facts: &RequestFacts<'_>,
-    org: &str,
-) -> Option<Refusal> {
-    use crate::claude_status_coverage::{Registration, Verdict};
-    if facts.desktop || !transcript_email_enabled() {
-        return None;
-    }
-    let home = facts.email_home?;
-    if evidence.default_home.as_ref() == Some(home) {
-        return None;
-    }
-    let Some(coverage) = evidence.status_coverage.as_ref() else {
-        return Some(Refusal::CoverageUnavailable);
-    };
-    let window = facts
-        .session_start_unix_seconds
-        .and_then(|start| start.checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS))
-        .zip(facts.terminal_unix_seconds);
-    let Some((from, to)) = window else {
-        return Some(Refusal::CoverageUnavailable);
-    };
-    match coverage.registration(home, from) {
-        Registration::Registered => {}
-        Registration::NeverRegistered => return None,
-        Registration::Unknown => return Some(Refusal::CoverageUnavailable),
-    }
-    Some(match coverage.verdict(home, from, to, org) {
-        Verdict::Unavailable => Refusal::CoverageUnavailable,
-        Verdict::Conflicting => Refusal::ContradictoryOrg,
-        Verdict::Unqualified => Refusal::CoverageUnqualified,
-    })
-}
-
-// --- Desktop census freshness witness ---------------------------------------
-
-/// Local completion witness for the Desktop store census: set only when a
-/// sweep finishes complete and error-free, bound to this process and to the
-/// store inventory it swept. Sole-login inference needs it to postdate the
-/// request; anything else (older index, restart, other inventory) is unknown.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DesktopCensusWitness {
-    completed_at_unix_seconds: u64,
-    process_id: u32,
-    inventory: String,
-}
-
-impl DesktopCensusWitness {
-    pub(super) fn new(now: u64, store_dirs: &BTreeSet<PathBuf>) -> Self {
-        Self {
-            completed_at_unix_seconds: now,
-            process_id: std::process::id(),
-            inventory: inventory_digest(store_dirs),
-        }
-    }
-
-    pub(super) fn retain_for_inventory(witness: &mut Option<Self>, store_dirs: &BTreeSet<PathBuf>) {
-        if witness
-            .as_ref()
-            .is_some_and(|witness| witness.inventory != inventory_digest(store_dirs))
-        {
-            *witness = None;
-        }
-    }
-
-    fn valid_at(&self, now: u64) -> bool {
-        self.process_id == std::process::id() && self.completed_at_unix_seconds <= now
-    }
-}
+// --- Desktop store inventory digest -----------------------------------------
 
 pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
     let mut digest = sha2::Sha256::new();
@@ -5148,47 +5249,6 @@ pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
         digest.update([0]);
     }
     format!("{:x}", digest.finalize())
-}
-
-/// The census this pass may use: the persisted complete Desktop identity
-/// census under a valid witness. Logins per org come from native (unimported)
-/// original identities only; bounded by the store's own file cap.
-pub(crate) fn desktop_census(index: &ScanIndex) -> Option<DesktopCensus> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    desktop_census_at(index, now)
-}
-
-pub(super) fn desktop_census_at(index: &ScanIndex, now: u64) -> Option<DesktopCensus> {
-    let witness = index.claude_desktop_census_witness.as_ref()?;
-    if !index.claude_desktop_identity_census_complete || !witness.valid_at(now) {
-        return None;
-    }
-    let mut logins_by_org: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for entry in index.claude_desktop_title_files.values() {
-        let Some(identity) = entry
-            .original_identity
-            .as_ref()
-            .filter(|identity| !identity.imported)
-        else {
-            continue;
-        };
-        if let (Some(login), Some(org)) = (
-            identity.account_identifier_hash.as_ref(),
-            identity.provider_workspace_hash.as_ref(),
-        ) {
-            logins_by_org
-                .entry(org.clone())
-                .or_default()
-                .insert(login.clone());
-        }
-    }
-    Some(DesktopCensus {
-        completed_at_unix_seconds: witness.completed_at_unix_seconds,
-        logins_by_org,
-    })
 }
 
 // --- Scan integration -----------------------------------------------------
@@ -5224,7 +5284,6 @@ pub(crate) struct RequestSink<'s, 'a> {
     root: String,
     desktop: bool,
     scan_unix_seconds: Option<u64>,
-    session_start_unix_seconds: Option<u64>,
     grouping: Grouping,
 }
 
@@ -5246,10 +5305,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 .and_then(|origin| origin.entrypoint.as_deref())
                 == Some("claude-desktop"),
             scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
-            session_start_unix_seconds: item
-                .source_started_at
-                .as_deref()
-                .and_then(rfc3339_unix_seconds),
             grouping: Grouping::new(max_groups),
         })
     }
@@ -5331,14 +5386,29 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             },
             desktop: self.desktop,
             scan_unix_seconds: self.scan_unix_seconds,
-            email_home: match (item.claude_org_markers.as_deref(), sequence) {
-                (Some(markers), Some(sequence)) => markers.email_home(sequence),
-                _ => None,
+            email_precedes: match (item.claude_org_markers.as_deref(), sequence) {
+                (Some(markers), Some(sequence)) => markers.email_precedes(sequence),
+                _ => false,
             },
-            session_start_unix_seconds: self.session_start_unix_seconds,
             duplicated_elsewhere,
+            recorded_login: item
+                .claude_money
+                .as_deref()
+                .and_then(|fold| fold.folder_trace.as_deref())
+                .and_then(FolderTrace::qualified),
         };
         let identity = classify_ref(self.evidence, &facts);
+        if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
+            && item
+                .claude_org_markers
+                .as_deref()
+                .zip(sequence)
+                .is_some_and(|(markers, at)| markers.flip_unexplained_for_no_key(at))
+        {
+            with_no_key_flip_refusals(|counter| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
@@ -5761,6 +5831,7 @@ fn request_occurrence_facts<'a>(
     request_id: &'a str,
     occurrence: &'a super::ClaudeTranscriptUsageOccurrence,
     duplicated_elsewhere: bool,
+    recorded_login: Option<&'a QualifiedFolder>,
 ) -> Option<RequestFacts<'a>> {
     let root = owner_root(item)?;
     let timestamp = occurrence.timestamp.as_deref()?;
@@ -5783,15 +5854,12 @@ fn request_occurrence_facts<'a>(
             }),
         desktop,
         scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
-        email_home: item
+        email_precedes: item
             .claude_org_markers
             .as_deref()
-            .and_then(|markers| markers.email_home(occurrence.sequence)),
-        session_start_unix_seconds: item
-            .source_started_at
-            .as_deref()
-            .and_then(rfc3339_unix_seconds),
+            .is_some_and(|markers| markers.email_precedes(occurrence.sequence)),
         duplicated_elsewhere,
+        recorded_login,
     })
 }
 
@@ -5823,7 +5891,13 @@ fn collect_request_owned_activity(
         let Some(timestamp) = occurrence.timestamp.as_deref() else {
             continue;
         };
-        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false) else {
+        let recorded = item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.folder_trace.as_deref())
+            .and_then(FolderTrace::qualified);
+        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false, recorded)
+        else {
             continue;
         };
         let identity = classify_ref(evidence, &facts);
@@ -6018,7 +6092,7 @@ fn tag_item(
     Some(tagged)
 }
 
-crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
+crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, address, other_address);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
     D entries: Vec<OrgMarker>,
     D starting_marker: Option<OrgMarker>,
@@ -6027,7 +6101,8 @@ crate::durable_tail_codec::durable_struct!(OrgMarkers {
     N context_changed: bool,
     N context_position: Option<u64>,
     N context_flip_position: Option<u64>,
-    E home: Option<crate::claude_status_coverage::HomeKey>,
+    H address: Option<String>,
+    N other_address: bool,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
@@ -6035,10 +6110,12 @@ crate::durable_tail_codec::durable_struct!(OrgMarker {
     U org: Option<String>,
     N terminal_trusted: bool,
 });
-crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
 crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);
+
+#[cfg(test)]
+mod context_digest_tests;
 
 #[cfg(test)]
 mod request_owned_contract_tests {

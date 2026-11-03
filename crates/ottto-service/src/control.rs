@@ -6208,6 +6208,8 @@ fn install_staged_account_switch(
             return Err(LocalApiError::StatePoisoned);
         }
         write_and_verify_pending_claim_commit(pending, candidate_secret)?;
+        crate::snapshot_sync::owe_login_address_erase(&default_support_dir())
+            .or_state_poisoned()?;
         let response = daemon.install_switched_account(
             staged.new_account.clone(),
             staged.setup_run_id.clone(),
@@ -7432,6 +7434,8 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
     } else if path.exists() {
         fs::remove_file(&path).or_state_poisoned()?;
     }
+    crate::snapshot_sync::erase_all_source_caches(&support_dir).or_state_poisoned()?;
+    crate::context_composition::erase_all_state(&support_dir).or_state_poisoned()?;
     crate::backfill::remove_backfill_state(&support_dir).or_state_poisoned()?;
     v2_erasure.or_state_poisoned()
 }
@@ -7449,6 +7453,7 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
+    crate::snapshot_sync::owe_login_address_erase(&default_support_dir()).or_state_poisoned()?;
     FileAccountStore::default().reset().or_state_poisoned()?;
     FileConnectionStore::default().reset().or_state_poisoned()?;
     FileDeviceStore::default().reset().or_state_poisoned()?;
@@ -23258,6 +23263,38 @@ for line in sys.stdin:
             forget_installation_state_locked().unwrap();
         }
         assert!(!snapshots.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn forget_erases_source_caches_and_composition_state_and_keeps_opt_outs() {
+        use crate::snapshots::SnapshotSource;
+        let _lock = lock_backend_test_env();
+        let env = history_choice_test_env();
+        fs::create_dir_all(env.root.join("snapshots")).unwrap();
+        let mut erased = vec![env
+            .root
+            .join("context_composition/v2/scopes/codex-scope.json")];
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            erased.push(crate::active_sessions::active_session_cache_path(
+                &env.root, source,
+            ));
+            erased.push(crate::mcp_inventory::cache_path(&env.root, source));
+        }
+        let kept = [
+            env.root.join("mcp_inventory/disabled"),
+            env.root.join("context_composition/disabled"),
+        ];
+        for path in erased.iter().chain(&kept) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"synthetic-forget-canary").unwrap();
+        }
+        {
+            let _identity_lock = lock_setup_run_binding();
+            forget_installation_state_locked().unwrap();
+        }
+        assert!(erased.iter().all(|path| !path.exists()));
+        assert!(kept.iter().all(|path| path.exists()));
     }
 
     #[test]

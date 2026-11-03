@@ -150,7 +150,6 @@ impl Family {
             window,
             365,
             2,
-            false,
         )
         .unwrap();
         scan.census_complete = census_complete;

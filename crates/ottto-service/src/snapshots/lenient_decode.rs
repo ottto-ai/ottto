@@ -388,7 +388,6 @@ impl Serialize for ScanIndex {
         field!(claude_desktop_store_sweep_had_errors);
         field!(claude_desktop_identity_census_complete);
         field!(claude_desktop_lineage_census_complete);
-        field!(claude_desktop_census_witness, Option::is_none);
         field!(claude_desktop_store_retry_attempt);
         field!(
             claude_desktop_store_retry_not_before_unix_seconds,
@@ -445,6 +444,8 @@ impl Serialize for ScanIndex {
             upload_context_receipt::ProofState::is_empty
         );
         field!(copy_prefix_last_accepted_nonce, Option::is_none);
+        field!(claude_folder_login_ledger, BTreeMap::is_empty);
+        field!(tail_discovery, TailDiscovery::is_empty);
         map.end()
     }
 }
@@ -500,7 +501,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_desktop_store_sweep_had_errors",
     "claude_desktop_identity_census_complete",
     "claude_desktop_lineage_census_complete",
-    "claude_desktop_census_witness",
+    "claude_desktop_census_witness", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_desktop_store_retry_attempt",
     "claude_desktop_store_retry_not_before_unix_seconds",
     "resume_after_path",
@@ -542,6 +543,8 @@ pub(super) const FIELDS: &[&str] = &[
     "archives",
     "archive_deferred_alarm_count",
     "copy_prefix_last_accepted_nonce",
+    "claude_folder_login_ledger",
+    "tail_discovery",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2379,9 +2382,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_lineage_census_complete" => {
                             index.claude_desktop_lineage_census_complete = self.typed(value)?
                         }
-                        "claude_desktop_census_witness" => {
-                            index.claude_desktop_census_witness = self.typed(value)?
-                        }
+                        "claude_desktop_census_witness" => {} // TOMBSTONE: decode-and-drop.
                         "claude_desktop_store_retry_attempt" => {
                             index.claude_desktop_store_retry_attempt = self.typed(value)?
                         }
@@ -2435,6 +2436,14 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "copy_prefix_last_accepted_nonce" => {
                             index.copy_prefix_last_accepted_nonce = self.typed(value)?
                         }
+                        "claude_folder_login_ledger" => {
+                            // Damage may have lost a sticky verdict: fail closed.
+                            index.claude_folder_login_ledger = self.history_scalar(
+                                value,
+                                crate::snapshots::claude_folder_login::damaged_ledger(),
+                            )?
+                        }
+                        "tail_discovery" => index.tail_discovery = self.typed(value)?,
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never
                             // the index.

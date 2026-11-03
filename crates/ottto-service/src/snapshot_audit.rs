@@ -101,6 +101,8 @@ pub struct SnapshotAuditSession {
     pub semantic_key: String,
     pub revision_key: String,
     pub legacy_revision_proof_available: bool,
+    /// Keys derived under policies this report did not apply; local to the verifier.
+    #[serde(skip_serializing)]
     pub legacy_policy_candidate_semantic_keys: Vec<String>,
     pub policy_neutral_component_keys: BTreeMap<String, String>,
     pub policy_sensitive_component_keys: BTreeMap<String, String>,
@@ -205,6 +207,7 @@ pub fn run_snapshot_audit<W: Write>(
             "session attribution HMAC key must be the exact 32-byte URL-safe no-pad activity-hint key"
         )
     })?;
+    crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
     let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::load(&index_path)?;
     let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
@@ -213,7 +216,6 @@ pub fn run_snapshot_audit<W: Write>(
         &mut index,
         &options.collected_at,
         options.backfill_window_days,
-        true,
         Some(&attribution_context),
         options.claude_support_dir.as_deref(),
         &[],
@@ -695,7 +697,7 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::{scan_source_roots_with_artifacts, scan_source_roots_with_attribution};
+    use crate::snapshots::{scan_source_roots_before_policy, scan_source_roots_with_attribution};
     use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -942,7 +944,6 @@ mod tests {
             &mut expected_index,
             "2026-05-29T00:05:00Z",
             BACKFILL_WINDOW_DAYS,
-            true,
             Some(&attribution_context),
         )
         .expect("production-equivalent scan");
@@ -1050,13 +1051,12 @@ mod tests {
         )
         .expect("write transcript");
         let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_artifacts(
+        let scan = scan_source_roots_before_policy(
             SnapshotSource::Pi,
             &[sessions],
             &mut index,
             "2026-07-22T08:02:00Z",
             BACKFILL_WINDOW_DAYS,
-            false,
         )
         .expect("scan");
         let mut original = scan.snapshots.into_iter().next().expect("snapshot");

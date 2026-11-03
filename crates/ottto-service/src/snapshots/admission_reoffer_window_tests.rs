@@ -32,7 +32,7 @@ fn window_and_context(index: &ScanIndex) -> (u64, String) {
         };
     (
         window,
-        scan_traversal_context_fingerprint(SnapshotSource::ClaudeCode, &[], index, window),
+        scan_traversal_context_fingerprint(SnapshotSource::ClaudeCode, &[], window),
     )
 }
 

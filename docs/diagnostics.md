@@ -42,7 +42,7 @@ See [the local handoff contract](session-launch.md).
 
 Local collection includes a `claude_local_evidence` section with separate API
 and trace counters for available canonical rows, duplicate/conflicting requests,
-malformed or unframed rows, oversized files/lines, unavailable or changed files,
+malformed or unframed rows, oversized lines, unavailable or changed files,
 and limited selection/reads. The inspection is on demand: at most four files per
 store, 64 directory entries per store, 64 KiB read per file (512 KiB total),
 16 KiB per line and 128 physical rows per file. Selection can be partial and is
@@ -149,6 +149,15 @@ telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
 process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
+Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
+`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
+capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
+record right after `native_collection_page`; `context_composition_read` carries
+them inline. 16 MiB is only a release point: a completed record above it
+frees its line buffer; byte targets yield between records. The counts-only
+`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
+on consecutive native pages, without changing reading or retries.
+
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
 or line, or changing its meaning, increments the version. Version 2 removes
@@ -159,7 +168,13 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
+| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
+Claude page counters `claude_sidecar_reparse_files` and
+`claude_sidecar_reparse_bytes` report side-file read attempts and actual input
+bytes since the previous Claude page. Repeated reads count again; absent keys
+mean zero. Nonzero values remain exact, with no separate diagnostic record.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -636,29 +651,34 @@ Claude/Pi walk, candidate revalidation and open, the Codex roster and
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
-File-size caps still apply. Registered sources today are the unverified
+Whole-file size no longer limits admission. Registered sources today are the unverified
 sampled-generation marker (any source) and Claude withheld-account holds. A new
 owed source (a Codex owed-residue set, a compressed hold) registers as one field
 plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
 separate exemption.
 
-The `local_resources` stage `oversized_discovery_alarm` reports oversized debt
-per source, per page: `outstanding_file_count`, `outstanding_bytes` (last
-observed total size) and `first_seen_oversized_age_seconds` (oldest first-seen
-age in the current traversal). The row is omitted at zero outstanding files.
-Debt follows the existing traversal checkpoint lifetime. Older checkpoints
-without these scalars default bytes to zero and first-seen to load time.
+The former `oversized_discovery_alarm`, `size` and `withheld_oversized`
+observations are retired with whole-file refusal. `last_oversized_file_count`
+remains on the wire and emits zero. Saved refusal debt stays decodable and is
+cleared after load through the ordinary save path.
 
-`counts.line_delivery_unselected` counts discovery skip decisions for the page's
-source: `age` (outside the backfill window, not held for verification and not
-withheld for an unresolved Claude account) and `size` (over the source's
-file-size cap). `withheld_oversized` counts the decisions, at the walk,
-candidate revalidation or open, that keep an over-cap key observed without a
-full parse while its parsed revision is withheld for an unresolved account: the
-entry and hold stay, and growth past the cap is not read. They are recorded
-after the existing decision, are drained by that source's next completed page,
-and count repeated decisions, not distinct files or bytes. They are recorded
-whether or not an observer is registered.
+The `local_resources` stage `file_size` reports the process high-water
+`largest_file_bytes` per source, with `file_over_1gib` on that same record.
+`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
+and existing footprint observations through native finish. Existing
+`bounded_traversal_transition` records report `max_unread_bytes` on retirement
+or in `previous` when replacing a traversal, with no per-file log emissions.
+This traversal maximum uses disk length minus the last native checkpoint's size
+(zero if none); it conservatively includes uncommitted reads.
+It resets on restart/new traversal. No persisted fields or per-file clocks are
+added; unread age and its six-hour alert are deferred because existing metadata
+does not record when an extent first became owed. Observations contain no paths
+or identities and never gate reads.
+
+`counts.line_delivery_unselected.age` counts a discovery decision outside the
+window without an owed-growth, verification or unresolved-account exemption.
+It is drained by that source's completed page, whether or not an observer is
+registered, and counts decisions rather than distinct files or bytes.
 
 `DiscoveryRetention::owes_with_len` also retains a file whose current length
 exceeds its committed indexed `size_bytes`, using metadata already available at
@@ -711,10 +731,10 @@ that never reaches a save has no fate row. Population/age rows describe bounded
 page observations, not a whole-index census.
 
 Retention changes no refusal/backoff or acquisition decision. Unchanged account
-refusals keep the existing content memo skip; oversized growth remains observed
+refusals keep the existing content memo skip; large-file growth remains observed
 without parsing each pass. The dedicated `discovery_growth_tests` fixtures cover
 real account-hold classification, Completed restoration and two unchanged passes
-with zero extra body bytes, saved catch-up, and oversized aging in all three
+with zero extra body bytes, saved catch-up, and large-file aging in all three
 sources. Existing identity/anchor controls remain in
 `reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
 `transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
@@ -930,6 +950,36 @@ reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account
 keeps usage off the server; token/age disclosure is implemented, and
 bounded-lifetime release remains a SOURCE follow-up.
+
+## Change Reason Counters
+
+After each source's `native_collection_page` line, a `native_change_reasons`
+line carries `counts.change_reasons` when any count is nonzero (its own line
+keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
+local diagnostics only; they gate, cap and upload nothing.
+
+- **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
+  `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
+  `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
+  `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
+  a changed body with no tag; never guessed). `privacy_off_erase` is an
+  upload-context read of a delivered file after the latest sharing-policy change
+  this daemon process saw turned a flag off. No direction is persisted, so after
+  a restart such reads count as `admin_other`.
+- **`upload`** (per entity, once per page): `entities`, `accepted` (stored or
+  unchanged ACK), `usage_identical`, `money_changed_or_unknown` (`accepted` minus
+  `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
+  Placement is known only for Claude with complete accepted state; else `u`.
+  An exact resend of a held, refused or catch-up body takes its delivery cause.
+- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
+  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
+  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
+  why.
+- **Sub-counts:** `source_reset_same_size_edit_files` and
+  `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
+  cannot see: money-only reveals and late external evidence.
+
+Upload counts land on the line after the source's next page line.
 
 ## Context Footprint Discovery
 
@@ -1294,6 +1344,9 @@ records can include two sparse, counts-only objects for `source: claude_code`:
 mean zero events in that observation. Counters saturate at `u64::MAX`. They
 add no wire fields, collected data kinds, persisted state or transcript reads.
 No paths, identifiers, fingerprints, bodies or content are emitted.
+Two sparse scalars ride the same counts: `link_scrape_bytes`, the text the
+always-on link scrape tokenized, and `links_over_limit`, links left off an
+upload because their value exceeds the receiver's 512-character limit.
 
 Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Comparison
@@ -1691,12 +1744,32 @@ counts each `thread_settings_applied` line whose `service_tier` is `fast`,
 count again. It is a cumulative saturating process total with no labelled log
 line and no path or session id, and it never affects money.
 
+## Claude usage iteration on another model
+
+`usage_iteration_model_differs` in `process_retained_cache_lifecycle_totals`
+counts each Claude usage line with a `usage.iterations[]` entry whose `model`
+differs from the line's model (a refusal fallback's declined first attempt, which
+is billed at the line's model); rereads count again. It is a cumulative
+saturating process total with no path or session id, and it never affects money.
+
+## Claude usage keys the parser does not read
+
+`usage_unknown_numeric_key` in `process_retained_cache_lifecycle_totals` counts
+each numeric key the Claude usage parser does not read, in `usage`,
+`usage.cache_creation`, `usage.output_tokens_details` and the same three levels of
+each `usage.iterations[]` entry. Non-numeric values and deeper objects are not
+counted. A non-zero value means a new numeric usage field is not reaching money.
+Counts are per parsed usage line, not per unique request; rereads count again. It
+is a cumulative saturating process total with no key name, path or session id,
+and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
-`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
-saturating process-lifetime counter for that cause. These count refused attempts,
-not distinct sessions, decoded bytes or money. No path or session id is included.
+`counts.codex_zst_refused{cause}`: a sparse map of the non-zero, saturating
+process-lifetime counters. One line is flushed per Codex pass, only when the
+counters changed since the last flush. These count refused attempts, not distinct
+sessions, decoded bytes or money. No path or session id is included.
 
 | Cause | Unsupported boundary |
 | --- | --- |
@@ -1719,11 +1792,16 @@ usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
-retained → cursor before taking the durable Stores leaf lock. It keeps an
+retained → cursor before taking the durable Stores leaf lock. It keeps a
 fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
-for primary Tail reads; admission never evicts or charges retained bytes twice.
+for primary Tail reads and never charges retained bytes twice. When free room is
+short and the claim can fit beside the whole cursor state, it reclaims optional
+header facts, then releases retained copies, counted in
+`cursor_reservation_entries_evicted`. It never drops a suspended proof, join
+owner, witness or durable owed state. A released copy can mean one more existing
+`state_missing` Full. `decoder_refused_header_occupancy` is no longer counted.
 Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
-A short reservation or busy singleton yields `None`, counts
+A claim that cannot fit evicts nothing. It or a busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
@@ -1877,23 +1955,8 @@ backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
 
-The shared six-hour Full pace also owns structural active-budget fallback.
-`degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
-`[event delta, source process total]` on the same alarm carrier. The source
-leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
-successful restore. `pace_evicted` has one immediate alarm owner and a per-source
-process total; post-save alarms never emit its delta again:
-at capacity the oldest stamp is evicted, the new key is enrolled and the read
-is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
-These are RAM-only counters and stamps; restart can admit one extra growth
-Full. Structural Full publishes without a replacement retained/durable record.
-The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
-seven-day sanity maximum expires toward reading. Codex page/cursor deferral
-consumes no structural allowance; the stamp is enrolled at acquisition start.
-Growth at 90% or more of the source file cap bypasses pacing immediately, under
-the same cause with a `near_cap` annotation. Source caps predate this path:
-512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
-rejection/disclosure still applies; near-cap admission does not expand it.
+Whole-file size no longer bypasses recovery pacing. The legacy `near_cap`
+recovery annotation remains zero; transcripts have no whole-file admission cap.
 
 With restart restore enabled, content re-derivation runs only after growth
 past the committed extent. Quiet files return Pending before certificate samples
@@ -1923,10 +1986,8 @@ do not add the two byte counters together.
 
 A replay attempt is remembered by predecessor extent, not exact generation.
 A new extent resets only the head attempt; the cross-cause Full spend remains.
-Re-derive failures take at most one growth Full per key per six hours, plus at
-most one extra near the source cap, counted `rederive_failure_full.near_cap`.
-This exception avoids losing discovery when a held file grows beyond its source
-cap. Budget contention waits without a Full; after six hours its counted
+Re-derive failures take at most one growth Full per key per six hours.
+There is no size-based extra read. Budget contention waits without a Full; after six hours its counted
 `rederive_budget_aged` fallback uses the same Full pacing. The paid pace map's
 overflow permits at most one extra head per evicted extent and alarms
 `pace_evicted`. Discovery custody survives pace eviction independently.
@@ -1959,7 +2020,7 @@ process total on the existing `durable_tail_alarm` carrier with `process_id`.
 It counts metadata-only restores returning Pending with zero transcript input.
 It does not decode obligations and cannot establish `pending_no_obligation`.
 Compare totals using `process_id`; they reset on restart and carry no key identity.
-Full-spend time and near-cap use for funded keys live in key custody, so evicting
+Full-spend time for funded keys lives in key custody, so evicting
 the paid pace node cannot renew either allowance.
 
 ## Codex state-only identity coverage
@@ -2117,17 +2178,18 @@ on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records the
-charged bytes of a save refused as save pressure, with `save_ceiling_cause`:
-`charged_work` above 256 MiB or `value_admission` for one row over its cap; at page size one,
-`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
+charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
+the complete valid save commits; `value_admission` for one row over its physical
+limit (64 MiB, or a kind's smaller fixed limit) still refuses the save. At page size one, a value-admission failure raises
+`save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires
 erasure instead of comparing strings.
-`row_cap_max` reports the largest written row as a percent of its cap, with its
-kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
-refuse every save of that source.
+`row_cap_max` reports the largest written row as a percent of its sizing target
+(1 MiB for mutable rows), with its kind name; `row_cap_alarm` flags 75% or more.
+Above 100% the row still commits; the alarm never refuses.
 `store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
 SQLite store once a day, on any between-cycles window, before reference verification.
 Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count
@@ -2210,23 +2272,42 @@ proved rows sent with different proof.
 ### Freshness alarm (all sources)
 
 Each source emits one `local_resources` `freshness_alarm` point when a root walk
-ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
-`now - live mtime` over indexed files whose live listing stamp differs from the
-stored settled stamp, and `changed_files` and `over_6h_files` count them.
-Members of an `UnprovenTerminal` Claude usage-authority family are reported
-apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
-hold keeps the pre-growth stamp and no read reaches the growth, so they are real
-unuploaded data, never counted as accepted or $0. A failed pass may never reach
-the walk, so with `basis: "last_ack"` `age_s` is the time since the source's
-newest accepted upload receipt, the file counts are 0, and no receipt in the
-bounded ring gives `age_s: null`. `alarm` is true when `age_s` is null or above
-21,600 seconds, or when `authority_terminal_files` is above 0 at any age, which
-lasts until those files settle. Both inputs are durable and nothing new is
-stored, so the first complete walk after a restart reports the true age; only the
-in-progress fold is process-local, so a restart mid-walk under-reports for one
-walk and a retried page can count a file twice. A file appended to continuously
-reads as fresh until it pauses. Files refused by snapshot quarantine settle
-without acceptance and stay with the terminal counters. The row carries counts
+ends and one on every failed pass. `debt` is the source's persisted per-file
+freshness debt, `null` for a graph with no state-v2 store or when its store
+cannot be read. Each listed file's owed changes are kept as metadata of its
+`tail.head` and `tail.revision` rows, so they survive restarts: a create, append
+or rewrite adds a revision timed at the live mtime, and only the file's own
+matched exact upload receipt retires it, and only the prefix it covers (a newer
+suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
+receipt elsewhere retires nothing. A rewritten file folds its old debt into the
+new object with the earliest time. Codex archives count by compressed size, and
+outside the discovery window no new debt starts. `outstanding_files` counts every
+owed file, `held_files` those whose debt is read or held rather than unread
+(every hold reason counts alike), `unread_bytes` the bytes no read reached, and
+`never_indexed_files` this walk's owed files with no index entry yet (archives
+aside), whose age is a lower bound. `over_6h_files` counts those whose oldest
+owed change is more than 21,600 seconds old, and `oldest_age_s` is the oldest of
+those ages, with `oldest_age_lower_bound` true when that age is a lower bound or
+some debt has no known age. `no_upload_required_files` counts this walk's files
+that owe nothing by per-file evidence: a confirmed-empty file or an empty archive
+at its stamp, and a Claude subagent journal, which the snapshot rule excludes
+from upload. `deleted_unaccepted_files` is the cumulative count of files erased
+while still owed: a complete walk erases the debt of a file it no longer lists
+and whose index entry is gone. `last_complete_discovery_at` is the Unix time a
+walk that covered every root without a listing error or an unconfirmed missing
+directory last began. Members of an `UnprovenTerminal` Claude usage-authority
+family with debt are also reported apart, in `authority_terminal_files` and
+`authority_terminal_oldest_age_s`: their hold keeps the pre-growth stamp and no
+read reaches the growth, so they are real unuploaded data, never counted as
+accepted or $0. `alarm`, and `debt.alarm` without the last two causes, is true
+when a file is over 6 h, when any debt has no known age, when there has been no
+complete discovery in 6 h, when `debt` is `null`, or when
+`authority_terminal_files` is above 0 at any age. With `basis: "walk"` the row is
+the walk just ended; a failed pass may never reach the walk, so with
+`basis: "last_walk"` it carries this process's last walk aggregate re-aged, with
+no authority-terminal counts, and before this process's first walk end `debt` is
+`null`. Only the walk in progress is process-local, so a walk resumed after a
+restart erases nothing and records no complete discovery. The row carries counts
 only.
 
 ### Money freshness (Claude queue and replay)

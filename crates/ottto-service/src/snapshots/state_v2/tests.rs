@@ -1170,6 +1170,64 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(sample(&mut db).len(), 1);
 }
 
+/// [regress] Freshness bookkeeping never sizes the next collection page: a
+/// save under target stays under it whatever heads, revisions, set-aside
+/// markers and discovery stamp it also writes, and whatever debt it resolves
+/// or replaces; that erasure still purges. An ordinary erasure still charges
+/// the purge's epoch rows.
+#[test]
+fn freshness_bookkeeping_never_counts_toward_the_save_target() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let debt = |id: u64| RowKey::record("tail.revision", "/synthetic/debt.jsonl", id).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..4_000 {
+        put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
+    }
+    for row in 0..2_000 {
+        for kind in ["tail.head", "tail.revision", "tail.set_aside"] {
+            let key = RowKey::record(kind, format!("/synthetic/{row}.jsonl"), 0).unwrap();
+            put(&mut tx, &key, b"debt");
+        }
+    }
+    let discovery = RowKey::record("scan_state.tail_discovery", Vec::<u8>::new(), 0).unwrap();
+    put(&mut tx, &discovery, b"{}");
+    put(&mut tx, &debt(0), b"r0");
+    put(&mut tx, &debt(1), b"r1");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+
+    // One ordinary row: the rest is what every commit charges.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("calibrate".into()), b"evidence");
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let at_target = 5_000 - (sqlite::dirty_rows_for_test(&db) - 1);
+
+    // Exactly at target, resolving one revision and replacing another.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..at_target {
+        put(&mut tx, &traversal(format!("at-{row}")), b"evidence");
+    }
+    tx.mark_erasure(true).unwrap();
+    assert!(tx.delete(&debt(0)).unwrap());
+    put(&mut tx, &debt(1), b"r1x");
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    assert_eq!(sqlite::dirty_rows_for_test(&db), 5_000);
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
+
+    // The same ordinary rows with an ordinary erasure: its epoch row counts.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..at_target {
+        put(&mut tx, &traversal(format!("over-{row}")), b"evidence");
+    }
+    tx.mark_erasure(false).unwrap();
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
+    assert_eq!(sqlite::dirty_rows_for_test(&db), 5_001);
+    assert!(db.save_over_target());
+}
+
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
@@ -1188,9 +1246,9 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
         assert_eq!(value(&mut tx, &header), b"evidence");
     }
 }
-/// [format] ceiling rolls back every row and keeps committed headers.
+/// [behaviour] complete saves alarm only when crossing the threshold.
 #[test]
-fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
+fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("first".into());
@@ -1199,9 +1257,10 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let removed = traversal("removed".into());
     put(&mut tx, &removed, b"retained");
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    // Leave room for both the replacement and deletion, including their
-    // charged metadata, before the oversized row refuses the whole save.
+    // Lower the production alarm threshold to keep this fixture small.
     sqlite::set_save_ceiling(&mut db, 4096);
+    telemetry::take_thread_event_for_test("save_ceiling_alarm");
+    telemetry::take_thread_event_for_test("save_ceiling_cause");
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut before = mapper::Rows::default();
     before.raw(key.clone(), b"old").unwrap();
@@ -1216,34 +1275,66 @@ fn ceiling_rolls_back_every_row_and_keeps_committed_headers() {
     let header = tx.get(&key).unwrap().unwrap();
     assert_eq!(value(&mut tx, &header), b"new");
     assert!(tx.get(&removed).unwrap().is_none());
-    let error = tx
-        .put(RowInput {
-            key: &traversal("over-ceiling".into()),
-            fixed: &Fixed::None,
-            value_version: 1,
-            value: &serde_json::to_vec(&"x".repeat(8192)).unwrap(),
-        })
-        .unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::NotPublished);
+    let large = traversal("over-ceiling".into());
+    let bytes = serde_json::to_vec(&"x".repeat(8192)).unwrap();
+    tx.put(RowInput {
+        key: &large,
+        fixed: &Fixed::None,
+        value_version: 1,
+        value: &bytes,
+    })
+    .unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     drop(pending);
-    assert_eq!(db.save_failure(), Some(Hold::SaveCeiling));
-    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(1));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"old");
-    let header = tx.get(&removed).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"retained");
-    drop(tx);
+    assert_eq!(db.save_failure(), None);
+    assert!(db.refused_save_bytes() > 4096);
+    assert!(
+        telemetry::take_thread_event_for_test("save_ceiling_alarm")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+            > 4096
+    );
+    assert_eq!(
+        telemetry::take_thread_event_for_test("save_ceiling_cause"),
+        Some(serde_json::json!("charged_work"))
+    );
+    // A second large save stays above; a small save re-arms the next crossing.
+    let changed_bytes = serde_json::to_vec(&"y".repeat(8192)).unwrap();
+    for (generation, payload, alarm) in [
+        (2, Some(changed_bytes.as_slice()), false),
+        (3, None, false),
+        (4, Some(bytes.as_slice()), true),
+    ] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        if let Some(payload) = payload {
+            put(&mut tx, &large, payload);
+        }
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        assert_eq!(db.refused_save_bytes() >= 4096, payload.is_some());
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some(),
+            alarm
+        );
+        assert_eq!(
+            telemetry::take_thread_event_for_test("save_ceiling_cause"),
+            alarm.then(|| serde_json::json!("charged_work"))
+        );
+    }
+    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(5));
     drop(db);
     let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();
     let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"old");
-    let header = tx.get(&removed).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"retained");
+    assert_eq!(value(&mut tx, &header), b"new");
+    assert!(tx.get(&removed).unwrap().is_none());
+    let header = tx.get(&large).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &header), bytes);
 }
-/// [behaviour] a written row at 78% of its cap reports a counts-only gauge and alarm.
+/// [behaviour] a written row at 78% of its target reports a counts-only gauge and alarm.
 #[test]
 fn row_near_its_cap_reports_gauge_and_alarm() {
     let tmp = Scratch::new();
@@ -1251,7 +1342,7 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
     let key = mapper::key("file.progress", "synthetic-private-row", 0).unwrap();
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        // 800 KiB plus two quotes of logical JSON against the 1 MiB mutable cap.
+        // 800 KiB plus two quotes of logical JSON against the 1 MiB mutable target.
         mapper::put(&mut tx, &key, &"x".repeat(800 * 1024)).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     });
@@ -1264,13 +1355,43 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
         .any(|r| r.to_string().contains("synthetic-private")));
 
     // A row refused while encoding still reports, so the refusal is visible.
+    let key = mapper::key("scan_state.traversal", "", 0).unwrap();
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        assert!(mapper::put(&mut tx, &key, &"x".repeat(2 * 1024 * 1024)).is_err());
+        assert!(mapper::put(&mut tx, &key, &"x".repeat(16 * 1024 * 1024)).is_err());
     });
-    let gauge = serde_json::json!({ "percent": 100, "kind": "file.progress" });
+    let gauge = serde_json::json!({ "percent": 100, "kind": "scan_state.traversal" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
+}
+/// [behaviour] a usage.pending row past its 1 MiB target commits, decodes
+/// byte-identical and alarms above 100%: the target never refuses the save.
+#[test]
+fn usage_pending_row_over_its_target_commits_and_alarms() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = mapper::key("usage.pending", "synthetic-family", 1).unwrap();
+    // Residual family JSON once request-hash sets move to shared rows: ~1.5 MiB.
+    let row = serde_json::json!({
+        "member_request_id_hashes": {},
+        "occurrences": "x".repeat(1536 * 1024),
+    });
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::put(&mut tx, &key, &row).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    });
+    let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
+    let gauge = serde_json::json!({ "percent": 150, "kind": "usage.pending" });
+    assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
+    assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 150));
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let header = tx.get(&key).unwrap().unwrap();
+    let restored: serde_json::Value = mapper::read(&mut tx, &header, None).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&row).unwrap()
+    );
 }
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
@@ -1543,8 +1664,8 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
     let mutable = file("family".into());
     let raw = raw_hold("family".into());
     for (key, size, ok) in [
-        (&mutable, MUTABLE_VALUE_BYTES, true),
-        (&mutable, MUTABLE_VALUE_BYTES + 1, false),
+        (&mutable, MUTABLE_VALUE_BYTES + 1, true),
+        (&mutable, VALUE_BYTES + 1, false),
         (&raw, VALUE_BYTES, true),
         (&raw, VALUE_BYTES + 1, false),
     ] {
@@ -1897,7 +2018,6 @@ fn serial_scan_propagates_maintenance_refusal_without_consuming_custody() {
         "2026-10-30T12:00:00Z",
         30,
         10,
-        false,
     );
     assert!(result.is_err());
     assert_eq!(before, serde_json::to_vec(&index).unwrap());

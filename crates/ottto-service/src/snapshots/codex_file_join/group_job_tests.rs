@@ -236,7 +236,6 @@ fn sampled_hinted(
         collected_at,
         7,
         limit,
-        false,
         None,
         hints,
         false,
@@ -460,6 +459,11 @@ fn v2_group_with_ui_only_turn_held_until_turn_hook() {
 
 /// R(t), E(t), zero Z, then `repeat` in member b.
 fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
+    eze_rows(vec![repeat])
+}
+
+/// R(t), E(t), zero Z, then `tail` in member b.
+fn eze_rows(tail: Vec<Value>) -> Option<(JoinRefusal, usize)> {
     let root = temp_root("eze");
     write_rows(
         &root.join("sessions/a.jsonl"),
@@ -471,7 +475,7 @@ fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
         ui(200, 300, "2026-10-01T10:01:30Z"),
         ui(0, 300, "2026-10-01T10:01:40Z"),
     ];
-    rows.push(repeat);
+    rows.extend(tail);
     write_rows(&root.join("sessions/b.jsonl"), &rows);
     let result = refused(replay_group(group_of(&root), None, &ScanIndex::default()));
     fs::remove_dir_all(root).unwrap();
@@ -480,10 +484,32 @@ fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
 
 #[test]
 fn eze_identical_repeat_is_overlap() {
-    // The repeated E has the same identity (the whole record): the parser
-    // admits it again after Z, and the tap's identity set refuses it.
+    // Before the forward date the repeated E has the same identity (the whole
+    // record): the parser admits it again after Z, and the tap's identity set
+    // refuses it.
     assert_eq!(
         eze(ui(200, 300, "2026-10-01T10:01:30Z")),
+        Some((JoinRefusal::Overlap, 1))
+    );
+    // Dated from it, the same re-emission after a zero line is the counter's
+    // own equal-total repeat: never admitted, so the group replays.
+    assert_eq!(
+        eze_rows(vec![
+            native(OWNER, "r-c", 10, 310),
+            ui(10, 310, "2026-11-04T10:00:00Z"),
+            ui(0, 310, "2026-11-04T10:00:10Z"),
+            ui(10, 310, "2026-11-04T10:00:00Z"),
+        ]),
+        None
+    );
+    // After another counted record the same identity is admitted again, and
+    // the tap's identity set refuses it.
+    assert_eq!(
+        eze_rows(vec![
+            ui(10, 310, "2026-11-04T10:00:00Z"),
+            ui(20, 330, "2026-11-04T10:00:10Z"),
+            ui(10, 310, "2026-11-04T10:00:00Z"),
+        ]),
         Some((JoinRefusal::Overlap, 1))
     );
 }
@@ -491,9 +517,17 @@ fn eze_identical_repeat_is_overlap() {
 #[test]
 fn eze_distinct_identity_repeat_is_ui_repeat_unproven() {
     // A distinct record of the same tuple, with no native between the two
-    // admissions: held, never counted twice.
+    // admissions, dated before the forward date: held, never counted twice.
     assert_eq!(
         eze(ui(200, 300, "2026-10-01T10:01:50Z")),
+        Some((JoinRefusal::UiRepeatUnproven, 1))
+    );
+    // Dated from it, it is the counter's equal-total repeat: dropped before
+    // the tap.
+    assert_eq!(eze(ui(200, 300, "2026-11-04T00:00:00Z")), None);
+    // The same `last` with a grown total is admitted; the group is held.
+    assert_eq!(
+        eze(ui(200, 500, "2026-11-04T00:00:00Z")),
         Some((JoinRefusal::UiRepeatUnproven, 1))
     );
 }
@@ -1342,7 +1376,7 @@ fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
 }
 
 #[test]
-fn upload_context_change_invalidates_paused_group() {
+fn upload_context_change_keeps_paused_group() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1352,14 +1386,13 @@ fn upload_context_change_invalidates_paused_group() {
         let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
             counters(&cache).jobs_paused > 0
         });
-        // Receipts must not mix upload scopes.
+        // A delivery context is no group scope input: the job resumes.
         index.active_upload_context_fingerprint = Some("other-upload-context".into());
         let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
         assert!(!done.snapshots.is_empty());
     });
     let after = counters(&cache);
-    assert!(after.jobs_invalidated >= 1, "{after:?}");
-    assert_eq!(after.groups_started, 2, "{after:?}");
+    assert_eq!(after.jobs_invalidated, 0, "{after:?}");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1416,7 +1449,6 @@ fn group_with_legacy_tee_is_byte_charged() {
             metadata: &metadata,
             traces: None,
             ledgers: None,
-            artifacts: false,
             index: &previous,
         })
         .unwrap();
@@ -1425,7 +1457,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     let inputs = StepInputs {
         metadata: &metadata,
         attribution: None,
-        artifacts: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1440,7 +1471,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         "2026-10-06T23:00:00Z",
         7,
         10,
-        false,
         None,
         &[],
         false,
@@ -1565,7 +1595,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
             metadata: &metadata,
             traces: None,
             ledgers: None,
-            artifacts: false,
             index: &previous,
         })
         .unwrap();
@@ -1573,7 +1602,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
     let inputs = StepInputs {
         metadata: &metadata,
         attribution: None,
-        artifacts: false,
         live_scope: &no_scope,
     };
     assert!(matches!(
@@ -1593,7 +1621,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         "2026-10-06T23:00:00Z",
         7,
         10,
-        false,
         None,
         &[],
         false,
@@ -2139,6 +2166,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         pending_directories: std::collections::VecDeque::new(),
         pending_candidates: std::collections::VecDeque::new(),
         observed_index_keys: Default::default(),
+
         oversized_discovery: Default::default(),
         codex_rollout_paths: census.iter().map(|key| (*key).to_owned()).collect(),
         codex_join_directory_census: None,
@@ -2741,7 +2769,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &metadata,
             None,
             None,
-            false,
             codex_counting_version::AckEvidence::None
         )
         .is_err());
@@ -2754,7 +2781,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &metadata,
             None,
             None,
-            false
         )
         .is_err());
     });
@@ -2771,7 +2797,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             metadata: &metadata,
             traces: None,
             ledgers: None,
-            artifacts: false,
             index: &index,
         })
         .unwrap();
@@ -2792,7 +2817,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
     let inputs = StepInputs {
         metadata: &metadata,
         attribution: None,
-        artifacts: false,
         live_scope: &no_scope,
     };
     assert_refused(CodexZstCause::GroupReadUnsupported, || {

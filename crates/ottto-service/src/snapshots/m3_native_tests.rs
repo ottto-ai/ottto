@@ -230,17 +230,9 @@ fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
         "input kind, independent of suffix"
     );
     let identity = opened_object_identity(source, &mut File::open(&archive).unwrap()).unwrap();
-    let mut parser = OwnedJsonlParser::new_opened(
-        input,
-        &archive,
-        source,
-        apply_codex_line,
-        None,
-        None,
-        None,
-        false,
-    )
-    .unwrap();
+    let mut parser =
+        OwnedJsonlParser::new_opened(input, &archive, source, apply_codex_line, None, None, None)
+            .unwrap();
     while !parser.step().unwrap() {}
     let cache = sampled_scan::SharedCache::default();
     let key = local_index_key(&archive);

@@ -72,25 +72,35 @@ pub(super) fn visit(
     };
     let kind = RecordKind::parse(kind)?;
     for root in roots {
-        let mut after = None;
-        loop {
-            let page = tx.scan_record_key(&kind, root.as_bytes(), after, KEY_PAGE)?;
-            let more = page.len() == KEY_PAGE;
-            if let Some(h) = page.last() {
-                let RowKey::Record { position, .. } = &h.key else {
-                    anyhow::bail!("state_v2_record_key")
-                };
-                after = Some(*position);
-            }
-            for h in page {
-                f(tx, h)?;
-            }
-            if !more {
-                break;
-            }
-        }
+        visit_key(tx, &kind, root.as_bytes(), KEY_PAGE, &mut f)?;
     }
     Ok(())
+}
+/// One key's rows of `kind` from position 0, read `page_rows` headers at a time.
+pub(super) fn visit_key(
+    tx: &mut dyn Transaction,
+    kind: &RecordKind,
+    key: &[u8],
+    page_rows: usize,
+    mut f: impl FnMut(&mut dyn Transaction, Header) -> Result<()>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = tx.scan_record_key(kind, key, after, page_rows)?;
+        let more = page.len() == page_rows;
+        if let Some(h) = page.last() {
+            let RowKey::Record { position, .. } = &h.key else {
+                anyhow::bail!("state_v2_record_key")
+            };
+            after = Some(*position);
+        }
+        for h in page {
+            f(tx, h)?;
+        }
+        if !more {
+            return Ok(());
+        }
+    }
 }
 /// One family's only row (position 1) of `kind`, decoded, with its row
 /// digest as stored. `None`: no row. Another row under the key errs.
@@ -247,12 +257,6 @@ struct Projection {
     refs: Vec<RowKey>,
     created: Vec<RowKey>,
 }
-fn input_cap(key: &RowKey) -> u64 {
-    match key {
-        RowKey::Record { kind, .. } if shared(kind.name()).is_some() => VALUE_BYTES,
-        _ => value_cap(key),
-    }
-}
 fn shared_json(
     tx: &mut dyn Transaction,
     kind: &str,
@@ -338,10 +342,10 @@ pub(super) fn put<T: Serialize + ?Sized>(
         RowKey::Record { kind, .. } => kind.name(),
         _ => "",
     };
-    let mut json = codec::json(value, input_cap(key)).inspect_err(|e| {
+    let mut json = codec::json(value, value_cap(key)).inspect_err(|e| {
         // Refused while encoding, before its size is known: report it as over.
         if e.to_string().contains("state_v2_value_admission") {
-            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_cap(key));
+            telemetry::row_cap(kind, value_cap(key).saturating_add(1), value_target(key));
         }
     })?;
     let old = tx.get(key)?;
@@ -367,9 +371,12 @@ pub(super) fn put<T: Serialize + ?Sized>(
         })?;
     }
     tx.diff_refs(&old_refs, &projection.refs)?;
-    let cap = value_cap(key);
-    telemetry::row_cap(kind, json.len() as u64, cap);
-    ensure!(json.len() as u64 <= cap, "state_v2_value_admission");
+    // Over the target is an alarm, never a refusal; only the physical limit refuses.
+    telemetry::row_cap(kind, json.len() as u64, value_target(key));
+    ensure!(
+        json.len() as u64 <= value_cap(key),
+        "state_v2_value_admission"
+    );
     let encoded = codec::encode(&json)?;
     tx.put(RowInput {
         key,

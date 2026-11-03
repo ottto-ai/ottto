@@ -351,6 +351,16 @@ mod tests {
         )
         .is_err());
     }
+    /// [format] Strict v2 decode still admits the retired upload-context
+    /// direction and drops it.
+    #[test]
+    fn strict_proof_state_admits_retired_direction() {
+        use crate::snapshots::upload_context_receipt::ProofState;
+        let old = br#"{"direction":{"policy":[true,false,false,false,false],
+            "context":null,"previous_context":"a","last_change_mask":2}}"#;
+        let proof = strict_json::<ProofState>(old).unwrap();
+        assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
+    }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
@@ -463,5 +473,43 @@ mod alias_tests {
             br#"{"files":{},"claude_full_rearm_progress":{"future_owed":true}}"#
         )
         .is_err());
+    }
+
+    /// [format] A sticky folder ledger stays unqualified across a reopen, and an
+    /// index from before the ledger imports empty.
+    #[test]
+    fn folder_login_ledger_sticky_stays_unqualified() {
+        use crate::snapshots::claude_folder_login::{qualify, OwnerReport};
+        let old = br#"{"files":{}}"#;
+        assert_eq!(inventory(old.as_slice()), Ok(()));
+        assert!(strict_json::<ScanIndex>(old)
+            .unwrap()
+            .claude_folder_login_ledger
+            .is_empty());
+        let record = |mixed: bool| {
+            serde_json::json!({"files":{},"claude_folder_login_ledger":{"folder":{
+                "fresh":true,"mixed":mixed,"login":"a","org":"o","owner_proven":true,
+                "census_complete":true,"covered_from":3600,"matched":[7]}}})
+        };
+        let owner = OwnerReport {
+            pair: Some(("a".to_string(), "o".to_string())),
+            email: Some("e".to_string()),
+            ..OwnerReport::default()
+        };
+        for (mixed, qualifies) in [(false, true), (true, false)] {
+            let raw = serde_json::to_vec(&record(mixed)).unwrap();
+            assert_eq!(inventory(raw.as_slice()), Ok(()));
+            let index = strict_json::<ScanIndex>(&raw).unwrap();
+            let folder = &index.claude_folder_login_ledger["folder"];
+            assert_eq!(qualify(folder, &owner).is_some(), qualifies);
+        }
+    }
+
+    /// [format] An older index holding the retired Desktop census witness
+    /// still passes the import inventory: the slot decodes and drops.
+    #[test]
+    fn inventory_accepts_the_retired_desktop_census_witness() {
+        let raw = br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#;
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
     }
 }

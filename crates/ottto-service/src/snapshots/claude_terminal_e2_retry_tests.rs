@@ -51,7 +51,6 @@ fn pre_e2_terminal_retries_once_and_matches_cold_full() {
         at,
         183,
         10,
-        false,
         Some(&scratch),
         &hints,
         false,

@@ -87,6 +87,7 @@ struct RejectedUsageEvidence {
     machine_ref: String,
     reason: RejectedUsageReason,
     permanent: bool,
+    /// Optional classification keeps the persisted reason vocabulary compatible.
     exclusive_usage_contract: bool,
     // request, input, output, cache_read, cache_creation_5m,
     // cache_creation_1h, reasoning_output, unattributed_total.
@@ -119,15 +120,10 @@ pub(crate) enum RejectedUsageReason {
 }
 
 impl RejectedUsageReason {
-    /// The backend already holds an equal-or-better (authority downgrade) or
-    /// newer (stale older upload) accepted record for this entity. Refusing
-    /// the body loses no usage the server does not already own.
+    /// Stale refusals additionally need their retained recording metadata;
+    /// the wire reason alone cannot distinguish legacy owed records.
     pub(crate) fn is_dominated(self) -> bool {
-        matches!(
-            self,
-            RejectedUsageReason::UsageAccountingAuthorityDowngrade
-                | RejectedUsageReason::AcceptedLogStaleOlderUpload
-        )
+        matches!(self, RejectedUsageReason::UsageAccountingAuthorityDowngrade)
     }
 
     pub(crate) fn from_wire(reason: &str) -> Self {
@@ -855,17 +851,6 @@ pub fn read(
         ring_capacity: UPLOAD_RECEIPT_RING_CAPACITY as u16,
         state_path_present,
     })
-}
-
-/// When `source` last had anything accepted, from the bounded ring.
-pub(crate) fn newest_accepted_unix_seconds(state_dir: &Path, source: SourceKind) -> Option<u64> {
-    let capacity = UPLOAD_RECEIPT_RING_CAPACITY as u16;
-    read(state_dir, capacity, None, Some(source))
-        .ok()?
-        .receipts
-        .iter()
-        .find(|receipt| receipt.accepted_count > 0)
-        .and_then(|receipt| crate::snapshots::rfc3339_unix_seconds(&receipt.uploaded_at))
 }
 
 fn empty_receipt(

@@ -30,6 +30,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         pending_directories: VecDeque::new(),
         pending_candidates: VecDeque::new(),
         observed_index_keys: Default::default(),
+        oversized_discovery: Default::default(),
         codex_rollout_paths: BTreeSet::new(),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,
@@ -40,7 +41,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         codex_parent_resolution_retry_required: false,
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,
-        oversized_discovery: BTreeMap::new(),
+
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
@@ -304,21 +305,6 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
         case(Incomplete::Queued, 1, {
             let key = target[1].clone();
             move |index| queue(index, &key)
-        }),
-        case(Incomplete::RefusedRead, 1, {
-            let key = target[1].clone();
-            move |index| {
-                index
-                    .traversal
-                    .as_mut()
-                    .unwrap()
-                    .oversized_discovery
-                    .insert(
-                        oversized_discovery::path_hash(Path::new(&key)),
-                        serde_json::from_value(json!({"content_hash": "c", "observations": 1}))
-                            .unwrap(),
-                    );
-            }
         }),
         // Unattributed refusals cannot name a file: every family.
         case(Incomplete::RefusedReadUnattributed, 5, |index| {
@@ -1179,7 +1165,6 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
             "2026-08-02T07:10:00Z",
             7,
             1,
-            false,
         )
         .unwrap()
     });
@@ -1828,7 +1813,6 @@ fn production_page(dir: &Path, index: &mut ScanIndex, finalize: bool) -> Value {
             PAGE_WINDOW,
             7,
             1,
-            false,
         )
         .unwrap()
     });

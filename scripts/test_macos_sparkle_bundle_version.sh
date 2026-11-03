@@ -216,7 +216,17 @@ bash "$repo/scripts/macos_package.sh" \
   --output-dir "$output_dir" \
   --skip-build >/dev/null
 
+# [behaviour] Only the daemon LaunchAgent carries the allocator setting.
+service_plist="$output_dir/Ottto.app/Contents/Library/LaunchAgents/net.ottto.service.plist"
+if [[ "$(plutil -extract EnvironmentVariables.MallocLargeCache raw -o - "$service_plist")" != "0" ]]; then
+  echo "Packaged daemon must disable libmalloc large-cache retention" >&2
+  exit 1
+fi
 info_plist="$output_dir/Ottto.app/Contents/Info.plist"
+if plutil -extract LSEnvironment.MallocLargeCache raw -o - "$info_plist" >/dev/null 2>&1; then
+  echo "Companion app must not carry the daemon allocator setting" >&2
+  exit 1
+fi
 bundle_short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
 bundle_version="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
 if [[ "$bundle_short_version" != "0.1.92-rc2" ]]; then

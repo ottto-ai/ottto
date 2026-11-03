@@ -351,6 +351,27 @@ impl LaunchEventInventory {
 
     /// Only a completed demanded sweep can supply a fact. Native collection
     /// and synchronous audit callers prepare explicitly before finalization.
+    /// Digest of the events naming `workers`, part of those files' source
+    /// fingerprint whatever the attribution setting.
+    pub(crate) fn witness(&self, workers: &[String]) -> Option<String> {
+        let mut hasher = Sha256::new();
+        let mut any = false;
+        for worker in workers {
+            if let Some(event) = self.matching(worker) {
+                any = true;
+                hasher.update(event.controller_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.worker_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.workflow_ref.as_deref().unwrap_or("").as_bytes());
+                hasher.update([0]);
+                hasher.update(event.agent_kind.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        any.then(|| format!("{:x}", hasher.finalize()))
+    }
+
     pub(crate) fn matching(&self, worker: &str) -> Option<LaunchEvent> {
         let lookup = self.lookup.lock().ok()?;
         if !lookup.complete || lookup.failed {
