@@ -3763,6 +3763,69 @@ fn contract_debt_unknown_scope_carries_exact_acks_only_in_the_same_context() {
     }
 }
 
+/// [regress] Latch and unknown scope: a carried family whose member then grows
+/// or changes fingerprint is parsed; the parse cancels the carry and re-arms
+/// and replays the sibling, exactly as with a settled sweep.
+#[test]
+fn contract_debt_unknown_scope_changed_member_cancels_and_rearms_siblings() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in ["content", "sidecar"] {
+        let mut index = carry_index();
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+        index.claude_request_identity_contract_changed = true;
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+            rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+        let [root_key, agent_key] = carry_family_keys();
+        let mut candidate = scoped_retry_accept_member(&mut index, &root_key);
+        scoped_retry_accept_member(&mut index, &agent_key);
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        assert!(claude_contract_debt_scope(&index).is_none(), "{case}");
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["prior_unsettled_upload"], true, "{case}");
+        assert!(
+            index.claude_stale_family_carry.contains(CARRY_ROOT),
+            "{case}: the family is carried before its member changes"
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+        traversal.observed_index_keys.extend(carry_family_keys());
+        carry_fill_queue(&mut index);
+        match case {
+            "content" => candidate.size_bytes += 1,
+            _ => candidate.source_file_fingerprint = "e".repeat(64),
+        }
+        assert_eq!(
+            owed_decision(&mut index, &candidate, 1),
+            CandidateDecision::Parse,
+            "{case}"
+        );
+        cancel_claude_family_carry_for_member_parse(
+            &mut index,
+            CARRY_RETRY,
+            &candidate.path,
+            &[],
+            &VecDeque::new(),
+        );
+        assert!(
+            !index.claude_stale_family_carry.contains(CARRY_ROOT),
+            "{case}"
+        );
+        assert!(
+            index.files[&agent_key].source_file_fingerprint.is_empty(),
+            "{case}: the sibling is re-armed"
+        );
+        assert_eq!(
+            index.claude_stale_family_carry.replay,
+            vec![carry_replayed(&agent_key)],
+            "{case}: the sibling is replayed"
+        );
+        assert!(index.claude_request_identity_contract_changed);
+        assert!(index.claude_duplicate_request_witness_overflowed);
+    }
+}
+
 /// [money] The same start with one member's body not exact-ACKed (a failed
 /// upload): that family is still re-armed and read once; the ACKed family
 /// is carried unchanged with no read.

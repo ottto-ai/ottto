@@ -45296,7 +45296,7 @@ fn ensure_bounded_traversal(
     let debt_scope = if !prior_unsettled_upload {
         Some(&empty_debt_scope)
     } else if debt_scope_known {
-        prior_held_family_roots.as_ref().or(unknown_debt_scope)
+        prior_held_family_roots.as_ref()
     } else {
         unknown_debt_scope
     };
