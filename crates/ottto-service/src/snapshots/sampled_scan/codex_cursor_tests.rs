@@ -3218,6 +3218,12 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     index.archive_pass.power = true;
     let header = archive_header_pass(&mut index, &archive, &cache);
     assert!(matches!(header, HeaderRead::Validated(_)));
+    // Selection is under test, not the Full. Refuse archive work on every
+    // platform: on a macOS runner with mains power the selected archive's
+    // Full is reserved, and only the collector's reservation save, which
+    // this page loop does not run, releases the next page's inventory.
+    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(NoArchivePower));
+    index.archive_pass.power = false;
     // Only census members stay queued; SESSION returns through its hint, and
     // the re-read and the archive are queued after the control turns.
     let reread = fixture.file(REREAD);
@@ -3248,7 +3254,9 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
                 &[fixture.file(SESSION)],
             );
             let flags = selected.codex_selected_flags.clone();
-            let (index, _) = finish_published(selected);
+            let (index, _) = finish_published_within(selected, 10_000, || {
+                format!("page {page}, selected {flags:?}")
+            });
             let kind = if flags.keys().eq([&session_key]) {
                 'F'
             } else if !flags.is_empty()
@@ -3341,9 +3349,31 @@ fn published_scan(
     finish_published(selected_page(fixture, cache, index, collected_at, hints))
 }
 
+/// Platform gates that refuse archive work, as off mains power.
+struct NoArchivePower;
+impl crate::snapshot_sync::continuation::PlatformGates for NoArchivePower {
+    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Refused
+    }
+    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Allowed
+    }
+    fn restore_qos(&mut self) {}
+}
+
 /// Step `scan` to completion and apply the collector's upload policy.
-fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
-    loop {
+fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    finish_published_within(scan, usize::MAX, String::new)
+}
+
+/// [`finish_published`] that fails after `max_steps` pending steps, naming
+/// `phase`, instead of spinning on a page that cannot complete.
+fn finish_published_within(
+    mut scan: OwnedSourceScan,
+    max_steps: usize,
+    phase: impl FnOnce() -> String,
+) -> (ScanIndex, SourceScanResult) {
+    for _ in 0..max_steps {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
@@ -3367,6 +3397,10 @@ fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) 
             }
         }
     }
+    panic!(
+        "page did not complete within {max_steps} steps: {}",
+        phase()
+    );
 }
 
 /// Write a one-turn rollout in a day directory below the fixture root.
