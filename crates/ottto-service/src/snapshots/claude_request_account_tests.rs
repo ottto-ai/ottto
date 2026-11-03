@@ -429,7 +429,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
             "machine",
             &mut [mixed.clone()],
             &[],
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &qualification.mixed
         )
         .is_empty());
@@ -461,7 +461,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
             "machine",
             &mut [fresh.clone()],
             &[],
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &again.mixed
         )
         .is_empty());
@@ -552,7 +552,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
                     "machine",
                     &mut [item],
                     &[],
-                    (&[], &mut [0; 6]),
+                    (&[], &mut [0; 9]),
                     &new.mixed
                 )
                 .contains(&mixed.source_session_id)
@@ -610,7 +610,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
             "machine",
             &mut multihour,
             &[],
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &proof.mixed
         )
         .is_empty());
@@ -643,7 +643,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
             "machine",
             &mut multihour,
             &[],
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &proof.mixed
         )
         .contains(&mixed.source_session_id));

@@ -781,7 +781,7 @@ fn other_page_with_slots(
         "e2-synthetic-machine",
         &mut scan.snapshots,
         &[],
-        (slots, &mut [0; 6]),
+        (slots, &mut [0; 9]),
         &Default::default(),
     );
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());

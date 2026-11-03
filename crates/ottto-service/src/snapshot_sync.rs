@@ -7989,7 +7989,7 @@ fn finish_sync_source(
         &current_codex_bindings,
         (
             &creator_slots,
-            codex_diagnostics.map_or(&mut [0; 6], |d| &mut d.creator_slot_naming),
+            codex_diagnostics.map_or(&mut [0; 9], |d| &mut d.creator_slot_naming),
         ),
         &claude_authority_disposition.mixed_uploads,
     );
@@ -24995,7 +24995,7 @@ mod tests {
                         "machine",
                         std::slice::from_mut(item),
                         &[],
-                        (&[], &mut [0; 6]),
+                        (&[], &mut [0; 9]),
                         &proof.mixed_uploads
                     )
                     .is_empty());
@@ -25044,7 +25044,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut candidate),
                 &[],
-                (&[], &mut [0; 6]),
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());
@@ -25123,7 +25123,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut retry),
                 &[],
-                (&[], &mut [0; 6]),
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());

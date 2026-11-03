@@ -1,8 +1,8 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     ParentUnresolvableCauses, RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs,
-    UnreadableCause, UnreadableCauses, CREATOR_MULTI_MATCH, CREATOR_NAMED, CREATOR_NO_MATCH,
-    LINEAGE_SAMPLES,
+    UnreadableCause, UnreadableCauses, CREATOR_DIFFERENT_OWNER, CREATOR_MULTI_MATCH, CREATOR_NAMED,
+    CREATOR_NO_MATCH, CREATOR_NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -8367,12 +8367,9 @@ impl SourceScanResult {
                 continue;
             }
             // Explicit missing/conflict creator evidence intentionally retracts
-            // legacy guessed ownership, and a creator-slot name is new ownership
-            // of rows recording no login mode. Compare with the previously cached
-            // binding only to isolate those authorized corrections; never emit it.
+            // legacy guessed ownership. Compare with the previously cached
+            // binding only to isolate that authorized correction; never emit it.
             for item in &mut baseline.snapshots {
-                let key = sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
-                let prior = previous.session_account_bindings.get(&key);
                 if item
                     .session_account_evidence
                     .as_ref()
@@ -8381,11 +8378,11 @@ impl SourceScanResult {
                             && matches!(evidence.identity_disposition, Some("missing" | "conflict"))
                     })
                 {
-                    if let Some(binding) = prior {
+                    let key =
+                        sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
+                    if let Some(binding) = previous.session_account_bindings.get(&key) {
                         set_session_account_hash(item, Some(&binding.account_identifier_hash));
                     }
-                } else if prior.is_none() && codex_rows_all(item, |mode| mode.is_none()) {
-                    set_session_account_hash(item, None);
                 }
             }
             if !matches(&baseline.snapshots) {
@@ -48927,7 +48924,7 @@ impl ScanIndex {
             machine_id,
             snapshots,
             codex_homes,
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &claude_request_accounts::MixedUploads::default(),
         )
     }
@@ -48939,7 +48936,7 @@ impl ScanIndex {
         machine_id: &str,
         snapshots: &mut [SnapshotItem],
         codex_homes: &[crate::agent_status::CodexHomeBinding],
-        (codex_slots, creator_counts): (&[(String, String, usize)], &mut [u64; 6]),
+        (codex_slots, creator_counts): (&[(String, String, usize)], &mut [u64; 9]),
         mixed: &claude_request_accounts::MixedUploads,
     ) -> BTreeSet<String> {
         let mut deferred = BTreeSet::new();
@@ -48951,24 +48948,37 @@ impl ScanIndex {
                 SnapshotSource::Codex => {
                     let mut creator_slot = None;
                     if !codex_rows_all(item, |mode| matches!(mode, Some("oauth" | "chatgpt"))) {
-                        // No recorded mode: only the creator's slot names it, never the home.
-                        let Some((account, workspace)) = codex_creator_pair(item)
-                            .filter(|_| codex_rows_all(item, |mode| mode.is_none()))
-                        else {
+                        // No recorded mode: only the creator's slot names a session
+                        // never emitted before, never the home (forward only).
+                        if !codex_rows_all(item, |mode| mode.is_none()) {
                             set_session_account_hash(item, None);
                             continue;
-                        };
-                        let refused = match existing {
-                            Some(owner) => owner.account_identifier_hash != account,
-                            None => {
-                                let slots = (codex_slots, &mut *creator_counts);
-                                creator_slot = codex_creator_slot(account, workspace, slots);
-                                creator_slot.is_none()
+                        }
+                        let decided = match (codex_creator_pair(item), existing) {
+                            (None, _) => Err(CREATOR_NO_PAIR),
+                            (Some((account, _)), Some(owner))
+                                if owner.account_identifier_hash == account =>
+                            {
+                                Ok(None)
+                            }
+                            (Some(_), Some(_)) => Err(CREATOR_DIFFERENT_OWNER),
+                            (Some(_), None) if !self.codex_file_never_emitted(item) => {
+                                Err(CREATOR_PREVIOUSLY_UPLOADED)
+                            }
+                            (Some((account, workspace)), None) => {
+                                codex_creator_slot(account, workspace, codex_slots).map(Some)
                             }
                         };
-                        if refused {
-                            set_session_account_hash(item, None);
-                            continue;
+                        match decided {
+                            Ok(owner) => {
+                                creator_counts[CREATOR_NAMED] += u64::from(owner.is_some());
+                                creator_slot = owner;
+                            }
+                            Err(cause) => {
+                                creator_counts[cause] += 1;
+                                set_session_account_hash(item, None);
+                                continue;
+                            }
                         }
                     }
                     // An explicit creator-negative is a source decision, not
@@ -49071,6 +49081,20 @@ impl ScanIndex {
             }
         }
         deferred
+    }
+
+    /// `item`'s one file has emitted no snapshot before this scan.
+    fn codex_file_never_emitted(&self, item: &SnapshotItem) -> bool {
+        let fingerprint = item.source_file_fingerprint.as_deref();
+        let mut keys = self
+            .files
+            .iter()
+            .filter(|(_, entry)| Some(entry.source_file_fingerprint.as_str()) == fingerprint);
+        let (Some((key, _)), None) = (keys.next(), keys.next()) else {
+            return false;
+        };
+        let emitted = self.file_snapshot_fingerprints.get(key);
+        emitted.map_or(true, BTreeSet::is_empty)
     }
 
     fn codex_owner_for_item(
@@ -55564,19 +55588,18 @@ pub(crate) fn codex_creator_pair(item: &SnapshotItem) -> Option<(&str, &str)> {
 fn codex_creator_slot(
     account: &str,
     workspace: &str,
-    (slots, counts): (&[(String, String, usize)], &mut [u64; 6]),
-) -> Option<SessionAccountBinding> {
+    slots: &[(String, String, usize)],
+) -> Result<SessionAccountBinding, usize> {
     let mut matches = slots.iter().filter(|s| s.0 == account && s.1 == workspace);
-    let cause = match (matches.next(), matches.next()) {
-        (None, _) => CREATOR_NO_MATCH,
-        (Some(_), Some(_)) => CREATOR_MULTI_MATCH,
-        (Some(slot), None) => slot.2,
-    };
-    counts[cause] += 1;
-    (cause == CREATOR_NAMED).then(|| SessionAccountBinding {
-        account_identifier_hash: account.to_string(),
-        workspace_identifier_hash: Some(workspace.to_string()),
-    })
+    match (matches.next(), matches.next()) {
+        (None, _) => Err(CREATOR_NO_MATCH),
+        (Some(_), Some(_)) => Err(CREATOR_MULTI_MATCH),
+        (Some(slot), None) if slot.2 != CREATOR_NAMED => Err(slot.2),
+        (Some(_), None) => Ok(SessionAccountBinding {
+            account_identifier_hash: account.to_string(),
+            workspace_identifier_hash: Some(workspace.to_string()),
+        }),
+    }
 }
 
 pub fn source_file_fingerprint(

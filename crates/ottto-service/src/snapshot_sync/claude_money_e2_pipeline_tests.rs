@@ -267,7 +267,7 @@ impl Page {
             "e2-synthetic-machine",
             &mut self.scan.snapshots,
             &[],
-            (&[], &mut [0; 6]),
+            (&[], &mut [0; 9]),
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred);

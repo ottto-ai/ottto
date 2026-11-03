@@ -2678,7 +2678,7 @@ fn bind_owner_a(
         machine,
         items,
         &[],
-        (&[], &mut [0; 6]),
+        (&[], &mut [0; 9]),
         capability,
     );
     assert_eq!(

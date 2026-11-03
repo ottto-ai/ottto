@@ -5,9 +5,10 @@
 use super::tests::{manifest_index_entry, valid_v6_batch_request};
 use super::*;
 use crate::codex_scan_diagnostics::{
-    CREATOR_API_KEY as API_KEY, CREATOR_MODE_UNREADABLE as MODE_UNREADABLE,
-    CREATOR_MULTI_MATCH as MULTI_MATCH, CREATOR_NAMED as NAMED,
-    CREATOR_NOT_FORCED_CHATGPT as NOT_FORCED, CREATOR_NO_MATCH as NO_MATCH,
+    CREATOR_API_KEY as API_KEY, CREATOR_DIFFERENT_OWNER as DIFFERENT_OWNER,
+    CREATOR_MODE_UNREADABLE as MODE_UNREADABLE, CREATOR_MULTI_MATCH as MULTI_MATCH,
+    CREATOR_NAMED as NAMED, CREATOR_NOT_FORCED_CHATGPT as NOT_FORCED, CREATOR_NO_MATCH as NO_MATCH,
+    CREATOR_NO_PAIR as NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED as PREVIOUSLY_UPLOADED,
 };
 
 const HOME_A: &str = "/synthetic/codex-slot-a";
@@ -29,14 +30,16 @@ fn creator(account: Option<&str>, disposition: Option<&'static str>) -> SessionA
 }
 
 /// Binds one Codex session found in slot A's home, created per `evidence`,
-/// whose rows and buckets record `modes`. Returns the session's account, its
+/// whose rows and buckets record `modes`, and whose file has (`uploaded`) or
+/// has not emitted a snapshot before. Returns the session's account, its
 /// retained binding and the scan's creator counts.
 fn bind(
     evidence: SessionAccountEvidence,
     slots: &[(String, String, usize)],
     (row_mode, bucket_mode): (Option<&str>, Option<&str>),
     cached: Option<&str>,
-) -> (Option<String>, Option<SessionAccountBinding>, [u64; 6]) {
+    uploaded: bool,
+) -> (Option<String>, Option<SessionAccountBinding>, [u64; 9]) {
     let key = sha256_hex(&["session_owner:v1", "machine", "creator-session"]);
     let home = crate::agent_status::CodexHomeBinding {
         home: PathBuf::from(HOME_A),
@@ -60,8 +63,12 @@ fn bind(
     item.session_account_evidence = Some(evidence.clone());
     let mut entry = manifest_index_entry(None);
     entry.source_file_fingerprint = "creator-file".into();
-    let path = Path::new(HOME_A).join("sessions/rollout.jsonl");
-    index.files.insert(local_index_key(&path), entry);
+    let file = local_index_key(&Path::new(HOME_A).join("sessions/rollout.jsonl"));
+    index.files.insert(file.clone(), entry);
+    if uploaded {
+        let emitted = BTreeSet::from(["earlier-unknown-revision".to_string()]);
+        index.file_snapshot_fingerprints.insert(file, emitted);
+    }
     if let Some(cached) = cached {
         let owner = SessionAccountBinding {
             account_identifier_hash: cached.into(),
@@ -69,7 +76,7 @@ fn bind(
         };
         index.session_account_bindings.insert(key.clone(), owner);
     }
-    let mut counts = [0; 6];
+    let mut counts = [0; 9];
     let deferred = index.bind_session_accounts_with_mixed(
         SnapshotSource::Codex,
         "machine",
@@ -94,24 +101,50 @@ fn bind(
     (exact_session_account_hash(&item), binding, counts)
 }
 
-fn counted(cause: usize) -> [u64; 6] {
-    let mut counts = [0; 6];
-    counts[cause] = 1;
+fn counted(cause: Option<usize>) -> [u64; 9] {
+    let mut counts = [0; 9];
+    if let Some(cause) = cause {
+        counts[cause] = 1;
+    }
     counts
 }
 
 /// [regress] Codex rollouts record no login mode, so no Codex session was
-/// named. One whose creator pair matches its single registered subscription
-/// slot is now named by that slot and counted.
+/// named. A session never uploaded before, whose creator pair matches its
+/// single registered subscription slot, is now named by that slot and counted.
 #[test]
 fn codex_creator_pair_names_its_single_subscription_slot() {
     let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
-    let named = bind(creator(Some("slot-a"), None), &slots, (None, None), None);
+    let named = bind(
+        creator(Some("slot-a"), None),
+        &slots,
+        (None, None),
+        None,
+        false,
+    );
     let owner = SessionAccountBinding {
         account_identifier_hash: "slot-a".into(),
         workspace_identifier_hash: Some("slot-a-workspace".into()),
     };
-    assert_eq!(named, (Some("slot-a".into()), Some(owner), counted(NAMED)));
+    assert_eq!(
+        named,
+        (Some("slot-a".into()), Some(owner), counted(Some(NAMED)))
+    );
+}
+
+/// [regress] Forward only (D185): a session already uploaded as Unknown stays
+/// Unknown on every later revision, counted, and mints no owner.
+#[test]
+fn codex_session_uploaded_unknown_stays_unknown_as_it_grows() {
+    let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
+    let named = bind(
+        creator(Some("slot-b"), None),
+        &slots,
+        (None, None),
+        None,
+        true,
+    );
+    assert_eq!(named, (None, None, counted(Some(PREVIOUSLY_UPLOADED))));
 }
 
 /// D185: a session found in slot A's home whose creator pair matches slot B
@@ -119,18 +152,27 @@ fn codex_creator_pair_names_its_single_subscription_slot() {
 #[test]
 fn codex_creator_pair_names_its_slot_never_the_home_it_was_found_in() {
     let slots = [slot("slot-a", NAMED), slot("slot-b", NAMED)];
-    let named = bind(creator(Some("slot-b"), None), &slots, (None, None), None);
+    let named = bind(
+        creator(Some("slot-b"), None),
+        &slots,
+        (None, None),
+        None,
+        false,
+    );
     let owner = SessionAccountBinding {
         account_identifier_hash: "slot-b".into(),
         workspace_identifier_hash: Some("slot-b-workspace".into()),
     };
-    assert_eq!(named, (Some("slot-b".into()), Some(owner), counted(NAMED)));
+    assert_eq!(
+        named,
+        (Some("slot-b".into()), Some(owner), counted(Some(NAMED)))
+    );
 }
 
 /// One control per refusal cause, the slot login causes read from synthetic
-/// slot homes. Every refusal names nothing (never the home), and only slot
-/// decisions are counted. A null stored key is no key; rows proving OAuth keep
-/// today's home owner; an owner of the creator's account stands.
+/// slot homes. Every refusal names nothing (never the home) and is counted.
+/// A null stored key is no key; rows proving OAuth keep today's home owner; an
+/// owner of the creator's account stands, also on a later revision.
 #[cfg(unix)]
 #[test]
 fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
@@ -175,40 +217,54 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
         ("no match", a_c, NO_MATCH),
         ("multi match", b_b, MULTI_MATCH),
     ] {
-        let (named, _, counts) = bind(creator(Some("slot-b"), None), &slots, (None, None), None);
+        let positive = creator(Some("slot-b"), None);
+        let (named, _, counts) = bind(positive, &slots, (None, None), None, false);
         let expected = (cause == NAMED).then_some("slot-b");
-        assert_eq!(
-            (named.as_deref(), counts),
-            (expected, counted(cause)),
-            "{label}"
-        );
+        let counts_and_name = (named.as_deref(), counts);
+        assert_eq!(counts_and_name, (expected, counted(Some(cause))), "{label}");
     }
-    // Controls the slot never decides: nothing is counted.
     let (a, b, none) = (Some("slot-a"), Some("slot-b"), (None, None));
     let (oauth, api, mixed) = (
         (Some("oauth"), Some("oauth")),
         (Some("api_key"), Some("api_key")),
         (Some("oauth"), None),
     );
-    for (label, slots, account, modes, cached, expected) in [
-        ("negative", with_b(NAMED), None, none, None, None),
-        ("api rows", with_b(NAMED), b, api, None, None),
-        ("mixed rows", with_b(NAMED), b, mixed, None, None),
-        ("oauth rows", with_b(NAMED), b, oauth, None, a),
-        ("retained", with_b(API_KEY), b, none, b, b),
-        ("other owner", with_b(NAMED), b, none, a, None),
+    for (label, slots, account, modes, cached, expected, cause) in [
+        (
+            "no pair",
+            with_b(NAMED),
+            None,
+            none,
+            None,
+            None,
+            Some(NO_PAIR),
+        ),
+        (
+            "other owner",
+            with_b(NAMED),
+            b,
+            none,
+            a,
+            None,
+            Some(DIFFERENT_OWNER),
+        ),
+        ("api rows", with_b(NAMED), b, api, None, None, None),
+        ("mixed rows", with_b(NAMED), b, mixed, None, None, None),
+        ("oauth rows", with_b(NAMED), b, oauth, None, a, None),
+        ("retained", with_b(API_KEY), b, none, b, b, None),
     ] {
         let evidence = creator(account, account.is_none().then_some("missing"));
-        let (named, _, counts) = bind(evidence, &slots, modes, cached);
-        assert_eq!((named.as_deref(), counts), (expected, [0; 6]), "{label}");
+        let (named, _, counts) = bind(evidence, &slots, modes, cached, cached.is_some());
+        let counts_and_name = (named.as_deref(), counts);
+        assert_eq!(counts_and_name, (expected, counted(cause)), "{label}");
     }
 }
 
-/// [regress] Upgrading names a pre-join Codex group by its creator slot. The
-/// legacy check still reproduces the untagged output an older release
-/// persisted, so the newly named group is not held.
+/// [regress] Upgrade: pre-join Codex groups an older release uploaded as
+/// Unknown are not named by their creator slot, so the legacy check
+/// reproduces their untagged output and the groups are not held.
 #[test]
-fn codex_legacy_join_reproduces_untagged_output_before_creator_naming() {
+fn codex_legacy_join_groups_uploaded_unknown_stay_unknown_on_upgrade() {
     let (root, inventory) = codex_file_join::tests::fixture();
     let previous = codex_file_join::tests::legacy_index(&inventory, None);
     let (mut index, mut result) = codex_file_join::tests::scan(&root, previous.clone(), 2);
@@ -226,13 +282,6 @@ fn codex_legacy_join_reproduces_untagged_output_before_creator_naming() {
                 row.auth_mode = None;
                 row.account_identifier_hash = None;
             }
-            // This scan's bind named the session; the older release did not.
-            let key = sha256_hex(&["session_owner:v1", "machine", &snapshot.source_session_id]);
-            let owner = SessionAccountBinding {
-                account_identifier_hash: "slot-b".into(),
-                workspace_identifier_hash: Some("slot-b-workspace".into()),
-            };
-            index.session_account_bindings.insert(key, owner);
         }
         let fingerprints = baseline
             .snapshots
@@ -240,17 +289,22 @@ fn codex_legacy_join_reproduces_untagged_output_before_creator_naming() {
             .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot));
         baseline.expected = snapshot_file_entity_set_hex(fingerprints.collect::<BTreeSet<_>>());
     }
-    // Control: the projection alone tags the named owner.
-    let mut tagged = result.codex_legacy_join_baselines[0].snapshots.clone();
-    index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut tagged, &[]);
-    assert_eq!(
-        exact_session_account_hash(&tagged[0]).as_deref(),
-        Some("slot-b")
-    );
-
+    let slots = [slot("slot-b", NAMED)];
+    let mut counts = [0; 9];
     result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |index, snapshots| {
-        index.bind_session_accounts(SnapshotSource::Codex, "machine", snapshots, &[]);
+        let creator = (&slots[..], &mut counts);
+        let mixed = Default::default();
+        index.bind_session_accounts_with_mixed(
+            SnapshotSource::Codex,
+            "machine",
+            snapshots,
+            &[],
+            creator,
+            &mixed,
+        );
     });
-    assert!(result.census_complete, "a creator-slot name is not a hold");
+    assert!(result.census_complete, "untagged legacy output reproduces");
+    assert_eq!(counts[NAMED], 0);
+    assert!(counts[PREVIOUSLY_UPLOADED] > 0);
     std::fs::remove_dir_all(root).unwrap();
 }
