@@ -370,3 +370,20 @@ fn recorded_login_capability_off_keeps_every_byte() {
     );
     assert_eq!(serde_json::to_vec(&index).unwrap(), before);
 }
+
+/// [regress] D156: the login-address key and its capability are not in the
+/// acquisition scope, so a flap or a rotation never forces a whole read.
+#[test]
+fn the_login_address_key_never_changes_the_acquisition_scope() {
+    use crate::claude_status_coverage::bind_address_key;
+    let index_path = std::path::Path::new("/synthetic/index.json");
+    let scope = || cycle_sampled_scope(&[7; 32], "namespace", index_path, true).0;
+    bind_address_key(None);
+    let off = scope();
+    bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    assert_eq!(scope(), off);
+    bind_address_key(Some(zeroize::Zeroizing::new([0x43; 32])));
+    assert_eq!(scope(), off);
+    bind_address_key(None);
+    assert_eq!(scope(), off);
+}

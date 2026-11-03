@@ -42,7 +42,6 @@ struct Ledger {
 }
 
 const ADDRESS_DOMAIN: &str = "claude_folder_login_address:v1";
-const ADDRESS_SCOPE_DOMAIN: &str = "claude_folder_login_address_scope:v1";
 
 fn keyed_address(key: &[u8; 32], address: &str) -> String {
     keyed_text_digest(key, ADDRESS_DOMAIN, &address.trim().to_ascii_lowercase())
@@ -102,7 +101,8 @@ pub(crate) fn observe_with_email(home: String, mut report: OwnerReport, email: O
 
 /// Sync pass: the attribution key for this capability, or none. A digest under
 /// another key can never be compared, so a change drops every report's email.
-/// True when a held key went away: values under it may still be retained.
+/// True on any change, gaining a key included: a retained parse read sentences
+/// under the old key or without one, so the caller scrubs its recorded login.
 pub(crate) fn bind_address_key(key: Option<Zeroizing<[u8; 32]>>) -> bool {
     with_ledger(|ledger| {
         let unchanged = match (&ledger.address_key, &key) {
@@ -113,12 +113,11 @@ pub(crate) fn bind_address_key(key: Option<Zeroizing<[u8; 32]>>) -> bool {
         if unchanged {
             return false;
         }
-        let replaced = ledger.address_key.is_some();
         ledger.address_key = key;
         for report in ledger.reports.values_mut() {
             report.email = None;
         }
-        replaced
+        true
     })
 }
 
@@ -134,17 +133,6 @@ pub(crate) fn address_digest(address: &str) -> Option<String> {
             .address_key
             .as_ref()
             .map(|key| keyed_address(key, address))
-    })
-}
-
-/// A retained parse holds digests under the key it was read with, so it never
-/// crosses keys. None while no key is bound: those scope bytes are unchanged.
-pub(crate) fn address_scope() -> Option<String> {
-    with_ledger(|ledger| {
-        ledger
-            .address_key
-            .as_ref()
-            .map(|key| keyed_text_digest(key, ADDRESS_SCOPE_DOMAIN, "")[..16].to_string())
     })
 }
 

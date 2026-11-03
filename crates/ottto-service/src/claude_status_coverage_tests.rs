@@ -44,10 +44,6 @@ fn the_address_digest_is_keyed_and_has_its_own_domain() {
     );
     assert_ne!(
         digest,
-        keyed_text_digest(&KEY, ADDRESS_SCOPE_DOMAIN, ADDRESS)
-    );
-    assert_ne!(
-        digest,
         keyed_text_digest(&KEY, "claude_accepted_key_epoch:v2", ADDRESS)
     );
     assert_ne!(
@@ -56,34 +52,32 @@ fn the_address_digest_is_keyed_and_has_its_own_domain() {
     );
 }
 
-/// [privacy] No key: no digest, no report email, no scope bytes.
+/// [privacy] No key: no digest, no report email.
 #[test]
 fn no_key_gives_no_field() {
     forget_addresses();
     assert_eq!(address_digest(ADDRESS), None);
-    assert_eq!(address_scope(), None);
     observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
     assert_eq!(snapshot()["folder"].email, None);
 }
 
-/// [regress] A digest under another key is never compared, and forgetting ends both.
+/// [regress] A digest under another key is never compared, and forgetting ends
+/// both. Every change is reported, gaining a key too, so retained logins scrub.
 #[test]
 fn a_key_change_drops_every_report_email_and_forgetting_drops_the_key() {
     forget_addresses();
-    assert!(!bind(KEY), "nothing was held");
+    assert!(bind(KEY), "gaining a key is a change");
     observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
     assert_eq!(snapshot()["folder"].email, address_digest(ADDRESS));
-    let scope = address_scope().unwrap();
     assert!(!bind(KEY), "the same key changes nothing");
     assert_eq!(snapshot()["folder"].email, address_digest(ADDRESS));
 
     assert!(bind([0x43; 32]));
     assert_eq!(snapshot()["folder"].email, None);
-    assert_ne!(address_scope().unwrap(), scope);
 
     observe_with_email("folder".into(), OwnerReport::default(), Some(ADDRESS));
-    forget_addresses();
+    assert!(bind_address_key(None));
     assert_eq!(snapshot()["folder"].email, None);
     assert_eq!(address_digest(ADDRESS), None);
-    assert_eq!(address_scope(), None);
+    assert!(!bind_address_key(None));
 }

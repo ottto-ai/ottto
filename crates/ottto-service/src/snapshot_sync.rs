@@ -6360,10 +6360,6 @@ fn cycle_sampled_scope(
         // A retained parser never crosses capture modes; the dark scope bytes
         // are unchanged.
         sampled_scope.push_str(":request_identity");
-        if let Some(epoch) = crate::claude_status_coverage::address_scope() {
-            sampled_scope.push_str(":login_address:");
-            sampled_scope.push_str(&epoch);
-        }
     }
     crate::transcript_acquisition::Scope(format!("{:x}", Sha256::digest(sampled_scope.as_bytes())))
 }
@@ -6659,13 +6655,17 @@ fn prepare_sync_source_inner(
             .as_ref()
             .filter(|_| sole_login)
             .map(SessionAttributionContext::accepted_fingerprint_key);
-        if crate::claude_status_coverage::bind_address_key(key) {
-            daemon.transcript_cache.forget_retained_transcripts();
-        }
-        if crate::snapshots::claude_request_identity::bind_session_context_key(
+        // A key or capability change only scrubs what retained parses compare
+        // under the old key: every parse, cursor and count stays, so a server
+        // hint never causes a re-read.
+        let address = crate::claude_status_coverage::bind_address_key(key);
+        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        ) {
-            daemon.transcript_cache.scrub_retained_context_digests();
+        );
+        if context || address {
+            daemon
+                .transcript_cache
+                .scrub_retained_identity(context, address);
         }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);

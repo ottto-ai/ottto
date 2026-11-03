@@ -634,6 +634,53 @@ fn a_fork_reference_growing_by_tail_ends_the_name_and_never_returns() {
     assert_eq!(witness(&again), None);
 }
 
+/// [money] A key rotation scrubs the retained parse's recorded login instead
+/// of dropping it: the tail read after it reads only new bytes and names nothing,
+/// with no sticky verdict, while a new session is named under the new key.
+#[test]
+fn a_key_rotation_scrubs_the_recorded_login_and_keeps_the_parse() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::claude_request_identity::take_address_scrubs_for_test;
+    let f = folder("recorded-rotation");
+    let mut index = ScanIndex::default();
+    let mut retained = named_session(&f, &mut index).unwrap();
+    assert!(bind_address_key(Some(zeroize::Zeroizing::new([0x43; 32]))));
+    observe(f.key.clone(), folder_report());
+    take_address_scrubs_for_test();
+    retained.state.scrub_identity(false, true);
+    assert_eq!(take_address_scrubs_for_test(), 1);
+
+    let path = f.path(SESSION_A);
+    append(
+        &path,
+        &[
+            context(ADDRESS, SESSION_A),
+            assistant(SESSION_A, "req_2", "2026-08-02T07:05:00Z"),
+        ],
+    );
+    let (_, mode, mut tailed) = resumable_read(&path, Some(retained), 101);
+    assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
+    let seen = tailed[0]
+        .claude_org_markers
+        .as_deref()
+        .unwrap()
+        .recorded_login();
+    assert_eq!(seen.email, None, "no new baseline after a scrub");
+    assert!(!seen.contradicted);
+    page(&mut index, &mut tailed, true);
+    assert_eq!(witness(&tailed), None);
+    assert!(!f.record(&index).mixed);
+
+    let mut new = f.read(SESSION_B, &own_lines(SESSION_B, "req_b"));
+    page(&mut index, &mut new, true);
+    assert!(
+        witness(&new).is_some(),
+        "new sessions name under the new key"
+    );
+}
+
 /// [money]
 #[test]
 fn later_real_telemetry_replaces_the_name_for_good() {

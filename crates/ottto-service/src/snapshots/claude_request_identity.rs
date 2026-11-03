@@ -2887,7 +2887,8 @@ pub(crate) struct OrgMarkers {
     /// The keyed digest (`claude_status_coverage::address_digest`) of the one
     /// address the sentences name, and whether a later one named another. A
     /// sentence without exactly one well-formed address answers nothing, and
-    /// without the key there is no field.
+    /// without the key there is no field. `other_address` with no `address`
+    /// is a scrubbed file: it answers nothing until a whole read.
     address: Option<String>,
     other_address: bool,
 }
@@ -2982,11 +2983,12 @@ pub(crate) fn note_marker_line(
             if let Some(address) =
                 recorded_address(&text).and_then(crate::claude_status_coverage::address_digest)
             {
-                state.other_address |= state
-                    .address
-                    .as_ref()
-                    .is_some_and(|known| *known != address);
-                state.address.get_or_insert(address);
+                match &state.address {
+                    Some(known) => state.other_address |= *known != address,
+                    // A scrubbed file never takes a new baseline.
+                    None if !state.other_address => state.address = Some(address),
+                    None => {}
+                }
             }
         }
         Some("credential_org") => {
@@ -3047,6 +3049,28 @@ pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
     with_context_digest_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+#[cfg(not(test))]
+static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_address_scrubs<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        ADDRESS_SCRUBS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&ADDRESS_SCRUBS)
+    }
+}
+#[cfg(test)]
+pub(crate) fn take_address_scrubs_for_test() -> u64 {
+    with_address_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVerdict<'m> {
     None,
@@ -3073,9 +3097,24 @@ impl OrgMarkers {
         });
     }
 
+    /// Ends login comparison across an address key or capability change. A
+    /// sentence already read went unrecorded or sits under the old key, so a
+    /// file that read one never answers again; a later whole read starts over.
+    /// Markers, positions and verdicts stay, and nothing is re-read.
+    pub(crate) fn scrub_address(&mut self) {
+        if self.context_position.is_none() && self.address.is_none() {
+            return;
+        }
+        self.address = None;
+        self.other_address = true;
+        with_address_scrubs(|counter| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     pub(crate) fn recorded_login(&self) -> RecordedLogin<'_> {
         let first = self.starting_marker.as_ref();
-        let contradicted = self.other_address
+        let contradicted = (self.other_address && self.address.is_some())
             || first.is_some_and(|first| {
                 first.org.is_none() || self.entries.iter().any(|marker| marker.org != first.org)
             });
@@ -4520,6 +4559,10 @@ pub(crate) struct IdentityCounts {
     /// Retained Claude parses scrubbed on an attribution key change.
     #[serde(skip_serializing_if = "is_zero")]
     claude_context_digest_scrubs: u64,
+    /// Retained Claude parses whose recorded login was scrubbed on an address
+    /// key or capability change.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_login_address_scrubs: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -4543,6 +4586,9 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_blocked_no_account_requests: blocked,
         claude_carry_skipped_incomplete_transcripts: incomplete,
         claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
+        claude_login_address_scrubs: with_address_scrubs(|counter| {
             counter.swap(0, std::sync::atomic::Ordering::Relaxed)
         }),
         claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {

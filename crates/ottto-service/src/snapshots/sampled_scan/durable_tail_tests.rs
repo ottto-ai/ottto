@@ -9519,7 +9519,7 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
 
             assert!(bind_session_context_key(to.map(attribution).as_ref()));
             take_context_digest_scrubs_for_test();
-            owner.cache.scrub_retained_context_digests();
+            owner.cache.scrub_retained_identity(true, false);
             assert_eq!(take_context_digest_scrubs_for_test(), parses as u64);
             assert_eq!(retained(), parses);
             let ((index, _, _), bytes) = observe_consumed(|| scan(index));
@@ -9548,6 +9548,76 @@ fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
             );
         });
     }
+}
+
+/// [money] D156: a recorded-login capability flap (key on, off, on again) only
+/// scrubs each retained recorded login. No parse is dropped, every count stays,
+/// and the scans after each change read 0 transcript bytes.
+#[test]
+fn capability_flap_scrubs_recorded_logins_without_a_read() {
+    use crate::claude_status_coverage::bind_address_key;
+    use crate::snapshots::claude_request_identity::take_address_scrubs_for_test;
+    let attachment = |body: serde_json::Value| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"attachment",
+                "sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","attachment":body})
+        )
+    };
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("capability-flap-scrub");
+        let _lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(
+            &path,
+            attachment(serde_json::json!({"type":"session_context",
+                "context":{"userEmail":"one@example.invalid"}}))
+                + &attachment(serde_json::json!({"type":"credential_org",
+                    "organizationUuid":"11111111-1111-4111-8111-111111111111"}))
+                + &a1a_row("accepted", 100),
+        )
+        .unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::capturing_identity();
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut index, mut first, _) = scan(index);
+        a1a_wire(&root, &mut index, &mut first);
+        let retained = || owner.cache.retained().unwrap().keys().count();
+        let parses = retained();
+        assert!(parses > 0);
+        for key in [None, Some([0x42; 32])] {
+            assert!(bind_address_key(key.map(zeroize::Zeroizing::new)));
+            take_address_scrubs_for_test();
+            owner.cache.scrub_retained_identity(false, true);
+            assert_eq!(take_address_scrubs_for_test(), parses as u64);
+            assert_eq!(retained(), parses);
+            let ((next, _, _), bytes) = observe_consumed(|| scan(index));
+            assert_eq!(bytes, 0);
+            assert_eq!(retained(), parses);
+            index = next;
+        }
+        bind_address_key(None);
+    });
 }
 
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
