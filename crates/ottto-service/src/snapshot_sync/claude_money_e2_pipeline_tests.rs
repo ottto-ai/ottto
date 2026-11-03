@@ -3169,7 +3169,12 @@ fn settle_captured_holds(
         &sent,
         &progress.fresh_context_body_acks,
     );
-    c.reload(&mut settled.index)
+    // The daemon's save and reload: a routed page commits over its route's
+    // current baseline, as the route moved on while the page was scanned.
+    crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+        &mut settled.index,
+        &c.base.join("scan-index.json"),
+    )
 }
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
