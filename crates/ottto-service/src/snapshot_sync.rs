@@ -7964,11 +7964,19 @@ fn finish_sync_source(
         crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
     let cached_codex_login_changed = source == SnapshotSource::Codex
         && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
+    let creator_slots = (source == SnapshotSource::Codex)
+        .then(crate::agent_status::registered_codex_creator_slots)
+        .unwrap_or_default();
+    let codex_diagnostics = scan_result.local_codex_diagnostics.as_mut();
     let deferred_accounts = index.bind_session_accounts_with_mixed(
         source,
         machine_id,
         &mut scan_result.snapshots,
         &current_codex_bindings,
+        (
+            &creator_slots,
+            codex_diagnostics.map_or(&mut [0; 9], |d| &mut d.creator_slot_naming),
+        ),
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
@@ -10209,6 +10217,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
     let mut cross_window =
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
+    cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
         let (generation, mut api, mut trace) = decode_window.time(|| {
             let generation =
@@ -14707,6 +14716,16 @@ mod tests {
         )
         .unwrap();
         index.activate_upload_context("cache-on-mandatory".into());
+        // Forward-only: the capability change alone reads nothing, although
+        // the accepted file holds no receipt under the new context.
+        assert!(
+            scan(&mut index.clone()).snapshots.is_empty(),
+            "a capability change reads nothing"
+        );
+        // Its next ordinary read carries the capability; a re-arm stands in.
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
         let mut on = scan(&mut index);
         apply_upload_policy(
             SnapshotSource::Codex,
@@ -14979,11 +14998,21 @@ mod tests {
         assert_eq!(accepted, 1);
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         index.activate_upload_context("cache-on".into());
+        // Forward-only: the capability change alone reads nothing, although
+        // the accepted file holds no receipt under the new context.
+        assert!(
+            scan(&mut index.clone()).snapshots.is_empty(),
+            "a capability change reads nothing"
+        );
+        // Its next ordinary read carries the capability; a re-arm stands in.
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
         let mut on = scan(&mut index);
         assert_eq!(
             on.snapshots.len(),
             1,
-            "context transition actually reparses unchanged file"
+            "the next ordinary read reparses the unchanged file"
         );
         apply_upload_policy(
             SnapshotSource::Codex,
@@ -24840,6 +24869,7 @@ mod tests {
                         "machine",
                         std::slice::from_mut(item),
                         &[],
+                        (&[], &mut [0; 9]),
                         &proof.mixed_uploads
                     )
                     .is_empty());
@@ -24888,6 +24918,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut candidate),
                 &[],
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());
@@ -24966,6 +24997,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut retry),
                 &[],
+                (&[], &mut [0; 9]),
                 &proof.mixed
             )
             .is_empty());

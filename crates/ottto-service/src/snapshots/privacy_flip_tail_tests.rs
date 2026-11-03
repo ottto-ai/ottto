@@ -103,12 +103,77 @@ fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
     }
 }
 
+/// [money] Forward-only, Codex and Pi: a delivered file whose proof is gone
+/// (no receipt, no stamps) reads nothing at any setting or capability flip. Its
+/// next growth is one Tail under the new context that equals a cold Full
+/// under it: money, placement, what the scan retains and the POSTed bodies.
+#[test]
+fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        for bit in &FLIPS {
+            let before = mode(false);
+            let after = flipped(before, bit);
+            let label = format!("{source:?}/{}", bit.0);
+            let mut f = Fixture::new(source);
+            f.append(&material(source));
+            f.flip_to(before);
+            let committed = f.index.clone();
+            let parsed = f.flip_walk(before.policy, f.attribution_for(before).as_ref());
+            f.send_all(&committed, &parsed.scan);
+            assert!(!f.debt(), "{label}: positive control, delivered and proven");
+            let key = f.key();
+            f.index.files.get_mut(&key).unwrap().upload_context_receipt = None;
+            f.drop_entity_stamps();
+            f.flip_to(after);
+            assert!(f.debt(), "{label}: delivered, unproven");
+            let posted = f.uploader.posts.len();
+            let committed = f.index.clone();
+            let quiet = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
+            assert_eq!(
+                (quiet.modes.0, quiet.modes.1, quiet.bytes),
+                (0, 0, 0),
+                "{label}"
+            );
+            assert!(quiet.scan.snapshots.is_empty(), "{label}: nothing to send");
+            f.send_all(&committed, &quiet.scan);
+            assert_eq!(f.uploader.posts.len(), posted, "{label}: no POST");
+            assert!(f.debt(), "{label}: still owed, paid by the next read");
+
+            f.append(&growth(source));
+            let committed = f.index.clone();
+            let tail = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
+            assert_eq!(tail.modes, (0, 1, 0), "{label}");
+            assert!(tail.bytes > 0, "{label}: the append is read");
+            let tail_money = scan_money(source, &f.index, &tail.scan);
+            let posted = f.uploader.posts.len();
+            f.send_all(&committed, &tail.scan);
+            let tail_posts = f.uploader.posts[posted..].concat();
+            assert!(!f.debt(), "{label}: the growth send pays the debt");
+
+            f.index = ScanIndex::default();
+            f.cache = Arc::default();
+            f.uploader = crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source);
+            f.flip_to(after);
+            let committed = f.index.clone();
+            let cold = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
+            assert_eq!(cold.modes.0, 1, "{label}: the control is a Full");
+            assert_eq!(cold.retained, tail.retained, "{label}");
+            let cold_money = scan_money(source, &f.index, &cold.scan);
+            assert_equivalent(&cold_money, &tail_money);
+            f.send_all(&committed, &cold.scan);
+            let cold_posts = f.uploader.posts.concat();
+            assert!(!cold_posts.is_empty(), "{label}: the control posts");
+            assert_eq!(tail_posts, cold_posts, "{label}: POSTed bodies");
+        }
+    }
+}
+
 /// [behaviour] T4: a page partly acknowledged under B is checkpointed, then the
 /// pass fails and rolls back to that checkpoint. Back under A the file still
-/// holds A's receipt, but the entities ACKed under B make it select, and the
-/// read resends exactly those.
+/// holds A's receipt, and the entities ACKed under B leave it owing delivery,
+/// never a read; its next ordinary send resends exactly those.
 #[test]
-fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
+fn partial_ack_under_flip_checkpoint_rollback_owes_delivery_not_a_read() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.flip(all(false));
     let a = f.index.active_upload_context_fingerprint.clone().unwrap();
@@ -119,7 +184,8 @@ fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
     assert_eq!(sent.unwrap().0, 1);
     assert!(!f.debt());
     f.flip(flipped(mode(false), &FLIPS[0]).policy);
-    assert!(f.debt() && !f.read_owed());
+    assert!(f.debt());
+    assert!(f.reads_nothing(), "the flip reads nothing");
     let committed = f.index.clone();
     let b = f.index.active_upload_context_fingerprint.clone().unwrap();
     f.uploader.activate(f.source, b.clone(), &mut f.index);
@@ -143,7 +209,7 @@ fn partial_ack_under_flip_checkpoint_rollback_still_selects() {
     f.flip(all(false));
     let owed = "A's receipt no longer proves what the server holds";
     assert!(f.debt(), "{owed}");
-    assert!(f.read_owed());
+    assert!(f.reads_nothing(), "the owed delivery reads nothing");
     let committed = f.index.clone();
     let before = f.uploader.posts.len();
     f.uploader.activate(f.source, a, &mut f.index);

@@ -355,7 +355,8 @@ Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
 final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
-step) and no footprint fields.
+step) and no footprint fields. `evidence_cross_root` counts carry
+`demanded_requests`: the page's demanded request ids each root is joined against.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
 around folding stored usage families into heads.
 
@@ -1681,7 +1682,7 @@ sessions, decoded bytes or money. No path or session id is included.
 | `CompressedParentSideUnsupported` | Parent side acquisition |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
+| `CompressedParentLedgerUnbound` | Parent rollout is compressed and cannot supply ledger evidence, or the shared ownership parser held an ordinary archive fork after Full decoding without proven parent-prefix evidence |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |

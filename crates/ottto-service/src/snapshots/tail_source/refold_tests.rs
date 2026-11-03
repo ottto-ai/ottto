@@ -54,9 +54,9 @@ fn fresh(route: &Route, path: &Path) -> Vec<SnapshotItem> {
 
 /// [money] SOURCE (a), golden: every selection that continues an unchanged
 /// file from stored state reads no transcript byte, and its wire bodies and
-/// envelopes equal a fresh native read's, byte for byte. A grown
-/// upload-context selection reads only past the sealed offset, and its body
-/// and money fold equal the cold Full's.
+/// envelopes equal a fresh native read's, byte for byte. A grown file reads
+/// only past the sealed offset, and its body and money fold equal the cold
+/// Full's.
 #[test]
 fn a_refold_is_byte_equal_to_a_fresh_native_read() {
     let mut route = route();
@@ -71,7 +71,7 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
         ]);
         for reason in unchanged {
             assert!(
-                reuses_stored(&route.index, &key, Some(reason), false, false),
+                reuses_stored(&route.index, &key, Some(reason), false),
                 "{reason:?}"
             );
         }
@@ -82,9 +82,8 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
 
     let (path, key) = committed(&mut route, "grown.jsonl", 300);
     append(&path, 300);
-    let context = Some(CandidateParseReason::UploadContext);
-    assert!(reuses_stored(&route.index, &key, context, true, false));
-    assert!(!reuses_stored(&route.index, &key, context, false, false));
+    let changed = Some(CandidateParseReason::TranscriptChanged);
+    assert!(reuses_stored(&route.index, &key, changed, false));
     let (Load::Reused(taken, Some(base)), _) = loaded(&route, &path, &key) else {
         panic!("the committed head is reused");
     };
@@ -116,13 +115,7 @@ fn a_retry_held_file_reads_natively() {
         .file_snapshot_fingerprints
         .insert(key.clone(), [fingerprint.clone()].into());
     for reason in LATE {
-        assert!(reuses_stored(
-            &route.index,
-            &key,
-            Some(reason),
-            false,
-            false
-        ));
+        assert!(reuses_stored(&route.index, &key, Some(reason), false));
     }
     route.index.quarantined_snapshot_fingerprints.insert(
         fingerprint,
@@ -130,12 +123,12 @@ fn a_retry_held_file_reads_natively() {
     );
     for reason in LATE {
         assert!(
-            !reuses_stored(&route.index, &key, Some(reason), false, false),
+            !reuses_stored(&route.index, &key, Some(reason), false),
             "{reason:?}"
         );
     }
     let changed = Some(CandidateParseReason::TranscriptChanged);
-    assert!(reuses_stored(&route.index, &key, changed, true, false));
+    assert!(reuses_stored(&route.index, &key, changed, false));
     let (_, mode, start) = read(&route, &path, None);
     assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
 }
@@ -148,13 +141,7 @@ fn incomplete_stored_state_never_refolds() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 3);
     for reason in LATE {
-        assert!(reuses_stored(
-            &route.index,
-            &key,
-            Some(reason),
-            false,
-            false
-        ));
+        assert!(reuses_stored(&route.index, &key, Some(reason), false));
     }
     append(&path, 3);
     let (Load::Reused(taken, Some(base)), _) = loaded(&route, &path, &key) else {
@@ -169,12 +156,12 @@ fn incomplete_stored_state_never_refolds() {
     assert!(set_aside(&route.index, &key));
     for reason in LATE {
         assert!(
-            !reuses_stored(&route.index, &key, Some(reason), false, false),
+            !reuses_stored(&route.index, &key, Some(reason), false),
             "{reason:?}"
         );
     }
     let changed = Some(CandidateParseReason::TranscriptChanged);
-    assert!(reuses_stored(&route.index, &key, changed, true, false));
+    assert!(reuses_stored(&route.index, &key, changed, false));
 
     let path = route.dir.join("new.jsonl");
     std::fs::write(&path, lines(3).join("\n") + "\n").unwrap();

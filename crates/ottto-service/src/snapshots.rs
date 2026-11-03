@@ -1,7 +1,8 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     ParentUnresolvableCauses, RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs,
-    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
+    UnreadableCause, UnreadableCauses, CREATOR_DIFFERENT_OWNER, CREATOR_MULTI_MATCH, CREATOR_NAMED,
+    CREATOR_NO_MATCH, CREATOR_NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -112,6 +113,8 @@ pub(crate) use claude_context_file_birth::{
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
+#[cfg(test)]
+mod codex_creator_slot_tests;
 mod codex_root_copies;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
@@ -6059,7 +6062,6 @@ fn claude_stale_member_independently_accepted(
             .as_ref()
             .is_some_and(|witness| !witness.is_empty())
         && claude_index_file_body_accepted(index, key, entry)
-        && !index.file_context_read_owed(key)
         && entry
             .last_snapshot_fingerprint
             .as_ref()
@@ -6433,8 +6435,7 @@ fn claude_fence_closed_retry_carry_observed(
             || index
                 .claude_account_deferred_holds
                 .contains_key(index_key.as_str())
-            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry))
-            || index.file_context_read_owed(index_key);
+            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry));
         let status = blocked.entry(root_session_id).or_default();
         status.0 |= refused;
         // The accepted refusal is the streaming/storage-only member predicate.
@@ -12631,7 +12632,6 @@ fn claude_unchanged_proof_roots<'p>(
         let (root_session_id, source_session_id) = member_ref.into_owned();
         *unchanged = claude_index_file_body_accepted(index, index_key, entry)
             && !entry.rearmed()
-            && !index.file_context_read_owed(index_key)
             && !current_ids.contains(source_session_id.as_str())
             && !index
                 .claude_account_deferred_holds
@@ -28346,7 +28346,6 @@ impl OwnedSourceScan {
                             &identified_candidates,
                             inventory,
                             &codex_page,
-                            codex_parent_ownership_ledgers.as_ref(),
                         );
                         pending!();
                     }
@@ -32963,19 +32962,12 @@ impl OwnedSourceScan {
             // again as a re-read for the next page of the walk. Codex and Pi
             // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
-                // A Claude history hold defers upload-context debt with the
-                // revision: the gate vetoes every body of a held file, so its
-                // read could never earn a receipt. The file stays owed and
-                // pays both when the hold releases and it is exact-ACKed.
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                    && (index.candidate_requires_only_body_witness_adoption(
-                        &candidate,
-                        audit_now,
-                        source != SnapshotSource::ClaudeCode,
-                    ) || (source == SnapshotSource::ClaudeCode
-                        && claude_copy_prefix_reread::unchanged_requested(
-                            index, &candidate, audit_now,
-                        )));
+                    && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
+                        || (source == SnapshotSource::ClaudeCode
+                            && claude_copy_prefix_reread::unchanged_requested(
+                                index, &candidate, audit_now,
+                            )));
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
@@ -33216,7 +33208,6 @@ impl OwnedSourceScan {
                     &opened_file,
                     codex_join_inventory.as_ref(),
                     &codex_page,
-                    codex_parent_ownership_ledgers.as_ref(),
                 ) {
                     pending!();
                 }
@@ -33892,9 +33883,6 @@ impl OwnedSourceScan {
                                     index,
                                     &key,
                                     parse_reason,
-                                    index.files.get(&key).is_some_and(|entry| {
-                                        candidate.size_bytes > entry.size_bytes
-                                    }),
                                     e2_held_new_file,
                                 )
                                 && !parser.reader.reader.is_compressed()
@@ -46691,16 +46679,19 @@ impl ScanIndex {
             machine_id,
             snapshots,
             codex_homes,
+            (&[], &mut [0; 9]),
             &claude_request_accounts::MixedUploads::default(),
         )
     }
 
+    /// `codex_slots`: (account, workspace, login cause) a Codex creator may name.
     pub(crate) fn bind_session_accounts_with_mixed(
         &mut self,
         source: SnapshotSource,
         machine_id: &str,
         snapshots: &mut [SnapshotItem],
         codex_homes: &[crate::agent_status::CodexHomeBinding],
+        (codex_slots, creator_counts): (&[(String, String, usize)], &mut [u64; 9]),
         mixed: &claude_request_accounts::MixedUploads,
     ) -> BTreeSet<String> {
         let mut deferred = BTreeSet::new();
@@ -46710,9 +46701,40 @@ impl ScanIndex {
             let existing = self.session_account_bindings.get(&key);
             match source {
                 SnapshotSource::Codex => {
-                    if !codex_rows_prove_oauth(item) {
-                        set_session_account_hash(item, None);
-                        continue;
+                    let mut creator_slot = None;
+                    if !codex_rows_all(item, |mode| matches!(mode, Some("oauth" | "chatgpt"))) {
+                        // No recorded mode: only the creator's slot names a session
+                        // never emitted before, never the home (forward only).
+                        if !codex_rows_all(item, |mode| mode.is_none()) {
+                            set_session_account_hash(item, None);
+                            continue;
+                        }
+                        let decided = match (codex_creator_pair(item), existing) {
+                            (None, _) => Err(CREATOR_NO_PAIR),
+                            (Some((account, _)), Some(owner))
+                                if owner.account_identifier_hash == account =>
+                            {
+                                Ok(None)
+                            }
+                            (Some(_), Some(_)) => Err(CREATOR_DIFFERENT_OWNER),
+                            (Some(_), None) if !self.codex_file_never_emitted(item) => {
+                                Err(CREATOR_PREVIOUSLY_UPLOADED)
+                            }
+                            (Some((account, workspace)), None) => {
+                                codex_creator_slot(account, workspace, codex_slots).map(Some)
+                            }
+                        };
+                        match decided {
+                            Ok(owner) => {
+                                creator_counts[CREATOR_NAMED] += u64::from(owner.is_some());
+                                creator_slot = owner;
+                            }
+                            Err(cause) => {
+                                creator_counts[cause] += 1;
+                                set_session_account_hash(item, None);
+                                continue;
+                            }
+                        }
                     }
                     // An explicit creator-negative is a source decision, not
                     // the legacy absence of an optional witness. Neither a
@@ -46733,6 +46755,7 @@ impl ScanIndex {
                     }
                     let owner = existing
                         .cloned()
+                        .or(creator_slot)
                         .or_else(|| self.codex_owner_for_item(item, codex_homes));
                     if let Some(owner) = owner {
                         self.session_account_bindings
@@ -46813,6 +46836,20 @@ impl ScanIndex {
             }
         }
         deferred
+    }
+
+    /// `item`'s one file has emitted no snapshot before this scan.
+    fn codex_file_never_emitted(&self, item: &SnapshotItem) -> bool {
+        let fingerprint = item.source_file_fingerprint.as_deref();
+        let mut keys = self
+            .files
+            .iter()
+            .filter(|(_, entry)| Some(entry.source_file_fingerprint.as_str()) == fingerprint);
+        let (Some((key, _)), None) = (keys.next(), keys.next()) else {
+            return false;
+        };
+        let emitted = self.file_snapshot_fingerprints.get(key);
+        emitted.map_or(true, BTreeSet::is_empty)
     }
 
     fn codex_owner_for_item(
@@ -52653,14 +52690,7 @@ impl ScanIndex {
                 .files
                 .get(&local_index_key(&candidate.path))
                 .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
-        self.candidate_decision_refined(
-            candidate,
-            audit_now,
-            true,
-            true,
-            growth_only,
-            source_change,
-        )
+        self.candidate_decision_refined(candidate, audit_now, true, growth_only, source_change)
     }
 
     #[cfg(test)]
@@ -52673,7 +52703,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true, true, false)
+        self.candidate_decision_with_reason_gated(candidate, now, true, false)
     }
 
     /// True when the local list names this Claude file's family root or the
@@ -52687,25 +52717,16 @@ impl ScanIndex {
     }
 
     /// True when only the body-witness revision selects this candidate: the
-    /// same decision without that gate skips the file. With
-    /// `upload_context_adoption: false`, upload-context debt does not count
-    /// as another reason to read.
+    /// same decision without that gate skips the file.
     fn candidate_requires_only_body_witness_adoption(
         &self,
         candidate: &CandidateFile,
         now: u64,
-        upload_context_adoption: bool,
     ) -> bool {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(
-                candidate,
-                now,
-                false,
-                upload_context_adoption,
-                false,
-            )
+            .candidate_decision_with_reason_gated(candidate, now, false, false)
             .0
             == CandidateDecision::Skip
     }
@@ -52755,14 +52776,12 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
-        upload_context_adoption: bool,
         growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_refined(
             candidate,
             now,
             body_witness_adoption,
-            upload_context_adoption,
             growth_only,
             &mut None,
         )
@@ -52775,7 +52794,6 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
-        upload_context_adoption: bool,
         growth_only: bool,
         source_change: &mut Option<change_reason::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
@@ -52876,19 +52894,8 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        // An unsettled page may preserve the previous global context too.
-        // CONTENT is scoped to the active context, so only its already-read
-        // local repair is deferred; a new activation still invalidates it.
-        if upload_context_adoption
-            && !withheld_unchanged
-            && self.file_context_read_owed(&key)
-            && !self.file_upload_context_backoff_holds(candidate)
-        {
-            return (
-                CandidateDecision::Parse,
-                Some(CandidateParseReason::UploadContext),
-            );
-        }
+        // A settings or capability change never selects a read: it applies
+        // from the file's next ordinary read on, for every source.
         if self
             .file_snapshot_fingerprints
             .get(&key)
@@ -53284,15 +53291,45 @@ impl ScanIndex {
     }
 }
 
-fn codex_rows_prove_oauth(item: &SnapshotItem) -> bool {
+fn codex_rows_all(item: &SnapshotItem, mode: impl Fn(Option<&str>) -> bool) -> bool {
     let mut rows = item.model_usage.iter().chain(
         item.usage_buckets
             .iter()
             .flat_map(|bucket| bucket.model_usage.iter()),
     );
     rows.next()
-        .is_some_and(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
-        && rows.all(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
+        .is_some_and(|row| mode(row.auth_mode.as_deref()))
+        && rows.all(|row| mode(row.auth_mode.as_deref()))
+}
+
+/// A Codex item's complete positive creator pair: (account, workspace).
+pub(crate) fn codex_creator_pair(item: &SnapshotItem) -> Option<(&str, &str)> {
+    let evidence = item.session_account_evidence.as_ref().filter(|evidence| {
+        evidence.evidence_source == "codex_creator_header:v1"
+            && !matches!(evidence.identity_disposition, Some("missing" | "conflict"))
+    })?;
+    Some((
+        evidence.account_identifier_hash.as_deref()?,
+        evidence.provider_workspace_hash.as_deref()?,
+    ))
+}
+
+/// Only exactly one slot matching the pair names it, by its login cause.
+fn codex_creator_slot(
+    account: &str,
+    workspace: &str,
+    slots: &[(String, String, usize)],
+) -> Result<SessionAccountBinding, usize> {
+    let mut matches = slots.iter().filter(|s| s.0 == account && s.1 == workspace);
+    match (matches.next(), matches.next()) {
+        (None, _) => Err(CREATOR_NO_MATCH),
+        (Some(_), Some(_)) => Err(CREATOR_MULTI_MATCH),
+        (Some(slot), None) if slot.2 != CREATOR_NAMED => Err(slot.2),
+        (Some(_), None) => Ok(SessionAccountBinding {
+            account_identifier_hash: account.to_string(),
+            workspace_identifier_hash: Some(workspace.to_string()),
+        }),
+    }
 }
 
 pub fn source_file_fingerprint(
@@ -56440,7 +56477,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_context_without_receipt_reparses_under_every_context() {
+    fn upload_context_without_receipt_stays_owed_and_reads_nothing_under_any_context() {
         let root = temp_dir("upload-context-aba");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -56470,9 +56507,12 @@ mod tests {
 
         // No ACK, no receipt: a complete census alone proves nothing, so the
         // file stays owed under every context until its own receipt exists.
+        // Owed proof selects no read: neither the same context again nor a
+        // new one reads the closed file (forward-only).
         assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-b").scanned_file_count, 1);
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 0);
+        assert_eq!(scan_with_context("context-b").scanned_file_count, 0);
+        assert!(index.file_upload_context_requires_adoption(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);
     }
 

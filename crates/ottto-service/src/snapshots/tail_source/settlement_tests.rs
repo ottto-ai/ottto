@@ -292,8 +292,8 @@ fn a_proven_change_names_its_full() {
 #[test]
 fn the_shipped_selections_reuse_stored_state() {
     let index = ScanIndex::default();
-    let held_new = |reason| reuses_stored(&index, "a.jsonl", Some(reason), false, true);
-    let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew, false);
+    let held_new = |reason| reuses_stored(&index, "a.jsonl", Some(reason), true);
+    let reuses_stored = |reason| reuses_stored(&index, "a.jsonl", reason, false);
     for reason in [
         CandidateParseReason::TranscriptChanged,
         CandidateParseReason::Audit,
@@ -304,7 +304,7 @@ fn the_shipped_selections_reuse_stored_state() {
         CandidateParseReason::AuthorityQuarantine,
         CandidateParseReason::ActivityOrQuarantineRetry,
     ] {
-        assert!(reuses_stored(Some(reason), false), "{reason:?}");
+        assert!(reuses_stored(Some(reason)), "{reason:?}");
     }
     assert!(!late_evidence(CandidateParseReason::TranscriptChanged));
     assert!(!late_evidence(CandidateParseReason::Audit));
@@ -313,18 +313,8 @@ fn the_shipped_selections_reuse_stored_state() {
         CandidateParseReason::UploadContext,
         CandidateParseReason::BodyWitnessAdoption,
     ] {
-        assert!(!reuses_stored(Some(reason), false), "{reason:?}");
+        assert!(!reuses_stored(Some(reason)), "{reason:?}");
     }
-    // Growth beats an upload-context selection: the grown file continues.
-    assert!(reuses_stored(
-        Some(CandidateParseReason::UploadContext),
-        true
-    ));
-    assert!(!reuses_stored(Some(CandidateParseReason::NewFile), true));
-    assert!(!reuses_stored(
-        Some(CandidateParseReason::BodyWitnessAdoption),
-        true
-    ));
     // A NEW file `e2` withheld continues its committed head; the
     // certificate admits no other native selection.
     assert!(held_new(CandidateParseReason::NewFile));

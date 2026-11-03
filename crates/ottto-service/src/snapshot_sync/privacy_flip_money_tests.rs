@@ -387,3 +387,87 @@ fn flipped_policy_tail_places_money_like_a_full() {
         }
     });
 }
+
+/// [money] Forward-only on the real pipeline, Claude: the bodies were sent but
+/// no proof reached the index (no receipt, no stamps). A setting or capability
+/// flip reads none of those files. Their next growth is a Tail under the new
+/// context whose wire follows the new setting and whose money and placement
+/// equal a cold Full under it.
+#[cfg(unix)]
+#[test]
+fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        println!("PRIVACY_FLIP_FORWARD_ONLY UNEXECUTED: native retained layout unavailable");
+        return;
+    }
+    with_e2(|| {
+        for (name, field) in FLIPS {
+            let label = format!("{name}/forward-only");
+            let before = start_of(name, false);
+            let mut after = before;
+            field(&mut after);
+
+            let (mut c, _) = claude_corpus("progressive_response");
+            let path = write_root_material(&mut c);
+            evidence_gap(&mut c, false);
+            resumed_session(&mut c, false);
+            cold_session(&mut c, false);
+            let scanner = E2ScanFixture::with_identity_capture(true);
+            let mut warm = page_under(&c, &scanner, ScanIndex::default(), before);
+            settle(&c, &mut warm, before);
+            // Delivered: the server holds the bodies. The index keeps no proof.
+            let delivered = routed(&warm, before.policy);
+            assert!(!delivered.snapshots.is_empty(), "{label}: delivered");
+            let owed = warm.index.upload_context_owed_file_count();
+            assert!(owed > 0, "{label}: positive control, unproven files");
+
+            let mut quiet = page_under(&c, &scanner, warm.index.clone(), after);
+            assert_eq!(
+                (quiet.modes.0, quiet.modes.1),
+                (0, 0),
+                "{label}: the flip reads nothing"
+            );
+            // The forked session's owned-start correction is re-armed until
+            // its corrective body is accepted (snapshots.rs owned-start
+            // re-arm; the emitted stamp commits only after acceptance), and
+            // this chain records no ACK into the index. It is served from the
+            // page cache with no read; no other file is selected.
+            assert!(
+                quiet
+                    .scan
+                    .snapshots
+                    .iter()
+                    .all(|item| item.source_session_id == COLD),
+                "{label}: nothing but the owned-start correction"
+            );
+            settle(&c, &mut quiet, after);
+            assert_eq!(
+                quiet.index.upload_context_owed_file_count(),
+                owed,
+                "{label}: still owed, paid by the next read"
+            );
+
+            claude_change(&c, &path, "progressive_response");
+            append(&path, &format!("{}\n", link(ROOT, AT, 1)));
+            second_account(&c, &path);
+            side_call(&c);
+            evidence_gap(&mut c, true);
+            resumed_session(&mut c, true);
+            cold_session(&mut c, true);
+            input_clock(&path);
+
+            let mut tail = page_under(&c, &scanner, quiet.index.clone(), after);
+            settle(&c, &mut tail, after);
+            assert_eq!(tail.modes, (0, 4, 0), "{label}");
+
+            let fresh = E2ScanFixture::with_identity_capture(true);
+            let mut cold = page_under(&c, &fresh, ScanIndex::default(), after);
+            settle(&c, &mut cold, after);
+            assert_eq!(cold.modes.0, 4, "{label}: control is a Full");
+            let (cold, tail) = (routed(&cold, after.policy), routed(&tail, after.policy));
+            assert_wire(&cold, after, &format!("{label}/cold"));
+            assert_wire(&tail, after, &format!("{label}/tail"));
+            assert_equivalent(&cold, &tail);
+        }
+    });
+}

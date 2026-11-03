@@ -525,8 +525,8 @@ struct ClaudeRecordCaps {
     #[serde(skip_serializing_if = "is_zero")]
     claude_records_max_per_response: u64,
 }
-pub(crate) fn is_zero(value: &u64) -> bool {
-    *value == 0
+pub(crate) fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 struct ClaudeRecordCounters {
     half: std::sync::atomic::AtomicU64,
@@ -1505,7 +1505,7 @@ fn wall_us(started: Instant) -> u64 {
 fn emit_stage(
     stage: &'static str,
     source: Source,
-    refusal_exposure: Option<RefusalExposure>,
+    demanded_requests: Option<usize>,
     observation: impl FnOnce() -> Observation,
 ) {
     if std::thread::panicking() {
@@ -1517,17 +1517,19 @@ fn emit_stage(
         stage,
         source,
         observation: observation(),
-        counts: StageCounts { refusal_exposure },
+        counts: StageCounts { demanded_requests },
     });
 }
 /// Named window summed over repeated steps inside a source stage: one record
-/// with summed wall time and process CPU, and no footprint fields. Empty
-/// counts; unwinding emits nothing, like `StageWindow`.
+/// with summed wall time and process CPU, and no footprint fields. Counts
+/// hold only an optional demand size; unwinding emits nothing, like
+/// `StageWindow`.
 pub(crate) struct StageSum {
     stage: &'static str,
     source: Source,
     wall_us: u64,
     cpu_us: Option<u64>,
+    pub(crate) demanded_requests: Option<usize>,
 }
 impl StageSum {
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
@@ -1536,6 +1538,7 @@ impl StageSum {
             source: Source::from_slug(source),
             wall_us: 0,
             cpu_us: Some(0),
+            demanded_requests: None,
         }
     }
     /// Runs `step` unchanged and adds its wall and CPU to the window.
@@ -1554,7 +1557,7 @@ impl StageSum {
 }
 impl Drop for StageSum {
     fn drop(&mut self) {
-        emit_stage(self.stage, self.source, None, || {
+        emit_stage(self.stage, self.source, self.demanded_requests, || {
             let mut observation = Observation::point();
             observation.wall_elapsed_us = self.wall_us;
             observation.shared_process_cpu_delta_us = self.cpu_us;
@@ -1595,7 +1598,7 @@ pub(crate) fn codex_census_fence(
 #[derive(Serialize)]
 struct StageCounts {
     #[serde(skip_serializing_if = "Option::is_none")]
-    refusal_exposure: Option<RefusalExposure>,
+    demanded_requests: Option<usize>,
 }
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.

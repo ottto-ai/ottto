@@ -639,11 +639,10 @@ fn only_the_ordinary_equality_skip_attests() {
         },
     );
     assert!(!attests(&quarantined, &candidate));
-    // Witness-less upload-context debt (#899 R23) is presence, even when its
-    // backoff lets the file skip.
+    // Upload-context debt selects no read: the Skip stays the ordinary one.
     let mut debt = index.clone();
     debt.active_upload_context_fingerprint = Some("context-new".into());
-    assert!(!attests(&debt, &candidate));
+    assert!(attests(&debt, &candidate));
 }
 
 /// [behaviour] loss vetoes stay up for the generation.

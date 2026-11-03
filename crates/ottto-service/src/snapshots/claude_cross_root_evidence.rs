@@ -34,16 +34,34 @@ impl RequestRootJoins {
     }
 
     /// Probe the diagnostic sets already built by the strict reader. API and
-    /// trace hits are one claim per root, regardless of duplicate rows.
+    /// trace hits are one claim per root, regardless of duplicate rows. Walks
+    /// the smaller side, so a pass costs at most its rows, not roots × demand.
     pub(crate) fn add_root(&mut self, root: u32, api: &BTreeSet<&str>, trace: &BTreeSet<&str>) {
-        for (id, answer) in &mut self.0 {
-            if api.contains(id.as_str()) || trace.contains(id.as_str()) {
-                *answer = Some(match answer {
-                    None => Some(root),
-                    Some(_) => None,
-                });
+        let claim = |answer: &mut Option<Option<u32>>| {
+            *answer = Some(match answer {
+                None => Some(root),
+                Some(_) => None,
+            });
+        };
+        if api.len() + trace.len() < self.0.len() {
+            // `union` yields each id once: one claim per root.
+            for id in api.union(trace) {
+                if let Some(answer) = self.0.get_mut(*id) {
+                    claim(answer);
+                }
+            }
+        } else {
+            for (id, answer) in &mut self.0 {
+                if api.contains(id.as_str()) || trace.contains(id.as_str()) {
+                    claim(answer);
+                }
             }
         }
+    }
+
+    /// Demanded request ids, for the cross-root stage record.
+    pub(crate) fn demand_count(&self) -> usize {
+        self.0.len()
     }
 
     pub(crate) fn get(&self, request: &str) -> Option<Option<u32>> {
@@ -235,29 +253,62 @@ mod tests {
     use crate::snapshots::claude_request_identity::RequestRootIndex;
 
     /// [behaviour] Exact page joins equal the old index across API/trace
-    /// overlap and shared roots; an unhealthy API row still vetoes birth.
+    /// overlap and shared roots, whichever side `add_root` walks; an
+    /// unhealthy API row still vetoes birth.
     #[test]
     fn demand_joins_equal_index_and_preserve_tripwire() {
         let demand = ["own", "shared", "trace-only", "absent"].map(String::from);
-        let mut joins = RequestRootJoins::new(demand.iter());
-        let mut old = RequestRootIndex::default();
-        for (root, api, trace) in [
-            (0, vec!["own", "shared", "off-page"], vec!["own", "shared"]),
-            (1, vec!["shared"], vec!["shared", "trace-only"]),
-            (2, vec!["shared"], vec![]),
+        let pad = |prefix: &'static str| (0..16).map(move |i| format!("{prefix}-{i}"));
+        // Padding demand with absent ids makes every root walk its own ids;
+        // padding roots with off-page ids makes every root walk the demand.
+        let padded_demand = demand.iter().cloned().chain(pad("pad")).collect::<Vec<_>>();
+        let off_page = pad("off-page").collect::<Vec<_>>();
+        for roots in [
+            // Mixed sizes against |demand| = 4: 5, 3 and 1 ids.
+            vec![
+                (0, vec!["own", "shared", "off-page"], vec!["own", "shared"]),
+                (1, vec!["shared"], vec!["shared", "trace-only"]),
+                (2, vec!["shared"], vec![]),
+            ],
+            // Root ⊃ demand.
+            vec![(
+                0,
+                vec!["own", "shared", "trace-only", "absent", "x"],
+                vec![],
+            )],
+            // Roots ⊂ demand, one with the same id on both sides.
+            vec![
+                (0, vec!["shared"], vec!["shared"]),
+                (1, vec!["own"], vec![]),
+            ],
+            // Root size equal to |demand|.
+            vec![
+                (0, vec!["own", "x"], vec!["own", "shared"]),
+                (1, vec!["shared", "trace-only"], vec!["absent", "own"]),
+            ],
         ] {
-            old.add_root(root, api.iter().chain(&trace).copied());
-            joins.add_root(
-                root,
-                &api.into_iter().collect(),
-                &trace.into_iter().collect(),
-            );
+            let mut old = RequestRootIndex::default();
+            let mut joins = RequestRootJoins::new(demand.iter());
+            let mut root_walk = RequestRootJoins::new(padded_demand.iter());
+            let mut demand_walk = RequestRootJoins::new(demand.iter());
+            for (root, api, trace) in roots {
+                old.add_root(root, api.iter().chain(&trace).copied());
+                let api = api.into_iter().collect::<BTreeSet<_>>();
+                let trace = trace.into_iter().collect::<BTreeSet<_>>();
+                joins.add_root(root, &api, &trace);
+                root_walk.add_root(root, &api, &trace);
+                let mut padded = api.clone();
+                padded.extend(off_page.iter().map(String::as_str));
+                demand_walk.add_root(root, &padded, &trace);
+            }
+            old.finish();
+            for id in &demand {
+                assert_eq!(joins.get(id), old.get(id));
+                assert_eq!(root_walk.get(id), old.get(id));
+                assert_eq!(demand_walk.get(id), old.get(id));
+            }
+            assert_eq!(joins.demand_count(), demand.len());
         }
-        old.finish();
-        for id in &demand {
-            assert_eq!(joins.get(id), old.get(id));
-        }
-        assert_eq!(joins.0.len(), demand.len());
         let root = "a0000000-0000-4000-8000-00000000000a";
         let dir = std::env::temp_dir().join(format!(
             "ottto-demand-join-{}-{}",
