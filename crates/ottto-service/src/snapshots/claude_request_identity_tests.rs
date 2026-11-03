@@ -1172,7 +1172,6 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
     let classify = |request_id: &str, source_session_id: &str| {
         let mut request = facts(request_id, Some(999_000), MarkerVerdict::Trusted(&org));
         request.source_session_id = source_session_id;
-        request.desktop = true;
         identity::classify(&evidence, &request)
     };
     let refused = RequestIdentity::Refused;
