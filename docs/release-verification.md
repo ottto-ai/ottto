@@ -95,14 +95,17 @@ expected repository and subject digest from the release manifest:
 gh attestation verify <artifact> --repo <owner>/<repo> \
   --predicate-type https://slsa.dev/provenance/v1 \
   --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 gh attestation verify <artifact> --repo <owner>/<repo> \
   --predicate-type https://cyclonedx.org/bom \
   --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 ```
+
+Releases are built from the protected release tag `v<version>`; releases built
+before tag-based releases verify with `--source-ref refs/heads/main`.
 
 The attestation subject must match the artifact digest. The SLSA provenance must
 use the expected source repository, workflow, commit, and Build L2-or-better

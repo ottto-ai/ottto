@@ -182,6 +182,18 @@ never promotes the stable channel pointer. Final publication remains a private,
 manual operator step after stable preflight and clean-machine closeout evidence
 are green.
 
+The workflow runs only when dispatched on a protected release tag
+`refs/tags/v<X.Y.Z>`; any other ref fails the dispatch policy step. The tag is an
+annotated tag on a `main` commit whose own merge-queue `Public CI` run passed,
+and its message carries one `App-Source-Commit: <40-hex>` trailer naming the
+macOS app source commit. Both legs of a release, `X.Y.Z-rcN` (stable-candidate)
+and `X.Y.Z` (stable), dispatch on the same tag, so they build the same public and
+app source commits. `scripts/macos_release_source_check.sh` checks the tag, the
+first-parent position on `main`, and the CI run before packaging; the packager
+then requires the app source checkout to be at the pinned commit and that commit
+to be on the first-parent line of the app source `master`. A tag cannot be moved
+or deleted: a release that needs new code uses a new version and tag.
+
 Before cutting a stable build, build an internal stable-candidate RC from the
 same commit and attach redacted stable-candidate evidence. Generate the
 evidence skeleton from the exact `stable-candidate` manifest:
@@ -328,24 +340,29 @@ gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
   -R ottto-ai/ottto \
   --predicate-type https://slsa.dev/provenance/v1 \
   --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
   -R ottto-ai/ottto \
   --predicate-type https://cyclonedx.org/bom \
   --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 ```
 
-Then bind the exact manifest with the same subject checksum file:
+Releases built before tag-based releases verify with `--source-ref refs/heads/main`.
+
+Then bind the exact manifest with the same subject checksum file. The source ref
+is required (`--source-ref` or `OTTTO_RELEASE_SOURCE_REF`); the workflow sets it
+to the release tag:
 
 ```bash
 ./scripts/macos_attestation_bind.sh \
   --manifest dist/macos/release-manifest.json \
   --subject-checksums dist/macos/subject.checksums.txt \
   --repo ottto-ai/ottto \
-  --signer-workflow .github/workflows/macos-stable-release.yml
+  --signer-workflow .github/workflows/macos-stable-release.yml \
+  --source-ref refs/tags/v<version>
 ```
 
 The binder updates only `supply_chain.slsa_build` and `supply_chain.sbom`, sets
@@ -473,7 +490,8 @@ AWS/CDN prerequisites before publish:
     the stable release workflow with `github_release_mirror: true` (stable channel
     only). The mirror is verification-only: it never writes to the CDN and never
     promotes a channel pointer, and it refuses to overwrite an existing
-    `v<version>` release. It attaches the app, CLI, and daemon archives, the
+    `v<version>` release. It publishes the release for the existing release tag
+    only and never creates a tag. It attaches the app, CLI, and daemon archives, the
     CycloneDX SBOM, `release-manifest.json`, `release-manifest.json.sig`, and
     `subject.checksums.txt`, and intentionally omits `install-macos.sh`, the
     Homebrew formula, and QA evidence files. Immutable GitHub releases are

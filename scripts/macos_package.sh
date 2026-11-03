@@ -206,22 +206,34 @@ if [[ -n "$(git -C "$MAC_APP_GIT_ROOT" ls-files --others --exclude-standard -- "
   echo "macOS app source subtree has untracked files; freeze a clean private commit before packaging" >&2
   exit 2
 fi
+MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 MAC_APP_SOURCE_COMMIT="$(git -C "$MAC_APP_GIT_ROOT" rev-parse HEAD)"
+# The release workflow pins the app source commit from the release tag. CI
+# builds require that pin; local builds default to the checkout HEAD.
+if [[ "${GITHUB_ACTIONS:-}" == "true" && ! "${OTTTO_MACOS_APP_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "OTTTO_MACOS_APP_SOURCE_COMMIT must be a 40-hex app source commit in CI" >&2
+  exit 2
+fi
+MAC_APP_SOURCE_PIN="${OTTTO_MACOS_APP_SOURCE_COMMIT:-$MAC_APP_SOURCE_COMMIT}"
+if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_SOURCE_PIN" ]]; then
+  echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not the pinned commit $MAC_APP_SOURCE_PIN" >&2
+  exit 2
+fi
 if env -u GH_TOKEN -u GITHUB_TOKEN \
   gh api repos/singular-labs/coding-agents-observability >/dev/null 2>&1; then
   echo "Singular guard failed while verifying the private app source" >&2
   exit 2
 fi
-MAC_APP_REMOTE_MASTER="$(
-  env -u GH_TOKEN -u GITHUB_TOKEN \
-    gh api repos/ottto-ai/coding-agents-observability/commits/master --jq .sha
-)"
-if [[ ! "$MAC_APP_REMOTE_MASTER" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "Could not resolve authoritative private app source master from GitHub" >&2
+if ! env -u GH_TOKEN -u GITHUB_TOKEN \
+  git -C "$MAC_APP_GIT_ROOT" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+  fetch -q --no-tags "https://github.com/$MAC_APP_SOURCE_REPOSITORY.git" refs/heads/master; then
+  echo "Could not fetch the private app source master from GitHub" >&2
   exit 2
 fi
-if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_REMOTE_MASTER" ]]; then
-  echo "macOS app source commit must equal authoritative GitHub master" >&2
+MAC_APP_REMOTE_MASTER="$(git -C "$MAC_APP_GIT_ROOT" rev-parse FETCH_HEAD)"
+if ! git -C "$MAC_APP_GIT_ROOT" rev-list --first-parent "$MAC_APP_REMOTE_MASTER" |
+  grep -xF "$MAC_APP_SOURCE_PIN" >/dev/null; then
+  echo "macOS app source commit $MAC_APP_SOURCE_PIN is not on the first-parent line of GitHub master" >&2
   exit 2
 fi
 MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
@@ -236,7 +248,6 @@ fi
 if ! ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"; then
   exit 2
 fi
-MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 BUNDLE_VERSION="$(ottto_sparkle_bundle_version "$VERSION")"
 MIN_PROTOCOL_VERSION="${OTTTO_MIN_PROTOCOL_VERSION:-$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' "$ROOT/crates/ottto-protocol/src/lib.rs" | head -n1)}"
 if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
