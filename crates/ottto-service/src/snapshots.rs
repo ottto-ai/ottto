@@ -46854,6 +46854,11 @@ impl ScanIndex {
         let (Some((key, _)), None) = (keys.next(), keys.next()) else {
             return false;
         };
+        // Compressed rollouts are cold history, even when their new path
+        // has no emission record. Forward-only naming leaves them Unknown.
+        if is_compressed_codex_rollout(Some(Path::new(key)), None) {
+            return false;
+        }
         let emitted = self.file_snapshot_fingerprints.get(key);
         emitted.map_or(true, BTreeSet::is_empty)
     }
