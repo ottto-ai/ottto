@@ -107,11 +107,13 @@ pub(super) fn digest(json: &[u8]) -> [u8; 16] {
     h.update(json);
     integrity(h)
 }
-/// Physical storage can also contain opaque raw holds; only zstd frames expand.
+/// Physical storage also holds opaque raw holds and binary Tail values; only
+/// other rows' zstd frames expand.
 pub(super) fn stored_digest(key: &RowKey, version: u32, bytes: &[u8]) -> Result<[u8; 16]> {
     use sha2::Digest;
     let mut h = value_digest_start(version);
-    let opaque = matches!(key,RowKey::Record{kind,..} if kind.name().starts_with("raw_hold."));
+    let opaque = matches!(key,RowKey::Record{kind,..} if kind.name().starts_with("raw_hold."))
+        || tail::owned(key);
     if !matches!(key, RowKey::Meta(_)) && !opaque && bytes.starts_with(MAGIC) {
         h.update(expand(bytes, value_cap(key))?);
     } else {

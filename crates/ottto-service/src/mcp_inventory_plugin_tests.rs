@@ -103,3 +103,91 @@ enabled = true
     assert_eq!(servers["tools"].config_dir.as_deref(), Some(root.as_path()));
     let _ = fs::remove_dir_all(&home);
 }
+
+#[cfg(unix)]
+#[test]
+fn claude_json_project_disable_blocks_the_launch() {
+    let home = test_home("claude-json-disable");
+    let marker = home.join("launched");
+    let root = home.join("plugin");
+    write_json(
+        &root.join(".mcp.json"),
+        json!({"mcpServers": {"srv": {"command": "/usr/bin/true"}}}),
+    );
+    write_json(
+        &home
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
+        json!({"plugins": {"ask@m": [{"installPath": root}]}}),
+    );
+    write_json(
+        &home.join(".claude").join("settings.json"),
+        json!({"enabledPlugins": {"ask@m": true}}),
+    );
+    let true_server = json!({"command": "/usr/bin/true"});
+    write_json(
+        &home.join(".claude.json"),
+        json!({
+            "mcpServers": {
+                "off": {"command": "/usr/bin/touch", "args": [marker]},
+                "legacy": true_server,
+                "single": true_server,
+                "on": true_server,
+            },
+            "projects": {
+                "/p/a": {"disabledMcpServers": ["off", "plugin:ask:srv"]},
+                "/p/b": {"disabledMcpjsonServers": ["legacy"], "disabledMcpServers": "single"},
+            },
+        }),
+    );
+
+    let servers = discover_claude_code(&home);
+
+    for name in ["off", "legacy", "single", "plugin_ask_srv"] {
+        let server = servers.iter().find(|server| server.name == name);
+        assert!(server.expect(name).disabled, "{name}");
+    }
+    assert!(
+        !servers
+            .iter()
+            .find(|server| server.name == "on")
+            .expect("on")
+            .disabled
+    );
+    let off = servers
+        .iter()
+        .find(|server| server.name == "off")
+        .expect("off");
+    let (input, deferred) = harvest_server(off, &test_spawn_env());
+    assert!(input.disabled && !input.reachable && !deferred);
+    assert!(
+        !marker.exists(),
+        "a server disabled via /mcp is never spawned"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn disabled_servers_are_not_launched() {
+    let home = test_home("disabled-not-launched");
+    let marker = home.join("launched");
+    let server = ConfiguredServer {
+        name: "off".to_string(),
+        transport: Transport::Stdio {
+            command: "/usr/bin/touch".to_string(),
+            args: vec![marker.to_string_lossy().into_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        disabled: true,
+        always_load: false,
+        config_dir: None,
+    };
+
+    let (input, deferred) = harvest_server(&server, &test_spawn_env());
+
+    assert!(input.disabled && !input.reachable && !deferred);
+    assert!(!marker.exists(), "a disabled server is never spawned");
+    let _ = fs::remove_dir_all(&home);
+}

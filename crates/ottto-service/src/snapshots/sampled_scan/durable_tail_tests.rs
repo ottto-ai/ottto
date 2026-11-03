@@ -2637,7 +2637,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         native_fixture(&path);
         if arm == "codec" {
             use std::io::Write;
-            let line = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555", "timestamp":"2026-10-07T10:00:01Z","requestId":"req-skill", "message":{"id":"msg-skill","role":"assistant","model":"fixture-model","content":[{"type":"tool_use","id":"tool-skill","name":"Bash","input":{"command":"cat ~/.claude/skills/pdf/SKILL.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}});
+            let line = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555", "timestamp":"2026-10-07T10:00:01Z", "attributionSkill":"x".repeat(97), "requestId":"req-skill", "message":{"id":"msg-skill","role":"assistant","model":"fixture-model","content":[],"usage":{"input_tokens":1,"output_tokens":1}}});
             writeln!(
                 std::fs::OpenOptions::new()
                     .append(true)
@@ -2656,14 +2656,24 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
                     &reduction,
                     store::RECORD_BYTES,
                     jsonl_line_cap() as u64,
-                    false
+                    true
                 ),
-                Err(Refuse::NonEmpty("skill_label_consent_off"))
+                Err(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
             ));
         }
         let ds = durable_source(source).unwrap();
         let digest = store::key_digest(ds, &key);
         let cache = fixture::cache(source, &index_path, &namespace, false);
+        crate::snapshots::begin_durable_pass(
+            &cache,
+            &root,
+            source,
+            &index_path,
+            false,
+            &namespace,
+            false,
+            false,
+        );
         // Capture requires an eligible predecessor before the later storage fault.
         let binding = {
             let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source)
@@ -2741,7 +2751,9 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         assert_eq!(stats.t14_rebuild, 1);
         if arm == "codec" {
             assert_eq!(
-                counts.not_persisted.get("skill_label_consent_off"),
+                counts
+                    .not_persisted
+                    .get("skill_label_out_of_bounds{set=provider}"),
                 Some(&1)
             );
         }
@@ -7188,19 +7200,11 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    b4_structural_transition(false);
-    b4_structural_transition(true);
+    b4_structural_transition();
 }
 
-fn b4_structural_transition(near_cap: bool) {
+fn b4_structural_transition() {
     use std::io::Write;
-    struct ResetCap;
-    impl Drop for ResetCap {
-        fn drop(&mut self) {
-            TEST_JSONL_FILE_CAP.set(None);
-        }
-    }
-    let _cap = ResetCap;
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -7334,8 +7338,13 @@ fn b4_structural_transition(near_cap: bool) {
     let mtime_before_birth = metadata.modified().unwrap() < metadata.created().unwrap();
     let actual_modes = (modes.0, modes.1, unchanged_files.get());
     let context = native_restore_context(
-        format!("b4/near-cap-{near_cap}/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"),
-        (modes.0, modes.1, unchanged_files.get()), &caught, &cache, selector,
+        format!(
+            "b4/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"
+        ),
+        (modes.0, modes.1, unchanged_files.get()),
+        &caught,
+        &cache,
+        selector,
     );
     assert!(
         !birth_changed,
@@ -7377,8 +7386,23 @@ fn b4_structural_transition(near_cap: bool) {
         1,
         "native_restore structural_cold_emitted {context:?}"
     );
-    native_restore_compare_wire(actual, a0h_batch(&root, &mut oracle_index, &mut oracle), true,
-        native_restore_context(format!("b4/near-cap-{near_cap}/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"), (actual_modes, (oracle_modes.0, oracle_modes.1, unchanged_files.get())), &caught, &cache, selector));
+    native_restore_compare_wire(
+        actual,
+        a0h_batch(&root, &mut oracle_index, &mut oracle),
+        true,
+        native_restore_context(
+            format!(
+                "b4/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"
+            ),
+            (
+                actual_modes,
+                (oracle_modes.0, oracle_modes.1, unchanged_files.get()),
+            ),
+            &caught,
+            &cache,
+            selector,
+        ),
+    );
     next.record_accepted_snapshot_fingerprints(
         &caught
             .snapshots
@@ -7425,44 +7449,7 @@ fn b4_structural_transition(near_cap: bool) {
         index = held;
     }
     assert_eq!(cache.durable().unwrap().counters.active_bound[0], [1, 2]);
-    if near_cap {
-        // Scale the SAME discovery cap and pace threshold, preserving actual
-        // accepted-prefix/native-read/terminal-settlement transitions.
-        let before = std::fs::metadata(&path).unwrap().len();
-        let row = a0h_row("growth-3", 25);
-        let cap = before + row.len() as u64 + 1;
-        TEST_JSONL_FILE_CAP.set(Some(cap));
-        assert!(
-            !near_source_cap(source, before),
-            "prior refusal was below 90%"
-        );
-        append("growth-3");
-        let high = std::fs::metadata(&path).unwrap().len();
-        assert!(high < cap && near_source_cap(source, high));
-        let (((caught_index, caught, modes), reads), events) =
-            crate::local_resource_diagnostics::capture(|| {
-                a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
-            });
-        assert_eq!(modes, (1, 0, high));
-        assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
-        assert_eq!(caught.snapshots[0].input_tokens, 175);
-        assert_eq!(caught_index.files[&key].size_bytes, high);
-        assert_successor(&cache, high, 3);
-        assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
-            && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
-        append("growth-4");
-        assert!(std::fs::metadata(&path).unwrap().len() > cap);
-        let ((oversized, disclosure, modes), reads) =
-            a0h_observe(|| run(cache.clone(), caught_index, "2026-10-29T12:00:00Z"));
-        assert_eq!(modes, (0, 0, 0));
-        assert_eq!(reads.1, 0);
-        assert!(
-            disclosure.oversized_file_count > 0,
-            "pre-existing SIZE loss disclosure"
-        );
-        assert_eq!(oversized.files[&key].size_bytes, high);
-        return;
-    }
+
     cache.durable().unwrap().retail_full_now =
         Some(now + std::time::Duration::from_secs(PACE_SECS));
     let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
@@ -8079,9 +8066,9 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// [format] OFF consent and committed-key absence erase by digest, with distinct counts and unlink retries.
+/// [regress] consent OFF preserves local records; committed-key absence still erases with retries.
 #[test]
-fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write() {
+fn consent_off_preserves_pl_records_and_key_absence_still_erases() {
     let _reset = ClearWriteFaults;
     for (source, fork) in [
         (SnapshotSource::ClaudeCode, false),
@@ -8091,7 +8078,6 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
         for case in [
             "consent",
             "unreadable",
-            "failure",
             "no-marker",
             "key-absence",
             "key-absence-failure",
@@ -8179,45 +8165,27 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
             }
             let _off = crate::snapshots::RestartRestoreForTest::disabled();
             let cache = fixture::cache(source, &index_path, &scope, false);
-            cache.durable_skill_label_permission(source, true);
+            crate::snapshots::begin_durable_pass(
+                &cache,
+                &root,
+                source,
+                &index_path,
+                false,
+                &scope,
+                false,
+                true,
+            );
             cache.durable_write_after_save(lock, source, &index);
             if case == "unreadable" {
                 std::fs::remove_file(&marker).unwrap();
                 std::fs::create_dir(&marker).unwrap();
-                // The unknown-inventory fallback must advance past a full page
-                // of retained, content-free records to reach the labelled tail.
-                let empty = PendingRecord {
-                    acquisition: fixture_acquisition(source),
-                    binding: Binding {
-                        source: ds,
-                        key: [0; 32],
-                        context: [1; 32],
-                        scope: [2; 32],
-                        entry: [3; 32],
-                    },
-                    certificate: certificate(&path, &scope),
-                    body: codec::store_fixture_body(source, 0, 0),
-                    allowlist: codec::allowlist_digest(source),
-                };
-                for n in 0..store::INVENTORY_BOUND {
-                    let mut record = empty.clone();
-                    record.binding.key[24..].copy_from_slice(&(n as u64).to_be_bytes());
-                    let name: String = record
-                        .binding
-                        .key
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    let path = dir.join(format!("{name}.rec"));
-                    std::fs::write(&path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
-                    std::fs::set_permissions(
-                        path,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-                    )
-                    .unwrap();
-                }
             }
-            if failure {
+            let record_path = dir.join(format!(
+                "{}.rec",
+                key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ));
+            let before_record = std::fs::read(&record_path).ok();
+            if failure && orphan {
                 store::test_hooks::set_before_unlink(Some(Box::new(|_| {
                     Err(std::io::Error::other("erase failed"))
                 })));
@@ -8226,7 +8194,16 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
                 if orphan {
                     cache.durable_gc(lock, source, &index).unwrap();
                 } else {
-                    cache.durable_skill_label_permission(source, false);
+                    crate::snapshots::begin_durable_pass(
+                        &cache,
+                        &root,
+                        source,
+                        &index_path,
+                        false,
+                        &scope,
+                        false,
+                        false,
+                    );
                     cache.durable_write_after_save(lock, source, &index);
                 }
             };
@@ -8240,17 +8217,24 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
                 assert!(cache.durable_counters(source).is_none());
                 assert!(cache.durable.lock().unwrap().state.is_none());
                 assert!(!dir.exists());
+            } else if !orphan {
+                assert_eq!(std::fs::read(&record_path).ok(), before_record);
+                assert!(before_record.is_some(), "local labels survive consent OFF");
+                assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
+                let (counts, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.rec_orphans_erased, 0);
+                assert_eq!(
+                    counts
+                        .not_persisted
+                        .get("skill_label_purged")
+                        .copied()
+                        .unwrap_or(0),
+                    0
+                );
             } else {
                 let (counts, stats) = cache.durable_counters(source).unwrap();
                 assert_eq!(stats.rec_orphans_erased, u64::from(orphan && !failure));
-                assert_eq!(
-                    counts.not_persisted.get("skill_label_scanned"),
-                    Some(&if case == "unreadable" {
-                        store::INVENTORY_BOUND as u64 + 1
-                    } else {
-                        1
-                    })
-                );
+                assert_eq!(counts.not_persisted.get("skill_label_scanned"), Some(&1));
                 if failure {
                     assert_eq!(counts.not_persisted.get("skill_label_purged"), Some(&0));
                     assert_eq!(
@@ -8284,29 +8268,16 @@ fn consent_off_post_save_purges_pl_records_and_on_does_not_force_a_read_or_write
                 assert!(counts
                     .summary(source, &stats)
                     .contains(&format!("rec_orphans_erased={}", u64::from(orphan))));
-                if orphan {
-                    assert!(
-                        record_path(store::key_digest(ds, "live")).exists(),
-                        "live owner survives"
-                    );
-                    erase();
-                    assert_eq!(
-                        cache.durable_counters(source).unwrap().1.rec_orphans_erased,
-                        1,
-                        "no repeat credit"
-                    );
-                    assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
-                    continue;
-                }
-                for entry in std::fs::read_dir(&dir).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.extension().is_some_and(|ext| ext == "rec") {
-                        let bytes = std::fs::read(path).unwrap();
-                        assert!(!bytes
-                            .windows(b"syntheticpurgelabel".len())
-                            .any(|s| s == b"syntheticpurgelabel"));
-                    }
-                }
+                assert!(
+                    record_path(store::key_digest(ds, "live")).exists(),
+                    "live owner survives"
+                );
+                erase();
+                assert_eq!(
+                    cache.durable_counters(source).unwrap().1.rec_orphans_erased,
+                    1,
+                    "no repeat credit"
+                );
                 assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
             }
         }
@@ -8574,7 +8545,7 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
             );
         }
     }
-    assert!(cache.paced_admission(source, "eviction-trigger", now, false, false, true));
+    assert!(cache.paced_admission(source, "eviction-trigger", now, false, true));
     let mut stores = cache.durable().unwrap();
     assert!(!stores.retail_full_at.contains_key(&digest));
     // Let the next call start another turnover; keep the failed key's debt.
@@ -8584,9 +8555,9 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
     assert!(stores.key_debt.contains_key(&digest));
 }
 
-/// [money] rederive failure full and near cap allowance survive repeated real evictions.
+/// [regress] Full pacing survives eviction without any size-based exemption.
 #[test]
-fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions() {
+fn rederive_failure_full_pacing_survives_repeated_real_evictions() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let root = crate::test_scratch::ScratchDir::new("full-spend-custody");
@@ -8612,39 +8583,20 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
             ));
             assert!(cache.owes_discovery(source, key));
         }
-        // A sparse file makes the real near-cap metadata branch inexpensive.
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(max_jsonl_file_bytes(source))
+            .set_len(former_file_cap(source))
             .unwrap();
-        assert!(cache.rederive_full(source, key, &file, 2, false)); // probe is free
-        assert!(cache.rederive_full(source, key, &file, 2, true));
-        for _ in 0..4 {
-            evict_failed_replay_pace(&cache, source, key);
-            let _ = cache.rederive_gate(source, digest, 2, true, false);
-            assert!(!cache.rederive_full(source, key, &file, 2, true));
-        }
+        assert!(!cache.rederive_full(source, key, &file, 2, false));
+        assert!(!cache.rederive_full(source, key, &file, 2, true));
         let stores = cache.durable().unwrap();
-        assert_eq!(
-            stores
-                .counters
-                .resource_full
-                .get("rederive_failure_full.near_cap"),
-            Some(&1)
-        );
         assert_eq!(stores.key_debt[&digest].full_spend.unwrap().at, now);
         drop(stores);
         cache.durable().unwrap().retail_full_now =
             Some(now + std::time::Duration::from_secs(PACE_SECS));
         assert!(cache.rederive_full(source, key, &file, 2, true));
-        assert!(
-            !cache.durable().unwrap().key_debt[&digest]
-                .full_spend
-                .unwrap()
-                .near_extra
-        );
         assert!(owed::key_debt_node_bytes().unwrap() <= 1024);
     }
 }
@@ -8805,10 +8757,7 @@ fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spend
     stores.retail_full_now = Some(now);
     for n in 0..store::MAX_RECORDS {
         let digest = full_pace_key(SnapshotSource::Codex, &format!("spent-{n}"));
-        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend {
-            at: now,
-            near_extra: true,
-        });
+        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend { at: now });
     }
     let extra = full_pace_key(SnapshotSource::Codex, "extra");
     assert!(
@@ -9025,12 +8974,14 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         assert!(!cache.upgrade_full_allowed(source, &key, &file, &index, &mut full_files));
         let writable = fs::OpenOptions::new().write(true).open(&path).unwrap();
         writable.set_len(512 * 1024 * 1024 + 1).unwrap();
-        assert!(!cache.upgrade_full_allowed(
+        // Probe first-unit admission above the retired cap without spending the later pace check.
+        assert!(cache.upgrade_full_admission(
             source,
             &key,
             &file,
             &index,
-            &mut HistoryPage::default()
+            &mut HistoryPage::default(),
+            false,
         ));
         writable.set_len(6).unwrap();
         {
@@ -9415,6 +9366,188 @@ fn off_publication_invalidates_outgrown_v1() {
         assert!(matches!(reader.read(&key), ReadOutcome::Missing));
         store::test_hooks::set_before_access(None);
     });
+}
+
+/// [money] the OFF clear rewrites disk only: no body, no parse drop, no re-read.
+#[test]
+fn off_retired_body_clear_keeps_retained_parses_and_reads_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("off-retired-clear");
+        let lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(&path, a1a_row("accepted", 100)).unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+        let index_path = root.join("index.json");
+        owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+        let key = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&path));
+        let mut binding = store::tests::binding("account", "old", ("accepted", None));
+        binding.key = key;
+        let mut record =
+            store::tests::pending(binding, certificate(&path, &Scope("old".into())), 1);
+        record.allowlist = store::parse_hex_digest(
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        )
+        .unwrap();
+        let dir = store::store_dir_for_index(&index_path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        fs::write(&record_path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        store::test_hooks::set_before_access(Some(Box::new(|_, phase| {
+            assert_ne!(phase, "body", "OFF never acquires a restart body");
+            Ok(())
+        })));
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut index, mut first, _) = scan(index);
+        a1a_wire(&root, &mut index, &mut first);
+        let retained = || owner.cache.retained().unwrap().keys().count();
+        let parses = retained();
+        assert!(parses > 0);
+        owner
+            .cache
+            .durable_write_after_save(lock, SnapshotSource::ClaudeCode, &index);
+        assert_eq!(
+            fs::metadata(&record_path).unwrap().len(),
+            (store::HEADER_BYTES + 32) as u64
+        );
+        assert_eq!(retained(), parses);
+        let (_, bytes) = observe_consumed(|| scan(index));
+        assert_eq!(bytes, 0);
+        assert_eq!(retained(), parses);
+        store::test_hooks::set_before_access(None);
+    });
+}
+
+/// [money] A key change keeps every retained parse, reads no transcript byte on
+/// the next scan, and the retained markers trust no org flip after it. The new
+/// sentence differs, so a Full under the new key would trust that flip instead.
+#[test]
+fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
+    use crate::snapshots::claude_request_identity::{
+        bind_session_context_key, take_context_digest_scrubs_for_test, MarkerVerdict,
+    };
+    use base64::Engine as _;
+    let attribution = |byte: u8| {
+        crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::ClaudeCode,
+            Path::new("/nonexistent/context-digest"),
+            true,
+            Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap()
+    };
+    let attachment = |body: serde_json::Value| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"attachment",
+                "sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","attachment":body})
+        )
+    };
+    let sentence = |email: &str| {
+        attachment(serde_json::json!({"type":"session_context","context":{"userEmail":email}}))
+    };
+    let org = |uuid: &str| {
+        attachment(serde_json::json!({"type":"credential_org","organizationUuid":uuid}))
+    };
+    for (from, to) in [(Some(1), Some(2)), (Some(1), None), (None, Some(2))] {
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let _off = RestartRestoreForTest::disabled();
+            let root = crate::test_scratch::ScratchDir::new("key-change-scrub");
+            let _lock = test_locks::hold(&root);
+            let projects = root.join("projects");
+            fs::create_dir(&projects).unwrap();
+            let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+            fs::write(
+                &path,
+                sentence("one@example.invalid")
+                    + &org("11111111-1111-4111-8111-111111111111")
+                    + &a1a_row("accepted", 100),
+            )
+            .unwrap();
+            let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+            let owner =
+                crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::capturing_identity();
+            let scan = |index| {
+                owner.scan(
+                    std::slice::from_ref(&projects),
+                    &root,
+                    index,
+                    100,
+                    true,
+                    &births,
+                    &[],
+                )
+            };
+            bind_session_context_key(from.map(attribution).as_ref());
+            let mut index = ScanIndex::default();
+            index.activate_effective_upload_body_witness_revision(
+                crate::snapshot_sync::effective_upload_body_witness_revision(
+                    SnapshotSource::ClaudeCode,
+                ),
+            );
+            let (mut index, mut first, _) = scan(index);
+            a1a_wire(&root, &mut index, &mut first);
+            let retained = || owner.cache.retained().unwrap().keys().count();
+            let parses = retained();
+            assert!(parses > 0);
+
+            assert!(bind_session_context_key(to.map(attribution).as_ref()));
+            take_context_digest_scrubs_for_test();
+            owner.cache.scrub_retained_context_digests();
+            assert_eq!(take_context_digest_scrubs_for_test(), parses as u64);
+            assert_eq!(retained(), parses);
+            let ((index, _, _), bytes) = observe_consumed(|| scan(index));
+            assert_eq!(bytes, 0);
+            assert_eq!(retained(), parses);
+
+            std::io::Write::write_all(
+                &mut fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                (sentence("two@example.invalid")
+                    + &org("22222222-2222-4222-8222-222222222222")
+                    + &a1a_row("growth", 200))
+                    .as_bytes(),
+            )
+            .unwrap();
+            let _ = scan(index);
+            let cache = owner.cache.retained().unwrap();
+            assert_eq!(
+                cache
+                    .peek(&local_index_key(&path))
+                    .unwrap()
+                    .state
+                    .org_markers_for_test()
+                    .unwrap()
+                    .verdict(u64::MAX, false),
+                MarkerVerdict::UntrustedFlip
+            );
+        });
+    }
 }
 
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->

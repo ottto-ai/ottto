@@ -1179,8 +1179,10 @@ fn decode_api_sidecar(
     // Preserve ordinary API read-through on concurrent appends within the
     // protected per-pair allowance.
     let mut reader = BufReader::new((&file).take(allowance));
+    crate::local_resource_diagnostics::claude_sidecar_reparse(1, 0);
     let rows = decode_api_rows(&mut reader, session_id, &mut health);
     let bytes = allowance - reader.get_ref().limit();
+    crate::local_resource_diagnostics::claude_sidecar_reparse(0, bytes);
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
     if bytes >= allowance {
         health.unreadable_lines += 1;
@@ -1348,6 +1350,7 @@ pub fn load_claude_trace_ownership_evidence(
             }
         });
         let mut reader = BufReader::new((&file).take(limit));
+        crate::local_resource_diagnostics::claude_sidecar_reparse(1, 0);
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
         for line in reader.by_ref().lines() {
@@ -1361,6 +1364,7 @@ pub fn load_claude_trace_ownership_evidence(
             decoder.push_line(line.as_bytes());
         }
         let bytes = limit - reader.get_ref().limit();
+        crate::local_resource_diagnostics::claude_sidecar_reparse(0, bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
         let unchanged = generation_unchanged(&file, &path, api_file_generation(&opened).as_ref());
@@ -3122,6 +3126,61 @@ mod tests {
         assert_eq!(stats.api_evidence_row_count, 2);
         fs::remove_dir_all(dir).unwrap();
     }
+    // [behaviour] Each pass counts real API/trace reads again, including bad
+    // rows, while missing inputs add nothing and other sources cannot drain it.
+    #[test]
+    fn sidecar_reparse_counts_repeat_actual_bytes_per_claude_page() {
+        use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+        let (dir, _) = decode_reuse_fixture("reparse-counts");
+        fs::create_dir_all(dir.join(TRACE_STORE_DIR)).unwrap();
+        let trace_path = trace_evidence_path(&dir, "sess-mixed");
+        fs::write(&trace_path, b"not json\n").unwrap();
+        let expected_bytes = fs::metadata(evidence_path(&dir, "sess-mixed"))
+            .unwrap()
+            .len()
+            + fs::metadata(&trace_path).unwrap().len();
+        let page = |source| {
+            Probe::start().collection(
+                source,
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            )
+        };
+        // Drain any earlier fixture activity on this test thread.
+        capture(|| page("claude_code"));
+        let (_, records) = capture(|| {
+            for _ in 0..2 {
+                let api =
+                    ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "missing".into()])
+                        .unwrap();
+                assert!(!api.evidence.is_empty());
+                let trace = load_claude_trace_ownership_evidence(
+                    &dir,
+                    ["sess-mixed".into(), "missing".into()],
+                );
+                assert_eq!(trace.malformed_lines, 1);
+                page("codex");
+                page("claude_code");
+            }
+            page("claude_code");
+        });
+        for (i, record) in records.iter().enumerate() {
+            let counts = &record["counts"];
+            if i == 0 || i == 2 || i == 4 {
+                assert!(counts.get("claude_sidecar_reparse_files").is_none());
+                assert!(counts.get("claude_sidecar_reparse_bytes").is_none());
+            } else {
+                assert_eq!(counts["claude_sidecar_reparse_files"], 2);
+                assert_eq!(counts["claude_sidecar_reparse_bytes"], expected_bytes);
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn decode_reuse_fixture(label: &str) -> (PathBuf, Vec<ClaudeLocalOtelEvidence>) {
         let dir = crate::test_scratch::private_dir(&format!("ottto-decode-{label}"));
         let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();

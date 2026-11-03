@@ -99,8 +99,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         snapshot: SnapshotSource::Pi,
         tag: 3,
         below_accepted: BelowAccepted::Tail,
-        // Pi joins the v2 store in its own later step.
-        state_v2: false,
+        state_v2: true,
         write_format: 3,
         representations: &representations(
             "10a14138dc3d8c6c41f499fb728e96b9755ab21b87b7e850386a2c39a513f527",

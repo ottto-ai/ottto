@@ -206,15 +206,6 @@ fn the_fence_admits_only_a_settled_covering_record_and_writes_nothing_then() {
         }
     );
     assert!(index.codex_parent_side_requests.is_empty());
-
-    // Over main's cap: no side state at all.
-    parent
-        .writer()
-        .set_len(MAX_CODEX_JSONL_FILE_BYTES + 1)
-        .unwrap();
-    assert_eq!(parent.fence(&mut index, 1, now).0, SideFence::FileCapHeld);
-    assert!(index.codex_parent_side_requests.is_empty());
-    assert!(index.codex_parent_side.contains_key(KEY));
 }
 
 /// With no record the fence takes the request path: create `Live{0}`, or

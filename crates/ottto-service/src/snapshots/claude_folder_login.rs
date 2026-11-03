@@ -129,6 +129,25 @@ pub(crate) struct FolderRecord {
 }
 crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_remaining, reoffer_moved_at, reoffer_owed, reoffer_revision);
 
+// Admission classes: flags, counts and times are N; `login`/`org` are identity
+// hashes (H); `matched`/`reoffer_owed` hold location digests truncated to u64,
+// so they are N-typed, not H's fixed 32 bytes. Not part of any retained body.
+crate::durable_tail_codec::durable_struct!(FolderRecord {
+    N fresh: bool,
+    N mixed: bool,
+    H login: Option<String>,
+    H org: Option<String>,
+    N owner_proven: bool,
+    N census_complete: bool,
+    N covered_from: Option<i64>,
+    N matched: Vec<u64>,
+    N reoffer: u8,
+    N reoffer_remaining: u64,
+    N reoffer_moved_at: i64,
+    N reoffer_owed: Vec<u64>,
+    N reoffer_revision: u64,
+});
+
 impl FolderRecord {
     fn set_mixed(&mut self) {
         self.mixed = true;

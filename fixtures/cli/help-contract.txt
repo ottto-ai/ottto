@@ -573,7 +573,7 @@ Usage: ottto uninstall [OPTIONS]
 Options:
       --json                      Print one final JSON object and no human summary text
       --socket <SOCKET>           Override the ottto-service Unix socket path
-      --backup-state <DIRECTORY>  Copy local sync receipts and first-sweep progress here before uninstalling
+      --backup-state <DIRECTORY>  Copy local sync receipts and first-sweep progress here before uninstalling; the backup contains local session titles, prompts and workspace paths, so keep it private
       --token <TOKEN>             Override the local-control token for CLI and agent requests
       --confirm                   Confirm removal of local credentials, receipts, and first-sweep progress
       --no-autostart              Do not kickstart the standard per-user ottto-service

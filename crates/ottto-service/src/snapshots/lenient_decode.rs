@@ -445,6 +445,7 @@ impl Serialize for ScanIndex {
         );
         field!(copy_prefix_last_accepted_nonce, Option::is_none);
         field!(claude_folder_login_ledger, BTreeMap::is_empty);
+        field!(tail_discovery, TailDiscovery::is_empty);
         map.end()
     }
 }
@@ -543,6 +544,7 @@ pub(super) const FIELDS: &[&str] = &[
     "archive_deferred_alarm_count",
     "copy_prefix_last_accepted_nonce",
     "claude_folder_login_ledger",
+    "tail_discovery",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -2441,6 +2443,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 crate::snapshots::claude_folder_login::damaged_ledger(),
                             )?
                         }
+                        "tail_discovery" => index.tail_discovery = self.typed(value)?,
                         "upload_context_proof" => {
                             // Damage only means owed: the proof is lost, never
                             // the index.

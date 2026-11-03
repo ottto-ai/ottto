@@ -22,6 +22,13 @@ impl Fixture {
         Self::with_claims(BTreeMap::new())
     }
     fn with_claims(claims: BTreeMap<String, sampled_audit::GrowthRetention>) -> Self {
+        Self::on_route("claude_code-test-scan-index.json", claims)
+    }
+    /// `index_file` names the route, and so the source its binding derives.
+    fn on_route(
+        index_file: &str,
+        claims: BTreeMap<String, sampled_audit::GrowthRetention>,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let support = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-growth-lineage-{}-{}",
@@ -30,7 +37,7 @@ impl Fixture {
         ));
         let parent = support.join("snapshots/destinations").join("a".repeat(64));
         fs::create_dir_all(&parent).unwrap();
-        let path = parent.join("claude_code-test-scan-index.json");
+        let path = parent.join(index_file);
         let source = support.join("session.jsonl");
         fs::write(&source, b"old\nappend\n").unwrap();
         let key = local_index_key(&source);
@@ -617,13 +624,16 @@ fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
 }
 
 /// [regress] claim-only saves undid page halving and page-one oversize retries stormed
-/// (charged ceiling or an over-cap value).
+/// after value-admission failures.
 #[test]
 fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     let f = Fixture::new();
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        f.key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -631,14 +641,17 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     assert_eq!(collection_page_limit(&index, 250), 125);
     assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
 
-    // Simulate successive ceiling reductions reaching a page of one.
+    // Simulate successive value-admission reductions reaching a page of one.
     with_state(&f.path, |state| {
         state.page_limit = 1;
         Ok(())
     })
     .unwrap();
     assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
-    super::tests::with_session_db(&index, |db| sqlite::set_save_ceiling(db, 0));
+    index.file_snapshot_fingerprints.insert(
+        f.key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
     assert!(index.save(&f.path).is_err());
     let mut index = f.load();
     assert!(save_oversize_active(&index).unwrap());
@@ -700,8 +713,8 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     );
     crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
 
-    // [money] A native value over its 1 MiB cap at save (not the charged
-    // ceiling) takes the same page-one SaveOversize hold, alarm and pacing.
+    // [money] A native value over its 1 MiB cap at save retains the
+    // page-one SaveOversize hold, alarm and pacing.
     let mut index = f.load();
     let before = index.clone();
     with_state(&f.path, |state| {
@@ -738,6 +751,65 @@ fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
     assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &reopened)().is_err());
     assert!(!save_read_admitted(&reopened, &f.key, held_at + INTERVAL - 1).unwrap());
     assert!(save_read_admitted(&reopened, &f.key, held_at + INTERVAL).unwrap());
+}
+
+/// [regress] the scan's source fence ran for Claude only: a Codex SaveOversize
+/// hold named no page-one file, so its retry never completed and it never lifted.
+#[test]
+fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
+    use crate::snapshots::{codex_file_join, OwnedSourceScan, OwnedSourceScanStep};
+    let f = Fixture::on_route("codex-test-scan-index.json", BTreeMap::new());
+    let sessions = f.support.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let rows =
+        codex_file_join::tests::member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r", 100, 100);
+    let body = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+        .collect::<String>();
+    fs::write(sessions.join("a.jsonl"), body).unwrap();
+    with_state(&f.path, |state| {
+        state.page_limit = 1;
+        Ok(())
+    })
+    .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&sessions),
+        f.load(),
+        &now,
+        30,
+        1,
+        false,
+        None,
+        &[],
+        false,
+    );
+    while let OwnedSourceScanStep::Pending(next) = scan.step(None) {
+        scan = next;
+    }
+    let (key, read_at) = with_state(&f.path, |state| Ok(state.last_read.clone()))
+        .unwrap()
+        .expect("the scan's fence names its page-one file");
+
+    let mut index = f.load();
+    index.file_snapshot_fingerprints.insert(
+        key.clone(),
+        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
+    );
+    assert!(index.save(&f.path).is_err());
+    let mut held = f.load();
+    assert!(save_oversize_active(&held).unwrap());
+    let due = read_at + INTERVAL;
+    assert!(!save_read_admitted(&held, &key, due - 1).unwrap());
+    assert!(!save_read_admitted(&held, "/synthetic/other.jsonl", due).unwrap());
+    assert!(save_read_admitted(&held, &key, due).unwrap());
+    sampled_audit::settle_growth(&mut held, &key);
+    held.save(&f.path).unwrap();
+    assert!(!save_oversize_active(&held).unwrap());
 }
 
 /// [regress] grown and undiscovered keys kept old Exact proof after lossy/failed parses.

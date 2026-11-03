@@ -3725,6 +3725,74 @@ fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
     );
 }
 
+/// The no-key refusal count: a terminal flip after a sentence with no key to
+/// compare it counts per refused request; keyed, or on Desktop, it stays zero.
+#[test]
+fn no_key_flip_refusals_count_only_uncompared_terminal_flips() {
+    let refusals = |entrypoint: &str| {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        accumulator.claude_request_identity_capture = true;
+        let response = |n: u32| {
+            json!({"type": "assistant", "sessionId": ROOT, "entrypoint": entrypoint,
+                "timestamp": format!("2026-08-02T07:00:{n:02}Z"),
+                "requestId": format!("req_{n}"), "message": {"id": format!("msg_{n}"),
+                "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}})
+        };
+        for line in [
+            context("one@example.invalid"),
+            marker(ORG_1),
+            response(0),
+            context("two@example.invalid"),
+            marker(ORG_2),
+            response(1),
+        ] {
+            apply_claude_code_line(&line, &mut accumulator);
+        }
+        accumulator.finalize_claude_responses();
+        let item = accumulator
+            .into_items(
+                Path::new("/synthetic/session.jsonl"),
+                "2026-08-02T07:01:00Z",
+                "fp".into(),
+                None,
+            )
+            .remove(0);
+        let (api, trace) = reports(Vec::new(), Vec::new());
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
+        for (request_id, occurrence) in &item.claude_usage_occurrences {
+            let (key, _, _) = build_row_identity(
+                occurrence.model.as_deref().unwrap(),
+                &occurrence.selector,
+                None,
+            );
+            sink.add(
+                &item,
+                identity::Request {
+                    request_id,
+                    occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                    timestamp: occurrence.timestamp.as_deref().unwrap(),
+                    bucket_start: "2026-08-02T07:00:00Z",
+                    row_key: &key,
+                    usage: &occurrence.usage,
+                },
+            );
+        }
+        serde_json::to_value(identity::take_identity_counts()).unwrap()
+            ["claude_no_key_flip_refusals"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        refusals("cli"),
+        0,
+        "keyed: the new sentence explains the flip"
+    );
+    identity::bind_session_context_key(None);
+    assert_eq!(refusals("cli"), 1, "only the request after the flip");
+    assert_eq!(refusals("claude-desktop"), 0, "Desktop markers are trusted");
+}
+
 /// Desktop recent identity stays in the exact account/org scope. Positive,
 /// in the daemon's order (save native originals, apply request enrichment
 /// including its billing veto, rebuild/place requests, publish the fold): a

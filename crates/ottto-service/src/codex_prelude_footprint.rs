@@ -37,11 +37,10 @@ use crate::context_footprint::{
     ContextFootprintItemInput, RepositoryIdentity,
 };
 use crate::locked_state_dir::write_json_atomic;
-use crate::snapshot_client::{
-    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
-};
+use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshot_roots::registered_scan_roots;
 use crate::snapshots::SnapshotSource;
+use crate::upload_policy::{filter_footprint, FootprintRules};
 use anyhow::{anyhow, Result};
 use ottto_core::{
     compiled_release_version, read_codex_config_file_secure, CodexHomeTrust, LocalDeviceBinding,
@@ -1042,6 +1041,7 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         custom_agents: Vec::new(),
         mcp_tools: Vec::new(),
         instruction_inventory: None,
+        names_withheld: None,
     })
 }
 
@@ -1111,18 +1111,19 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeF
     let identity = destination_identity(&device, &machine_id, &api_base_url);
     let marker = support_dir.join(STATE_DIR).join("org_disabled");
     // Same backend opt-out cascade as the Claude Code footprint.
-    let labels_enabled = match client.get_activity_hint(&relay_token) {
+    let rules = match client.get_activity_hint(&relay_token) {
         Ok(hint) => {
             if !hint.context_footprint_harvest_enabled {
                 write_json_atomic(&marker, &identity);
                 return Ok(());
             }
             let _ = fs::remove_file(&marker);
-            workspace_labels_allowed(Some(&hint))
+            FootprintRules::for_pass(support_dir, &identity, Some(&hint))
         }
         Err(_) if marker_matches(&marker, &identity) => return Ok(()),
-        Err(_) => workspace_labels_allowed(None),
+        Err(_) => FootprintRules::for_pass(support_dir, &identity, None),
     };
+    let labels_enabled = rules.policy.workspace();
 
     let roots = registered_scan_roots(SnapshotSource::Codex, home)?;
     let salt = load_or_create_salt(support_dir);
@@ -1133,7 +1134,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeF
         if Instant::now() >= deadline {
             break;
         }
-        let request = build_request(RequestInputs {
+        let mut request = build_request(RequestInputs {
             prelude: &prelude,
             workspace: &workspace,
             identity: resolve_repository_identity(&workspace, labels_enabled),
@@ -1143,7 +1144,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeF
             home,
             salt: salt.as_ref(),
         });
-        let Some(request) = request else {
+        let Some(request) = request.as_mut() else {
             skipped += 1;
             continue;
         };
@@ -1152,7 +1153,8 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeF
             &relay_token,
             support_dir,
             &identity,
-            &request,
+            request,
+            rules,
             prelude.started_at,
         ) {
             Ok(true) => uploaded += 1,
@@ -1231,14 +1233,16 @@ fn select_candidates(
     chosen
 }
 
-fn upload_if_changed(
+pub(crate) fn upload_if_changed(
     client: &SnapshotApiClient,
     relay_token: &str,
     support_dir: &Path,
     identity: &str,
-    request: &ContextFootprintIngestRequest,
+    request: &mut ContextFootprintIngestRequest,
+    rules: FootprintRules,
     started_at: Option<i64>,
 ) -> Result<bool> {
+    filter_footprint(request, rules);
     let hash = request_content_hash_for_request(request)?;
     let path = upload_cache_path(support_dir, &request.workspace_hash);
     let now = OffsetDateTime::now_utc();

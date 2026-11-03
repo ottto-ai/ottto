@@ -89,7 +89,6 @@ fields!(SnapshotOpeningFile; []; request,tool,repo_path,path_hash,ext,chars,read
 fields!(OpeningFileCandidate; []; row,repo_path,path_hash,ext);
 fields!(SnapshotOrigin; [parent_session_ref]; thread_source,source,source_subagent,originator,agent_role,entrypoint,is_sidechain,session_kind,used_workflow_orchestration);
 fields!(SnapshotActivityCount; []; name,count);
-fields!(SnapshotToolUsage; []; name,count);
 fields!(SnapshotCapabilityCount; []; capability_id,raw_origin,count);
 fields!(SnapshotCapabilityBucket; []; bucket_start,capability_id,raw_origin,call_count);
 fields!(SnapshotActivitySummary; []; capability_collection_version,tool_calls,shell_commands,patch_operations,changed_files,lines_added,lines_deleted,web_searches,mcp_calls,subagent_spawns,tool_counts,mcp_tool_counts,capability_counts,capability_buckets,skills);

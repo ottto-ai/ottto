@@ -26,14 +26,14 @@ keys take the counted budget path without allocating a large key buffer.
 Excess damage uses the existing load quarantine or CAS error. The load diagnostic
 names the prior-history gated rebuild, which requires #712 to land first; the
 existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
-If this same checkpoint has a `.corrupt` sibling timestamped within seven days,
+If this same checkpoint has a `.corrupt` sibling timestamped within 24 hours,
 the next over-budget load refuses in place instead of rebuilding again. The
 existing backup name supplies the rename timestamp (mtime survives rename);
 no new durable state is added. Future timestamps also block a rebuild, covering
 clock rollback. All same-checkpoint corruption backups conservatively count,
 including syntax and identity-collision quarantines. Syntax/truncation still quarantines on load.
 A paused source reports `scan_index_rebuild_loop` with its automatic retry time
-(`auto_retry_at=`, the newest backup stamp plus seven days) in the health
+(`auto_retry_at=`, the newest backup stamp plus 24 hours) in the health
 `clear_condition`. One interactive user Repair from the signed companion
 (token-less `repair`, not dry run) may pass the guard once: the next source load
 strictly decodes the session-identity fields (bindings, deferred holds,
@@ -51,7 +51,7 @@ the source stays paused, the index is untouched, and the successful-override
 cooldown is not spent. A later press returns the same clear refusal without arming or incrementing the
 attempt counter. A compatible load clears that refusal.
 `scan_index_rebuild_override_identity_unrecoverable` is counted, alarmed and
-named in the health `clear_condition`. Syntax damage waits for the seven-day
+named in the health `clear_condition`. Syntax damage waits for the 24-hour
 automatic retry: sessions arrive late, not lost.
 
 Carried ACK debt is separate from ordinary ACKs: only the original identities
@@ -68,11 +68,11 @@ Each census line reports `retained_carried_entries` and
 file or granting new ACKs blanket retention. Releasing a file suppresses its
 already accepted entities and transfers its reconstructed membership to the
 ordinary ACK ledger; a partial commit retires debt only for committed files.
- The witness re-arms the seven-day guard;
+ The witness re-arms the 24-hour guard;
 the 24-hour cooldown is durable per checkpoint and source-wide
 (`<support>/snapshots/<source>-scan-index-rebuild-override.json`, outside every
 destination namespace, so a re-pair does not reset it; future or malformed
-stamps cool). A second press inside it returns
+stamps cool; an unreadable Repair stamp counts as absent). A second press inside it returns
 `scan_index_rebuild_override_cooldown`. Verify, automatic retries,
 unattributed loads and token (CLI or agent) Repairs never override. Transcripts
 stay on disk, so a paused source's sessions arrive late, not lost.

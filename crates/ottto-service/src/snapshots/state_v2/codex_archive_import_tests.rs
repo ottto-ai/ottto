@@ -14,6 +14,7 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
         .chain([
             "copy_prefix_last_accepted_nonce",
             "claude_folder_login_ledger",
+            "tail_discovery",
         ])
         .collect();
     let positional = original_presence(b"[2,0,null,{}]".as_slice()).unwrap();

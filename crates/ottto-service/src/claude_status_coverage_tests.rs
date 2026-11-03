@@ -40,7 +40,7 @@ fn the_address_digest_is_keyed_and_has_its_own_domain() {
     assert_ne!(digest, format!("{:x}", Sha256::digest(ADDRESS.as_bytes())));
     assert_ne!(
         digest,
-        crate::snapshots::claude_request_identity::marker_email_digest(ADDRESS)
+        keyed_text_digest(&KEY, "claude_session_context:v1", ADDRESS)
     );
     assert_ne!(
         digest,

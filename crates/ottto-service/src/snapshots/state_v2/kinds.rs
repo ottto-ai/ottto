@@ -27,6 +27,11 @@ pub(super) struct KindCx {
     /// Archive reads an ordinary save may spend compacting whole families.
     pub(super) compact_allowance: Option<usize>,
     pub(super) compaction: kinds_accounts::Compaction,
+    /// A full save's staged Tail state; claim-only saves leave this `None` and
+    /// publish none. The save's owner takes it back after the attempt.
+    pub(super) tail: Option<tail::TailStage>,
+    /// This save rolled back a staged file's graph rows with its Tail rows.
+    pub(super) tail_rolled_back: bool,
     valid: bool,
 }
 
@@ -194,14 +199,24 @@ pub(super) fn delta(
     cx.compaction = Default::default();
     let result = (|| {
         let mut rows = mapper::Rows {
-            tx: Some(tx),
+            tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
+            // A staged file's own graph rows commit or roll back with its Tail.
+            closures: cx
+                .tail
+                .iter()
+                .flat_map(|stage| stage.staged())
+                .map(|file| (file.clone(), Vec::new()))
+                .collect(),
             ..Default::default()
         };
         let windows = enumerate(next, &mut rows, &previous.windows, cx)?;
+        let retired = tail::removed_files(&rows.old);
+        cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
+        let digests = rows.finish()?;
         Ok(Baseline {
             generation: next.generation,
-            rows: rows.finish()?,
+            rows: digests,
             windows,
         })
     })();
@@ -246,6 +261,12 @@ pub(super) fn save_graph(
         match outcome {
             DurableCommitOutcome::Committed(generation) => {
                 next.generation = generation;
+                // RAM is ahead of a rolled-back file's committed rows: reload
+                // them. The stage is published; the file reselects.
+                if pending.tail_rolled_back {
+                    pending.tail = None;
+                    bail!(Hold::ReloadRequired);
+                }
                 #[cfg(test)]
                 if FAIL_DIGEST_PROMOTION.with(|fail| fail.replace(false)) {
                     bail!(Hold::ReloadRequired);
@@ -308,6 +329,7 @@ pub(super) fn save_graph(
     } else {
         // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
+        committed.tail = pending.tail.take();
         if !published {
             next.generation = generation;
         }

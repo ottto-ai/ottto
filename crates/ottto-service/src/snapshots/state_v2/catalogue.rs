@@ -146,7 +146,8 @@ macro_rules! scan_index_fields {
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
             copy_prefix_recovery_scope => Misc (runtime none) [] side,
-            claude_folder_login_ledger => Misc (misc check_field Map) ["v1_field.claude_folder_login_ledger" => 4] side,
+            claude_folder_login_ledger => Misc (misc check_field Map) ["v1_field.claude_folder_login_ledger" => 5] side,
+            tail_discovery => Misc (misc check_field Field) ["scan_state.tail_discovery" => 5] side,
         }
     };
     (@apply [each $m:ident] $($f:ident => $g:ident $store:tt [$($kind:literal => $introduced:literal),*] $heap:ident,)*) => {
@@ -171,17 +172,56 @@ pub(super) enum Group {
     Misc,
     Accounts,
     Census,
+    Tail,
 }
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
 /// Layout one is the original catalogue; additions declare their first layout.
-pub(super) const LAYOUT: u32 = 4;
+// Append one line per bump; two PRs appending the same number conflict by design.
+pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
+    (1, "original catalogue"),
+    (2, "kind-introduction layouts and upload context proof"),
+    (3, "copy-prefix recovery nonce"),
+    (4, "tail store"),
+    (5, "folder login ledger + tail revision + head envelope"),
+];
+pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
+/// Tail state's closed kinds, each owned by `tail.rs`: no `ScanIndex` field, no
+/// hook, and never a row of `enumerate` or a baseline. Pages first, in
+/// `tail::Collection` order.
+pub(super) const TAIL_KINDS: &[&str] = &[
+    "tail.page.responses",
+    "tail.page.tool_uses",
+    "tail.page.changed_files",
+    "tail.page.cap_hours",
+    "tail.page.compactions",
+    "tail.page.signatures",
+    "tail.page.priority_turns",
+    "tail.page.usage_hours",
+    "tail.page.requests",
+    "tail.page.pi_usage_keys",
+    "tail.page.codex_active_turns",
+    "tail.page.codex_open_calls",
+    "tail.page.codex_name_counts",
+    "tail.revision",
+    "tail.page.session_facts",
+    "tail.head",
+    "tail.frag",
+    "tail.set_aside",
+];
+/// The Tail store's own layout. A Tail-only exit commit raises a store to this
+/// layout at most, never to a later one whose graph roots it does not write.
+pub(super) const TAIL_LAYOUT: u32 = 4;
+/// Tail kinds added after the Tail store, each at its own layout.
+const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
         .iter()
         .find(|(name, _, _)| *name == kind)
         .map(|(_, _, layout)| *layout)
+        .or_else(|| TAIL_LATER.iter().find(|(k, _)| *k == kind).map(|(_, l)| *l))
+        .or_else(|| TAIL_KINDS.contains(&kind).then_some(TAIL_LAYOUT))
         .ok_or_else(|| anyhow::anyhow!("state_v2_unmapped_kind"))
 }
 /// Before layout controls existed, this authenticated inventory contained every
@@ -202,6 +242,7 @@ pub(super) fn group(kind: &str) -> Option<Group> {
         .iter()
         .find(|(owned, _)| *owned == kind)
         .map(|(_, group)| *group)
+        .or_else(|| TAIL_KINDS.contains(&kind).then_some(Group::Tail))
 }
 pub(super) fn accepts(kind: &str) -> bool {
     group(kind).is_some() || RESERVED.contains(&kind)
@@ -245,8 +286,27 @@ mod tests {
         }
         assert!(RESERVED.iter().all(|kind| group(kind).is_none()));
         assert_eq!(group("family.requests"), Some(Group::Census));
-        // Each kind is introduced at a supported layout; the newest is current.
+        // Each graph kind is introduced at a supported layout.
         assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
-        assert!(LAYOUTS.iter().any(|(_, _, l)| *l == LAYOUT));
+        // Earlier Tail kinds stay at the Tail store's layout; later ones own theirs.
+        assert_eq!(TAIL_LAYOUT, 4);
+        assert_eq!(introduced("tail.head").unwrap(), TAIL_LAYOUT);
+        assert_eq!(introduced("tail.revision").unwrap(), 5);
+        assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
+        assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
+        // An unversioned store's inventory never names a layout-5 field, so its
+        // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).
+        let presence = super::super::super::lenient_decode::FIELDS
+            .iter()
+            .filter(|field| !LAYOUTS.iter().any(|(_, f, l)| f == *field && *l == 5))
+            .map(|field| (field.to_string(), true))
+            .collect();
+        assert!(legacy_layout(&presence) < 5);
+        // Tail kinds are a closed list too: no wildcard, and no graph owner.
+        assert_eq!(group("tail.head"), Some(Group::Tail));
+        assert_eq!(group("tail.page.future"), None);
+        assert!(TAIL_KINDS
+            .iter()
+            .all(|kind| !OWNED.iter().any(|o| o.0 == *kind)));
     }
 }

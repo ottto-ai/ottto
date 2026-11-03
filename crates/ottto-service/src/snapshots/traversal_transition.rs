@@ -28,6 +28,7 @@ struct Previous {
     unsettled_residue: bool,
     // This type contains numeric counters and a fixed cause-counter array only.
     counts: ScanTraversalCounts,
+    max_unread_bytes: u64,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -106,6 +107,7 @@ impl Starting {
             retryable_problems: t.counts.has_retryable_problems(),
             unsettled_residue: t.counts.has_unsettled_residue(),
             counts: t.counts.clone(),
+            max_unread_bytes: t.counts.max_unread_bytes,
         });
         let (prior_held_family_roots, prior_held_family_set_digest) = prior_held_family_observation(
             (source == SnapshotSource::ClaudeCode)
@@ -193,6 +195,7 @@ pub(super) fn retiring(
         /// Fixed names of the paths that set the clean follow-up's flag.
         unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
+        max_unread_bytes: u64,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
         /// Claude only: path-(a) absence retirement process totals, and the
         /// index's tombstone uncertainty fence.
@@ -239,6 +242,7 @@ pub(super) fn retiring(
             gates,
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
+            max_unread_bytes: traversal.counts.max_unread_bytes,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
             absent_retry_pending_retired: absence.map(|(counts, _)| counts.absent_families_retired),
             absent_family_tombstone_hits: absence.map(|(counts, _)| counts.tombstone_hits),
