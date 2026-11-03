@@ -695,7 +695,12 @@ fn entity_stamp_dropped_by_old_decoder_is_owed() {
         &BTreeMap::from([(entity.clone(), "c".repeat(64))]),
         &BTreeMap::from([(entity.clone(), "d".repeat(64))]),
     );
-    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 0);
+    assert_eq!(
+        f.index
+            .upload_context_owed_counts(f.source)
+            .no_proof_entities,
+        0
+    );
     let saved_path = f._scratch.join("entity-stamp-index.json");
     f.index.save(&saved_path).unwrap();
     let mut encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
@@ -713,7 +718,12 @@ fn entity_stamp_dropped_by_old_decoder_is_owed() {
     assert!(serde_json::to_value(&f.index).unwrap()["upload_context_fingerprint"].is_null());
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
-    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 1);
+    assert_eq!(
+        f.index
+            .upload_context_owed_counts(f.source)
+            .no_proof_entities,
+        1
+    );
     assert!(f.entry().upload_context_receipt.is_some());
 }
 
@@ -2508,4 +2518,194 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         );
     }
     f.assert_quiet();
+}
+
+/// One file without its own context proof under an active context: on disk,
+/// committed member `entity`, accepted in the current ledger, no receipt.
+fn owed_count_index(
+    source: SnapshotSource,
+) -> (crate::test_scratch::ScratchDir, ScanIndex, String) {
+    let scratch = crate::test_scratch::ScratchDir::new("owed-count-exemption");
+    let path = scratch.join(format!("projects/synthetic/{SESSION}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        super::tests::manifest_index_entry(Some("entity")),
+    );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["entity".to_string()]));
+    index.accepted_snapshot_fingerprints.insert("entity".into());
+    index.activate_file_upload_context(source, "a".repeat(64));
+    assert!(index.file_upload_context_requires_adoption(&key));
+    (scratch, index, key)
+}
+
+/// The real operator list, naming one root session's family.
+fn list_root(index: &mut ScanIndex, root: &str) {
+    use sha2::Digest;
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(
+        format!("{:x}\n", sha2::Sha256::digest(root.as_bytes())).as_bytes(),
+    );
+}
+
+/// [behaviour] An operator-listed family file owes no body: settled while
+/// listed, even with no committed member, and owed again once delisted.
+#[test]
+fn listed_family_file_counts_settled_until_delisted() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    index.accepted_snapshot_fingerprints.clear();
+    list_root(&mut index, SESSION);
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.listed_files), (0, 1));
+    assert_eq!(counts.no_proof_entities, 0, "listed owes no entity either");
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!(
+        (counts.owed_files, counts.listed_files),
+        (0, 1),
+        "an empty member set is still settled as listed"
+    );
+    index.claude_reemission_exclusions = ReemissionExclusions::default();
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.listed_files), (1, 0));
+    assert!(
+        index.file_upload_context_requires_adoption(&key),
+        "count only: the file never gained proof"
+    );
+}
+
+/// [behaviour] A confirmed-empty file without its empty proof is settled only
+/// once absent on disk: a present one may have grown unread, so it stays owed.
+#[test]
+fn confirmed_empty_counts_settled_only_when_absent() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    index.file_snapshot_fingerprints.remove(&key);
+    index.confirmed_empty_files.insert(key.clone());
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.empty_files), (1, 0));
+    fs::remove_file(&key).unwrap();
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.empty_files), (0, 1));
+    assert!(
+        index.file_upload_context_requires_adoption(&key),
+        "count only: the file never gained proof"
+    );
+}
+
+/// [behaviour] Exact ledger acceptance settles a file only on a current
+/// ledger, with every committed member accepted and unquarantined, and no
+/// open evidence debt. Codex also needs its proven owner.
+#[test]
+fn ledger_accepted_file_counts_settled_only_with_current_ledger() {
+    let settled = |index: &ScanIndex, source| {
+        let counts = index.upload_context_owed_counts(source);
+        assert_eq!(counts.owed_files + counts.ledger_accepted_files, 1);
+        counts.ledger_accepted_files == 1
+    };
+    let (_scratch, index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    assert!(settled(&index, SnapshotSource::ClaudeCode));
+    let mut stale = index.clone();
+    stale.accepted_snapshot_fingerprint_ledger_version = 0;
+    assert!(!settled(&stale, SnapshotSource::ClaudeCode), "stale ledger");
+    let mut reconciling = index.clone();
+    reconciling.legacy_settlement_reconcile_after_fingerprint = Some("entity".into());
+    assert!(
+        !settled(&reconciling, SnapshotSource::ClaudeCode),
+        "ledger being rebuilt"
+    );
+    let mut quarantined = index.clone();
+    quarantined.quarantined_snapshot_fingerprints.insert(
+        "entity".into(),
+        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
+    );
+    assert!(
+        !settled(&quarantined, SnapshotSource::ClaudeCode),
+        "quarantined member"
+    );
+    let mut grown = index.clone();
+    grown.file_snapshot_fingerprints.insert(
+        key.clone(),
+        BTreeSet::from(["entity".to_string(), "new".to_string()]),
+    );
+    assert!(
+        !settled(&grown, SnapshotSource::ClaudeCode),
+        "newly committed unaccepted member"
+    );
+    let mut evidence = index.clone();
+    evidence.files.get_mut(&key).unwrap().evidence_owed = true;
+    assert!(
+        !settled(&evidence, SnapshotSource::ClaudeCode),
+        "open evidence debt"
+    );
+    assert!(
+        !settled(&index, SnapshotSource::Codex),
+        "Codex acceptance needs a proven owner"
+    );
+}
+
+/// [behaviour] Pi has no file-body acceptance predicate: its accepted ledger
+/// settles nothing, and only the confirmed-empty exemption applies.
+#[test]
+fn pi_gets_empty_exemption_only() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::Pi);
+    let counts = index.upload_context_owed_counts(SnapshotSource::Pi);
+    assert_eq!((counts.owed_files, counts.ledger_accepted_files), (1, 0));
+    index.file_snapshot_fingerprints.remove(&key);
+    index.confirmed_empty_files.insert(key.clone());
+    fs::remove_file(&key).unwrap();
+    let counts = index.upload_context_owed_counts(SnapshotSource::Pi);
+    assert_eq!((counts.owed_files, counts.empty_files), (0, 1));
+}
+
+/// [behaviour] The hourly owed line names the settled buckets, and the file
+/// buckets reconcile with the per-file gate: every unproven file is owed or
+/// settled exactly once. No active context owes nothing.
+#[test]
+fn owed_line_reports_exempt_buckets() {
+    assert_eq!(
+        ScanIndex::default().upload_context_owed_counts(SnapshotSource::ClaudeCode),
+        upload_context_receipt::OwedCounts::default()
+    );
+    let (scratch, mut index, accepted) = owed_count_index(SnapshotSource::ClaudeCode);
+    let entry = index.files[&accepted].clone();
+    let mut add = |name: &str, members: &[&str]| {
+        let key = local_index_key(&scratch.join(format!("projects/synthetic/{name}")));
+        index.files.insert(key.clone(), entry.clone());
+        index.file_snapshot_fingerprints.insert(
+            key.clone(),
+            members.iter().map(|member| member.to_string()).collect(),
+        );
+        key
+    };
+    // Listed with an empty member set; never on disk.
+    add("listed-root/subagents/agent-a.jsonl", &[]);
+    add("owed.jsonl", &["unaccepted"]);
+    let deleted_empty = add("deleted-empty.jsonl", &[]);
+    index.file_snapshot_fingerprints.remove(&deleted_empty);
+    index.confirmed_empty_files.insert(deleted_empty);
+    list_root(&mut index, "listed-root");
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    let line = serde_json::to_value(&counts).unwrap();
+    for (field, value) in [
+        ("owed_files", 1),
+        ("listed_files", 1),
+        ("empty_files", 1),
+        ("ledger_accepted_files", 1),
+        ("no_proof_entities", 1),
+    ] {
+        assert_eq!(line[field], json!(value), "{field}");
+    }
+    assert!(line.get("empty_pending_files").is_none());
+    assert_eq!(
+        crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&index)
+            as u64,
+        counts.owed_files + counts.listed_files + counts.empty_files + counts.ledger_accepted_files,
+        "old file count = owed + listed + empty + ledger_accepted"
+    );
 }

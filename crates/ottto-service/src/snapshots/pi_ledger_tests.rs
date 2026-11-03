@@ -126,7 +126,10 @@ fn fork_copies_before_the_header_skip_usage_but_at_and_after_count() {
 /// [format] A fork's box is charged by the heap bound, and the ledger stays one
 /// word over its map.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "native heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "native heap layout"
+)]
 fn fork_heap_bound_charges_inline_box_allocation() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

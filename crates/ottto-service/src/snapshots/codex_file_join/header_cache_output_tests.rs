@@ -1,6 +1,6 @@
 // Header-cache identity and production output regression fixtures.
 use super::*;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::transcript_acquisition::Scope;
 use std::os::unix::fs::MetadataExt;
 
@@ -75,7 +75,7 @@ fn same_size_new_owner_rereads_and_changes_group_key() {
 
 /// Drive the real wake, finalize/policy boundary and production wire serializer.
 /// Only owning headers are primed: neither arm has retained transcript state.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn header_cache_production_wake_output_equivalence_join_parent_counting() {
     let (root, group_keys) = tests::counting_v2_fixture();

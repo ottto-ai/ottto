@@ -238,8 +238,8 @@ invoking the provider.
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
 definitions to derive tenant-scoped HMAC identifiers. Bounded native skill labels
-are kept in owner-only local records independently of upload settings; retirement,
-source removal, forget and uninstall still erase those records. The Companion
+are kept in owner-only local records independently of upload settings; retirement
+and uninstall erase those records. The Companion
 session list also keeps local titles and workspace labels when uploads omit them. When the
 existing **session titles and minimal descriptions** setting is enabled and the
 backend advertises support, a template or skill fact may additionally include
@@ -361,18 +361,21 @@ bytes once after a setting changes, and the server rejects those bytes.
 
 ## Local Erasure
 
-**Removing a source** erases, for that source only: its scan indexes and durable
-state in `snapshots`, and its active-session, detected-use, MCP inventory and
-context composition state.
+**Turning a source off**, a device grant that no longer names it, **logging out**
+and **switching accounts** stop collection and keep local data: scan indexes and
+durable state in `snapshots`, caches, context composition state, backfill state and
+upload receipts all stay. Turning a source back on resumes from that kept state; it
+drops only that source's upload records (composition upload acknowledgments, the MCP
+inventory upload time and its context-footprint upload hashes), so data the server
+removed when the source was turned off is sent again at each collector's normal
+cadence.
 
-**Forget installation** erases, for every source: the whole `snapshots` folder,
-backfill state and upload receipts, the same active-session, detected-use and MCP
-inventory caches, and all context composition state. It also clears the installation
-identity and credentials.
+**Forget installation** clears the installation identity and credentials only; all
+collected local data stays.
 
-Neither erases your agents' own transcripts or source data, opt-out markers, or
-label-free bookkeeping: counts-only composition run records, footprint upload hashes
-and the remembered privacy settings.
+**Uninstall** (`ottto uninstall --confirm`) deletes the local state, after an
+optional `--backup-state` export of receipts and first-sweep progress. None of these
+actions touch your agents' own transcripts or source data.
 
 ## Live Telemetry
 
