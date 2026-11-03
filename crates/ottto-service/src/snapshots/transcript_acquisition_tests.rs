@@ -1510,55 +1510,83 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
     }
 }
 
-/// [regress] A source with a Tail codec on an index with no state database
-/// route keeps its reduction in RAM, as its retention keys on the route, and
-/// its next read takes that copy back. The take keyed on the codec instead,
-/// so the copy was never taken and each read was Full (CX1 S2b run
-/// 41569018173: 27 Codex rows). Admission keyed on the source, so an
-/// unrouted Claude copy was retained but never admitted (c12 CI 41577566254:
-/// admitted 0). Claude's unrouted read has its own Desktop census gate after
-/// the take, so the row asserts the admission and the take, and prints modes.
+/// One sampled Claude page of `fixture` through `cache`: (index, modes).
+fn codec_page(
+    fixture: &ScanFixture,
+    cache: &Arc<sampled_scan::SharedCache>,
+    mut index: ScanIndex,
+) -> (ScanIndex, (usize, usize, usize)) {
+    let source = SnapshotSource::ClaudeCode;
+    cache.bind_withheld(&mut index);
+    let scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(cache.clone(), Scope("account-a".into()));
+    let (index, _, _, modes, _) = finish_production_scan_page(scan, source);
+    (index, modes)
+}
+
+/// [regress] A source with a Tail codec keeps no reduction in RAM, on a
+/// state database route or off one: retention and the take key on the codec
+/// alone. A split rule kept a copy it never took and read Full every time
+/// (CX1 S2b run 41569018173: 27 Codex rows); RAM off a route was a second
+/// continuation beside the database (conformance B2).
 #[test]
-fn an_unrouted_codec_source_takes_its_ram_copy() {
+fn an_unrouted_codec_source_keeps_no_ram_copy() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
     let source = SnapshotSource::ClaudeCode;
     let fixture = ScanFixture::new(source);
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let page = |mut index: ScanIndex| {
-        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
-        cache.bind_withheld(&mut index);
-        let scan = OwnedSourceScan::new(
-            source,
-            std::slice::from_ref(&fixture.root),
-            index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            None,
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(cache.clone(), Scope("account-a".into()));
-        let (index, _, _, modes, _) = finish_production_scan_page(scan, source);
-        (index, modes)
-    };
     fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let ((index, modes), first) = observe(|| page(ScanIndex::default()));
+    let ((index, modes), first) = observe(|| codec_page(&fixture, &cache, ScanIndex::default()));
+    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
     assert_eq!(modes, (1, 0, 0), "first read");
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let ((_, modes), next) = observe(|| page(index));
-    eprintln!(
-        "UNROUTED_CODEC_TAKE retained={} admitted={} modes={modes:?} take_hit={}",
-        first.retention_produced, first.insert_admitted, next.take_hit
-    );
-    assert_eq!(first.insert_admitted, 1, "the first read admits its copy");
+    let ((_, modes), next) = observe(|| codec_page(&fixture, &cache, index));
     assert_eq!(
-        next.take_hit, 1,
-        "the next read takes the copy it kept (first read retained {}, admitted {}; modes {modes:?})",
-        first.retention_produced, first.insert_admitted
+        first.insert_admitted, 0,
+        "no copy is admitted (modes {modes:?})"
+    );
+    assert_eq!(next.take_hit, 0, "no copy is taken (modes {modes:?})");
+}
+
+/// [regress] A codec source's route that cannot be read now (a poisoned
+/// session: `DbUnavailable`) holds the file for its next selection, counted
+/// `tail_db_loads{held}`: no read, no RAM copy taken or kept (conformance B2).
+#[test]
+fn a_codec_route_error_holds_the_file_without_ram() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    use crate::snapshots::e2_pipeline_scan_fixture::{route_for_test, tail_counter_for_test};
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = ScanFixture::new(source);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
+    let (index, modes) = codec_page(&fixture, &cache, routed);
+    assert_eq!(modes, (1, 0, 0), "first read");
+    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
+    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+    crate::snapshots::state_v2::poison_route_for_test(&index);
+    let held = tail_counter_for_test("tail_db_loads", "held");
+    let ((_, modes), lifecycle) = observe(|| codec_page(&fixture, &cache, index));
+    assert_eq!(
+        tail_counter_for_test("tail_db_loads", "held") - held,
+        1,
+        "the route error is counted once (modes {modes:?})"
+    );
+    assert_eq!(modes, (0, 0, 0), "the held file is not read");
+    assert_eq!(
+        (lifecycle.take_hit, lifecycle.insert_admitted),
+        (0, 0),
+        "RAM is no fallback"
     );
 }
 #[test]

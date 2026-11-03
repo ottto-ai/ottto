@@ -615,7 +615,6 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
                 cursor: Default::default(),
                 side: Default::default(),
                 quiet: Default::default(),
-                tail_held_new: Default::default(),
                 test_route: Default::default(),
             })
         } else {

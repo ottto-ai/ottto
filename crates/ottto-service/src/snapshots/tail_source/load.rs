@@ -93,6 +93,13 @@ pub(in crate::snapshots) fn reuses_stored(
     }
 }
 
+/// A NEW key `e2` withheld, by its durable custody: the withheld read left
+/// its census record and no index entry. Its committed head (if any) is then
+/// custody, never acceptance; the load still validates it against the file.
+pub(in crate::snapshots) fn held_new(index: &ScanIndex, key: &str) -> bool {
+    !index.files.contains_key(key) && index.claude_request_census.get(key).is_some()
+}
+
 /// A body of this file waits in the upload ledger for a retry: the server
 /// refused it (a head-CAS conflict, a held decrease) and the ledger keeps it.
 fn retry_held(index: &ScanIndex, key: &str) -> bool {
@@ -133,7 +140,7 @@ pub(in crate::snapshots) fn retire_absent(
     observed: &BTreeSet<String>,
     residue: &BTreeSet<String>,
 ) {
-    let (Some(route), Some(revision)) = (
+    let (Ok(Some(route)), Some(revision)) = (
         super::tail_route(source, index),
         super::reduction_revision(source),
     ) else {

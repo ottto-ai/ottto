@@ -219,7 +219,7 @@ fn codec_list_gives_routes_and_counters_stay_per_source() {
         let codec = CODECS.contains(&source);
         assert_eq!(has_codec(source), codec, "{}", source.api_slug());
         assert_eq!(
-            tail_route(source, &route.index).is_some(),
+            tail_route(source, &route.index).unwrap().is_some(),
             codec,
             "{}",
             source.api_slug()
@@ -234,16 +234,15 @@ fn codec_list_gives_routes_and_counters_stay_per_source() {
     assert_eq!(claude.len(), 1);
 }
 
-/// [regress] Retention and the RAM take share one rule, keyed on the Tail
-/// route: a source off a route keeps and takes its RAM copy, one on a route
-/// neither. The take keyed on the codec, so a codec source off a route kept a
-/// copy it never took and read Full every time (CX1 S2b run 41569018173).
+/// [regress] Retention and the RAM take share one rule, keyed on the codec:
+/// a source without one keeps and takes its RAM copy, a codec source neither,
+/// on a route or off one (a split rule kept a copy it never took and read
+/// Full every time, CX1 S2b run 41569018173).
 #[test]
-fn the_ram_copy_is_kept_and_taken_only_off_a_tail_route() {
-    let route = route();
-    assert!(!keeps_ram(SnapshotSource::ClaudeCode, &route.index));
-    assert!(keeps_ram(SnapshotSource::ClaudeCode, &ScanIndex::default()));
-    assert!(keeps_ram(SnapshotSource::Codex, &route.index));
+fn the_ram_copy_is_kept_and_taken_only_without_a_codec() {
+    assert!(!keeps_ram(SnapshotSource::ClaudeCode));
+    assert!(keeps_ram(SnapshotSource::Codex));
+    assert!(keeps_ram(SnapshotSource::Pi));
 }
 
 /// [format] The one hourly page codec carries usage buckets (`UsageHours`,

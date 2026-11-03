@@ -3314,6 +3314,13 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
             "held NEW keys must never gain money authority after real save/load"
         );
         let restarted = E2ScanFixture::default();
+        if let Some(route) = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior) {
+            // A restart keeps the state database: only RAM is lost.
+            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
+                &restarted.cache,
+                &route,
+            );
+        }
         if loss == 1 {
             scanner.evict(&prior);
         } else if loss == 2 {
@@ -3327,17 +3334,13 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         });
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
-            // On the database route the held-new certificate stays in RAM
-            // beside the committed head; a lost certificate reads Full.
+            // On the database route the held-new custody is durable (the
+            // withheld read's census record and committed head): a RAM
+            // clear, eviction or restart still continues it.
             assert_eq!(
                 retry.modes,
-                if loss != 0 {
-                    (1, 0, 0)
-                } else if grow {
-                    (0, 1, 0)
-                } else {
-                    (0, 0, 1)
-                }
+                if grow { (0, 1, 0) } else { (0, 0, 1) },
+                "retry, loss={loss}"
             );
         }
         let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
@@ -3345,7 +3348,7 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         let before = std::fs::metadata(&path).unwrap();
         let restored = ready(&c, scanner, prior.clone(), 100, sampled);
         if sampled {
-            assert_eq!(restored.modes, (0, 0, 1));
+            assert_eq!(restored.modes, (0, 0, 1), "restored, loss={loss}");
         }
         literal(&restored);
         // Cold Full is only the fixture's reference oracle. Production keeps

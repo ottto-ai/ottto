@@ -45,20 +45,24 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> Option
 }
 
 /// The state database route `source`'s Tail lives on, when it has a codec.
+/// `Err`: the route exists but cannot be read now (a database hold); the
+/// caller holds the file, and RAM is never its fallback.
 pub(in crate::snapshots) fn tail_route(
     source: SnapshotSource,
     index: &ScanIndex,
-) -> Option<PathBuf> {
-    has_codec(source)
-        .then(|| state_v2::runtime_path(index).ok().flatten())
-        .flatten()
+) -> anyhow::Result<Option<PathBuf>> {
+    if !has_codec(source) {
+        return Ok(None);
+    }
+    state_v2::runtime_path(index)
 }
 
 /// Whether `source`'s reduction is kept in RAM between reads: exactly when it
-/// has no Tail route. Retention and the take both key on this one rule, so a
-/// copy is kept only where the next read takes it back.
-pub(in crate::snapshots) fn keeps_ram(source: SnapshotSource, index: &ScanIndex) -> bool {
-    tail_route(source, index).is_none()
+/// has no Tail codec. Retention and the take both key on this one rule, so a
+/// copy is kept only where the next read takes it back. A codec source keeps
+/// none, whatever its route's state.
+pub(in crate::snapshots) fn keeps_ram(source: SnapshotSource) -> bool {
+    !has_codec(source)
 }
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
@@ -404,6 +408,64 @@ fn encode(put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>) -> Result<Vec<u8>, R
     put(&mut writer)?;
     writer.finish_written()?;
     Ok(out)
+}
+
+/// The head envelope every codec writes: the identity, the checkpoint
+/// certificate, the read report and the three reduction scalars, then the
+/// codec's `lead`, the shared head-field walk and the codec's `trailer`.
+/// Opening-call file paths are content: the opening-settings fact stores them
+/// by call id, so no head holds them.
+fn encode_envelope(
+    view: &PreFinalization<'_>,
+    certificate: &DurableCertificate,
+    id: &HeadIdentity,
+    lead: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
+    trailer: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
+) -> Result<Vec<u8>, Refuse> {
+    let scalars = (
+        view.recognized_usage_drop_count,
+        view.positive_recognized_usage_count,
+        view.positive_usage_evidence,
+    );
+    encode(|e| {
+        e.with_moved_field("OpeningCall.files", |e| {
+            id.put(e)?;
+            certificate.put(e)?;
+            view.report.put(e)?;
+            scalars.put(e)?;
+            lead(e)?;
+            put_fields(view.accumulator, e)?;
+            trailer(e)
+        })
+    })
+}
+
+/// `S`'s envelope back, at its own revision only: the accumulator, the
+/// codec's `lead` and `trailer`, and the parts outside the accumulator.
+fn decode_envelope<S: TailSource, L, T>(
+    revision: u32,
+    head: &[u8],
+    lead: impl FnOnce(&mut Dec<'_>) -> Result<L, Corrupt>,
+    trailer: impl FnOnce(&mut Dec<'_>) -> Result<T, Corrupt>,
+) -> Result<(SnapshotAccumulator, L, T, DecodedHead), ReconstructCause> {
+    if revision != S::REDUCTION_REVISION {
+        return Err(ReconstructCause::Incompatible);
+    }
+    let mut d = Dec::new(head);
+    HeadIdentity::take(&mut d)?;
+    let certificate = DurableCertificate::take(&mut d)?;
+    let report = JsonlReadReport::take(&mut d)?;
+    let scalars = <(usize, usize, bool)>::take(&mut d)?;
+    let lead = lead(&mut d)?;
+    let acc = take_fields(&mut d)?;
+    let trailer = trailer(&mut d)?;
+    d.finish()?;
+    let head = DecodedHead {
+        certificate,
+        report,
+        scalars,
+    };
+    Ok((acc, lead, trailer, head))
 }
 
 /// `Slot` and `Log` pages: element `i` on page `i / g`, each page a count and

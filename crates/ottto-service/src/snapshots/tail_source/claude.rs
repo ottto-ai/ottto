@@ -10,11 +10,11 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    encode, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes, put_fields,
-    read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
-    DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
+    read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
+    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
-use crate::durable_tail_codec::{Dec, Durable, HDigest, Refuse};
+use crate::durable_tail_codec::{Durable, HDigest, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -167,24 +167,8 @@ impl TailSource for Claude {
         certificate: &DurableCertificate,
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse> {
-        let acc = view.accumulator;
-        let scalars = (
-            view.recognized_usage_drop_count,
-            view.positive_recognized_usage_count,
-            view.positive_usage_evidence,
-        );
-        encode(|e| {
-            // Opening-call file paths are content: the opening-settings fact
-            // stores them by call id.
-            e.with_moved_field("OpeningCall.files", |e| {
-                id.put(e)?;
-                certificate.put(e)?;
-                view.report.put(e)?;
-                scalars.put(e)?;
-                acc.claude_responses.selectors.put(e)?;
-                put_fields(acc, e)
-            })
-        })
+        let selectors = &view.accumulator.claude_responses.selectors;
+        encode_envelope(view, certificate, id, |e| selectors.put(e), |_| Ok(()))
     }
 
     fn encode_pages(
@@ -223,24 +207,11 @@ impl TailSource for Claude {
         head: &[u8],
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
-        if revision != Self::REDUCTION_REVISION {
-            return Err(ReconstructCause::Incompatible);
-        }
-        let mut d = Dec::new(head);
-        HeadIdentity::take(&mut d)?;
-        let certificate = DurableCertificate::take(&mut d)?;
-        let report = JsonlReadReport::take(&mut d)?;
-        let scalars = <(usize, usize, bool)>::take(&mut d)?;
-        let selectors = ClaudeSelectorTable::take(&mut d)?;
-        let mut acc = take_fields(&mut d)?;
-        d.finish()?;
+        let (mut acc, selectors, (), decoded) =
+            decode_envelope::<Self, _, _>(revision, head, ClaudeSelectorTable::take, |_| Ok(()))?;
         acc.claude_responses.selectors = selectors;
         *into = acc;
-        Ok(DecodedHead {
-            certificate,
-            report,
-            scalars,
-        })
+        Ok(decoded)
     }
 
     fn decode_page(

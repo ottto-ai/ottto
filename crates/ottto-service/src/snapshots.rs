@@ -30020,11 +30020,10 @@ impl OwnedSourceScan {
                         sampled_scan::test_hooks::fire(
                             sampled_scan::test_hooks::Point::BeforeRetain,
                         );
-                        // A reduction on a Tail route is never retained in
+                        // A codec source's reduction is never retained in
                         // RAM: its Tail is its continuation.
                         #[cfg(unix)]
-                        let cache_compatible =
-                            cache_compatible && tail_source::keeps_ram(source, index);
+                        let cache_compatible = cache_compatible && tail_source::keeps_ram(source);
                         match parser.retain_reduction(
                             &acquisition.scope,
                             sampled_scan::now_seconds(),
@@ -31504,15 +31503,15 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            // No reduction on a Tail route lives in RAM: its
+                            // No codec source's reduction lives in RAM: its
                             // completion has its committed head, or no
-                            // continuation. Off a route it is admitted, by the
-                            // rule retention and the take key on.
+                            // continuation. Another source's is admitted, by
+                            // the rule retention and the take key on.
                             #[cfg(unix)]
                             let quiet_proven = quiet_retired
                                 && context.cache.quiet_certified(&key, &completed.checkpoint);
                             #[cfg(unix)]
-                            let admitted = if !tail_source::keeps_ram(source, index) {
+                            let admitted = if !tail_source::keeps_ram(source) {
                                 drop(completed);
                                 tail_reused == Some(true)
                             } else {
@@ -33049,7 +33048,7 @@ impl OwnedSourceScan {
             // re-reads from its committed head.
             #[cfg(unix)]
             if decision == CandidateDecision::Skip
-                && tail_source::tail_route(source, index).is_some()
+                && matches!(tail_source::tail_route(source, index), Ok(Some(_)))
                 && tail_source::load::set_aside(index, &local_index_key(&candidate.path))
             {
                 decision = CandidateDecision::Parse;
@@ -33693,15 +33692,23 @@ impl OwnedSourceScan {
                 .filter(|_| !parser.reader.reader.is_compressed())
             {
                 let key = local_index_key(&candidate.path);
-                // On a Tail route the continuation is the committed Tail,
-                // never a RAM copy; off one, the RAM copy is taken back, by
-                // the rule its retention keys on.
+                // A codec source's continuation is its committed Tail, never
+                // a RAM copy; a source without a codec takes its RAM copy
+                // back, by the rule its retention keys on. A route that
+                // cannot be read now holds the file for its next selection.
                 #[cfg(unix)]
-                let tail_route = tail_source::tail_route(source, index);
+                let tail_route = match tail_source::tail_route(source, index) {
+                    Ok(route) => route,
+                    Err(_) => {
+                        tail_source::counters::bump(source, "tail_db_loads", "held");
+                        residue_index_keys.insert(key.clone());
+                        pending!();
+                    }
+                };
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
-                let taken = tail_source::keeps_ram(source, index)
+                let taken = tail_source::keeps_ram(source)
                     .then(|| context.cache.take(&key).map(Box::new))
                     .flatten();
                 #[cfg(not(unix))]
@@ -33714,15 +33721,15 @@ impl OwnedSourceScan {
                         taken.retained.state.usage_witness(),
                     )
                 });
-                // On a Tail route RAM keeps the held-new certificate alone;
-                // its continuation is the committed head.
+                // On a Tail route the held-new custody is durable: the
+                // withheld read's census record, and its committed head.
                 #[cfg(unix)]
-                let tail_held_new = tail_route.is_some() && context.cache.tail_held_new(&key);
-                #[cfg(not(unix))]
-                let tail_held_new = false;
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
-                    && (tail_held_new
-                        || taken.as_ref().is_some_and(|taken| taken.e2_held_new_file));
+                    && tail_route.is_some()
+                    && tail_source::load::held_new(index, &key);
+                #[cfg(not(unix))]
+                let e2_held_new_file = source == SnapshotSource::ClaudeCode
+                    && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
                 let mut retained = taken;
                 let retained_present = retained.is_some();
                 let reinsertion =

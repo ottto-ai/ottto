@@ -148,9 +148,6 @@ impl CapPace {
     }
 }
 
-/// The bound on Tail-route held-new certificates: the retained copies' own.
-#[cfg(unix)]
-const TAIL_HELD_NEW_KEYS: usize = CACHE_ENTRIES;
 pub(crate) struct SharedCache {
     pub(crate) withheld_memo: withheld_account::Memo,
     inner: Mutex<RetainedCache>,
@@ -167,12 +164,6 @@ pub(crate) struct SharedCache {
     /// another. Outside the state budget: pass-scoped, never walked.
     #[cfg(unix)]
     pub(in crate::snapshots) quiet: Mutex<sampled_audit::quiet_retirement::QuietRetirements>,
-    /// Claude keys `e2` withheld as new files, on a Tail route: the held-new
-    /// certificate RAM keeps there in place of a reduction, whose
-    /// continuation is the committed head. At most `TAIL_HELD_NEW_KEYS`; a
-    /// leaf lock; cleared with the retained copies, as theirs is.
-    #[cfg(unix)]
-    tail_held_new: Mutex<BTreeSet<String>>,
     /// The state database this owner's fixture scans continue from: Claude's
     /// continuation lives there, not in RAM.
     #[cfg(test)]
@@ -188,8 +179,6 @@ impl Default for SharedCache {
             side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
             quiet: Mutex::default(),
-            #[cfg(unix)]
-            tail_held_new: Mutex::default(),
             #[cfg(test)]
             test_route: Default::default(),
         }
@@ -303,10 +292,6 @@ impl SharedCache {
         } else {
             record(Event::ClearPoisonedLock);
         }
-        #[cfg(unix)]
-        if let Ok(mut held) = self.tail_held_new.lock() {
-            held.clear();
-        }
         self.with_cursor(|cursor| cursor.headers.clear());
     }
     /// Evict retained copies in victim order until they fit the state
@@ -410,59 +395,6 @@ impl SharedCache {
                 visited.then_some(held)
             });
         }
-        #[cfg(unix)]
-        if super::tail_source::tail_route(SnapshotSource::ClaudeCode, scanned).is_some() {
-            self.record_tail_held_new(committed, scanned, items, withheld);
-        }
-    }
-    /// The same certificate on a Tail route, where no reduction stays in RAM
-    /// to carry it. Custody only: the key gains no index entry, acceptance or
-    /// receipt, and its next read still validates the committed head against
-    /// the file. A visited key no longer held, or one the committed index
-    /// now has, loses it. Past the bound a held key reads Full, as without it.
-    #[cfg(unix)]
-    fn record_tail_held_new(
-        &self,
-        committed: &ScanIndex,
-        scanned: &ScanIndex,
-        items: &[SnapshotItem],
-        withheld: &BTreeSet<String>,
-    ) {
-        let Ok(mut keys) = self.tail_held_new.lock() else {
-            return;
-        };
-        keys.retain(|key| !committed.files.contains_key(key));
-        if withheld.is_empty() && keys.is_empty() {
-            return;
-        }
-        let mut visited = BTreeMap::<&str, bool>::new();
-        for item in items {
-            if let Some(fingerprint) = item.source_file_fingerprint.as_deref() {
-                *visited.entry(fingerprint).or_default() |=
-                    withheld.contains(&item.source_session_id);
-            }
-        }
-        for (key, entry) in &scanned.files {
-            if committed.files.contains_key(key) {
-                continue;
-            }
-            match visited.get(entry.source_file_fingerprint.as_str()) {
-                Some(true) if keys.len() < TAIL_HELD_NEW_KEYS => {
-                    keys.insert(key.clone());
-                }
-                Some(false) => {
-                    keys.remove(key);
-                }
-                _ => {}
-            }
-        }
-    }
-    /// Whether `key` holds the held-new certificate on a Tail route.
-    #[cfg(unix)]
-    pub(super) fn tail_held_new(&self, key: &str) -> bool {
-        self.tail_held_new
-            .lock()
-            .is_ok_and(|keys| keys.contains(key))
     }
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.retained().ok()?.sealed_offset(key)

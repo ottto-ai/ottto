@@ -216,9 +216,20 @@ fn append_after_restart_and_eviction_preserves_placement() {
 /// placement equal the cold Full's.
 #[test]
 fn held_new_file_continues_from_its_committed_head() {
+    held_new_file_continues(false);
+}
+
+/// [regress] The same after a restart: RAM holds nothing of the held file,
+/// and its durable custody (census record and committed head) continues it.
+#[test]
+fn held_new_file_continues_after_a_restart() {
+    held_new_file_continues(true);
+}
+
+fn held_new_file_continues(restart: bool) {
     use crate::snapshots::claude_request_census::with_walk_deadline_for_test as deadline;
     with_e2(|| {
-        let mut c = corpus("s2-held-new-continues");
+        let mut c = corpus(&format!("s2-held-new-continues-{restart}"));
         c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.evidence_for(
             COPY,
@@ -248,9 +259,20 @@ fn held_new_file_continues_from_its_committed_head() {
             !prior.files.contains_key(&key),
             "a held NEW file has no entry"
         );
+        let restarted = E2ScanFixture::capturing_identity();
+        let scanner = if restart {
+            let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
+                &restarted.cache,
+                &route,
+            );
+            &restarted
+        } else {
+            &scanner
+        };
 
         let (mut unchanged, consumed) =
-            fixture::observe_consumed(|| c.raw(&scanner, prior.clone(), 100, true, &[]));
+            fixture::observe_consumed(|| c.raw(scanner, prior.clone(), 100, true, &[]));
         assert_eq!(unchanged.modes, (0, 0, 1), "the committed head continues");
         assert_eq!(
             consumed, 0,
@@ -264,7 +286,7 @@ fn held_new_file_continues_from_its_committed_head() {
 
         // Pre-birth, so growth alone cannot release the all-copied hold.
         append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
-        let mut grown = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        let mut grown = c.raw(scanner, prior.clone(), 100, true, &[]);
         assert_eq!(grown.modes, (0, 1, 0), "growth reads past the head only");
         grown.enrich(&c);
         let warm = result(&grown, Mode::Restart);

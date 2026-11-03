@@ -106,6 +106,17 @@ impl crate::heap_layout_bound::HeapLayoutBound for Runtime {
     }
 }
 
+/// `index`'s route made unreadable, as a poisoned session lock is: its
+/// `runtime_path` reports `DbUnavailable` from now on.
+#[cfg(test)]
+pub(crate) fn poison_route_for_test(index: &ScanIndex) {
+    let runtime = index.v2().persistence_v2.as_ref().expect("a routed index");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _session = runtime.session.lock().unwrap();
+        panic!("poisons the route's session lock");
+    }));
+}
+
 /// Stable seam shared with selection and census retention. Derived/subset
 /// indices carry the committed route; switch changes do not erase custody.
 pub(crate) fn state_v2_growth_retention_active(index: &ScanIndex) -> bool {
