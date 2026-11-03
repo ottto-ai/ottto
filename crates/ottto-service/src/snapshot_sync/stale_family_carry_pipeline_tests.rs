@@ -1672,7 +1672,9 @@ fn source_t2_ordinary_reference() -> RearmFixture {
             for entry in index.files.values_mut() {
                 entry.source_file_fingerprint.clear();
             }
-            index.claude_usage_family_pending.clear();
+            let mut saved = serde_json::to_value(&index).unwrap();
+            saved["claude_usage_family_pending"] = serde_json::json!({});
+            index = serde_json::from_value(saved).unwrap();
             index.save(&reference.index_path).unwrap();
             reference.list_held(&[REARM_ROOT, REARM_SIBLING]);
             latch_contract_generation(&reference, 10);
