@@ -231,11 +231,15 @@ enum CopyProof {
     /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
     /// With the index key of the original its `fork-context-ref` line names.
     Holders(Option<String>),
+    /// A subagent's family root (its index key): a forked subagent repeats
+    /// the parent's last response as its first line, so a request id the
+    /// root also holds counts once, at the root.
+    Family(String),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Twin(key) | Self::Holders(Some(key)) => key.heap_bound(c),
+            Self::Twin(key) | Self::Holders(Some(key)) | Self::Family(key) => key.heap_bound(c),
             Self::Holders(None) => c.add(0),
         }
     }
@@ -1371,6 +1375,11 @@ impl FileFold {
     ) {
         let started = Instant::now();
         self.decide_native(context, markers, fork_parent);
+        if self.proof.is_none() {
+            self.proof = context
+                .and_then(|context| family_root_key(context.path))
+                .map(CopyProof::Family);
+        }
         // The fold lives until the page finishes: keep no parse-time slack.
 
         self.skipped.shrink_to_fit();
@@ -1560,6 +1569,35 @@ impl FileFold {
             occurrence.timestamp.as_deref(),
             self.bucket_fallback.as_deref(),
         )
+    }
+
+    /// The family root counts this request: move it from its estimated grain
+    /// to the removal and skip it, so attach finds the root alone. False
+    /// (still counted) when the grain cannot give it back.
+    fn drop_family_duplicate(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) -> bool {
+        let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+        let requests = occurrence.usage.request_count;
+        let account = self
+            .accounts
+            .as_ref()
+            .and_then(|accounts| accounts.account(occurrence.sequence));
+        let Some(key) = self.occurrence_key(occurrence) else {
+            return false;
+        };
+        if !self
+            .entity
+            .take_estimated(&(key, None, account), &tokens, requests)
+        {
+            return false;
+        }
+        self.entity.removed.add(&tokens);
+        self.entity.removed_requests += requests;
+        let at = self
+            .skipped
+            .partition_point(|(_, end)| *end <= occurrence.sequence);
+        self.skipped
+            .insert(at, (occurrence.sequence, occurrence.sequence + 1));
+        true
     }
 
     /// One held copy whose proof failed counts after all: from the removal
@@ -1946,6 +1984,7 @@ pub(crate) fn decide_page_copies(
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
             Some(CopyProof::Holders(_)) => holders.push(at),
+            Some(CopyProof::Family(root)) => decide_family(items, at, &root, index),
             None => {}
         }
     }
@@ -2174,6 +2213,75 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
         Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
         None => hold_copies(&mut items[at], "held_twin_unproven"),
     }
+}
+
+/// A subagent's family root file: `<project>/<root>.jsonl` beside the
+/// `<root>/subagents/` directory (the nearest one, as the member rule).
+fn family_root_key(path: &Path) -> Option<String> {
+    let member = claude_index_path_member_ref(path)?;
+    member.subagent_stem?;
+    let family = path
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "subagents"))?
+        .parent()?;
+    Some(local_index_key(
+        &family.with_file_name(format!("{}.jsonl", member.root)),
+    ))
+}
+
+/// Inside one family a request id counts once, at the root: a forked
+/// subagent's first line repeats the parent's last response. The root's
+/// parse on this page decides, else its current census record; a root not
+/// read yet holds the subagent (as `decide_twin`). An id only the subagent
+/// holds, or a root without scan state, stays counted.
+fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &ScanIndex) {
+    let root = claude_snapshot_family_root_ref(&items[at]).to_owned();
+    let on_page = items
+        .iter()
+        .filter(|item| item.source_session_id == root)
+        .map(|item| &item.claude_usage_request_ids)
+        .collect::<Vec<_>>();
+    let record = index.claude_request_census.get(root_key);
+    if on_page.is_empty() {
+        let evidence = record.map(|record| scan_evidence(index, root_key, record));
+        if matches!(evidence, Some(Evidence::Queued | Evidence::Stale))
+            || (evidence.is_none() && queued(index, root_key))
+        {
+            hold_copies(&mut items[at], "held_family_root_unread");
+        }
+        if evidence != Some(Evidence::Current) {
+            return;
+        }
+    }
+    let item = &items[at];
+    let Some(fold) = item.claude_money.as_deref() else {
+        return;
+    };
+    let duplicates = item
+        .claude_usage_occurrences
+        .iter()
+        .filter(|(id, occurrence)| {
+            !fold.is_skipped(occurrence.sequence)
+                && match record.filter(|_| on_page.is_empty()) {
+                    Some(record) => record.holds_hash(claude_request_hash(id)),
+                    None => on_page.iter().any(|ids| ids.contains(*id)),
+                }
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let SnapshotItem {
+        claude_money: Some(fold),
+        claude_usage_occurrences,
+        ..
+    } = &mut items[at]
+    else {
+        return;
+    };
+    let dropped = duplicates
+        .iter()
+        .filter(|id| fold.drop_family_duplicate(&claude_usage_occurrences[*id]))
+        .count();
+    diag("family_duplicate_removed", dropped as u64);
 }
 
 /// What a census record proves about its file now.
@@ -4436,6 +4544,10 @@ mod tests;
 #[cfg(test)]
 #[path = "e2_holder_redrift_tests.rs"]
 mod holder_redrift_tests;
+
+#[cfg(test)]
+#[path = "e2_family_duplicate_tests.rs"]
+mod family_duplicate_tests;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.
