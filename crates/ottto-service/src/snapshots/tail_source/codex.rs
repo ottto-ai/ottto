@@ -18,9 +18,7 @@ use super::{
     put_fields, read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
     DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
-use crate::durable_tail_codec::{
-    durable_enum, durable_struct, Dec, Durable, DurableEmpty, HDigest, Refuse,
-};
+use crate::durable_tail_codec::{durable_enum, durable_struct, Dec, Durable, HDigest, Refuse};
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
 use crate::snapshots::sampled_scan::codex_cursor::{priority_decisions, PriorityDecisions};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
@@ -265,10 +263,7 @@ impl TailSource for Codex {
             ),
             ("claude_money", acc.claude_money.is_some()),
             ("cache_observations", acc.cache_observations.is_some()),
-            (
-                "seen_pi_usage_keys",
-                !acc.seen_pi_usage_keys.durable_empty(),
-            ),
+            ("seen_pi_usage_keys", !acc.seen_pi_usage_keys.is_empty()),
             (
                 "claude_compaction_observations",
                 !acc.claude_compaction_observations.is_empty(),
@@ -431,7 +426,7 @@ impl TailSource for Codex {
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
         if revision != Self::REDUCTION_REVISION {
-            return Err(ReconstructCause::Revision);
+            return Err(ReconstructCause::Incompatible);
         }
         let mut d = Dec::new(head);
         HeadIdentity::take(&mut d)?;
