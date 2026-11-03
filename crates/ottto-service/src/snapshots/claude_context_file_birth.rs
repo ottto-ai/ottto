@@ -1363,9 +1363,10 @@ impl ClaudeFileBirth {
 
     /// The writer's stored bytes as a build with `slots` writers wrote them.
     pub(crate) fn writer_bytes_for_test(&self, slots: usize) -> Vec<u8> {
-        let mut e = crate::durable_tail_codec::Enc::bytes(1 << 10);
-        crate::durable_tail_codec::Durable::put(&self.writer.latest, &mut e).unwrap();
-        let mut out = e.into_bytes();
+        let mut out = crate::durable_tail_codec::Enc::count_write(1 << 10, |e| {
+            crate::durable_tail_codec::Durable::put(&self.writer.latest, e)
+        })
+        .unwrap();
         out.extend(crate::durable_tail_codec::grown_bytes_for_test(
             &self.writer.others,
             slots,
