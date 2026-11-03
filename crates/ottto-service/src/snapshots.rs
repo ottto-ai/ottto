@@ -83806,7 +83806,7 @@ crate::heap_layout_bound::unit_enum!(true;
     CandidateParseReason: TerminalDisposition | NewFile | AuthorityQuarantine | Audit
         | BodyWitnessAdoption | UploadContext | ActivityOrQuarantineRetry | TranscriptChanged
         | CodexCapture | UnknownOutcome | LegacyActivity | LegacyIdentity | Rearmed
-        | SourceChanged | ForcedFamily;
+        | SourceChanged | ForcedFamily | DeliveryDebt;
     ClaudeCompactionKind: LegacySummary | CurrentBoundary;
     SnapshotQuarantineDisposition: RetryPending | UnprovenTerminal | SupersededTerminal;
     ClaudeUsageAuthorityQuarantineDisposition: RetryPending | UnprovenTerminal;

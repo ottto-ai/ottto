@@ -83,7 +83,7 @@ fn deleted_source_stays_owed_after_retirement_and_restart() {
     let (_, diagnostic) = crate::local_resource_diagnostics::capture(|| {
         wake(SnapshotSource::ClaudeCode, &mut route.index);
     });
-    assert!(diagnostic.records.iter().any(|row| {
+    assert!(diagnostic.iter().any(|row| {
         row["counts"]["deleted_unaccepted_files"] == 1 && row["counts"]["alarm"] == true
     }));
 }
@@ -99,7 +99,7 @@ fn held_debt_does_not_rebuild() {
     route
         .index
         .file_snapshot_fingerprints
-        .insert(key.clone(), [fp.clone()].into());
+        .insert(key.to_string(), [fp.clone()].into());
     let mut hold = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
     hold.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
     route

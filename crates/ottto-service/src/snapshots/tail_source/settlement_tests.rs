@@ -40,7 +40,11 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
 }
 
 /// The bodies a stored read of a committed file finishes, and its native bytes.
-pub(super) fn stored_finish(route: &Route, path: &Path, key: &str) -> (Vec<SnapshotItem>, u64) {
+pub(in crate::snapshots::tail_source) fn stored_finish(
+    route: &Route,
+    path: &Path,
+    key: &str,
+) -> (Vec<SnapshotItem>, u64) {
     let (Load::Reused(taken, Some(base)), _) = loaded(route, path, key) else {
         panic!("the committed head is reused");
     };
@@ -52,7 +56,7 @@ pub(super) fn stored_finish(route: &Route, path: &Path, key: &str) -> (Vec<Snaps
 
 /// One finalization of `items` for an entry whose ACKed tuple is theirs, or
 /// another body when `identical` is false.
-pub(super) fn finalize(
+pub(in crate::snapshots::tail_source) fn finalize(
     route: &mut Route,
     key: &str,
     mut items: Vec<SnapshotItem>,

@@ -15,7 +15,11 @@ use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
 /// A first completion of `responses` committed as `name`.
-pub(super) fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, String) {
+pub(in crate::snapshots::tail_source) fn committed(
+    route: &mut Route,
+    name: &str,
+    responses: usize,
+) -> (PathBuf, String) {
     committed_lines(route, name, &lines(responses))
 }
 
