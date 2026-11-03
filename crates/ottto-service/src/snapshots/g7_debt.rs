@@ -478,7 +478,10 @@ pub(super) struct Page {
     route: Option<PathBuf>,
     root_walk: bool,
     walk: Walk,
-    heads: Option<BTreeSet<String>>,
+    /// Keys whose observation is staged and not yet committed, this page's
+    /// included: each is a delta from the committed rows, so none is staged
+    /// twice before the save.
+    pending: BTreeSet<String>,
     /// This page's observations, staged together at its end.
     staged: Vec<(String, Observation)>,
     errors: (usize, usize),
@@ -501,9 +504,13 @@ impl Page {
         root_walk: bool,
     ) -> Self {
         let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
-        let (route, unavailable) = match state_v2::tail_route_path(index) {
-            Ok(route) => (route, false),
-            Err(_) => (None, true),
+        let (route, pending, unavailable) = match state_v2::tail_route_path(index) {
+            Ok(Some(route)) => match state_v2::tail_observed_keys(&route) {
+                Ok(pending) => (Some(route), pending, false),
+                Err(_) => (None, BTreeSet::new(), true),
+            },
+            Ok(None) => (None, BTreeSet::new(), false),
+            Err(_) => (None, BTreeSet::new(), true),
         };
         // A walk begins with exactly the configured roots pending.
         let unmarked: Vec<&ScanTraversalPath> = traversal
@@ -520,8 +527,12 @@ impl Page {
         let mut walk = if !root_walk {
             Walk::default()
         } else if begins {
+            // A root that did not resolve, or failed to, is not listed: the
+            // walk proves nothing absent under it.
+            let counts = &traversal.counts;
             Walk {
                 started_at: Some(now_ms),
+                incomplete: listing_errors(counts) != (0, 0) || counts.disappeared_file_count > 0,
                 ..Walk::default()
             }
         } else {
@@ -533,7 +544,7 @@ impl Page {
             route,
             root_walk,
             walk,
-            heads: None,
+            pending,
             staged: Vec::new(),
             errors: listing_errors(&traversal.counts),
             now_ms,
@@ -681,14 +692,6 @@ impl Page {
         live
     }
 
-    fn has_head(&mut self, index: &ScanIndex, key: &str) -> Option<bool> {
-        if self.heads.is_none() {
-            self.heads = state_v2::tail_head_keys(index).ok();
-            self.walk.unavailable |= self.heads.is_none();
-        }
-        self.heads.as_ref().map(|heads| heads.contains(key))
-    }
-
     /// Reconcile one listed file and stage what changed. A head this build
     /// cannot read is counted unknown and never written (F2, F4).
     pub(super) fn listed(
@@ -701,25 +704,22 @@ impl Page {
             return;
         }
         let key = local_index_key(listing.path);
-        let Some(has_head) = self.has_head(index, &key) else {
-            return;
-        };
         let live = self.live(index, traversal, &key, &listing);
         if live.evidence.is_some() {
             self.walk.no_upload_required += 1;
         }
-        let head = if has_head {
-            self.walk.seen.insert(key.clone());
-            match state_v2::load_head(index, &key, u32::MAX) {
-                Ok(head) => head,
-                Err(_) => {
-                    self.walk.files.insert(key, FileDebt::UNKNOWN);
-                    return;
-                }
+        // One keyed read per listed file; an absent head is `None`.
+        let head = match state_v2::load_head(index, &key, u32::MAX) {
+            Ok(head) => head,
+            Err(_) => {
+                self.walk.seen.insert(key.clone());
+                self.walk.files.insert(key, FileDebt::UNKNOWN);
+                return;
             }
-        } else {
-            None
         };
+        if head.is_some() {
+            self.walk.seen.insert(key.clone());
+        }
         let committed = match &head {
             Some(head) => match revisions(index, &key, head) {
                 Some(committed) => committed,
@@ -741,7 +741,7 @@ impl Page {
             || head
                 .as_ref()
                 .is_some_and(|head| head.common.debt != summary);
-        if changed {
+        if changed && self.pending.insert(key.clone()) {
             // F1: the head's own representation and the full recomputed summary.
             let observation = Observation {
                 representation: head

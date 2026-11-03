@@ -128,12 +128,12 @@ fn age(path: &Path, seconds: u64) {
         .unwrap();
 }
 
-/// One complete single-page walk: its `freshness_alarm` counts.
-fn walk(source: SnapshotSource, root: &Path, index: &mut ScanIndex) -> serde_json::Value {
+/// One single-page walk of `roots`: its `freshness_alarm` counts.
+fn walk(source: SnapshotSource, roots: &[PathBuf], index: &mut ScanIndex) -> serde_json::Value {
     index.traversal = None;
     ensure_bounded_traversal(
         source,
-        &[root.to_path_buf()],
+        roots,
         index,
         "2026-10-30T00:00:00Z",
         BACKFILL_WINDOW_DAYS,
@@ -211,7 +211,7 @@ impl Fixture {
         path
     }
     fn walk(&mut self) -> serde_json::Value {
-        walk(self.source, &self.root, &mut self.index)
+        walk(self.source, &[self.root.clone()], &mut self.index)
     }
     /// The walk's observations commit with the next full save; reload them.
     fn save(&mut self) {
@@ -470,6 +470,56 @@ fn never_indexed_file_over_6h_turns_the_alarm_on() {
         f.save();
         assert!(committed(&f.index, &never).is_empty());
         assert_eq!(f.index.tail_discovery.deleted_unaccepted_files, 1);
+        f.close();
+    }
+}
+
+/// [regress] Each observation is a delta from the committed rows: a second walk
+/// before the save stages nothing again, so no revision is added twice.
+#[test]
+fn a_second_walk_before_the_save_adds_no_revision_twice() {
+    for store in STORES {
+        let mut f = Fixture::new(store, "g7-no-duplicate");
+        let never = f.file("never.jsonl", 70);
+        f.walk();
+        let row = f.walk();
+        assert_eq!(row["debt"]["outstanding_files"], 1, "{store:?}");
+        assert_eq!(row["debt"]["unread_bytes"], 70);
+        f.save();
+        assert_eq!(committed(&f.index, &never).len(), 1);
+        assert_eq!(f.walk()["debt"]["unread_bytes"], 70);
+        f.close();
+    }
+}
+
+/// [regress] A known root that no longer resolves is not listed: the walk
+/// proves nothing absent under it, so its debt is neither erased nor counted
+/// deleted, and the walk earns no complete discovery.
+#[test]
+fn an_unresolved_root_erases_nothing_and_earns_no_discovery() {
+    for store in STORES {
+        let mut f = Fixture::new(store, "g7-unresolved-root");
+        let other = f.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let never = other.join("never.jsonl");
+        std::fs::write(&never, vec![b'x'; 30]).unwrap();
+        let roots = [f.root.clone(), other.clone()];
+        let row = walk(f.source, &roots, &mut f.index);
+        assert_eq!(row["debt"]["outstanding_files"], 1, "{store:?}");
+        f.save();
+        let discovered = f.index.tail_discovery.last_complete_discovery_at;
+        assert!(discovered.is_some());
+
+        std::fs::remove_dir_all(&other).unwrap();
+        let row = walk(f.source, &roots, &mut f.index);
+        assert_eq!(row["debt"]["outstanding_files"], 1);
+        assert_eq!(row["debt"]["deleted_unaccepted_files"], 0);
+        f.save();
+        assert_eq!(committed(&f.index, &never).len(), 1);
+        assert_eq!(
+            f.index.tail_discovery.last_complete_discovery_at,
+            discovered
+        );
         f.close();
     }
 }

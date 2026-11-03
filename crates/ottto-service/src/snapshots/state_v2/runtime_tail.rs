@@ -58,6 +58,20 @@ pub(in crate::snapshots) fn observe_tails(
         Ok(())
     })
 }
+/// Keys whose debt-only observation is staged and not yet committed. An
+/// observation is a delta from the committed rows, so its owner stages none
+/// again before the save: `added` revisions would be added twice.
+pub(in crate::snapshots) fn tail_observed_keys(
+    path: &Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    with_state(path, |state| {
+        Ok(state
+            .tail
+            .observed_keys()
+            .filter_map(|key| String::from_utf8(key.to_vec()).ok())
+            .collect())
+    })
+}
 /// The caller's authorised final disposition of the file's whole debt: its
 /// revisions go and its marker clears; a head left with no reduction goes too.
 pub(in crate::snapshots) fn dispose_tail(

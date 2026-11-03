@@ -304,6 +304,13 @@ impl TailStage {
         }
         self.report();
     }
+    /// Keys with a debt-only observation staged and not yet committed.
+    pub(super) fn observed_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.debt
+            .iter()
+            .filter(|(_, debt)| debt.observation.is_some())
+            .map(|(key, _)| key.as_slice())
+    }
     fn merge(&mut self, key: &str, observation: Observation) {
         let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
         let merged = match debt.observation.take() {
