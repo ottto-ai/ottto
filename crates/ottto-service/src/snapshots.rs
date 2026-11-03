@@ -54787,11 +54787,13 @@ mod tests {
             "{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"first-empty\"}}\n",
         )
         .expect("write first page fixture");
+        // An unresolved native-created thread stays held; a legacy user fork
+        // now counts available records and cannot stand in for that hold.
         let session_id = "019fcafe-bbbb-7000-9000-ffffffffffff";
         fs::write(
             sessions_dir.join(format!("z-rollout-{session_id}.jsonl")),
             format!(
-                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"user\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n"
+                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"agent_created_thread\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n"
             ),
         )
         .expect("write later ambiguous fixture");
@@ -71365,9 +71367,10 @@ mod tests {
                 }
             }
             let child = child_snapshot.expect("paged child converges");
+            // Two available usage events: the copied prefix and the child's suffix.
             assert_eq!(
                 (child.input_tokens, child.output_tokens, child.request_count),
-                (125, 14, 3)
+                (125, 14, 2)
             );
             let body = snapshot_upload_body_witness(&child);
             if let Some(expected) = control.as_ref() {
