@@ -229,10 +229,6 @@ pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) inventory: Option<InventoryFacts>,
 }
 impl Observation {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-    )]
     fn absorb(&mut self, later: Self) {
         self.representation = later.representation;
         self.summary = later.summary;
@@ -305,10 +301,6 @@ impl TailStage {
             && self.retire.is_empty()
             && self.erase.is_empty()
     }
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-    )]
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
         let merged = match debt.observation.take() {
@@ -322,10 +314,6 @@ impl TailStage {
         self.report();
     }
     /// Staged observations of the key are superseded; later ones apply after.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-    )]
     pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {
         self.debt.insert(
             key.as_bytes().to_vec(),
@@ -338,10 +326,6 @@ impl TailStage {
     /// Erasure of the key's whole scope; anything staged for it goes. `true`:
     /// newly erased while it held unaccepted revisions, committed or staged;
     /// the timestamp is the oldest known change in that debt.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-    )]
     pub(super) fn erase(
         &mut self,
         key: &str,
@@ -805,10 +789,6 @@ pub(super) fn load_pages(
     stream(tx, file, head, generation, pages, visit)
 }
 /// `head`'s revisions (debt), by revision id, under the same checks.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-)]
 pub(super) fn load_revisions(
     tx: &mut dyn Transaction,
     file: &[u8],
@@ -954,10 +934,6 @@ fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
 }
 /// Debt presence from row headers, with its oldest known change when the head
 /// is readable. A damaged head must never prevent scope erasure.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-)]
 pub(super) fn erasure_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(bool, Option<u64>)> {
     let kind = RecordKind::parse(REVISION)?;
     let owed = !tx.scan_record_key(&kind, file, None, 1)?.is_empty();
