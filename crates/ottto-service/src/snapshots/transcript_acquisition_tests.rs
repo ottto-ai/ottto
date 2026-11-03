@@ -3050,10 +3050,16 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             });
         assert_eq!(modes, tagged_modes);
         assert_eq!(bytes, tagged_bytes);
-        assert_eq!(
-            serde_json::to_value(next).unwrap(),
-            serde_json::to_value(plain_next).unwrap()
-        );
+        // The routed fixture's walk stamps its wall-clock completion (G7 debt);
+        // the two scans may straddle a second. Everything else is identical.
+        let unstamped = |index: ScanIndex| {
+            let mut value = serde_json::to_value(index).unwrap();
+            if let Some(discovery) = value.get_mut("tail_discovery") {
+                discovery["last_complete_discovery_at"] = serde_json::Value::Null;
+            }
+            value
+        };
+        assert_eq!(unstamped(next), unstamped(plain_next));
         let tagged_body = production_body(source, tagged);
         assert_eq!(tagged_body, production_body(source, plain));
         let wire = tagged_body.to_string();
