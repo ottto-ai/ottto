@@ -13,6 +13,7 @@ const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
         4,
         "tail revision and head envelope: older writers would drop debt",
     ),
+    (5, "zstd Tail values and fragments"),
 ];
 pub(super) const WRITER_CAPABILITY: u64 =
     WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;
@@ -45,9 +46,12 @@ pub(super) fn supported(conn: &Connection) -> Result<u32> {
 }
 /// Independent of DDL revision: value-only upgrades fence old readers/writers.
 pub(super) fn writer_supported(conn: &Connection) -> Result<()> {
+    writer_supported_at(conn, WRITER_CAPABILITY)
+}
+fn writer_supported_at(conn: &Connection, capability: u64) -> Result<()> {
     let minimum =
         read_json::<u64>(conn, &RowKey::Meta("minimum_writer_capability".into()))?.unwrap_or(0);
-    if minimum > WRITER_CAPABILITY {
+    if minimum > capability {
         super::super::telemetry::event("newer_writer_refused", &1);
         bail!(super::super::Hold::NewerSchema);
     }
@@ -144,6 +148,22 @@ pub(super) fn run(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// [format] Capability 5 fences the previous reader/writer without DDL.
+    #[test]
+    fn compressed_tail_fences_capability_four() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("tail-writer-fence");
+        let mut db = Sqlite::create_import(&scratch.join("index.sqlite")).unwrap();
+        db.control("minimum_writer_capability", &5_u64).unwrap();
+        let conn = db.conn().unwrap();
+        assert_eq!(WRITER_CAPABILITY, 5);
+        assert_eq!(revision(conn).unwrap(), 1);
+        assert!(writer_supported(conn).is_ok());
+        let error = writer_supported_at(conn, 4).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<super::super::super::Hold>(),
+            Some(&super::super::super::Hold::NewerSchema)
+        );
+    }
     /// [format] format ledgers are consecutive and cover every catalogue kind.
     #[test]
     fn format_bump_ledgers_are_consecutive_and_cover_catalogue() {

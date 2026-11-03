@@ -1,4 +1,4 @@
-//! One record codec: existing serde JSON, optionally a dictionary-free zstd frame.
+//! Shared dictionary-free zstd codec, with JSON validation for graph records.
 use super::*;
 use anyhow::{ensure, Context};
 use serde::de::DeserializeOwned;
@@ -54,9 +54,9 @@ pub(super) fn json<T: Serialize + ?Sized>(value: &T, cap: u64) -> Result<Vec<u8>
     serde_json::to_writer(&mut out, value)?;
     Ok(out.inner)
 }
-pub(super) fn encode(json: &[u8]) -> Result<Vec<u8>> {
-    if json.len() < 512 {
-        return Ok(json.to_vec());
+pub(super) fn encode(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 512 {
+        return Ok(bytes.to_vec());
     }
     ENCODER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -66,28 +66,32 @@ pub(super) fn encode(json: &[u8]) -> Result<Vec<u8>> {
         let compressed = slot
             .as_mut()
             .context("state_v2_zstd_context")?
-            .compress(json)?;
-        Ok(if compressed.len() < json.len() {
+            .compress(bytes)?;
+        Ok(if compressed.len() < bytes.len() {
             compressed
         } else {
-            json.to_vec()
+            bytes.to_vec()
         })
+    })
+}
+/// Expand one binary frame within the caller's raw-output and window bound.
+pub(super) fn expand_frame(bytes: &[u8], cap: u64) -> Result<Vec<u8>> {
+    DECODER.with(|context| -> Result<Vec<u8>> {
+        let mut context = context.borrow_mut();
+        context
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|_| anyhow::anyhow!("state_v2_zstd_reset"))?;
+        let mut decoder = zstd::stream::read::Decoder::with_context(bytes, &mut context);
+        decoder.window_log_max(cap.next_power_of_two().ilog2().clamp(10, 26))?;
+        let mut out = Vec::new();
+        decoder.take(cap + 1).read_to_end(&mut out)?;
+        ensure!(out.len() as u64 <= cap, "state_v2_value_admission");
+        Ok(out)
     })
 }
 pub(super) fn expand(bytes: &[u8], cap: u64) -> Result<Vec<u8>> {
     let json = if bytes.starts_with(MAGIC) {
-        DECODER.with(|context| -> Result<Vec<u8>> {
-            let mut context = context.borrow_mut();
-            context
-                .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
-                .map_err(|_| anyhow::anyhow!("state_v2_zstd_reset"))?;
-            let mut decoder = zstd::stream::read::Decoder::with_context(bytes, &mut context);
-            decoder.window_log_max(cap.next_power_of_two().ilog2().clamp(10, 26))?;
-            let mut out = Vec::new();
-            decoder.take(cap + 1).read_to_end(&mut out)?;
-            ensure!(out.len() as u64 <= cap, "state_v2_value_admission");
-            Ok(out)
-        })?
+        expand_frame(bytes, cap)?
     } else {
         ensure!(bytes.len() as u64 <= cap, "state_v2_value_admission");
         bytes.to_vec()
@@ -313,6 +317,45 @@ mod tests {
         for raw in [b"binary".as_slice(), b"(json)", MAGIC, &[0x28, 0xb5, 0x2f]] {
             assert!(decode::<serde_json::Value>(raw, 1024).is_err());
         }
+    }
+    /// [format] Binary frames reject truncation, corruption, excessive windows
+    /// and output, even when the physical frame is tiny and has no size field.
+    #[test]
+    fn binary_frames_are_bounded_independently_of_physical_length() {
+        const CAP: u64 = 16 * 1024 * 1024;
+        let raw = vec![0; 1024];
+        let encoded = encode(&raw).unwrap();
+        assert_eq!(expand_frame(&encoded, CAP).unwrap(), raw);
+        assert!(
+            expand(&encoded, CAP).is_err(),
+            "JSON guard remains separate"
+        );
+        assert!(expand_frame(&encoded[..encoded.len() - 1], CAP).is_err());
+        let mut corrupt = encoded.clone();
+        corrupt[0] ^= 1;
+        assert!(expand_frame(&corrupt, CAP).is_err());
+        // Unknown content size, 16 MiB window, RLE blocks of at most 128 KiB.
+        let mut frame = MAGIC.to_vec();
+        frame.extend_from_slice(&[0, 0x70]);
+        for _ in 0..128 {
+            frame.extend_from_slice(&(((128_u32 * 1024) << 3) | 2).to_le_bytes()[..3]);
+            frame.push(0);
+        }
+        frame.extend_from_slice(&[11, 0, 0, 0]); // last RLE block: one extra byte
+        assert!(frame.len() < 1024);
+        assert!(expand_frame(&frame, CAP)
+            .unwrap_err()
+            .to_string()
+            .contains("state_v2_value_admission"));
+        // Same valid short frame with a window larger than the decode bound.
+        let mut window = MAGIC.to_vec();
+        window.extend_from_slice(&[0, 0x80, 11, 0, 0, 0]);
+        assert!(expand_frame(&window, CAP).is_err());
+        assert_eq!(
+            expand_frame(&encoded, CAP).unwrap(),
+            raw,
+            "context reusable after refusal"
+        );
     }
     /// [format] generic and exact guards reject nested ignored fields, opaque
     /// census keys and noncanonical values.
