@@ -30321,7 +30321,10 @@ impl OwnedSourceScan {
                     false
                 };
                 #[cfg(test)]
-                sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterRetain);
+                sampled_scan::test_hooks::fire_for_key(
+                    sampled_scan::test_hooks::Point::AfterRetain,
+                    &local_index_key(&candidate.path),
+                );
                 // U1a-2a G17b + C9′: a side read's certificate, without
                 // retention or any cache event; the same path must still name
                 // the object. Its failures are its charged attempt.

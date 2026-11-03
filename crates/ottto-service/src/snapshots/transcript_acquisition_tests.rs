@@ -1169,10 +1169,55 @@ type ProductionScanPage = (
 fn production_scan_page_at_with_setup(
     fixture: &ScanFixture,
     source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> ProductionScanPage {
+    production_scan_page_hinted(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        &[],
+        setup,
+    )
+}
+
+/// `production_scan` with watcher hints, as the daemon passes them.
+fn production_scan_hinted(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    hinted_paths: &[PathBuf],
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let (index, raw, _, modes, _) = production_scan_page_hinted(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        NOW,
+        hinted_paths,
+        |_| {},
+    );
+    (index, raw, modes)
+}
+
+#[allow(clippy::too_many_arguments)] // The page fixture plus its watcher hints.
+fn production_scan_page_hinted(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
     mut index: ScanIndex,
     cache: Option<Arc<sampled_scan::SharedCache>>,
     namespace: &str,
     collected_at: &str,
+    hinted_paths: &[PathBuf],
     setup: impl FnOnce(&mut OwnedSourceScan),
 ) -> ProductionScanPage {
     index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
@@ -1194,7 +1239,7 @@ fn production_scan_page_at_with_setup(
         10,
         false,
         None,
-        &[],
+        hinted_paths,
         false,
     );
     if let Some(cache) = cache {
