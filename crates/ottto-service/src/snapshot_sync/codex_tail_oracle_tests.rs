@@ -1,11 +1,9 @@
 //! Scan-level Codex Tail row on a real state database route: a restarted
-//! owner's quiet pass over committed Codex heads reads zero transcript bytes
+//! owner's quiet pass over committed Codex heads consumes no transcript byte
 //! and emits no body. The per-file money rows (cold Full == Tail restart ==
 //! upgrade, totals and placement) are `tail_source::seam::transition_tests`.
 use super::*;
-use crate::snapshots::sampled_scan::transition_fixture::{
-    self as fixture, money_oracle, scan_money, IoBytes, Mode,
-};
+use crate::snapshots::sampled_scan::transition_fixture as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::StateV2ColdSession;
 
@@ -59,7 +57,7 @@ fn page(
 }
 
 /// [money] A restarted owner's quiet pass over committed Codex heads on their
-/// route reads no transcript byte, opens no transcript and emits no body.
+/// route reads no Full, consumes no transcript byte and emits no body.
 #[test]
 fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
     let _cutover = crate::snapshots::TestCutover::set(0);
@@ -84,19 +82,15 @@ fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
     let prior = session.save_reload(&mut index).0;
 
     let restart = E2ScanFixture::default();
-    let opens = crate::snapshots::all_transcript_opens_for_test();
-    let ((index, scan, modes), consumed) = fixture::observe_consumed(|| page(&c, &restart, prior));
-    // Zero opens measures zero identity, cheap and other reads.
-    let measured = (crate::snapshots::all_transcript_opens_for_test() == opens).then_some(0);
-    let mut quiet = scan_money(SOURCE, &index, &scan);
-    quiet.mode = Mode::Restart;
-    quiet.modes = modes;
-    quiet.io = IoBytes {
-        consumed,
-        cheap_checks: measured,
-        anchor_reads: measured,
-        other_reads: measured,
-        ..Default::default()
-    };
-    money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    let ((_, scan, modes), consumed) = fixture::observe_consumed(|| page(&c, &restart, prior));
+    // The quiet-restart equivalent of the Claude route's row (`s2_oracle_tests`):
+    // a restart may open a file to check its identity (the anchor read the
+    // opened-object witness is), but reads no Full, consumes no transcript
+    // byte and emits no body.
+    assert_eq!(modes.0, 0, "quiet restart read Full");
+    assert_eq!(consumed, 0, "quiet restart: no transcript consumption");
+    assert!(
+        scan.snapshots.is_empty(),
+        "quiet restart emitted a new body"
+    );
 }
