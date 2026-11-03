@@ -1233,7 +1233,7 @@ fn open_member(
         .consumed_before
         .saturating_add(active.parser.reader.consumed_bytes());
     let parser = &mut active.parser;
-    parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file));
+    parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), jsonl_line_cap(), true);
     // Context inferred in one physical file must not price an unrelated
     // record at the beginning of another file.
     parser.accumulator.current_selector = SelectorCapture::default();

@@ -32,6 +32,8 @@ const CURSOR_PASS_BYTES: u64 = 64 * 1024 * 1024;
 /// Aggregate decoded bytes per page for ordinary Codex singleton reads
 /// (B_s = B; no further constant).
 const SINGLETON_PASS_BYTES: u64 = CURSOR_PASS_BYTES;
+/// A cursor read's overlong-line skip yields after this many skipped bytes.
+const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
 /// A live cursor job's copy-budget charge is walked again after this many
 /// consumed bytes: at most 16 walks per page (B / 4 MiB), plus the
 /// pause and completion walks, against one per line before.
@@ -51,6 +53,9 @@ pub(in crate::snapshots) const SAMPLE_READ_BYTES: u64 = 2 * SAMPLE_BYTES as u64;
 /// A paused job is stale, and another namespace may evict it, once this many
 /// cursor pages passed without its own namespace resuming it (K10).
 const NAMESPACE_STALE_PAGES: u64 = 16;
+/// U1a-2a (cc row 4, rev 6 §5.1): free room a proof step needs beyond the
+/// scan's walked state and the running job's last walked charge.
+pub(in crate::snapshots) const PROOF_STEP_HEADROOM_BYTES: usize = 1 << 20;
 /// A paused job whose revalidation evidence stays unavailable for this
 /// many consecutive resume pages ends (slot freed, path processed for the
 /// generation with a retryable cause, prior body kept). Small, like
@@ -74,6 +79,7 @@ pub(in crate::snapshots) const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proo
 pub(in crate::snapshots) struct Limits {
     cursor: u64,
     singleton: u64,
+    skip_chunk: usize,
 }
 
 impl Limits {
@@ -85,12 +91,19 @@ impl Limits {
         Self {
             cursor: CURSOR_PASS_BYTES,
             singleton: SINGLETON_PASS_BYTES,
+            skip_chunk: SKIP_CHUNK_BYTES,
         }
     }
 
     /// Files above this size are read by the cursor, never as one pass.
     pub(in crate::snapshots) fn singleton(&self) -> u64 {
         self.singleton
+    }
+
+    /// U1a-2a (row 33): a resumable read's overlong-skip chunk (a proof
+    /// job's readers use the cursor's).
+    pub(in crate::snapshots) fn skip_chunk(&self) -> usize {
+        self.skip_chunk
     }
 }
 
@@ -104,7 +117,7 @@ thread_local! {
 pub(in crate::snapshots) fn with_test_limits<T>(
     cursor: u64,
     singleton: u64,
-    _skip_chunk: usize,
+    skip_chunk: usize,
     run: impl FnOnce() -> T,
 ) -> T {
     struct Reset;
@@ -113,7 +126,13 @@ pub(in crate::snapshots) fn with_test_limits<T>(
             TEST_LIMITS.with(|limits| limits.set(None));
         }
     }
-    TEST_LIMITS.with(|limits| limits.set(Some(Limits { cursor, singleton })));
+    TEST_LIMITS.with(|limits| {
+        limits.set(Some(Limits {
+            cursor,
+            singleton,
+            skip_chunk,
+        }))
+    });
     let _reset = Reset;
     run()
 }
@@ -464,6 +483,20 @@ impl PageBudget {
             }
         }
     }
+}
+
+/// U1a-2a (cc row 4, rev 5/6 §5.1, R2-B1): the most a running proof job
+/// may hold before a step: `state_bytes() − bound(context) −
+/// PROOF_STEP_HEADROOM_BYTES`, the copy-budget computation
+/// (`copy_budget_parts`) with the running job in place of the active file.
+/// `bound(context)` includes the shared cache (cursor state, retained
+/// copies, side ledger) but not the running job (out of the holder). Cycles
+/// are serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main
+/// state. None: the context is unbounded or leaves no headroom.
+pub(in crate::snapshots) fn proof_room(context: &super::Context) -> Option<usize> {
+    crate::heap_layout_bound::bound(context, state_bytes())
+        .and_then(|resident| state_bytes().checked_sub(resident))
+        .and_then(|room| room.checked_sub(PROOF_STEP_HEADROOM_BYTES))
 }
 
 /// Opened-object facts of the held descriptor, captured at job open.
@@ -3338,6 +3371,9 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
     job.parser.accumulator.codex_priority_witnesses_uncapped = true;
     job.parser
         .reader
+        .set_chunked_skip(Limits::current().skip_chunk);
+    job.parser
+        .reader
         .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
     meta.stamp_open = stamp_open;
     meta.started = super::now_seconds();
@@ -3404,7 +3440,7 @@ pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &O
             .cursor
             .as_ref()
             .is_some_and(|meta| &meta.stamp_open == boot)
-        && reader.sealed_fragment.is_some()
+        && matches!(reader.sealed_fragment, Some((false, _)))
         && std::str::from_utf8(bytes).is_ok_and(|line| {
             line.trim().is_empty() || serde_json::from_str::<serde_json::Value>(line).is_ok()
         })
@@ -3519,6 +3555,7 @@ pub(in crate::snapshots) fn arm_group_member(
     if !boot.append_compatible(&now) {
         return Err(GroupEnd::Changed);
     }
+    reader.set_chunked_skip(Limits::current().skip_chunk);
     match live {
         Some(scope) => {
             let plan = crate::transcript_acquisition::ReadPlan::prepare(
@@ -5386,7 +5423,9 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
+        let limits = Limits::current();
         job.parser.accumulator.codex_priority_witnesses_uncapped = true;
+        job.parser.reader.set_chunked_skip(limits.skip_chunk);
         // The reader counts from the acquisition start (`s` for a tail).
         job.parser
             .reader
@@ -5475,12 +5514,14 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
+        let limits = Limits::current();
         let accumulator = &mut job.parser.accumulator;
         accumulator.codex_priority_witnesses_uncapped = true;
         // Resume revalidates every priority decision against the witnesses.
         accumulator
             .codex_observed_priority_turns
             .get_or_insert_with(BTreeMap::new);
+        job.parser.reader.set_chunked_skip(limits.skip_chunk);
         job.parser.reader.set_extent_limit(boot.extent);
         job.cursor = Some(JobMeta {
             counting,

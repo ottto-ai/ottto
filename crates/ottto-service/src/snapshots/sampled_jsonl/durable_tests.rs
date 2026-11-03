@@ -467,6 +467,10 @@ fn full_digest(reduction: &CachedJsonlReduction) -> [u8; 32] {
     e.finish_hash()
 }
 
+fn line_cap() -> u64 {
+    jsonl_line_cap() as u64
+}
+
 fn restore(
     path: &Path,
     body: &[u8],
@@ -846,8 +850,12 @@ fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, _) = full_read(&path, case.source);
         take_l_spans();
-        let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES)
-            .unwrap_or_else(|refuse| panic!("{:?} not persisted: {refuse:?}", case.source));
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap_or_else(|refuse| panic!("{:?} not persisted: {refuse:?}", case.source));
         let spans = take_l_spans();
         let path_text = path.to_string_lossy();
         for canary in case.content.iter().copied().chain([path_text.as_ref()]) {
@@ -913,8 +921,12 @@ fn instruction_text_and_its_config_digest_never_reach_the_body() {
         for secret in secrets {
             let path = scratch.write("t.jsonl", &build(secret));
             let (reduction, _) = full_read(&path, source);
-            let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES)
-                .unwrap_or_else(|refuse| panic!("{source:?} not persisted: {refuse:?}"));
+            let body = encode(
+                &reduction,
+                crate::durable_tail_store::RECORD_BYTES,
+                line_cap(),
+            )
+            .unwrap_or_else(|refuse| panic!("{source:?} not persisted: {refuse:?}"));
             assert!(
                 occurrences(&body, secret.as_bytes()).is_empty(),
                 "{source:?}"
@@ -950,7 +962,12 @@ fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     let scratch = Scratch::new("org");
     let path = scratch.write("t.jsonl", &claude_org_lines());
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
     let plain: [u8; 32] = sha2::Sha256::digest(CANARY_EMAIL.as_bytes()).into();
     let separated: [u8; 32] = sha2::Sha256::new()
         .chain_update(b"ottto-claude-org-marker-context:v1\0")
@@ -982,7 +999,12 @@ fn e_content_refuses_and_approved_mid_file_skills_persist() {
         value: "https://example.test/CANARY_ARTIFACT/pull/1".into(),
     });
     assert_eq!(
-        encode(&reduction, crate::durable_tail_store::RECORD_BYTES).err(),
+        encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap()
+        )
+        .err(),
         Some(Refuse::NonEmpty("SnapshotAccumulator.artifacts"))
     );
     let mut skill = skill_fixture_lines();
@@ -1001,7 +1023,12 @@ fn e_content_refuses_and_approved_mid_file_skills_persist() {
     let path = scratch.write("t.jsonl", &skill);
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
     assert!(
-        encode(&reduction, crate::durable_tail_store::RECORD_BYTES).is_ok(),
+        encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap()
+        )
+        .is_ok(),
         "a native mid-file SKILL.md label is now PL-retained"
     );
 }
@@ -1019,7 +1046,12 @@ fn request_shape_and_blob_keys_are_stored_only_as_domain_separated_digests() {
     let scratch = Scratch::new("request-keys");
     let path = scratch.write("t.jsonl", &claude_held_request_lines(secret));
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
     assert!(occurrences(&body, secret.as_bytes()).is_empty());
     for (domain, raw) in [
         (&b"ottto-dt-claude-shape-key:v1\0"[..], shape_key(secret)),
@@ -1083,7 +1115,7 @@ fn attribution_selector_context_refuses_the_record() {
         "priority".into(),
         "derived_from_logs_2",
     );
-    encode(&kept, crate::durable_tail_store::RECORD_BYTES)
+    encode(&kept, crate::durable_tail_store::RECORD_BYTES, line_cap())
         .expect("a non-attribution selector context persists");
     for key in crate::snapshots::CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
         let mut captured = plain.clone();
@@ -1093,7 +1125,12 @@ fn attribution_selector_context_refuses_the_record() {
             "claude_code_attribution_field",
         );
         assert_eq!(
-            encode(&captured, crate::durable_tail_store::RECORD_BYTES).err(),
+            encode(
+                &captured,
+                crate::durable_tail_store::RECORD_BYTES,
+                line_cap()
+            )
+            .err(),
             Some(Refuse::NonEmpty("SelectorCapture.context.attribution")),
             "{key}"
         );
@@ -1108,7 +1145,12 @@ fn restore_rederives_the_exact_retained_copy() {
         let scratch = Scratch::new("exact");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, _) = full_read(&path, case.source);
-        let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
         let (restored, receipt) = restore(&path, &body, case.source).unwrap();
         assert_eq!(
             full_digest(&restored),
@@ -1126,8 +1168,7 @@ fn restore_rederives_the_exact_retained_copy() {
         );
         assert!(receipt.head_bytes <= HEAD_BOUND);
         assert!(receipt.named_lines as usize <= NAMED_LINES);
-        // Line bytes come only from a title line re-read outside the head.
-        assert_eq!(receipt.line_bytes > 0, receipt.named_lines > 0);
+        assert!(receipt.line_bytes <= line_cap());
     }
 }
 
@@ -1256,7 +1297,7 @@ fn restored_tail(
     grow: &[String],
 ) -> (OwnedJsonlParser, RederiveReceipt) {
     let (native, checkpoint) = full_read(path, source);
-    let body = encode(&native, crate::durable_tail_store::RECORD_BYTES).unwrap();
+    let body = encode(&native, crate::durable_tail_store::RECORD_BYTES, line_cap()).unwrap();
     let certificate = checkpoint
         .durable_certificate(birth_unix_nanos(&fs::metadata(path).unwrap()))
         .unwrap();
@@ -1372,7 +1413,12 @@ fn metadata_only_touch_restores_unchanged() {
         let scratch = Scratch::new("touch");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, checkpoint) = full_read(&path, case.source);
-        let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
         let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
         let certificate = checkpoint.durable_certificate(birth).unwrap();
         let before = fs::metadata(&path).unwrap();
@@ -1435,7 +1481,12 @@ fn edits_after_the_checkpoint_refuse_restore() {
         reduction
             .accumulator
             .note_activity_skills("/synthetic/skills/HeadLabel/SKILL.md");
-        let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
         let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
         (path, body, checkpoint.durable_certificate(birth).unwrap())
     };
@@ -1767,7 +1818,11 @@ fn fallback_classes_over_the_synthetic_corpus() {
         let scratch = Scratch::new("corpus");
         let path = scratch.write("t.jsonl", &lines);
         let (reduction, _) = full_read(&path, source);
-        let class = match encode(&reduction, crate::durable_tail_store::RECORD_BYTES) {
+        let class = match encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        ) {
             Ok(_) => "persisted",
             Err(
                 Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field),
@@ -1820,7 +1875,12 @@ fn codec_budget_receipt() {
         let scratch = Scratch::new("receipt");
         let path = scratch.write("t.jsonl", &case.lines);
         let (reduction, _) = full_read(&path, case.source);
-        let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
         let (_, receipt) = restore(&path, &body, case.source).unwrap();
         println!(
             "dt_codec_budget: source={} file_bytes={} body_bytes={} record_bytes={} \
@@ -1890,7 +1950,7 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
     ] {
         let path = scratch.write(name, &lines);
         let (reduction, _) = full_read(&path, source);
-        let body = encode(&reduction, 1 << 20).unwrap();
+        let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
         assert_structural_body(source, name, &body, min_present_options);
     }
 }
@@ -2006,7 +2066,7 @@ fn structural_verifier_large_body_still_allocates_nothing() {
     // Uploaded model/tool strings are stored U fields, so make the body large
     // without increasing transcript acquisition or test-probe bookkeeping.
     reduction.accumulator.latest_model = Some("m".repeat(256 * 1024));
-    let body = encode(&reduction, 1 << 20).unwrap();
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
     assert!(body.len() > 256 * 1024);
     assert_eq!(verified_without_allocation(&body), Ok(()));
     assert_eq!(
@@ -2017,7 +2077,7 @@ fn structural_verifier_large_body_still_allocates_nothing() {
 
 fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
     take_l_spans();
-    let rederive = rederive_digests(&reduction.accumulator).unwrap();
+    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
     let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
     reduction.put(&mut old).unwrap();
     rederive.put(&mut old).unwrap();
@@ -2043,13 +2103,16 @@ fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
         take_l_spans().is_empty(),
         "count is not a second L-span output"
     );
-    let actual = encode(reduction, expected.len()).unwrap();
+    let actual = encode(reduction, expected.len(), line_cap()).unwrap();
     assert_eq!(
         actual, expected,
         "borrowed parts preserve the original codec bytes"
     );
     assert_eq!(actual.capacity(), actual.len());
-    assert_eq!(encode(reduction, expected.len() - 1), Err(Refuse::TooLarge));
+    assert_eq!(
+        encode(reduction, expected.len() - 1, line_cap()),
+        Err(Refuse::TooLarge)
+    );
     let (_, options) =
         crate::durable_tail_codec::trace_verify(|| verify_body(&mut Dec::new(&actual)).unwrap());
     assert!(options >= 5, "fixture must populate nested optional state");
@@ -2124,8 +2187,8 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
     while !limited.step().unwrap() {}
     let (cold, _) = full_read(&path, source);
     assert_eq!(
-        encode(&limited.reduction_copy(), 1 << 20).unwrap(),
-        encode(&cold, 1 << 20).unwrap(),
+        encode(&limited.reduction_copy(), 1 << 20, 1 << 20).unwrap(),
+        encode(&cold, 1 << 20, 1 << 20).unwrap(),
         "fallback uses the fresh native reduction"
     );
 }
@@ -2148,6 +2211,7 @@ fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
             live.positive_usage_evidence,
         ),
         usize::MAX,
+        line_cap(),
     )
     .expect("a clean fixture encodes");
     (body, detached)
@@ -2201,7 +2265,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         );
         assert_eq!(
             body,
-            &encode_body(&retained, usize::MAX).unwrap(),
+            &encode_body(&retained, usize::MAX, line_cap()).unwrap(),
             "{source:?}: PRE-finalization live bytes are the retained copy's bytes"
         );
         assert_eq!(
@@ -2260,7 +2324,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
         record.accumulator.note_provider_skill(Some(label));
         let native = record.accumulator.provider_skills.clone();
         assert_eq!(
-            encode_permitted(&record, usize::MAX, true).err(),
+            encode_permitted(&record, usize::MAX, line_cap(), true).err(),
             Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
         );
         assert_eq!(
@@ -2283,7 +2347,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
         record.accumulator.activity_skills,
         BTreeSet::from(["FirstSpelling".into()])
     );
-    let body = encode_permitted(&record, usize::MAX, true).unwrap();
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
     assert!(body_has_skill_labels(SnapshotSource::ClaudeCode, &body).unwrap());
     let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
     let _on = RestartRestoreForTest::enabled();
@@ -2303,7 +2367,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
         assert!(local_labels, "local custody ignores upload consent");
         assert!(decoded.permits_skill_labels(local_labels));
         assert_eq!(
-            encode_permitted(&record, usize::MAX, local_labels).unwrap(),
+            encode_permitted(&record, usize::MAX, line_cap(), local_labels).unwrap(),
             body
         );
     }
@@ -2394,7 +2458,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
     }
     record.accumulator.activity_skills.insert("bad/path".into());
     assert_eq!(
-        encode_permitted(&record, usize::MAX, true).err(),
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
         Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
     );
 }
@@ -2431,7 +2495,7 @@ fn skill_labels_preserve_native_provider_and_activity_caps() {
     assert!(record.accumulator.activity_skills.contains("Activity32"));
     assert!(!record.accumulator.provider_skills.contains("provider33"));
     assert!(!record.accumulator.activity_skills.contains("Activity33"));
-    let body = encode_permitted(&record, usize::MAX, true).unwrap();
+    let body = encode_permitted(&record, usize::MAX, line_cap(), true).unwrap();
     let decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
     assert_eq!(
         decoded.reduction.accumulator.provider_skills,
@@ -2443,7 +2507,7 @@ fn skill_labels_preserve_native_provider_and_activity_caps() {
     );
     record.accumulator.activity_skills.insert("extra".into());
     assert_eq!(
-        encode_permitted(&record, usize::MAX, true).err(),
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
         Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=activity}"))
     );
     record.accumulator.activity_skills.remove("extra");
@@ -2451,7 +2515,7 @@ fn skill_labels_preserve_native_provider_and_activity_caps() {
     // approved <=33 bound independently of that narrower native cap.
     record.accumulator.provider_skills = (0..34).map(|n| format!("provider{n:02}")).collect();
     assert_eq!(
-        encode_permitted(&record, usize::MAX, true).err(),
+        encode_permitted(&record, usize::MAX, line_cap(), true).err(),
         Some(Refuse::NonEmpty("skill_label_out_of_bounds{set=provider}"))
     );
 }
@@ -2516,7 +2580,7 @@ fn bounded_pi_prompt_workspace_tail_matches_cold_body_in_two_cycles() {
         let path = root.write(if cwd.is_some() { "cwd" } else { "no-cwd" }, &lines);
         for cycle in 0..2 {
             let (native, _) = full_read(&path, source);
-            let digests = rederive_digests(&native.accumulator).unwrap();
+            let digests = rederive_digests(&native.accumulator, line_cap()).unwrap();
             assert!(digests.first_prompt.is_some());
             assert!(digests.session_start.is_none());
             assert!(digests.agent_label.is_none());
@@ -2557,7 +2621,7 @@ fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without
     let root = Scratch::new("unsupported-bounded");
     let path = root.write("t", &codex_lines());
     let (native, _) = full_read(&path, SnapshotSource::Codex);
-    let body = encode(&native, crate::durable_tail_store::BODY_BYTES).unwrap();
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
     for boundary in [
         CodexOwnershipBoundary::AwaitingLegacyTrigger,
         CodexOwnershipBoundary::AwaitingParentPrefix,
@@ -2587,7 +2651,7 @@ fn bounded_plan_refuses_unsupported_codex_boundaries_and_oversized_marks_without
     let (native, _) = full_read(&path, SnapshotSource::Pi);
     assert!(native.accumulator.durable_marks.first_prompt.unwrap() > HEAD_BOUND);
     assert!(matches!(
-        encode(&native, crate::durable_tail_store::RECORD_BYTES),
+        encode(&native, crate::durable_tail_store::RECORD_BYTES, line_cap()),
         Err(Refuse::NotRederivable(
             "SnapshotAccumulator.first_prompt_material"
         ))
@@ -2652,7 +2716,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
         let path = root.join(format!("{}-private.jsonl", source.api_slug()));
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let body = encode(&native, crate::durable_tail_store::BODY_BYTES).unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         for class in 0..5 {
             let bad = decode_body(&body, source).unwrap().test_fence_body(class);
             // A real caught panic is a failed test, with a content-free failure
@@ -2695,7 +2759,7 @@ pub(super) fn replay_privacy_artifacts(root: &Path) -> [&'static str; 4] {
             + "\n";
         fs::write(&path, raw + &lines.join("\n") + "\n").unwrap();
         let (native, _) = full_read(&path, source);
-        let body = encode(&native, crate::durable_tail_store::BODY_BYTES).unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let result = {
             let decoded = decode_body(&body, source).unwrap();
             decoded
@@ -2787,7 +2851,7 @@ fn codex_pi_restored_tail_race_below_accepted_publishes_complete_native_body() {
         let path = root.write("source.jsonl", &lines);
         let (native, checkpoint) = full_read(&path, source);
         let a = fs::metadata(&path).unwrap().len();
-        let body = encode(&native, crate::durable_tail_store::BODY_BYTES).unwrap();
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
         let certificate = checkpoint
             .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
             .unwrap();
@@ -3065,7 +3129,7 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
         assert!(crate::durable_tail_codec::DurableEmpty::durable_empty(
             &reduction.accumulator.seen_pi_usage_keys
         ));
-        let body = encode(&reduction, 1 << 20).unwrap();
+        let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
         let decoded = decode_body(&body, source).unwrap();
         assert!(decoded
             .reduction
@@ -3074,7 +3138,11 @@ fn claude_and_codex_bodies_round_trip_byte_identical_through_the_pi_ledger() {
             .usage_keys()
             .is_empty());
         let (restored, _) = restore(&path, &body, source).unwrap();
-        assert_eq!(encode(&restored, 1 << 20).unwrap(), body, "{name}");
+        assert_eq!(
+            encode(&restored, 1 << 20, line_cap()).unwrap(),
+            body,
+            "{name}"
+        );
     }
 }
 
@@ -3323,7 +3391,12 @@ fn org_marker_address_is_stored_only_as_its_keyed_digest() {
     let scratch = Scratch::new("org-keyed");
     let path = scratch.write("t.jsonl", &claude_org_lines());
     let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
-    let body = encode(&reduction, crate::durable_tail_store::RECORD_BYTES).unwrap();
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
     let digest = crate::claude_status_coverage::address_digest(CANARY_EMAIL).unwrap();
     let keyed: Vec<u8> = (0..digest.len())
         .step_by(2)

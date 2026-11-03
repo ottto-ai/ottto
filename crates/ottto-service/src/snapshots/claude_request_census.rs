@@ -105,7 +105,7 @@ pub(crate) const CLAUDE_REQUEST_CENSUS_DERIVATION: u16 = 1;
 #[cfg(test)]
 pub(crate) const CLAUDE_REQUEST_CENSUS_CANARY: (u16, &str) = (
     1,
-    "13c57766a314142a46296ef186e752768a2e5dd18822bb8c0a9300bcfc74af76",
+    "e8e0dbc0cce7d3afefdb65752cda8f8236c6f5704a00aa1080e46620473e0ff5",
 );
 /// 16 MiB of hashes per census. The scan index's census (transcript records)
 /// and the money ledger's own census (telemetry, message-only, family and sweep

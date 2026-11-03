@@ -149,15 +149,6 @@ telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
 process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
-Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
-`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
-capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
-record right after `native_collection_page`; `context_composition_read` carries
-them inline. 16 MiB is only a release point: a completed record above it
-frees its line buffer; byte targets yield between records. The counts-only
-`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
-on consecutive native pages, without changing reading or retries.
-
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
 or line, or changing its meaning, increments the version. Version 2 removes
