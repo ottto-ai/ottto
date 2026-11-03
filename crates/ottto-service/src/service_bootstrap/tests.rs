@@ -326,3 +326,46 @@ fn filesystem_error_json_retains_the_diagnostic_cause() {
     assert!(message.contains("Permission denied"), "{message}");
     assert_eq!(payload["error"]["retryable"], false);
 }
+
+/// [behaviour] A loaded job whose program and plist bytes stay the same
+/// restarts in place with `kickstart -k`; a changed plist still boots out
+/// and bootstraps the new definition.
+#[test]
+fn unchanged_loaded_job_restarts_in_place_and_changed_plist_is_replaced() {
+    let fixture = Fixture::new();
+    let plist = fixture.0.join("agent.plist");
+    let run = |config: &LaunchAgentConfig| {
+        let mut calls = Vec::new();
+        install_with(
+            config,
+            &plist,
+            false,
+            true,
+            || Ok(Some(config.executable_path.clone())),
+            |args| {
+                calls.push(args.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        calls
+    };
+    let stages = |calls: Vec<Vec<String>>| {
+        calls
+            .into_iter()
+            .map(|args| args[1].clone())
+            .collect::<Vec<_>>()
+    };
+    let config = fixture.config();
+    // Nothing on disk yet, so the loaded job's definition is unknown.
+    assert_eq!(stages(run(&config)), ["bootout", "enable", "bootstrap"]);
+    let plan = macos_service::install_plan(&config, &plist);
+    assert_eq!(
+        run(&config),
+        [plan.enable_command, plan.kickstart_command.clone()]
+    );
+    assert_eq!(plan.kickstart_command[2], "-k");
+    let mut changed = fixture.config();
+    changed.companion_code_requirement = Some("identifier \"test\"".to_string());
+    assert_eq!(stages(run(&changed)), ["bootout", "enable", "bootstrap"]);
+}
