@@ -3250,7 +3250,12 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         literal(&restored);
         // Cold Full is only the fixture's reference oracle. Production keeps
         // the retained read when the external census becomes available.
-        let full_prior = prior.clone();
+        // A routed prior reads unrouted here, as every cold oracle does.
+        let full_prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::ClaudeCode,
+            None,
+            prior.clone(),
+        );
         assert!(!full_prior
             .files
             .contains_key(path.to_string_lossy().as_ref()));

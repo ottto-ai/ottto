@@ -272,7 +272,9 @@ fn held_new_file_continues_from_its_committed_head() {
             warm.snapshots.contains_key(COPY),
             "external evidence releases it"
         );
-        let cold = result(&page(&c, prior, 100, false), Mode::ColdFull);
+        let unrouted =
+            crate::snapshots::e2_pipeline_scan_fixture::route_for_test(SOURCE, None, prior);
+        let cold = result(&page(&c, unrouted, 100, false), Mode::ColdFull);
         money_oracle::assert_equivalent(&cold, &warm);
         grown.finish();
     });
