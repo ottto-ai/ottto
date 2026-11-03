@@ -12,8 +12,9 @@ pub(crate) enum DurableSource {
 pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
-    /// Registry identity; Pi records return with S2c.
-    #[allow(dead_code, reason = "Pi records read the tag again with S2c")]
+    /// Registry identity, a stable wire ID; Tail heads bind the source by
+    /// its slug instead.
+    #[allow(dead_code, reason = "Tail heads bind the source by its slug")]
     pub(crate) tag: u8,
     /// Its index routes through the state v2 store. Only ever set: a published
     /// route's custody wins, and clearing it would let v1 load the frozen
