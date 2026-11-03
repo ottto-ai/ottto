@@ -52,6 +52,8 @@ fn refused(
         progress.permanent_rejections.insert(
             fp(*value),
             PermanentSnapshotRejection {
+                exposure: None,
+                revisions: BTreeMap::new(),
                 body_witness: body(*value),
                 reason: crate::upload_receipts::RejectedUsageReason::Other,
                 reoffer: *reoffer,
@@ -747,7 +749,20 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
     );
     assert_eq!(
         progress.reason_reoffer_cooldowns(NOW),
-        BTreeMap::from([(fp(1), body(1)), (fp(2), body(2)), (fp(4), body(4)),])
+        BTreeMap::from([
+            (
+                fp(1),
+                crate::snapshots::ReasonReofferCooldown::from(body(1))
+            ),
+            (
+                fp(2),
+                crate::snapshots::ReasonReofferCooldown::from(body(2))
+            ),
+            (
+                fp(4),
+                crate::snapshots::ReasonReofferCooldown::from(body(4))
+            )
+        ])
     );
     let mut mismatched = progress.clone();
     mismatched
@@ -798,7 +813,16 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
     assert_eq!(progress.active_reason_reoffers[&fp(2)], body(2));
     assert_eq!(
         progress.reason_reoffer_cooldowns(NOW + 300),
-        BTreeMap::from([(fp(1), body(1)), (fp(4), body(4))])
+        BTreeMap::from([
+            (
+                fp(1),
+                crate::snapshots::ReasonReofferCooldown::from(body(1))
+            ),
+            (
+                fp(4),
+                crate::snapshots::ReasonReofferCooldown::from(body(4))
+            )
+        ])
     );
     let mut counts = progress.reason_reoffer_counts;
     counts.cooldown_conflict_deferred = 2;
