@@ -9,6 +9,7 @@ use serde::de::{
     self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess,
     SeqAccess, VariantAccess, Visitor,
 };
+use serde_json::json;
 use serde_json::value::RawValue;
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
@@ -16,6 +17,8 @@ use std::collections::BTreeSet;
 type DeError = de::value::Error;
 type Schema = BTreeMap<String, BTreeSet<String>>;
 type Fill = fn(&mut ScanIndex, &mut Synth) -> Result<()>;
+/// A value given at a path whose reader the type alone cannot drive.
+type Given = fn(&mut Synth) -> Result<Json, DeError>;
 /// One stored row: kind, key, position and its logical JSON.
 type Row = (String, String, u64, Box<RawValue>);
 
@@ -26,7 +29,9 @@ const RELEASE_LAYOUT: u32 = 5;
 /// Controls the frozen release stored beside its rows.
 const RELEASE_META: [&str; 3] = ["schema_version", "catalogue_layout", "field_presence"];
 /// A collection stops growing here even if an enum inside it has not cycled.
-const WIDTH: usize = 8;
+const WIDTH: usize = 16;
+/// Below this depth options are `None` and collections empty.
+const DEPTH: usize = 48;
 /// Shapes offered to a self-describing (`deserialize_any`) reader, in order.
 const ANY_SHAPES: usize = 4;
 
@@ -35,22 +40,34 @@ const ANY_SHAPES: usize = 4;
 struct Synth {
     strings: u64,
     path: Vec<String>,
+    depth: usize,
     error_path: Option<String>,
-    /// Per enum: variants offered so far, and its declared variant names.
-    enums: BTreeMap<&'static str, (usize, &'static [&'static str])>,
+    /// Per enum or given path: alternatives offered so far, and their count.
+    enums: BTreeMap<String, (usize, usize)>,
     /// Enums offered, in order: a collection grows until its enums cycle.
-    visits: Vec<&'static str>,
+    visits: Vec<String>,
     /// The shape each self-describing reader takes, by path.
     any: BTreeMap<String, usize>,
     pending_any: Option<String>,
     /// Field names a struct also accepts as an alias of an emitted one.
     skip: BTreeSet<(&'static str, &'static str)>,
     last_key: Option<(&'static str, &'static str)>,
+    /// Values given by path suffix, and the path one is being built at.
+    given: Vec<(&'static str, Vec<Given>)>,
+    giving: Option<String>,
 }
 impl Synth {
-    fn like<T: DeserializeOwned>(&mut self, _: &T) -> Result<T> {
-        for _ in 0..64 {
-            self.path.clear();
+    fn new() -> Self {
+        Self {
+            given: given(),
+            ..Self::default()
+        }
+    }
+    /// A sample of `field`'s type. A self-describing reader is offered each
+    /// shape in turn, and an alias of an emitted field is skipped.
+    fn like<T: DeserializeOwned>(&mut self, field: &str, _: &T) -> Result<T> {
+        for _ in 0..256 {
+            self.path = vec![field.to_owned()];
             self.error_path = None;
             self.pending_any = None;
             self.last_key = None;
@@ -74,11 +91,19 @@ impl Synth {
             let at = self.error_path.take().unwrap_or_default();
             anyhow::bail!("{error} at /{at}");
         }
-        anyhow::bail!("no sample after 64 attempts")
+        anyhow::bail!("{field}: no sample after 256 attempts")
+    }
+    /// A sample of `T` at the current path, as JSON.
+    fn json<T: DeserializeOwned + Serialize>(&mut self) -> Result<Json, DeError> {
+        let value = T::deserialize(Gen(self))?;
+        serde_json::to_value(value).map_err(de::Error::custom)
     }
     fn string(&mut self) -> String {
         self.strings += 1;
         format!("{:064x}", self.strings)
+    }
+    fn deep(&self) -> bool {
+        self.path.len() > DEPTH || self.depth > DEPTH
     }
     fn nested<R>(
         &mut self,
@@ -93,23 +118,61 @@ impl Synth {
         self.path.pop();
         result
     }
+    /// The next of `count` alternatives `name` offers.
+    fn offer(&mut self, name: String, count: usize) -> usize {
+        let offered = &mut self.enums.entry(name.clone()).or_insert((0, count)).0;
+        let pick = *offered % count;
+        *offered += 1;
+        self.visits.push(name);
+        pick
+    }
     /// Whether a collection begun at `from` takes member `index`: its first,
     /// then more while an enum offered inside it still has a variant to offer.
     fn grows(&self, index: usize, from: usize) -> bool {
         index == 0
             || (index < WIDTH
+                && !self.deep()
                 && self.visits[from..].iter().any(|name| {
                     self.enums
                         .get(name)
-                        .is_some_and(|(offered, all)| *offered < all.len())
+                        .is_some_and(|(offered, count)| offered < count)
                 }))
+    }
+    /// The value given for the current path, if one is.
+    fn given_here(&mut self) -> Result<Option<Json>, DeError> {
+        let path = self.path.join("/");
+        if self.giving.as_deref() == Some(path.as_str()) {
+            return Ok(None);
+        }
+        let Some(at) = self.given.iter().position(|(suffix, _)| {
+            path.strip_suffix(suffix)
+                .is_some_and(|head| head.is_empty() || head.ends_with('/'))
+        }) else {
+            return Ok(None);
+        };
+        let count = self.given[at].1.len();
+        let pick = self.offer(format!("given {path}"), count);
+        let make = self.given[at].1[pick];
+        let outer = self.giving.replace(path);
+        let json = make(self);
+        self.giving = outer;
+        json.map(Some)
     }
 }
 
 struct Gen<'a>(&'a mut Synth);
+/// Answers from the given value at this path, when there is one.
+macro_rules! given {
+    ($gen:ident.$method:ident($($arg:expr),*)) => {
+        if let Some(json) = $gen.0.given_here()? {
+            return json.$method($($arg),*).map_err(de::Error::custom);
+        }
+    };
+}
 macro_rules! one {
     ($($method:ident)*) => {$(
         fn $method<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+            given!(self.$method(v));
             v.visit_u64(1)
         }
     )*};
@@ -117,6 +180,7 @@ macro_rules! one {
 impl<'de> Deserializer<'de> for Gen<'_> {
     type Error = DeError;
     fn deserialize_any<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_any(v));
         let s = self.0;
         let path = s.path.join("/");
         let shape = s.any.get(&path).copied().unwrap_or_default();
@@ -133,6 +197,7 @@ impl<'de> Deserializer<'de> for Gen<'_> {
         result
     }
     fn deserialize_bool<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_bool(v));
         v.visit_bool(true)
     }
     one! {
@@ -140,40 +205,58 @@ impl<'de> Deserializer<'de> for Gen<'_> {
         deserialize_u8 deserialize_u16 deserialize_u32 deserialize_u64 deserialize_u128
     }
     fn deserialize_f32<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_f32(v));
         v.visit_f64(1.5)
     }
     fn deserialize_f64<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_f64(v));
         v.visit_f64(1.5)
     }
     fn deserialize_char<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_char(v));
         v.visit_char('a')
     }
     fn deserialize_str<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_str(v));
         v.visit_string(self.0.string())
     }
     fn deserialize_string<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_string(v));
         v.visit_string(self.0.string())
     }
     fn deserialize_identifier<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_identifier(v));
         v.visit_string(self.0.string())
     }
     fn deserialize_bytes<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_bytes(v));
         v.visit_byte_buf(vec![1])
     }
     fn deserialize_byte_buf<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_byte_buf(v));
         v.visit_byte_buf(vec![1])
     }
     fn deserialize_option<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
-        v.visit_some(self)
+        given!(self.deserialize_option(v));
+        let s = self.0;
+        if s.deep() {
+            return v.visit_none();
+        }
+        s.depth += 1;
+        let result = v.visit_some(Gen(&mut *s));
+        s.depth -= 1;
+        result
     }
     fn deserialize_unit<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_unit(v));
         v.visit_unit()
     }
     fn deserialize_unit_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         v: V,
     ) -> Result<V::Value, DeError> {
+        given!(self.deserialize_unit_struct(name, v));
         v.visit_unit()
     }
     fn deserialize_newtype_struct<V: Visitor<'de>>(
@@ -181,26 +264,35 @@ impl<'de> Deserializer<'de> for Gen<'_> {
         name: &'static str,
         v: V,
     ) -> Result<V::Value, DeError> {
+        given!(self.deserialize_newtype_struct(name, v));
         if name == "$serde_json::private::RawValue" {
             return Err(de::Error::custom("raw JSON value"));
         }
-        v.visit_newtype_struct(self)
+        let s = self.0;
+        s.depth += 1;
+        let result = v.visit_newtype_struct(Gen(&mut *s));
+        s.depth -= 1;
+        result
     }
     fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_seq(v));
         v.visit_seq(Elements::new(self.0, None))
     }
     fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_tuple(len, v));
         v.visit_seq(Elements::new(self.0, Some(len)))
     }
     fn deserialize_tuple_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         len: usize,
         v: V,
     ) -> Result<V::Value, DeError> {
+        given!(self.deserialize_tuple_struct(name, len, v));
         v.visit_seq(Elements::new(self.0, Some(len)))
     }
     fn deserialize_map<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
+        given!(self.deserialize_map(v));
         let from = self.0.visits.len();
         v.visit_map(Entries {
             s: self.0,
@@ -214,6 +306,7 @@ impl<'de> Deserializer<'de> for Gen<'_> {
         fields: &'static [&'static str],
         v: V,
     ) -> Result<V::Value, DeError> {
+        given!(self.deserialize_struct(name, fields, v));
         v.visit_map(Fields::new(self.0, name, fields))
     }
     fn deserialize_enum<V: Visitor<'de>>(
@@ -222,14 +315,12 @@ impl<'de> Deserializer<'de> for Gen<'_> {
         variants: &'static [&'static str],
         v: V,
     ) -> Result<V::Value, DeError> {
-        let s = self.0;
+        given!(self.deserialize_enum(name, variants, v));
         if variants.is_empty() {
             return Err(de::Error::custom("enum without variants"));
         }
-        let offered = &mut s.enums.entry(name).or_insert((0, variants)).0;
-        let pick = variants[*offered % variants.len()];
-        *offered += 1;
-        s.visits.push(name);
+        let s = self.0;
+        let pick = variants[s.offer(format!("enum {name}"), variants.len())];
         s.nested(pick, |s| v.visit_enum(Variant { s, pick }))
     }
     fn deserialize_ignored_any<V: Visitor<'de>>(self, v: V) -> Result<V::Value, DeError> {
@@ -262,7 +353,7 @@ impl<'de> SeqAccess<'de> for Elements<'_> {
     ) -> Result<Option<T::Value>, DeError> {
         let more = match self.len {
             Some(len) => self.index < len,
-            None => self.s.grows(self.index, self.from),
+            None => !self.s.deep() && self.s.grows(self.index, self.from),
         };
         if !more {
             return Ok(None);
@@ -282,11 +373,11 @@ impl<'de> MapAccess<'de> for Entries<'_> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, DeError> {
-        if !self.s.grows(self.index, self.from) {
+        if self.s.deep() || !self.s.grows(self.index, self.from) {
             return Ok(None);
         }
         self.index += 1;
-        seed.deserialize(Gen(&mut *self.s)).map(Some)
+        self.s.nested("~", |s| seed.deserialize(Gen(s))).map(Some)
     }
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, DeError> {
         self.s.nested("*", |s| seed.deserialize(Gen(s)))
@@ -373,7 +464,7 @@ fn fills() -> Vec<(&'static str, Fill)> {
             fills.push((
                 stringify!($f),
                 (|index: &mut ScanIndex, synth: &mut Synth| -> Result<()> {
-                    index.$f = synth.like(&index.$f)?;
+                    index.$f = synth.like(stringify!($f), &index.$f)?;
                     Ok(())
                 }) as Fill,
             ));
@@ -570,20 +661,164 @@ fn unwritten(kind: &str) -> bool {
         )
 }
 
-/// A fixture index with every stored field filled from its type.
+/// Fields whose readers take only their own encoding: the fixture's values.
+const KEPT: [&str; 3] = [
+    "claude_request_census",
+    "claude_request_census_shadow",
+    "claude_account_family_pending",
+];
+/// A fixture index with every other stored field filled from its type.
 fn sample() -> ScanIndex {
     let mut index = fixture();
-    let mut synth = Synth::default();
+    let mut synth = Synth::new();
     for (name, fill) in fills() {
-        fill(&mut index, &mut synth).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        if !KEPT.contains(&name) {
+            fill(&mut index, &mut synth).unwrap_or_else(|e| panic!("{e:#}"));
+        }
     }
     index
+}
+/// Wraps a constructor for one given value.
+fn g(given: Given) -> Given {
+    given
+}
+fn tagged(mut value: Json, tag: &str, name: &str) -> Result<Json, DeError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| de::Error::custom("tagged payload"))?;
+    object.insert(tag.to_owned(), name.into());
+    Ok(value)
+}
+/// Values for readers a type cannot drive: internally tagged enums, readers
+/// that decode any JSON and keep a default on failure, and binary encodings.
+fn given() -> Vec<(&'static str, Vec<Given>)> {
+    use crate::local_resource_diagnostics::CapCounts;
+    use crate::snapshots::codex_file_join::AppliedTierReceipt;
+    use crate::snapshots::evidence_owed::EvidenceContract;
+    use crate::snapshots::{
+        ClaudeStaleFamilyCarryOrigin, CodexParentPrefixProof, CodexParentProofOwed, WakeStamp,
+    };
+    fn wake(kind: &str, s: &mut Synth) -> Result<Json, DeError> {
+        let (parent, child) = (s.json::<WakeStamp>()?, s.json::<WakeStamp>()?);
+        Ok(json!({"kind": kind, "parent": parent, "child": child}))
+    }
+    vec![
+        (
+            "codex_parent_side_requests/*/state",
+            vec![
+                g(|_| Ok(json!({"kind": "live"}))),
+                g(|_| Ok(json!({"kind": "evicted"}))),
+                g(|_| Ok(json!({"kind": "short", "covered": 1}))),
+                g(|_| Ok(json!({"kind": "lossy"}))),
+                g(|_| Ok(json!({"kind": "unsealed"}))),
+            ],
+        ),
+        (
+            "codex_parent_side/*/verdict",
+            vec![
+                g(|_| Ok(json!({"kind": "settled"}))),
+                g(|_| Ok(json!({"kind": "held", "lineage": true, "cause": 1}))),
+            ],
+        ),
+        (
+            "codex_parent_prefix_proofs/*",
+            vec![
+                g(|s| tagged(s.json::<CodexParentPrefixProof>()?, "state", "proven")),
+                g(|s| tagged(s.json::<CodexParentProofOwed>()?, "state", "owed")),
+            ],
+        ),
+        (
+            "codex_parent_prefix_proofs/*/wake",
+            vec![
+                g(|_| Ok(json!({"kind": "due"}))),
+                g(|s| wake("parent_changed", s)),
+                g(|s| wake("child_changed", s)),
+                g(|s| wake("rewritten", s)),
+                g(|s| {
+                    let (matches, child) = (s.string(), s.json::<WakeStamp>()?);
+                    Ok(json!({"kind": "census", "matches": matches, "child": child}))
+                }),
+                g(|s| {
+                    let (key, entry) = (s.string(), s.string());
+                    Ok(
+                        json!({"kind": "parent_held", "parent_key": key, "generation": 1,
+                        "parent_entry": entry, "parent": s.json::<WakeStamp>()?,
+                        "lineage": true, "needed_extent": 1}),
+                    )
+                }),
+                g(|_| Ok(json!({"kind": "backoff"}))),
+            ],
+        ),
+        ("traversal/counts/caps", vec![g(|s| s.json::<CapCounts>())]),
+        (
+            "claude_stale_family_carry/origin",
+            vec![g(|s| s.json::<ClaudeStaleFamilyCarryOrigin>())],
+        ),
+        (
+            "claude_usage_family_pending/*/identity_contract",
+            vec![g(|s| s.json::<EvidenceContract>())],
+        ),
+        (
+            "claude_usage_family_pending/*/contract_unproven",
+            vec![g(|_| Ok(json!(true)))],
+        ),
+        (
+            "files/*/codex_applied_tier_receipt",
+            vec![g(|s| s.json::<AppliedTierReceipt>())],
+        ),
+        (
+            "files/*/codex_captured_tier_receipt",
+            vec![g(|s| s.json::<AppliedTierReceipt>())],
+        ),
+        (
+            "files/*/codex_captured_joined_member_set",
+            vec![g(|s| Ok(s.string().into()))],
+        ),
+        (
+            "files/*/codex_protected_owner",
+            vec![g(|s| Ok(s.string().into()))],
+        ),
+        (
+            "files/*/codex_counting_owner",
+            vec![g(|s| Ok(s.string().into()))],
+        ),
+        (
+            "claude_retired_family_tombstones",
+            vec![g(|s| {
+                let mut roots = serde_json::Map::new();
+                roots.insert(s.string(), 1.into());
+                Ok(Json::Object(roots))
+            })],
+        ),
+        (
+            "claude_money_birth_store",
+            vec![g(|_| Ok(BIRTH_STORE.into()))],
+        ),
+        (
+            "claude_copy_removals",
+            vec![g(|_| {
+                Ok(super::super::super::money_test_support::CCR2_DEFINITE.into())
+            })],
+        ),
+    ]
+}
+/// A birth store as the release encodes it (CMB5).
+const BIRTH_STORE: &str = "Q01CNQEAAAADwxjXlms0BKSq4FMStJ_t-wnx8yRWvP0MaTz_mpBVywBgwSna6scYAAAAAAAAAAABAAAA-wnx8yRWvP0MaTz_mpBVywBgwSna6scYAQAAANzp6EjGhiOxfQEAAAAAAQAAAPsJ8fMkVrz9DGk8_5qQVcsE";
+/// Runs `f` on a thread with room for the deep serde stacks of a full sample.
+fn deep_stack(f: impl FnOnce() + Send + 'static) {
+    let worker = std::thread::Builder::new().stack_size(256 << 20).spawn(f);
+    if let Err(panic) = worker.unwrap().join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// [format] Every field path the writer stores is in the append-only history,
 /// and each path the writer no longer stores still loads through the reader.
 #[test]
 fn stored_field_paths_only_grow_and_retired_paths_still_load() {
+    deep_stack(stored_field_paths_check);
+}
+fn stored_field_paths_check() {
     let index = sample();
     let (_scratch, mut db) = stored(&index).unwrap();
     let current = schema(&dump(&mut db).unwrap().rows).unwrap();
@@ -624,21 +859,17 @@ fn stored_field_paths_only_grow_and_retired_paths_still_load() {
 }
 fn retired_path_loads(index: &ScanIndex, kind: &str, path: &str) {
     let (_scratch, mut db) = stored(index).unwrap();
+    let rows = dump(&mut db).unwrap().rows;
+    let (key, row) = rows
+        .iter()
+        .filter(|row| row.0 == kind)
+        .find_map(|(_, name, position, value)| {
+            let mut row: Json = serde_json::from_str(value.get()).unwrap();
+            insert(&mut row, &segments(path)).then(|| (mapper::key(kind, name, *position), row))
+        })
+        .unwrap_or_else(|| panic!("{kind}: no row can hold retired {path}"));
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    let headers = tx
-        .scan_kind(&RecordKind::parse(kind).unwrap(), None, 1 << 16)
-        .unwrap();
-    let mut written = false;
-    for h in headers {
-        let raw: Box<RawValue> = mapper::read(&mut tx, &h, None).unwrap();
-        let mut row: Json = serde_json::from_str(raw.get()).unwrap();
-        if insert(&mut row, &segments(path)) {
-            mapper::put(&mut tx, &h.key, &row).unwrap();
-            written = true;
-            break;
-        }
-    }
-    assert!(written, "{kind}: no row can hold retired {path}");
+    mapper::put(&mut tx, &key.unwrap(), &row).unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     if let Err(e) = hydrate(&mut db, Scratch::binding()) {
         panic!("{kind}: a row holding retired {path} refused: {e:#}");
@@ -649,6 +880,9 @@ fn retired_path_loads(index: &ScanIndex, kind: &str, path: &str) {
 /// values, load through the current reader.
 #[test]
 fn previous_release_rows_load_through_the_current_reader() {
+    deep_stack(previous_release_check);
+}
+fn previous_release_check() {
     let release: Release = serde_json::from_str(&read_fixture(RELEASE)).unwrap();
     let kinds: BTreeSet<&str> = release.rows.iter().map(|row| row.0.as_str()).collect();
     for (kind, _) in catalogue::OWNED {
@@ -667,34 +901,40 @@ fn previous_release_rows_load_through_the_current_reader() {
 /// Discovery report for building the fixtures; removed before review.
 #[test]
 fn bootstrap_report() {
-    let mut out = String::from("BOOTSTRAP-REPORT\n");
+    deep_stack(bootstrap);
+}
+fn bootstrap() {
+    println!("BOOTSTRAP-REPORT");
     let mut index = fixture();
-    let mut synth = Synth::default();
+    let mut synth = Synth::new();
     for (name, fill) in fills() {
+        println!("FIELD try {name}");
         let mut one = fixture();
-        let result = fill(&mut one, &mut Synth::default()).and_then(|()| {
+        let mut alone = Synth::new();
+        let result = fill(&mut one, &mut alone).and_then(|()| {
+            for gap in coverage(&one).iter().filter(|g| g.starts_with(name)) {
+                println!("GAP {gap}");
+            }
             let (_scratch, mut db) = stored(&one)?;
             let (restored, _) = hydrate(&mut db, Scratch::binding())?;
             let same = serde_json::to_vec(&restored)? == serde_json::to_vec(&one)?;
             Ok(same)
         });
+        println!("ANY {name} {:?} SKIP {:?}", alone.any, alone.skip);
+        for (key, (offered, count)) in &alone.enums {
+            if offered < count {
+                println!("ENUM {name} {key} offered {offered} of {count}");
+            }
+        }
         match result {
             Ok(same) => {
-                out += &format!("FIELD ok {name} roundtrip_equal={same}\n");
-                fill(&mut index, &mut synth).unwrap();
+                println!("FIELD ok {name} roundtrip_equal={same}");
+                if !KEPT.contains(&name) {
+                    fill(&mut index, &mut synth).unwrap();
+                }
             }
-            Err(e) => out += &format!("FIELD err {name}: {e:#}\n"),
+            Err(e) => println!("FIELD err {name}: {e:#}"),
         }
-    }
-    out += &format!("ANY {:?}\nSKIP {:?}\n", synth.any, synth.skip);
-    for (name, (offered, all)) in &synth.enums {
-        if *offered < all.len() {
-            out += &format!("ENUM {name} offered {offered} of {all:?}\n");
-        }
-    }
-    let gaps = coverage(&index);
-    for gap in &gaps {
-        out += &format!("GAP {gap}\n");
     }
     match stored(&index).and_then(|(scratch, mut db)| {
         let release = dump(&mut db)?;
@@ -706,27 +946,26 @@ fn bootstrap_report() {
             let current = schema(&release.rows).unwrap();
             for (kind, _) in catalogue::OWNED {
                 if !current.contains_key(*kind) {
-                    out += &format!("NOKIND {kind}\n");
+                    println!("NOKIND {kind}");
                 }
             }
-            out += &format!(
-                "SCHEMA-BEGIN\n{}\nSCHEMA-END\n",
+            println!(
+                "SCHEMA-BEGIN\n{}\nSCHEMA-END",
                 serde_json::to_string_pretty(&current).unwrap()
             );
-            out += "RELEASE-BEGIN\n{\"meta\":";
-            out += &serde_json::to_string(&release.meta).unwrap();
-            out += ",\n\"rows\":[\n";
             let rows: Vec<String> = release
                 .rows
                 .iter()
                 .map(|row| serde_json::to_string(row).unwrap())
                 .collect();
-            out += &rows.join(",\n");
-            out += "\n]}\nRELEASE-END\n";
+            println!(
+                "RELEASE-BEGIN\n{{\"meta\":{},\n\"rows\":[\n{}\n]}}\nRELEASE-END",
+                serde_json::to_string(&release.meta).unwrap(),
+                rows.join(",\n")
+            );
         }
-        Err(e) => out += &format!("COMBINED err {e:#}\n"),
+        Err(e) => println!("COMBINED err {e:#}"),
     }
-    println!("{out}");
     panic!("bootstrap report");
 }
 
