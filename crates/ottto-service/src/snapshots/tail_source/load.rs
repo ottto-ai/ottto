@@ -379,7 +379,14 @@ fn stored<S: TailSource>(
             None => Miss::Reconstruct(ReconstructCause::Corrupt),
         });
     }
-    let table = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
+    // The reduction's collections only: `Revisions` is the file's freshness
+    // debt (G7), never a reduction page (`load_tail` skips it too).
+    let table = head
+        .table
+        .iter()
+        .filter(|(c, _)| **c != state_v2::Collection::Revisions)
+        .map(|(c, m)| (*c, m.meta))
+        .collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
     S::install_live(&mut acc, fresh, live).map_err(|error| match error {
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
