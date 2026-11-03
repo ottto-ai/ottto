@@ -1532,6 +1532,7 @@ fn group_with_legacy_tee_is_byte_charged() {
         retained_finalization_charge: 0,
         retained_usage: None,
         reinsertion: Default::default(),
+        tier_prefix_replay: false,
     });
     let acquisition = active.parser.reader.acquisition.replace(plan);
     let replay = active.parser.accumulator.codex_tier_replay.take();
