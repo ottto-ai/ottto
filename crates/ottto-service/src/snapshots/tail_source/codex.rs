@@ -608,12 +608,16 @@ impl TailSource for Codex {
     /// reconstruction. Never a silent success. In order: the counting rule,
     /// the priority decisions, the sidecar's projected ordinal, the parent
     /// evidence the stored boundary used; then the traces, ledgers and file
-    /// birth. A protected receipt and a group never reach a load (their
-    /// replays are counted where they read); the tier replay is configured
-    /// after the load, on the restored state.
+    /// birth. Last, the file's lineage (D131): the stored head continues only
+    /// the session its owning header named when it was written, so a header
+    /// rewritten to another id is another file (a counted `Identity`
+    /// reconstruction), and a header this read cannot read waits. A protected
+    /// receipt and a group never reach a load (their replays are counted
+    /// where they read); the tier replay is configured after the load, on
+    /// the restored state.
     fn install_live(
         stored: &mut SnapshotAccumulator,
-        _fresh: &CandidateFile,
+        fresh: &CandidateFile,
         live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError> {
         let incompatible = LiveLoadError::Reconstruct(ReconstructCause::Incompatible);
@@ -644,6 +648,11 @@ impl TailSource for Codex {
             _ => {}
         }
         install_parent(stored, live)?;
+        match crate::snapshots::codex_file_join::header_owner(fresh) {
+            Ok(owner) if stored.codex_creator_header_id.as_deref() == Some(owner.as_str()) => {}
+            Ok(_) => return Err(LiveLoadError::Reconstruct(ReconstructCause::Identity)),
+            Err(_) => return Err(LiveLoadError::Unavailable),
+        }
         stored.codex_sidecar_projected_next_ordinal = live.codex_sidecar_projected_next_ordinal;
         stored
             .claude_file_birth
