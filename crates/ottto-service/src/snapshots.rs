@@ -53419,6 +53419,9 @@ pub(crate) fn claude_registration_display_title(value: String) -> Option<String>
 }
 
 pub(crate) fn prompt_prefix_display_title(value: String) -> Option<String> {
+    if looks_like_resume_boilerplate(&value.trim().to_ascii_lowercase()) {
+        return None;
+    }
     normalize_display_title(value, "first_prompt")
 }
 
