@@ -10167,11 +10167,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 clear_claude_context_posture(item);
             }
         }
-        // Cache rows ship only for an Admitted file, and only its own
-        // requests: those not more than the copy slack before its content
-        // birth. No content birth (no timed own response) ships nothing.
+        // Cache rows ship only for an owned file (a strict owned start or an
+        // Admitted file birth), and only its own requests: those not more
+        // than the copy slack before its content birth. No content birth (no
+        // timed own response) ships nothing.
         item.cache_observations = cache_birth
-            .filter(|_| item.claude_file_birth_verdict == Some(ClaudeFileBirthVerdict::Admitted))
+            .filter(|_| {
+                posture_owned
+                    || item.claude_file_birth_verdict == Some(ClaudeFileBirthVerdict::Admitted)
+            })
             .map(|birth| {
                 cache_wire(
                     &item.source_session_id,
@@ -82371,77 +82375,6 @@ pub(crate) mod cache_adapter_tests {
         assert_eq!(absent.cache_read_tokens, None);
         assert_eq!(absent.cache_creation_tokens, None);
         assert_eq!(absent.prompt_tokens, None);
-    }
-    /// [regress] A session past the server's 64-operation patch bound
-    /// ships every row: the rest follow on the next upload, never dropped.
-    #[test]
-    fn cache_wire_past_the_patch_bound_sends_the_rest_next_upload() {
-        let warm = OwnedRequest {
-            slot: RequestSlot {
-                request_ref: "A".into(),
-                occurred_at: "2026-09-30T10:00:00Z".into(),
-                model: Some("m".into()),
-                prompt_tokens: Some(100_000),
-                cache_read_tokens: Some(90_000),
-                ..Default::default()
-            },
-            ordering: "sequential".into(),
-            compaction_before: false,
-            configuration_changed: false,
-            configuration_witness: None,
-            idle_seconds: None,
-        };
-        let mut cold = warm.clone();
-        cold.slot.request_ref = "B".into();
-        cold.slot.cache_read_tokens = Some(0);
-        let mut pathological = vec![warm.clone()];
-        for index in 0..65 {
-            let mut cold = cold.clone();
-            cold.slot.request_ref = format!("cold_{index}");
-            pathological.push(cold);
-        }
-        let wire = cache_wire("s", &pathological, true);
-        assert_eq!(wire.operations.len(), 65, "the detector keeps every row");
-        assert_eq!(wire.coverage, "complete");
-        // The server takes 64 operations per patch: the first upload sends
-        // the first 64 and counts the last; the next sends only that one.
-        let mut first = super::tests::sample_session_artifact_item();
-        first.cache_observations = Some(wire.clone());
-        prepare_cache_observations(&mut first, None);
-        let sent = first.cache_observations.unwrap();
-        assert_eq!(sent.operations.len(), cache_observations::MAX_OPERATIONS);
-        assert_eq!(
-            (sent.coverage.as_str(), sent.omitted_observation_count),
-            ("partial", Some(1))
-        );
-        let accepted = first.cache_observations_state.unwrap();
-        let mut next = super::tests::sample_session_artifact_item();
-        next.cache_observations = Some(wire);
-        prepare_cache_observations(&mut next, Some(&accepted));
-        let rest = next.cache_observations.unwrap();
-        assert!(matches!(
-            rest.operations.as_slice(),
-            [cache_observations::Operation::Upsert { observation }]
-                if observation.affected_request_ref == "cold_64"
-        ));
-        assert_eq!(rest.coverage, "complete");
-        assert_eq!(
-            next.cache_observations_state.unwrap()["observations"]
-                .as_array()
-                .unwrap()
-                .len(),
-            65
-        );
-        let patch = cache_wire("s", &[warm.clone(), cold], true);
-        let prior = cache_state_from_patch(None, &patch).unwrap();
-        let current = cache_wire("s", &[warm], true);
-        let mut item = super::tests::sample_session_artifact_item();
-        item.cache_observations = Some(current);
-        prepare_cache_observations(&mut item, Some(&prior));
-        assert!(matches!(
-            item.cache_observations.unwrap().operations[0],
-            cache_observations::Operation::Retract { .. }
-        ));
     }
 }
 

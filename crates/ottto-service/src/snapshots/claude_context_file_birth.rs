@@ -351,7 +351,7 @@ impl ClaudeFileBirth {
         let ClaudeBirthScope::Root(birth) = self.scope else {
             return None;
         };
-        Some(at? < birth.checked_sub(slack)?)
+        before_birth(at?, birth, slack)
     }
 
     pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
@@ -567,16 +567,14 @@ pub(super) fn apply_own_context_scalars(
 /// response, then the lower session id: content only, so cold, Tail and
 /// restored reads agree. `None` when no own response has a readable time.
 pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
+    use super::claude_request_money::e2::{earlier_holders, first_own_turn_at};
     let order = items
         .iter()
         .map(|item| {
-            let first = item
-                .claude_usage_occurrences
-                .values()
-                .min_by_key(|occurrence| occurrence.sequence)
-                .and_then(|occurrence| occurrence.timestamp.as_deref())
-                .and_then(rfc3339_unix_nanos);
-            (first, item.source_session_id.as_str())
+            (
+                first_own_turn_at(item, 0, &[]),
+                item.source_session_id.as_str(),
+            )
         })
         .collect::<Vec<_>>();
     let mut families = BTreeMap::<&str, Vec<usize>>::new();
@@ -590,16 +588,13 @@ pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> 
         .iter()
         .enumerate()
         .map(|(at, item)| {
-            let earlier = families[claude_snapshot_family_root_ref(item)]
-                .iter()
-                .filter(|&&other| order[other] < order[at])
-                .map(|&other| &items[other].claude_usage_request_ids)
-                .collect::<Vec<_>>();
-            super::claude_request_money::e2::first_own_turn_at(
-                item,
-                item.claude_file_birth.first_own_sequence?,
-                &earlier,
-            )
+            let earlier = earlier_holders(
+                items,
+                &families[claude_snapshot_family_root_ref(item)],
+                &order[at],
+                |other| Some(order[other]),
+            );
+            first_own_turn_at(item, item.claude_file_birth.first_own_sequence?, &earlier)
         })
         .collect()
 }
@@ -608,8 +603,15 @@ pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> 
 /// the copy slack before the content birth. An unreadable time is kept, so
 /// the wire makes the session partial instead of dropping it.
 pub(super) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
-    rfc3339_unix_nanos(occurred_at)
-        .map_or(true, |at| at >= birth - CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS)
+    rfc3339_unix_nanos(occurred_at).map_or(true, |at| {
+        before_birth(at, birth, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) != Some(true)
+    })
+}
+
+/// Whether `at` is more than `slack` before `birth`; `None` when that bound
+/// does not fit.
+fn before_birth(at: i128, birth: i128, slack: i128) -> Option<bool> {
+    Some(at < birth.checked_sub(slack)?)
 }
 
 /// When the session's first own request ended (`first_own_request_at`): only for

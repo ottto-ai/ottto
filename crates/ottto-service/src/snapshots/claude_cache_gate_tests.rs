@@ -5,16 +5,13 @@
 // before the test file's real birth and copied ones days earlier.
 use super::*;
 
-/// One response of a 100,000-token prompt with `read` tokens from cache
-/// (90,000 is warm, 0 is cold).
+/// The parent's [`assistant`] as a 100,000-token prompt with `read` tokens
+/// from cache (90,000 is warm, 0 is cold).
 fn cached(session: &str, request: &str, timestamp: &str, read: u64) -> String {
-    let uncached = 100_000 - read;
-    format!(
-        "{{\"timestamp\":\"{timestamp}\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"id\":\"msg_{request}\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":{uncached},\"cache_read_input_tokens\":{read},\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}}}}\n"
-    )
+    with_cache_read(assistant(session, request, timestamp, 100_000 - read), read)
 }
 
-/// [`cached`] in a subagent transcript of `session`.
+/// The parent's [`subagent_assistant`], read as in [`cached`].
 fn subagent_cached(
     session: &str,
     agent: &str,
@@ -22,9 +19,18 @@ fn subagent_cached(
     timestamp: &str,
     read: u64,
 ) -> String {
-    let uncached = 100_000 - read;
-    format!(
-        "{{\"timestamp\":\"{timestamp}\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"{request}\",\"message\":{{\"id\":\"msg_{request}\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":{uncached},\"cache_read_input_tokens\":{read},\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}}}}\n"
+    let line = subagent_assistant(session, agent, request, timestamp);
+    let line = line.replace(
+        "\"input_tokens\":40,",
+        &format!("\"input_tokens\":{},", 100_000 - read),
+    );
+    with_cache_read(line, read)
+}
+
+fn with_cache_read(line: String, read: u64) -> String {
+    line.replace(
+        "\"output_tokens\":1",
+        &format!("\"cache_read_input_tokens\":{read},\"cache_creation_input_tokens\":0,\"output_tokens\":1"),
     )
 }
 

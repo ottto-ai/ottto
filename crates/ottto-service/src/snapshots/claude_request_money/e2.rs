@@ -2514,25 +2514,40 @@ fn twin_page_held(
     order: (i128, LocationKey),
 ) -> BTreeSet<u64> {
     let item = &items[at];
-    let earlier = page_folds
-        .get(item.source_session_id.as_str())
-        .into_iter()
-        .flatten()
-        .filter(|&&other| {
+    let earlier = earlier_holders(
+        items,
+        page_folds
+            .get(item.source_session_id.as_str())
+            .map_or(&[][..], Vec::as_slice),
+        &order,
+        |other| {
             items[other]
                 .claude_money
                 .as_deref()
                 .and_then(FileFold::copy_order)
-                .is_some_and(|earlier| earlier < order)
-        })
-        .map(|&other| &items[other].claude_usage_request_ids)
-        .collect::<Vec<_>>();
+        },
+    );
     if earlier.is_empty() || !twin_copy_born_from_cutoff(item, &earlier) {
         return BTreeSet::new();
     }
     skipped_ids(item)
         .filter(|id| earlier.iter().any(|ids| ids.contains(*id)))
         .map(|id| claude_request_hash(id))
+        .collect()
+}
+
+/// The request ids of the files in `group` that come before `at` in the
+/// caller's `order`; a file without a place in that order holds nothing.
+pub(in crate::snapshots) fn earlier_holders<'a, K: Ord>(
+    items: &'a [SnapshotItem],
+    group: &[usize],
+    at: &K,
+    order: impl Fn(usize) -> Option<K>,
+) -> Vec<&'a BTreeSet<String>> {
+    group
+        .iter()
+        .filter(|&&other| order(other).is_some_and(|key| key < *at))
+        .map(|&other| &items[other].claude_usage_request_ids)
         .collect()
 }
 

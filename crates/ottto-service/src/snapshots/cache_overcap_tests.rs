@@ -91,7 +91,8 @@ fn settle(requests: &[OwnedRequest], mut prior: Option<Value>) -> Value {
 /// server's per-session state bound, past which the count stays exact.
 #[test]
 fn long_session_uploads_every_break_across_patches_with_exact_omitted_count() {
-    for breaks in [64, 65, 10_000] {
+    // One patch, one past it, and one past the per-session row bound (128).
+    for breaks in [64, 65, 129] {
         let requests = session("", breaks);
         let wire = cache_wire("s", &requests, true);
         assert_eq!(upserted(&wire), colds(0..breaks), "{breaks}");
