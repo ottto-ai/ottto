@@ -4118,7 +4118,7 @@ mod tests {
         let unconfirmed =
             Cli::parse_from(["ottto", "logout", "--local-only", "--forget-installation"]);
         let error = validate_cli(&unconfirmed).expect_err("confirmation required");
-        assert!(error.message.contains("local receipts"));
+        assert!(error.message.contains("collected local state stays"));
         assert!(error.message.contains("--confirm"));
 
         let confirmed = Cli::parse_from([
