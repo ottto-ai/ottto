@@ -13694,13 +13694,13 @@ struct OpenPiSessionRoot {
 
 fn open_pi_session_root() -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     let home = home_path("");
-    open_pi_session_root_from_home(&home)
+    open_pi_session_root_from_home(&home, &crate::agent_status::pi_sessions_dir(&home))
 }
 
 fn open_or_create_pi_session_root() -> Result<OpenPiSessionRoot, LocalApiError> {
     require_pi_session_import_platform_support()?;
     let home = home_path("");
-    open_or_create_pi_session_root_from_home_io(&home)
+    open_or_create_pi_session_root_from_home_io(&home, &crate::agent_status::pi_sessions_dir(&home))
         .map_err(|_| pi_session_import_refused("session root could not be safely established"))
 }
 
@@ -13714,9 +13714,12 @@ fn open_pi_session_root_direct(root: &Path) -> Result<Option<OpenPiSessionRoot>,
     }
 }
 
-fn open_pi_session_root_from_home(home: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+fn open_pi_session_root_from_home(
+    home: &Path,
+    sessions: &Path,
+) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     require_pi_session_import_platform_support()?;
-    match open_pi_session_root_from_home_io(home) {
+    match open_pi_session_root_from_home_io(home, sessions) {
         Ok(root) => Ok(Some(root)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
@@ -13736,25 +13739,62 @@ fn open_pi_session_root_direct_io(root: &Path) -> std::io::Result<OpenPiSessionR
     })
 }
 
+/// The components of `sessions` below `home`, walked one by one from the
+/// trusted home directory. A sessions directory outside `home`, relative, or
+/// with `..` is refused, and never as NotFound, so neither open path reports
+/// it as "no root". (`Path` drops interior `.` components.)
 #[cfg(unix)]
-fn open_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
-    let trusted_home = open_pi_session_root_direct_io(home)?;
-    let mut directory = trusted_home.directory;
-    let mut path = home.to_path_buf();
-    for component in [".pi", "agent", "sessions"] {
-        directory = open_pi_directory_component(&directory, component.as_ref())?;
-        path.push(component);
-    }
-    Ok(OpenPiSessionRoot { path, directory })
+fn pi_session_components<'a>(
+    home: &Path,
+    sessions: &'a Path,
+) -> std::io::Result<Vec<&'a std::ffi::OsStr>> {
+    let outside = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory is not below the home directory",
+        )
+    };
+    sessions
+        .strip_prefix(home)
+        .map_err(|_| outside())?
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(outside()),
+        })
+        .collect()
 }
 
 #[cfg(unix)]
-fn open_or_create_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_pi_session_root_from_home_io(
+    home: &Path,
+    sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
+    walk_pi_session_root_from_home(home, sessions, open_pi_directory_component)
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_session_root_from_home_io(
+    home: &Path,
+    sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
+    walk_pi_session_root_from_home(home, sessions, open_or_create_pi_directory_component)
+}
+
+/// Walks `sessions` one component at a time from the trusted home directory,
+/// each opened by `open`.
+#[cfg(unix)]
+fn walk_pi_session_root_from_home(
+    home: &Path,
+    sessions: &Path,
+    open: fn(&fs::File, &std::ffi::OsStr) -> std::io::Result<fs::File>,
+) -> std::io::Result<OpenPiSessionRoot> {
+    let components = pi_session_components(home, sessions)?;
     let trusted_home = open_pi_session_root_direct_io(home)?;
     let mut directory = trusted_home.directory;
     let mut path = home.to_path_buf();
-    for component in [".pi", "agent", "sessions"] {
-        directory = open_or_create_pi_directory_component(&directory, component.as_ref())?;
+    for component in components {
+        directory = open(&directory, component)?;
         path.push(component);
     }
     Ok(OpenPiSessionRoot { path, directory })
@@ -13843,12 +13883,18 @@ fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSession
 }
 
 #[cfg(not(unix))]
-fn open_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_pi_session_root_from_home_io(
+    _home: &Path,
+    _sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
 }
 
 #[cfg(not(unix))]
-fn open_or_create_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_or_create_pi_session_root_from_home_io(
+    _home: &Path,
+    _sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
 }
 
@@ -14486,7 +14532,7 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
         }
         SourceKind::Pi => {
             let command_found = executable_exists("pi");
-            let sessions = home_path(".pi/agent/sessions");
+            let sessions = crate::agent_status::pi_sessions_dir(&home_path(""));
             let telemetry_installed = snapshot_device_credentials_include_source("pi");
             setup_scan_source(
                 source,
@@ -15671,7 +15717,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -15696,7 +15742,7 @@ fn pi_route_post_smoke_census_failure(
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -16158,7 +16204,7 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Failed if all_census_failed => (
             PI_SESSION_CENSUS_FAILED_CODE,
-            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify."
                 .to_string(),
         ),
         SourceVerificationStatus::NoFreshTelemetry if all_telemetry_disabled => (
@@ -26886,7 +26932,11 @@ for line in sys.stdin:
         let outside = control_test_root("pi-live-root-symlink-outside");
         symlink(&outside, home.join(".pi")).expect("symlink .pi outside HOME");
 
-        assert!(open_or_create_pi_session_root_from_home_io(&home).is_err());
+        assert!(open_or_create_pi_session_root_from_home_io(
+            &home,
+            &home.join(".pi/agent/sessions")
+        )
+        .is_err());
         assert!(!outside.join("agent").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
@@ -26973,7 +27023,7 @@ for line in sys.stdin:
 
         symlink(&outside, home.join(".pi")).expect("symlink .pi outside home");
         assert!(matches!(
-            open_pi_session_root_from_home(&home),
+            open_pi_session_root_from_home(&home, &home.join(".pi/agent/sessions")),
             Err(LocalApiError::LocalOperationFailed(_))
         ));
 
@@ -26981,10 +27031,43 @@ for line in sys.stdin:
         fs::create_dir(home.join(".pi")).expect("create real .pi");
         symlink(outside.join("agent"), home.join(".pi/agent")).expect("symlink agent outside .pi");
         assert!(matches!(
-            open_pi_session_root_from_home(&home),
+            open_pi_session_root_from_home(&home, &home.join(".pi/agent/sessions")),
             Err(LocalApiError::LocalOperationFailed(_))
         ));
 
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    /// [behaviour] An overridden Pi agent directory below home is walked from
+    /// the trusted home; one outside home, relative or with `..` is refused,
+    /// never reported as no root, and nothing is created.
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_root_follows_an_override_below_home_and_refuses_others() {
+        let home = control_test_root("pi-session-root-override");
+        let sessions = home.join("alt/agent/sessions");
+        let opened = open_or_create_pi_session_root_from_home_io(&home, &sessions)
+            .expect("an override below home is created and walked");
+        assert_eq!(opened.path, sessions);
+        assert!(matches!(
+            open_pi_session_root_from_home(&home, &sessions),
+            Ok(Some(_))
+        ));
+        let outside = control_test_root("pi-session-root-override-outside");
+        for refused in [
+            outside.join("agent/sessions"),
+            PathBuf::from("agent/sessions"),
+            home.join("alt/../escape/sessions"),
+        ] {
+            assert!(matches!(
+                open_pi_session_root_from_home(&home, &refused),
+                Err(LocalApiError::LocalOperationFailed(_))
+            ));
+            assert!(open_or_create_pi_session_root_from_home_io(&home, &refused).is_err());
+        }
+        assert!(!outside.join("agent").exists());
+        assert!(!home.join("escape").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
     }

@@ -15223,7 +15223,8 @@ fn percent_quota_status(used_percent: u8) -> AgentQuotaWindowStatus {
 }
 
 fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("pi") && !home_path(".pi").exists() {
+    if !executable_exists("pi") && !home_path(".pi").exists() && !pi_agent_dir(&home_dir()).exists()
+    {
         return not_installed_snapshot(SourceKind::Pi, "pi", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(
@@ -15262,7 +15263,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "pi_agent_settings_detected",
             AgentDiagnosticSeverity::Info,
-            "Pi model route read from ~/.pi/agent/settings.json.",
+            "Pi model route read from Pi's agent settings.json.",
         ));
     }
     snapshot.quota_windows = vec![unsupported_quota_window("usage")];
@@ -15274,7 +15275,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
     snapshot.capabilities = vec![
         supported_capability(
             "model_list",
-            "Collected from ~/.pi/agent/settings.json enabledModels, falling back to pi --list-models.",
+            "Collected from Pi's agent settings.json enabledModels, falling back to pi --list-models.",
         ),
         unsupported_capability(
             "account_plan",
@@ -18959,25 +18960,36 @@ fn read_pi_agent_settings() -> Option<Value> {
         .map(strip_secret_json)
 }
 
-fn pi_agent_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("PI_CODING_AGENT_DIR") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            if let Some(relative) = trimmed.strip_prefix("~/") {
-                return home_path(relative);
-            }
-            return PathBuf::from(trimmed);
-        }
+/// Pi's agent directory, resolved as Pi itself does: a non-empty
+/// `PI_CODING_AGENT_DIR`, taken as written (no trim) with a leading `~`
+/// expanded against `home`, else `~/.pi/agent`. The scanner, the status
+/// reader and the Verify census all use this one rule.
+pub(crate) fn pi_agent_dir(home: &Path) -> PathBuf {
+    pi_agent_dir_from(home, std::env::var_os("PI_CODING_AGENT_DIR"))
+}
+
+/// Where Pi writes its sessions: `sessions` under its agent directory.
+pub(crate) fn pi_sessions_dir(home: &Path) -> PathBuf {
+    pi_agent_dir(home).join("sessions")
+}
+
+fn pi_agent_dir_from(home: &Path, value: Option<std::ffi::OsString>) -> PathBuf {
+    match value.filter(|value| !value.is_empty()).map(PathBuf::from) {
+        Some(dir) => match dir.strip_prefix("~") {
+            Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+            Ok(rest) => home.join(rest),
+            Err(_) => dir,
+        },
+        None => home.join(".pi").join("agent"),
     }
-    home_path(".pi/agent")
 }
 
 fn pi_agent_auth_path() -> PathBuf {
-    pi_agent_dir().join("auth.json")
+    pi_agent_dir(&home_dir()).join("auth.json")
 }
 
 fn pi_agent_settings_path() -> PathBuf {
-    pi_agent_dir().join("settings.json")
+    pi_agent_dir(&home_dir()).join("settings.json")
 }
 
 fn pi_auth_entry<'a>(auth: &'a Value, provider: &str) -> Option<&'a Value> {
@@ -32626,6 +32638,23 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             routes[1].classification.source_category.as_deref(),
             Some("google_cloud_vertex")
         );
+    }
+
+    /// [behaviour] Pi's agent directory as Pi resolves it: an empty or unset
+    /// override is the default, the value is taken as written (no trim), and
+    /// a leading `~` is the home directory.
+    #[test]
+    fn pi_agent_dir_follows_pis_own_override_rule() {
+        let home = Path::new("/home/user");
+        let dir = |value: Option<&str>| pi_agent_dir_from(home, value.map(Into::into));
+        assert_eq!(dir(None), home.join(".pi/agent"));
+        assert_eq!(dir(Some("")), home.join(".pi/agent"));
+        assert_eq!(dir(Some("/abs/pi")), PathBuf::from("/abs/pi"));
+        assert_eq!(dir(Some(" /abs/pi ")), PathBuf::from(" /abs/pi "));
+        assert_eq!(dir(Some("~")), home.to_path_buf());
+        assert_eq!(dir(Some("~/alt/pi")), home.join("alt/pi"));
+        assert_eq!(dir(Some("~alt")), PathBuf::from("~alt"));
+        assert_eq!(dir(Some("rel/pi")), PathBuf::from("rel/pi"));
     }
 
     /// [behaviour] Every named platform keeps its route; an unnamed provider
