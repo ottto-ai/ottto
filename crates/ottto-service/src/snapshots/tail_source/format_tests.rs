@@ -205,11 +205,11 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
 }
 
 /// [behaviour] L01: the codec list alone gives a source its codec and Tail
-/// route, whatever the registry's `state_v2` flag says (on this branch Claude
-/// only), and each source's counters stay on its own line.
+/// route, whatever the registry's `state_v2` flag says (Claude and Codex; Pi
+/// has none), and each source's counters stay on its own line.
 #[test]
 fn codec_list_gives_routes_and_counters_stay_per_source() {
-    const CODECS: [SnapshotSource; 1] = [SnapshotSource::ClaudeCode];
+    const CODECS: [SnapshotSource; 2] = [SnapshotSource::ClaudeCode, SnapshotSource::Codex];
     let route = route();
     for source in [
         SnapshotSource::ClaudeCode,
@@ -243,7 +243,9 @@ fn the_ram_copy_is_kept_and_taken_only_off_a_tail_route() {
     let route = route();
     assert!(!keeps_ram(SnapshotSource::ClaudeCode, &route.index));
     assert!(keeps_ram(SnapshotSource::ClaudeCode, &ScanIndex::default()));
-    assert!(keeps_ram(SnapshotSource::Codex, &route.index));
+    assert!(!keeps_ram(SnapshotSource::Codex, &route.index));
+    assert!(keeps_ram(SnapshotSource::Codex, &ScanIndex::default()));
+    assert!(keeps_ram(SnapshotSource::Pi, &route.index));
 }
 
 /// [format] The one hourly page codec carries usage buckets (`UsageHours`,
