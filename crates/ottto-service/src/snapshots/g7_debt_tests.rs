@@ -110,9 +110,8 @@ fn walk(source: SnapshotSource, roots: &[PathBuf], index: &mut ScanIndex) -> ser
 }
 
 fn failed_pass(source: SnapshotSource) -> serde_json::Value {
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        money_freshness::report_failed_pass(source, Some(sampled_scan::now_seconds()))
-    });
+    let (_, rows) =
+        crate::local_resource_diagnostics::capture(|| money_freshness::report_failed_pass(source));
     rows.into_iter()
         .find(|row| row["stage"] == "freshness_alarm")
         .expect("one row")["counts"]

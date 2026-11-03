@@ -543,8 +543,9 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// A configured root that is not there proves nothing absent.
-    pub(super) fn root_missing(&mut self) {
+    /// A queued directory that is gone, with no confirmed removal, proves
+    /// nothing absent beneath it.
+    pub(super) fn unlisted_directory(&mut self) {
         self.fold.debt.incomplete = true;
     }
 
@@ -609,8 +610,19 @@ impl<'a> Page<'a> {
                 ArchiveDisposition::Empty => {
                     live.evidence = Some(NoUploadRequired::ZeroUsageLines);
                 }
-                ArchiveDisposition::Held { .. } => live.read = len,
-                ArchiveDisposition::HeaderValidated | ArchiveDisposition::Pending => {}
+                // A retained body witness is a whole read; a disposition
+                // alone is not (a refusal may come before any read).
+                ArchiveDisposition::Held { .. }
+                | ArchiveDisposition::HeaderValidated
+                | ArchiveDisposition::Pending => {
+                    if archive
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.body_witness.is_some())
+                    {
+                        live.read = len;
+                    }
+                }
             }
             return live;
         }
@@ -624,10 +636,12 @@ impl<'a> Page<'a> {
         live.exact = index.file_upload_context_enabled()
             && !index.file_upload_context_requires_adoption(key)
             && (unchanged || grown);
-        live.read = match (unchanged, grown) {
-            (true, _) => len,
-            (false, true) => entry.size_bytes,
-            (false, false) => 0,
+        // The stored size, never the live one: a matching Codex fragment's
+        // entry records only its certified prefix.
+        live.read = if unchanged || grown {
+            entry.size_bytes.min(len)
+        } else {
+            0
         };
         live.accepted = if live.exact { live.read } else { 0 };
         live.replaced = !unchanged && !grown;

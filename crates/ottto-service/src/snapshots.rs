@@ -47197,9 +47197,6 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if directory.path == directory.scan_root {
-                    debt.root_missing();
-                }
                 // A queued directory gone below its live parent, in a strictly
                 // later walk too, is a removal; its files settle one by one
                 // through the missing-parent rule.
@@ -47215,6 +47212,7 @@ fn advance_bounded_directory_traversal_with_budget(
                         disappearance_diagnostics::Site::WalkDirectory,
                     );
                 } else {
+                    debt.unlisted_directory();
                     disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
