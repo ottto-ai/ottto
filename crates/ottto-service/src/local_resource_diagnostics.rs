@@ -3407,10 +3407,11 @@ mod tests {
         );
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
-            // Fixed page gate totals extend this local diagnostic record only;
-            // upload/finish records and all runtime resource caps stay unchanged.
+            // Fixed page gate totals and the Full/Tail byte split extend this
+            // local diagnostic record only; upload/finish records and all
+            // runtime resource caps stay unchanged.
             let limit = if record["stage"] == "native_collection_page" {
-                4096
+                4160
             } else {
                 2048
             };
