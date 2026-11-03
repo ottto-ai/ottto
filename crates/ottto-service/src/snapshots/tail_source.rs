@@ -545,6 +545,133 @@ fn read_hour_page<K: Durable + Ord, V: Durable>(
     })
 }
 
+/// The session facts collection every codec stores: content the head never
+/// carries, one fact per page at its kind's position.
+const SESSION_FACTS: CollectionSpec = CollectionSpec {
+    collection: Collection::SessionFacts,
+    shape: PageShape::Slot,
+    g: 1,
+    required: true,
+    private: true,
+};
+
+/// The session facts (D168-1): content the head never carries, one element
+/// per page at the kind's position, `[kind][version][value]`. A slot is
+/// rewritten when its fact changes. A kind or version this build does not
+/// know is incompatible: new ones come with a reduction revision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fact {
+    Title = 0,
+    FirstPrompt = 1,
+    Workspace = 2,
+    OpeningSettings = 3,
+}
+const FACTS: [Fact; 4] = [
+    Fact::Title,
+    Fact::FirstPrompt,
+    Fact::Workspace,
+    Fact::OpeningSettings,
+];
+const FACT_VERSION: u64 = 1;
+
+impl Fact {
+    fn present(self, acc: &SnapshotAccumulator) -> bool {
+        match self {
+            Self::Title => acc.title.is_some(),
+            Self::FirstPrompt => {
+                acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some()
+            }
+            Self::Workspace => acc.workspace_path.is_some(),
+            Self::OpeningSettings => acc.session_start.has_opening_fact(),
+        }
+    }
+
+    fn put(self, acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
+        e.varint(self as u64)?;
+        e.varint(FACT_VERSION)?;
+        match self {
+            Self::Title => acc.title.put(e),
+            Self::FirstPrompt => {
+                acc.first_prompt_material.put(e)?;
+                acc.first_prompt_title.put(e)
+            }
+            // A path never enters a record body (`PathBuf` refuses outside
+            // hashing); the workspace path is a parsed JSON string, stored so.
+            Self::Workspace => acc
+                .workspace_path
+                .as_ref()
+                .map(|path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
+                })
+                .transpose()?
+                .put(e),
+            Self::OpeningSettings => acc.session_start.put_opening_fact(e),
+        }
+    }
+
+    /// One fact page into a decoded head's state.
+    fn take(
+        page: u64,
+        bytes: &[u8],
+        into: &mut SnapshotAccumulator,
+    ) -> Result<(), ReconstructCause> {
+        let fact = usize::try_from(page)
+            .ok()
+            .and_then(|at| FACTS.get(at).copied())
+            .ok_or(ReconstructCause::Incompatible)?;
+        let mut d = Dec::new(bytes);
+        if d.varint()? != page {
+            return Err(ReconstructCause::Corrupt);
+        }
+        if d.varint()? != FACT_VERSION {
+            return Err(ReconstructCause::Incompatible);
+        }
+        match fact {
+            Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
+            Self::FirstPrompt => {
+                into.first_prompt_material = <Option<String> as Durable>::take(&mut d)?;
+                into.first_prompt_title = <Option<String> as Durable>::take(&mut d)?;
+            }
+            Self::Workspace => {
+                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
+            }
+            Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
+        }
+        d.finish()?;
+        // A stored slot holds its fact: an empty one is corrupt.
+        if fact.present(into) {
+            Ok(())
+        } else {
+            Err(ReconstructCause::Corrupt)
+        }
+    }
+}
+
+/// How many session facts `acc` holds.
+fn fact_count(acc: &SnapshotAccumulator) -> usize {
+    FACTS.iter().filter(|fact| fact.present(acc)).count()
+}
+
+/// The session-fact pages of `acc`, each at its kind's position.
+fn fact_pages(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+    FACTS
+        .into_iter()
+        .filter(|fact| fact.present(acc))
+        .map(|fact| Ok((fact as u64, encode(|e| fact.put(acc, e))?)))
+        .collect()
+}
+
+/// One stored session-fact page into a decoded head's state.
+fn read_fact_page(
+    page: u64,
+    bytes: &[u8],
+    into: &mut SnapshotAccumulator,
+) -> Result<(), ReconstructCause> {
+    Fact::take(page, bytes, into)
+}
+
 // Artifacts are head data: collected whatever the upload toggle says, and
 // filtered only when an item is built.
 crate::durable_tail_codec::durable_struct!(SessionArtifact {
