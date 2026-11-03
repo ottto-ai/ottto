@@ -466,6 +466,8 @@ fn never_indexed_file_over_6h_turns_the_alarm_on() {
         assert_eq!(committed(&f.index, &never).len(), 1);
         assert!(committed(&f.index, &outside).is_empty());
         assert!(committed(&f.index, &settled).is_empty());
+        // The active upload context is runtime-only: re-activate it.
+        accept(f.source, &mut f.index, &settled);
 
         std::fs::remove_file(&never).unwrap();
         let row = f.walk();
