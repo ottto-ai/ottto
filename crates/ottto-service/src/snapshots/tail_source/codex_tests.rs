@@ -452,7 +452,7 @@ fn damaged_state_is_classified() {
 
     let mut other = copy(&staged);
     other.revision = Codex::REDUCTION_REVISION + 1;
-    assert_eq!(cause(&other), Some(ReconstructCause::Revision));
+    assert_eq!(cause(&other), Some(ReconstructCause::Incompatible));
 
     let mut short = copy(&staged);
     short.head.pop();

@@ -39923,6 +39923,12 @@ impl PiLedger {
         &mut self.usage_keys
     }
 
+    /// No ledger key and no fork state: what Claude and Codex hold, since a
+    /// fork state is as non-empty as a key.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.usage_keys.is_empty() && self.fork.is_none()
+    }
+
     /// The persisted fork values: (`has_parent`, header time).
     pub(crate) fn fork_parts(&self) -> (bool, Option<i128>) {
         self.fork
