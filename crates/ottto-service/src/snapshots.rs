@@ -23603,6 +23603,41 @@ pub(in crate::snapshots) struct CodexParentPrefixProof {
     pub(in crate::snapshots) published: bool,
 }
 crate::heap_layout_bound::fields!(CodexParentPrefixProof; parent, parent_seal, matched, child_digest, owned, published);
+// Content-free: ids, stamps, sample hashes, counts. A Codex Tail head stores
+// used proofs and refusals as facts; none is admission authority when loaded.
+#[cfg(unix)]
+crate::durable_tail_codec::durable_struct!(CodexParentPrefixProof {
+    U parent: String,
+    D parent_seal: crate::transcript_acquisition::PrefixSeal,
+    N matched: u64,
+    H child_digest: String,
+    N owned: bool,
+    N published: bool,
+});
+#[cfg(unix)]
+crate::durable_tail_codec::durable_enum!(ProofWake {
+    0 => Due,
+    1 => ParentChanged { D parent: WakeStamp, D child: WakeStamp },
+    2 => ChildChanged { D parent: WakeStamp, D child: WakeStamp },
+    3 => Rewritten { D parent: Option<WakeStamp>, D child: WakeStamp },
+    4 => Census { N matches: String, D child: WakeStamp },
+    5 => ParentHeld {
+        N parent_key: String,
+        N generation: u64,
+        N parent_entry: String,
+        D parent: WakeStamp,
+        N lineage: bool,
+        N needed_extent: u64,
+    },
+    6 => Backoff,
+});
+#[cfg(unix)]
+crate::durable_tail_codec::durable_enum!(ProofRefusal {
+    0 => Identity(D reason: CodexParentUnresolvable),
+    1 => Side(D wake: ProofWake),
+    2 => Seal(D reason: crate::transcript_acquisition::FullReason),
+    3 => Decision,
+});
 
 #[allow(dead_code)] // first production callers are the proof job and finish
 impl CodexParentPrefixProof {
