@@ -7185,19 +7185,11 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
 fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
-    b4_structural_transition(false);
-    b4_structural_transition(true);
+    b4_structural_transition();
 }
 
-fn b4_structural_transition(near_cap: bool) {
+fn b4_structural_transition() {
     use std::io::Write;
-    struct ResetCap;
-    impl Drop for ResetCap {
-        fn drop(&mut self) {
-            TEST_JSONL_FILE_CAP.set(None);
-        }
-    }
-    let _cap = ResetCap;
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -7330,8 +7322,13 @@ fn b4_structural_transition(near_cap: bool) {
     let mtime_before_birth = metadata.modified().unwrap() < metadata.created().unwrap();
     let actual_modes = (modes.0, modes.1, unchanged_files.get());
     let context = native_restore_context(
-        format!("b4/near-cap-{near_cap}/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"),
-        (modes.0, modes.1, unchanged_files.get()), &caught, &cache, selector,
+        format!(
+            "b4/structural birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"
+        ),
+        (modes.0, modes.1, unchanged_files.get()),
+        &caught,
+        &cache,
+        selector,
     );
     assert!(
         !birth_changed,
@@ -7373,8 +7370,23 @@ fn b4_structural_transition(near_cap: bool) {
         1,
         "native_restore structural_cold_emitted {context:?}"
     );
-    native_restore_compare_wire(actual, a0h_batch(&root, &mut oracle_index, &mut oracle), true,
-        native_restore_context(format!("b4/near-cap-{near_cap}/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"), (actual_modes, (oracle_modes.0, oracle_modes.1, unchanged_files.get())), &caught, &cache, selector));
+    native_restore_compare_wire(
+        actual,
+        a0h_batch(&root, &mut oracle_index, &mut oracle),
+        true,
+        native_restore_context(
+            format!(
+                "b4/wire birth_changed={birth_changed} mtime_before_birth={mtime_before_birth}"
+            ),
+            (
+                actual_modes,
+                (oracle_modes.0, oracle_modes.1, unchanged_files.get()),
+            ),
+            &caught,
+            &cache,
+            selector,
+        ),
+    );
     next.record_accepted_snapshot_fingerprints(
         &caught
             .snapshots
@@ -7421,44 +7433,7 @@ fn b4_structural_transition(near_cap: bool) {
         index = held;
     }
     assert_eq!(cache.durable().unwrap().counters.active_bound[0], [1, 2]);
-    if near_cap {
-        // Scale the SAME discovery cap and pace threshold, preserving actual
-        // accepted-prefix/native-read/terminal-settlement transitions.
-        let before = std::fs::metadata(&path).unwrap().len();
-        let row = a0h_row("growth-3", 25);
-        let cap = before + row.len() as u64 + 1;
-        TEST_JSONL_FILE_CAP.set(Some(cap));
-        assert!(
-            !near_source_cap(source, before),
-            "prior refusal was below 90%"
-        );
-        append("growth-3");
-        let high = std::fs::metadata(&path).unwrap().len();
-        assert!(high < cap && near_source_cap(source, high));
-        let (((caught_index, caught, modes), reads), events) =
-            crate::local_resource_diagnostics::capture(|| {
-                a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
-            });
-        assert_eq!(modes, (1, 0, high));
-        assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
-        assert_eq!(caught.snapshots[0].input_tokens, 175);
-        assert_eq!(caught_index.files[&key].size_bytes, high);
-        assert_successor(&cache, high, 3);
-        assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
-            && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
-        append("growth-4");
-        assert!(std::fs::metadata(&path).unwrap().len() > cap);
-        let ((oversized, disclosure, modes), reads) =
-            a0h_observe(|| run(cache.clone(), caught_index, "2026-10-29T12:00:00Z"));
-        assert_eq!(modes, (0, 0, 0));
-        assert_eq!(reads.1, 0);
-        assert!(
-            disclosure.oversized_file_count > 0,
-            "pre-existing SIZE loss disclosure"
-        );
-        assert_eq!(oversized.files[&key].size_bytes, high);
-        return;
-    }
+
     cache.durable().unwrap().retail_full_now =
         Some(now + std::time::Duration::from_secs(PACE_SECS));
     let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
@@ -8552,7 +8527,7 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
             );
         }
     }
-    assert!(cache.paced_admission(source, "eviction-trigger", now, false, false, true));
+    assert!(cache.paced_admission(source, "eviction-trigger", now, false, true));
     let mut stores = cache.durable().unwrap();
     assert!(!stores.retail_full_at.contains_key(&digest));
     // Let the next call start another turnover; keep the failed key's debt.
@@ -8562,9 +8537,9 @@ pub(in crate::snapshots) fn evict_failed_replay_pace(
     assert!(stores.key_debt.contains_key(&digest));
 }
 
-/// [money] rederive failure full and near cap allowance survive repeated real evictions.
+/// [regress] Full pacing survives eviction without any size-based exemption.
 #[test]
-fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions() {
+fn rederive_failure_full_pacing_survives_repeated_real_evictions() {
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let root = crate::test_scratch::ScratchDir::new("full-spend-custody");
@@ -8590,39 +8565,20 @@ fn rederive_failure_full_and_near_cap_allowance_survive_repeated_real_evictions(
             ));
             assert!(cache.owes_discovery(source, key));
         }
-        // A sparse file makes the real near-cap metadata branch inexpensive.
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(max_jsonl_file_bytes(source))
+            .set_len(former_file_cap(source))
             .unwrap();
-        assert!(cache.rederive_full(source, key, &file, 2, false)); // probe is free
-        assert!(cache.rederive_full(source, key, &file, 2, true));
-        for _ in 0..4 {
-            evict_failed_replay_pace(&cache, source, key);
-            let _ = cache.rederive_gate(source, digest, 2, true, false);
-            assert!(!cache.rederive_full(source, key, &file, 2, true));
-        }
+        assert!(!cache.rederive_full(source, key, &file, 2, false));
+        assert!(!cache.rederive_full(source, key, &file, 2, true));
         let stores = cache.durable().unwrap();
-        assert_eq!(
-            stores
-                .counters
-                .resource_full
-                .get("rederive_failure_full.near_cap"),
-            Some(&1)
-        );
         assert_eq!(stores.key_debt[&digest].full_spend.unwrap().at, now);
         drop(stores);
         cache.durable().unwrap().retail_full_now =
             Some(now + std::time::Duration::from_secs(PACE_SECS));
         assert!(cache.rederive_full(source, key, &file, 2, true));
-        assert!(
-            !cache.durable().unwrap().key_debt[&digest]
-                .full_spend
-                .unwrap()
-                .near_extra
-        );
         assert!(owed::key_debt_node_bytes().unwrap() <= 1024);
     }
 }
@@ -8783,10 +8739,7 @@ fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spend
     stores.retail_full_now = Some(now);
     for n in 0..store::MAX_RECORDS {
         let digest = full_pace_key(SnapshotSource::Codex, &format!("spent-{n}"));
-        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend {
-            at: now,
-            near_extra: true,
-        });
+        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend { at: now });
     }
     let extra = full_pace_key(SnapshotSource::Codex, "extra");
     assert!(
@@ -9003,12 +8956,14 @@ fn retired_missing_uses_shared_history_page_and_growth_pace() {
         assert!(!cache.upgrade_full_allowed(source, &key, &file, &index, &mut full_files));
         let writable = fs::OpenOptions::new().write(true).open(&path).unwrap();
         writable.set_len(512 * 1024 * 1024 + 1).unwrap();
-        assert!(!cache.upgrade_full_allowed(
+        // Probe first-unit admission above the retired cap without spending the later pace check.
+        assert!(cache.upgrade_full_admission(
             source,
             &key,
             &file,
             &index,
-            &mut HistoryPage::default()
+            &mut HistoryPage::default(),
+            false,
         ));
         writable.set_len(6).unwrap();
         {

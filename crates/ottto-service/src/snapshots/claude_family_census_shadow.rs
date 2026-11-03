@@ -83,8 +83,6 @@ pub(super) enum Incomplete {
     /// A member is queued (census member, re-read hint or carry replay).
     /// Claude growth hints stay current-generation members.
     Queued,
-    /// A member's read was refused by the size cap (`oversized_discovery`).
-    RefusedRead,
     /// Unreadable, disappeared or directory-cap loss the traversal cannot
     /// attribute to a file: every family, sticky for the generation.
     RefusedReadUnattributed,
@@ -871,15 +869,6 @@ impl<'a> View<'a> {
             || self.queued_roots.contains(&hash64(family.root.as_bytes()))
         {
             return Some(Incomplete::Queued);
-        }
-        if !traversal.oversized_discovery.is_empty()
-            && members.iter().any(|key| {
-                traversal
-                    .oversized_discovery
-                    .contains_key(&oversized_discovery::path_hash(Path::new(key)))
-            })
-        {
-            return Some(Incomplete::RefusedRead);
         }
         vetoes
             .unattributed

@@ -2103,8 +2103,9 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
     });
 }
 
+/// [regress] First-group byte admission must publish and acknowledge the complete twin history.
 #[test]
-fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
+fn e2_pipeline_first_twin_group_above_byte_budget_preserves_complete_history() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-byte-hold");
         c.write_at(
@@ -2126,7 +2127,20 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
                       progress: &mut SnapshotUploadProgress| {
             page.finish();
             let sent = page.scan.snapshots.clone();
-            upload(&sent, progress, ack).0.unwrap();
+            assert_eq!(
+                upload(&sent, progress, ack).0.unwrap(),
+                ResumableUploadResult::Completed
+            );
+            for item in &sent {
+                assert_eq!(
+                    page.delivered
+                        .as_ref()
+                        .expect("ready records exact ACKs")
+                        .get(&item.snapshot_fingerprint),
+                    Some(&snapshot_upload_body_witness(item)),
+                    "exact body ACK precedes settlement"
+                );
+            }
             let holds = LocalHoldSettlement::classify(
                 SnapshotSource::ClaudeCode,
                 &mut page.index,
@@ -2158,7 +2172,7 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
         assert_eq!(
             before.len(),
             1,
-            "hold starts from one complete accepted family body"
+            "admission starts from one complete accepted family body"
         );
         prior.activate_effective_upload_body_witness_revision(3);
         for key in prior.files.keys().cloned().collect::<Vec<_>>() {
@@ -2168,33 +2182,46 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             );
         }
         let committed = prior.clone();
-        let mut held =
+        let admitted =
             crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
                 ready(&c, &scanner, prior, 1, false)
             });
-        assert!(
-            held.scan.snapshots.is_empty(),
-            "byte-limited twin family emits no partial replacement"
+        literal(&admitted);
+        assert_eq!(
+            total(&admitted),
+            2,
+            "the first group emits both owned requests"
         );
-        held.finish();
-        let holds = LocalHoldSettlement::classify(
-            SnapshotSource::ClaudeCode,
-            &mut held.index,
-            &mut held.scan,
-            &held.disposition,
+        assert_eq!(
+            admitted
+                .scan
+                .snapshots
+                .iter()
+                .fold((0, 0, 0, 0, 0), |sum, item| (
+                    sum.0 + item.input_tokens,
+                    sum.1 + item.output_tokens,
+                    sum.2 + item.cache_read_tokens,
+                    sum.3 + item.cache_creation_5m_tokens,
+                    sum.4 + item.cache_creation_1h_tokens,
+                )),
+            (30, 30, 6, 10, 4)
         );
-        let mut settlement = settle_completed_upload(held.index, &committed, &progress, &holds);
-        settle_index_after_upload(&mut settlement.index, &committed, &progress);
-        let restored = c.reload(&mut settlement.index);
+        assert_eq!(
+            scanner.paths().len(),
+            2,
+            "both twins are read despite the page byte target"
+        );
+        let restored = settle(&c, &committed, admitted, &mut progress);
         assert_eq!(
             restored.current_snapshot_fingerprints(),
             before,
-            "previous complete accepted history survives hold and disk reload"
+            "complete accepted history survives first-group admission and reload"
         );
-        assert!(
-            scanner.paths().is_empty(),
-            "strict byte budget refuses the complete twin group before either file is read; opened={}", scanner.paths().len()
-        );
+        assert_eq!(progress.accepted_fingerprints.len(), 1);
+        assert!(restored
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
     });
 }
 

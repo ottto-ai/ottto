@@ -93,25 +93,6 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         assert_eq!(traversal.pending_candidates[0].path, path);
         assert_eq!(traversal.counts.listing_changes_without_hint, 1);
     }
-    let f = Fixture::new();
-    let mut index = kept_generation(&f, SnapshotSource::Codex, false);
-    let path = f.root.join("oversized.jsonl.zst");
-    fs::File::create(&path)
-        .unwrap()
-        .set_len(max_jsonl_file_bytes(SnapshotSource::Codex) + 1)
-        .unwrap();
-    relist(SnapshotSource::Codex, &mut index);
-    let traversal = index.traversal.as_ref().unwrap();
-    assert!(traversal.pending_candidates.is_empty());
-    assert_eq!(traversal.counts.oversized_file_count, 0);
-    assert_eq!(traversal.counts.unreadable_path_count, 0);
-    assert!(index
-        .archive_pass
-        .deferred
-        .contains(&local_index_key(&path)));
-    let (_, logs) = capture(|| index.disclose_archive_debt());
-    assert!(index.archive_owed_count() > 0);
-    assert!(logs.iter().any(|row| row["stage"] == "durable_tail_alarm"));
 }
 
 /// [regress] 0.1.212: the re-listing pass queued 8,114 archives as census

@@ -1567,6 +1567,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "accepted_rebuild_last_alarm_unix_seconds"
             | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
+            "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
+            "tail_discovery" => serde_json::json!({"deleted_unaccepted_files": 1}),
             "upload_context_fingerprint"
             | "codex_parent_proof_cursor"
             | "codex_parent_side_cursor"
@@ -1635,6 +1637,9 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
@@ -1762,6 +1767,9 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
@@ -1808,7 +1816,9 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[89], "archives");
     assert_eq!(fields[90], "archive_deferred_alarm_count");
     assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
-    assert_eq!(fields.len(), 92);
+    assert_eq!(fields[92], "claude_folder_login_ledger");
+    assert_eq!(fields[93], "tail_discovery");
+    assert_eq!(fields.len(), 94);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1837,6 +1847,9 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -4057,6 +4070,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     }
 }
 
+/// [format] Legacy count slots survive load/save while retired refusal counts become zero.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
@@ -4102,6 +4116,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
+        // Load retires only this decoded legacy value; neighboring positional counts survive.
+        expected["oversized_file_count"] = serde_json::json!(0);
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
@@ -4224,6 +4240,8 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "archives",
             "archive_deferred_alarm_count",
             "copy_prefix_last_accepted_nonce",
+            "claude_folder_login_ledger",
+            "tail_discovery",
         ]
     );
 }
