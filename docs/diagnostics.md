@@ -1710,6 +1710,17 @@ differs from the line's model (a refusal fallback's declined first attempt, whic
 is billed at the line's model); rereads count again. It is a cumulative
 saturating process total with no path or session id, and it never affects money.
 
+## Claude usage keys the parser does not read
+
+`usage_unknown_numeric_key` in `process_retained_cache_lifecycle_totals` counts
+each numeric key the Claude usage parser does not read, in `usage`,
+`usage.cache_creation`, `usage.output_tokens_details` and the same three levels of
+each `usage.iterations[]` entry. Non-numeric values and deeper objects are not
+counted. A non-zero value means a new numeric usage field is not reaching money.
+Counts are per parsed usage line, not per unique request; rereads count again. It
+is a cumulative saturating process total with no key name, path or session id,
+and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with

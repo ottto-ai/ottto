@@ -448,6 +448,16 @@ pub(crate) fn claude_usage_iteration_model_differs() {
     cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
 }
 
+/// Counts per numeric key the Claude usage parser does not read, per observed
+/// usage line; rereads count again. Only the lifecycle registry atomics are
+/// updated.
+pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -3203,9 +3213,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields, the Codex tier field and the Claude iteration
-        // model field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2474);
+        // The four Pi fields, the Codex tier field and the two Claude usage
+        // fields stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2523);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);
