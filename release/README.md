@@ -193,9 +193,9 @@ first-parent position on `main`, and the CI run before packaging; the packager
 then requires the app source checkout to be at the pinned commit and that commit
 to be on the first-parent line of the app source `master`. Protected release
 tags cannot be moved or deleted: a release that needs new code uses a new
-version and tag. The stable-candidate RC gate also requires the stable manifest
-to match the verified candidate's base version, public commit, and app source
-commit.
+version and tag. Stable preflight requires the stable manifest's version,
+public commit, and app source commit to match the candidate in the verified RC
+evidence (its version without `-rcN`).
 
 Before cutting a stable build, build an internal stable-candidate RC from the
 same commit and attach redacted stable-candidate evidence. Generate the
@@ -224,10 +224,11 @@ app launch, service readiness, `status --json`, browser-claim setup, Codex
 verification, diagnostics redaction, update check, rollback notes, and static
 stable formula and hosted-installer review. The evidence must also bind the
 exercised local runtime to `ottto-service`, `net.ottto.service`, protocol v15,
-the stable-candidate version/channel, and candidate release-manifest SHA-256.
-Stable preflight refuses a stable manifest unless
-`quality_gates.stable_candidate_rc` points at passing evidence from a
-stable-candidate manifest with the same commit and local-runtime binding.
+the stable-candidate version/channel, and candidate release-manifest SHA-256,
+and name the candidate's app source commit. Stable preflight refuses a stable
+manifest unless `quality_gates.stable_candidate_rc` points at passing evidence
+from a stable-candidate manifest with the same base version, commit, app source
+commit, and local-runtime binding.
 
 To produce a distribution-signed package, pass a Developer ID identity:
 

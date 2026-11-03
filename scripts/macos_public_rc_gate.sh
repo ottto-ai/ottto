@@ -14,8 +14,8 @@ Usage: macos_public_rc_gate.sh --candidate-manifest <release-manifest.json> --ev
 Validates stable-candidate RC evidence before stable public-v1 promotion.
 The stable-candidate manifest must pass the release gate, the evidence must be
 redacted and fully passed, and an optional stable manifest must point at the
-same stable-candidate evidence and release identity: base version (without
--rcN), commit, and app source commit.
+same stable-candidate evidence and commit. The evidence must name the
+candidate's app source commit.
 USAGE
 }
 
@@ -153,20 +153,16 @@ def resolve_reference(base_dir: Path, reference: str) -> Path:
     return (base_dir / path).resolve()
 
 
-def release_identity(manifest: dict[str, Any], label: str) -> tuple[str, str, str]:
-    version = require_string(manifest.get("version"), f"{label} version")
-    commit = require_string(manifest.get("commit"), f"{label} commit")
-    supply_chain = require_object(manifest.get("supply_chain"), f"{label} supply_chain")
-    materials = supply_chain.get("materials")
-    app_commits = [
+def app_source_commit(manifest: dict[str, Any], label: str) -> str:
+    materials = require_object(manifest.get("supply_chain"), f"{label} supply_chain").get("materials")
+    commits = [
         material.get("commit")
         for material in (materials if isinstance(materials, list) else [])
         if isinstance(material, dict) and material.get("kind") == "git_subtree"
     ]
-    if len(app_commits) != 1:
+    if len(commits) != 1:
         die(f"{label} must record exactly one app source commit in supply_chain.materials")
-    app_commit = require_string(app_commits[0], f"{label} app source commit")
-    return re.sub(r"-rc[0-9]+$", "", version), commit, app_commit
+    return require_string(commits[0], f"{label} app source commit")
 
 
 def contains_placeholder(value: Any) -> bool:
@@ -198,6 +194,7 @@ if candidate_manifest.get("min_protocol_version") != 15:
     die("stable-candidate manifest min_protocol_version must be 15")
 if not re.fullmatch(r"[0-9a-f]{7,40}", candidate_commit):
     die("stable-candidate manifest commit is not a git SHA prefix")
+candidate_app_commit = app_source_commit(candidate_manifest, "stable-candidate manifest")
 
 raw_artifacts = candidate_manifest.get("artifacts", [])
 if not isinstance(raw_artifacts, list) or not raw_artifacts:
@@ -243,6 +240,8 @@ if candidate_evidence.get("version") != candidate_version:
     die("evidence stable-candidate version does not match stable-candidate manifest")
 if candidate_evidence.get("commit") != candidate_commit:
     die("evidence stable-candidate commit does not match stable-candidate manifest")
+if candidate_evidence.get("app_source_commit") != candidate_app_commit:
+    die("evidence stable-candidate app_source_commit does not match stable-candidate manifest")
 if candidate_evidence.get("sha256") != candidate_sha:
     die("evidence stable-candidate manifest SHA does not match stable-candidate manifest")
 if local_platform.get("runtime") != "ottto-service":
@@ -294,17 +293,11 @@ if stable_manifest_path is not None:
         die("stable manifest product must be ottto-local-platform")
     if stable_manifest.get("channel") != "stable":
         die("stable manifest channel must be stable")
+    stable_commit = require_string(stable_manifest.get("commit"), "stable manifest commit")
     if stable_manifest.get("min_protocol_version") != 15:
         die("stable manifest min_protocol_version must be 15")
-    # The stable build must be the same release as the verified candidate:
-    # base version, public commit, and app source commit.
-    candidate_identity = release_identity(candidate_manifest, "stable-candidate manifest")
-    stable_identity = release_identity(stable_manifest, "stable manifest")
-    if stable_identity != candidate_identity:
-        die(
-            "stable manifest release identity (base version, commit, app source commit) "
-            f"{stable_identity} must match the stable-candidate RC {candidate_identity}"
-        )
+    if stable_commit != candidate_commit:
+        die("stable manifest commit must match the stable-candidate RC commit")
     quality_gates = require_object(stable_manifest.get("quality_gates"), "stable quality_gates")
     gate = require_object(
         quality_gates.get("stable_candidate_rc"),

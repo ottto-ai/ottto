@@ -166,8 +166,8 @@ macos_public_rc_gate.sh \
 ```
 
 Stable preflight requires `quality_gates.stable_candidate_rc.status: passed`,
-the candidate manifest SHA-256, and an evidence file whose candidate commit
-matches the stable manifest commit. The stable-candidate manifest must mark
+the candidate manifest SHA-256, and an evidence file whose candidate version
+(without `-rcN`), commit, and app source commit match the stable manifest. The stable-candidate manifest must mark
 every macOS artifact as signed, notarized, and Gatekeeper-assessed, and the
 evidence must include passed `artifact_signatures`, `notarization`, and
 `gatekeeper_assessment` checks. It must also bind the exercised local runtime to
