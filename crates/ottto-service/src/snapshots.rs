@@ -8363,9 +8363,12 @@ impl SourceScanResult {
                 continue;
             }
             // Explicit missing/conflict creator evidence intentionally retracts
-            // legacy guessed ownership. Compare with the previously cached
-            // binding only to isolate that authorized correction; never emit it.
+            // legacy guessed ownership, and a creator-slot name is new ownership
+            // of rows recording no login mode. Compare with the previously cached
+            // binding only to isolate those authorized corrections; never emit it.
             for item in &mut baseline.snapshots {
+                let key = sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
+                let prior = previous.session_account_bindings.get(&key);
                 if item
                     .session_account_evidence
                     .as_ref()
@@ -8374,11 +8377,11 @@ impl SourceScanResult {
                             && matches!(evidence.identity_disposition, Some("missing" | "conflict"))
                     })
                 {
-                    let key =
-                        sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
-                    if let Some(binding) = previous.session_account_bindings.get(&key) {
+                    if let Some(binding) = prior {
                         set_session_account_hash(item, Some(&binding.account_identifier_hash));
                     }
+                } else if prior.is_none() && codex_rows_all(item, |mode| mode.is_none()) {
+                    set_session_account_hash(item, None);
                 }
             }
             if !matches(&baseline.snapshots) {

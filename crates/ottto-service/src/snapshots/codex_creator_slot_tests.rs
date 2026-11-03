@@ -203,3 +203,54 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
         assert_eq!((named.as_deref(), counts), (expected, [0; 6]), "{label}");
     }
 }
+
+/// [regress] Upgrading names a pre-join Codex group by its creator slot. The
+/// legacy check still reproduces the untagged output an older release
+/// persisted, so the newly named group is not held.
+#[test]
+fn codex_legacy_join_reproduces_untagged_output_before_creator_naming() {
+    let (root, inventory) = codex_file_join::tests::fixture();
+    let previous = codex_file_join::tests::legacy_index(&inventory, None);
+    let (mut index, mut result) = codex_file_join::tests::scan(&root, previous.clone(), 2);
+    assert_eq!(result.codex_legacy_join_baselines.len(), 2);
+    for baseline in &mut result.codex_legacy_join_baselines {
+        for snapshot in &mut baseline.snapshots {
+            assert!(!snapshot.model_usage.is_empty());
+            snapshot.session_account_evidence = Some(creator(Some("slot-b"), None));
+            for row in snapshot.model_usage.iter_mut().chain(
+                snapshot
+                    .usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                row.auth_mode = None;
+                row.account_identifier_hash = None;
+            }
+            // This scan's bind named the session; the older release did not.
+            let key = sha256_hex(&["session_owner:v1", "machine", &snapshot.source_session_id]);
+            let owner = SessionAccountBinding {
+                account_identifier_hash: "slot-b".into(),
+                workspace_identifier_hash: Some("slot-b-workspace".into()),
+            };
+            index.session_account_bindings.insert(key, owner);
+        }
+        let fingerprints = baseline
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot));
+        baseline.expected = snapshot_file_entity_set_hex(fingerprints.collect::<BTreeSet<_>>());
+    }
+    // Control: the projection alone tags the named owner.
+    let mut tagged = result.codex_legacy_join_baselines[0].snapshots.clone();
+    index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut tagged, &[]);
+    assert_eq!(
+        exact_session_account_hash(&tagged[0]).as_deref(),
+        Some("slot-b")
+    );
+
+    result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |index, snapshots| {
+        index.bind_session_accounts(SnapshotSource::Codex, "machine", snapshots, &[]);
+    });
+    assert!(result.census_complete, "a creator-slot name is not a hold");
+    std::fs::remove_dir_all(root).unwrap();
+}
