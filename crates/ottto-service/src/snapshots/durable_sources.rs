@@ -12,7 +12,8 @@ pub(crate) enum DurableSource {
 pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
-    /// Registry identity; Pi records return with S2c.
+    /// Registry identity, a stable wire ID; Tail heads bind the source by
+    /// its slug instead.
     #[allow(dead_code)]
     pub(crate) tag: u8,
     /// Its index routes through the state v2 store. Only ever set: a published

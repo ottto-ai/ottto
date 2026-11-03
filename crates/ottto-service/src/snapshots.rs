@@ -40447,8 +40447,8 @@ impl PiLedger {
             .map_or((false, None), |fork| (fork.has_parent, fork.header_nanos))
     }
 
-    /// The pure constructor S2c's Pi Tail decode refills the ledger with.
-    #[allow(dead_code)]
+    /// The ledger a Pi Tail head restores: no keys yet (its pages follow)
+    /// and the stored fork values.
     pub(crate) fn from_parts(
         usage_keys: BTreeMap<String, PiUsageDedupState>,
         has_parent: bool,
