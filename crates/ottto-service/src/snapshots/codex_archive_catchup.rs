@@ -130,6 +130,7 @@ impl ScanIndex {
             crate::local_resource_diagnostics::codex_zst_held(cause, count);
         }
         archive_alarm(alarm);
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
     }
     pub(super) fn hold_archive_corrections(&mut self, context: Option<&str>) {
         let mut count = 0;

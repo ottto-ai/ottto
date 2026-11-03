@@ -317,7 +317,7 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded = 16,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 17,
-    // Optional plain header occupancy refused an otherwise fundable decoder.
+    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
     #[serde(rename = "decoder_refused_header_occupancy")]
     DecoderRefusedHeaderOccupancy = 18,
     #[serde(rename = "CompressedFamilyUnproven")]
@@ -335,22 +335,94 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
-    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+/// Every counted cause; the length is checked against `__Count`.
+const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+    CodexZstCause::ReplayNotAuthorized,
+    CodexZstCause::ProofParentUnsupported,
+    CodexZstCause::ProofChildUnsupported,
+    CodexZstCause::ParentSideUnsupported,
+    CodexZstCause::DurableTailUnsupported,
+    CodexZstCause::GroupProbeUnsupported,
+    CodexZstCause::GroupReadUnsupported,
+    CodexZstCause::ParentLedgerUnbound,
+    CodexZstCause::PhysicalOffsetUnsupported,
+    CodexZstCause::AdmissionRefused,
+    CodexZstCause::DecodeFailed,
+    CodexZstCause::OwnerUnproven,
+    CodexZstCause::OutputHeld,
+    CodexZstCause::DecodedOverLimit,
+    CodexZstCause::HeaderInvalid,
+    CodexZstCause::CorrectionUnapplied,
+    CodexZstCause::HeaderUnfunded,
+    CodexZstCause::CompatibilityUnfunded,
+    CodexZstCause::DecoderRefusedHeaderOccupancy,
+    CodexZstCause::FamilyUnproven,
+    CodexZstCause::ArchiveEquivalenceUnproven,
+];
+struct CodexZstRefused {
+    counters: [AtomicU64; CODEX_ZST_CAUSES],
+    /// The counters' sum at the last flush.
+    flushed: AtomicU64,
+}
+impl CodexZstRefused {
+    const fn new() -> Self {
+        Self {
+            counters: [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES],
+            flushed: AtomicU64::new(0),
+        }
+    }
+}
+#[cfg(not(test))]
+static CODEX_ZST_REFUSED: CodexZstRefused = CodexZstRefused::new();
+#[cfg(test)]
+thread_local! {
+    static CODEX_ZST_REFUSED: CodexZstRefused = const { CodexZstRefused::new() };
+}
+fn with_codex_zst_refused<T>(f: impl FnOnce(&CodexZstRefused) -> T) -> T {
+    #[cfg(test)]
+    {
+        CODEX_ZST_REFUSED.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CODEX_ZST_REFUSED)
+    }
+}
 
+/// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
-    let counter = &CODEX_ZST_REFUSED[cause as usize];
-    let previous = counter
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-        .unwrap_or_else(|n| n);
-    traversal_point(
-        "codex_zst_refused",
-        "codex",
-        &BTreeMap::from([(
+    with_codex_zst_refused(|refused| {
+        let _ = refused.counters[cause as usize]
+            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
+/// One sparse line of the non-zero cumulative counters, only when their sum
+/// moved since the last flush.
+pub(crate) fn codex_zst_refused_flush() {
+    let counts = with_codex_zst_refused(|refused| {
+        let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
+            .into_iter()
+            .map(|cause| (cause, refused.counters[cause as usize].load(Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        let total = counts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        (refused.flushed.swap(total, Relaxed) != total).then_some(counts)
+    });
+    if let Some(counts) = counts {
+        traversal_point(
             "codex_zst_refused",
-            BTreeMap::from([(cause, previous.saturating_add(1))]),
-        )]),
-    );
+            "codex",
+            &BTreeMap::from([("codex_zst_refused", counts)]),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_refused_count(cause: CodexZstCause) -> u64 {
+    with_codex_zst_refused(|refused| refused.counters[cause as usize].load(Relaxed))
 }
 
 /// Counts per observed usage line, before response deduplication and timestamp

@@ -208,7 +208,6 @@ impl ArchiveWork {
             self.reservation,
             ArchiveReservation::HeaderSave | ArchiveReservation::HeaderReady
         ) {
-            self.header_attempts = self.header_attempts.saturating_sub(1);
             self.header_retry_after = 0;
             self.reservation = ArchiveReservation::None;
         }
@@ -878,7 +877,7 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Deferred);
         }
         self.archive_pass.started = true;
-        // An attempt is spent only once a funded reader is about to read.
+        // An attempt is spent only once a funded reader exists, below.
         let file = match open_candidate_beneath_root(candidate) {
             Ok(file) => file,
             Err(error) => {
@@ -903,6 +902,7 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Deferred);
         };
         if let Some(w) = self.archives.get_mut(&key).and_then(|a| a.work.as_mut()) {
+            w.header_attempts = w.header_attempts.saturating_add(1);
             w.reservation = ArchiveReservation::None;
         }
         input = input.header_only();
@@ -2127,7 +2127,7 @@ pub(in crate::snapshots) mod tests {
                                 .work
                                 .as_mut()
                                 .unwrap();
-                            assert_eq!(w.header_attempts, 1);
+                            assert_eq!(w.header_attempts, 0, "reserved, not read");
                             assert!(w.reservation == ArchiveReservation::None);
                             assert!(w.header_retry_after > sampled_scan::now_seconds());
                             w.header_retry_after = 0;
@@ -3612,7 +3612,7 @@ pub(in crate::snapshots) mod tests {
             index.archives.insert(key.clone(), a);
             index.disclose_archive_debt();
             let w = index.archives[&key].work.as_ref().unwrap();
-            assert_eq!(w.header_attempts, u64::from(opened));
+            assert_eq!(w.header_attempts, 1, "a cancellation refunds nothing");
             assert_eq!(w.header_retry_after > 0, opened);
             index.archives.clear();
             index.archive_pass.deferred.insert(key.clone());
