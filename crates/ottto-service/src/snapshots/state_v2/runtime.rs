@@ -490,10 +490,12 @@ fn normalize_hydrated(
     let slug = source.snapshot().api_slug();
     lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
         lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-            Hold::Future.into()
+            anyhow::Error::from(Hold::Future)
         }
-        error => error.into(),
-    })
+        error => anyhow::Error::from(error),
+    })?;
+    index.clear_retired_file_size_debt();
+    Ok(())
 }
 
 fn pause(state: &mut RouteState, class: Pause) {
