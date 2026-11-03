@@ -23195,6 +23195,10 @@ mod tests {
         mod privacy_flip_money_tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
         }
+        #[cfg(unix)]
+        mod claude_login_only_org_tests {
+            include!("snapshot_sync/claude_login_only_org_tests.rs");
+        }
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");

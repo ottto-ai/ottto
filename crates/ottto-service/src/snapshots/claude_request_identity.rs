@@ -770,7 +770,7 @@ impl Grouping {
     }
 
     /// Drops every tag that rests on transcript markers: the org-only (and
-    /// legacy sole-login) bases, and a marker org joined to login-only telemetry. Their
+    /// legacy sole-login) bases, and any org on login-only telemetry. Their
     /// usage stays on its row, untagged or login-only; refusals stay.
     fn withdraw_transcript_tags(&mut self) {
         for group in self.groups.values_mut().flat_map(BTreeMap::values_mut) {
@@ -4702,8 +4702,6 @@ pub(crate) struct ScanEvidence<'a> {
     /// checked once here (its fingerprint included); `classify` reuses the
     /// verdict, and a passing row's login is its `account_identifier_hash`.
     invalid_logins: BTreeSet<(&'a str, &'a str)>,
-    /// Orgs per login, proven by complete telemetry request identity.
-    pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
     /// Pre-enrichment native evidence already saved by this scan. Request
     /// telemetry may veto its original org for billing without changing the
     /// unambiguous native account used by local Desktop activity.
@@ -4757,7 +4755,7 @@ impl RequestRootIndex {
 }
 
 /// One root's API rows by request id: the row, or `None` when several name it.
-pub(crate) fn unique_by_request(
+fn unique_by_request(
     rows: &[ClaudeLocalOtelEvidence],
 ) -> BTreeMap<&str, Option<&ClaudeLocalOtelEvidence>> {
     let mut unique = BTreeMap::new();
@@ -4768,21 +4766,6 @@ pub(crate) fn unique_by_request(
             .or_insert(Some(row));
     }
     unique
-}
-
-/// Only a unique row that passes the same integrity checks `classify` applies
-/// may establish a (login, org) pair. `false`: its login is invalid.
-pub(crate) fn prove_membership(
-    row: &ClaudeLocalOtelEvidence,
-    root: &str,
-    memberships: &mut BTreeMap<String, BTreeSet<String>>,
-) -> bool {
-    let login = valid_login(row, root);
-    if let (Some(login), Some(org)) = (login, complete_org(row)) {
-        let orgs = memberships.entry(login.to_string()).or_default();
-        orgs.insert(org.to_string());
-    }
-    login.is_some()
 }
 
 impl<'a> ScanEvidence<'a> {
@@ -4802,7 +4785,7 @@ impl<'a> ScanEvidence<'a> {
         }
         for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
-            if !prove_membership(row, key.0, &mut evidence.memberships) {
+            if valid_login(row, key.0).is_none() {
                 evidence.invalid_logins.insert(key);
             }
         }
@@ -4819,13 +4802,12 @@ impl<'a> ScanEvidence<'a> {
     }
 
     /// The whole corpus's cross-root answers, for a pass whose reports hold
-    /// only the page roots: request roots and login memberships.
+    /// only the page roots: request roots.
     pub(crate) fn with_cross_root(
         mut self,
         cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
     ) -> Self {
         self.cross_request_roots = Some(&cross.request_roots);
-        self.memberships = cross.memberships.clone();
         self
     }
 
@@ -4913,7 +4895,7 @@ fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<
     }
 }
 
-/// The org of a row whose request identity is complete, as memberships use.
+/// The org of a row whose request identity is complete.
 pub(super) fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
     row.request_identity
         .as_ref()
@@ -4922,7 +4904,7 @@ pub(super) fn complete_org(row: &ClaudeLocalOtelEvidence) -> Option<&str> {
 }
 
 /// A telemetry-only side call's own account: an intact row login with a
-/// complete org (the same checks that establish memberships). `None` when
+/// complete org (the same checks `classify` applies). `None` when
 /// either is missing or incomplete: the caller keeps the session fallback.
 pub(crate) fn side_call_account(row: &ClaudeLocalOtelEvidence, root: &str) -> AccountPartition {
     let login = valid_login(row, root)?;
@@ -5179,22 +5161,10 @@ pub(crate) fn classify_ref<'k>(
             account_source: None,
         });
     }
-    // Login-only telemetry: a trusted marker org joins only when it is an
-    // established org of that login; otherwise today's login rule.
-    let org = match facts.marker {
-        MarkerVerdict::Trusted(org)
-            if evidence
-                .memberships
-                .get(login)
-                .is_some_and(|orgs| orgs.contains(org)) =>
-        {
-            Some(org)
-        }
-        _ => None,
-    };
+    // Login-only telemetry never borrows a transcript marker's org.
     Tagged(KeyRef {
         login: Some(login),
-        org,
+        org: None,
         basis: TELEMETRY_LOGIN,
         account_source: None,
     })

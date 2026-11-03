@@ -5,7 +5,6 @@
 //! gives: the same rows, the same sorted root order, the same first refusal.
 
 use super::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
-use super::claude_request_identity::{prove_membership, unique_by_request};
 use super::{claude_earliest_request, ClaudeLegacyRequestOwners, SnapshotItem};
 use crate::claude_local_otel::{
     claude_pair_generation, ClaudeLocalOtelEvidence, ClaudePairGeneration,
@@ -79,8 +78,6 @@ pub(crate) struct CrossRootEvidence {
     roots: Vec<String>,
     /// (a) Exact cross-root answers for the page's possible request lookups.
     pub(crate) request_roots: RequestRootJoins,
-    /// (b) Login to orgs, from every healthy root's intact unique rows.
-    pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
     /// (c) Legacy request owners, added in sorted root order.
     pub(crate) legacy_request_owners: ClaudeLegacyRequestOwners,
     /// (d) Every loaded API (healthy or vetoing) and healthy trace row: its
@@ -107,7 +104,6 @@ impl CrossRootEvidence {
                     .iter()
                     .flat_map(super::claude_request_money::e2::item_request_ids),
             ),
-            memberships: BTreeMap::new(),
             legacy_request_owners: ClaudeLegacyRequestOwners::default(),
             tripwire_rows: Vec::new(),
             earliest_requests: BTreeMap::new(),
@@ -142,9 +138,6 @@ impl CrossRootEvidence {
         let api_rows = api.map_or(&[][..], Vec::as_slice);
         let trace_rows = trace.map_or(&[][..], Vec::as_slice);
         self.request_roots.add_root(ordinal, api_ids, trace_ids);
-        for row in unique_by_request(api_rows).into_values().flatten() {
-            prove_membership(row, root, &mut self.memberships);
-        }
         if let Some(api) = api {
             self.legacy_request_owners.add_root(root, api, trace);
         }
