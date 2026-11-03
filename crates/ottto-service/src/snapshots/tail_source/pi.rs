@@ -241,7 +241,7 @@ impl TailSource for Pi {
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
         if revision != Self::REDUCTION_REVISION {
-            return Err(ReconstructCause::Revision);
+            return Err(ReconstructCause::Incompatible);
         }
         let mut d = Dec::new(head);
         HeadIdentity::take(&mut d)?;
