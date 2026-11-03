@@ -2615,7 +2615,13 @@ fn conflict_then_append() {
         );
         let (mut pages, disk_hits) = arms(&c, &warm, &mut disk, &prior);
         assert_eq!(pages[0].modes, (1, 0, 0), "the RAM arm reads Full");
-        assert_eq!(pages[2].modes, (1, 0, 0), "the restored arm reads Full");
+        // A new owner's native read of the grown file may be cap-funded
+        // (unsampled); either way it is no Tail and the bodies below match.
+        assert_eq!(
+            pages[2].modes.1 + pages[2].modes.2,
+            0,
+            "the restored arm reads natively"
+        );
         assert_eq!(disk_hits, 0, "an owed answer never continues the head");
         finish_claude_pages(&c, &mut pages);
         compare_claude_uploads(&pages);
