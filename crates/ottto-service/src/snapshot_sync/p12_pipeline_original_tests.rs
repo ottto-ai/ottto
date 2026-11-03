@@ -1345,7 +1345,7 @@ fn native_comparison_novel_import_base_parity() {
         assert_eq!(rearm_reads(&base_quiet), 0);
         let base_before = serde_json::to_value(&base_quiet.last().unwrap().index).unwrap();
         let base_selected = native_comparison_selected_family(&base_quiet.last().unwrap().index);
-        let candidate_selected = {
+        let (candidate_selected, candidate_pending_before_import) = {
             let _native = crate::snapshots::claude_native_comparison::enable_for_test();
             assert_eq!(
                 candidate.establish_listed(&candidate_proven).heads,
@@ -1353,7 +1353,14 @@ fn native_comparison_novel_import_base_parity() {
             );
             let quiet = candidate.generation(10);
             assert_eq!(rearm_reads(&quiet), 0);
-            native_comparison_selected_family(&quiet.last().unwrap().index)
+            (
+                native_comparison_selected_family(&quiet.last().unwrap().index),
+                quiet
+                    .last()
+                    .unwrap()
+                    .duplicate_census
+                    .pending_occurrence_count,
+            )
         };
         assert_eq!(base_selected, candidate_selected);
         const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
@@ -1445,8 +1452,9 @@ fn native_comparison_novel_import_base_parity() {
                 .last()
                 .unwrap()
                 .duplicate_census
-                .pending_occurrence_count,
-            7,
+                .pending_occurrence_count
+                .checked_sub(candidate_pending_before_import),
+            Some(1),
             "Skips/envelope state never become native pending or coverage"
         );
         let fp = offered_body(&candidate_import).1;
