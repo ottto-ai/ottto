@@ -893,14 +893,16 @@ fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
 /// append after the open step keeps main's stable-source failure (`OpenRead`).
 #[test]
 fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let source = SnapshotSource::Codex;
     let base = baseline(source, 4, 2);
-    base.cache.clear();
+    // No continuation: the committed head on its route is retired.
+    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+        &base.cache,
+        &base.index,
+    );
     let path = base.path.clone();
     let appended = row_bytes(source, 6..8);
     let (_, full, seen, read) = page_injecting(

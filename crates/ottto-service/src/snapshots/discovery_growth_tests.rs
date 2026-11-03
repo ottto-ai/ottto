@@ -337,8 +337,6 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
 /// the fragment witness across source preparations is a separate follow-up.
 #[test]
 fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     use crate::transcript_acquisition::{AuditDebt, ReadPlan, Scope};
     let f = Fixture::new();
     let source = SnapshotSource::Codex;

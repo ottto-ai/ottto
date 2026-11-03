@@ -768,7 +768,8 @@ fn codex_case(legacy: bool, content: bool) {
         return;
     }
     let c = corpus(name);
-    let mut disk = Disk::new(&c);
+    // Codex continues from its state database route, as Claude does.
+    let mut disk = Disk::with_route(&c, SnapshotSource::Codex);
     let path = c.root.join("rollout.jsonl");
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
     let content_prefix = if content {
@@ -803,9 +804,9 @@ fn codex_case(legacy: bool, content: bool) {
     input_clock(&path);
     let _cutover = crate::snapshots::TestCutover::set(0);
     if legacy {
-        // The old binary's cutover differs, so its RAM reduction cannot be
+        // The old binary's cutover differs, so its committed head cannot be
         // reused. Warm the upgraded binary from the actual Legacy ACK facts,
-        // then exercise its next page's retained Tail under that same rule.
+        // then exercise its next page's routed Tail under that same rule.
         let (mut upgraded, scan, modes) = other_page(&c, &scanner, source, prior);
         assert_eq!(modes, (1, 0, 0));
         assert!(!scan.snapshots.is_empty());
@@ -817,12 +818,16 @@ fn codex_case(legacy: bool, content: bool) {
     let restart = disk.owner(source);
     save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
-    assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
+    assert_eq!(modes, (0, 1, 0), "must continue from the Codex route head");
     let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior.clone());
     assert_eq!(modes, (1, 0, 0));
-    // Codex keeps its RAM reduction until S2b: a new owner reads Full.
+    // S2b: a new owner continues from the same committed Codex heads.
     let (_, restored, modes) = other_page(&c, &restart, source, prior);
-    assert_eq!(modes, (1, 0, 0), "a restarted Codex owner reads Full");
+    assert_eq!(
+        modes,
+        (0, 1, 0),
+        "a restarted Codex owner continues from the same committed heads"
+    );
     assert!(tail_index
         .files
         .values()
@@ -2135,7 +2140,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
             // and Tail, as well as from RAM and a cold byte-zero read.
             let source = SnapshotSource::Codex;
             let _cutover = crate::snapshots::TestCutover::set(0);
-            let mut disk = Disk::new(&c);
+            let mut disk = Disk::with_route(&c, source);
             let scanner = E2ScanFixture::default();
             disk.begin(&scanner, source);
             std::fs::write(&path, prefix + &codex_rows("seed", 1)).unwrap();
@@ -2161,7 +2166,8 @@ fn codex_admission_branches_preserve_emitted_totals() {
             ];
             assert_eq!(arms[0].2, (0, 1, 0));
             assert_eq!(arms[1].2, (1, 0, 0));
-            assert_eq!(arms[2].2, (1, 0, 0));
+            // The restarted owner continues from the same committed Codex head.
+            assert_eq!(arms[2].2, (0, 1, 0));
             for (index, scan, _) in &arms {
                 assert_eq!(scan.dropped_usage_record_count, 1);
                 assert_eq!(scan.recognized_usage_drop_count, 1);
