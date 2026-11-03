@@ -6,6 +6,7 @@ use super::state_v2_money_tests::{routed, tagged_api};
 use super::*;
 use crate::snapshots::e2_pipeline_scan_fixture::{
     commit_tail_head_for_test, hold_claude_account_for_test,
+    legacy_owner_of_terminal_family_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent;
 use std::collections::BTreeSet;
@@ -216,6 +217,33 @@ fn telemetry_retention_positive_control_cold_restart_and_append() {
                 .any(|item| !item.request_evidence.is_empty()),
             "the fixture carries identity-tagged rows"
         );
+        // Both accounts' requests survive qualification: one request each.
+        let mut placed = BTreeMap::<String, u64>::new();
+        for row in warm
+            .scan
+            .snapshots
+            .iter()
+            .flat_map(|item| &item.usage_buckets)
+            .flat_map(|bucket| &bucket.model_usage)
+        {
+            let shares = match &row.identity_parts {
+                Some(parts) => parts
+                    .iter()
+                    .map(|part| (&part.account_identifier_hash, part.request_count))
+                    .collect(),
+                None => vec![(&row.account_identifier_hash, row.request_count)],
+            };
+            for (account, requests) in shares {
+                if let Some(account) = account {
+                    *placed.entry(account.clone()).or_default() += requests;
+                }
+            }
+        }
+        assert_eq!(
+            placed.into_values().collect::<Vec<_>>(),
+            [1, 1],
+            "each account keeps its own request"
+        );
         let gone = ["claude-code-effort", "claude-code-trace-ownership"].map(|dir| {
             let path = member(&c, dir, GONE);
             let bytes = std::fs::read(&path).unwrap();
@@ -286,42 +314,74 @@ enum Dependency {
     SubagentCopy,
     /// A fork/resume transcript of another session holds its request.
     ResumeCopy,
-    /// This page's bodies name it (its main and subagent bodies, read by the
-    /// real extraction, then both files are gone).
+    /// Another body of this page names it as parent/root (its subagent's,
+    /// through the real extraction; its own main body is left out), then its
+    /// files are gone.
     NamedByPage,
     /// A pending family witness.
     PendingWitness,
+    /// It is a legacy owner of another root's terminal family witness.
+    LegacyOwnerOfTerminalFamily,
     /// An account hold on its transcript key.
     AccountHold,
     /// A committed Tail head for its transcript key.
     TailHead,
     /// The walk listed its transcript (aged, never indexed or read).
     AgedListedFile,
+    /// Its login-only rows answer a request (after an org marker) that only
+    /// another root's transcript holds.
+    LoginOnlyForeignOwner,
+    /// Its transcript was read on a page whose upload was never ACKed, then
+    /// deleted: the unACKed scan state keeps it.
+    UnackedRoot,
+    /// Only its excluded subagent journal remains. The journal names no
+    /// session and is never read, so it keeps nothing: the pair retires.
+    ExcludedFileOnly,
 }
 
-/// [money] Every dependency keeps the candidate's pair; the uncopied gone
-/// control retires in every row.
+/// [money] Every dependency keeps the candidate's pair, except an excluded
+/// journal, which reads nothing; the uncopied gone control retires in every
+/// row.
 #[test]
 fn telemetry_retention_keeps_every_dependency() {
-    for row in [
-        Dependency::SubagentCopy,
-        Dependency::ResumeCopy,
-        Dependency::NamedByPage,
-        Dependency::PendingWitness,
-        Dependency::AccountHold,
-        Dependency::TailHead,
-        Dependency::AgedListedFile,
+    for (row, keeps) in [
+        (Dependency::SubagentCopy, true),
+        (Dependency::ResumeCopy, true),
+        (Dependency::NamedByPage, true),
+        (Dependency::PendingWitness, true),
+        (Dependency::LegacyOwnerOfTerminalFamily, true),
+        (Dependency::AccountHold, true),
+        (Dependency::TailHead, true),
+        (Dependency::AgedListedFile, true),
+        (Dependency::LoginOnlyForeignOwner, true),
+        (Dependency::UnackedRoot, true),
+        (Dependency::ExcludedFileOnly, false),
     ] {
         with_e2(|| {
             let mut c = Corpus::new(&format!("telemetry-retention-{row:?}"));
-            c.root(ROOT, &line(ROOT, "r0", AT, 11));
+            let foreign = matches!(row, Dependency::LoginOnlyForeignOwner);
+            let marker = serde_json::json!({"type":"attachment", "sessionId":ROOT,
+                "attachment":{"type":"credential_org",
+                    "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+            c.root(
+                ROOT,
+                &if foreign {
+                    marker.to_string()
+                        + "\n"
+                        + &line(ROOT, "r0", AT, 11)
+                        + &line(ROOT, "x0", AT, 14)
+                } else {
+                    line(ROOT, "r0", AT, 11)
+                },
+            );
             c.evidence(&[api("r0", 11, 110)], &[trace("r0", "")]);
             for (session, request) in [(HELD, "x0"), (GONE, "g0")] {
-                c.evidence_for(
-                    session,
-                    &[api_for(session, request, 14, 140)],
-                    &[trace_for(session, request, "")],
-                );
+                let api_row = if foreign && session == HELD {
+                    api_login(session, request, 14, '1', None)
+                } else {
+                    api_for(session, request, 14, 140)
+                };
+                c.evidence_for(session, &[api_row], &[trace_for(session, request, "")]);
             }
             match row {
                 Dependency::SubagentCopy => {
@@ -336,13 +396,8 @@ fn telemetry_retention_keeps_every_dependency() {
                 }
                 _ => {}
             }
-            let mut warm = ready(
-                &c,
-                &E2ScanFixture::capturing_identity(),
-                ScanIndex::default(),
-                100,
-                true,
-            );
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut warm = ready(&c, &scanner, ScanIndex::default(), 100, true);
             warm.finish();
             let held = key(&c, HELD);
             let mut named = Vec::new();
@@ -363,7 +418,25 @@ fn telemetry_retention_keeps_every_dependency() {
                     );
                     // Read where the sync loop reads it: after enrichment.
                     page.enrich(&c);
-                    named = crate::snapshot_sync::claude_evidence_session_ids(&page.scan.snapshots);
+                    let others = page
+                        .scan
+                        .snapshots
+                        .iter()
+                        .filter(|item| item.source_session_id != HELD)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert!(
+                        others
+                            .iter()
+                            .any(|item| item.attribution_facts.iter().any(|fact| {
+                                matches!(
+                                    fact.field.as_str(),
+                                    "parent_session_ref" | "root_session_ref"
+                                ) && fact.value == HELD
+                            })),
+                        "another body names it by reference"
+                    );
+                    named = crate::snapshot_sync::claude_evidence_session_ids(&others);
                     assert!(named.iter().any(|session| session == HELD));
                     std::fs::remove_file(Path::new(&held)).unwrap();
                     std::fs::remove_dir_all(c.root.join(HELD)).unwrap();
@@ -371,6 +444,9 @@ fn telemetry_retention_keeps_every_dependency() {
                 Dependency::PendingWitness => {
                     warm.index
                         .insert_retry_pending_claude_authority_for_test(HELD);
+                }
+                Dependency::LegacyOwnerOfTerminalFamily => {
+                    legacy_owner_of_terminal_family_for_test(&mut warm.index, ROOT, HELD);
                 }
                 Dependency::AccountHold => hold_claude_account_for_test(&mut warm.index, &held),
                 Dependency::TailHead => {
@@ -387,13 +463,31 @@ fn telemetry_retention_keeps_every_dependency() {
                         )
                         .unwrap();
                 }
-                Dependency::SubagentCopy | Dependency::ResumeCopy => {}
+                Dependency::UnackedRoot => {
+                    let path = c.root(HELD, &line(HELD, "x1", AT, 9));
+                    let mut page = c.raw(&scanner, warm.index, 100, true, &[]);
+                    page.enrich(&c);
+                    page.finish();
+                    assert!(page.delivered.is_none(), "no ACK reached this page");
+                    std::fs::remove_file(path).unwrap();
+                    warm = page;
+                }
+                Dependency::ExcludedFileOnly => {
+                    c.write_at(
+                        &format!("{HELD}/subagents/journal.jsonl"),
+                        &line(HELD, "x1", AT, 9),
+                        AT,
+                    );
+                }
+                Dependency::SubagentCopy
+                | Dependency::ResumeCopy
+                | Dependency::LoginOnlyForeignOwner => {}
             }
             walked(&c, now_ms() + 60_000);
             retire_with(&c, &warm.index, &BTreeSet::new(), &named);
             assert_eq!(
                 [members(&c, HELD), members(&c, GONE)],
-                [(true, true), (false, false)],
+                [(keeps, keeps), (false, false)],
                 "{row:?}"
             );
         });
@@ -498,20 +592,28 @@ fn telemetry_retention_hint_path_retires_only_after_not_found() {
 }
 
 /// [format] A crash between a pair's two unlinks leaves one member; the next
-/// process's first complete walk deletes it.
+/// process's first complete walk deletes it. A restart's cold read of every
+/// survivor equals the read before retention, both after the crash and after
+/// the finishing run (money and placement oracle).
 #[test]
 fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
     with_e2(|| {
         let (c, warm) = corpus("telemetry-retention-crash");
         // GONE is then the only unread pair; its second unlink fails.
         std::fs::remove_file(member(&c, "claude-code-effort", HALF)).unwrap();
+        let before = cold(&c);
+        let before = routed(&before, before.upload_policy);
         crate::claude_local_otel::fail_telemetry_unlink_for_test(2);
         walked(&c, now_ms() + 60_000);
         retire(&c, &warm.index);
         assert_eq!(members(&c, GONE), (false, true));
+        let crashed = cold(&c);
+        assert_equivalent(&before, &routed(&crashed, crashed.upload_policy));
         walked(&c, now_ms() + 60_000);
         retire(&c, &warm.index);
         assert_eq!(members(&c, GONE), (false, false));
         assert_eq!(members(&c, ROOT), (true, true));
+        let finished = cold(&c);
+        assert_equivalent(&before, &routed(&finished, finished.upload_policy));
     });
 }

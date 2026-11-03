@@ -43,6 +43,8 @@ pub(crate) fn retire_claude_telemetry(
     removed: &BTreeSet<String>,
     named: &[String],
 ) {
+    #[cfg(test)]
+    RUNS.with(|runs| runs.set(runs.get() + 1));
     let Some((roster, backlog)) = index_current_since_start(SnapshotSource::ClaudeCode) else {
         return;
     };
@@ -75,6 +77,18 @@ pub(crate) fn retire_claude_telemetry(
     if run != Counts::default() {
         crate::local_resource_diagnostics::claude_telemetry_retention(run);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: how many times the sync loop reached retention on this thread
+/// since the last call.
+#[cfg(test)]
+pub(crate) fn take_runs_for_test() -> u32 {
+    RUNS.with(|runs| runs.replace(0))
 }
 
 /// One run over `stems`: every stem is retired, held or a read fault.

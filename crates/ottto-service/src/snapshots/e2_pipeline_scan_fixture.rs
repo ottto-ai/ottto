@@ -815,3 +815,19 @@ pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> boo
     index.save(&route).unwrap();
     state_v2::tail_head_keys(index).unwrap().contains(key)
 }
+
+/// Telemetry retention dependency row: `owner` is a legacy owner root of
+/// `root`'s family witness, under a terminal (unproven) authority record.
+pub(crate) fn legacy_owner_of_terminal_family_for_test(
+    index: &mut ScanIndex,
+    root: &str,
+    owner: &str,
+) {
+    index.insert_unproven_terminal_claude_authority_for_test(root, &"1".repeat(64));
+    index
+        .claude_usage_family_witnesses
+        .get_mut(root)
+        .expect("the terminal record retains its witness")
+        .legacy_owner_roots
+        .insert(owner.to_owned());
+}
