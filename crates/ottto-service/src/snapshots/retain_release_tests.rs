@@ -33,7 +33,7 @@ fn scan_fixture(source: SnapshotSource, rows: usize, modified: SystemTime) -> Sc
     let root = match source {
         SnapshotSource::Codex => dir.join("home/.codex/sessions"),
         SnapshotSource::ClaudeCode => dir.join("home/.claude/projects"),
-        _ => unreachable!(),
+        SnapshotSource::Pi => dir.join("home/.pi/agent/sessions"),
     };
     fs::create_dir_all(&root).unwrap();
     let (name, header) = match source {
@@ -45,7 +45,11 @@ fn scan_fixture(source: SnapshotSource, rows: usize, modified: SystemTime) -> Sc
             "native-tail-fixture.jsonl",
             json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}}),
         ),
-        _ => unreachable!(),
+        SnapshotSource::Pi => (
+            "native-tail-fixture.jsonl",
+            json!({"type":"session", "version":3, "id":"native-tail-fixture",
+                "timestamp":"2026-10-07T10:00:00Z", "cwd":"/synthetic/pi"}),
+        ),
     };
     let fixture = ScanFixture {
         dir,
@@ -411,13 +415,13 @@ fn run(world: &mut World, opts: Opts) -> Run {
 /// singleton is granted an exact completion measure.
 #[test]
 fn r0_tail_with_room_is_granted_and_releases_nothing() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let mut world = World::new(source);
         assert!(
             matches!(
@@ -449,11 +453,8 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
             "{source:?}"
         );
         // #667: a granted copy is admitted against main's peak-reserved
-        // budget, `b_ins` less the decode peak (none for Codex).
+        // budget, `b_ins` less the decode peak.
         let peak = probe.granted_peak.expect("granted peak");
-        if source == SnapshotSource::Codex {
-            assert_eq!(peak, 0);
-        }
         assert_eq!(
             run.decisions,
             vec![Decision::Granted {
@@ -560,13 +561,13 @@ fn r0_blocking_measure_waits_for_the_retained_lock() {
 /// from the cursor reservation, and the next take carries it.
 #[test]
 fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let fixture = resident(
             source,
@@ -727,13 +728,13 @@ fn packet_refusal_buckets_and_budget_variants() {
 /// for both sources (Codex by under 1 KiB). It is recorded, not pinned.
 #[test]
 fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let spec = Spec {
             older: 1,
             rows: 0,
@@ -755,16 +756,17 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
 /// reaches `tail_completion_budget` (the only source of `Deferred`, called
 /// only behind `releases_at_completion`). Aliases and receipts are
 /// in the guard matrix; the cursor and group conjuncts are in
-/// `codex_cursor_tests` and `group_job_tests`.
+/// `codex_cursor_tests` and `group_job_tests`. Codex's tier-join conjunct
+/// left with Codex's RAM reduction copy (a codec source keeps none).
 #[test]
 fn r0_non_f_shapes_keep_clear_other_active() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let mut world = World::new(source);
         let index = std::mem::take(&mut world.index);
         let mut scan = step_until(
@@ -814,27 +816,6 @@ fn r0_non_f_shapes_keep_clear_other_active() {
         let active = scan.active_file.as_deref_mut().unwrap();
         active.sampling.as_mut().unwrap().mode = mode;
 
-        if source == SnapshotSource::Codex {
-            let active = scan.active_file.as_deref_mut().unwrap();
-            let replay = active.parser.accumulator.codex_tier_replay.take();
-            let mut joined = replay
-                .clone()
-                .unwrap_or_else(|| codex_file_join::TierReplay::new(None, false, String::new()));
-            joined.join = Some(Box::new(codex_file_join::StreamProof::new(
-                String::new(),
-                false,
-                vec![codex_file_join::MemberPlan::default()],
-            )));
-            active.parser.accumulator.codex_tier_replay = Some(joined);
-            assert!(!shape_f(&scan), "join");
-            assert_eq!(release(&mut scan).clear_other_active, 1, "join");
-            scan.active_file
-                .as_deref_mut()
-                .unwrap()
-                .parser
-                .accumulator
-                .codex_tier_replay = replay;
-        }
         assert!(shape_f(&scan), "restored {source:?}");
     }
 }
@@ -876,8 +857,8 @@ fn contended<T>(
 /// is free, never `ClearOtherActive`.
 #[test]
 fn r0_branches_a_and_d_release_as_base_under_contention() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -890,7 +871,7 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
         )
     };
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         // A: a new file read Full beside one resident.
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let base = SystemTime::now() - Duration::from_secs(3_600);
@@ -969,13 +950,13 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
 /// without it, and a supported CI build always has it.
 #[test]
 fn r0_unknown_resident_evicts_nothing() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
+    // Pi keeps the RAM retention path (no Tail codec until S2c); a codec
+    // source keeps no RAM reduction copy.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let mut world = World::new(source);
         let cache = Arc::clone(&world.cache);
         let run = run(

@@ -15,6 +15,15 @@ impl Fixture {
             .session_attribution_enabled
             .then(|| attribution(self.source, &self.root, mode.key))
     }
+    /// The owner's commit before its next walk: a codec source (Codex)
+    /// continues from its state database route; Pi is left alone.
+    fn route(&mut self) {
+        self.index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            self.source,
+            Some(self.cache.as_ref()),
+            std::mem::take(&mut self.index),
+        );
+    }
     fn send_all(&mut self, committed: &ScanIndex, scan: &SourceScanResult) {
         let context = self
             .index
@@ -56,12 +65,14 @@ fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
                 let mut f = Fixture::new(source);
                 f.append(&material(source));
                 f.flip_to(before);
+                f.route();
                 let committed = f.index.clone();
                 let parsed = f.flip_walk(before.policy, f.attribution_for(before).as_ref());
                 f.send_all(&committed, &parsed.scan);
                 assert!(!f.debt(), "{label}: parsed and acknowledged under A");
                 f.flip_to(after);
                 f.append(&growth(source));
+                f.route();
                 let committed = f.index.clone();
                 let tail = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
                 assert_eq!(tail.modes, (0, 1, 0), "{label}");
@@ -77,6 +88,7 @@ fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
                 f.uploader =
                     crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source);
                 f.flip_to(after);
+                f.route();
                 let committed = f.index.clone();
                 let cold = f.flip_walk(after.policy, f.attribution_for(after).as_ref());
                 assert_eq!(cold.modes.0, 1, "{label}: the control is a Full");

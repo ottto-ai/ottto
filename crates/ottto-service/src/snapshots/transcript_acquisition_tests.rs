@@ -1589,8 +1589,7 @@ fn a_codec_route_error_holds_the_file_without_ram() {
         assert!(super::tail_source::tail_route(source, &index).is_err());
         assert!(!super::tail_source::keeps_ram(source));
         let held = tail_counter_for_test("tail_db_loads", "held");
-        let ((index, modes), lifecycle) =
-            observe(|| codec_page(source, &fixture, &cache, index));
+        let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
         eprintln!(
             "ROUTE_ERROR_HOLD {source:?} held={} modes={modes:?}",
             tail_counter_for_test("tail_db_loads", "held") - held
@@ -1844,11 +1843,10 @@ fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
 /// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
 /// limit, with the sidecar census incomplete) owns no optimization state. Its
 /// copy refusal must not wipe an unrelated, independently bounded resident
-/// reduction, and must not insert one of its own.
+/// reduction, and must not insert one of its own. Both sources continue on
+/// their route; a codec source keeps no RAM resident to check.
 #[test]
 fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1867,7 +1865,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -1917,7 +1916,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
         assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
         assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "the unrelated reduction survives {source:?}"
         );
         assert!(
@@ -1978,8 +1978,6 @@ fn step_until(
 /// (no release unless it borrows more than its reduction).
 #[test]
 fn sampled_unsampled_native_refusal_guard_matrix() {
-    // Codex's RAM retention path: a Codex index off its V2 route.
-    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2008,7 +2006,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -2060,7 +2059,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "{source:?}"
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "{source:?}"
         );
         assert_eq!(
@@ -2076,12 +2076,13 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         active.aliases.push(candidate);
         let counts = release(&scan, measured);
         assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
+        // Only a source that keeps a RAM copy has a resident to release.
         assert_eq!(
             counts.clear_entries_released,
-            if source == SnapshotSource::ClaudeCode {
-                0
-            } else {
+            if super::tail_source::keeps_ram(source) {
                 1
+            } else {
+                0
             },
             "{source:?}"
         );
