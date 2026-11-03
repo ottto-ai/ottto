@@ -77,25 +77,12 @@ fn process_start() -> Option<ProcessStart> {
     *START.get_or_init(acquire_process_start)
 }
 
-#[cfg(not(test))]
-static CENSUS_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+// Parallel fixtures never share production attempt ordering or injected identity.
+crate::local_resource_diagnostics::process_static!(fn with_attempt_counter: AtomicU64 = AtomicU64::new(0));
 #[cfg(test)]
 thread_local! {
-    // Parallel fixtures never share production attempt ordering or injected identity.
-    static TEST_CENSUS_ATTEMPT: AtomicU64 = const { AtomicU64::new(0) };
     static TEST_PROCESS_START: std::cell::Cell<Option<Option<ProcessStart>>> = const { std::cell::Cell::new(None) };
     static TEST_OUTCOME_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn with_attempt_counter<T>(operation: impl FnOnce(&AtomicU64) -> T) -> T {
-    #[cfg(test)]
-    {
-        TEST_CENSUS_ATTEMPT.with(operation)
-    }
-    #[cfg(not(test))]
-    {
-        operation(&CENSUS_ATTEMPT)
-    }
 }
 
 fn begin_census_attempt() {

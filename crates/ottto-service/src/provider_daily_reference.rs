@@ -25,6 +25,7 @@
 //!   The backend separately applies its collector-build admission list to each
 //!   upload and stores nothing from an unadmitted build.
 
+use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
@@ -1036,27 +1037,6 @@ fn live_binding_mismatch(grants: &GrantStore, runtime: &Runtime) -> Option<&'sta
         }
     }
     None
-}
-
-/// [`collector_status`] plus the live-binding check. This is what operator and UI
-/// surfaces should call: a status that can still read `enabled` while the
-/// collector refuses every cycle is the bug this exists to prevent.
-pub fn collector_status_live(grants: &GrantStore, network_disabled: bool) -> CollectorStatusV1 {
-    let status = collector_status(grants, network_disabled);
-    if status.runtime_state != RuntimeState::Enabled {
-        // Nothing is resolved and no account state is touched unless consent is
-        // already permitted to read.
-        return status;
-    }
-    let runtime = load_runtime_binding()
-        .ok()
-        .map(|(runtime, _credential, _api_base_url)| runtime);
-    status_with_live_binding(grants, status, runtime.as_ref())
-}
-
-/// The status view for the real support directory.
-pub fn default_collector_status() -> CollectorStatusV1 {
-    collector_status_live(&GrantStore::default(), network_disabled())
 }
 
 /// Replay ledger for this capability's one-time control tokens.
@@ -3641,27 +3621,6 @@ fn random_key() -> Result<Vec<u8>> {
     let mut key = vec![0_u8; 32];
     random_fill(&mut key).map_err(|_| anyhow!("generate codex daily aggregates HMAC key"))?;
     Ok(key)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex(raw: &str) -> Option<Vec<u8>> {
-    (raw.len() % 2 == 0).then_some(())?;
-    (0..raw.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&raw[index..index + 2], 16).ok())
-        .collect()
-}
-
-fn is_uuid(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
 }
 
 fn timestamp(value: OffsetDateTime) -> String {

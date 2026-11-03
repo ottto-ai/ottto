@@ -1,4 +1,35 @@
-//! Shape checks for a SHA-256 digest written as 64 hex digits.
+//! Lowercase hex encoding and shape checks (SHA-256 digests, UUIDs).
+
+use sha2::{Digest, Sha256};
+
+/// Two lowercase hex digits per byte.
+pub(crate) fn encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Inverse of [`encode`] (either case); `None` on odd length or a non-hex pair.
+pub(crate) fn decode(raw: &str) -> Option<Vec<u8>> {
+    (raw.len() % 2 == 0).then_some(())?;
+    (0..raw.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&raw[index..index + 2], 16).ok())
+        .collect()
+}
+
+/// SHA-256 of `bytes` as 64 lowercase hex digits.
+pub(crate) fn sha256_lower(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The 36-byte 8-4-4-4-12 hex UUID shape (either case).
+pub(crate) fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
 
 /// 64 lowercase hex digits: the shape `format!("{:x}", Sha256::digest(..))` writes.
 pub(crate) fn is_sha256_lower(value: &str) -> bool {

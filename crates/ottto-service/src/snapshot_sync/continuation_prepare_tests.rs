@@ -143,6 +143,7 @@ impl ContinuationFixture {
             retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
+            sole_login: false,
             account_witness: [3; 32],
             scan_started_at: "2026-10-24T00:00:00Z".into(),
             activity_hint: continuation_hint(true),
