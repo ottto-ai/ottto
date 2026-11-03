@@ -135,6 +135,13 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// explicit action (a key rotation), not a failure. Attribution toggled
     /// on or off is no rotation (`HeadIdentity::check`).
     KeyEpoch,
+    /// A Codex group read from its first member (D168): a counted replay,
+    /// never a load outcome or a failure after a head.
+    GroupReplay,
+    /// A file with a protected Codex receipt read from its start, so the
+    /// receipt's prefix is reproduced (D168): a counted replay, never a load
+    /// outcome or a failure after a head.
+    TierPrefixReplay,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -146,6 +153,8 @@ impl ReconstructCause {
             Self::Identity => "identity",
             Self::NotRederivable => "not_rederivable",
             Self::KeyEpoch => "key_epoch",
+            Self::GroupReplay => "group_replay",
+            Self::TierPrefixReplay => "tier_prefix_replay",
         }
     }
 }

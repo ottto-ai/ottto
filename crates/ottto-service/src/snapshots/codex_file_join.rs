@@ -1174,6 +1174,11 @@ impl TierReplay {
     pub(super) fn has_protected_tiers(&self) -> bool {
         !self.tiers.is_empty()
     }
+    /// This file has a protected receipt (or owes one): its continuation must
+    /// reproduce the receipt's physical prefix digest and contribution keys.
+    pub(super) fn needs_prior_prefix(&self) -> bool {
+        self.previous.is_some() || self.invalid
+    }
     pub(super) fn finish(self) -> Result<Option<AppliedTierReceipt>> {
         anyhow::ensure!(
             !self.invalid,

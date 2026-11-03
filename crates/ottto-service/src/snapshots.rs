@@ -29522,6 +29522,34 @@ impl OwnedSourceScan {
                                 "sample",
                                 metrics.sample_bytes as u64,
                             );
+                            // D168's replays, with the bytes they read: a
+                            // group from its first member, and a protected
+                            // receipt's file from its start.
+                            let replay = if let Some(group) = active.group.as_deref() {
+                                Some((
+                                    tail_source::ReconstructCause::GroupReplay,
+                                    group
+                                        .consumed_before
+                                        .saturating_add(active.parser.reader.consumed_bytes()),
+                                ))
+                            } else {
+                                (matches!(
+                                    plan.mode(),
+                                    crate::transcript_acquisition::ReadMode::Full(_)
+                                ) && active
+                                    .parser
+                                    .accumulator
+                                    .codex_tier_replay
+                                    .as_ref()
+                                    .is_some_and(codex_file_join::TierReplay::needs_prior_prefix))
+                                .then_some((
+                                    tail_source::ReconstructCause::TierPrefixReplay,
+                                    metrics.native_bytes,
+                                ))
+                            };
+                            if let Some((cause, bytes)) = replay {
+                                tail_source::counters::replay(source, cause, bytes);
+                            }
                         }
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
