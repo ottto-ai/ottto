@@ -826,4 +826,5 @@ head_fields! {
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
+    I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
 }
