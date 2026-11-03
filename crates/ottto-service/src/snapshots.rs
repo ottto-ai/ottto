@@ -148,6 +148,7 @@ pub(crate) mod cache_observations;
 pub(crate) mod cache_overcap_tests;
 #[cfg(test)]
 mod cache_policy_tests;
+mod change_reason;
 mod claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
@@ -14167,7 +14168,13 @@ fn apply_claude_effort_evidence_with_families(
             continue;
         };
         let identity_changed = veto_claude_original_identity(item, evidence);
-        if apply_claude_account_evidence(item, evidence) || identity_changed {
+        let account_applied = apply_claude_account_evidence(item, evidence);
+        if account_applied {
+            crate::local_resource_diagnostics::change_reason::claude_account_evidence_applied(
+                &item.source_session_id,
+            );
+        }
+        if account_applied || identity_changed {
             rebuild_retagged_model_usage(item);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
@@ -14508,6 +14515,14 @@ fn claude_family_subagents_dir<'a>(path: &'a Path, root: &str) -> Option<&'a Pat
                 .and_then(std::ffi::OsStr::to_str)
                 == Some(root)
         })
+}
+
+/// The family root transcript `<project>/<root>.jsonl` of a member path.
+fn claude_family_root_path(path: &Path, root: &str) -> Option<PathBuf> {
+    let project = claude_family_subagents_dir(path, root)?
+        .parent()?
+        .parent()?;
+    Some(project.join(format!("{root}.jsonl")))
 }
 
 fn claude_index_path_member_ref(path: &Path) -> Option<ClaudeIndexPathMemberRef<'_>> {
@@ -27536,7 +27551,11 @@ impl OwnedSourceScan {
             // its sidecar digest in the scan fingerprint slot, so each twin is
             // identified on a copy first: one more open per twin candidate. A
             // twin that cannot be identified pulls its family in, as before.
-            let read_twins = identified_candidates
+            // A twin whose growth Full is paced would only be deferred, so it
+            // neither pulls its family nor stays on the page alone (where its
+            // known twin would hold it as `absent_twin`); it waits with its debt.
+            let growth_now = sampled_scan::now_seconds();
+            let (paced_twins, read_twins): (Vec<_>, Vec<_>) = identified_candidates
                 .iter()
                 .filter(|candidate| {
                     !claude_request_money::e2::selected_twin_roots(
@@ -27571,7 +27590,9 @@ impl OwnedSourceScan {
                     }
                 })
                 .map(|candidate| candidate.path.as_path())
-                .collect::<Vec<_>>();
+                .partition(|path| {
+                    sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
+                });
             for root in
                 claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
             {
@@ -27579,6 +27600,17 @@ impl OwnedSourceScan {
                     claude_twin_only_family_reparses.insert(root);
                 }
             }
+            let paced_twins = paced_twins
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect::<BTreeSet<_>>();
+            identified_candidates.retain(|candidate| {
+                let paced = paced_twins.contains(&candidate.path);
+                if paced {
+                    sampled_audit::defer_growth_read(index, &mut census, candidate);
+                }
+                !paced
+            });
         }
         if !forced_claude_family_reparses.is_empty() {
             let already_identified = identified_candidates
@@ -29689,6 +29721,13 @@ impl OwnedSourceScan {
                             active.parse_reason,
                             0,
                             plan.metrics().native_bytes,
+                        );
+                        crate::local_resource_diagnostics::change_reason::read(
+                            source.api_slug(),
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                            plan.metrics().sample_bytes as u64,
                         );
                         #[cfg(unix)]
                         context.cache.durable_acquisition_completed(
@@ -33555,6 +33594,7 @@ impl OwnedSourceScan {
                 index.mark_bounded_sweep_unsettled();
                 pending!();
             }
+            let mut source_change = None;
             let (mut decision, mut parse_reason) =
                 match claude_index_path_family_member(&candidate.path).filter(
                     |(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id),
@@ -33585,6 +33625,7 @@ impl OwnedSourceScan {
                         audit_now,
                         census_unix_seconds,
                         backfill_window_days,
+                        &mut source_change,
                     ),
                 };
             if source == SnapshotSource::ClaudeCode {
@@ -35407,6 +35448,9 @@ impl OwnedSourceScan {
             {
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
+            }
+            if side_origin.is_none() {
+                index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
             }
             let mut active = Box::new(OwnedActiveFile {
                 first_read: crate::local_resource_diagnostics::StageWindow::first_read(
@@ -49381,15 +49425,12 @@ impl ScanIndex {
         {
             return false;
         }
-        claude_family_subagents_dir(&candidate.path, member.root)
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .is_some_and(|project| {
-                matches!(
-                    fs::symlink_metadata(project.join(format!("{}.jsonl", member.root))),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                )
-            })
+        claude_family_root_path(&candidate.path, member.root).is_some_and(|root| {
+            matches!(
+                fs::symlink_metadata(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
     }
 
     /// A list line may name only a member (`root_stem`). On a
@@ -54777,6 +54818,7 @@ impl ScanIndex {
         audit_now: u64,
         census_now: Option<u64>,
         window: u64,
+        source_change: &mut Option<change_reason::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let growth_only = census_now
             .is_some_and(|now| !is_recent_enough_at(candidate.modified_unix_seconds, now, window))
@@ -54785,7 +54827,14 @@ impl ScanIndex {
                 .files
                 .get(&local_index_key(&candidate.path))
                 .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
-        self.candidate_decision_with_reason_gated(candidate, audit_now, true, true, growth_only)
+        self.candidate_decision_refined(
+            candidate,
+            audit_now,
+            true,
+            true,
+            growth_only,
+            source_change,
+        )
     }
 
     #[cfg(test)]
@@ -54883,6 +54932,27 @@ impl ScanIndex {
         upload_context_adoption: bool,
         growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        self.candidate_decision_refined(
+            candidate,
+            now,
+            body_witness_adoption,
+            upload_context_adoption,
+            growth_only,
+            &mut None,
+        )
+    }
+
+    /// The gated decision; `source_change` names the `SourceChanged` arm that
+    /// selected the file, for the change-reason counts only.
+    fn candidate_decision_refined(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+        body_witness_adoption: bool,
+        upload_context_adoption: bool,
+        growth_only: bool,
+        source_change: &mut Option<change_reason::SourceChange>,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
             return (CandidateDecision::Skip, None);
@@ -54954,6 +55024,7 @@ impl ScanIndex {
             .claude_copy_removals
             .pending(claude_money_birth_store::location_key(&key))
         {
+            *source_change = Some(change_reason::SourceChange::CopyRemoval);
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::SourceChanged),
@@ -55136,6 +55207,7 @@ impl ScanIndex {
             let reason = if entry.source_file_fingerprint.is_empty() {
                 CandidateParseReason::Rearmed
             } else {
+                *source_change = Some(change_reason::SourceChange::Fingerprint);
                 CandidateParseReason::SourceChanged
             };
             (CandidateDecision::Parse, Some(reason))

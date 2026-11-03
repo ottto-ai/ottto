@@ -166,6 +166,7 @@ macro_rules! codex_cursor_events {
 pub(crate) use codex_cursor_events;
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod change_reason;
 pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
@@ -697,7 +698,8 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 6;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const UNSELECTED_REASONS: usize = PAGE_SELECTION_START + 4;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
+const UNSELECTED_REASONS: usize = change_reason::END;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -707,9 +709,13 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
         const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
+fn source_slot(source: &str) -> Option<usize> {
+    ["claude_code", "codex", "pi"]
+        .iter()
+        .position(|s| *s == source)
+}
 fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
-    let sources = ["claude_code", "codex", "pi"];
-    let Some(slot) = sources.iter().position(|s| *s == source) else {
+    let Some(slot) = source_slot(source) else {
         return 0;
     };
     #[cfg(test)]
@@ -1251,6 +1257,21 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
+        // Own record, so the page line stays under its size bound (§13).
+        if let Some(change_reasons) = change_reason::drain(source) {
+            #[derive(Serialize)]
+            struct Counts {
+                change_reasons: change_reason::Page,
+            }
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_change_reasons",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: Counts { change_reasons },
+            });
+        }
         jsonl.emit_page_lines(source);
         jsonl.alarm_on_consecutive_failures(source);
     }

@@ -951,6 +951,33 @@ keeps the file discoverable, not an age-based drop. A never-binding account
 keeps usage off the server; token/age disclosure is implemented, and
 bounded-lifetime release remains a SOURCE follow-up.
 
+## Change Reason Counters
+
+After each source's `native_collection_page` line, a `native_change_reasons`
+line carries `counts.change_reasons` when any count is nonzero (its own line
+keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
+local diagnostics only; they gate, cap and upload nothing.
+
+- **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
+  `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
+  `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
+  `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
+  a changed body with no tag; never guessed).
+- **`upload`** (per entity, once per page): `entities`, `accepted` (stored or
+  unchanged ACK), `usage_identical`, `money_changed_or_unknown` (`accepted` minus
+  `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
+  Placement is known only for Claude with complete accepted state; else `u`.
+  An exact resend of a held, refused or catch-up body takes its delivery cause.
+- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
+  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
+  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
+  why.
+- **Sub-counts:** `source_reset_same_size_edit_files` and
+  `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
+  cannot see: money-only reveals and late external evidence.
+
+Upload counts land on the line after the source's next page line.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of
