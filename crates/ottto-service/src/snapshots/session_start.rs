@@ -713,6 +713,15 @@ impl SessionStartState {
         Ok(())
     }
 
+    /// Opening-settings content: request-1 instructions, one opening file at
+    /// `path`, and an opening call that read it.
+    #[cfg(test)]
+    pub(super) fn opening_fact_for_test(&mut self, instructions: &str, path: &str) {
+        self.instructions = Some(instructions.into());
+        self.files.insert(path.into(), OpeningFileState::default());
+        self.open_call_for_test("toolu_opening", &[path]);
+    }
+
     /// An opening call holding `files`, as a read in the window records it.
     #[cfg(test)]
     pub(super) fn open_call_for_test(&mut self, id: &str, files: &[&str]) {

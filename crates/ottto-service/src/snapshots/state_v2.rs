@@ -566,7 +566,7 @@ mod money_fault_tests;
 pub(super) mod money_test_support;
 #[cfg(test)]
 pub(crate) use runtime::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
 // Growth receipts attest confirmed DB custody, independently of the root fence.
 pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};

@@ -1077,8 +1077,21 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     );
 }
 
-/// A published store whose head, page and live WAL hold these literals in the
-/// clear. The returned session keeps them there and erases them when dropped.
+/// The session facts S2 stores (D168-1), each seeded as `{literal}-{fact}`:
+/// title, first prompt material and display title, workspace, opening
+/// instructions and an opening file path.
+pub(crate) const TAIL_FACT_LITERALS: [&str; 6] = [
+    "TITLE",
+    "PROMPT",
+    "DISPLAY",
+    "WORKSPACE",
+    "INSTRUCTIONS",
+    "PATH",
+];
+
+/// A published store whose head, pages (session facts among them) and live
+/// WAL hold these literals in the clear. The returned session keeps them
+/// there and erases them when dropped.
 pub(crate) fn seed_tail_literals_for_test(
     support: &Path,
     literal: &str,
@@ -1090,12 +1103,20 @@ pub(crate) fn seed_tail_literals_for_test(
     );
     let path = session.path().to_owned();
     let (label, private) = (format!("{literal}-L"), format!("{literal}-PL"));
+    let facts: Vec<String> = TAIL_FACT_LITERALS
+        .iter()
+        .map(|fact| format!("{literal}-{fact}"))
+        .collect();
+    let fact_page = facts.join("\n");
     stage_tail(
         &path,
         FILE,
         staged(
             label.as_bytes(),
-            &[(Collection::ToolUses, 0, private.as_bytes())],
+            &[
+                (Collection::ToolUses, 0, private.as_bytes()),
+                (Collection::SessionFacts, 0, fact_page.as_bytes()),
+            ],
         ),
     )
     .unwrap();
@@ -1105,7 +1126,7 @@ pub(crate) fn seed_tail_literals_for_test(
         "-wal",
     ))
     .unwrap();
-    for needle in [&label, &private] {
+    for needle in [&label, &private].into_iter().chain(&facts) {
         assert!(
             wal.windows(needle.len()).any(|b| b == needle.as_bytes()),
             "positive control: the literal is stored in the clear"

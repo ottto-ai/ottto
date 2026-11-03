@@ -136,3 +136,100 @@ fn a_long_first_prompt_goes_through_fragments() {
     assert_eq!(counted(&records), ("hit".into(), vec![]));
     assert_eq!(facts(&taken)[1].as_deref(), Some(long.as_str()));
 }
+
+/// [behaviour] A session fact of a version this build does not know is a
+/// newer build's: the file holds as for a future revision, with no
+/// reconstruction, no Full and the head untouched.
+#[test]
+fn an_unknown_fact_version_holds_the_file() {
+    let mut route = route();
+    let (mut tail, _native) = route.complete("a.jsonl", &lines(3), None, |_| {});
+    let key = tail.key_for_test().to_owned();
+    let mut staged = tail.take_staged_for_test();
+    let title = staged
+        .pages
+        .get_mut(&(Collection::SessionFacts, 0))
+        .expect("the title fact");
+    assert_eq!(title[..2], [0, 1], "kind 0, version 1");
+    title[1] = 2;
+    state_v2::stage_tail(&route.path, &key, staged).unwrap();
+    route.save(false);
+    let head = route.head(&key).unwrap().body;
+    let (load, records) = loaded(&route, &route.dir.join("a.jsonl"), &key);
+    assert!(matches!(load, Load::Held));
+    assert_eq!(counted(&records), ("held".into(), vec![]));
+    assert_eq!(route.head(&key).unwrap().body, head);
+}
+
+/// [behaviour] Opening-settings counts are checked against the head's call
+/// keys in the same load. A mismatch is corrupt for that file alone: it is
+/// one counted reconstruction, and a sibling on the same route still loads.
+#[test]
+fn an_opening_settings_count_mismatch_reconstructs_that_file_only() {
+    let mut route = route();
+    let (mut two, _) = route.complete("two.jsonl", &lines(3), None, |acc| {
+        acc.session_start.open_call_for_test("toolu_a", &["a.md"]);
+        acc.session_start.open_call_for_test("toolu_b", &["b.md"]);
+    });
+    let (mut one, _) = route.complete("one.jsonl", &lines(3), None, |acc| {
+        acc.session_start.open_call_for_test("toolu_a", &["a.md"]);
+    });
+    let (two_key, one_key) = (two.key_for_test().to_owned(), one.key_for_test().to_owned());
+    let two_staged = two.take_staged_for_test();
+    let mut one_staged = one.take_staged_for_test();
+    let page = (Collection::SessionFacts, 3);
+    let two_calls = two_staged.pages[&page].clone();
+    assert_ne!(one_staged.pages[&page], two_calls);
+    one_staged.pages.insert(page, two_calls);
+    state_v2::stage_tail(&route.path, &two_key, two_staged).unwrap();
+    state_v2::stage_tail(&route.path, &one_key, one_staged).unwrap();
+    route.save(false);
+    let (load, records) = loaded(&route, &route.dir.join("one.jsonl"), &one_key);
+    assert!(matches!(load, Load::Cold(None)));
+    assert_eq!(counted(&records), ("error".into(), vec!["corrupt".into()]));
+    let (load, records) = loaded(&route, &route.dir.join("two.jsonl"), &two_key);
+    assert!(matches!(load, Load::Reused(..)));
+    assert_eq!(counted(&records), ("hit".into(), vec![]));
+}
+
+/// [privacy] STATE: no session fact (title, first prompt material and display
+/// title, workspace, opening instructions and file paths) reaches a
+/// diagnostics record through a stage, save or load, while the load restores
+/// each one (the positive control).
+#[test]
+fn session_facts_never_reach_diagnostics() {
+    const CANARY: &str = "PRIVATE_SESSION_FACT_CANARY_20261103";
+    let literal = |fact: &str| format!("{CANARY}-{fact}");
+    let mut route = route();
+    // `capture` does not nest: the stage and save, then the load's own.
+    let (key, records) = crate::local_resource_diagnostics::capture(|| {
+        let (tail, native) = route.complete("a.jsonl", &lines(3), None, |acc| {
+            acc.title = Some(literal("TITLE"));
+            acc.first_prompt_material = Some(literal("PROMPT"));
+            acc.first_prompt_title = Some(literal("DISPLAY"));
+            acc.workspace_path = Some(PathBuf::from(format!("/tmp/{}", literal("WORKSPACE"))));
+            acc.session_start
+                .opening_fact_for_test(&literal("INSTRUCTIONS"), &literal("PATH"));
+        });
+        let key = tail.key_for_test().to_owned();
+        assert!(tail.publish(&native));
+        route.save(false);
+        key
+    });
+    let (Load::Reused(taken, _), load_records) = loaded(&route, &route.dir.join("a.jsonl"), &key)
+    else {
+        panic!("the committed head is reused");
+    };
+    let [title, prompt, display, workspace] = facts(&taken);
+    assert_eq!(title, Some(literal("TITLE")));
+    assert_eq!(prompt, Some(literal("PROMPT")));
+    assert_eq!(display, Some(literal("DISPLAY")));
+    assert!(workspace.is_some_and(|path| path.contains(&literal("WORKSPACE"))));
+    let (acc, _, _) = taken.retained.state.finish_view();
+    assert_eq!(
+        acc.session_start.call_files_for_test("toolu_opening"),
+        Some(&[literal("PATH")][..])
+    );
+    let all = serde_json::to_string(&(records, load_records)).unwrap();
+    assert!(!all.contains(CANARY), "a session fact reached diagnostics");
+}

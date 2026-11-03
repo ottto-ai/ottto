@@ -84448,7 +84448,7 @@ pub(crate) use state_v2::money_test_support::publish as publish_state_v2_for_tes
 #[cfg(test)]
 pub(crate) use state_v2::{
     seed_tail_literals_for_test, stage_tail_for_test as state_v2_stage_tail_for_test,
-    tail_published_for_test as state_v2_tail_published_for_test,
+    tail_published_for_test as state_v2_tail_published_for_test, TAIL_FACT_LITERALS,
 };
 
 /// Local-only recovery bypasses a save-pressure hold, never custody fencing.

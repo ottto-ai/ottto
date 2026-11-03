@@ -10,8 +10,11 @@
 //! with the head and page bytes it read on a hit. Stored state that cannot be
 //! reused is a counted reconstruction (`tail_reconstruct`) and the read starts
 //! at once as a Full; a file shorter than its head reads Full (`Shrunk`) and
-//! is counted in `tail_shorter_file_full`. Only a head from a newer build, or
-//! a live input that is not available now, holds the file, untouched. A
+//! is counted in `tail_shorter_file_full`. Only a head from a newer build, a
+//! session fact of a kind or version this build does not know, or a live
+//! input that is not available now, holds the file, untouched. A session
+//! fact that does not match its head (a count mismatch) is corrupt: that
+//! file alone reconstructs. A
 //! metadata-only head (revisions or inventory, no reduction) is no
 //! checkpoint: the file's first read, with no credit. A head bound to another
 //! route, scan root or path is retired before anything else in it is read
@@ -209,6 +212,9 @@ enum Miss {
     /// A head with no reduction: no checkpoint to continue.
     MetadataOnly,
     Future,
+    /// A session fact of a kind or version this build does not know: a
+    /// newer build's, held as a future revision is, never read Full.
+    FutureFact,
     /// The file is no longer the certified one: an ordinary Full.
     Changed(FullReason),
     /// The database or the file could not be read.
@@ -257,6 +263,7 @@ pub(super) fn load<S: TailSource>(
             return Load::Reused(hit.taken, base);
         }
         Err(Miss::Future) => ("held", "future_revision".into(), None, Load::Held),
+        Err(Miss::FutureFact) => ("held", "future_fact".into(), None, Load::Held),
         Err(Miss::LiveUnavailable) => ("held", "live_unavailable".into(), None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
         // shorter file is main's counted Full; no floor holds it (D158).
@@ -382,14 +389,18 @@ fn stored<S: TailSource>(
         S::decode_page(collection, page, &bytes, &mut acc)
             .and_then(|()| base.observe::<S>(collection, page, &bytes))
             .map_err(|cause| {
-                failed = Some(cause);
+                failed = Some((collection, cause));
                 anyhow::anyhow!("tail_page")
             })
     });
     if pages.is_err() {
-        return Err(Miss::Reconstruct(
-            failed.unwrap_or(ReconstructCause::Corrupt),
-        ));
+        return Err(match failed {
+            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible)) => {
+                Miss::FutureFact
+            }
+            Some((_, cause)) => Miss::Reconstruct(cause),
+            None => Miss::Reconstruct(ReconstructCause::Corrupt),
+        });
     }
     let table = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;

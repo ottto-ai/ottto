@@ -24649,6 +24649,11 @@ for line in sys.stdin:
         assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
         assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
+        // STATE: no stored session fact reaches the bundle.
+        for fact in crate::snapshots::TAIL_FACT_LITERALS {
+            let literal = format!("{canary}-{fact}");
+            assert!(!serde_json::to_string(&payload).unwrap().contains(&literal));
+        }
         for private in [
             "PRIVATE_REPLAY_HEAD_CANARY_20261030",
             "PRIVATE_REPLAY_PROMPT_CANARY_20261030",
@@ -24791,6 +24796,12 @@ for line in sys.stdin:
         assert!(body.contains("\"support_claim_provided\":true"));
         assert!(!body.contains("support_123"));
         assert!(!body.contains(canary));
+        // STATE: no stored session fact reaches the uploaded bundle.
+        for fact in crate::snapshots::TAIL_FACT_LITERALS {
+            let literal = format!("{canary}-{fact}");
+            assert!(!body.contains(&literal));
+            assert!(!payload_json.contains(&literal));
+        }
         for private in [
             "PRIVATE_REPLAY_HEAD_CANARY_20261030",
             "PRIVATE_REPLAY_PROMPT_CANARY_20261030",

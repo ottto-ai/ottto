@@ -1670,5 +1670,5 @@ pub(super) mod tail_route;
 mod tail_tests;
 #[cfg(test)]
 pub(crate) use tail_tests::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test,
+    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
