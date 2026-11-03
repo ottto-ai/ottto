@@ -3,7 +3,7 @@
 //! removal and reinsertion, content comes back from the session facts, damaged
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
-use super::super::counters;
+use super::super::{counters, encode};
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
@@ -519,18 +519,6 @@ fn damaged_state_is_classified() {
         Some(ReconstructCause::Corrupt)
     );
 
-    // The foreign compaction variant does not decode into a Codex reduction.
-    let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
-    let claude = encode(|e| {
-        e.varint(1)?;
-        e.varint(1)
-    })
-    .unwrap();
-    assert_eq!(
-        Codex::decode_page(Collection::Compactions, 0, &claude, &mut into).err(),
-        Some(ReconstructCause::Corrupt)
-    );
-
     // Decisions under a head that recorded none contradict it.
     let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
     into.codex_observed_priority_turns = None;
@@ -675,32 +663,6 @@ fn continuable() -> SnapshotAccumulator {
     stored.codex_observed_priority_turns = Some(BTreeMap::new());
     stored.codex_creator_header_id = Some(SESSION.into());
     stored
-}
-
-/// [money] TEMPORARY (until the Codex D134 re-placement rows): a Codex head
-/// continues only under the account scope it was read under; another, or
-/// none, is a counted `ContextChanged` reconstruction. The digest is of the
-/// sampled namespace only.
-#[test]
-fn install_live_binds_the_account_scope_the_head_was_read_under() {
-    let scope = |namespace: &str| Some(super::account_scope(&Scope(namespace.into())));
-    assert_ne!(scope("a"), scope("b"));
-    assert_eq!(scope("a").unwrap().len(), 64);
-    let live = |namespace: Option<&str>| {
-        let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
-        live.codex_account_scope = namespace.and_then(scope);
-        live
-    };
-    let stored = || {
-        let mut stored = continuable();
-        stored.codex_account_scope = scope("a");
-        stored
-    };
-    let changed = Err(LiveLoadError::Reconstruct(ReconstructCause::ContextChanged));
-    assert_eq!(install(&mut stored(), &live(Some("a"))), Ok(()));
-    assert_eq!(install(&mut stored(), &live(Some("b"))), changed);
-    assert_eq!(install(&mut stored(), &live(None)), changed);
-    assert_eq!(ReconstructCause::ContextChanged.label(), "codex_scope");
 }
 
 /// [money] The lineage (D131): a head continues only the session its owning

@@ -1,8 +1,9 @@
 //! The Codex Tail codec.
 //!
-//! Head: the identity, the checkpoint certificate, the read report and the
-//! three reduction scalars, the shared field walk (`put_fields`) and the Codex
-//! trailer. The trailer holds the
+//! Head: the shared head envelope (`encode_envelope`: the identity, the
+//! checkpoint certificate, the read report, the three reduction scalars and
+//! the shared field walk), with no lead and the Codex trailer. The trailer
+//! holds the
 //! walk's `I` fields Codex keeps in its head: whether priority decisions
 //! exist, the parse-time totals (head state on Codex, not finish output), the
 //! parent proof's use and refusal, and the sidecar's projected ordinal this
@@ -14,11 +15,11 @@
 //! settings, agent label, prelude), so content never re-derives. Live fields come from this read's inputs through `install_live`;
 //! foreign and finish-only fields stay empty at the seam.
 use super::{
-    capability_hour, encode, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
-    put_fields, read_fact_page, read_hour_page, read_page, slot_start, take_fields, CollectionSpec,
+    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages,
+    hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
     DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
-use crate::durable_tail_codec::{durable_enum, durable_struct, Dec, Durable, HDigest, Refuse};
+use crate::durable_tail_codec::{durable_struct, Durable, HDigest, Refuse};
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
 use crate::snapshots::sampled_scan::codex_cursor::{priority_decisions, PriorityDecisions};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
@@ -116,19 +117,6 @@ struct CodexPriorityTurn {
 durable_struct!(CodexPriorityTurn {
     L turn_id: String,
     N priority: bool,
-});
-
-/// A compaction element. Every append and duplicate has its own slot. Sizes
-/// live in the head and are never zipped to these slots. A Codex head reads
-/// only the timestamp variant; the tag keeps one element kind for both sources.
-#[allow(clippy::large_enum_variant)] // Elements are built and written one at a time.
-enum TaggedCompaction {
-    CodexTimestamp { at: String },
-    ClaudeObservation(ClaudeCompactionObservation),
-}
-durable_enum!(TaggedCompaction {
-    0 => CodexTimestamp { N at: String },
-    1 => ClaudeObservation(D observation: ClaudeCompactionObservation),
 });
 
 /// The Codex source: a marker type, never a value.
@@ -304,24 +292,8 @@ impl TailSource for Codex {
         if !slots_cover_live_maps(acc) {
             return Err(Refuse::NonEmpty(SLOTS_FIELD));
         }
-        let scalars = (
-            view.recognized_usage_drop_count,
-            view.positive_recognized_usage_count,
-            view.positive_usage_evidence,
-        );
         let trailer = Trailer::of(acc);
-        encode(|e| {
-            // Opening-call file paths are content: the opening-settings fact
-            // stores them by call id.
-            e.with_moved_field("OpeningCall.files", |e| {
-                id.put(e)?;
-                certificate.put(e)?;
-                view.report.put(e)?;
-                scalars.put(e)?;
-                put_fields(acc, e)?;
-                trailer.put(e)
-            })
-        })
+        encode_envelope(view, certificate, id, |_| Ok(()), |e| trailer.put(e))
     }
 
     fn encode_pages(
@@ -396,15 +368,10 @@ impl TailSource for Codex {
             Collection::Requests => {
                 fixed_pages(&acc.cache_requests, REQUESTS_G, |request, e| request.put(e))
             }
+            // A compaction's timestamp, one slot per append and duplicate.
+            // Sizes live in the head and are never zipped to these slots.
             Collection::Compactions => {
-                let compactions: Vec<_> = acc
-                    .compaction_timestamps
-                    .iter()
-                    .map(|at| TaggedCompaction::CodexTimestamp { at: at.clone() })
-                    .collect();
-                fixed_pages(&compactions, COMPACTIONS_G, |compaction, e| {
-                    compaction.put(e)
-                })
+                fixed_pages(&acc.compaction_timestamps, COMPACTIONS_G, |at, e| at.put(e))
             }
             Collection::UsageHours => hour_pages(&acc.usage_buckets, String::as_str),
             Collection::CapabilityHours => {
@@ -425,27 +392,14 @@ impl TailSource for Codex {
         head: &[u8],
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
-        if revision != Self::REDUCTION_REVISION {
-            return Err(ReconstructCause::Incompatible);
-        }
-        let mut d = Dec::new(head);
-        HeadIdentity::take(&mut d)?;
-        let certificate = DurableCertificate::take(&mut d)?;
-        let report = JsonlReadReport::take(&mut d)?;
-        let scalars = <(usize, usize, bool)>::take(&mut d)?;
-        let mut acc = take_fields(&mut d)?;
-        let trailer = Trailer::take(&mut d)?;
-        d.finish()?;
+        let (mut acc, (), trailer, decoded) =
+            decode_envelope::<Self, _, _>(revision, head, |_| Ok(()), Trailer::take)?;
         if acc.source != Self::SOURCE {
             return Err(ReconstructCause::Corrupt);
         }
         trailer.restore(&mut acc);
         *into = acc;
-        Ok(DecodedHead {
-            certificate,
-            report,
-            scalars,
-        })
+        Ok(decoded)
     }
 
     fn decode_page(
@@ -555,12 +509,9 @@ impl TailSource for Codex {
             Collection::Compactions => {
                 let timestamps = &mut into.compaction_timestamps;
                 slot_start(page, COMPACTIONS_G, timestamps.len())?;
-                read_page(bytes, COMPACTIONS_G, |d| match TaggedCompaction::take(d)? {
-                    TaggedCompaction::CodexTimestamp { at } => {
-                        timestamps.push(at);
-                        Ok(())
-                    }
-                    TaggedCompaction::ClaudeObservation(_) => Err(ReconstructCause::Corrupt),
+                read_page(bytes, COMPACTIONS_G, |d| {
+                    timestamps.push(String::take(d)?);
+                    Ok(())
                 })
             }
             Collection::UsageHours => {
@@ -643,10 +594,6 @@ impl TailSource for Codex {
             _ => {}
         }
         install_parent(stored, live)?;
-        // TEMPORARY (D134): the account scope the head was read under.
-        if stored.codex_account_scope != live.codex_account_scope {
-            return Err(LiveLoadError::Reconstruct(ReconstructCause::ContextChanged));
-        }
         match crate::snapshots::codex_file_join::header_owner(fresh) {
             Ok(owner) if stored.codex_creator_header_id.as_deref() == Some(owner.as_str()) => {}
             Ok(_) => return Err(LiveLoadError::Reconstruct(ReconstructCause::Identity)),
@@ -750,7 +697,6 @@ struct Trailer {
     codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     codex_parent_proof_refusal: Option<ProofRefusal>,
     codex_sidecar_projected_next_ordinal: Option<u64>,
-    codex_account_scope: Option<String>,
 }
 durable_struct!(Trailer {
     N priority_present: bool,
@@ -759,8 +705,6 @@ durable_struct!(Trailer {
     D codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     D codex_parent_proof_refusal: Option<ProofRefusal>,
     N codex_sidecar_projected_next_ordinal: Option<u64>,
-    // TEMPORARY (D134): see `account_scope`.
-    H codex_account_scope: Option<String>,
 });
 impl Trailer {
     fn of(acc: &SnapshotAccumulator) -> Self {
@@ -771,7 +715,6 @@ impl Trailer {
             codex_parent_proof_used: acc.codex_parent_proof_used.clone(),
             codex_parent_proof_refusal: acc.codex_parent_proof_refusal.clone(),
             codex_sidecar_projected_next_ordinal: acc.codex_sidecar_projected_next_ordinal,
-            codex_account_scope: acc.codex_account_scope.clone(),
         }
     }
     fn restore(self, acc: &mut SnapshotAccumulator) {
@@ -781,24 +724,7 @@ impl Trailer {
         acc.codex_parent_proof_used = self.codex_parent_proof_used;
         acc.codex_parent_proof_refusal = self.codex_parent_proof_refusal;
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
-        acc.codex_account_scope = self.codex_account_scope;
     }
-}
-
-/// TEMPORARY exception, removed with the Codex D134 re-placement rows: the
-/// account-scope digest a Codex head keeps in its trailer. A Codex creator
-/// witness is carried in the stored state (captured at its header's read),
-/// not re-derived at finish from live account evidence as Claude's is, so a
-/// Codex head keeps main's RAM binding to the scope it was read under: a
-/// changed scope is a counted `ContextChanged` reconstruction (parity with
-/// main's Full, not a new cause). The digest is content-free and of
-/// acquisition evidence only: the cycle's sampled namespace (account
-/// witness, destination namespace, index path, capture mode), never a
-/// policy, receipt or etag.
-pub(in crate::snapshots) fn account_scope(
-    namespace: &crate::transcript_acquisition::Scope,
-) -> String {
-    sha256_hex(&["codex_tail_account_scope:v1", &namespace.0])
 }
 
 #[cfg(test)]
