@@ -27737,7 +27737,11 @@ impl OwnedSourceScan {
             // its sidecar digest in the scan fingerprint slot, so each twin is
             // identified on a copy first: one more open per twin candidate. A
             // twin that cannot be identified pulls its family in, as before.
-            let read_twins = identified_candidates
+            // A twin whose growth Full is paced would only be deferred, so it
+            // neither pulls its family nor stays on the page alone (where its
+            // known twin would hold it as `absent_twin`); it waits with its debt.
+            let growth_now = sampled_scan::now_seconds();
+            let (paced_twins, read_twins): (Vec<_>, Vec<_>) = identified_candidates
                 .iter()
                 .filter(|candidate| {
                     !claude_request_money::e2::selected_twin_roots(
@@ -27772,7 +27776,9 @@ impl OwnedSourceScan {
                     }
                 })
                 .map(|candidate| candidate.path.as_path())
-                .collect::<Vec<_>>();
+                .partition(|path| {
+                    sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
+                });
             for root in
                 claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
             {
@@ -27780,6 +27786,17 @@ impl OwnedSourceScan {
                     claude_twin_only_family_reparses.insert(root);
                 }
             }
+            let paced_twins = paced_twins
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect::<BTreeSet<_>>();
+            identified_candidates.retain(|candidate| {
+                let paced = paced_twins.contains(&candidate.path);
+                if paced {
+                    sampled_audit::defer_growth_read(index, &mut census, candidate);
+                }
+                !paced
+            });
         }
         if !forced_claude_family_reparses.is_empty() {
             let already_identified = identified_candidates

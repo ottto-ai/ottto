@@ -1379,6 +1379,81 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
     });
 }
 
+/// [regress] A grown twin whose growth Full was paced still pulled its
+/// unchanged twin into a forced-family Full on every listing; the pace then
+/// deferred the grown twin, so the sibling was held as `absent_twin` each page.
+/// While paced neither twin is read and nothing is held; once due, both read
+/// together, the growth publishes and nothing is held.
+#[test]
+fn e2_pipeline_paced_twin_does_not_force_its_family() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{indexed_size, owe_claimed_growth};
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-twin-paced");
+        c.write_at(
+            &format!("a/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        let twin = c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut index = ScanIndex::default();
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            let mut page = c.raw(&scanner, index, 100, false, &[]);
+            page.enrich(&c);
+            page.finish();
+            if !page.scan.snapshots.is_empty() {
+                let mut progress = e2_progress();
+                let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                page.index
+                    .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+                accept_upload_context_acks_for_test(
+                    &mut page.index,
+                    &page.scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
+            }
+            reads.push(page.scan.scanned_file_count);
+            index = c.reload(&mut page.index);
+        }
+        assert_eq!(reads.last(), Some(&0), "both twins settled: {reads:?}");
+        let indexed = indexed_size(&index, &twin);
+        append(&twin, &line(ROOT, "r3", "2026-08-02T07:04:00Z", 30));
+        for paced in [true, false] {
+            let owed = owe_claimed_growth(&index, &c.base, &twin, paced);
+            let mut page = c.raw(&scanner, owed, 100, false, std::slice::from_ref(&twin));
+            page.enrich(&c);
+            assert_eq!(
+                page.disposition
+                    .request_owned_hold_reasons
+                    .get("absent_twin"),
+                None,
+                "paced={paced}: no twin is held off the page"
+            );
+            if paced {
+                assert_eq!(
+                    (scanner.paths().len(), page.scan.snapshots.len()),
+                    (0, 0),
+                    "a paced twin pulls no forced-family Full"
+                );
+                assert_eq!(
+                    indexed_size(&page.index, &twin),
+                    indexed,
+                    "growth stays owed"
+                );
+            } else {
+                assert_eq!(scanner.paths().len(), 2, "both twins read together");
+                assert_eq!(total(&page), 3, "the due growth publishes");
+            }
+        }
+    });
+}
+
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
     with_e2(|| {

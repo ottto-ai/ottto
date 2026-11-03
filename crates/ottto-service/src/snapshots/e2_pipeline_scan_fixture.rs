@@ -210,6 +210,41 @@ pub(crate) fn explicitly_held(
     disposition.quarantined_source_session_ids.contains(session)
 }
 
+/// `index` published as a live state_v2 store under `dir`, owing `path`'s
+/// growth from its indexed size with its growth Full claimed now (paced) or
+/// one interval ago (due), as a daemon that already spent that Full holds it.
+pub(crate) fn owe_claimed_growth(
+    index: &ScanIndex,
+    dir: &Path,
+    path: &Path,
+    paced: bool,
+) -> ScanIndex {
+    let key = local_index_key(path);
+    let now = sampled_scan::now_seconds();
+    let claim = if paced {
+        now
+    } else {
+        now - sampled_audit::GROWTH_FULL_INTERVAL
+    };
+    let mut seed = index.clone();
+    let owed =
+        json!({"predecessor_size": seed.files[&key].size_bytes, "last_growth_full_unix": claim});
+    seed.v2_mut()
+        .growth_retention
+        .insert(key, serde_json::from_value(owed).unwrap());
+    let store = dir
+        .join("snapshots/destinations")
+        .join("a".repeat(64))
+        .join(format!("claude_code-growth-{paced}-scan-index.json"));
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let published = publish_state_v2_for_test(&seed, &store, br#"{"generation":0}"#);
+    assert_eq!(
+        sampled_audit::growth_full_paced(&published, &local_index_key(path), now),
+        paced
+    );
+    published
+}
+
 pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
     index
         .files
