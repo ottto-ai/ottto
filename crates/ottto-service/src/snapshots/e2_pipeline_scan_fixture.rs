@@ -232,11 +232,13 @@ pub(crate) fn owe_claimed_growth(
     seed.v2_mut()
         .growth_retention
         .insert(key, serde_json::from_value(owed).unwrap());
-    let store = dir
-        .join("snapshots/destinations")
-        .join("a".repeat(64))
+    // State v2 refuses a store below a symlinked ancestor (a `$TMPDIR` one).
+    let parent = dir.join("snapshots/destinations").join("a".repeat(64));
+    fs::create_dir_all(&parent).unwrap();
+    let store = parent
+        .canonicalize()
+        .unwrap()
         .join(format!("claude_code-growth-{paced}-scan-index.json"));
-    fs::create_dir_all(store.parent().unwrap()).unwrap();
     let published = publish_state_v2_for_test(&seed, &store, br#"{"generation":0}"#);
     assert_eq!(
         sampled_audit::growth_full_paced(&published, &local_index_key(path), now),
