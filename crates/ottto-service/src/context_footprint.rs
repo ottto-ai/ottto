@@ -1650,9 +1650,12 @@ fn destination_identity(
     format!("{}|{}|{}", device.device_id, machine_id, api_base_url)
 }
 
+/// Folder of the per-workspace upload witnesses and the opt-out markers.
+pub(crate) const STATE_DIR: &str = "context_footprint";
+
 fn cache_path(support_dir: &Path, workspace_hash: &str) -> PathBuf {
     support_dir
-        .join("context_footprint")
+        .join(STATE_DIR)
         .join(format!("{workspace_hash}.json"))
 }
 

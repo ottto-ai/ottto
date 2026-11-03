@@ -1054,16 +1054,9 @@ impl ClaudeContextFileBirthCounts {
     }
 }
 
-#[cfg(not(test))]
-static RESOURCE_WITHHOLD_ALARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 // Tests share one process, so each test thread keeps its own latch.
-#[cfg(test)]
-thread_local! {
-    static RESOURCE_WITHHOLD_ALARMED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
+crate::local_resource_diagnostics::process_static!(fn with_resource_withhold_alarmed:
+    std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 #[derive(Serialize)]
 struct ResourceWithholdAlarm {
@@ -1078,10 +1071,9 @@ pub(super) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCount
     if !counts.resource_withheld() {
         return;
     }
-    #[cfg(not(test))]
-    let alarmed = RESOURCE_WITHHOLD_ALARMED.swap(true, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    let alarmed = RESOURCE_WITHHOLD_ALARMED.with(|alarmed| alarmed.replace(true));
+    let alarmed = with_resource_withhold_alarmed(|alarmed| {
+        alarmed.swap(true, std::sync::atomic::Ordering::Relaxed)
+    });
     if !alarmed {
         crate::local_resource_diagnostics::claude_context_resource_withhold(
             &ResourceWithholdAlarm {
@@ -1282,9 +1274,10 @@ impl ClaudeFileBirth {
 /// of `others` (cycled), as a build listing that many writers stored them.
 #[cfg(test)]
 pub(crate) fn retired_writer_bytes_for_test(latest: i64, others: &[i64], slots: usize) -> Vec<u8> {
-    let mut e = crate::durable_tail_codec::Enc::bytes(1 << 10);
-    crate::durable_tail_codec::Durable::put(&latest, &mut e).unwrap();
-    let mut out = e.into_bytes();
+    let mut out = crate::durable_tail_codec::Enc::count_write(1 << 10, |e| {
+        crate::durable_tail_codec::Durable::put(&latest, e)
+    })
+    .unwrap();
     out.extend(crate::durable_tail_codec::grown_bytes_for_test(
         others, slots,
     ));

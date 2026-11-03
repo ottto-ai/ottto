@@ -267,8 +267,9 @@ def main():
                     if r.get("reason") == "compiler-artifact" and r.get("executable")]
             if len(bins) != 1:
                 raise RuntimeError(f"expected one test binary: {bins}")
-            # Native tests must emit a VERIFIED receipt each; Linux's explicit
-            # UNEXECUTED line or a zero-match test result cannot pass this job.
+            # Native tests must emit a VERIFIED receipt each; an unsupported
+            # layout's explicit UNEXECUTED line (layout_supported() false, e.g.
+            # an unpinned toolchain) or a zero-match test result cannot pass.
             result = subprocess.run([bins[0], "money_equivalence_tests::", "--nocapture",
                               "--test-threads=1"], cwd=tree, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

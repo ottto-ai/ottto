@@ -179,10 +179,10 @@ fn a_longer_stored_array_is_a_counted_corrupt_reconstruction() {
 /// `value` put, taken back and put again: the same bytes both times.
 fn round_trips<T: Durable>(value: &T) -> Vec<u8> {
     let put = |value: &T| {
-        let mut e = Enc::bytes(1 << 20);
-        e.with_moved_field("OpeningCall.files", |e| value.put(e))
-            .unwrap();
-        e.into_bytes()
+        Enc::count_write(1 << 20, |e| {
+            e.with_moved_field("OpeningCall.files", |e| value.put(e))
+        })
+        .unwrap()
     };
     let first = put(value);
     let mut d = crate::durable_tail_codec::Dec::new(&first);

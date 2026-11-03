@@ -790,9 +790,7 @@ fn legacy_on_both_routes(lines: &[Value], tail_from: usize) -> Run {
         saved.counters().is_some(),
         "the first counted UI line allocates the slot"
     );
-    let mut e = Enc::bytes(1 << 20);
-    saved.put(&mut e).unwrap();
-    let body = e.into_bytes();
+    let body = Enc::count_write(1 << 20, |e| saved.put(e)).unwrap();
     let restored =
         codex_usage_occurrence::CodexCounting::take(&mut Dec::new(&body)).expect("decode");
     let fresh = codex_usage_occurrence::CodexCounting::new(AckEvidence::None, Some(CUTOVER));

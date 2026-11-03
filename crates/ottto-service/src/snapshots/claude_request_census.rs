@@ -36,36 +36,21 @@ use std::sync::Arc;
 // Reloading a held record does not enter it again; a lost/over-budget record
 // is not a successful clearance. No persisted or uploaded bookkeeping.
 // Slots: entered, cleared, audit deadline restored (option B).
-#[cfg(not(test))]
-static IDENTITY_INCOMPLETE_HOLDS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-#[cfg(test)]
-thread_local! {
-    static IDENTITY_INCOMPLETE_HOLDS: [std::cell::Cell<u64>; 3] = const {
-        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
-    };
-}
+crate::local_resource_diagnostics::process_static!(fn with_identity_incomplete_holds:
+    [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3]);
 
 fn add_identity_incomplete_hold_total(slot: usize, count: u64) {
-    #[cfg(not(test))]
-    let _ = IDENTITY_INCOMPLETE_HOLDS[slot].fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |total| Some(total.saturating_add(count)),
-    );
-    #[cfg(test)]
-    IDENTITY_INCOMPLETE_HOLDS.with(|totals| {
-        totals[slot].set(totals[slot].get().saturating_add(count));
+    with_identity_incomplete_holds(|totals| {
+        let _ = totals[slot].fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(count)),
+        );
     });
 }
 
 fn identity_incomplete_hold_total(slot: usize) -> u64 {
-    #[cfg(not(test))]
-    {
-        IDENTITY_INCOMPLETE_HOLDS[slot].load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    IDENTITY_INCOMPLETE_HOLDS.with(|totals| totals[slot].get())
+    with_identity_incomplete_holds(|totals| totals[slot].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn note_identity_incomplete_hold(entered: bool, cleared: bool) {

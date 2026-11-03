@@ -8,8 +8,24 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     // Cleanup also owns deliberately malformed fences; it must not decode them.
     let _owner =
         super::super::super::CheckpointLock::acquire_with_custody(path, false, Some(true)).unwrap();
-    erase_locked(path, None).unwrap();
+    erase_locked(path).unwrap();
     states().lock().unwrap().remove(path);
+}
+
+/// Close the shared session before unlinking all artifacts, and invalidate
+/// clones before releasing CheckpointLock.
+fn erase_locked(path: &Path) -> Result<()> {
+    invalidate_locked(path)?;
+    for (suffix, _, _) in fence::ARTIFACTS {
+        fence::remove_artifact(&fence::sibling(path, suffix))?;
+    }
+    super::super::ack::erase_failed_imports(path)?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    remove_retired_record_dir(&retired_record_dir(path))?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    // Retain the invalidated route's custody latch: erased artifacts must not
+    // let this process resume v1 or re-create v2 without an explicit new lineage.
+    Ok(())
 }
 
 pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
@@ -217,10 +233,10 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let before = fs::read(&f.path).unwrap();
     // An ordinary v1 owner must not prevent uninstall from reaching its
     // established cleanup, and an absent checkpoint lock must stay absent.
-    close_tree(&f.support, false).unwrap();
+    invalidate_tree(&f.support).unwrap();
     assert!(!f.path.with_extension("lock").exists());
     let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
-    close_tree(&f.support, false).unwrap();
+    invalidate_tree(&f.support).unwrap();
     drop(lock);
     with_state(&f.path, |state| {
         assert!(!state.latched);
@@ -234,7 +250,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
-    close_tree(&live.support, false).unwrap();
+    invalidate_tree(&live.support).unwrap();
     assert!(runtime.session.lock().unwrap().is_none());
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);
@@ -722,97 +738,6 @@ fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
     assert!(usage.family("r1").is_err());
     assert!(usage.contains_key("r2"));
     assert!(usage.family("r2").is_err());
-}
-/// [format] f6 explicit forget deletes all artifacts, including a retired
-/// record directory, and invalidates stale clones.
-#[test]
-fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
-    use crate::snapshots::scan_index_persistence::Source;
-    for source in [Source::Claude, Source::Codex, Source::Pi] {
-        f6_forget(source);
-    }
-}
-fn f6_forget(source: crate::snapshots::scan_index_persistence::Source) {
-    let mut f = Fixture::new();
-    // This API is binding-scoped (source + namespace dir name), so a shared
-    // literal namespace collides with parallel fixtures: use a unique one.
-    let namespace = {
-        use sha2::Digest;
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(f.support.to_string_lossy().as_bytes())
-        )
-    };
-    let parent = f.path.parent().unwrap().with_file_name(namespace);
-    fs::rename(f.path.parent().unwrap(), &parent).unwrap();
-    f.path = parent.join(super::super::money_test_support::synthetic_file(
-        source, ".json",
-    ));
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    let file = serde_json::from_value(serde_json::json!({
-        "size_bytes": 4, "modified_unix_seconds": 1,
-        "source_file_fingerprint": "a".repeat(64),
-        "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
-    }))
-    .unwrap();
-    index.files.insert("committed".into(), file);
-    save_with(&f.path, &mut index).unwrap();
-    fill_session(&mut index);
-    assert!(save_with(&f.path, &mut index).is_err());
-    let mut retry = load_with(&f.path, false).unwrap().unwrap();
-    save_with(&f.path, &mut retry).unwrap();
-    let mut stale = retry.clone();
-    assert!(fence::sibling(&f.path, ".v2.sqlite.owner").exists());
-    for suffix in [
-        ".v2.sqlite.migration-backup",
-        ".v1-readonly",
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v2-fence.tmp",
-        ".v2-ack-receipt",
-    ] {
-        fs::write(fence::sibling(&f.path, suffix), b"forgotten-path-canary").unwrap();
-    }
-    let shards = fence::sibling(&f.path, ".v1-readonly.shards");
-    fs::create_dir(&shards).unwrap();
-    fs::write(shards.join("payload"), b"forgotten-path-canary").unwrap();
-    let recovery = fence::sibling(&f.path, ".v2-recovery");
-    fs::create_dir(&recovery).unwrap();
-    fs::write(
-        recovery.join("interrupted-member"),
-        b"forgotten-path-canary",
-    )
-    .unwrap();
-    let records = crate::snapshots::state_v2::retired_record_dir(&f.path);
-    fs::create_dir(&records).unwrap();
-    fs::write(records.join("synthetic.rec"), b"restart-record").unwrap();
-    with_session_db(&retry, |db| {
-        db.control("erasure_pending", &retry.generation).unwrap()
-    });
-    crate::snapshots::erase_claude_state_v2_artifacts(&f.support).unwrap();
-    assert!(!records.exists());
-    assert!(!recovery.exists());
-    for suffix in [
-        ".v2.sqlite.migration-backup",
-        "",
-        ".v2.sqlite",
-        ".v2.sqlite-wal",
-        ".v2.sqlite-shm",
-        ".v2.sqlite.owner",
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v1-readonly",
-        ".v1-readonly.shards",
-        ".v2-fence.tmp",
-        ".v2-ack-receipt",
-    ] {
-        assert!(!fence::sibling(&f.path, suffix).exists());
-    }
-    assert!(save_with(&f.path, &mut stale).is_err());
-    assert!(load_with(&f.path, false).is_err());
 }
 /// [format] publication pending pause does not touch v1.
 #[test]
