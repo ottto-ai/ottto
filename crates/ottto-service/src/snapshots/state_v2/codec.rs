@@ -127,27 +127,70 @@ pub(super) fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8], cap: u64) ->
 /// `strict_json` plus value equality, sharing one parse of each side. Also
 /// returns the value's compact serialization, which the equality check proved.
 pub(super) fn exact_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<(T, Vec<u8>)> {
-    let mut de = serde_json::Deserializer::from_slice(json);
-    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
-    de.end()?;
-    let original: serde_json::Value = serde_json::from_slice(json)?;
+    let (value, observed, original, retired) = guarded::<T>(json)?;
     let canonical = serde_json::to_vec(&value)?;
     let restored: serde_json::Value = serde_json::from_slice(&canonical)?;
     key_coverage(&original, &restored, &observed, &mut Vec::new())?;
     ensure!(original == restored, "state_v2_noncanonical_value");
-    Ok((value, canonical))
+    // A dropped retired key leaves the stored row unlike the value; commit the
+    // seed to the stored bytes so the next save rewrites the row without it.
+    Ok((value, if retired { json.to_vec() } else { canonical }))
 }
 /// Existing v1 deserializers include opaque RawValue and flatten boundaries.
 /// Validate the consumed key coverage too, so those boundaries cannot hide an
 /// ignored field. Values are never compared: v1's intentional defaults stand.
 pub(super) fn strict_json<T: DeserializeOwned + Serialize>(json: &[u8]) -> Result<T> {
-    let mut de = serde_json::Deserializer::from_slice(json);
-    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
-    de.end()?;
-    let before: serde_json::Value = serde_json::from_slice(json)?;
+    let (value, observed, before, _) = guarded::<T>(json)?;
     let after: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&value)?)?;
     key_coverage(&before, &after, &observed, &mut Vec::new())?;
     Ok(value)
+}
+/// Traversal counters #1290 retired, by path from the checkpoint root. An
+/// older build stored each while nonzero; decode drops it, never writes it.
+const RETIRED_KEYS: [&[&str]; 2] = [
+    &["counts", "listing_owed_pace_evicted"],
+    &["counts", "caps", "inventory_hold_keys_discarded"],
+];
+/// The guarded decode both checks share, of the input without retired keys.
+/// Also returns that input's value and whether a retired key was dropped.
+fn guarded<T: DeserializeOwned>(
+    json: &[u8],
+) -> Result<(T, super::ignored::Observed, serde_json::Value, bool)> {
+    fn object<'v>(
+        value: &'v mut serde_json::Value,
+        path: &[&str],
+    ) -> Option<&'v mut serde_json::Map<String, serde_json::Value>> {
+        path.iter()
+            .try_fold(value, |v, k| v.get_mut(*k))?
+            .as_object_mut()
+    }
+    let mut input: serde_json::Value = serde_json::from_slice(json)?;
+    let mut retired = false;
+    for path in RETIRED_KEYS {
+        let (key, parents) = path.split_last().expect("nonempty path");
+        let Some(parent) = object(&mut input, parents) else {
+            continue;
+        };
+        if parent.remove(*key).is_none() {
+            continue;
+        }
+        retired = true;
+        // `caps` is omitted when empty, so a retired key can be its last.
+        if let (true, [grand @ .., last]) = (parent.is_empty(), parents) {
+            if let Some(map) = object(&mut input, grand) {
+                map.remove(*last);
+            }
+        }
+    }
+    let stripped = if retired {
+        Some(serde_json::to_vec(&input)?)
+    } else {
+        None
+    };
+    let mut de = serde_json::Deserializer::from_slice(stripped.as_deref().unwrap_or(json));
+    let (value, observed) = super::ignored::deserialize::<T, _>(&mut de)?;
+    de.end()?;
+    Ok((value, observed, input, retired))
 }
 fn key_coverage(
     before: &serde_json::Value,
@@ -360,6 +403,28 @@ mod tests {
             "context":null,"previous_context":"a","last_change_mask":2}}"#;
         let proof = strict_json::<ProofState>(old).unwrap();
         assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
+    }
+    /// [behaviour] An older build's traversal row holding the counters #1290
+    /// retired loads, re-encodes without them, and seeds the stored bytes so
+    /// the next save rewrites the row; a live sibling counter stays.
+    #[test]
+    fn retired_traversal_counters_load_and_reencode_without_them() {
+        use crate::snapshots::ScanTraversalCheckpoint as Checkpoint;
+        let current = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["counts"]["listing_owed_pace_evicted"] = 3.into();
+        row["counts"]["caps"] = serde_json::json!({"inventory_hold_keys_discarded": 4});
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Option<Checkpoint>>(&old).unwrap();
+        let reencoded = serde_json::to_vec(&loaded).unwrap();
+        assert_eq!(reencoded, serde_json::to_vec(&current).unwrap());
+        assert_eq!(seed, old);
+        assert!(strict_json::<Option<Checkpoint>>(&old).is_ok());
+        row["counts"]["caps"]["parent_ref_refusals"] = 5.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, _) = exact_json::<Option<Checkpoint>>(&old).unwrap();
+        let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
+        assert_eq!(caps, &serde_json::json!({"parent_ref_refusals": 5}));
     }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
