@@ -444,13 +444,65 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     // never serializes the RAM-only fragment custody, so each reloaded pass
     // re-reads the fragment only: a Tail from the committed prefix, bounded
     // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
-    // The existing repeat counter counts each such pass, and the withheld
-    // record adds no usage. These passes run before the metadata-only change
-    // below, as production's re-read sees an unchanged file: once reloaded,
-    // the entry has no fragment record to adopt a stored ctime against.
+    // The existing repeat counter counts each such pass. These passes run
+    // before the metadata-only change below, as production's re-read sees an
+    // unchanged file: once reloaded, the entry has no fragment record to
+    // adopt a stored ctime against.
+    // Money (main's trailing-line rule): a complete unterminated record is
+    // held back only from the sealed prefix, the head and line delivery, so
+    // the re-read counts it exactly as a cold Full of the same bytes does, and
+    // re-applies it idempotently: the next pass adds no usage.
+    let cold_full = |collected_at: &str| {
+        let mut cold_scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&f.root),
+            ScanIndex::default(),
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            None,
+            &[],
+            false,
+        );
+        loop {
+            match cold_scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => cold_scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut scan,
+                    mut index,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        source,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    finalize_scan_after_policy(source, &mut scan, &mut index);
+                    break (index, scan);
+                }
+            }
+        }
+    };
+    let usage = |items: &[SnapshotItem]| {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    [
+                        item.input_tokens,
+                        item.output_tokens,
+                        item.cache_read_tokens,
+                        item.reasoning_output_tokens,
+                        item.request_count,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     let bound = index.clone();
     let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
-    let baseline_input: u64 = baseline.snapshots.iter().map(|s| s.input_tokens).sum();
+    let mut first_pass = Vec::new();
     for pass in 0..2 {
         let (next, scan, reads, rows) = f.page(source, index);
         let modes = reads.0.lock().unwrap().0.clone();
@@ -459,8 +511,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
             .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
             .collect::<Vec<_>>();
+        let emitted = usage(&scan.snapshots);
         eprintln!(
-            "CODEX_FRAGMENT_REREAD pass={pass} scanned={} reads={modes:?} fragment_bytes={fragment_bytes} repeats={repeats:?}",
+            "CODEX_FRAGMENT_REREAD pass={pass} scanned={} reads={modes:?} fragment_bytes={fragment_bytes} repeats={repeats:?} usage={emitted:?} first_pass={first_pass:?}",
             scan.scanned_file_count
         );
         assert_eq!(
@@ -479,12 +532,32 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                 "pass {pass}: one fragment-only Tail, byte-bounded to the fragment"
             );
         }
-        assert!(
-            scan.snapshots
-                .iter()
-                .all(|snapshot| snapshot.input_tokens <= baseline_input),
-            "pass {pass}: the withheld record adds no usage"
-        );
+        if pass == 0 {
+            assert!(
+                !scan.snapshots.is_empty(),
+                "the complete unterminated record counts on the re-read"
+            );
+            first_pass = emitted;
+        } else {
+            for (session, totals) in &emitted {
+                let first = first_pass
+                    .iter()
+                    .find(|(first, _)| first == session)
+                    .map(|(_, first)| first)
+                    .unwrap_or_else(|| panic!("pass {pass}: new usage for {session}"));
+                assert!(
+                    totals.iter().zip(first).all(|(now, first)| now <= first),
+                    "pass {pass}: no snapshot above the first re-read: {totals:?} > {first:?}"
+                );
+            }
+        }
+        if !scan.snapshots.is_empty() {
+            let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
+            sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+                &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
+                &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
+            );
+        }
         assert!(next.files[&key].has_unverified_source());
         index = next;
     }
@@ -668,31 +741,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         fs::metadata(&f.path).unwrap().len()
     );
     // Whole-body equality with a cold ordinary Full, not token-only equality.
-    let mut cold_scan = OwnedSourceScan::new(
-        source,
-        std::slice::from_ref(&f.root),
-        ScanIndex::default(),
-        &scan.snapshots[0].collected_at,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        None,
-        &[],
-        false,
-    );
-    let (cold_index, cold) = loop {
-        match cold_scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => cold_scan = next,
-            OwnedSourceScanStep::Complete {
-                mut scan,
-                mut index,
-                ..
-            } => {
-                apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
-                finalize_scan_after_policy(source, &mut scan, &mut index);
-                break (index, scan);
-            }
-        }
-    };
+    let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
     assert_eq!(
         serde_json::to_value(&scan.snapshots).unwrap(),
         serde_json::to_value(&cold.snapshots).unwrap(),
