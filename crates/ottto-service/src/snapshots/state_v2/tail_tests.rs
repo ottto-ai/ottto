@@ -13,7 +13,7 @@ use super::*;
 
 const FILE: &str = "/synthetic/tail/file.jsonl";
 const SIBLING: &str = "/synthetic/tail/z-sibling.jsonl";
-/// Larger than one stored fragment, and not zstd-compressible by accident.
+/// Larger than one raw fragment, even when its physical bytes compress.
 const LONG: usize = 17 * 1024 * 1024;
 const REVISION: u32 = 1;
 
@@ -221,9 +221,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
 
     // An overwrite of accumulating state owes no purge; a dropped private
     // string and a reset do, even with the same page count.
+    let compressed = vec![0; 2048];
     let page = |change| StagedFile {
         change,
-        ..staged(b"head2", &[(Collection::Responses, 0, b"page2")])
+        ..staged(b"head2", &[(Collection::Responses, 0, &compressed)])
     };
     for (change, marks) in [
         (Change::Ordinary, 0),
@@ -234,6 +235,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
         save_with(&f.path, &mut index).unwrap();
         assert_eq!(erasure_marks(&index), marks, "{change:?}");
         assert_eq!(all_tail_rows(&index, FILE), 2);
+        assert_eq!(
+            rows(&index, "tail.page.responses", FILE)[0].value_version,
+            3
+        );
     }
 
     // A removed progress row retires in its own commit.
@@ -574,7 +579,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -835,7 +840,7 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         // Capability 3 refuses any store whose minimum is above it.
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     assert_eq!(revisions(&reloaded, FILE).len(), 1);
