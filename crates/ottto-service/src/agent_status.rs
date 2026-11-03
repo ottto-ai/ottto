@@ -272,6 +272,38 @@ struct CodexHomeSlot {
     registered_binding: Option<(String, String)>,
 }
 
+impl CodexHomeSlot {
+    /// A home seen only through a running Codex process: read like an account
+    /// home, but not registered.
+    fn process_home(home: PathBuf) -> Self {
+        Self {
+            slot_id: "process_home".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home,
+            registered_binding: None,
+        }
+    }
+
+    /// A registered Ottto account slot's login may be refreshed by the limits
+    /// probe; the default home and a home seen only through a running Codex
+    /// process (no registered binding) are a person's own logins.
+    fn login_refresh(&self) -> CodexLoginRefresh {
+        match (self.ownership, &self.registered_binding) {
+            (CodexAccountSlotOwnershipV1::Managed, Some(_)) => CodexLoginRefresh::WhenLapsing,
+            _ => CodexLoginRefresh::Never,
+        }
+    }
+}
+
+/// Whether the limits probe may force a refresh of a home's login: only for
+/// an Ottto account slot, and then only while it lapses
+/// ([`codex_probe_refresh_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginRefresh {
+    Never,
+    WhenLapsing,
+}
+
 struct CodexSlotCandidate {
     slot: CodexHomeSlot,
     snapshot: AgentStatusSnapshot,
@@ -2270,6 +2302,8 @@ fn read_registered_codex_home_for_setup(
                 captured_at,
                 home,
                 CodexHomeTrust::Managed,
+                // `home` is an Ottto account slot's, resolved by the store.
+                CodexLoginRefresh::WhenLapsing,
                 CodexQuotaRead::Provider,
             )
         });
@@ -2384,6 +2418,7 @@ fn collect_codex_home_candidate(
         expires_at.to_string(),
         &slot.home,
         home_trust,
+        slot.login_refresh(),
         quota_read,
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
@@ -3198,6 +3233,7 @@ fn collect_codex_status_for_home(
     expires_at: String,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     quota_read: CodexQuotaRead,
 ) -> (
     AgentStatusSnapshot,
@@ -3293,7 +3329,7 @@ fn collect_codex_status_for_home(
     );
     let mut strong_identity = None;
     let mut probe_failed = false;
-    match collect_codex_usage_for_home(codex_home, home_trust, quota_read) {
+    match collect_codex_usage_for_home(codex_home, home_trust, login_refresh, quota_read) {
         Ok(usage) => {
             if usage.credential_read_failed {
                 append_codex_credential_read_failed_diagnostic(&mut snapshot);
@@ -3462,20 +3498,24 @@ fn collect_codex_status_for_home(
 fn collect_codex_usage_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     quota_read: CodexQuotaRead,
 ) -> Result<CodexUsageProbe, codex_saved_quota::CodexQuotaFailure> {
     match quota_read {
         CodexQuotaRead::Saved => {
             codex_saved_quota::serve_saved(codex_home, home_trust, current_unix_seconds())
         }
-        CodexQuotaRead::Provider => {
-            codex_saved_quota::read_provider_and_save(codex_home, home_trust, |_, _| true)
-                .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
-                .map_err(|message| codex_saved_quota::CodexQuotaFailure {
-                    message,
-                    at_epoch_seconds: current_unix_seconds(),
-                })
-        }
+        CodexQuotaRead::Provider => codex_saved_quota::read_provider_and_save(
+            codex_home,
+            home_trust,
+            login_refresh,
+            |_, _| true,
+        )
+        .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
+        .map_err(|message| codex_saved_quota::CodexQuotaFailure {
+            message,
+            at_epoch_seconds: current_unix_seconds(),
+        }),
     }
 }
 
@@ -3485,8 +3525,9 @@ fn collect_codex_usage_for_home(
 fn read_codex_usage_from_provider(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
 ) -> Result<CodexUsageProbe, String> {
-    collect_codex_app_server_usage_for_home(codex_home, home_trust)
+    collect_codex_app_server_usage_for_home(codex_home, home_trust, login_refresh)
 }
 
 fn stamp_codex_meter_identity(snapshot: &mut AgentStatusSnapshot) {
@@ -16009,6 +16050,7 @@ fn subscription_period_timestamp(value: &Value, key: &str) -> Option<String> {
 fn collect_codex_app_server_usage_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
 ) -> Result<CodexUsageProbe, String> {
     let now = current_unix_seconds();
     let needs_details =
@@ -16021,25 +16063,29 @@ fn collect_codex_app_server_usage_for_home(
             codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
         };
     let started = Instant::now();
-    let observation =
-        match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
-            Ok(observation) => observation,
-            Err(message) => {
-                eprintln!(
-                    "{}",
-                    codex_probe_failure_log_line(
-                        &message,
-                        codex_home,
-                        started.elapsed(),
-                        current_unix_seconds(),
-                    )
-                );
-                // No reading at all: the detail back-off still applies to the
-                // account last validated at this home.
-                codex_credit_grants::record_session_failure(codex_home, now);
-                return Err(message);
-            }
-        };
+    let observation = match call_codex_app_server_rate_limits_for_home(
+        codex_home,
+        home_trust,
+        login_refresh,
+        &needs_details,
+    ) {
+        Ok(observation) => observation,
+        Err(message) => {
+            eprintln!(
+                "{}",
+                codex_probe_failure_log_line(
+                    &message,
+                    codex_home,
+                    started.elapsed(),
+                    current_unix_seconds(),
+                )
+            );
+            // No reading at all: the detail back-off still applies to the
+            // account last validated at this home.
+            codex_credit_grants::record_session_failure(codex_home, now);
+            return Err(message);
+        }
+    };
     let probe = codex_usage_probe_from_app_server_observation(observation);
     if let Some(identity) = probe.identity.as_ref() {
         codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
@@ -16371,14 +16417,20 @@ fn with_codex_app_server_test_timeouts<T>(
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     needs_details: CodexNeedsDetails<'_>,
 ) -> Result<CodexAppServerObservation, String> {
     use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
     let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
     let started = Instant::now();
     let mut run = CodexAppServerRun::default();
-    let result =
-        run_codex_app_server_rate_limits_for_home(codex_home, home_trust, needs_details, &mut run);
+    let result = run_codex_app_server_rate_limits_for_home(
+        codex_home,
+        home_trust,
+        login_refresh,
+        needs_details,
+        &mut run,
+    );
     if run.spawned {
         let result_class = match &result {
             Ok(_) => CallResult::Ok,
@@ -16404,9 +16456,49 @@ fn call_codex_app_server_rate_limits_for_home(
     result
 }
 
+/// How far ahead of its lapse the probe refreshes an account home's login: the
+/// longest gap between two reads of a home, so the claimed workspace does not
+/// lapse before the next read. A lapse alone does not bring that read forward.
+const CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS: u64 = codex_saved_quota::UNUSED_REFRESH_SECONDS;
+
+/// Why the probe forces a token refresh in `account/read`, or `None` to leave
+/// the login as it is. Only an Ottto account slot's home
+/// ([`CodexLoginRefresh::WhenLapsing`]) is refreshed, and only when its
+/// claimed binding has lapsed, lapses within
+/// [`CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS`] or has no readable expiry:
+/// Codex does not persist a refresh of its own for that, so the workspace
+/// would stay unconfirmed. The default home, and a home seen only through a
+/// running Codex process, hold a person's own login and are never refreshed
+/// here.
+fn codex_probe_refresh_reason(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
+    now: u64,
+) -> Option<&'static str> {
+    if login_refresh == CodexLoginRefresh::Never || home_trust != CodexHomeTrust::Managed {
+        return None;
+    }
+    let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => return None,
+        Err(_) => return Some("unreadable"),
+    };
+    match codex_credential_claim_lapses_at(&credentials) {
+        None => Some("lapsed_or_unknown"),
+        Some(lapses_at)
+            if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
+        {
+            Some("lapses_soon")
+        }
+        Some(_) => None,
+    }
+}
+
 fn run_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    login_refresh: CodexLoginRefresh,
     needs_details: CodexNeedsDetails<'_>,
     run: &mut CodexAppServerRun,
 ) -> Result<CodexAppServerObservation, String> {
@@ -16482,12 +16574,19 @@ fn run_codex_app_server_rate_limits_for_home(
         }
     });
     let initialized = serde_json::json!({"method": "initialized"});
-    // Codex refreshes its own login when the token nears expiry; the probe
-    // never forces a refresh on top of that.
+    let refresh_reason = codex_probe_refresh_reason(
+        codex_home,
+        home_trust,
+        login_refresh,
+        current_unix_seconds(),
+    );
+    if let Some(reason) = refresh_reason {
+        eprintln!("codex usage probe: forcing account home login refresh reason={reason}");
+    }
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": false}
+        "params": {"refreshToken": refresh_reason.is_some()}
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it.
@@ -16755,6 +16854,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
     call_codex_app_server_rate_limits_for_home(
         &default_codex_home(),
         CodexHomeTrust::ProviderDefault,
+        CodexLoginRefresh::Never,
         &|_, _, _| false,
     )
     .map(|observation| observation.rate_limits)
@@ -22709,6 +22809,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         );
 
@@ -23046,6 +23147,7 @@ for line in sys.stdin:
         collect_codex_usage_for_home(
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         )
         .expect("setup read");
@@ -23094,6 +23196,7 @@ for line in sys.stdin:
                 "2026-08-26T00:15:00Z".to_string(),
                 &home,
                 CodexHomeTrust::ProviderDefault,
+                CodexLoginRefresh::Never,
                 CodexQuotaRead::Provider,
             )
         };
@@ -23878,6 +23981,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
             CodexQuotaRead::Provider,
         );
 
@@ -23962,16 +24066,9 @@ for line in sys.stdin:
         .is_none());
     }
 
-    /// [behaviour] The probe starts Codex with its home-writing startup
-    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
-    /// keys and keeps stdin open for the asynchronous default-home answer.
-    /// Both home modes share the builder that always sends refreshToken:false.
-    #[test]
-    #[serial]
-    fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
-        let dir = std::env::temp_dir().join(format!("ottto-app-server-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    /// A fake `codex` in `dir` that answers the limits probe and appends each
+    /// `account/read` `refreshToken` value to `dir/refresh.log`.
+    fn write_fake_codex_app_server(dir: &Path) {
         let helper = dir.join("fake_codex.py");
         std::fs::write(
             &helper,
@@ -23994,8 +24091,9 @@ for line in sys.stdin:
         print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
     if '"id":"ottto_account"' in line:
         account_read = True
-        if json.loads(line).get("params", {}).get("refreshToken") is not False:
-            sys.exit(4)
+        refresh = json.loads(line).get("params", {}).get("refreshToken")
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh.log"), "a") as log:
+            log.write(json.dumps(refresh) + "\n")
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     if "account/rateLimits/read" in line:
         if not account_read:
@@ -24018,6 +24116,19 @@ for line in sys.stdin:
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+    }
+
+    /// [behaviour] The probe starts Codex with its home-writing startup
+    /// installers off, shares CODEX_HOME as the SQLite home, drops provider
+    /// keys and keeps stdin open for the asynchronous default-home answer.
+    /// The default home never forces a token refresh.
+    #[test]
+    #[serial]
+    fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
+        let dir = std::env::temp_dir().join(format!("ottto-app-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        write_fake_codex_app_server(&dir);
 
         let _guard =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
@@ -24034,7 +24145,92 @@ for line in sys.stdin:
                 .and_then(Value::as_u64),
             Some(2)
         );
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(refreshes.lines().collect::<Vec<_>>(), ["false"]);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// [regress] A registered account slot whose login has lapsed is
+    /// refreshed by the limits probe, and one with a live login is not, so its
+    /// workspace stays confirmed; Codex 0.163 does not persist a refresh of its
+    /// own. A home seen only through a running Codex process (a person's own
+    /// `CODEX_HOME`) is never refreshed. Control: the default home is never
+    /// refreshed, even with a lapsed login.
+    #[test]
+    #[serial]
+    fn codex_probe_refreshes_only_a_lapsing_registered_slot_login() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-app-server-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        write_fake_codex_app_server(&dir);
+        let _guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let home_with_login = |label: &str, expires_at: i64| {
+            let home = crate::test_scratch::ScratchDir::canonical(label);
+            let token = synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            );
+            let auth = home.join("auth.json");
+            std::fs::write(
+                &auth,
+                serde_json::json!({"tokens": {"access_token": token, "id_token": token}})
+                    .to_string(),
+            )
+            .expect("auth fixture");
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+                .expect("auth mode");
+            home
+        };
+        let lapsed = home_with_login("codex-refresh-lapsed", now - 60);
+        let live = home_with_login("codex-refresh-live", now + 3600);
+        let registered = |home: PathBuf| CodexHomeSlot {
+            slot_id: "synthetic-slot".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home,
+            registered_binding: Some((
+                "synthetic-account-hash".to_string(),
+                "synthetic-workspace-hash".to_string(),
+            )),
+        };
+        let default_home = CodexHomeSlot {
+            slot_id: "default".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Default,
+            home: lapsed.to_path_buf(),
+            registered_binding: None,
+        };
+        for (slot, trust) in [
+            (registered(lapsed.to_path_buf()), CodexHomeTrust::Managed),
+            (registered(live.to_path_buf()), CodexHomeTrust::Managed),
+            (
+                CodexHomeSlot::process_home(lapsed.to_path_buf()),
+                CodexHomeTrust::Managed,
+            ),
+            (default_home, CodexHomeTrust::ProviderDefault),
+        ] {
+            call_codex_app_server_rate_limits_for_home(
+                &slot.home,
+                trust,
+                slot.login_refresh(),
+                &|_, _, _| false,
+            )
+            .expect("rate limits");
+        }
+
+        let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+        assert_eq!(
+            refreshes.lines().collect::<Vec<_>>(),
+            ["true", "false", "false", "false"],
+            "lapsed registered slot, live registered slot, lapsed process-only home, \
+             lapsed default home (control)"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -24175,7 +24371,12 @@ for line in sys.stdin:
             .expect("fake codex mode");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
-        call_codex_app_server_rate_limits_for_home(&home, CodexHomeTrust::Managed, &|_, _, _| false)
+        call_codex_app_server_rate_limits_for_home(
+            &home,
+            CodexHomeTrust::Managed,
+            CodexLoginRefresh::Never,
+            &|_, _, _| false,
+        )
     }
 
     fn assert_no_provider_text(message: &str) {

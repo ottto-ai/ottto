@@ -3153,6 +3153,185 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     });
 }
 
+/// [regress] 0.1.214: with fresh appends on every page and census members
+/// queued, the Codex rotation alternated freshness (F) and census (C) turns
+/// and never ran an ordinary one, so a header-validated archive and a plain
+/// re-read, both queued non-members, were never selected. While such work
+/// waits, the turn a freshness page owes now alternates census (C) and a
+/// dedicated ordinary turn (O): F O F C. Fresh keeps every second selecting
+/// page; ordinary and census work are each served within 4 selecting pages,
+/// and O reads the owed re-read despite a census backlog over one page.
+/// Control: with no ordinary-only work the order stays F C F C.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
+    use codex_compressed_input::HeaderRead;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const MEMBERS: usize = 40;
+    const REREAD: &str = "019fa333-2222-7333-8444-888888888888";
+    const ARCHIVE: &str = "019fa333-2222-7333-8444-888888888889";
+    let ids = (0..MEMBERS)
+        .map(|n| format!("019fa333-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    sessions.push((REREAD, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 2);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+        None,
+    );
+    index.archive_pass.power = true;
+    let header = archive_header_pass(&mut index, &archive, &cache);
+    assert!(matches!(header, HeaderRead::Validated(_)));
+    // Selection is under test, not the Full. Refuse archive work on every
+    // platform: on a macOS runner with mains power the selected archive's
+    // Full is reserved, and only the collector's reservation save, which
+    // this page loop does not run, releases the next page's inventory.
+    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(NoArchivePower));
+    index.archive_pass.power = false;
+    // Only census members stay queued; SESSION returns through its hint, and
+    // the re-read and the archive are queued after the control turns.
+    let reread = fixture.file(REREAD);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.pending_candidates.retain(|candidate| {
+        candidate.census_member
+            && candidate.path != fixture.file(SESSION)
+            && candidate.path != reread
+            && candidate.path != archive
+    });
+    assert!(traversal.pending_candidates.len() >= MEMBERS - 1);
+    let scan_root = traversal.scan_roots[0].clone();
+
+    let session_key = local_index_key(&fixture.file(SESSION));
+    let reread_key = local_index_key(&reread);
+    let archive_key = local_index_key(&archive);
+    let budget = fixture.len(SESSION) * 4;
+    cache.clear();
+    with_test_limits(2048, budget, 64, || {
+        // One selecting page with a fresh append to SESSION and its hint.
+        let turn = |index: ScanIndex, page: u64| {
+            fixture.append(SESSION, &token_line(4 + page));
+            let selected = selected_page(
+                &fixture,
+                &cache,
+                index,
+                &collected_at(page),
+                &[fixture.file(SESSION)],
+            );
+            let flags = selected.codex_selected_flags.clone();
+            let (index, _) = finish_published_within(selected, 10_000, || {
+                format!("page {page}, selected {flags:?}")
+            });
+            let kind = if flags.keys().eq([&session_key]) {
+                'F'
+            } else if !flags.is_empty()
+                && !flags.contains_key(&session_key)
+                && flags.values().all(|(member, _)| *member)
+            {
+                'C'
+            } else {
+                'O'
+            };
+            (index, kind, flags)
+        };
+
+        // Control: no ordinary-only work, so F C F C is unchanged; the
+        // census bit set on page 2 does not divert page 4.
+        let mut kinds = Vec::new();
+        for page in 1..=4 {
+            let (next, kind, _) = turn(index, page);
+            index = next;
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ['F', 'C', 'F', 'C']);
+
+        // A plain non-member re-read, owed a read (its fingerprint is gone),
+        // and a hinted non-member archive, queued behind a census backlog
+        // larger than one page's read budget.
+        index
+            .files
+            .get_mut(&reread_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let traversal = index.traversal.as_mut().unwrap();
+        let backlog = traversal
+            .pending_candidates
+            .iter()
+            .filter(|candidate| candidate.census_member)
+            .map(|candidate| fs::metadata(&candidate.path).unwrap().len())
+            .sum::<u64>();
+        assert!(backlog > 2 * budget, "census backlog {backlog} B");
+        for (path, watcher_hint) in [(&reread, false), (&archive, true)] {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path: path.clone(),
+                census_member: false,
+                watcher_hint,
+            });
+        }
+        // Ordinary debt waits: fresh keeps pages 5 and 7, the owed turn
+        // after census serves it on page 6, and census returns on page 8.
+        let mut kinds = Vec::new();
+        let mut pages = Vec::new();
+        let mut reread_read = Vec::new();
+        for page in 5..=8 {
+            let (next, kind, flags) = turn(index, page);
+            index = next;
+            kinds.push(kind);
+            pages.push(flags);
+            reread_read.push(!index.files[&reread_key].source_file_fingerprint.is_empty());
+        }
+        assert_eq!(kinds, ['F', 'O', 'F', 'C']);
+        // The ordinary turn selects only its own work, so the census backlog
+        // cannot spend its budget: the owed re-read is read on page 6.
+        assert_eq!(pages[1].get(&reread_key), Some(&(false, false)));
+        assert_eq!(pages[1].get(&archive_key), Some(&(false, true)));
+        assert!(pages[1].values().all(|(member, _)| !member));
+        assert_eq!(reread_read, [false, true, true, true]);
+        assert!(ids
+            .iter()
+            .any(|id| pages[3].contains_key(&local_index_key(&fixture.file(id)))));
+    });
+}
+
 /// The session ids `scan` published.
 fn published_ids(scan: &SourceScanResult) -> BTreeSet<&str> {
     scan.snapshots
@@ -3195,6 +3374,18 @@ fn published_scan(
     finish_published(selected_page(fixture, cache, index, collected_at, hints))
 }
 
+/// Platform gates that refuse archive work, as off mains power.
+struct NoArchivePower;
+impl crate::snapshot_sync::continuation::PlatformGates for NoArchivePower {
+    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Refused
+    }
+    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Allowed
+    }
+    fn restore_qos(&mut self) {}
+}
+
 /// Step `scan` to completion and apply the collector's upload policy.
 fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     let (index, scan, _) = finish_saving_reservations(scan);
@@ -3202,17 +3393,36 @@ fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 }
 
 /// A page needs far fewer steps; past this it is not progressing.
-const PAGE_STEP_CAP: u64 = 100_000;
+const PAGE_STEP_CAP: usize = 100_000;
+
+/// [`finish_published`] that fails after `max_steps` pending steps, naming
+/// `phase`, instead of spinning on a page that cannot complete.
+fn finish_published_within(
+    scan: OwnedSourceScan,
+    max_steps: usize,
+    phase: impl FnOnce() -> String,
+) -> (ScanIndex, SourceScanResult) {
+    let (index, scan, _) = finish_saving_reservations_within(scan, max_steps, phase);
+    (index, scan)
+}
 
 /// `finish_published`, with the number of archive reservation batches saved.
+fn finish_saving_reservations(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
+    finish_saving_reservations_within(scan, PAGE_STEP_CAP, String::new)
+}
+
 /// Like the collector (`SourcePreparation::step`), every pending step saves
 /// its batch: an archive page yields until its reservation is saved.
-fn finish_saving_reservations(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
+fn finish_saving_reservations_within(
+    mut scan: OwnedSourceScan,
+    max_steps: usize,
+    phase: impl FnOnce() -> String,
+) -> (ScanIndex, SourceScanResult, usize) {
     let mut committed = scan.index.clone();
     let checkpoint = Temp::new("reservation", b"");
     fs::remove_file(&checkpoint.0).unwrap();
     let mut saved = 0;
-    for _ in 0..PAGE_STEP_CAP {
+    for _ in 0..max_steps {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(mut next) => {
                 saved += usize::from(next.index.archive_pass.dirty);
@@ -3241,7 +3451,10 @@ fn finish_saving_reservations(mut scan: OwnedSourceScan) -> (ScanIndex, SourceSc
             }
         }
     }
-    panic!("a Codex page did not complete within {PAGE_STEP_CAP} steps");
+    panic!(
+        "a Codex page did not complete within {max_steps} steps: {}",
+        phase()
+    );
 }
 
 /// Archive power as on a Mac on AC power; Linux reports it unknown.

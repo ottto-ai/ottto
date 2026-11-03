@@ -1267,7 +1267,7 @@ mod tests {
         use super::*;
         use crate::agent_status::{
             call_codex_app_server_rate_limits_for_home, with_codex_app_server_test_timeouts,
-            CodexAppServerObservation, CODEX_APP_SERVER_TIMEOUT,
+            CodexAppServerObservation, CodexLoginRefresh, CODEX_APP_SERVER_TIMEOUT,
         };
         use crate::test_scratch::ScratchDir;
         use ottto_core::CodexHomeTrust;
@@ -1388,6 +1388,7 @@ for line in sys.stdin:
                 call_codex_app_server_rate_limits_for_home(
                     &home,
                     CodexHomeTrust::Managed,
+                    CodexLoginRefresh::Never,
                     &|_, _, _| escalate,
                 )
             };

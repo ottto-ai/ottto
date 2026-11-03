@@ -187,6 +187,7 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
+mod g7_debt;
 pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
@@ -27147,6 +27148,18 @@ impl OwnedSourceScan {
         // starves it; always putting it first can starve the census instead.
         // Continuations never select new work. A hint alone does not trigger
         // a read: all selected paths still pass the unchanged candidate gate.
+        // The turn a freshness page owes alternates census (C) and ordinary
+        // (O) work while queued work neither of those selects waits: F C F O;
+        // with no such work it stays F C F C. Fresh keeps its cadence. An
+        // ordinary turn is dedicated too: due audits, then queued non-member,
+        // non-fresh paths (archives, plain re-reads). Order only.
+        let ordinary_turn = source == SnapshotSource::Codex
+            && selection_limit > 0
+            && traversal.codex_freshness_yield
+            && codex_census_turn_was_last(&traversal.scan_roots)
+            && traversal.pending_candidates.iter().any(|candidate| {
+                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+            });
         let freshness_page = source == SnapshotSource::Codex
             && selection_limit > 0
             && !traversal.codex_freshness_yield
@@ -27157,6 +27170,7 @@ impl OwnedSourceScan {
             && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
         let census_page = source == SnapshotSource::Codex
             && selection_limit > 0
+            && !ordinary_turn
             && traversal.codex_freshness_yield
             && traversal
                 .pending_candidates
@@ -27164,13 +27178,33 @@ impl OwnedSourceScan {
                 .any(|candidate| candidate.census_member);
         if source == SnapshotSource::Codex && selection_limit > 0 {
             traversal.codex_freshness_yield = freshness_page;
+            if !freshness_page {
+                note_codex_census_turn(&traversal.scan_roots, census_page);
+            }
         }
-        if freshness_page || census_page {
+        if freshness_page || census_page || ordinary_turn {
             let limit = if freshness_page {
                 selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             } else {
                 selection_limit
             };
+            let ordinary_only = |candidate: &ScanTraversalPath| {
+                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+            };
+            if ordinary_turn {
+                traversal.pending_candidates.retain(|candidate| {
+                    let due = pending_paths.len() < limit
+                        && index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .is_some_and(|entry| entry.audit_requires_full(audit_now))
+                        && ordinary_only(candidate);
+                    if due {
+                        pending_paths.push(candidate.clone());
+                    }
+                    !due
+                });
+            }
             // Rotate the original queue once without allocating another
             // backlog-sized container. Keep unselected paths in FIFO order.
             for _ in 0..traversal.pending_candidates.len() {
@@ -27180,9 +27214,11 @@ impl OwnedSourceScan {
                 let eligible = pending_paths.len() < limit
                     && if freshness_page {
                         codex_fresh_data_pending(&candidate, &index.files)
-                    } else {
+                    } else if census_page {
                         candidate.census_member
                             && !codex_fresh_data_pending(&candidate, &index.files)
+                    } else {
+                        ordinary_only(&candidate)
                     };
                 if eligible {
                     pending_paths.push(candidate);
@@ -27208,7 +27244,7 @@ impl OwnedSourceScan {
         // Dedicated turns select only their own work, plus any retry riders:
         // new hinted members, audits or old groups cannot consume the other
         // turn's allowance.
-        let selection_limit = if freshness_page || census_page {
+        let selection_limit = if freshness_page || census_page || ordinary_turn {
             pending_paths.len()
         } else {
             selection_limit
@@ -45880,6 +45916,31 @@ fn codex_selection_may_exhaust_page(
     false
 }
 
+/// Codex scan-root sets whose last non-fresh selecting page was a census turn.
+/// Scheduling only and RAM only: the index is reloaded every page, and a
+/// restart costs at most one rotation. One entry per configured root set.
+static CODEX_CENSUS_TURN_LAST: Mutex<BTreeSet<Vec<PathBuf>>> = Mutex::new(BTreeSet::new());
+
+fn codex_census_turns() -> std::sync::MutexGuard<'static, BTreeSet<Vec<PathBuf>>> {
+    CODEX_CENSUS_TURN_LAST.lock().unwrap_or_else(|poisoned| {
+        CODEX_CENSUS_TURN_LAST.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn codex_census_turn_was_last(roots: &[PathBuf]) -> bool {
+    codex_census_turns().contains(roots)
+}
+
+fn note_codex_census_turn(roots: &[PathBuf], census: bool) {
+    let mut turns = codex_census_turns();
+    if !census {
+        turns.remove(roots);
+    } else if !turns.contains(roots) {
+        turns.insert(roots.to_vec());
+    }
+}
+
 /// Priority only, never read admission. Byte length is content-relevant;
 /// ctime, inode, permissions and mtime alone cannot promote an unchanged file.
 /// New paths need a watcher/roster hint so a cold history walk stays FIFO.
@@ -46586,7 +46647,7 @@ fn advance_bounded_directory_traversal_with_budget(
         .iter()
         .any(|directory| !directory.watcher_hint);
     let mut freshness = money_freshness::WalkFold::resume(source);
-    let listed_at = sampled_scan::now_seconds();
+    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk, &mut freshness);
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -46608,6 +46669,7 @@ fn advance_bounded_directory_traversal_with_budget(
         }
     };
     while remaining > 0 {
+        debt.counts(&traversal.counts, relisted_counts.as_ref());
         restore(
             &mut traversal.counts,
             relisted_counts.take(),
@@ -46636,6 +46698,7 @@ fn advance_bounded_directory_traversal_with_budget(
                         disappearance_diagnostics::Site::WalkDirectory,
                     );
                 } else {
+                    debt.unlisted();
                     disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
@@ -46711,6 +46774,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(_) => {
@@ -46741,6 +46805,7 @@ fn advance_bounded_directory_traversal_with_budget(
             if source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(&path)
             {
+                debt.excluded(&path);
                 continue;
             }
             if source == SnapshotSource::Codex {
@@ -46750,6 +46815,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(metadata) => metadata,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -46795,19 +46861,15 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if index
-                .files
-                .get(&local_index_key(&path))
-                .is_some_and(|entry| !entry.same_listing_stamp_as(&metadata))
-            {
-                freshness.changed_file(
-                    index.authority_terminal_member(&path),
-                    listed_at.saturating_sub(modified_unix_seconds),
-                );
-            }
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
+            let listing = g7_debt::Listing {
+                path: &path,
+                metadata: &metadata,
+                in_window: !aged,
+            };
+            debt.listed(index, listing);
             let owes_stamped = aged
                 && retention.owes_stamped(
                     source,
@@ -46829,14 +46891,6 @@ fn advance_bounded_directory_traversal_with_budget(
                     line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 }
                 continue;
-            }
-            // Inside the window and unread: outstanding. Archives keep their own
-            // debt.
-            if !codex_archive_path(&path) && !index.files.contains_key(&local_index_key(&path)) {
-                freshness.never_indexed_file(
-                    index.authority_terminal_member(&path),
-                    listed_at.saturating_sub(modified_unix_seconds),
-                );
             }
             let mut owed_unchanged = false;
             if relisting {
@@ -46924,6 +46978,7 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
+    debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
         &mut traversal.counts,
         relisted_counts,
@@ -46934,8 +46989,10 @@ fn advance_bounded_directory_traversal_with_budget(
             census.invalidate_walk();
         }
     }
+    let walk_ended = traversal.pending_directories.is_empty();
+    let debt = debt.end(index, walk_ended);
     if root_walk {
-        freshness.page_end(source, traversal.pending_directories.is_empty());
+        freshness.page_end(source, walk_ended, debt);
     }
     index.traversal = Some(traversal);
 }
