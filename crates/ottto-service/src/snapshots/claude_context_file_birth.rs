@@ -45,6 +45,10 @@ const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 /// timestamp when they write a copy (`/branch`, `/resume` copy, fork). Only
 /// such a writer lets the money birth rule skip pre-birth records; any other
 /// or mixed writer counts and discloses them.
+///
+/// Frozen: an unlisted version takes request-id proof instead (`Holders`,
+/// and the same-session page proof for a path twin). Appending a version
+/// changes the persisted fixed-size `ClaudeOwnWriters::others` shape.
 pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
 
 /// Sticky response writer certificate. Zero = no responses, 255 = invalid.
