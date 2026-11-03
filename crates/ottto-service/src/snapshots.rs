@@ -29293,6 +29293,32 @@ impl OwnedSourceScan {
                                 crate::transcript_acquisition::ReadMode::Full(_)
                             ),
                         );
+                        // D168's replays, with the bytes they read: a group
+                        // from its first member, and a file with protected
+                        // tiers re-read from its start.
+                        #[cfg(unix)]
+                        if tail_source::has_codec(source) {
+                            let replay = if let Some(group) = active.group.as_deref() {
+                                Some((
+                                    tail_source::ReconstructCause::GroupReplay,
+                                    group
+                                        .consumed_before
+                                        .saturating_add(active.parser.reader.consumed_bytes()),
+                                ))
+                            } else {
+                                active
+                                    .sampling
+                                    .as_ref()
+                                    .is_some_and(|acquisition| acquisition.tier_prefix_replay)
+                                    .then_some((
+                                        tail_source::ReconstructCause::TierPrefixReplay,
+                                        plan.metrics().native_bytes,
+                                    ))
+                            };
+                            if let Some((cause, bytes)) = replay {
+                                tail_source::counters::replay(source, cause, bytes);
+                            }
+                        }
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
@@ -29392,6 +29418,7 @@ impl OwnedSourceScan {
                         pending!();
                     };
                     acquisition.mode = mode;
+                    acquisition.tier_prefix_replay = true;
                     if let Some(context) = sampling.as_mut() {
                         context.priority_replays += 1;
                         context.record_mode(mode, acquisition.audit_due);
@@ -33734,6 +33761,7 @@ impl OwnedSourceScan {
                             retained_finalization_charge: 0,
                             retained_usage: None,
                             reinsertion: Default::default(),
+                            tier_prefix_replay: false,
                         });
                     }
                     Err(_) => {
@@ -34135,6 +34163,7 @@ impl OwnedSourceScan {
                                 .map_or(0, |(_, charge, _)| charge),
                             retained_usage: continued.map(|(_, _, usage)| usage),
                             reinsertion,
+                            tier_prefix_replay: false,
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -34201,6 +34230,7 @@ impl OwnedSourceScan {
                             retained_finalization_charge: 0,
                             retained_usage: None,
                             reinsertion: Default::default(),
+                            tier_prefix_replay: false,
                         });
                     }
                 }
