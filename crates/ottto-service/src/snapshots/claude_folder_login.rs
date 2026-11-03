@@ -20,7 +20,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::claude_money_birth_store::location_key;
-use super::claude_request_identity::{complete_org, valid_login, AcceptedBuckets, RecordedLogin};
+use super::claude_request_identity::{
+    complete_org, digest_hex, valid_login, AcceptedBuckets, RecordedLogin,
+};
 use super::{local_index_key, ScanIndex, SnapshotItem, SoleLoginWitness};
 use crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 use crate::claude_status_coverage as coverage;
@@ -34,13 +36,9 @@ const MAX_HASH_TEXT: usize = 128;
 /// every folder first seen after it starts sticky.
 const DAMAGED_LEDGER: &str = "damaged";
 
-fn hex(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// The ledger and status key of one config folder.
 pub(crate) fn folder_key(config_dir: &Path) -> String {
-    hex(&coverage::home_key(config_dir))
+    digest_hex::encode(&coverage::home_key(config_dir))
 }
 
 /// Which file a fold read and whether it is its session's own, set when the
@@ -59,7 +57,7 @@ impl FolderTrace {
     pub(crate) fn of_file(path: &Path, forked: bool) -> Self {
         Self {
             forked,
-            home: coverage::transcript_home_key(path).map(|home| hex(&home)),
+            home: coverage::transcript_home_key(path).map(|home| digest_hex::encode(&home)),
             location: Some(file_location(&local_index_key(path))),
             qualified: None,
         }
