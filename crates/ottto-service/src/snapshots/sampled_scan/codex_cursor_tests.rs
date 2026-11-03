@@ -6570,12 +6570,34 @@ fn cursor_without_header_facts(cache: &SharedCache) -> usize {
 /// whose filename owner sits in the residue (a plain ownership refusal,
 /// checkpointed and reloaded) retires exactly like an unrelated vanished
 /// entry, on both absence paths, and nothing is re-emitted for either owner.
+/// The owner's accepted body and witness stay as accepted, and the next
+/// ordinary page equals a cold Full of the same disk, whose file-backed
+/// sibling rollout is the positive control.
 #[test]
 fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
     use crate::snapshots::disappearance_diagnostics::tests::finish;
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
 
     let fixture = ScanRoot::with_sessions(&[]);
     write_account_rollout(&fixture, SESSION, "a", 1);
+    write_account_rollout(&fixture, SESSION_B, "b", 1);
+    let (prior_index, prior_scan) = page(&fixture, ScanIndex::default(), None);
+    let mut prior = scan_money(SnapshotSource::Codex, &prior_index, &prior_scan);
+    prior.accepted = prior_scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                Accepted {
+                    body: prior.snapshots[&item.source_session_id].clone(),
+                    witness: snapshot_upload_body_witness(item),
+                },
+            )
+        })
+        .collect();
+    assert!(prior.accepted.contains_key(SESSION));
+    assert!(prior.accepted.contains_key(SESSION_B));
     fs::remove_file(fixture.file(SESSION)).unwrap();
     let held_key = local_index_key(&fixture.file(SESSION));
     let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
@@ -6605,6 +6627,17 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
         tokens_used: 10,
         ..Default::default()
     };
+
+    // Independent cold Full of the disk after the removal: only the sibling
+    // rollout (and the empty last-page file) remain, and the sibling emits.
+    let (cold_index, cold_scan) = page(&fixture, ScanIndex::default(), None);
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+    assert!(
+        cold.snapshots.contains_key(SESSION_B),
+        "positive file-backed control"
+    );
+    assert!(!cold.snapshots.contains_key(SESSION));
+
     for removal_hint in [false, true] {
         let mut first = new_scan(seed.clone());
         first.codex_join_prepared = true;
@@ -6668,6 +6701,13 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
                 "removal_hint {removal_hint}"
             );
         }
+        // The next ordinary page over the same disk: the retired owner stays
+        // held at its accepted body and every emitted sibling equals cold.
+        let (route_index, route_scan) = page(&fixture, index, None);
+        let mut route = scan_money(SnapshotSource::Codex, &route_index, &route_scan);
+        route.accepted = prior.accepted.clone();
+        money_oracle::assert_held(SESSION, &prior, &route, &cold);
+        money_oracle::assert_equivalent(&cold, &route);
     }
 }
 

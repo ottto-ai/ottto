@@ -59231,18 +59231,20 @@ mod tests {
 
     /// [money] Positive control for the removed Codex state-only fallback: the
     /// previous build emitted a `codex_state_sqlite` total-only item for each
-    /// state row below; head emits none. Two accounts, each with a state row
-    /// that never had a rollout, a tagged one, and a rollout deleted after its
-    /// split body was accepted.
+    /// state row below; head emits none. Run under two state-row titles, each
+    /// with a row that never had a rollout, a user-sourced row
+    /// (`thread_source = 'user'`), and a row whose rollout one scan emitted
+    /// before the file was deleted. The rows carry no account, so this asserts
+    /// no account placement and no accepted-body oracle.
     #[test]
-    fn codex_state_rows_without_a_rollout_emit_nothing_across_accounts() {
-        for account in ["account-a", "account-b"] {
-            let codex_dir = temp_dir(&format!("codex-state-no-fallback-{account}"));
+    fn codex_state_rows_without_a_rollout_emit_nothing_under_either_title() {
+        for title in ["title-a", "title-b"] {
+            let codex_dir = temp_dir(&format!("codex-state-no-fallback-{title}"));
             let sessions_dir = codex_dir.join("sessions");
             fs::create_dir_all(&sessions_dir).expect("create sessions dir");
             let deleted = "019e253c-bbbb-7000-9000-ffffffffffff";
             let never = "019e253c-cccc-7000-9000-ffffffffffff";
-            let tagged = "019e253c-dddd-7000-9000-ffffffffffff";
+            let user_sourced = "019e253c-dddd-7000-9000-ffffffffffff";
             let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{deleted}.jsonl"));
             fs::write(
                 &rollout,
@@ -59256,13 +59258,17 @@ mod tests {
             connection
                 .execute(CODEX_THREADS_DDL, [])
                 .expect("create threads");
-            for (id, tokens) in [(deleted, 59_i64), (never, 1_234_i64), (tagged, 77_i64)] {
+            for (id, tokens) in [
+                (deleted, 59_i64),
+                (never, 1_234_i64),
+                (user_sourced, 77_i64),
+            ] {
                 connection
                     .execute(
                         CODEX_THREADS_INSERT,
                         (
                             id,
-                            account,
+                            title,
                             tokens,
                             0_i64,
                             1_777_777_000_i64,
@@ -59277,25 +59283,25 @@ mod tests {
             connection
                 .execute(
                     "UPDATE threads SET thread_source = 'user' WHERE id = ?1",
-                    [tagged],
+                    [user_sourced],
                 )
-                .expect("tag thread");
+                .expect("mark thread user-sourced");
             drop(connection);
             let no_state_total = |label: &str, scan: &SourceScanResult| {
                 for snapshot in &scan.snapshots {
                     assert_ne!(
                         snapshot.provenance.collector.as_str(),
                         "codex_state_sqlite",
-                        "{account} {label}"
+                        "{title} {label}"
                     );
                     assert_ne!(
                         snapshot.provenance.input_token_scope.as_deref(),
                         Some("total_only"),
-                        "{account} {label}"
+                        "{title} {label}"
                     );
                     assert!(
-                        ![never, tagged].contains(&snapshot.source_session_id.as_str()),
-                        "{account} {label}"
+                        ![never, user_sourced].contains(&snapshot.source_session_id.as_str()),
+                        "{title} {label}"
                     );
                 }
             };
@@ -59309,7 +59315,11 @@ mod tests {
             )
             .expect("scan file-backed session");
             assert!(first.census_complete);
-            assert_eq!(first.snapshots.len(), 1, "{account}: the split body only");
+            assert_eq!(
+                first.snapshots.len(),
+                1,
+                "{title}: the file-backed body only"
+            );
             assert_eq!(first.snapshots[0].source_session_id, deleted);
             no_state_total("first", &first);
 
