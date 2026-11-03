@@ -1576,6 +1576,7 @@ mod tests;
 #[cfg(test)]
 pub(in super::super) use tests::{
     delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
+    with_session_db,
 };
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.

@@ -74,7 +74,10 @@ pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
 
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
-pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
+pub(in crate::snapshots) fn with_session_db(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut sqlite::Sqlite),
+) {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     let mut guard = runtime.session.lock().unwrap();
     f(&mut guard.as_mut().unwrap().db);

@@ -1147,18 +1147,18 @@ mod application_cases {
             assert_eq!(fs::read(&progress_path).unwrap(), progress);
             // An older build's 16 MiB decode bound refuses the widened row
             // rather than reading a narrower value: it holds until upgrade.
-            let runtime = reloaded.v2().persistence_v2.as_ref().unwrap();
-            let mut guard = runtime.session.lock().unwrap();
-            let mut tx = guard.as_mut().unwrap().db.begin(TxnMode::Read).unwrap();
-            let header = tx.get(&key).unwrap().unwrap();
-            let stored = mapper::bytes(&mut tx, &header).unwrap();
-            assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), wide);
-            assert_eq!(
-                codec::expand(&stored, 16 * 1024 * 1024)
-                    .unwrap_err()
-                    .to_string(),
-                "state_v2_value_admission"
-            );
+            super::super::runtime::with_session_db(&reloaded, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                let header = tx.get(&key).unwrap().unwrap();
+                let stored = mapper::bytes(&mut tx, &header).unwrap();
+                assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), wide);
+                assert_eq!(
+                    codec::expand(&stored, 16 * 1024 * 1024)
+                        .unwrap_err()
+                        .to_string(),
+                    "state_v2_value_admission"
+                );
+            });
         }
     }
 
