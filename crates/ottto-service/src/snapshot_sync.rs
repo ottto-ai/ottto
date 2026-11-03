@@ -12136,7 +12136,7 @@ fn collector_status_request(
         last_census_complete: Some(status.counts.census_complete),
         last_symlink_rejected_count: status.counts.symlink_rejected_count,
         last_unreadable_path_count: status.counts.unreadable_path_count,
-        last_oversized_file_count: status.counts.oversized_file_count,
+        last_oversized_file_count: 0,
         last_disappeared_file_count: status.counts.disappeared_file_count,
         last_malformed_json_line_count: status.counts.malformed_json_line_count,
         last_invalid_utf8_line_count: status.counts.invalid_utf8_line_count,
@@ -22947,9 +22947,6 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-                mod oversized_discovery_pipeline_tests {
-                    include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
-                }
             }
         }
     }

@@ -369,7 +369,6 @@ fn codex_proof_readers_room(context: &sampled_scan::Context, job: &ProofJob) -> 
 /// The outcome a P side fence that did not admit gives every entry.
 fn codex_proof_held_outcome(fenced: SideFence) -> ProofOutcome {
     match fenced {
-        SideFence::FileCapHeld => ProofOutcome::FileCapHeld,
         SideFence::Unreadable => ProofOutcome::SideUnreadable,
         SideFence::Stale => ProofOutcome::SideStale,
         SideFence::Held { lineage: true, .. } => ProofOutcome::LineageHeld,

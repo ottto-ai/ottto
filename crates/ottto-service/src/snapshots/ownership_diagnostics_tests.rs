@@ -78,6 +78,7 @@ fn prior_map_and_positional_counts_default_the_appended_split_without_shifting_n
         ..ScanTraversalCounts::default()
     };
     let mut object = serde_json::to_value(old).unwrap();
+    object["oversized_file_count"] = json!(13);
     object.as_object_mut().unwrap().remove("causes");
     let fields = [
         "discovered_file_count",
