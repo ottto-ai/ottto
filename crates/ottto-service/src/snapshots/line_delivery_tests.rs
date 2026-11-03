@@ -118,7 +118,6 @@ fn new_scan(root: &Path, index: ScanIndex) -> OwnedSourceScan {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -248,7 +247,7 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
     let mut bytes = physical.concat();
     bytes.extend(raw(&last));
     let seen = RefCell::new(Vec::new());
-    let mut reader = BoundedJsonlReader::new(Cursor::new(bytes.clone()), 1024, false);
+    let mut reader = BoundedJsonlReader::new(Cursor::new(bytes.clone()));
     let report = drive(&mut reader, &seen);
 
     let mut expected = Vec::new();
@@ -278,10 +277,8 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
     assert!(reader.consumed_bytes() > start, "the EOF line was consumed");
 
     let mut untapped = Vec::new();
-    let plain = read_bounded_jsonl_lines(Cursor::new(bytes), 1024, |value| {
-        untapped.push(value.clone())
-    })
-    .unwrap();
+    let plain =
+        read_bounded_jsonl_lines(Cursor::new(bytes), |value| untapped.push(value.clone())).unwrap();
     assert_eq!(report, plain, "byte-identical JsonlReadReport");
     assert_eq!(untapped, vec![first, crlf, last]);
     assert_eq!(report.physical_line_count, 7);
@@ -290,11 +287,9 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
     assert_eq!(report.invalid_utf8_line_count, 1);
 }
 
-/// An overlong line skipped across paused steps is delivered once,
-/// at its newline, with no value and its whole physical length; money still
-/// receives the salvaged Codex envelope.
+/// [regress] Every complete row reaches the tap and usage reducer without salvage.
 #[test]
-fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
+fn large_line_is_delivered_whole_to_both_observers() {
     let short = json!({"timestamp": "2026-10-01T00:00:00Z", "ordinal": 6});
     let after = json!({"timestamp": "2026-10-01T00:00:02Z", "ordinal": 8});
     let overlong = format!(
@@ -307,13 +302,10 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
         [raw(&after), b"\n".to_vec()].concat(),
     ];
     let seen = RefCell::new(Vec::new());
-    let mut reader = BoundedJsonlReader::new(
-        std::io::BufReader::with_capacity(16, Cursor::new(lines.concat())),
-        64,
-        true,
-    );
-    reader.set_chunked_skip(32);
-    let mut partial = 0;
+    let mut reader = BoundedJsonlReader::new(std::io::BufReader::with_capacity(
+        16,
+        Cursor::new(lines.concat()),
+    ));
     let report = loop {
         let step = reader
             .step_lines(
@@ -322,12 +314,10 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
             )
             .unwrap();
         match step {
-            JsonlReaderStep::Partial => partial += 1,
             JsonlReaderStep::Line => {}
             JsonlReaderStep::Complete(report) => break report,
         }
     };
-    assert!(partial > 0, "the skip paused across steps");
     let seen = seen.into_inner();
     let taps = seen
         .iter()
@@ -337,7 +327,7 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
         *taps[1],
         Seen::Tap {
             length: lines[1].len() as u64,
-            value: None,
+            value: Some(serde_json::from_slice::<Value>(&lines[1]).unwrap()),
         }
     );
     assert_eq!(taps.len(), 3);
@@ -353,9 +343,9 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(money.len(), 3, "salvaged envelope still reaches money");
+    assert_eq!(money.len(), 3, "every complete record reaches money");
     assert_eq!(money[1]["ordinal"], 7);
-    assert_eq!(report.over_line_cap_count, 1);
+    assert_eq!(report.over_line_cap_count, 0);
 }
 
 /// A frozen-extent read withholds its unterminated record; applying it at
@@ -369,7 +359,7 @@ fn sealed_fragment_is_delivered_only_after_its_newline() {
     let sealed = bytes.len() as u64;
     bytes.extend(raw(&pending));
     let seen = RefCell::new(Vec::new());
-    let mut reader = BoundedJsonlReader::new(Cursor::new(bytes.clone()), 1024, false);
+    let mut reader = BoundedJsonlReader::new(Cursor::new(bytes.clone()));
     reader.set_extent_limit(bytes.len() as u64);
     drive(&mut reader, &seen);
     assert!(reader.sealed_fragment());
@@ -388,7 +378,7 @@ fn sealed_fragment_is_delivered_only_after_its_newline() {
     let mut tail = bytes[sealed as usize..].to_vec();
     tail.push(b'\n');
     let next = RefCell::new(Vec::new());
-    let mut reader = BoundedJsonlReader::new(Cursor::new(tail.clone()), 1024, false);
+    let mut reader = BoundedJsonlReader::new(Cursor::new(tail.clone()));
     reader.set_extent_limit(tail.len() as u64);
     drive(&mut reader, &next);
     assert_eq!(
@@ -564,7 +554,6 @@ fn codex_group_member_reads_call_no_observer() {
         "2026-10-06T23:00:00Z",
         7,
         2,
-        false,
         None,
         &[],
         false,
@@ -843,7 +832,6 @@ fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -1704,7 +1692,6 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
                     &now,
                     7,
                     10,
-                    false,
                     None,
                     &[],
                     false,
@@ -1765,7 +1752,6 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         &after_sleep,
         730,
         10,
-        false,
         None,
         &[],
         false,
@@ -1882,7 +1868,6 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
                 &at,
                 BACKFILL_WINDOW_DAYS,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -2035,7 +2020,6 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
                     collected_at,
                     7,
                     10,
-                    false,
                     None,
                     &[],
                     false,
@@ -2167,7 +2151,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
                 at,
                 days,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -2218,7 +2201,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             &today,
             7,
             10,
-            false,
             None,
             &[],
             false,
@@ -2509,7 +2491,6 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
                     &today,
                     7,
                     10,
-                    false,
                     Some(support.as_path()),
                     &[],
                     false,
@@ -2860,7 +2841,7 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
     for overlong in [false, true] {
         let mut data=[raw(&json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z","payload":{"id":id,"cwd":root.0,"timestamp":"2026-10-07T10:00:00Z","context_window":200000}})),b"\n".to_vec(),raw(&usage(100)),b"\n".to_vec()].concat();
         if overlong {
-            data.extend(format!("{{\"timestamp\":\"2026-10-07T10:00:01Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":\"{}\"}}\n","x".repeat(MAX_JSONL_LINE_BYTES+1)).as_bytes());
+            data.extend(format!("{{\"timestamp\":\"2026-10-07T10:00:01Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":\"{}\"}}\n","x".repeat(16_777_216+1)).as_bytes());
         }
         data.extend(raw(&usage(140)));
         data.push(b'\n');
@@ -2876,7 +2857,6 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
                     NOW,
                     BACKFILL_WINDOW_DAYS,
                     10,
-                    false,
                     None,
                     &[],
                     false,
@@ -2932,7 +2912,7 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
                     || e.codex_applied_tier_receipt.is_some()),
             "nonempty TierReplay evidence"
         );
-        assert_eq!(bare.over_line_cap_count, usize::from(overlong));
+        assert_eq!(bare.over_line_cap_count, 0);
         let a = page_counts(&bare_counts);
         let b = page_counts(&seen_counts);
         for key in [
@@ -2975,7 +2955,6 @@ fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -3027,7 +3006,6 @@ fn codex_cursor_yield_drops_prefix_before_late_token_record() {
                 NOW,
                 BACKFILL_WINDOW_DAYS,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -3086,7 +3064,6 @@ fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -3139,7 +3116,6 @@ fn codex_symlinked_root_leaf_resolves_home_and_delivers_lines() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -3195,11 +3171,8 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
     let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
     let mut observer = feed.observer(&roots);
     assert_eq!(observer.begin(&view), Want::Lines);
-    let mut reader = BoundedJsonlReader::new(
-        std::io::BufReader::new(fs::File::open(&path).unwrap()),
-        1024,
-        false,
-    );
+    let mut reader =
+        BoundedJsonlReader::new(std::io::BufReader::new(fs::File::open(&path).unwrap()));
     let mut delivered = Vec::new();
     loop {
         let step = reader
@@ -3233,7 +3206,7 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
     };
     let mut observer = feed.observer(&roots);
     assert_eq!(observer.begin(&tail), Want::Lines);
-    let mut reader = BoundedJsonlReader::new(std::io::BufReader::new(file), 1024, false);
+    let mut reader = BoundedJsonlReader::new(std::io::BufReader::new(file));
     let mut appended = Vec::new();
     loop {
         let step = reader
@@ -3278,7 +3251,7 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
 }
 
 #[test]
-fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
+fn codex_live_observer_receives_large_row_before_terminal_usage() {
     let root = Root::new("prelude-live-overlong");
     let path = root.file("fixture");
     let meta = raw(
@@ -3313,12 +3286,10 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
     let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
     let mut observer = feed.observer(&[root.projects()]);
     assert_eq!(observer.begin(&view), Want::Lines);
-    let mut reader = BoundedJsonlReader::new(
-        std::io::BufReader::with_capacity(64, fs::File::open(&path).unwrap()),
-        1024,
-        true,
-    );
-    reader.set_chunked_skip(64);
+    let mut reader = BoundedJsonlReader::new(std::io::BufReader::with_capacity(
+        64,
+        fs::File::open(&path).unwrap(),
+    ));
     let mut delivered = Vec::new();
     let report = loop {
         let step = reader
@@ -3335,10 +3306,10 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
         }
     };
     observer.end(&view, &DeliveryEnd::Complete);
-    assert_eq!(report.over_line_cap_count, 1);
+    assert_eq!(report.over_line_cap_count, 0);
     assert_eq!(delivered.len(), 3);
     assert_eq!(delivered[0].1.as_ref().unwrap()["type"], "session_meta");
-    assert_eq!(delivered[1].1, None);
+    assert!(delivered[1].1.is_some());
     assert_eq!(
         delivered[2].1.as_ref().unwrap()["payload"]["usage"]["input_tokens"],
         19
@@ -3348,8 +3319,8 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
     assert_eq!(done.len(), 1);
     assert_eq!(
         done[0].1.first_input_tokens,
-        Some(19),
-        "777 must not terminate the live observer"
+        Some(777),
+        "the complete large row reaches the live observer"
     );
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
 }
@@ -3384,7 +3355,6 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
                         at,
                         7,
                         10,
-                        false,
                         None,
                         hints,
                         false,
@@ -3620,7 +3590,6 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
                     "2026-10-07T12:10:00Z",
                     BACKFILL_WINDOW_DAYS,
                     10,
-                    false,
                     None,
                     &hints,
                     false,
@@ -3702,7 +3671,6 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
                         &days_from_now(0),
                         7,
                         10,
-                        false,
                         None,
                         &[],
                         false,
@@ -3757,7 +3725,6 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
             &days_from_now(0),
             7,
             10,
-            false,
             None,
             &[],
             false,
@@ -3844,7 +3811,6 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
                     "2026-10-07T12:10:00Z",
                     BACKFILL_WINDOW_DAYS,
                     10,
-                    false,
                     None,
                     &[],
                     false,
@@ -3922,7 +3888,6 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
                 NOW,
                 7,
                 10,
-                false,
                 None,
                 std::slice::from_ref(&path),
                 false,
@@ -4245,13 +4210,10 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         audited.candidate_decision_with_reason_at(&candidate, 2),
         (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
     );
+    // A delivery context changes no parse: CONTENT stays valid.
     let mut context = held.clone();
     context.activate_upload_context("new-authority".into());
-    assert!(!context.withheld_account_unchanged(&key, &candidate));
-    assert_eq!(
-        context.candidate_decision_at(&candidate, 1),
-        CandidateDecision::Parse
-    );
+    assert!(context.withheld_account_unchanged(&key, &candidate));
     let mut other_revision = held.clone();
     activate(&mut other_revision, revision - 1);
     assert!(!other_revision.withheld_account_unchanged(&key, &candidate));

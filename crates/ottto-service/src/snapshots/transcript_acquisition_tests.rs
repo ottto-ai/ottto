@@ -93,7 +93,6 @@ fn native_parser_with(
         Some(metadata),
         None,
         None,
-        false,
     )
     .unwrap();
     (parser, expected, scope)
@@ -213,13 +212,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
         SnapshotSource::Codex => {
             parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
         }
-        SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_artifacts(
-            &fixture.0,
-            NOW,
-            "native-fixture".into(),
-            false,
-        )
-        .unwrap(),
+        SnapshotSource::ClaudeCode => {
+            parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
         SnapshotSource::Pi => {
             parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
         }
@@ -444,13 +439,7 @@ fn sampled_native_claude_compaction_sizes_across_tail_passes() {
         acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
     assert_eq!(mode, ReadMode::Tail);
     let tail = rebuilt(items);
-    let mut full = parse_claude_code_jsonl_file_with_artifacts(
-        &fixture.0,
-        NOW,
-        "native-fixture".into(),
-        false,
-    )
-    .unwrap();
+    let mut full = parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
     apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
     let full = rebuilt(full);
     assert_eq!(
@@ -1234,7 +1223,6 @@ fn production_scan_page_hinted(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         hinted_paths,
         false,
@@ -1549,7 +1537,6 @@ fn an_unrouted_codec_source_takes_its_ram_copy() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             None,
             &[],
             false,
@@ -1871,7 +1858,6 @@ fn cached_scan(
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -2268,167 +2254,6 @@ fn sampled_production_long_owning_header_change_cannot_hide_outside_samples() {
     );
     let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
     assert_eq!(production_body(source, scan), production_body(source, full));
-}
-
-#[test]
-fn sampled_production_terminal_row_loss_preserves_first_tail_debt_after_restart() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = ScanFixture::new(source);
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        fixture
-            .file
-            .append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
-        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        fixture
-            .file
-            .append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
-        let (index, _, modes) = production_scan(
-            &fixture,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "a",
-        );
-        assert_eq!(modes, (1, 0, 0));
-        let key = local_index_key(&fixture.file.0);
-        assert!(!index.files[&key].has_unverified_source());
-        let original = fs::read_to_string(&fixture.file.0).unwrap();
-        let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
-        assert_ne!(original, edited);
-        assert_eq!(original.len(), edited.len());
-        fs::write(&fixture.file.0, edited).unwrap();
-        fixture
-            .file
-            .append(&json!({"type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)}));
-        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
-        let (mut index, interim, modes) =
-            production_scan(&fixture, source, index, Some(cache.clone()), "a");
-        assert_eq!(modes, (0, 1, 0));
-        assert!(interim.over_line_cap_count > 0);
-        let deadline = index.files[&key]
-            .unverified_deadline()
-            .expect("terminal sampled settlement owes audit");
-        let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
-        assert_ne!(
-            production_body(source, interim),
-            production_body(source, full)
-        );
-        let path = fixture.dir.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
-        cache.clear();
-        index = ScanIndex::load(&path).unwrap();
-        assert_eq!(index.files[&key].unverified_deadline(), Some(deadline));
-        let (mut index, idle, _) =
-            production_scan(&fixture, source, index, Some(cache.clone()), "a");
-        assert!(idle.snapshots.is_empty());
-        assert_eq!(index.files[&key].unverified_deadline(), Some(deadline));
-        index
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .set_unverified_deadline(1);
-        let (index, corrected, modes) =
-            production_scan(&fixture, source, index, Some(cache.clone()), "a");
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(
-            index.files[&key].unverified_deadline(),
-            Some(1),
-            "lossy audit cannot certify full verification"
-        );
-        let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
-        assert_eq!(
-            production_body(source, corrected),
-            production_body(source, full)
-        );
-        // Ordinary full parsing has no acquisition certificate either. Its
-        // broader terminal-loss settlement cannot discharge source verification.
-        let (index, unsampled, _) = production_scan(&fixture, source, index, None, "a");
-        assert!(unsampled.over_line_cap_count > 0);
-        assert_eq!(index.files[&key].unverified_deadline(), Some(1));
-        let incomplete_sidecar = (source == SnapshotSource::Codex)
-            .then(|| fixture.root.parent().unwrap().join("session_index.jsonl"));
-        let index = if let Some(sidecar) = incomplete_sidecar.as_ref() {
-            fs::write(sidecar, "{not valid json}\n").unwrap();
-            let (index, bypassed, modes) =
-                production_scan(&fixture, source, index, Some(cache.clone()), "a");
-            assert!(!bypassed.sidecar_census_complete);
-            assert!(bypassed.over_line_cap_count > 0);
-            assert_eq!(
-                modes,
-                (0, 0, 0),
-                "incomplete sidecar bypasses acquisition setup"
-            );
-            assert_eq!(index.files[&key].unverified_deadline(), Some(1));
-            index
-        } else {
-            index
-        };
-        // Once the native row loss is repaired, a real full read can clear debt.
-        let mut text = fs::read_to_string(&fixture.file.0).unwrap();
-        text = text
-            .lines()
-            .filter(|line| line.len() <= MAX_JSONL_LINE_BYTES)
-            .map(|line| format!("{line}\n"))
-            .collect();
-        fs::write(&fixture.file.0, text).unwrap();
-        let index = if let Some(sidecar) = incomplete_sidecar.as_ref() {
-            let (_, fresh_rows, _) =
-                production_scan(&fixture, source, ScanIndex::default(), None, "a");
-            assert_eq!(fresh_rows.over_line_cap_count, 0);
-            let (index, bypassed, _) =
-                production_scan(&fixture, source, index, Some(cache.clone()), "a");
-            assert!(!bypassed.sidecar_census_complete);
-            // Existing incomplete sweeps retain historical census loss counts;
-            // fresh native rows above prove the current repaired file is clean.
-            assert_eq!(
-                index.files[&key].unverified_deadline(),
-                Some(1),
-                "incomplete dependencies cannot verify source history"
-            );
-            fs::remove_file(sidecar).unwrap();
-            index
-        } else {
-            index
-        };
-        // The existing unhealthy census deliberately delays a fresh walk.
-        // Advance that real scheduler clock; do not discard its durable state.
-        let retry_at = index
-            .traversal
-            .as_ref()
-            .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
-            .unwrap_or_else(|| rfc3339_unix_seconds(NOW).unwrap());
-        let collected_at = time::OffsetDateTime::from_unix_timestamp(retry_at as i64)
-            .unwrap()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let (verified, clean, modes, _) = production_scan_at(
-            &fixture,
-            source,
-            index,
-            Some(cache.clone()),
-            "a",
-            &collected_at,
-        );
-        let (verified, clean, modes) = if modes == (0, 0, 0) {
-            // Repaired Codex metadata can first finish the existing healthy
-            // frozen census, whose file page was already consumed. Completing
-            // that census alone must retain debt for the next ordinary walk.
-            assert!(verified.traversal.is_none());
-            assert_eq!(verified.files[&key].unverified_deadline(), Some(1));
-            let (index, scan, modes, _) =
-                production_scan_at(&fixture, source, verified, Some(cache), "a", &collected_at);
-            (index, scan, modes)
-        } else {
-            (verified, clean, modes)
-        };
-        assert_eq!(modes, (1, 0, 0));
-        assert_eq!(clean.over_line_cap_count, 0);
-        assert!(clean.sidecar_census_complete);
-        assert!(!verified.files[&key].has_unverified_source());
-    }
 }
 
 #[test]
@@ -3206,4 +3031,63 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             .get("full_cause")
             .is_none());
     }
+}
+
+/// [regress] Every source publishes usage on a real line above the former 16 MiB boundary,
+/// delivered once, with its line buffer freed.
+#[test]
+fn whole_large_usage_line_is_published_for_each_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let fixture = ScanFixture::new(source);
+        let mut row = usage(source, 100, 0, "fixture-model");
+        row["padding"] = json!("x".repeat(16 * 1024 * 1024 + 1));
+        fixture.file.append(&row);
+        drop(row);
+        let ((_, scan, _), observations) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(&fixture, source, ScanIndex::default(), None, "large-line")
+        });
+        assert_eq!(scan.over_line_cap_count, 0);
+        assert_eq!(scan.dropped_usage_record_count, 0);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].input_tokens > 0);
+        assert_eq!(scan.snapshots[0].output_tokens, 10);
+        let counts = observations
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_jsonl_lines")
+            .map(|row| &row["counts"])
+            .find(|counts| counts["lines_over_16_mib"] == 1)
+            .unwrap();
+        assert!(counts["max_line_bytes"].as_u64().unwrap() > 16 * 1024 * 1024);
+        assert!(
+            counts["max_line_buffer_bytes"].as_u64().unwrap()
+                >= counts["max_line_bytes"].as_u64().unwrap()
+        );
+    }
+    let mut bytes =
+        format!("{{\"padding\":\"{}\"}}\n", "x".repeat(16 * 1024 * 1024 + 1)).into_bytes();
+    let first_end = bytes.len() as u64;
+    bytes.extend_from_slice(b"{\"next\":true}\n");
+    let mut reader = BoundedJsonlReader::new(BufReader::with_capacity(8192, bytes.as_slice()));
+    let mut delivered = 0;
+    assert_eq!(
+        reader.step(|_| delivered += 1).unwrap(),
+        JsonlReaderStep::Line
+    );
+    assert_eq!(delivered, 1);
+    assert_eq!(reader.consumed_bytes(), first_end);
+    assert_eq!(
+        reader.buf.capacity(),
+        0,
+        "the large record's buffer is freed"
+    );
+    assert_eq!(
+        reader.step(|_| delivered += 1).unwrap(),
+        JsonlReaderStep::Line
+    );
+    assert_eq!(delivered, 2);
+    assert!(reader.report.complete());
 }

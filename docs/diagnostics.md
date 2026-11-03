@@ -149,6 +149,15 @@ telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
 process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
+Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
+`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
+capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
+record right after `native_collection_page`; `context_composition_read` carries
+them inline. 16 MiB is only a release point: a completed record above it
+frees its line buffer; byte targets yield between records. The counts-only
+`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
+on consecutive native pages, without changing reading or retries.
+
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
 or line, or changing its meaning, increments the version. Version 2 removes
@@ -877,6 +886,33 @@ keeps the file discoverable, not an age-based drop. A never-binding account
 keeps usage off the server; token/age disclosure is implemented, and
 bounded-lifetime release remains a SOURCE follow-up.
 
+## Change Reason Counters
+
+After each source's `native_collection_page` line, a `native_change_reasons`
+line carries `counts.change_reasons` when any count is nonzero (its own line
+keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
+local diagnostics only; they gate, cap and upload nothing.
+
+- **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
+  `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
+  `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
+  `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
+  a changed body with no tag; never guessed).
+- **`upload`** (per entity, once per page): `entities`, `accepted` (stored or
+  unchanged ACK), `usage_identical`, `money_changed_or_unknown` (`accepted` minus
+  `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
+  Placement is known only for Claude with complete accepted state; else `u`.
+  An exact resend of a held, refused or catch-up body takes its delivery cause.
+- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
+  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
+  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
+  why.
+- **Sub-counts:** `source_reset_same_size_edit_files` and
+  `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
+  cannot see: money-only reveals and late external evidence.
+
+Upload counts land on the line after the source's next page line.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of
@@ -1240,6 +1276,9 @@ records can include two sparse, counts-only objects for `source: claude_code`:
 mean zero events in that observation. Counters saturate at `u64::MAX`. They
 add no wire fields, collected data kinds, persisted state or transcript reads.
 No paths, identifiers, fingerprints, bodies or content are emitted.
+Two sparse scalars ride the same counts: `link_scrape_bytes`, the text the
+always-on link scrape tokenized, and `links_over_limit`, links left off an
+upload because their value exceeds the receiver's 512-character limit.
 
 Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Comparison
@@ -1960,16 +1999,16 @@ values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
 (>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
 charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
-the complete valid save commits; `value_admission` for one row over its cap still
-refuses the save. At page size one, a value-admission failure raises
+the complete valid save commits; `value_admission` for one row over its physical
+limit (64 MiB, or a kind's smaller fixed limit) still refuses the save. At page size one, a value-admission failure raises
 `save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires
 erasure instead of comparing strings.
-`row_cap_max` reports the largest written row as a percent of its cap, with its
-kind name; `row_cap_alarm` flags 75% or more, before one row's growth would
-refuse every save of that source.
+`row_cap_max` reports the largest written row as a percent of its sizing target
+(1 MiB for mutable rows), with its kind name; `row_cap_alarm` flags 75% or more.
+Above 100% the row still commits; the alarm never refuses.
 `store_growth.claude`, `store_growth.codex` and `store_growth.pi` sample their
 SQLite store once a day, on any between-cycles window, before reference verification.
 Each reports `page_count`, `freelist_count`, `page_size`, and `kinds` with row count

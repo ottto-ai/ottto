@@ -947,7 +947,7 @@ mod tests {
             "growth stays discoverable, never dropped"
         );
         let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
-            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+            index.candidate_decision_in_window(candidate, at, Some(at), 7, &mut None)
         };
         let mut recent = candidate.clone();
         recent.modified_unix_seconds = now;
@@ -2343,6 +2343,15 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
     state
         .last_growth_full_unix
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
+}
+
+/// Owed growth whose Full `claim_growth_full` would refuse now: selecting it
+/// only defers it again (`defer_growth_read`), so it must not pull a family.
+pub(super) fn growth_full_paced(index: &ScanIndex, key: &str, now: u64) -> bool {
+    growth_active(index)
+        && index.v2().growth_retention.get(key).is_some_and(|state| {
+            state.predecessor_size.is_some() && growth_claim_recent(state, now)
+        })
 }
 
 /// Debt whose claim has expired. Its deferral did not re-queue it, so its

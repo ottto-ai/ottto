@@ -75,7 +75,6 @@ fn run_with_limit(
         NOW,
         BACKFILL_WINDOW_DAYS,
         file_limit,
-        false,
         None,
         &[],
         false,
@@ -164,7 +163,7 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
     );
     let context = home.context(SnapshotSource::ClaudeCode);
     let workers = vec![WORKER.to_owned()];
-    while !context.prepare_launch_step(&workers).unwrap() {}
+    while !context.launch_events().prepare_step(&workers).unwrap() {}
     let mut state = OwnedSourceScan::new(
         SnapshotSource::ClaudeCode,
         &[root],
@@ -172,7 +171,6 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -545,7 +543,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
     home.event(WORKER, CONTROLLER);
     let context = home.context(SnapshotSource::ClaudeCode);
     let workers = vec![WORKER.to_owned()];
-    while !context.prepare_launch_step(&workers).unwrap() {}
+    while !context.launch_events().prepare_step(&workers).unwrap() {}
     let mut candidate = CandidateFile {
         physical_identity: None,
         scan_root: home.0.clone(),
@@ -565,7 +563,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
     candidate.source_file_fingerprint = sha256_hex(&[
         "launcher_worker_context:v1",
         &physical,
-        &context.launch_witness(&workers).unwrap(),
+        &context.launch_events().witness(&workers).unwrap(),
     ]);
     let witness = ClaudeUsageFamilyWitness {
         evidence_fingerprint: "synthetic-provider-witness".into(),
@@ -601,7 +599,11 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
     );
     let remaining = VecDeque::new();
     assert!(claude_held_family_matches_launch_context(
-        &index, WORKER, &candidate, &remaining, &context
+        &index,
+        WORKER,
+        &candidate,
+        &remaining,
+        context.launch_events()
     ));
     for mutation in 0..4 {
         let mut changed = index.clone();
@@ -625,7 +627,11 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
         }
         assert!(
             !claude_held_family_matches_launch_context(
-                &changed, WORKER, &candidate, &remaining, &context
+                &changed,
+                WORKER,
+                &candidate,
+                &remaining,
+                context.launch_events()
             ),
             "must retain forced reparse for changed boundary {mutation}"
         );
@@ -637,6 +643,6 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
         WORKER,
         &candidate,
         &VecDeque::from([extra]),
-        &context
+        context.launch_events()
     ));
 }

@@ -6208,6 +6208,8 @@ fn install_staged_account_switch(
             return Err(LocalApiError::StatePoisoned);
         }
         write_and_verify_pending_claim_commit(pending, candidate_secret)?;
+        crate::snapshot_sync::owe_login_address_erase(&default_support_dir())
+            .or_state_poisoned()?;
         let response = daemon.install_switched_account(
             staged.new_account.clone(),
             staged.setup_run_id.clone(),
@@ -7451,6 +7453,7 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
+    crate::snapshot_sync::owe_login_address_erase(&default_support_dir()).or_state_poisoned()?;
     FileAccountStore::default().reset().or_state_poisoned()?;
     FileConnectionStore::default().reset().or_state_poisoned()?;
     FileDeviceStore::default().reset().or_state_poisoned()?;

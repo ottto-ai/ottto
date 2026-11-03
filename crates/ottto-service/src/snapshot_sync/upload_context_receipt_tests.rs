@@ -340,6 +340,10 @@ pub(crate) struct Uploader {
     pub completed: bool,
 }
 impl Uploader {
+    /// Forget which context each accepted body was ACKed under.
+    pub(crate) fn drop_body_contexts(&mut self) {
+        self.progress.accepted_body_contexts.clear();
+    }
     pub(crate) fn new(source: SnapshotSource) -> Self {
         Self {
             progress: SnapshotUploadProgress::new(
@@ -364,6 +368,25 @@ impl Uploader {
         index: &mut ScanIndex,
     ) {
         activate_source_upload_context(source, context, index, &mut self.progress);
+    }
+
+    /// The service prepare's context steps.
+    pub(crate) fn activate_like_prepare(
+        &mut self,
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        policy: SnapshotUploadPolicy,
+        namespace: Option<&str>,
+        cache: bool,
+        copy: bool,
+    ) {
+        let claude = source == SnapshotSource::ClaudeCode;
+        let base = cycle_upload_context(policy, namespace, cache);
+        let context =
+            copy_unproven_upload_context(resumed_prefix_upload_context(base.clone(), claude), copy);
+        activate_source_upload_context(source, context, index, &mut self.progress);
+        index.copy_unproven_enabled = copy;
+        index.set_copy_prefix_base_upload_context(claude.then_some(base));
     }
 
     pub(crate) fn prepare_for_scan(
@@ -533,6 +556,15 @@ impl Uploader {
             &self.progress.accepted_body_contexts,
         );
         Ok((counts.files, counts.bytes))
+    }
+    /// As a mid-pass checkpoint commit: the ledger's ACKs so far become the
+    /// index's durable stamps.
+    pub(crate) fn checkpoint_stamps(&self, index: &mut ScanIndex) {
+        index.stamp_entity_upload_context_acks(
+            &self.progress.destination_namespace_hash,
+            &self.progress.accepted_body_witnesses,
+            &self.progress.accepted_body_contexts,
+        );
     }
     pub(crate) fn finish_adopted_index(
         &mut self,

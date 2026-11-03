@@ -1588,6 +1588,12 @@ mod hydrate_parity {
     }
 }
 
+/// One file-entities value past the physical row limit, so value admission
+/// refuses the save; mutable rows past their 1 MiB target still commit.
+pub(super) fn over_row_limit() -> BTreeSet<String> {
+    BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
+}
+
 /// [format] value admission reloads the prior generation halves then retries and grows back.
 #[test]
 fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
@@ -1595,10 +1601,9 @@ fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_ba
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 250), 250);
-    index.file_snapshot_fingerprints.insert(
-        "oversize".into(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert("oversize".into(), over_row_limit());
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
     assert_eq!(collection_page_limit(&index, 250), 125);
@@ -1650,10 +1655,9 @@ fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(collection_page_limit(&index, 1), 1);
-    index.file_snapshot_fingerprints.insert(
-        "oversize".into(),
-        (0..16_384_u32).map(|n| format!("{n:064x}")).collect(),
-    );
+    index
+        .file_snapshot_fingerprints
+        .insert("oversize".into(), over_row_limit());
     let error = save_with(&f.path, &mut index).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
     let current = load_with(&f.path, false).unwrap().unwrap();
@@ -1889,7 +1893,6 @@ fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
             "2050-10-31T12:00:00Z",
             30,
             10,
-            false,
         )
         .unwrap()
     };
@@ -1968,7 +1971,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                     &at(now),
                     30,
                     10,
-                    false,
                 )
                 .unwrap();
             }
@@ -1979,7 +1981,6 @@ fn paced_growth_read_defers_at_both_admission_sites() {
                 &at(now),
                 30,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -2109,7 +2110,6 @@ fn expired_growth_claim_rides_the_next_selecting_page() {
             &at(now),
             30,
             1,
-            false,
         )
         .unwrap()
     };

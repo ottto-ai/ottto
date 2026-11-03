@@ -130,3 +130,10 @@ sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+
+Local collection never depends on an upload setting. No read-side identity (file scope, Codex
+group scope, traversal, memos, tier receipts, archives) includes a setting, the attribution key, a
+server capability or the replay directive; the upload filter applies them at send. Delivery proofs
+keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
+file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
+applies to bodies from then on, never retroactively.

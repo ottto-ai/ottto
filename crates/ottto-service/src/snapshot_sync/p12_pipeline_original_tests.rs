@@ -354,8 +354,7 @@ impl RearmFixture {
             index.clone(),
             collected_at,
             183,
-            self.native_file_limit,
-            true, // Match the ordinary test scanner's artifact setting.
+            self.native_file_limit, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
             &self.hinted_paths,
             false, // Match its context-curve setting; byte parity includes it.

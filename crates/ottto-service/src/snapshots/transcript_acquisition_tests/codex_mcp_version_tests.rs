@@ -52,7 +52,6 @@ fn codex_prelude_ld_and_mcp_eof_share_one_primary_read() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,

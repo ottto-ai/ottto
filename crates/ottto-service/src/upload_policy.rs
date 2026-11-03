@@ -22,7 +22,8 @@ use crate::context_footprint::{
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::{
-    snapshot_fingerprint, SnapshotActivityCount, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
+    snapshot_fingerprint, SnapshotActivityCount, SnapshotItem, SnapshotSource,
+    SnapshotUploadPolicy, MAX_SESSION_ARTIFACT_VALUE_CHARS,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -226,8 +227,16 @@ pub fn apply_upload_policy(
     snapshots: &mut [SnapshotItem],
     policy: SnapshotUploadPolicy,
 ) {
+    let mut links_over_limit = 0_u64;
     for item in snapshots {
         let mut fingerprint_needs_refresh = apply_released_rules(item, policy);
+        let links = item.session_artifacts.len();
+        item.session_artifacts
+            .retain(|link| link.value.chars().count() <= MAX_SESSION_ARTIFACT_VALUE_CHARS);
+        if item.session_artifacts.len() != links {
+            links_over_limit += (links - item.session_artifacts.len()) as u64;
+            fingerprint_needs_refresh = true;
+        }
         if !policy.names() {
             fingerprint_needs_refresh |= hide_names(item);
         }
@@ -235,6 +244,7 @@ pub fn apply_upload_policy(
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
     }
+    crate::local_resource_diagnostics::claude_reread::links_over_limit(links_over_limit);
 }
 
 /// The rules of the releases before names were filtered. Only for checking a

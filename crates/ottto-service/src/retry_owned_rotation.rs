@@ -55,7 +55,6 @@ impl OwnedRotationProof {
                 "2026-10-05T00:00:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap();
             controls.insert(
@@ -159,7 +158,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             "2026-10-05T00:00:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
             None,
             &[],
             false,

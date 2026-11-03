@@ -113,7 +113,6 @@ fn retry_test_context(index: &mut ScanIndex, root: &Path) {
     let context = scan_traversal_context_fingerprint(
         SnapshotSource::ClaudeCode,
         &[root.to_owned()],
-        index,
         BACKFILL_WINDOW_DAYS,
     );
     let traversal = index.traversal.as_mut().unwrap();
@@ -137,7 +136,6 @@ fn retry_test_page(
         at,
         BACKFILL_WINDOW_DAYS,
         limit,
-        false,
         Some(&root.join("support")),
         &[],
         false,
@@ -938,7 +936,6 @@ fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed()
             CARRY_RETRY,
             BACKFILL_WINDOW_DAYS,
             2,
-            false,
             Some(&root.join("support")),
             &[],
             false,

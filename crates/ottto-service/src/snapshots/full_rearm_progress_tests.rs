@@ -1031,7 +1031,6 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 WINDOW,
                 7,
                 100,
-                false,
             )
             .unwrap();
             scan.snapshots = rearm.items.clone();
@@ -1111,7 +1110,6 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 WINDOW,
                 7,
                 100,
-                false,
             )
             .unwrap();
             scan.snapshots = rearm.items.clone();
@@ -1157,7 +1155,6 @@ fn always_on_terminal_at(
         WINDOW,
         7,
         100,
-        false,
     )
     .unwrap();
     scan.snapshots = rearm.items.clone();
@@ -1843,7 +1840,6 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
         WINDOW,
         0,
         100,
-        false,
     )
     .unwrap();
     assert!(scan.census_complete, "{scan:?}");
@@ -1877,7 +1873,6 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
         "2026-08-02T08:10:00Z",
         0,
         100,
-        false,
     )
     .unwrap();
     assert!(scan.census_complete);
@@ -1983,7 +1978,6 @@ fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
             WINDOW,
             0,
             if failed { 100 } else { 1 },
-            false,
         )
         .unwrap();
         assert!(!scan.census_complete, "{failed}: {scan:?}");

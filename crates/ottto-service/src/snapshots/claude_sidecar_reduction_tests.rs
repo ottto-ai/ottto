@@ -169,7 +169,6 @@ fn raw_scan_at(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         100,
-        false,
         Some(&fixture.support),
         &[],
         false,
@@ -650,7 +649,7 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
     let prior = seed_predecessor(&f, &cache);
     f.evidence(1);
     let cached = raw_scan(&f, prior, Some(cache), |scan| {
-        scan.index.active_upload_context_fingerprint = Some("changed-after-start".into());
+        scan.sampling.as_mut().unwrap().namespace = Scope("changed-after-start".into());
     });
     assert!(cached.result.snapshots.is_empty());
     assert!(!cached.result.census_complete);
@@ -813,8 +812,7 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
             |scan| match change {
                 "sidecars" => f.write_rows(true, &f.trace[..2]),
                 "context" => {
-                    scan.index.active_upload_context_fingerprint =
-                        Some("changed-after-start".into())
+                    scan.sampling.as_mut().unwrap().namespace = Scope("changed-after-start".into())
                 }
                 "object" => {
                     let replacement = f.path.with_extension("replacement");
@@ -970,7 +968,6 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
         .clear();
     index.claude_desktop_identity_census_complete = false;
     index.claude_desktop_lineage_census_complete = false;
-    index.claude_desktop_census_witness = None;
     let unrelated = f.dir.join("unrelated.jsonl");
     // An indexed held session with no Desktop proof cannot be selected by this recovery.
     let mut unrelated_entry = index.files[&key].clone();

@@ -220,7 +220,6 @@ fn parse_forged(
         Some(&metadata),
         None,
         Some(Arc::new(Mutex::new(ledgers))),
-        true,
     )
     .unwrap();
     parser.accumulator.codex_parent_prefix_proof = proof;
@@ -556,7 +555,6 @@ impl Scene {
             None,
             None,
             None,
-            true,
         )
         .unwrap();
         let opened = install_codex_parent_proof(
@@ -907,7 +905,7 @@ fn job_of(parent: &Path, children: &[&Path]) -> CodexProofReaders {
 
 fn run_to_end(job: &mut CodexProofReaders) -> Vec<ChildResult> {
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
+    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
     job.children
         .iter()
         .map(|child| child.result.expect("every child has a result"))
@@ -1137,13 +1135,13 @@ fn a_straddling_parent_row_pushes_no_signature() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// No overshoot: a run reads only while one more step fits its budget.
+/// [regress] A started record finishes beyond its byte target, then yields.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs macOS heap layout"
 )]
-fn a_job_reads_nothing_past_its_budget() {
+fn a_job_finishes_a_record_before_yielding_at_its_budget() {
     let root = temp_root("job-budget");
     let parent = rollout(&root, PARENT);
     write_values(&parent, &parent_values());
@@ -1153,15 +1151,16 @@ fn a_job_reads_nothing_past_its_budget() {
 
     let mut job = job_of(&parent, &[&child]);
     let mut budget = reserve - 1;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
+    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
     assert_eq!((budget, job.consumed), (reserve - 1, 0));
 
     let mut budget = reserve;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
-    assert!(job.consumed > 0 && budget == reserve - job.consumed);
+    assert_eq!(job.run(&mut budget), CodexProofRun::Budget);
+    assert!(job.consumed > reserve);
+    assert_eq!(budget, 0);
 
     let mut budget = u64::MAX;
-    assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Done);
+    assert_eq!(job.run(&mut budget), CodexProofRun::Done);
     assert!(matches!(
         job.children[0].result,
         Some(ChildResult::Decided {
@@ -1181,7 +1180,7 @@ fn a_job_reads_nothing_past_its_budget() {
 const ORDINARY_LINE_RETAINED: usize = 4 * SAMPLE_BYTES + 1024;
 
 /// The job's walked bound less its reader buffers' capacity (the buffer is
-/// the charged `MAX_JSONL_LINE_BYTES` term).
+/// the charged `16_777_216` term).
 fn retained(job: &CodexProofReaders) -> usize {
     crate::heap_layout_bound::bound(job, usize::MAX).unwrap() - job.buffers()
 }
@@ -1201,7 +1200,7 @@ fn headers_seen(job: &CodexProofReaders) -> usize {
 fn one_step(job: &mut CodexProofReaders) -> (CodexProofRun, isize, bool) {
     let (before, seen) = (retained(job), headers_seen(job));
     let mut budget = codex_proof_step_reserve();
-    let run = job.run(&mut budget, usize::MAX);
+    let run = job.run(&mut budget);
     let grew = retained(job) as isize - before as isize;
     (run, grew, headers_seen(job) != seen)
 }
@@ -1214,7 +1213,7 @@ fn an_ordinary_long_proof_line_retains_a_fixed_amount() {
         return;
     }
     let root = temp_root("job-line-k");
-    let long = MAX_JSONL_LINE_BYTES - 4096;
+    let long = 16_777_216 - 4096;
     let shared = [turn("2026-08-02T08:00:01Z", &"t".repeat(long))];
     let mut parent_rows = vec![parent_values()[0].clone()];
     parent_rows.extend(shared.iter().cloned());

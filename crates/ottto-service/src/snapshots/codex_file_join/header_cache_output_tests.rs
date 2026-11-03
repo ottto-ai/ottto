@@ -170,7 +170,6 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             "2026-10-06T23:00:00Z",
             183,
             100,
-            false,
             None,
             &[],
             false,

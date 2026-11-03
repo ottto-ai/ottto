@@ -30,7 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
@@ -46,7 +45,6 @@ pub(in crate::snapshots) fn new_group_parser(
         Some(metadata),
         traces,
         ledgers,
-        artifacts,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
@@ -310,18 +308,22 @@ impl GroupBoot {
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         index: &ScanIndex,
     ) -> Boot {
-        self.step_with_cache(attribution, index, None)
+        self.step_with_cache(
+            attribution.map(|context| context.launch_events()),
+            index,
+            None,
+        )
     }
 
     pub(in crate::snapshots) fn step_with_cache(
         &mut self,
-        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
         let n = self.group.members.len();
         if self.identified < n {
-            return self.identify(attribution, index, cache);
+            return self.identify(launch_events, index, cache);
         }
         if !self.admitted {
             if self.unchanged_joined(index) {
@@ -384,20 +386,20 @@ impl GroupBoot {
 
     fn identify(
         &mut self,
-        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
-        if let Some(context) = attribution {
+        if let Some(events) = launch_events {
             let workers = vec![self.group.owner.clone()];
-            match context.prepare_launch_step(&workers) {
+            match events.prepare_step(&workers) {
                 Ok(false) => return Boot::Pending,
                 Err(()) => return Boot::Strict,
                 Ok(true) => {}
             }
-            if let Some(witness) = context.launch_witness(&workers) {
+            if let Some(witness) = events.witness(&workers) {
                 candidate.source_file_fingerprint = sha256_hex(&[
                     "launcher_worker_context:v1",
                     &candidate.source_file_fingerprint,
@@ -463,7 +465,6 @@ impl GroupBoot {
                         && receipt.as_ref().map_or(true, |receipt| {
                             receipt.version == RECEIPT_VERSION
                                 && receipt.derivation == SnapshotSource::Codex.parser_version()
-                                && receipt.scope == self.receipt_scope
                                 && receipt.tiers.len() <= MAX_APPLIED_TIERS
                         })
                 })
@@ -564,7 +565,6 @@ impl GroupBoot {
                 .collect::<Vec<_>>(),
             index,
             codex,
-            &self.receipt_scope,
             |member| self.wake_identity(member),
         ))
     }
@@ -636,7 +636,6 @@ impl GroupBoot {
             inputs.metadata,
             inputs.traces.clone(),
             inputs.ledgers.clone(),
-            inputs.artifacts,
         )?;
         let mut parser = new_group_parser(
             file,
@@ -644,7 +643,6 @@ impl GroupBoot {
             inputs.metadata,
             inputs.traces,
             inputs.ledgers,
-            inputs.artifacts,
             evidence,
         )
         .map_err(|_| GroupEnd::Strict)?;
@@ -706,7 +704,7 @@ impl GroupBoot {
                 own_page,
                 dependencies,
                 memo_digest,
-                scope: cursor::group_scope(index),
+                scope: cursor::group_scope(),
                 walked: None,
                 consumed_before: 0,
             })),
@@ -720,7 +718,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    pub(in crate::snapshots) artifacts: bool,
     pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
@@ -750,7 +747,6 @@ fn legacy_tee(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    artifacts: bool,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
     refuse_compressed_codex(
         Some(&member.path),
@@ -770,7 +766,6 @@ fn legacy_tee(
         Some(metadata),
         traces,
         ledgers,
-        artifacts,
     )
     .map(|tee| Some(Box::new(tee)))
     .map_err(|_| GroupEnd::Strict)
@@ -899,7 +894,6 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
-    pub(in crate::snapshots) artifacts: bool,
     /// The live member's acquisition scope (cursor jobs), computed on demand.
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
@@ -1006,7 +1000,7 @@ fn member_eof(
             .unwrap_or_else(|| launch_workers_for_path(SnapshotSource::Codex, &member.path));
         // The legacy baseline below needs the lookup; park the finished
         // member until it is prepared.
-        match context.prepare_launch_step(&workers) {
+        match context.launch_events().prepare_step(&workers) {
             Ok(false) => return Ok(false),
             Err(()) => return Err(GroupEnd::Strict),
             Ok(true) => {}
@@ -1221,7 +1215,6 @@ fn open_member(
             .accumulator
             .codex_parent_ownership_ledgers
             .clone(),
-        inputs.artifacts,
     )?;
     let previous = group
         .previous_receipts
@@ -1235,7 +1228,7 @@ fn open_member(
         .consumed_before
         .saturating_add(active.parser.reader.consumed_bytes());
     let parser = &mut active.parser;
-    parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), jsonl_line_cap(), true);
+    parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file));
     // Context inferred in one physical file must not price an unrelated
     // record at the beginning of another file.
     parser.accumulator.current_selector = SelectorCapture::default();

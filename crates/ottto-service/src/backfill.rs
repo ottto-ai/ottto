@@ -562,14 +562,11 @@ pub fn mark_backfill_complete_for_destination(
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
 /// UPSERTs by `snapshot_fingerprint` so re-runs on partial failure are
 /// idempotent. This function does not write anything — caller is responsible
-/// for routing snapshots through the existing sync channel. `artifacts_enabled`
-/// is the org session-artifacts upload policy; when false the per-line VCS
-/// scrape is skipped (artifacts are stripped before upload regardless).
+/// for routing snapshots through the existing sync channel.
 pub fn run_backfill(
     home_dir: &Path,
     pending: &[SnapshotSource],
     collected_at: &str,
-    artifacts_enabled: bool,
     attribution_context: Option<&SessionAttributionContext>,
 ) -> Result<(Vec<SnapshotItem>, BackfillReport)> {
     let mut snapshots = Vec::new();
@@ -586,7 +583,6 @@ pub fn run_backfill(
             &mut index,
             collected_at,
             u64::MAX,
-            artifacts_enabled,
             attribution_context,
             None,
             &[],
@@ -642,15 +638,13 @@ pub type SnapshotDeliverer = Arc<dyn Fn(Vec<SnapshotItem>) -> Result<()> + Send 
 /// result so callers (e.g. tests) can await it. Production callers detach.
 /// State is only persisted (and the sink notified) when `deliver` returns
 /// `Ok`; a failing deliver leaves the replay bookkeeping untouched
-/// so the next daemon start retries the backfill. `artifacts_enabled` is the
-/// org session-artifacts upload policy, threaded down to `run_backfill`.
+/// so the next daemon start retries the backfill.
 pub fn spawn_backfill_thread(
     home_dir: PathBuf,
     state_dir: PathBuf,
     collected_at: String,
     sink: Arc<dyn BackfillNotificationSink>,
     deliver: SnapshotDeliverer,
-    artifacts_enabled: bool,
 ) -> std::thread::JoinHandle<Result<BackfillReport>> {
     std::thread::spawn(move || {
         let state = load_backfill_state(&state_dir);
@@ -658,8 +652,7 @@ pub fn spawn_backfill_thread(
         if pending.is_empty() {
             return Ok(state.last_report.clone().unwrap_or_default());
         }
-        let (mut snapshots, report) =
-            run_backfill(&home_dir, &pending, &collected_at, artifacts_enabled, None)?;
+        let (mut snapshots, report) = run_backfill(&home_dir, &pending, &collected_at, None)?;
         apply_backfill_cutoff(&mut snapshots, &state);
         deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
         update_backfill_state(&state_dir, |state| {
@@ -1495,7 +1488,6 @@ mod tests {
             &home,
             &[SnapshotSource::Codex],
             "2026-08-20T10:02:00Z",
-            false,
             None,
         )
         .expect("backfill succeeds");

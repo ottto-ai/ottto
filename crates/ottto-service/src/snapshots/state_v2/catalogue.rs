@@ -52,7 +52,6 @@ macro_rules! scan_index_fields {
             claude_desktop_store_sweep_had_errors => Misc (misc check_field Field) ["v1_field.claude_desktop_store_sweep_had_errors" => 1] side,
             claude_desktop_identity_census_complete => Misc (misc check_field Field) ["v1_field.claude_desktop_identity_census_complete" => 1] side,
             claude_desktop_lineage_census_complete => Misc (misc check_field Field) ["v1_field.claude_desktop_lineage_census_complete" => 1] side,
-            claude_desktop_census_witness => Misc (misc check_field Field) ["v1_field.claude_desktop_census_witness" => 1] side,
             claude_desktop_store_retry_attempt => Misc (misc check_field Field) ["v1_field.claude_desktop_store_retry_attempt" => 1] side,
             claude_desktop_store_retry_not_before_unix_seconds => Misc (misc check_field Field) ["v1_field.claude_desktop_store_retry_not_before_unix_seconds" => 1] side,
             resume_after_path => Misc (misc check_field Field) ["scan_state.resume_after_path" => 1] side,
@@ -139,6 +138,8 @@ macro_rules! scan_index_fields {
             retired_context_curve_capability_enabled => Misc (retired none) [] side,
             retired_context_curve_replay_epoch => Misc (retired none) [] side,
             retired_completed_context_curve_replay_generation => Misc (retired none) [] side,
+            // An earlier store's row stays accepted and is never read or written.
+            retired_claude_desktop_census_witness => Misc (retired none) ["v1_field.claude_desktop_census_witness" => 1] side,
             codex_counting_evictions => Misc (runtime none) [] side,
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
@@ -263,7 +264,10 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
         };
     }
     scan_index_fields!(each check);
-    if field == "upload_context_fingerprint" {
+    if matches!(
+        field,
+        "upload_context_fingerprint" | "claude_desktop_census_witness"
+    ) {
         // TOMBSTONE: decode-and-drop, as the v1 decoder does.
         map.next_value::<serde::de::IgnoredAny>()?;
         return Ok(true);

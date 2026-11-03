@@ -133,6 +133,22 @@ impl RouteResult {
         batches: Vec<Vec<u8>>,
         items: &[SnapshotItem],
     ) -> Self {
+        Self::emitted_under(
+            mode,
+            source,
+            batches,
+            items,
+            SnapshotUploadPolicy::default(),
+        )
+    }
+    /// `emitted` for a page the upload filter applied `policy` to.
+    pub(crate) fn emitted_under(
+        mode: Mode,
+        source: SnapshotSource,
+        batches: Vec<Vec<u8>>,
+        items: &[SnapshotItem],
+        policy: SnapshotUploadPolicy,
+    ) -> Self {
         let mut seen = BTreeSet::new();
         let mut snapshots = BTreeMap::new();
         let envelopes = batches
@@ -155,7 +171,6 @@ impl RouteResult {
                         .remove("semantic_envelope")
                         .expect("production envelope");
                     assert_eq!(Value::Object(fields), serde_json::to_value(item).unwrap());
-                    let policy = SnapshotUploadPolicy::default();
                     assert_eq!(
                         raw["semantic_envelope"],
                         serde_json::to_value(snapshot_semantic_envelope(source, item, policy))
@@ -968,7 +983,7 @@ pub(crate) mod native_cold {
         file: std::fs::File,
         apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     ) -> OwnedJsonlParser {
-        OwnedJsonlParser::new(file, path, source, apply, None, None, None, false).unwrap()
+        OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
     }
     pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,

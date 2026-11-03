@@ -843,7 +843,6 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
         "2026-08-02T07:10:00Z",
         7,
         100,
-        false,
     )
     .unwrap();
     assert!(scan.census_complete);

@@ -2027,7 +2027,6 @@ mod tests {
             "2026-10-18T10:05:00Z",
             "file-fingerprint".to_string(),
             &ClaudeTitleMetadata::default(),
-            false,
             attribution,
         )
         .expect("parse")

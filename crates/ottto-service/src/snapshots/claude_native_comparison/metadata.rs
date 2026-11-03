@@ -421,7 +421,6 @@ mod tests {
                             member: root,
                             revision: "revision".into(),
                             census_window_end: "window".into(),
-                            upload_context: Some("context".into()),
                             candidate,
                         },
                     ))

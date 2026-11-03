@@ -115,7 +115,6 @@ fn a_held_original_conserves_its_dependent_copy_money() {
         WINDOW,
         365,
         1_000,
-        true,
     )
     .unwrap();
     accept(&mut seeded, &seed);
@@ -182,7 +181,6 @@ fn a_held_original_conserves_its_dependent_copy_money() {
             WINDOW,
             365,
             1_000,
-            true,
             None,
             &[],
             false,

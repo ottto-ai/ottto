@@ -32,8 +32,6 @@ const CURSOR_PASS_BYTES: u64 = 64 * 1024 * 1024;
 /// Aggregate decoded bytes per page for ordinary Codex singleton reads
 /// (B_s = B; no further constant).
 const SINGLETON_PASS_BYTES: u64 = CURSOR_PASS_BYTES;
-/// A cursor read's overlong-line skip yields after this many skipped bytes.
-const SKIP_CHUNK_BYTES: usize = 1024 * 1024;
 /// A live cursor job's copy-budget charge is walked again after this many
 /// consumed bytes: at most 16 walks per page (B / 4 MiB), plus the
 /// pause and completion walks, against one per line before.
@@ -53,9 +51,6 @@ pub(in crate::snapshots) const SAMPLE_READ_BYTES: u64 = 2 * SAMPLE_BYTES as u64;
 /// A paused job is stale, and another namespace may evict it, once this many
 /// cursor pages passed without its own namespace resuming it (K10).
 const NAMESPACE_STALE_PAGES: u64 = 16;
-/// U1a-2a (cc row 4, rev 6 §5.1): free room a proof step needs beyond the
-/// scan's walked state and the running job's last walked charge.
-pub(in crate::snapshots) const PROOF_STEP_HEADROOM_BYTES: usize = 1 << 20;
 /// A paused job whose revalidation evidence stays unavailable for this
 /// many consecutive resume pages ends (slot freed, path processed for the
 /// generation with a retryable cause, prior body kept). Small, like
@@ -79,7 +74,6 @@ pub(in crate::snapshots) const CODEX_JOIN_PROOF_VERSION: &str = "codex_join_proo
 pub(in crate::snapshots) struct Limits {
     cursor: u64,
     singleton: u64,
-    skip_chunk: usize,
 }
 
 impl Limits {
@@ -91,19 +85,12 @@ impl Limits {
         Self {
             cursor: CURSOR_PASS_BYTES,
             singleton: SINGLETON_PASS_BYTES,
-            skip_chunk: SKIP_CHUNK_BYTES,
         }
     }
 
     /// Files above this size are read by the cursor, never as one pass.
     pub(in crate::snapshots) fn singleton(&self) -> u64 {
         self.singleton
-    }
-
-    /// U1a-2a (row 33): a resumable read's overlong-skip chunk (a proof
-    /// job's readers use the cursor's).
-    pub(in crate::snapshots) fn skip_chunk(&self) -> usize {
-        self.skip_chunk
     }
 }
 
@@ -117,7 +104,7 @@ thread_local! {
 pub(in crate::snapshots) fn with_test_limits<T>(
     cursor: u64,
     singleton: u64,
-    skip_chunk: usize,
+    _skip_chunk: usize,
     run: impl FnOnce() -> T,
 ) -> T {
     struct Reset;
@@ -126,13 +113,7 @@ pub(in crate::snapshots) fn with_test_limits<T>(
             TEST_LIMITS.with(|limits| limits.set(None));
         }
     }
-    TEST_LIMITS.with(|limits| {
-        limits.set(Some(Limits {
-            cursor,
-            singleton,
-            skip_chunk,
-        }))
-    });
+    TEST_LIMITS.with(|limits| limits.set(Some(Limits { cursor, singleton })));
     let _reset = Reset;
     run()
 }
@@ -246,12 +227,10 @@ pub(in crate::snapshots) enum StartPlan {
 }
 
 /// What the Stage 1 guard reads at a singleton's large start
-/// (`SharedCache::cursor_plan_paced`): the file as opened now, and the index
-/// whose receipt and replay scope keys its pace slot (`pace_key`).
+/// (`SharedCache::cursor_plan_paced`): the file as opened now.
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) struct PaceProbe<'a> {
     pub(in crate::snapshots) file: &'a File,
-    pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
 /// Why `cursor_start` did not start a job.
@@ -485,20 +464,6 @@ impl PageBudget {
             }
         }
     }
-}
-
-/// U1a-2a (cc row 4, rev 5/6 §5.1, R2-B1): the most a running proof job
-/// may hold before a step: `state_bytes() − bound(context) −
-/// PROOF_STEP_HEADROOM_BYTES`, the copy-budget computation
-/// (`copy_budget_parts`) with the running job in place of the active file.
-/// `bound(context)` includes the shared cache (cursor state, retained
-/// copies, side ledger) but not the running job (out of the holder). Cycles
-/// are serialized under `SNAPSHOT_SYNC_LOCK`, so it sees every live main
-/// state. None: the context is unbounded or leaves no headroom.
-pub(in crate::snapshots) fn proof_room(context: &super::Context) -> Option<usize> {
-    crate::heap_layout_bound::bound(context, state_bytes())
-        .and_then(|resident| state_bytes().checked_sub(resident))
-        .and_then(|room| room.checked_sub(PROOF_STEP_HEADROOM_BYTES))
 }
 
 /// Opened-object facts of the held descriptor, captured at job open.
@@ -1206,24 +1171,15 @@ pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &Sca
     }
 }
 
-/// A group job's `scope_job`: the receipt scope (upload
-/// context), the historical replay generation, and the parser, identity and
-/// proof versions. Recorded at job start; a change at any resume or at
-/// emission invalidates the job (receipts must not mix scopes).
-pub(in crate::snapshots) fn group_scope(index: &ScanIndex) -> String {
+/// A group job's `scope_job`: the join-proof and identity versions.
+/// Recorded at job start; a change at any resume or at emission invalidates
+/// the job (a paused group never mixes proofs). Settings, capabilities and the
+/// replay directive are no input: they apply after the scan.
+pub(in crate::snapshots) fn group_scope() -> String {
     sha256_hex(&[
-        "codex_group_scope:v1",
+        "codex_group_scope:v2",
         CODEX_JOIN_PROOF_VERSION,
-        SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
-        index
-            .active_upload_context_fingerprint
-            .as_deref()
-            .unwrap_or("none"),
-        index
-            .historical_replay_generation
-            .as_deref()
-            .unwrap_or("none"),
     ])
 }
 
@@ -3382,9 +3338,6 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
     job.parser.accumulator.codex_priority_witnesses_uncapped = true;
     job.parser
         .reader
-        .set_chunked_skip(Limits::current().skip_chunk);
-    job.parser
-        .reader
         .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
     meta.stamp_open = stamp_open;
     meta.started = super::now_seconds();
@@ -3451,7 +3404,7 @@ pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &O
             .cursor
             .as_ref()
             .is_some_and(|meta| &meta.stamp_open == boot)
-        && matches!(reader.sealed_fragment, Some((false, _)))
+        && reader.sealed_fragment.is_some()
         && std::str::from_utf8(bytes).is_ok_and(|line| {
             line.trim().is_empty() || serde_json::from_str::<serde_json::Value>(line).is_ok()
         })
@@ -3566,7 +3519,6 @@ pub(in crate::snapshots) fn arm_group_member(
     if !boot.append_compatible(&now) {
         return Err(GroupEnd::Changed);
     }
-    reader.set_chunked_skip(Limits::current().skip_chunk);
     match live {
         Some(scope) => {
             let plan = crate::transcript_acquisition::ReadPlan::prepare(
@@ -3629,10 +3581,10 @@ pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
     lease.end(|cursor| cursor.counters.jobs_deferred_inputs += 1);
 }
 
-/// M-1 `scope_job` of a group, with its wake dependencies (§d.4): parser,
-/// identity and proof versions, owner, canonical member keys, every sealed
+/// M-1 `scope_job` of a group, with its wake dependencies (§d.4): identity
+/// and proof versions, owner, canonical member keys, every sealed
 /// member's opened identity and the live member's `{dev, ino}` (never its
-/// growing length), header digests, receipt scope, counting view, each
+/// growing length), header digests, counting view, each
 /// member's path reduction facts and the census flags.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn group_memo_digest(
@@ -3642,16 +3594,13 @@ pub(in crate::snapshots) fn group_memo_digest(
     digests: &[&str],
     index: &ScanIndex,
     codex: &CodexTitleMetadata,
-    receipt_scope: &str,
     identity: impl Fn(&CandidateFile) -> String,
 ) -> String {
     let mut parts = vec![
-        "codex_group_memo:v1".to_owned(),
+        "codex_group_memo:v2".to_owned(),
         CODEX_JOIN_PROOF_VERSION.to_owned(),
-        SnapshotSource::Codex.parser_version().to_owned(),
         SnapshotSource::Codex.scan_identity_version().to_owned(),
         owner.to_owned(),
-        receipt_scope.to_owned(),
         group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
         if members
@@ -5284,7 +5233,7 @@ impl SharedCache {
             .filter(|_| plan == StartPlan::Cursor && !page.continuation())
             .and_then(|probe| {
                 let rev = OpenStamp::capture(probe.file).ok()?;
-                Some((pace_key(&namespace.0, &group_scope(probe.index), key), rev))
+                Some((pace_key(&namespace.0, &group_scope(), key), rev))
             });
         let key = rotation_key(&namespace.0, key);
         self.with_cursor(|cursor| {
@@ -5401,7 +5350,7 @@ impl SharedCache {
         };
         // Stage 1 guard (§6): the attempt's slot is written with the claim.
         // It is accelerated only with known coverage and a recorded slot.
-        let pace_key = pace_key(&namespace.0, &group_scope(index), &key);
+        let pace_key = pace_key(&namespace.0, &group_scope(), &key);
         let now = pace_now();
         let (token, accelerate) = self
             .with_cursor(|cursor| {
@@ -5423,9 +5372,7 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        let limits = Limits::current();
         job.parser.accumulator.codex_priority_witnesses_uncapped = true;
-        job.parser.reader.set_chunked_skip(limits.skip_chunk);
         // The reader counts from the acquisition start (`s` for a tail).
         job.parser
             .reader
@@ -5514,14 +5461,12 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        let limits = Limits::current();
         let accumulator = &mut job.parser.accumulator;
         accumulator.codex_priority_witnesses_uncapped = true;
         // Resume revalidates every priority decision against the witnesses.
         accumulator
             .codex_observed_priority_turns
             .get_or_insert_with(BTreeMap::new);
-        job.parser.reader.set_chunked_skip(limits.skip_chunk);
         job.parser.reader.set_extent_limit(boot.extent);
         job.cursor = Some(JobMeta {
             counting,
@@ -5946,9 +5891,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.claude,
             context.support,
         )
-        .map(|dependency| {
-            sampling.file_scope(context.source, &job.candidate, &dependency, true, index)
-        })
+        .map(|dependency| sampling.file_scope(context.source, &job.candidate, &dependency))
     });
     // A group's counting view is built over every member.
     let counting = job_counting_view(&job, index);
@@ -5963,7 +5906,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             inventory: context.inventory,
             scope,
             counting,
-            group_scope: group_scope(index),
+            group_scope: group_scope(),
             census_complete: context.census_complete,
         },
     );
@@ -6761,15 +6704,14 @@ impl SingletonMemo {
     }
 }
 
-/// The memo key for a singleton: parser, identity and proof versions, the
+/// The memo key for a singleton: identity and proof versions, the
 /// file's logical key and opened `{dev, ino}` (never its growing length),
-/// the receipt scope, the counting view, and the wake dependencies
-/// (path-scoped reduction facts and header witness, the path's conflicted
-/// candidate ids, the global sidecar census flags, and how many inventory
-/// members its owner has). The upload
-/// context and the census flags cannot cure most holds but are kept as
-/// conservative wake inputs (K3); their cost is one re-read per held file
-/// when they change.
+/// the counting view, and the wake dependencies (path-scoped reduction facts
+/// and header witness, the path's conflicted candidate ids, the global sidecar
+/// census flags, and how many inventory members its owner has). The census
+/// flags cannot cure most holds but are kept as conservative wake inputs
+/// (K3); their cost is one re-read per held file when they change. No setting
+/// or capability wakes a held file.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn memo_digest(
     index: &ScanIndex,
@@ -6782,17 +6724,12 @@ pub(in crate::snapshots) fn memo_digest(
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
-        "codex_singleton_memo:v3",
+        "codex_singleton_memo:v4",
         CODEX_JOIN_PROOF_VERSION,
-        SnapshotSource::Codex.parser_version(),
         SnapshotSource::Codex.scan_identity_version(),
         &local_index_key(&candidate.path),
         &stamp.dev.to_string(),
         &stamp.ino.to_string(),
-        index
-            .active_upload_context_fingerprint
-            .as_deref()
-            .unwrap_or("none"),
         counting,
         // PR-1: the tier receipt configures the parse
         // (`configure_tier_replay`), contents included.
@@ -6800,12 +6737,8 @@ pub(in crate::snapshots) fn memo_digest(
             let (receipt, required) = crate::snapshots::codex_file_join::receipt_state(
                 index.files.get(&local_index_key(&candidate.path)),
             );
-            let receipt = receipt.map_or_else(
-                || "none".to_owned(),
-                |receipt| {
-                    serde_json::to_string(&receipt).unwrap_or_else(|_| "unserializable".to_owned())
-                },
-            );
+            let receipt =
+                receipt.map_or_else(|| "none".to_owned(), |receipt| receipt.parse_input());
             format!("receipt:{required}:{receipt}")
         },
         dependencies,

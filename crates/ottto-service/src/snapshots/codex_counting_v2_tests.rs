@@ -200,7 +200,6 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
             metadata: &metadata,
             traces: None,
             parents: None,
-            artifacts: false,
             identity_capture: false,
             cache: None,
         },
