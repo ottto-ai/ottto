@@ -194,7 +194,6 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
 /// head but no receipt or stamp. That is no acceptance: the copy keeps the prefix.
 #[test]
 fn server_learned_head_is_not_an_accepted_origin() {
-    let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("server_learned_head_origin") {
         return;
     }

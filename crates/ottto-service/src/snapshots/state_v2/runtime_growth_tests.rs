@@ -870,7 +870,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
         if case == "invalidate" {
             let mut candidate = f.candidate(&index);
             candidate.physical_identity = Some([2, 2]);
-            assert!(!claude_request_census::retain_held(&mut index, &candidate));
+            claude_request_census::invalidate_claude_request_census(&mut index, &candidate.path);
         } else {
             claude_request_census::record_claude_request_census(
                 &mut index,

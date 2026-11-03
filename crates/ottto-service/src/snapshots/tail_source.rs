@@ -88,6 +88,10 @@ pub(in crate::snapshots) fn pending(
 
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    dead_code,
+    reason = "Claude's live inputs join at finish; the next codec constructs these"
+)]
 pub(in crate::snapshots) enum LiveLoadError {
     /// The live input is not available now: the file holds with its debt.
     Unavailable,

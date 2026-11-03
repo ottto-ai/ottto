@@ -446,7 +446,7 @@ impl TailSource for Claude {
                 read_page(bytes, RESPONSES_G, |d| {
                     let key = String::take(d)?;
                     let response = ClaudeResponseObservation::take(d)?;
-                    if book.contains_key(&key) || !book.insert(key, response) {
+                    if book.get_mut(&key).is_some() || !book.insert(key, response) {
                         return Err(ReconstructCause::Corrupt);
                     }
                     Ok(())

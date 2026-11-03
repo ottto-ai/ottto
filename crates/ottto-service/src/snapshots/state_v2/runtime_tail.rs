@@ -53,15 +53,6 @@ pub(in crate::snapshots) fn take_native_read(path: &Path, key: &str) -> Option<u
 pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Option<(u32, Vec<u8>)> {
     with_state(path, |state| Ok(state.tail.staged_head(key))).unwrap()
 }
-/// A process restart: the route's RAM notes are gone, the database stays.
-#[cfg(test)]
-pub(in crate::snapshots) fn forget_ram_for_test(path: &Path) {
-    with_state(path, |state| {
-        state.tail_native_owed.clear();
-        Ok(())
-    })
-    .unwrap();
-}
 /// One file's committed head, on the graph's authenticated session; no page is
 /// visited. A future revision holds; a lower one is the caller's to decide.
 pub(in crate::snapshots) fn load_head(
