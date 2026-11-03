@@ -392,6 +392,7 @@ impl RearmFixture {
             retry_authority: None,
             source: SnapshotSource::ClaudeCode,
             claude_scan_roots: Some(vec![self.root.clone()]),
+            sole_login: false,
             account_witness: [7; 32],
             scan_started_at: collected_at.to_owned(),
             activity_hint: hint,

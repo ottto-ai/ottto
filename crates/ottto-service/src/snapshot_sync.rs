@@ -5976,6 +5976,8 @@ struct SourcePreparation {
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     claude_scan_roots: Option<Vec<PathBuf>>,
+    /// Claude only: the hint's sole-login witness contract, read once per prepare.
+    sole_login: bool,
     account_witness: [u8; 32],
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
@@ -6764,12 +6766,13 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
-    if source == SnapshotSource::ClaudeCode {
-        // No capability or no key: no address digest, so no verdict.
-        let sole_login = activity_hint
+    let sole_login = source == SnapshotSource::ClaudeCode
+        && activity_hint
             .session_request_sole_login_witness_contract
             .as_deref()
             == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+    if source == SnapshotSource::ClaudeCode {
+        // No capability or no key: no address digest, so no verdict.
         let key = attribution_context
             .as_ref()
             .filter(|_| sole_login)
@@ -7149,6 +7152,7 @@ fn prepare_sync_source_inner(
         retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
+        sole_login,
         account_witness,
         scan_started_at,
         activity_hint,
@@ -7539,6 +7543,7 @@ fn prepare_continuation_source(
         retry_authority: None,
         source,
         claude_scan_roots: None,
+        sole_login: false,
         account_witness: inputs.account_witness,
         scan_started_at,
         activity_hint: inputs.activity_hint.clone(),
@@ -7689,6 +7694,7 @@ fn finish_sync_source(
         retry_authority,
         source,
         claude_scan_roots,
+        sole_login,
         account_witness,
         scan_started_at,
         activity_hint,
@@ -7738,10 +7744,6 @@ fn finish_sync_source(
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
     if source == SnapshotSource::ClaudeCode {
-        let sole_login = activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
         upload_progress
             .accepted_identity_buckets
             .set_sole_login_enabled(sole_login);
