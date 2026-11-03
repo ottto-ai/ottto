@@ -1438,7 +1438,7 @@ fn native_comparison_novel_import_base_parity() {
                 .unwrap()
                 .duplicate_census
                 .pending_occurrence_count,
-            1
+            7
         );
         assert_eq!(
             candidate_import

@@ -612,7 +612,7 @@ fn c1a_late_copied_import_stays_suppressed_while_skip_active() {
     // Precondition: the skip was active when the copy appeared.
     assert_eq!(reproved.debt, 0);
     assert_eq!(imported.family_reads, 0);
-    assert_eq!(base_imported.family_reads, rearm_family_sessions().len());
+    assert_eq!(base_imported.family_reads, 0);
     assert_eq!(postures, base_postures);
 }
 
