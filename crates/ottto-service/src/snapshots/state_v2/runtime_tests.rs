@@ -217,10 +217,10 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let before = fs::read(&f.path).unwrap();
     // An ordinary v1 owner must not prevent uninstall from reaching its
     // established cleanup, and an absent checkpoint lock must stay absent.
-    close_tree(&f.support, false).unwrap();
+    close_tree(&f.support).unwrap();
     assert!(!f.path.with_extension("lock").exists());
     let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
-    close_tree(&f.support, false).unwrap();
+    close_tree(&f.support).unwrap();
     drop(lock);
     with_state(&f.path, |state| {
         assert!(!state.latched);
@@ -234,7 +234,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
-    close_tree(&live.support, false).unwrap();
+    close_tree(&live.support).unwrap();
     assert!(runtime.session.lock().unwrap().is_none());
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);

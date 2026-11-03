@@ -7421,7 +7421,8 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         stores.browser.delete().or_state_poisoned()?;
     }
     // Collected state, caches and receipts stay; only uninstall deletes them.
-    FileMachineStore::default().reset().or_state_poisoned()
+    FileMachineStore::default().reset().or_state_poisoned()?;
+    Ok(())
 }
 
 #[cfg(test)]

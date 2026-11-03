@@ -1315,7 +1315,7 @@ pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
     telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 fn close_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
     let routes: Vec<_> = states()

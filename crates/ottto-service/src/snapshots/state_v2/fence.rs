@@ -99,7 +99,6 @@ pub(super) fn purge_obsolete_backups(path: &Path) -> Result<()> {
     super::super::sync_checkpoint_parent(path)
 }
 
-#[cfg(test)]
 pub(super) fn remove_artifact(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(path)?,
