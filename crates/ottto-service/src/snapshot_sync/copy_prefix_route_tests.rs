@@ -134,9 +134,11 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// copy of its prefix, its identical body is offered and exact-ACKed and it
 /// earns its receipt. A family re-arm on that page may clear its revision for
 /// one forced reparse, so it is read at most once more; the restored revision
-/// lets the receipt prove, and later pages neither read nor POST anything.
+/// lets the receipt prove. A copy's prefix goes only once its origin's body is
+/// accepted (#1253): page 1 sends the copy with the prefix flagged, page 3 the
+/// copy with the prefix removed after the holder's page-2 body was ACKed, and
+/// page 4 sends nothing.
 #[test]
-#[ignore = "pending E2 #1253 ruling"]
 fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
     // As every owner of this harness: commits persist durable records.
     if !supported("never_delivered_holder_reread_bound") {
@@ -158,11 +160,23 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         let mut reads = Vec::new();
         let mut posts = Vec::new();
         for page in 1..=4 {
+            let base = (page == 3).then(|| prior.clone());
             disk.begin(&scanner, SnapshotSource::ClaudeCode);
             let mut p = c.raw(&scanner, prior, 100, true, &[]);
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
+            if let Some(base) = base {
+                // The copy's prefix is removed, and the body equals a cold Full
+                // of the same prior.
+                let mut cold = c.raw(&E2ScanFixture::default(), base, 100, true, &[]);
+                cold.enrich(&c);
+                cold.finish();
+                money_oracle::assert_equivalent(
+                    &route(Mode::ColdFull, &cold),
+                    &route(Mode::DiskRestore, &p),
+                );
+            }
             let sent = deliver_counting(&mut p);
             posts.push(sent);
             if page == 1 {
@@ -183,9 +197,10 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             "the holder is read at most once more after it earns its receipt: {reads:?}"
         );
         assert_eq!(
-            (&reads[2..], &posts[2..]),
-            (&[false, false][..], &[0_usize, 0][..]),
-            "pages 3-4 read and POST nothing (reads {reads:?}, posts {posts:?})"
+            (&reads[2..], &posts[..]),
+            (&[false, false][..], &[1_usize, 0, 1, 0][..]),
+            "pages 3-4 never read the holder; only pages 1 and 3 POST \
+             (reads {reads:?}, posts {posts:?})"
         );
     });
 }
