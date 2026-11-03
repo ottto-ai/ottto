@@ -63,8 +63,11 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// Whether this selection loads the committed Tail. A due `Audit` certifies
 /// against the committed head: an unchanged file retires quietly, and only
 /// what the file proves changed reads Full. An `UnknownOutcome` re-read
-/// continues as well. `BodyWitnessAdoption` and every legacy selection stay
-/// native. A `NewFile` is a first read, except one `e2` withheld
+/// continues as well. Growth beats a quarantine-retry or activity selection,
+/// which precedes `TranscriptChanged`: a file that `grew` past its committed
+/// entry is an append and continues as for `TranscriptChanged`, even while a
+/// body of it waits on a retry. `BodyWitnessAdoption` and every legacy
+/// selection stay native. A `NewFile` is a first read, except one `e2` withheld
 /// (`held_new`): its committed head is custody, never acceptance, and it
 /// continues as a changed file does.
 ///
@@ -75,6 +78,7 @@ pub(in crate::snapshots) fn reuses_stored(
     index: &ScanIndex,
     key: &str,
     reason: Option<CandidateParseReason>,
+    grew: bool,
     held_new: bool,
 ) -> bool {
     match reason {
@@ -84,6 +88,7 @@ pub(in crate::snapshots) fn reuses_stored(
             | CandidateParseReason::Audit
             | CandidateParseReason::UnknownOutcome,
         ) => true,
+        Some(CandidateParseReason::ActivityOrQuarantineRetry) if grew => true,
         Some(CandidateParseReason::NewFile) => held_new,
         Some(reason) => late_evidence(reason) && !set_aside(index, key) && !retry_held(index, key),
     }

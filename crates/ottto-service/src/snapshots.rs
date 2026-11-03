@@ -33883,6 +33883,9 @@ impl OwnedSourceScan {
                                     index,
                                     &key,
                                     parse_reason,
+                                    index.files.get(&key).is_some_and(|entry| {
+                                        candidate.size_bytes > entry.size_bytes
+                                    }),
                                     e2_held_new_file,
                                 )
                                 && !parser.reader.reader.is_compressed()

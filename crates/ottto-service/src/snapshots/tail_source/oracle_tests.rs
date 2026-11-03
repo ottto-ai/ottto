@@ -311,7 +311,13 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
         assert!(envelope.get("conflict_head_challenge").is_none());
         assert!(envelope.get("rescan_from_revision_hash").is_none());
     }
-    assert!(reuses_stored(&route.index, &key, Some(REASON), false));
+    assert!(reuses_stored(
+        &route.index,
+        &key,
+        Some(REASON),
+        false,
+        false
+    ));
 
     let scan = finalize(&mut route, &key, items, false, None);
     assert_eq!(scan.snapshots.len(), count);
