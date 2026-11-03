@@ -2543,14 +2543,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
                         "claude_copy_removals" => {
-                            // Like the birth table: a damaged or over-budget
-                            // value decodes as none (copies decide afresh).
-                            let decoded = if !value.resource
-                                && value.len
-                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
-                                        * 4
-                                        + 64
-                            {
+                            // Like the birth table: a damaged value decodes
+                            // as none (copies decide afresh).
+                            let decoded = if !value.resource {
                                 self.typed::<claude_request_money::copy_removals::CopyRemovals>(
                                     value,
                                 )

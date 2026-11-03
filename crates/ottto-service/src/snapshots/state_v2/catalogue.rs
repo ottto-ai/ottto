@@ -146,7 +146,6 @@ macro_rules! scan_index_fields {
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
-            copy_prefix_recovery_scope => Misc (runtime none) [] side,
             claude_folder_login_ledger => Misc (misc check_field Map) ["v1_field.claude_folder_login_ledger" => 5] side,
             tail_discovery => Misc (misc check_field Field) ["scan_state.tail_discovery" => 5] side,
         }
