@@ -12903,7 +12903,8 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     let cache = Arc::new(SharedCache::default());
     let key = local_index_key(&fixture.file(SESSION));
     with_test_limits(2048, 1024, 64, || {
-        let (mut index, first) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+        let on_route = routed(ScanIndex::default(), &cache);
+        let (mut index, first) = page(&fixture, on_route, Some(cache.clone()));
         assert!(first.snapshots.is_empty());
         assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
         cache
@@ -12916,7 +12917,8 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
             })
             .unwrap();
         for _ in 0..64 {
-            let (next, scan) = page(&fixture, index, Some(cache.clone()));
+            let on_route = routed(index, &cache);
+            let (next, scan) = page(&fixture, on_route, Some(cache.clone()));
             index = next;
             if counter(&cache, |c| c.jobs_certified) > 0 {
                 assert_eq!(fingerprints(&scan), fingerprints(&oracle));

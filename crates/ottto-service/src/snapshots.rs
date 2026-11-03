@@ -28532,7 +28532,7 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     }
-                    codex_file_join::Boot::Refused(_) => {
+                    codex_file_join::Boot::Refused(_reason) => {
                         // Decided from headers at no replay cost: terminal
                         // debt (outcome R), fenced, never memoized.
                         if let Some(context) = sampling.as_ref() {

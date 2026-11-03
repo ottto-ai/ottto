@@ -315,7 +315,7 @@ fn codex_layout() -> String {
 }
 
 const CODEX_LAYOUT_SHA256: &str =
-    "eb8d23b04ff749971fa3fd272e5ee2a58f4b864d3e3d7f6115f8ec233c0231c8";
+    "3ed8f9dd74feed4b431241e5f9e2179bc5241022d35354e1d5499e50080ac9d0";
 
 /// [format] Codex's persisted head, pages and prelude fact have one layout pin.
 #[test]

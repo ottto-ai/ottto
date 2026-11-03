@@ -4842,8 +4842,7 @@ impl SharedCache {
                 .parent_restarts
                 .touch(parent_restart_key(&namespace.0, scope), page);
             slot.restarts = slot.restarts.saturating_add(1);
-            let restarts = slot.restarts;
-            restarts
+            slot.restarts
         })
     }
 

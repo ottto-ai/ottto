@@ -2567,11 +2567,11 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
         let root = paged_corpus("wake-content");
         let cache = Arc::new(SharedCache::default());
         with_test_limits(2048, 1024, 64, || {
-            let ((index, _), bytes) = observe_consumed(|| {
+            let ((index, _), first_bytes) = observe_consumed(|| {
                 with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache))
             });
             assert!(
-                bytes > 0 && bytes < corpus_bytes(&root),
+                first_bytes > 0 && first_bytes < corpus_bytes(&root),
                 "one partial attempt"
             );
             assert_eq!(counters(&cache).jobs_state_bound, 1);
@@ -2630,6 +2630,22 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
                 assert_eq!(bytes, 0, "{change}: zero wakes");
                 assert_eq!(group_replays(), replay);
+            } else if change == "poison_replace_sealed" {
+                // A poisoned retained-cache lock makes the resumed state
+                // unmeasurable: the one fresh attempt hits the state bound
+                // again instead of remaining paused or completing unpaged.
+                assert_eq!(after.parked_hits, 1, "{change}: must wake");
+                assert_eq!(after.jobs_state_bound, 2, "{change}: one new bound attempt");
+                assert!(
+                    bytes > 0 && bytes <= first_bytes,
+                    "{change}: at most one bounded partial-prefix read: {bytes}/{first_bytes}"
+                );
+                assert!(cache.paused_group_position().is_none());
+                assert_eq!(
+                    group_replays(),
+                    replay,
+                    "the partial attempt never completes"
+                );
             } else {
                 assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
                 assert!(bytes > 0, "{change}: must wake");

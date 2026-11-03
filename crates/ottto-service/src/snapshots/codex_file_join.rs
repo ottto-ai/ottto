@@ -1212,9 +1212,8 @@ impl TierReplay {
 }
 crate::heap_layout_bound::fields!(AppliedTierReceipt; version, derivation, scope, records, prefix_digest, tiers);
 crate::heap_layout_bound::fields!(TierReplay; previous, digest, records, matched, tiers, scope, prefix_matched, invalid, join);
-/// Named group refusals (§i). The discriminant is the RAM counter slot of
-/// `codex_join_terminal_debt`. Every reason but `ProbeBudgetOrder` is
-/// terminal debt for the attempt (outcome R): the members are disclosed as
+/// Named group refusals (§i). Every reason is terminal debt for the attempt
+/// (outcome R): the members are disclosed as
 /// settleable residue, never as an unreadable file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum JoinRefusal {
@@ -1240,11 +1239,6 @@ pub(super) enum JoinRefusal {
     /// typically a compressed (`.zst`, not yet scanned) predecessor, or
     /// another owner's file named without `forked_from_id`.
     MissingPredecessor,
-    /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
-    /// chronological order because its probes exceeded their budget: the
-    /// order may be our own artifact, so it is strict, never
-    /// settleable or memoized.
-    ProbeBudgetOrder,
 }
 impl JoinRefusal {
     /// Growth of the live member may cure these (§d.4). Every other reason,
