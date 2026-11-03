@@ -4798,9 +4798,8 @@ impl SharedCache {
         end: &str,
         restarts: u64,
     ) {
-        let unmarked = |cache: &Self| {};
         let Ok(mut retained) = self.retained() else {
-            return unmarked(self);
+            return;
         };
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
