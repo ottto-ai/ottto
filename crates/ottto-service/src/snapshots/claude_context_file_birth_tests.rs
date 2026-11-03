@@ -211,10 +211,17 @@ fn differing_keys(left: &SnapshotItem, right: &SnapshotItem) -> BTreeSet<String>
         .collect()
 }
 
+/// The rule's outputs: the context keys, the session start and, for an
+/// Admitted file, its cache rows. Usage, cost and identity never differ.
 fn allowed_difference() -> BTreeSet<String> {
     CONTEXT_KEYS
         .iter()
-        .chain(&["session_start", "snapshot_fingerprint", "context_curve"])
+        .chain(&[
+            "session_start",
+            "snapshot_fingerprint",
+            "context_curve",
+            "cache_observations",
+        ])
         .map(|key| key.to_string())
         .collect()
 }

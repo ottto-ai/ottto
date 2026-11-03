@@ -2536,18 +2536,29 @@ fn twin_page_held(
         .collect()
 }
 
-/// The copy's birth from its lines alone: the time of its first response
-/// no earlier twin holds (its first own turn). Never a file system birth,
-/// which a copy, rewrite or restore resets, so cold and stored reads agree.
 /// An unknown time keeps today's decision.
 fn twin_copy_born_from_cutoff(item: &SnapshotItem, earlier: &[&BTreeSet<String>]) -> bool {
+    first_own_turn_at(item, 0, earlier)
+        .is_some_and(|at| at >= i128::from(TWIN_ID_PROOF_FROM) * 1_000_000)
+}
+
+/// The copy's birth from its lines alone: the time of its first response at
+/// or after sequence `from` that no earlier twin holds (its first own turn).
+/// Never a file system birth, which a copy, rewrite or restore resets, so
+/// cold and stored reads agree.
+pub(in crate::snapshots) fn first_own_turn_at(
+    item: &SnapshotItem,
+    from: u64,
+    earlier: &[&BTreeSet<String>],
+) -> Option<i128> {
     item.claude_usage_occurrences
         .iter()
-        .filter(|(id, _)| !earlier.iter().any(|ids| ids.contains(*id)))
+        .filter(|(id, occurrence)| {
+            occurrence.sequence >= from && !earlier.iter().any(|ids| ids.contains(*id))
+        })
         .min_by_key(|(_, occurrence)| occurrence.sequence)
         .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
         .and_then(rfc3339_unix_nanos)
-        .is_some_and(|at| at >= i128::from(TWIN_ID_PROOF_FROM) * 1_000_000)
 }
 
 /// One census walk for every all-pre-birth main file of the page. A holder

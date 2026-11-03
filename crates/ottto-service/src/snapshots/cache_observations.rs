@@ -1,6 +1,8 @@
 //! Content-free owned-request cache evidence. Accounting remains in the usage owner.
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) fn event_id(session_ref: &str, request_ref: &str) -> String {
@@ -10,6 +12,10 @@ pub(crate) fn event_id(session_ref: &str, request_ref: &str) -> String {
     format!("cache:{:x}", Sha256::digest(identity))
 }
 
+// Server-enforced bounds (the backend's cache observation schema): at most
+// MAX_OPERATIONS operations per uploaded patch, and MAX_ROWS rows and
+// MAX_WIRE_BYTES per session's accepted state. The detector itself keeps
+// every row; the upload sends what these bounds admit.
 pub const MAX_OPERATIONS: usize = 64;
 pub const MAX_ROWS: usize = 128;
 pub const MAX_WIRE_BYTES: usize = 128 * 1024;
@@ -63,6 +69,16 @@ pub struct CacheObservations {
 }
 
 impl CacheObservations {
+    /// No rows, with an exact omitted count or none when it is unknown.
+    pub(crate) fn partial(omitted_observation_count: Option<u64>) -> Self {
+        Self {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "partial".into(),
+            omitted_observation_count,
+        }
+    }
+
     pub fn validate(&self) -> bool {
         let mut ids = BTreeSet::new();
         self.schema_version == 1
@@ -98,13 +114,17 @@ fn share(slot: &RequestSlot) -> Option<f64> {
     let read = slot.cache_read_tokens?;
     (prompt > 0 && read <= prompt).then_some(read as f64 / prompt as f64)
 }
-fn gap(previous: &RequestSlot, current: &RequestSlot) -> Option<u64> {
-    let previous = OffsetDateTime::parse(&previous.occurred_at, &Rfc3339).ok()?;
-    let current = OffsetDateTime::parse(&current.occurred_at, &Rfc3339).ok()?;
-    if current < previous {
-        return None;
-    }
-    u64::try_from((current - previous).whole_seconds()).ok()
+/// The time from `from` to `to` (RFC 3339). `None` when either does not
+/// parse or `to` is earlier, so a backwards clock never yields a gap.
+pub(crate) fn elapsed(from: &str, to: &str) -> Option<time::Duration> {
+    let from = OffsetDateTime::parse(from, &Rfc3339).ok()?;
+    let to = OffsetDateTime::parse(to, &Rfc3339).ok()?;
+    (to >= from).then_some(to - from)
+}
+
+/// [`elapsed`] in whole seconds.
+pub(crate) fn elapsed_seconds(from: &str, to: &str) -> Option<u64> {
+    u64::try_from(elapsed(from, to)?.whole_seconds()).ok()
 }
 fn comparable(a: &OwnedRequest, b: &OwnedRequest) -> bool {
     a.ordering != "ambiguous"
@@ -139,54 +159,28 @@ fn material(baseline: &RequestSlot, current: &RequestSlot) -> bool {
             || (before - now >= 0.5 && prior_read.min(prompt).saturating_sub(read) >= 20_000))
 }
 
-/// Replaying the same owned sequence rebuilds identical rows after restart or correction.
-/// Adjacent witnesses are selected before episode baselines; no later warm request is substituted.
+/// [`detect_unique`] keyed by event id.
 #[cfg(test)]
 pub(crate) fn detect(
     session_ref: &str,
     requests: &[OwnedRequest],
 ) -> BTreeMap<String, Observation> {
-    detect_bounded(session_ref, requests, usize::MAX).0
+    detect_unique(session_ref, requests)
+        .into_iter()
+        .map(|row| (row.event_id.clone(), row))
+        .collect()
 }
 
-pub(crate) fn detect_bounded(
-    session_ref: &str,
-    requests: &[OwnedRequest],
-    limit: usize,
-) -> (BTreeMap<String, Observation>, u64) {
-    let (rows, omitted) = detect_prefix(session_ref, requests, limit, true);
-    (
-        rows.into_iter()
-            .map(|row| (row.event_id.clone(), row))
-            .collect(),
-        omitted,
-    )
-}
-
-/// Input has already passed the adapter's existing duplicate/conflict check.
-/// Selection and ordering retain at most 64 rows, with no request-sized index.
-pub(crate) fn detect_unique_prefix(
-    session_ref: &str,
-    requests: &[OwnedRequest],
-) -> (Vec<Observation>, u64) {
-    detect_prefix(session_ref, requests, MAX_OPERATIONS, false)
-}
-
-fn detect_prefix(
-    session_ref: &str,
-    requests: &[OwnedRequest],
-    limit: usize,
-    deduplicate: bool,
-) -> (Vec<Observation>, u64) {
-    let mut rows = Vec::with_capacity(limit.min(requests.len()));
-    let mut omitted = 0;
+/// Every row of the session, in session order. Input has already passed the
+/// adapter's duplicate/conflict check. Replaying the same owned sequence
+/// rebuilds identical rows after restart or correction. Adjacent witnesses
+/// are selected before episode baselines; no later warm request is
+/// substituted.
+pub(crate) fn detect_unique(session_ref: &str, requests: &[OwnedRequest]) -> Vec<Observation> {
+    let mut rows = Vec::new();
     let mut baseline: Option<&OwnedRequest> = None;
     let mut episode: Option<String> = None;
-    let mut seen = BTreeSet::new();
     for (index, request) in requests.iter().enumerate() {
-        if deduplicate && !seen.insert(request.slot.request_ref.clone()) {
-            continue;
-        }
         let previous = index.checked_sub(1).map(|i| &requests[i]);
         let next = requests.get(index + 1);
         let boundary = previous.is_some_and(|prior| !comparable(prior, request));
@@ -209,10 +203,6 @@ fn detect_prefix(
         if loss && request.ordering != "ambiguous" && episode.is_none() {
             episode = Some(request.slot.request_ref.clone());
         }
-        if rows.len() == limit {
-            omitted += 1;
-            continue;
-        }
         let model_change = previous.is_some_and(|prior| prior.slot.model != request.slot.model);
         let configuration_changed = request.configuration_changed
             || previous.is_some_and(|prior| {
@@ -221,7 +211,8 @@ fn detect_prefix(
             });
         let prompt_reduced =
             previous.is_some_and(|prior| prompt_reduced(&prior.slot, &request.slot));
-        let report_gap = previous.and_then(|prior| gap(&prior.slot, &request.slot));
+        let report_gap = previous
+            .and_then(|prior| elapsed_seconds(&prior.slot.occurred_at, &request.slot.occurred_at));
         let mut conditions = Vec::new();
         if model_change {
             conditions.push("model_changed".into());
@@ -298,35 +289,7 @@ fn detect_prefix(
         };
         rows.push(observation);
     }
-    (rows, omitted)
-}
-
-/// Explicit delta operations; absence is never deletion. ACK owner must settle these IDs.
-pub(crate) fn reconcile(
-    prior: &BTreeMap<String, Observation>,
-    current: &BTreeMap<String, Observation>,
-) -> CacheObservations {
-    let mut operations = prior
-        .keys()
-        .filter(|id| !current.contains_key(*id))
-        .map(|id| Operation::Retract {
-            event_id: id.clone(),
-        })
-        .collect::<Vec<_>>();
-    operations.extend(
-        current
-            .iter()
-            .filter(|(id, row)| prior.get(*id) != Some(*row))
-            .map(|(_, row)| Operation::Upsert {
-                observation: Box::new(row.clone()),
-            }),
-    );
-    CacheObservations {
-        schema_version: 1,
-        operations,
-        coverage: "complete".into(),
-        omitted_observation_count: None,
-    }
+    rows
 }
 
 #[cfg(test)]

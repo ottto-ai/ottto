@@ -559,6 +559,59 @@ pub(super) fn apply_own_context_scalars(
         .saturating_add(id_less.after);
 }
 
+/// Cache rows only: each item's content birth, the provider time of its
+/// first own response (`e2::first_own_turn_at`). That response is at or after
+/// the first one this rule counts as own, and no earlier file of the same
+/// family on the page holds its request id: a subagent copy's prefix stays
+/// with the file it was copied from. Earlier means an earlier first
+/// response, then the lower session id: content only, so cold, Tail and
+/// restored reads agree. `None` when no own response has a readable time.
+pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
+    let order = items
+        .iter()
+        .map(|item| {
+            let first = item
+                .claude_usage_occurrences
+                .values()
+                .min_by_key(|occurrence| occurrence.sequence)
+                .and_then(|occurrence| occurrence.timestamp.as_deref())
+                .and_then(rfc3339_unix_nanos);
+            (first, item.source_session_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let mut families = BTreeMap::<&str, Vec<usize>>::new();
+    for (at, item) in items.iter().enumerate() {
+        families
+            .entry(claude_snapshot_family_root_ref(item))
+            .or_default()
+            .push(at);
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let earlier = families[claude_snapshot_family_root_ref(item)]
+                .iter()
+                .filter(|&&other| order[other] < order[at])
+                .map(|&other| &items[other].claude_usage_request_ids)
+                .collect::<Vec<_>>();
+            super::claude_request_money::e2::first_own_turn_at(
+                item,
+                item.claude_file_birth.first_own_sequence?,
+                &earlier,
+            )
+        })
+        .collect()
+}
+
+/// A cache request is the file's own unless its provider time is more than
+/// the copy slack before the content birth. An unreadable time is kept, so
+/// the wire makes the session partial instead of dropping it.
+pub(super) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
+    rfc3339_unix_nanos(occurred_at)
+        .map_or(true, |at| at >= birth - CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS)
+}
+
 /// When the session's first own request ended (`first_own_request_at`): only for
 /// a root file whose birth was measured and
 /// whose first own request follows no copied record. Read from values the

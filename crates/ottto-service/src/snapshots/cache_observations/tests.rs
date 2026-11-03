@@ -53,17 +53,12 @@ fn restart_update_and_retraction_keep_identity() {
         after.keys().collect::<Vec<_>>()
     );
     assert_eq!(after[&event_id("s", "B")].status, "complete");
-    assert!(matches!(
-        &reconcile(&before, &after).operations[0],
-        Operation::Upsert { .. }
-    ));
+    assert_ne!(before, after);
     let corrected = detect("s", &[request("A", 90_000), request("B", 90_000)]);
-    assert!(
-        matches!(&reconcile(&after,&corrected).operations[0],Operation::Retract{event_id} if event_id==&super::event_id("s", "B"))
-    );
+    assert!(!corrected.contains_key(&event_id("s", "B")));
     let persisted = serde_json::to_string(&after).unwrap();
     let restored: BTreeMap<String, Observation> = serde_json::from_str(&persisted).unwrap();
-    assert!(reconcile(&restored, &after).operations.is_empty());
+    assert_eq!(restored, after);
 }
 #[test]
 fn cold_start_model_switch_and_suffix_growth() {
