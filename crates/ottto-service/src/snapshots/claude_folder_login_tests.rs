@@ -18,7 +18,6 @@ const ADDRESS: &str = "one.login+tag@Example.test";
 const OTHER_ADDRESS: &str = "second@example.test";
 const EARLY_BIRTH: u64 = 1_785_542_400_000_000_000;
 const LATE_BIRTH: u64 = 1_785_801_600_000_000_000;
-const NOW: i64 = 1_785_801_600;
 
 fn login() -> String {
     "a".repeat(64)
@@ -181,17 +180,11 @@ fn owed(index: &ScanIndex) -> BTreeSet<String> {
         .collect()
 }
 
-/// The history gate let every owed file through.
-fn settle(index: &mut ScanIndex) {
-    for entry in index.files.values_mut() {
-        entry.effective_upload_body_witness_revision = 3;
-    }
-}
-
-/// [money] A real multi-page first walk: only the last page can be tagged at
-/// upload, and the single re-offer brings the earlier page to 100%.
+/// [money] A real multi-page first walk names only what it reads after the
+/// folder qualifies: the earlier page stays untagged and nothing is re-read or
+/// owed for it. A later read of that session is named.
 #[test]
-fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
+fn a_fresh_install_names_only_what_it_reads_after_qualifying() {
     let f = folder("recorded-multi-page");
     let mut index = ScanIndex::default();
     f.begin(&mut index, folder_report());
@@ -207,34 +200,20 @@ fn fresh_install_history_is_named_by_one_re_offer_across_pages() {
 
     seed(&mut index, &f.path(SESSION_A), 100);
     seed(&mut index, &f.path(SESSION_B), 100);
-    seed(&mut index, &f.path("no-own-marker"), 100);
-    apply_reoffers(&mut index, false, NOW);
-    assert!(owed(&index).is_empty(), "off offers nothing");
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(
-        owed(&index),
-        BTreeSet::from([
-            local_index_key(&f.path(SESSION_A)),
-            local_index_key(&f.path(SESSION_B))
-        ]),
-        "only matched own files are offered"
+    page(&mut index, &mut [], true);
+    assert!(
+        owed(&index).is_empty(),
+        "the earlier page is never re-offered"
     );
-    apply_reoffers(&mut index, true, NOW);
-    settle(&mut index);
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(f.record(&index).reoffer, REOFFER_DONE);
-    assert!(owed(&index).is_empty());
-    apply_reoffers(&mut index, true, NOW);
-    assert!(owed(&index).is_empty(), "never repeats");
 
     let mut again = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
     page(&mut index, &mut again, true);
-    assert!(witness(&again).is_some(), "the re-offered read is named");
+    assert!(witness(&again).is_some(), "a later read of it is named");
 }
 
 /// [regress]
 #[test]
-fn a_late_proof_starts_the_re_offer_and_a_failed_one_is_only_not_yet() {
+fn a_late_proof_names_later_reads_and_a_failed_one_is_only_not_yet() {
     let f = folder("recorded-late-proof");
     let mut index = ScanIndex::default();
     f.begin(
@@ -248,19 +227,17 @@ fn a_late_proof_starts_the_re_offer_and_a_failed_one_is_only_not_yet() {
     page(&mut index, &mut items, true);
     assert_eq!(witness(&items), None);
     assert!(!f.record(&index).mixed);
-    seed(&mut index, &f.path(SESSION_A), 100);
-    apply_reoffers(&mut index, true, NOW);
-    assert!(owed(&index).is_empty());
 
     observe(f.key.clone(), folder_report());
     page(&mut index, &mut [], true);
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(owed(&index).len(), 1);
+    let mut later = f.read(SESSION_B, &own_lines(SESSION_B, "req_b"));
+    page(&mut index, &mut later, true);
+    assert!(witness(&later).is_some());
 }
 
 /// [regress]
 #[test]
-fn two_folders_are_judged_alone_and_the_mixed_one_stays_owed() {
+fn two_folders_are_judged_alone_and_the_mixed_one_stays_unnamed() {
     let one = folder("recorded-one-login");
     let two = folder("recorded-two-logins");
     let mut index = ScanIndex::default();
@@ -287,7 +264,11 @@ fn two_folders_are_judged_alone_and_the_mixed_one_stays_owed() {
     page(&mut index, &mut clean, true);
     assert!(witness(&clean[..1]).is_some());
     assert_eq!(witness(&clean[1..2]), None);
-    assert_eq!(witness(&clean[2..]), None, "a matching session stays owed");
+    assert_eq!(
+        witness(&clean[2..]),
+        None,
+        "a matching session stays unnamed"
+    );
     assert!(two.record(&index).mixed);
     assert!(two.record(&index).matched.is_empty());
     assert!(!one.record(&index).mixed);
@@ -389,17 +370,13 @@ fn a_login_change_stops_later_names() {
 
 /// [money]
 #[test]
-fn a_new_slot_names_from_its_first_read_and_never_needs_a_re_offer() {
+fn a_new_slot_names_from_its_first_read() {
     let f = folder("recorded-new-slot");
     let mut index = ScanIndex::default();
     f.begin(&mut index, slot_report());
     let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
     page(&mut index, &mut items, false);
     assert_eq!(witness(&items).expect("named").kind, "slot");
-    seed(&mut index, &f.path(SESSION_A), 100);
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(f.record(&index).reoffer, REOFFER_DONE);
-    assert!(owed(&index).is_empty());
 
     observe(
         f.key.clone(),
@@ -419,51 +396,57 @@ fn a_new_slot_names_from_its_first_read_and_never_needs_a_re_offer() {
     assert!(f.record(&index).mixed);
 }
 
-/// [money]
+/// [money] Forward only: a folder or slot whose history was read before its
+/// record never names, never re-reads that history and asks for no proof.
 #[test]
-fn an_upgraded_slot_needs_every_session_to_match() {
-    let f = folder("recorded-upgraded-slot");
-    let mut index = ScanIndex::default();
-    f.begin_upgraded(&mut index, slot_report());
-    let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
-    page(&mut index, &mut items, true);
-    assert_eq!(witness(&items), None, "no census yet");
-    assert!(!f.record(&index).census_complete);
-
-    let mut silent = f.read(
-        SESSION_B,
-        &[assistant(SESSION_B, "req_b", "2026-08-02T07:00:00Z")],
-    );
-    page(&mut index, &mut silent, true);
-    assert!(f.record(&index).mixed, "a session with no recorded login");
+fn an_upgraded_folder_never_names_and_re_reads_nothing() {
+    for (name, report) in [
+        ("recorded-upgraded", folder_report()),
+        ("recorded-upgraded-slot", slot_report()),
+    ] {
+        let f = folder(name);
+        let mut index = ScanIndex::default();
+        f.begin_upgraded(&mut index, report);
+        seed(&mut index, &f.path(SESSION_A), 100);
+        let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
+        page(&mut index, &mut items, true);
+        page(&mut index, &mut [], true);
+        assert_eq!(witness(&items), None);
+        let record = f.record(&index);
+        assert!(!record.fresh && !record.census_complete && !record.mixed);
+        assert!(owed(&index).is_empty());
+        assert!(!proof_wanted_after_page(&mut index, &f));
+    }
 }
 
-/// [money] Upgraded history: one wire-silent census read, then one tag read of
-/// the matched files only.
+/// [money] Nothing can reset a folder into naming: a stored record that decodes
+/// to its defaults, or a ledger missing beside indexed history, stays unnamed
+/// and owes no read.
 #[test]
-fn an_upgraded_folder_reads_its_census_first_then_re_offers_its_own_files() {
-    let f = folder("recorded-upgraded");
-    let mut index = ScanIndex::default();
-    f.begin_upgraded(&mut index, folder_report());
-    seed(&mut index, &f.path(SESSION_A), 100);
-    seed(&mut index, &f.path("no-own-marker"), 100);
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(owed(&index).len(), 2, "the census reads every file");
-    let mut read = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
-    page(&mut index, &mut read, false);
-    assert_eq!(witness(&read), None);
-    settle(&mut index);
-    apply_reoffers(&mut index, true, NOW);
-    assert!(f.record(&index).census_complete);
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(
-        owed(&index),
-        BTreeSet::from([local_index_key(&f.path(SESSION_A))])
-    );
-    assert_eq!(f.record(&index).reoffer, REOFFER_TAG);
-    let mut named = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
-    page(&mut index, &mut named, false);
-    assert!(witness(&named).is_some());
+fn a_defaulted_or_missing_record_never_names_and_owes_nothing() {
+    let f = folder("recorded-defaulted");
+    let mut done = ScanIndex::default();
+    f.begin(&mut done, folder_report());
+    let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
+    page(&mut done, &mut items, true);
+    assert!(witness(&items).is_some());
+    seed(&mut done, &f.path(SESSION_A), 100);
+
+    let mut defaulted = done.clone();
+    defaulted.claude_folder_login_ledger =
+        serde_json::from_str(&format!("{{\"{}\":{{}}}}", f.key)).unwrap();
+    let mut missing = done.clone();
+    missing.claude_folder_login_ledger.clear();
+    for mut index in [defaulted, missing] {
+        let committed = index.clone();
+        begin_page(&mut index, &committed, std::slice::from_ref(&f.root), true);
+        observe(f.key.clone(), folder_report());
+        let mut items = f.read(SESSION_B, &own_lines(SESSION_B, "req_b"));
+        page(&mut index, &mut items, true);
+        assert_eq!(witness(&items), None);
+        assert!(!f.record(&index).fresh);
+        assert!(owed(&index).is_empty());
+    }
 }
 
 /// [regress]
@@ -704,45 +687,6 @@ fn later_real_telemetry_replaces_the_name_for_good() {
     stamp_page(&mut items, &index, &api, &AcceptedBuckets::for_test());
     assert_eq!(witness(&items), None, "this file's own row owns it now");
     assert!(f.record(&index).matched.is_empty());
-
-    // A re-offered later read sees no file left to offer.
-    seed(&mut index, &f.path(SESSION_A), 100);
-    apply_reoffers(&mut index, true, NOW);
-    assert!(owed(&index).is_empty());
-}
-
-/// [regress] Counts only, with the 8-hex key; a stalled re-offer warns, never stops.
-#[test]
-fn a_re_offer_reports_counts_and_warns_only_when_it_stalls() {
-    let home = "ab".repeat(32);
-    let mut record = FolderRecord {
-        reoffer: REOFFER_CENSUS,
-        ..FolderRecord::default()
-    };
-    let tally = ReofferTally {
-        files: 2_001,
-        bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
-        owed_files: 2_001,
-        owed_bytes: 3 * HISTORY_UPGRADE_BYTES_PER_PAGE,
-        ..ReofferTally::default()
-    };
-    assert_eq!(
-        reoffer_line(&home, &mut record, &tally, NOW).unwrap(),
-        format!(
-            "ottto-service: claude folder re-offer folder=abababab phase=census files_read=0 \
-             bytes_read=0 files_released=0 bytes_released=0 files_remaining=2001 \
-             bytes_remaining={} eta_minutes=15",
-            3 * HISTORY_UPGRADE_BYTES_PER_PAGE
-        )
-    );
-    assert_eq!(reoffer_line(&home, &mut record, &tally, NOW + 300), None);
-    let warning = reoffer_line(&home, &mut record, &tally, NOW + STALL_SECONDS).unwrap();
-    assert!(warning.contains("warning") && warning.contains("folder=abababab"));
-    assert_eq!(
-        reoffer_line(&home, &mut record, &tally, NOW + STALL_SECONDS + 300),
-        None,
-        "bounded"
-    );
 }
 
 /// [regress] A damaged ledger keeps every folder first seen after it sticky.
@@ -758,77 +702,6 @@ fn a_damaged_ledger_fails_closed() {
     let mut items = f.read(SESSION_A, &own_lines(SESSION_A, "req_a"));
     page(&mut index, &mut items, true);
     assert_eq!(witness(&items), None);
-    seed(&mut index, &f.path(SESSION_A), 100);
-    apply_reoffers(&mut index, true, NOW);
-    assert!(owed(&index).is_empty());
-}
-
-/// [money] A folder turning sticky hands back only what its own census lowered;
-/// a file owed for any other reason keeps its read, and a qualifying folder's
-/// census goes on.
-#[test]
-fn a_sticky_folder_releases_only_its_own_census_files() {
-    let f = folder("recorded-release");
-    let g = folder("recorded-release-other");
-    let mut index = ScanIndex::default();
-    f.begin_upgraded(&mut index, folder_report());
-    g.begin_upgraded(&mut index, folder_report());
-    let key = |name: &str| local_index_key(&f.path(name));
-    for name in [SESSION_A, "unread", "re-owed", "owed-before"] {
-        seed(&mut index, &f.path(name), 100);
-    }
-    seed(&mut index, &g.path(SESSION_B), 100);
-    index
-        .files
-        .get_mut(&key("owed-before"))
-        .unwrap()
-        .effective_upload_body_witness_revision = 2;
-    apply_reoffers(&mut index, true, NOW);
-    assert_eq!(owed(&index).len(), 5);
-    index.re_owe_effective_upload_body_witness_revision(&key("re-owed"), 2);
-
-    let mut first = f.read(
-        SESSION_A,
-        &[
-            context(OTHER_ADDRESS, SESSION_A),
-            marker(ORG_UUID, SESSION_A),
-            assistant(SESSION_A, "req_a", "2026-08-02T07:00:00Z"),
-        ],
-    );
-    page(&mut index, &mut first, false);
-    assert!(f.record(&index).mixed);
-    apply_reoffers(&mut index, true, NOW + 300);
-    assert_eq!(
-        owed(&index),
-        BTreeSet::from([
-            key("re-owed"),
-            key("owed-before"),
-            local_index_key(&g.path(SESSION_B)),
-        ]),
-    );
-    assert!(f.record(&index).reoffer_owed.is_empty());
-    assert_eq!(g.record(&index).reoffer, REOFFER_CENSUS);
-    apply_reoffers(&mut index, true, NOW + 600);
-    assert_eq!(owed(&index).len(), 3, "released once, never owed again");
-}
-
-/// [money] A newer revision since the census began owes the file for real.
-#[test]
-fn a_revision_change_keeps_a_sticky_folders_files_owed() {
-    let f = folder("recorded-release-revision");
-    let mut index = ScanIndex::default();
-    f.begin_upgraded(&mut index, folder_report());
-    seed(&mut index, &f.path(SESSION_A), 100);
-    apply_reoffers(&mut index, true, NOW);
-    index
-        .claude_folder_login_ledger
-        .get_mut(&f.key)
-        .unwrap()
-        .set_mixed();
-    index.active_effective_upload_body_witness_revision = 4;
-    apply_reoffers(&mut index, true, NOW + 300);
-    assert_eq!(owed(&index).len(), 1);
-    assert!(f.record(&index).reoffer_owed.is_empty());
 }
 
 /// [privacy] No key: the file keeps no address, and the folder gets no verdict.

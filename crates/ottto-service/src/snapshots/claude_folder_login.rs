@@ -19,9 +19,6 @@ use sha2::Digest;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::claude_history_upgrade::{
-    HISTORY_UPGRADE_BYTES_PER_PAGE, HISTORY_UPGRADE_FILES_PER_PAGE,
-};
 use super::claude_money_birth_store::location_key;
 use super::claude_request_identity::{complete_org, valid_login, AcceptedBuckets, RecordedLogin};
 use super::{local_index_key, ScanIndex, SnapshotItem, SoleLoginWitness};
@@ -33,22 +30,9 @@ pub(crate) use crate::claude_status_coverage::OwnerReport;
 pub(crate) const SOLE_LOGIN_WITNESS_CONTRACT: &str = "session_request_sole_login_witness:v1";
 const HOUR_SECONDS: i64 = 3_600;
 const MAX_HASH_TEXT: usize = 128;
-/// The sync cadence the history gate pages at, for the time estimate.
-const MINUTES_PER_PAGE: u64 = 5;
-/// A re-offer that moved no file for this long warns, and keeps going.
-const STALL_SECONDS: i64 = 6 * HOUR_SECONDS;
 /// Marks a ledger that decoded as damaged: it may have held a sticky verdict, so
 /// every folder first seen after it starts sticky.
 const DAMAGED_LEDGER: &str = "damaged";
-
-/// No re-offer started.
-const REOFFER_IDLE: u8 = 0;
-/// Re-reading history this folder uploaded before its record existed. Unchanged
-/// bodies re-upload nothing.
-const REOFFER_CENSUS: u8 = 1;
-/// Re-reading this folder's own matched files, so their bodies carry the tag.
-const REOFFER_TAG: u8 = 2;
-const REOFFER_DONE: u8 = 3;
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -100,12 +84,13 @@ fn file_location(index_key: &str) -> u64 {
 }
 
 /// One folder's durable evidence: hashes, flags and file digests, no email.
-/// Absent members default to "not qualified".
+/// Absent members default to "not qualified", and nothing re-reads history to
+/// change that: a folder whose history was read before its record never names.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct FolderRecord {
-    /// The record predates this folder's first read, or that read's login was
-    /// knowable. False: its history needs a census read.
+    /// The record predates this folder's first read, and every read since knew
+    /// the login. False: some history went unchecked, so the folder never names.
     fresh: bool,
     /// Sticky: this folder held another login, so it never names again.
     mixed: bool,
@@ -118,20 +103,12 @@ pub(crate) struct FolderRecord {
     covered_from: Option<i64>,
     /// Sorted. Own files whose own marker matched `login` and `org`.
     matched: Vec<u64>,
-    reoffer: u8,
-    /// Files the running re-offer still owes, and when that last changed.
-    reoffer_remaining: u64,
-    reoffer_moved_at: i64,
-    /// Sorted. Settled files this phase itself lowered, at `reoffer_revision`:
-    /// the only ones a folder turning sticky hands back.
-    reoffer_owed: Vec<u64>,
-    reoffer_revision: u64,
 }
-crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched, reoffer, reoffer_remaining, reoffer_moved_at, reoffer_owed, reoffer_revision);
+crate::heap_layout_bound::fields!(FolderRecord; fresh, mixed, login, org, owner_proven, census_complete, covered_from, matched);
 
-// Admission classes: flags, counts and times are N; `login`/`org` are identity
-// hashes (H); `matched`/`reoffer_owed` hold location digests truncated to u64,
-// so they are N-typed, not H's fixed 32 bytes. Not part of any retained body.
+// Admission classes: flags and times are N; `login`/`org` are identity hashes
+// (H); `matched` holds location digests truncated to u64, so it is N-typed, not
+// H's fixed 32 bytes. Not part of any retained body.
 crate::durable_tail_codec::durable_struct!(FolderRecord {
     N fresh: bool,
     N mixed: bool,
@@ -141,14 +118,15 @@ crate::durable_tail_codec::durable_struct!(FolderRecord {
     N census_complete: bool,
     N covered_from: Option<i64>,
     N matched: Vec<u64>,
-    N reoffer: u8,
-    N reoffer_remaining: u64,
-    N reoffer_moved_at: i64,
-    N reoffer_owed: Vec<u64>,
-    N reoffer_revision: u64,
 });
 
 impl FolderRecord {
+    /// Whether this folder can still ever name: it saw its whole history and
+    /// never held another login.
+    fn can_name(&self) -> bool {
+        !self.mixed && (self.fresh || self.census_complete)
+    }
+
     fn set_mixed(&mut self) {
         self.mixed = true;
         self.matched = Vec::new();
@@ -229,7 +207,8 @@ crate::heap_layout_bound::fields!(QualifiedFolder; login, org, witness);
 
 /// The (login, org, covered_from, kind) a folder may name, or `None` while any
 /// condition is unmet. A slot's account is its registration, so a slot the
-/// record saw from its first read needs no census; an upgraded slot does.
+/// record saw from its first read needs no census. A folder whose history was
+/// read before its record never qualifies.
 pub(crate) fn qualify<'r>(
     record: &'r FolderRecord,
     report: &OwnerReport,
@@ -257,7 +236,8 @@ pub(crate) fn qualify<'r>(
 }
 
 /// Sync pass, before this page's evidence: records each folder the first time
-/// it is seen. Off, it writes nothing.
+/// it is seen. A folder with indexed history is recorded as not fresh, so it
+/// never names; nothing re-reads that history. Off, it writes nothing.
 pub(crate) fn begin_page(
     index: &mut ScanIndex,
     committed: &ScanIndex,
@@ -295,10 +275,11 @@ pub(crate) fn begin_page(
             },
         );
     }
+    // No profile call can help a folder that can never name.
     let stopped = index
         .claude_folder_login_ledger
         .iter()
-        .filter(|(_, record)| record.mixed)
+        .filter(|(_, record)| !record.can_name())
         .map(|(home, _)| home.clone())
         .collect();
     coverage::set_wanted(true, stopped);
@@ -327,7 +308,7 @@ fn read_matches(seen: &RecordedLogin<'_>, report: &OwnerReport) -> bool {
 }
 
 /// One read's evidence on its folder. Sticky on any mismatch; a read of a folder
-/// with no known login leaves that history for a census read.
+/// with no known login leaves that history unchecked, so the folder never names.
 fn note_read(
     record: &mut FolderRecord,
     item: &SnapshotItem,
@@ -357,12 +338,6 @@ fn note_read(
         record.set_mixed();
     }
     let matches = read_matches(&seen, report);
-    // An upgraded slot has no history of its own, so every session must carry
-    // the matching login. A subagent file stands on its own record.
-    let root_file = super::claude_snapshot_family_root_ref(item) == item.source_session_id;
-    if report.slot && !record.fresh && !record.census_complete && root_file && !matches {
-        record.set_mixed();
-    }
     if record.mixed {
         return;
     }
@@ -428,210 +403,6 @@ pub(crate) fn note_page(
 
 fn short_key(home: &str) -> &str {
     home.get(..8).unwrap_or(home)
-}
-
-/// One folder's files the running phase covers, in counts.
-#[derive(Default)]
-struct ReofferTally {
-    files: u64,
-    bytes: u64,
-    owed_files: u64,
-    owed_bytes: u64,
-    released_files: u64,
-    released_bytes: u64,
-}
-
-/// A counts-only line when the re-offer moved, or a warning when it has not for
-/// `STALL_SECONDS`. It only ever reports: the history gate keeps pacing.
-fn reoffer_line(
-    home: &str,
-    record: &mut FolderRecord,
-    tally: &ReofferTally,
-    now: i64,
-) -> Option<String> {
-    let folder = short_key(home);
-    let phase = match (record.mixed, record.reoffer) {
-        (true, _) => "released",
-        (false, REOFFER_TAG) => "tag",
-        (false, _) => "census",
-    };
-    if record.reoffer_moved_at == 0 || record.reoffer_remaining != tally.owed_files {
-        record.reoffer_remaining = tally.owed_files;
-        record.reoffer_moved_at = now;
-        let pages = tally
-            .owed_bytes
-            .div_ceil(HISTORY_UPGRADE_BYTES_PER_PAGE)
-            .max(
-                tally
-                    .owed_files
-                    .div_ceil(HISTORY_UPGRADE_FILES_PER_PAGE as u64),
-            );
-        return Some(format!(
-            "ottto-service: claude folder re-offer folder={folder} phase={phase} files_read={} bytes_read={} files_released={} bytes_released={} files_remaining={} bytes_remaining={} eta_minutes={}",
-            tally.files - tally.owed_files - tally.released_files,
-            tally.bytes - tally.owed_bytes - tally.released_bytes,
-            tally.released_files,
-            tally.released_bytes,
-            tally.owed_files,
-            tally.owed_bytes,
-            pages * MINUTES_PER_PAGE,
-        ));
-    }
-    if now.saturating_sub(record.reoffer_moved_at) < STALL_SECONDS {
-        return None;
-    }
-    record.reoffer_moved_at = now;
-    Some(format!(
-        "ottto-service: warning: claude folder re-offer has not moved folder={folder} phase={phase} files_remaining={} bytes_remaining={} hours={}",
-        tally.owed_files,
-        tally.owed_bytes,
-        STALL_SECONDS / HOUR_SECONDS,
-    ))
-}
-
-/// Sync pass, before the walk, in the same save as the ledger. History already
-/// uploaded untagged reaches the tag only through one more read, so each phase
-/// owes its files once through the money rules' re-owe and the history gate then
-/// paces them like any owed file. A sticky folder can no longer qualify, so it
-/// hands back what its phase lowered and not yet read: those files had nothing
-/// else owed, and the ordinary walk still reads any change.
-pub(crate) fn apply_reoffers(index: &mut ScanIndex, enabled: bool, now: i64) {
-    if !enabled {
-        return;
-    }
-    let reports = coverage::snapshot();
-    let active = index.active_effective_upload_body_witness_revision;
-    let mut starting = BTreeSet::new();
-    let mut running = BTreeMap::<String, ReofferTally>::new();
-    for (home, record) in &mut index.claude_folder_login_ledger {
-        if record.mixed {
-            if record.reoffer_revision != active {
-                record.reoffer_owed = Vec::new();
-            }
-            if !record.reoffer_owed.is_empty() {
-                running.insert(home.clone(), ReofferTally::default());
-            }
-            continue;
-        }
-        if record.reoffer == REOFFER_IDLE {
-            let report = reports.get(home);
-            if !record.fresh && !record.census_complete {
-                record.reoffer = REOFFER_CENSUS;
-            } else if report.is_some_and(|report| report.slot) && record.fresh {
-                record.reoffer = REOFFER_DONE;
-            } else if report.is_some_and(|report| qualify(record, report).is_some()) {
-                record.reoffer = REOFFER_TAG;
-            }
-            if matches!(record.reoffer, REOFFER_CENSUS | REOFFER_TAG) {
-                starting.insert(home.clone());
-            }
-        }
-        if matches!(record.reoffer, REOFFER_CENSUS | REOFFER_TAG) {
-            running.insert(home.clone(), ReofferTally::default());
-        }
-    }
-    if running.is_empty() {
-        return;
-    }
-    let mut owe = Vec::new();
-    let mut release = Vec::new();
-    for (key, entry) in &index.files {
-        let Some(home) = coverage::transcript_home_key(Path::new(key)).map(|home| hex(&home))
-        else {
-            continue;
-        };
-        let (Some(tally), Some(record)) = (
-            running.get_mut(&home),
-            index.claude_folder_login_ledger.get(&home),
-        ) else {
-            continue;
-        };
-        let location = file_location(key);
-        let owed = index.effective_upload_body_witness_revision_requires_adoption(key);
-        if record.mixed {
-            if owed && record.reoffer_owed.binary_search(&location).is_ok() {
-                release.push((key.clone(), home, entry.size_bytes));
-            }
-            continue;
-        }
-        if record.reoffer == REOFFER_TAG && !record.matches_file(location) {
-            continue;
-        }
-        tally.files += 1;
-        tally.bytes += entry.size_bytes;
-        if starting.contains(&home) && !owed {
-            owe.push((key.clone(), home.clone()));
-        }
-        if starting.contains(&home) || owed {
-            tally.owed_files += 1;
-            tally.owed_bytes += entry.size_bytes;
-        }
-    }
-    for (key, home) in owe {
-        if index.re_owe_for_folder_reoffer(&key) {
-            if let Some(record) = index.claude_folder_login_ledger.get_mut(&home) {
-                record.reoffer_owed.push(file_location(&key));
-                record.reoffer_revision = active;
-            }
-        }
-    }
-    for (key, home, bytes) in release {
-        // The stamp's own holds still apply: a refused file simply stays owed.
-        let released = index.stamp_effective_upload_body_witness_revision(&key, "", active);
-        if let Some(tally) = running.get_mut(&home) {
-            tally.files += 1;
-            tally.bytes += bytes;
-            if released {
-                tally.released_files += 1;
-                tally.released_bytes += bytes;
-            } else {
-                tally.owed_files += 1;
-                tally.owed_bytes += bytes;
-            }
-        }
-    }
-    for (home, tally) in &running {
-        let Some(record) = index.claude_folder_login_ledger.get_mut(home) else {
-            continue;
-        };
-        record.reoffer_owed.sort_unstable();
-        if record.mixed {
-            record.reoffer_owed = Vec::new();
-            record.reoffer_moved_at = 0;
-        }
-        if let Some(line) = reoffer_line(home, record, tally, now) {
-            eprintln!("{line}");
-        }
-        if record.mixed {
-            continue;
-        }
-        // Every read of the phase settled. A file that never settles stays owed,
-        // and so does its folder.
-        if tally.owed_files == 0 && !starting.contains(home) {
-            record.reoffer_owed = Vec::new();
-            record.census_complete |= record.reoffer == REOFFER_CENSUS;
-            record.reoffer = match record.reoffer {
-                REOFFER_CENSUS => REOFFER_IDLE,
-                _ => REOFFER_DONE,
-            };
-            record.reoffer_moved_at = 0;
-        }
-    }
-}
-
-/// Another owner re-owed this file: its folder's re-offer never hands it back.
-pub(crate) fn keep_owed(ledger: &mut BTreeMap<String, FolderRecord>, index_key: &str) {
-    if ledger.is_empty() {
-        return;
-    }
-    let Some(record) = coverage::transcript_home_key(Path::new(index_key))
-        .and_then(|home| ledger.get_mut(&hex(&home)))
-    else {
-        return;
-    };
-    if let Ok(at) = record.reoffer_owed.binary_search(&file_location(index_key)) {
-        record.reoffer_owed.remove(at);
-    }
 }
 
 /// Hour-floored RFC 3339, as the witness carries it.
