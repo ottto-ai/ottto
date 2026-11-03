@@ -3461,6 +3461,152 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     });
 }
 
+/// [regress] 0.1.214: with fresh appends on every page and census members
+/// queued, the Codex rotation alternated freshness (F) and census (C) turns
+/// and never ran an ordinary one, so a header-validated archive and a plain
+/// re-read, both queued non-members, were never selected. A census turn now
+/// owes the next selecting page to such work: C -> O -> F, and each queued
+/// item is selected within 3 selecting pages. Control: with no ordinary-only
+/// work, a census turn is still followed by a freshness turn (F, C, F).
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
+    use codex_compressed_input::HeaderRead;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const MEMBERS: usize = 40;
+    const REREAD: &str = "019fa333-2222-7333-8444-888888888888";
+    const ARCHIVE: &str = "019fa333-2222-7333-8444-888888888889";
+    let ids = (0..MEMBERS)
+        .map(|n| format!("019fa333-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    sessions.push((REREAD, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 2);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+        None,
+    );
+    index.archive_pass.power = true;
+    let header = archive_header_pass(&mut index, &archive, &cache);
+    assert!(matches!(header, HeaderRead::Validated(_)));
+    // Only census members stay queued; SESSION returns through its hint, and
+    // the re-read and the archive are queued after the control turns.
+    let reread = fixture.file(REREAD);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.pending_candidates.retain(|candidate| {
+        candidate.census_member
+            && candidate.path != fixture.file(SESSION)
+            && candidate.path != reread
+            && candidate.path != archive
+    });
+    assert!(traversal.pending_candidates.len() >= MEMBERS - 1);
+    let scan_root = traversal.scan_roots[0].clone();
+
+    let session_key = local_index_key(&fixture.file(SESSION));
+    let reread_key = local_index_key(&reread);
+    let archive_key = local_index_key(&archive);
+    let budget = fixture.len(SESSION) * 4;
+    cache.clear();
+    with_test_limits(2048, budget, 64, || {
+        // One selecting page with a fresh append to SESSION and its hint.
+        let turn = |index: ScanIndex, page: u64| {
+            fixture.append(SESSION, &token_line(4 + page));
+            let selected = selected_page(
+                &fixture,
+                &cache,
+                index,
+                &collected_at(page),
+                &[fixture.file(SESSION)],
+            );
+            let flags = selected.codex_selected_flags.clone();
+            let (index, _) = finish_published(selected);
+            let kind = if flags.keys().eq([&session_key]) {
+                'F'
+            } else if !flags.is_empty()
+                && !flags.contains_key(&session_key)
+                && flags.values().all(|(member, _)| *member)
+            {
+                'C'
+            } else {
+                'O'
+            };
+            (index, kind, flags)
+        };
+
+        // Control: no ordinary-only work, so F <-> C is unchanged.
+        let mut kinds = Vec::new();
+        for page in 1..=3 {
+            let (next, kind, _) = turn(index, page);
+            index = next;
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ['F', 'C', 'F']);
+
+        // A plain non-member re-read and a hinted non-member archive.
+        let traversal = index.traversal.as_mut().unwrap();
+        for (path, watcher_hint) in [(&reread, false), (&archive, true)] {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path: path.clone(),
+                census_member: false,
+                watcher_hint,
+            });
+        }
+        let mut kinds = Vec::new();
+        let mut selected = BTreeMap::new();
+        for page in 4..=6 {
+            let (next, kind, flags) = turn(index, page);
+            index = next;
+            kinds.push(kind);
+            selected.extend(flags);
+        }
+        assert_eq!(kinds, ['C', 'O', 'F']);
+        assert_eq!(selected.get(&reread_key), Some(&(false, false)));
+        assert_eq!(selected.get(&archive_key), Some(&(false, true)));
+        assert!(selected.contains_key(&session_key));
+        assert!(ids
+            .iter()
+            .any(|id| selected.contains_key(&local_index_key(&fixture.file(id)))));
+    });
+}
+
 /// The session ids `scan` published.
 fn published_ids(scan: &SourceScanResult) -> BTreeSet<&str> {
     scan.snapshots
