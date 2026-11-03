@@ -938,7 +938,7 @@ pub(crate) struct FileFold {
     /// Which file this fold read, for the folder ledger; set as it becomes an item.
     pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, first_own_at, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -2401,7 +2401,7 @@ fn unscanned_may_hold(
     pending.iter().any(|(root, key)| {
         root != session
             && Path::new(key).parent() == Some(Path::new(folder))
-            && resumed.is_none_or(|order| {
+            && resumed.map_or(true, |order| {
                 !matches!(
                     holder_order(&index.claude_money_birth_store, root, key),
                     Some(holder) if holder >= order

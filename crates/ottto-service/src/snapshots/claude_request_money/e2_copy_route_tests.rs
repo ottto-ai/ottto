@@ -196,7 +196,7 @@ fn accepted_pre_cutoff_copy_keeps_its_decision() {
     let late = line("own-late", AFTER_CUTOFF, 20);
     let resumed = [copy_a.clone(), copy_b.clone(), own.clone()];
     // (case, lines, COPY mark, accepted body, saved removal, removed)
-    let cases: [(&str, Vec<Value>, bool, bool, bool, u64); 7] = [
+    let cases = [
         ("accepted", resumed.to_vec(), true, true, false, 2),
         (
             "later own after cutoff",

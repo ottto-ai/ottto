@@ -3809,6 +3809,8 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
             }));
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+            // As the scan runs it: the page's copy decision before telemetry attaches.
+            decide_page_copies(&mut items, &index, None);
             let read = sidecar(&[
                 row("unmarked-own", 1, 20),
                 row("b", 2, 30),
