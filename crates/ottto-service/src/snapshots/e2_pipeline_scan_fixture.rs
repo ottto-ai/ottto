@@ -361,6 +361,25 @@ pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bo
     index.file_upload_context_requires_adoption(&local_index_key(path))
 }
 
+/// Drop a file's upload-context receipt and every entity stamp, as an index
+/// that lost that proof holds them. The accepted-snapshot ledger stays.
+pub(crate) fn strip_upload_context_proof_for_test(index: &mut ScanIndex, path: &Path) {
+    if let Some(entry) = index.files.get_mut(&local_index_key(path)) {
+        entry.upload_context_receipt = None;
+    }
+    index.upload_context_proof.entity_stamps.clear();
+}
+
+/// Whether the current accepted-snapshot ledger proves the file's body.
+pub(crate) fn ledger_accepted_for_test(index: &ScanIndex, path: &Path) -> bool {
+    let key = local_index_key(path);
+    claude_accepted_ledger_is_current(index)
+        && index
+            .files
+            .get(&key)
+            .is_some_and(|entry| claude_index_file_body_accepted(index, &key, entry))
+}
+
 /// Install the real exclusion input used by ordinary-money fixture families.
 /// An empty slice adopts request-owned money on the next normal source pass.
 pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
