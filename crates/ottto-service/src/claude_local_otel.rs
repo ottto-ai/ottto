@@ -2955,10 +2955,18 @@ mod tests {
         assert_eq!(row.cache_creation_5m_tokens, 2014);
         assert!(!row.account_identity_checked);
     }
+    /// One paired root (`sess-mixed`): two API rows, two trace rows and the
+    /// transcript that names them, scanned into a page.
     #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
-        let dir = crate::test_scratch::private_dir("ottto-decode-overlap");
+    fn mixed_scan_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        crate::snapshots::ScanIndex,
+        crate::snapshots::SourceScanResult,
+    ) {
+        let dir = crate::test_scratch::private_dir(label);
         let sessions = dir.join("projects");
         fs::create_dir_all(&sessions).unwrap();
         let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
@@ -2997,6 +3005,50 @@ mod tests {
         )
         .unwrap();
         assert!(!scan.snapshots.is_empty());
+        (dir, sessions, index, scan)
+    }
+
+    /// [behaviour] The evidence_read record carries its memory checkpoints:
+    /// the kept rows, the largest root with its actual keep bit, and the
+    /// legacy owners; allocator in-use bytes only where the system reports them.
+    #[cfg(unix)]
+    #[test]
+    fn evidence_read_reports_memory_checkpoints() {
+        let (dir, _, mut index, mut scan) = mixed_scan_fixture("ottto-evidence-mem");
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index)
+        });
+        let reads = records
+            .iter()
+            .filter(|record| record["stage"] == "evidence_read")
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1);
+        let mem = &reads[0]["counts"]["evidence_mem"];
+        assert_eq!(mem["kept_rows"], 4);
+        assert_eq!(mem["largest_root_rows"], 4);
+        assert_eq!(mem["largest_root_kept"], true);
+        assert_eq!(mem["legacy_owners"], 2);
+        let in_use = mem["in_use_bytes"].as_array().unwrap();
+        assert_eq!(in_use.len(), 3);
+        assert!(in_use
+            .iter()
+            .all(|bytes| bytes.is_u64() == cfg!(target_os = "macos")));
+        assert_eq!(mem["footprint_bytes"].as_array().unwrap().len(), 2);
+        // No other record carries the object.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| !record["counts"]["evidence_mem"].is_null())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
+        let (dir, sessions, mut index, mut scan) = mixed_scan_fixture("ottto-decode-overlap");
         let mut reference_scan = scan.clone();
         let mut reference_index = index.clone();
         API_READ_RECEIPT.with(|r| r.set((0, 0, true)));

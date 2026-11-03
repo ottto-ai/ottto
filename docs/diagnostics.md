@@ -348,8 +348,8 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
-Claude Code's local-evidence stage adds three such footprint records (empty
-counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+Claude Code's local-evidence stage adds three such footprint records (none on
+panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
@@ -357,6 +357,16 @@ final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
 step) and no footprint fields. `evidence_cross_root` counts carry
 `demanded_requests`: the page's demanded request ids each root is joined against.
+Of the three footprint records, only `evidence_read` has counts: one
+`evidence_mem` object of scalars. `in_use_bytes` (system-allocator live bytes, `malloc_zone_statistics`
+`size_in_use`, after the API evidence is attached, after the root loop and
+after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
+footprint at the first two points; the third is `stage_end_footprint_bytes`),
+`kept_rows` (API plus trace rows the pass keeps for the fold),
+`largest_root_rows` with `largest_root_kept` (the root with the most rows and
+whether the pass kept it), and `legacy_owners` (legacy request owners). Compare
+deltas between the points only; footprint also charges memory the allocator
+does not report.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
 around folding stored usage families into heads.
 

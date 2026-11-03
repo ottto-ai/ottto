@@ -12899,6 +12899,10 @@ impl std::fmt::Debug for ClaudeLegacyRequestOwners {
 }
 
 impl ClaudeLegacyRequestOwners {
+    /// Owned request hashes so far; a diagnostics scalar.
+    pub(crate) fn owner_count(&self) -> usize {
+        self.owners.len()
+    }
     /// Adds one healthy root's rows. Call in sorted root order, once per root
     /// with API rows; after a refusal nothing more is added.
     pub(crate) fn add_root(

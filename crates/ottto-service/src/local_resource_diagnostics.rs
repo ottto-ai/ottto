@@ -1405,10 +1405,43 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     first_read_bytes: Option<u64>,
+    evidence_mem: Option<EvidenceMem>,
+}
+/// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
+/// at A (API evidence attached), B (root loop done) and C (cross-root finish
+/// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
+/// keeps, the largest root's rows with its keep bit, and legacy owners.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct EvidenceMem {
+    in_use_bytes: [Option<u64>; 3],
+    footprint_bytes: [Option<u64>; 2],
+    pub(crate) kept_rows: usize,
+    largest_root_rows: usize,
+    largest_root_kept: bool,
+    pub(crate) legacy_owners: usize,
+}
+crate::heap_layout_bound::no_heap!(true; EvidenceMem);
+impl EvidenceMem {
+    /// Checkpoint 0 = A, 1 = B, 2 = C.
+    pub(crate) fn sample(&mut self, at: usize) {
+        self.in_use_bytes[at] = footprint::malloc_in_use();
+        if let Some(slot) = self.footprint_bytes.get_mut(at) {
+            *slot = footprint::current().phys_footprint_bytes;
+        }
+    }
+    pub(crate) fn note_root(&mut self, rows: usize, kept: bool) {
+        if rows > self.largest_root_rows {
+            self.largest_root_rows = rows;
+            self.largest_root_kept = kept;
+        }
+    }
 }
 impl StageWindow {
     pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
         self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
+    }
+    pub(crate) fn set_evidence_mem(&mut self, mem: EvidenceMem) {
+        self.evidence_mem = Some(mem);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         Self {
@@ -1418,6 +1451,7 @@ impl StageWindow {
             footprint: footprint::Stage::begin(),
             jsonl: None,
             first_read_bytes: None,
+            evidence_mem: None,
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1458,6 +1492,8 @@ impl Drop for StageWindow {
             jsonl: Option<jsonl::Counts>,
             #[serde(flatten)]
             first_read: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evidence_mem: Option<EvidenceMem>,
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
@@ -1469,6 +1505,7 @@ impl Drop for StageWindow {
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 first_read,
+                evidence_mem: self.evidence_mem,
             },
         });
     }
