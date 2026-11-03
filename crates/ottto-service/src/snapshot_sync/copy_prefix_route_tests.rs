@@ -166,9 +166,13 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             p.enrich(&c);
             p.finish();
             reads.push(opened(&scanner, &holder));
-            if let Some(base) = base {
+            if let Some(mut base) = base {
                 // The copy's prefix is removed, and the body equals a cold Full
-                // of the same prior.
+                // of the copy on the same accepted state: a new owner with no
+                // entry for the copy reads it whole beside the accepted holder.
+                let key = path.to_str().unwrap();
+                base.files.remove(key);
+                base.file_snapshot_fingerprints.remove(key);
                 let mut cold = c.raw(&E2ScanFixture::default(), base, 100, true, &[]);
                 cold.enrich(&c);
                 cold.finish();
