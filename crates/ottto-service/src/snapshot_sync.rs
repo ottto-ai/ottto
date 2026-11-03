@@ -10226,6 +10226,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
     let mut cross_window =
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
+    cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
         let (generation, mut api, mut trace) = decode_window.time(|| {
             let generation =
