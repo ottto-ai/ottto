@@ -28,6 +28,13 @@ pub(super) fn version_supported(version: u32) -> bool {
 pub(super) fn owned(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name().starts_with("tail."))
 }
+/// Freshness bookkeeping: heads, revisions, set-aside markers and the discovery
+/// stamp. Never charged to the save target that sizes the next collection page;
+/// reduction pages and fragments are.
+pub(super) fn bookkeeping(key: &RowKey) -> bool {
+    matches!(key, RowKey::Record { kind, .. }
+        if matches!(kind.name(), HEAD | REVISION | SET_ASIDE | "scan_state.tail_discovery"))
+}
 
 /// Paged collections, in `catalogue::TAIL_KINDS` order. `Revisions` is the
 /// file's debt (`tail.revision`, layout 5, position = revision id): it shares
@@ -229,20 +236,6 @@ pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) inventory: Option<InventoryFacts>,
 }
 impl Observation {
-    fn absorb(&mut self, later: Self) {
-        self.representation = later.representation;
-        self.summary = later.summary;
-        self.added.extend(later.added);
-        self.inventory = later.inventory.or(self.inventory.take());
-        for id in later.resolved {
-            self.replaced.remove(&id);
-            self.resolved.insert(id);
-        }
-        for (id, value) in later.replaced {
-            self.resolved.remove(&id);
-            self.replaced.insert(id, value);
-        }
-    }
     fn bytes(&self) -> u64 {
         self.added
             .iter()
@@ -294,16 +287,23 @@ impl TailStage {
             && self.erase.is_empty()
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
-        let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
-        let merged = match debt.observation.take() {
-            Some(mut prior) => {
-                prior.absorb(observation);
-                prior
-            }
-            None => observation,
-        };
-        debt.observation = Some(merged);
+        self.replace_observation(key, observation);
         self.report();
+    }
+    /// Many files' debt-only changes, staged one by one, with one report.
+    pub(super) fn observe_all(&mut self, observations: Vec<(String, Observation)>) {
+        for (key, observation) in observations {
+            self.replace_observation(&key, observation);
+        }
+        self.report();
+    }
+    /// A later observation of the key replaces the staged one: each is its
+    /// owner's whole delta from the committed rows.
+    fn replace_observation(&mut self, key: &str, observation: Observation) {
+        self.debt
+            .entry(key.as_bytes().to_vec())
+            .or_default()
+            .observation = Some(observation);
     }
     /// Staged observations of the key are superseded; later ones apply after.
     pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {
@@ -865,7 +865,7 @@ fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
     if rows.is_empty() {
         return Ok(false);
     }
-    tx.mark_erasure()?;
+    tx.mark_erasure(rows.iter().all(|row| bookkeeping(&row.key)))?;
     for header in rows {
         tx.delete(&header.key)?;
     }
@@ -1000,7 +1000,7 @@ fn observe(
         let key = row(REVISION, file, id)?;
         let old = tx.get(&key)?.context("state_v2_tail_membership")?;
         toggle(&mut entry.commit, &term(REVISION, id, &old.digest));
-        tx.mark_erasure()?;
+        tx.mark_erasure(true)?;
         match value {
             Some(value) => {
                 let written = write_value(tx, file, owner, id, &key, value)?;
@@ -1067,7 +1067,7 @@ fn write_file(
         );
         // A reset's purge of actual prior rows marks itself; a bootstrap owes nothing.
         if staged.change == Change::DropsPrivate {
-            tx.mark_erasure()?;
+            tx.mark_erasure(false)?;
         }
         for (collection, meta) in &staged.collections {
             table
@@ -1091,7 +1091,7 @@ fn write_file(
                 entry.pages = entry.pages.wrapping_sub(1);
                 tx.delete(&page_key)?;
                 delete_fragments(tx, file, collection.owner(), page, 0)?;
-                tx.mark_erasure()?;
+                tx.mark_erasure(false)?;
             }
         }
         applied.dirty_pages = staged.pages.len() as u64;
@@ -1196,12 +1196,18 @@ fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
     }
     Ok(keep)
 }
-/// Retire over a future head written in `tx`, which the caller drops uncommitted.
+/// Write a head of a newer envelope in `tx`: this build cannot read it.
 #[cfg(test)]
-pub(super) fn retire_future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+pub(super) fn future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
     let mut head = encode_head(1, &MembershipTable::new(), &Common::default(), None)?;
     head[5] = 2;
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
+    Ok(())
+}
+/// Retire over a future head written in `tx`, which the caller drops uncommitted.
+#[cfg(test)]
+pub(super) fn retire_future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
+    future_head_for_test(tx, file)?;
     retire(tx, file)
 }
 /// Written outside the file's rolled-back boundary, in the same transaction.
@@ -1306,7 +1312,18 @@ pub(super) fn apply(
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
     for file in removed.iter().chain(authorised) {
-        if retire(tx, file)? {
+        // F4: a head this build cannot read is set aside, never retired.
+        let mut kept = false;
+        let result = tx.isolated(&mut |tx| {
+            kept = retire(tx, file)?;
+            Ok(())
+        })?;
+        if result.is_err() {
+            mark_set_aside(tx, file, SetAsideCause::Row)?;
+            applied.set_aside += 1;
+            continue;
+        }
+        if kept {
             applied.kept_debt += 1;
         } else {
             tx.delete(&set_aside_key(file)?)?;

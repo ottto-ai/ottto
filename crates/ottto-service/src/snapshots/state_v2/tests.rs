@@ -1170,6 +1170,64 @@ fn store_growth_gauge_is_daily_and_counts_only() {
     assert_eq!(sample(&mut db).len(), 1);
 }
 
+/// [regress] Freshness bookkeeping never sizes the next collection page: a
+/// save under target stays under it whatever heads, revisions, set-aside
+/// markers and discovery stamp it also writes, and whatever debt it resolves
+/// or replaces; that erasure still purges. An ordinary erasure still charges
+/// the purge's epoch rows.
+#[test]
+fn freshness_bookkeeping_never_counts_toward_the_save_target() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let debt = |id: u64| RowKey::record("tail.revision", "/synthetic/debt.jsonl", id).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..4_000 {
+        put(&mut tx, &traversal(format!("dirty-{row}")), b"evidence");
+    }
+    for row in 0..2_000 {
+        for kind in ["tail.head", "tail.revision", "tail.set_aside"] {
+            let key = RowKey::record(kind, format!("/synthetic/{row}.jsonl"), 0).unwrap();
+            put(&mut tx, &key, b"debt");
+        }
+    }
+    let discovery = RowKey::record("scan_state.tail_discovery", Vec::<u8>::new(), 0).unwrap();
+    put(&mut tx, &discovery, b"{}");
+    put(&mut tx, &debt(0), b"r0");
+    put(&mut tx, &debt(1), b"r1");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+
+    // One ordinary row: the rest is what every commit charges.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &traversal("calibrate".into()), b"evidence");
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let at_target = 5_000 - (sqlite::dirty_rows_for_test(&db) - 1);
+
+    // Exactly at target, resolving one revision and replacing another.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..at_target {
+        put(&mut tx, &traversal(format!("at-{row}")), b"evidence");
+    }
+    tx.mark_erasure(true).unwrap();
+    assert!(tx.delete(&debt(0)).unwrap());
+    put(&mut tx, &debt(1), b"r1x");
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    assert_eq!(sqlite::dirty_rows_for_test(&db), 5_000);
+    assert!(!db.save_over_target(), "the page limit is not reduced");
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
+
+    // The same ordinary rows with an ordinary erasure: its epoch row counts.
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for row in 0..at_target {
+        put(&mut tx, &traversal(format!("over-{row}")), b"evidence");
+    }
+    tx.mark_erasure(false).unwrap();
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
+    assert_eq!(sqlite::dirty_rows_for_test(&db), 5_001);
+    assert!(db.save_over_target());
+}
+
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {

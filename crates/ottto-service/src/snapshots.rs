@@ -187,6 +187,7 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
+mod g7_debt;
 pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
@@ -46586,7 +46587,7 @@ fn advance_bounded_directory_traversal_with_budget(
         .iter()
         .any(|directory| !directory.watcher_hint);
     let mut freshness = money_freshness::WalkFold::resume(source);
-    let listed_at = sampled_scan::now_seconds();
+    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk, &mut freshness);
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -46608,6 +46609,7 @@ fn advance_bounded_directory_traversal_with_budget(
         }
     };
     while remaining > 0 {
+        debt.counts(&traversal.counts, relisted_counts.as_ref());
         restore(
             &mut traversal.counts,
             relisted_counts.take(),
@@ -46636,6 +46638,7 @@ fn advance_bounded_directory_traversal_with_budget(
                         disappearance_diagnostics::Site::WalkDirectory,
                     );
                 } else {
+                    debt.unlisted();
                     disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
@@ -46711,6 +46714,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(_) => {
@@ -46741,6 +46745,7 @@ fn advance_bounded_directory_traversal_with_budget(
             if source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(&path)
             {
+                debt.excluded(&path);
                 continue;
             }
             if source == SnapshotSource::Codex {
@@ -46750,6 +46755,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 Ok(metadata) => metadata,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     index.archive_io_error(&path, Some(&error));
+                    debt.unlisted();
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -46795,19 +46801,15 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if index
-                .files
-                .get(&local_index_key(&path))
-                .is_some_and(|entry| !entry.same_listing_stamp_as(&metadata))
-            {
-                freshness.changed_file(
-                    index.authority_terminal_member(&path),
-                    listed_at.saturating_sub(modified_unix_seconds),
-                );
-            }
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
+            let listing = g7_debt::Listing {
+                path: &path,
+                metadata: &metadata,
+                in_window: !aged,
+            };
+            debt.listed(index, listing);
             let owes_stamped = aged
                 && retention.owes_stamped(
                     source,
@@ -46829,14 +46831,6 @@ fn advance_bounded_directory_traversal_with_budget(
                     line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 }
                 continue;
-            }
-            // Inside the window and unread: outstanding. Archives keep their own
-            // debt.
-            if !codex_archive_path(&path) && !index.files.contains_key(&local_index_key(&path)) {
-                freshness.never_indexed_file(
-                    index.authority_terminal_member(&path),
-                    listed_at.saturating_sub(modified_unix_seconds),
-                );
             }
             let mut owed_unchanged = false;
             if relisting {
@@ -46924,6 +46918,7 @@ fn advance_bounded_directory_traversal_with_budget(
             }
         }
     }
+    debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
         &mut traversal.counts,
         relisted_counts,
@@ -46934,8 +46929,10 @@ fn advance_bounded_directory_traversal_with_budget(
             census.invalidate_walk();
         }
     }
+    let walk_ended = traversal.pending_directories.is_empty();
+    let debt = debt.end(index, walk_ended);
     if root_walk {
-        freshness.page_end(source, traversal.pending_directories.is_empty());
+        freshness.page_end(source, walk_ended, debt);
     }
     index.traversal = Some(traversal);
 }

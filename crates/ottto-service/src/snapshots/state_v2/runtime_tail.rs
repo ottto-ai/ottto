@@ -36,8 +36,9 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
-/// A debt-only change of one file, committed with the next save or at exit. It
-/// never publishes the file's graph progress and never clears its marker.
+/// A debt-only change of one file, committed with the next save or at exit; a
+/// later one of the same file before then replaces it. It never publishes the
+/// file's graph progress and never clears its marker.
 pub(in crate::snapshots) fn observe_tail(
     path: &Path,
     key: &str,
@@ -45,6 +46,16 @@ pub(in crate::snapshots) fn observe_tail(
 ) -> Result<()> {
     with_state(path, |state| {
         state.tail.observe(key, observation);
+        Ok(())
+    })
+}
+/// `observe_tail` for many files at once: one stage report, not one per file.
+pub(in crate::snapshots) fn observe_tails(
+    path: &Path,
+    observations: Vec<(String, Observation)>,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe_all(observations);
         Ok(())
     })
 }
@@ -125,6 +136,13 @@ pub(in crate::snapshots) fn load_revisions(
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_revisions(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })
+}
+/// The route of `index`'s live session, for a caller holding only the graph:
+/// `None` for a v1 graph, which has no Tail store.
+pub(in crate::snapshots) fn tail_route_path(
+    index: &ScanIndex,
+) -> Result<Option<std::path::PathBuf>> {
+    runtime_path(index)
 }
 /// Every key with a committed head, this route's graph generation, keys only.
 pub(in crate::snapshots) fn tail_head_keys(

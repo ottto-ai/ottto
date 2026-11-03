@@ -53,8 +53,8 @@ mod tail;
 use kinds::KindCx;
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
-    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
+    retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]
@@ -324,7 +324,9 @@ pub(super) trait Transaction {
     ) -> Result<Result<()>>;
     /// An opaque value this transaction replaced or deleted may have held a
     /// private string: require the existing physical purge at commit.
-    fn mark_erasure(&mut self) -> Result<()>;
+    /// `bookkeeping`: only freshness bookkeeping rows went, so the purge's own
+    /// epoch rows are bookkeeping too.
+    fn mark_erasure(&mut self, bookkeeping: bool) -> Result<()>;
     fn commit(self, expected_generation: u64, next_generation: u64) -> DurableCommitOutcome;
 }
 
