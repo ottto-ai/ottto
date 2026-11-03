@@ -6954,6 +6954,13 @@ fn a_completing_cursor_job_reclaims_headers_before_its_clone() {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
+        // Force both copy shares to compete with optional headers, using an
+        // ordinary outstanding reservation rather than a retired proof holder.
+        let credit = cache
+            .cursor_reserve(
+                state_bytes() - retained_floor(&cache) - cache.cursor_resident() - 1024 * 1024,
+            )
+            .expect("fixture pressure fits beside a bounded native job");
         super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
         let mut certified = false;
@@ -6972,6 +6979,8 @@ fn a_completing_cursor_job_reclaims_headers_before_its_clone() {
         assert!(probe.budget > 0);
         assert_eq!(probe.headers, Some(0), "no omitted headers at the clone");
         assert!(probe.fits(), "{probe:?}");
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
     });
 }
 

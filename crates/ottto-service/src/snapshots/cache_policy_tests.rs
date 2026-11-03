@@ -788,6 +788,9 @@ fn cache_policy_m1_refusal_decision_matrix_evicts_the_minimum() {
     let full = full_cache_with_retained_file(true);
     let mut scan = tail_active(&full, true);
     let cache = &full.cache;
+    // This matrix measures minimum retained-copy eviction. Optional headers
+    // have their own reclamation tests and must not satisfy its injected deficit.
+    cache.with_cursor(|cursor| cursor.headers.clear()).unwrap();
     // Q-PR14 control: the same overflowing measures beside the shape-F tail
     // release nothing and clear nothing.
     {
