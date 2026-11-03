@@ -37507,15 +37507,9 @@ fn codex_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator)
             .or_else(|| string_at(value, &["cwd"])),
     );
 }
-fn codex_header_workspace_content(meta: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
-}
 fn codex_agent_content(src: &Value, accumulator: &mut SnapshotAccumulator) {
     accumulator.codex_agent_label = string_at(src, &["subagent", "thread_spawn", "agent_path"])
         .and_then(safe_codex_agent_display_label);
-}
-fn pi_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_workspace_hash(string_at(value, &["cwd"]));
 }
 fn pi_prompt_content(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
     if role == Some("user") {
@@ -37584,7 +37578,7 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     accumulator.origin.originator = string_at(meta, &["originator"]);
     accumulator.origin.agent_role =
         string_at(meta, &["agent_role"]).or_else(|| string_at(meta, &["agent_type"]));
-    codex_header_workspace_content(meta, accumulator);
+    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
     accumulator
         .note_time(string_at(value, &["timestamp"]).or_else(|| string_at(meta, &["timestamp"])));
     accumulator.codex_session_meta_seen = true;
@@ -39368,16 +39362,6 @@ fn codex_total_usage_has_request_count(value: &Value) -> bool {
         .is_some()
 }
 
-/// The content projection of one Pi line; `role` is the message role. Usage
-/// and timing stay with the native caller.
-fn pi_content_line(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
-    match string_at(value, &["type"]).as_deref() {
-        Some("session") => pi_workspace_content(value, accumulator),
-        Some("message") => pi_prompt_content(value, role, accumulator),
-        _ => {}
-    }
-}
-
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     // Count per observed usage line, before response deduplication and timestamp
     // drops; rereads count again. Usage-shape probes remain side-effect-free.
@@ -39405,7 +39389,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                     .or_else(|| string_at(value, &["session_id"]))
                     .or_else(|| string_at(value, &["sessionId"]));
             }
-            pi_content_line(value, None, accumulator);
+            accumulator.set_workspace_hash(string_at(value, &["cwd"]));
             accumulator.note_time(pi_timestamp_field(value));
         }
         Some("message") => {
@@ -39413,42 +39397,26 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
             let role = pi_message_role(value);
-            pi_content_line(value, role.as_deref(), accumulator);
-            let timestamp = pi_message_timestamp(value);
-            if role.as_deref() == Some("assistant")
-                && accumulator.seen_pi_usage_keys.skip_fork_copy(value)
-            {
-                accumulator.set_model(string_at(value, &["message", "model"]));
-            } else if role.as_deref() == Some("assistant")
-                && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
-            {
-                apply_pi_usage_line(
+            pi_prompt_content(value, role.as_deref(), accumulator);
+            let timestamp = pi_usage_record_timestamp(value);
+            if role.as_deref() == Some("assistant") {
+                apply_pi_usage_record(
                     value,
                     accumulator,
                     timestamp.as_deref(),
                     PiUsageRecordShape::Message,
                 );
-            } else if role.as_deref() == Some("assistant")
-                && pi_message_usage(value).is_some_and(|usage| !usage.is_zero())
-            {
-                accumulator.note_dropped_usage();
             }
             accumulator.note_time(timestamp);
         }
         Some("message_end") => {
-            let timestamp = pi_message_end_timestamp(value);
-            if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
-                accumulator.set_model(string_at(value, &["message", "model"]));
-            } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
-                apply_pi_usage_line(
-                    value,
-                    accumulator,
-                    timestamp.as_deref(),
-                    PiUsageRecordShape::MessageEnd,
-                );
-            } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
-                accumulator.note_dropped_usage();
-            }
+            let timestamp = pi_usage_record_timestamp(value);
+            apply_pi_usage_record(
+                value,
+                accumulator,
+                timestamp.as_deref(),
+                PiUsageRecordShape::MessageEnd,
+            );
             accumulator.note_time(timestamp);
         }
         Some("model_change") => {
@@ -39621,17 +39589,28 @@ fn pi_timestamp_field(value: &Value) -> Option<String> {
         .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
 }
 
-fn pi_message_timestamp(value: &Value) -> Option<String> {
-    // Current and transitional Pi records may carry a later envelope write
-    // time at the top level. Provider response time is the usage occurrence
-    // clock and is also what historical message_end records use.
-    pi_usage_record_timestamp(value)
+/// One usage record (an assistant `message` or a `message_end`): a fork copy
+/// only sets the model; a valid or absent clock applies the usage; a present
+/// but invalid clock drops positive usage.
+fn apply_pi_usage_record(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    shape: PiUsageRecordShape,
+) {
+    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+        accumulator.set_model(string_at(value, &["message", "model"]));
+    } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+        apply_pi_usage_line(value, accumulator, timestamp, shape);
+    } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+        accumulator.note_dropped_usage();
+    }
 }
 
-fn pi_message_end_timestamp(value: &Value) -> Option<String> {
-    pi_usage_record_timestamp(value)
-}
-
+/// A usage record's occurrence clock. Current and transitional Pi records may
+/// carry a later envelope write time at the top level; provider response time
+/// is the usage occurrence clock and is also what historical `message_end`
+/// records use.
 fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
     let provider_timestamp = value.pointer("/message/timestamp");
     if provider_timestamp.is_some() {
@@ -39967,7 +39946,7 @@ fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
         reasoning_output_tokens: u64_at(usage, &["reasoning"]).unwrap_or_default(),
         unattributed_total_tokens: 0,
         request_count: 1,
-        costs: pi_usage_costs(usage),
+        costs: pi_usage_costs_with_observations(usage).0,
     };
     Some(totals)
 }
@@ -40001,10 +39980,6 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
 struct PiCostObservations {
     refused: u64,
     rounded: u64,
-}
-
-fn pi_usage_costs(usage: &Value) -> UsageCosts {
-    pi_usage_costs_with_observations(usage).0
 }
 
 fn pi_usage_costs_with_observations(usage: &Value) -> (UsageCosts, PiCostObservations) {
@@ -73026,7 +73001,7 @@ mod tests {
                 "cacheRead": -1
             }
         });
-        let costs = pi_usage_costs(&partial);
+        let costs = pi_usage_costs_with_observations(&partial).0;
         assert!(costs.observed);
         assert!(costs.reported);
         assert_eq!(costs.total, None);
@@ -73037,9 +73012,10 @@ mod tests {
         assert_eq!(snapshot_cost.total_cost_usd, None);
         assert_eq!(snapshot_cost.input_cost_usd.as_deref(), Some("0.001"));
 
-        let invalid = pi_usage_costs(&serde_json::json!({
+        let invalid = pi_usage_costs_with_observations(&serde_json::json!({
             "cost": {"total": null, "input": "invalid"}
-        }));
+        }))
+        .0;
         assert!(invalid.observed);
         assert!(!invalid.reported);
         assert_eq!(invalid.snapshot_cost(), None);
