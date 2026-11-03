@@ -13,6 +13,10 @@ const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
         4,
         "tail revision and head envelope: older writers would drop debt",
     ),
+    (
+        5,
+        "usage request sets derived from occurrence keys: older readers cannot restore them",
+    ),
 ];
 pub(super) const WRITER_CAPABILITY: u64 =
     WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;

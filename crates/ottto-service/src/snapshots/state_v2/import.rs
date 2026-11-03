@@ -1595,14 +1595,14 @@ mod application_cases {
 #[cfg(test)]
 mod codec_mapper_regressions {
     use super::*;
-    /// [format] read back counts aggregated references to repeated empty evidence.
+    /// [format] read back counts aggregated references to repeated evidence.
     #[test]
-    fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
+    fn read_back_counts_aggregated_references_to_repeated_evidence() {
         let scratch = crate::test_scratch::ScratchDir::canonical("codec-ref-readback");
         let index: ScanIndex = serde_json::from_value(serde_json::json!({
             "schema_version":2,"files":{},"claude_usage_family_pending":{"f":{
                 "census_window_end":"A","invalid":false,
-                "member_request_id_hashes":{"a":[],"b":[]}
+                "member_request_id_hashes":{"a":["x"],"b":["x"]}
             }}
         }))
         .unwrap();

@@ -574,7 +574,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -835,7 +835,7 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         // Capability 3 refuses any store whose minimum is above it.
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     assert_eq!(revisions(&reloaded, FILE).len(), 1);

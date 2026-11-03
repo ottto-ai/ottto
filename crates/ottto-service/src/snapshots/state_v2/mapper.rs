@@ -241,9 +241,35 @@ fn id(value: &Json) -> Option<u64> {
         .then(|| object.get("$request_set")?.as_u64())
         .flatten()
 }
+/// Stands for a usage member's request set that equals the keys of its own
+/// occurrence map (no entry: empty), so the row stores those hashes once.
+/// Never longer than a reference; any other set keeps its shared reference.
+const DERIVED: &str = "$derived";
+fn derived(value: &Json) -> bool {
+    value
+        .as_object()
+        .is_some_and(|o| o.len() == 1 && o.get(DERIVED) == Some(&Json::Bool(true)))
+}
+/// Each usage member's occurrence keys, in set order, as its derived set.
+fn occurrence_sets(
+    root: &BTreeMap<String, Box<serde_json::value::RawValue>>,
+) -> Result<BTreeMap<String, Json>> {
+    let Some(raw) = root.get("member_occurrences") else {
+        return Ok(BTreeMap::new());
+    };
+    let members: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>> =
+        serde_json::from_str(raw.get())?;
+    Ok(members
+        .into_iter()
+        .map(|(member, keys)| (member, keys.into_keys().map(Json::String).collect()))
+        .collect())
+}
 fn ref_ids(kind: &str, value: &mut Json) -> Result<Vec<RowKey>> {
     let mut result = Vec::new();
     for value in evidence_values(kind, value) {
+        if derived(value) {
+            continue;
+        }
         result.push(RowKey::RequestSet(
             id(value).context("state_v2_shared_reference")?,
         ));
@@ -256,6 +282,8 @@ struct Projection {
     json: Vec<u8>,
     refs: Vec<RowKey>,
     created: Vec<RowKey>,
+    /// Read only: shared sets this row could derive instead.
+    derivable: usize,
 }
 fn shared_json(
     tx: &mut dyn Transaction,
@@ -268,34 +296,52 @@ fn shared_json(
             json: json.to_vec(),
             refs: Vec::new(),
             created: Vec::new(),
+            derivable: 0,
         });
     };
     let mut root: BTreeMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_slice(json)?;
     let mut refs = Vec::new();
     let mut created = Vec::new();
+    let mut derivable = 0;
+    let occurrences = if kind == "usage.pending" {
+        Some(occurrence_sets(&root)?)
+    } else {
+        None
+    };
     if let Some(raw) = root.get_mut(field) {
         let mut value: Json = serde_json::from_str(raw.get())?;
         let values: Vec<_> = if kind == "file.census" {
-            vec![&mut value]
+            vec![("", &mut value)]
         } else {
             value
                 .as_object_mut()
                 .context("state_v2_evidence_map")?
-                .values_mut()
+                .iter_mut()
+                .map(|(member, value)| (member.as_str(), value))
                 .collect()
         };
-        for value in values {
+        for (member, value) in values {
+            let derive = occurrences
+                .as_ref()
+                .map(|o| o.get(member).cloned().unwrap_or(Json::Array(Vec::new())));
             if acquire {
+                if derive.as_ref() == Some(&*value) {
+                    *value = serde_json::json!({ DERIVED: true });
+                    continue;
+                }
                 let (id, new) = interning::resolve(tx, class, value)?;
                 refs.push(RowKey::RequestSet(id));
                 if new {
                     created.push(RowKey::RequestSet(id));
                 }
                 *value = serde_json::json!({"$request_set":id});
+            } else if derived(value) {
+                *value = derive.context("state_v2_shared_reference")?;
             } else {
                 *value =
                     interning::read(tx, class, id(value).context("state_v2_shared_reference")?)?;
+                derivable += usize::from(derive.as_ref() == Some(&*value));
             }
         }
         *raw = serde_json::value::RawValue::from_string(serde_json::to_string(&value)?)?;
@@ -304,6 +350,7 @@ fn shared_json(
         json: serde_json::to_vec(&root)?,
         refs,
         created,
+        derivable,
     })
 }
 /// Row commitments recorded while one hydrate decodes; its seed consumes them.
@@ -314,6 +361,14 @@ pub(super) fn read<T: DeserializeOwned + Serialize>(
     h: &Header,
     seed: Option<&mut Digests>,
 ) -> Result<T> {
+    read_derivable(tx, h, seed).map(|(value, _)| value)
+}
+/// `read`, plus how many stored shared sets the row could derive instead.
+pub(super) fn read_derivable<T: DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    h: &Header,
+    seed: Option<&mut Digests>,
+) -> Result<(T, usize)> {
     let stored = bytes(tx, h)?;
     let json = codec::expand(&stored, value_cap(&h.key))?;
     let kind = match &h.key {
@@ -331,7 +386,7 @@ pub(super) fn read<T: DeserializeOwned + Serialize>(
             .finalize();
         seed.insert(h.key.clone(), digest.into());
     }
-    Ok(value)
+    Ok((value, projection.derivable))
 }
 pub(super) fn put<T: Serialize + ?Sized>(
     tx: &mut dyn Transaction,

@@ -1651,3 +1651,6 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
 
 #[path = "codex_archive_kinds_tests.rs"]
 mod codex_archive_tests;
+
+#[path = "usage_sets_tests.rs"]
+mod usage_sets_tests;

@@ -302,8 +302,12 @@ fn usage_rows(next: &ScanIndex, rows: &mut mapper::Rows<'_>) -> Result<()> {
     rows.put(mapper::key("usage.pending", "", 0)?, &families)
 }
 /// A complete hydrate folds each usage row into its head, seeds its digest
-/// and drops the value: one decoded family at a time.
-fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<UsagePending> {
+/// and drops the value: one decoded family at a time. Also returns the rows
+/// still storing a request set their occurrence keys derive.
+fn cold_usage(
+    tx: &mut dyn Transaction,
+    seed: &mut mapper::Digests,
+) -> Result<(UsagePending, Vec<RowKey>)> {
     let _window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "hydrate_usage_heads");
     let manifest = tx
@@ -312,18 +316,40 @@ fn cold_usage(tx: &mut dyn Transaction, seed: &mut mapper::Digests) -> Result<Us
     let expected: usize = mapper::read(tx, &manifest, Some(&mut *seed))?;
     let mut cold = ColdUsage::default();
     let mut count = 0_usize;
+    let mut derivable = Vec::new();
     mapper::rows(tx, "usage.pending", |tx, h| {
         let Some(key_bytes) = mapper::member(&h)? else {
             return Ok(());
         };
         count += 1;
-        let family: ClaudeUsageFamilyPending = mapper::read(tx, &h, Some(&mut *seed))?;
+        let (family, sets): (ClaudeUsageFamilyPending, _) =
+            mapper::read_derivable(tx, &h, Some(&mut *seed))?;
+        if sets > 0 {
+            derivable.push(h.key.clone());
+        }
         let digest = *seed.get(&h.key).context("state_v2_row_digest")?;
         cold.fold(&dependency_family(key_bytes)?, &family, digest);
         Ok(())
     })?;
     ensure!(count == expected, "state_v2_missing_member");
-    Ok(UsagePending::Cold(Box::new(cold)))
+    Ok((UsagePending::Cold(Box::new(cold)), derivable))
+}
+/// Rewrite each listed usage row as stored: the same logical row and digest,
+/// with every request set its occurrence keys derive released. DB-only.
+pub(super) fn derive_usage_sets(tx: &mut dyn Transaction, keys: Vec<RowKey>) -> Result<()> {
+    let mut rewritten = 0;
+    for key in keys {
+        let Some(h) = tx.get(&key)? else {
+            continue;
+        };
+        let row: Box<serde_json::value::RawValue> = mapper::read(tx, &h, None)?;
+        mapper::put(tx, &key, &row)?;
+        rewritten += 1;
+    }
+    if rewritten > 0 {
+        telemetry::count("usage_sets_derived", rewritten);
+    }
+    Ok(())
 }
 /// A cold family's stored archive as (digests of the rows the replay keeps,
 /// replayed tail). Its ids and digests come from the baseline, or from the
@@ -479,7 +505,9 @@ pub(super) fn hydrate_filtered(
     // Custody views read their usage families resident; a complete hydrate
     // without raw holds keeps heads only.
     index.claude_usage_family_pending = if cold {
-        cold_usage(tx, seed.as_deref_mut().context("state_v2_seed")?)?
+        let (usage, derivable) = cold_usage(tx, seed.as_deref_mut().context("state_v2_seed")?)?;
+        cx.derivable_usage = derivable;
+        usage
     } else {
         mapper::read_map::<ClaudeUsageFamilyPending>(
             tx,

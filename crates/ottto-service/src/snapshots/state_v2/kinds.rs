@@ -32,6 +32,9 @@ pub(super) struct KindCx {
     pub(super) tail: Option<tail::TailStage>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
+    /// Usage rows a complete hydrate found storing a request set their own
+    /// occurrence keys derive; the next save rewrites them in place.
+    pub(super) derivable_usage: Vec<RowKey>,
     valid: bool,
 }
 
@@ -214,6 +217,7 @@ pub(super) fn delta(
         let retired = tail::removed_files(&rows.old);
         cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
         let digests = rows.finish()?;
+        kinds_accounts::derive_usage_sets(tx, std::mem::take(&mut cx.derivable_usage))?;
         Ok(Baseline {
             generation: next.generation,
             rows: digests,
