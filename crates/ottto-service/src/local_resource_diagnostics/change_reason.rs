@@ -109,6 +109,10 @@ struct Tags {
     sessions: BTreeMap<String, u8>,
     /// Per source: the cause of a `NewFile`, decided at index load.
     new_file: [Token; 3],
+    /// Per source, process-local and never persisted: the latest sharing
+    /// policy bits (`SEEN` once known), and `OFF` while the latest change
+    /// turned a flag off.
+    policy: [u8; 3],
     upload: [Upload; 3],
 }
 impl Tags {
@@ -116,6 +120,7 @@ impl Tags {
         files: BTreeMap::new(),
         sessions: BTreeMap::new(),
         new_file: [Token::Append; 3],
+        policy: [0; 3],
         upload: [Upload::NEW, Upload::NEW, Upload::NEW],
     };
 }
@@ -158,6 +163,33 @@ pub(crate) fn new_file_token(source: &str) -> Token {
     source_slot(source).map_or(Token::AdminOther, |slot| {
         with_tags(|tags| tags.new_file[slot])
     })
+}
+const POLICY_SEEN: u8 = 1 << 6;
+const POLICY_OFF: u8 = 1 << 7;
+/// The source's sharing-policy bits (titles, workspace labels, artifacts,
+/// attribution, attribution labels) at each upload-context check. A restart
+/// forgets the direction: its reads stay `admin_other`, never guessed.
+pub(crate) fn upload_policy(source: &str, bits: u8) {
+    let Some(slot) = source_slot(source) else {
+        return;
+    };
+    with_tags(|tags| {
+        let last = tags.policy[slot];
+        let flipped = (last ^ bits) & !(POLICY_SEEN | POLICY_OFF);
+        let off = if last & POLICY_SEEN == 0 || flipped == 0 {
+            last & POLICY_OFF
+        } else if flipped & !bits != 0 {
+            POLICY_OFF
+        } else {
+            0
+        };
+        tags.policy[slot] = bits | POLICY_SEEN | off;
+    });
+}
+/// An upload-context read of a delivered file while the latest sharing
+/// change this process saw turned a flag off.
+pub(crate) fn privacy_off(source: &str) -> bool {
+    source_slot(source).is_some_and(|slot| with_tags(|tags| tags.policy[slot] & POLICY_OFF != 0))
 }
 /// A file the scan is about to read, with its selection-time first cause.
 pub(crate) fn selected(source: &str, key: String, token: Token, sidecar_or_fingerprint: bool) {

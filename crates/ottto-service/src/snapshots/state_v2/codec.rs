@@ -351,6 +351,16 @@ mod tests {
         )
         .is_err());
     }
+    /// [format] Strict v2 decode still admits the retired upload-context
+    /// direction and drops it.
+    #[test]
+    fn strict_proof_state_admits_retired_direction() {
+        use crate::snapshots::upload_context_receipt::ProofState;
+        let old = br#"{"direction":{"policy":[true,false,false,false,false],
+            "context":null,"previous_context":"a","last_change_mask":2}}"#;
+        let proof = strict_json::<ProofState>(old).unwrap();
+        assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
+    }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
