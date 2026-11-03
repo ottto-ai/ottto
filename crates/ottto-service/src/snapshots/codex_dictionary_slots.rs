@@ -95,12 +95,3 @@ pub(super) struct CodexDictionarySlots {
 }
 crate::heap_layout_bound::fields!(CodexDictionarySlots; active_turns, open_calls, name_counts,
     priority_turns);
-impl CodexDictionarySlots {
-    /// No slot at all: a source other than Codex never takes one.
-    pub(super) fn is_empty(&self) -> bool {
-        self.active_turns.len() == 0
-            && self.open_calls.len() == 0
-            && self.name_counts.len() == 0
-            && self.priority_turns.len() == 0
-    }
-}
