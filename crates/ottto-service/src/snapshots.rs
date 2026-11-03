@@ -1451,13 +1451,7 @@ impl SnapshotSource {
                 home.join(".codex").join("archived_sessions"),
             ],
             SnapshotSource::ClaudeCode => vec![home.join(".claude").join("projects")],
-            SnapshotSource::Pi => {
-                if let Some(override_dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
-                    vec![PathBuf::from(override_dir).join("sessions")]
-                } else {
-                    vec![home.join(".pi").join("agent").join("sessions")]
-                }
-            }
+            SnapshotSource::Pi => vec![crate::agent_status::pi_sessions_dir(home)],
         }
     }
 }
