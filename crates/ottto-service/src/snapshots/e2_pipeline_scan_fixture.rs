@@ -770,7 +770,6 @@ pub(super) fn parse_ordinary_with_metadata(
         apply_claude_code_line,
         None,
         None,
-        None,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

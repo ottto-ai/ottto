@@ -2,9 +2,7 @@
 //! A source the store serves adds a row here, never a second test body.
 use super::*;
 use crate::snapshots::scan_index_persistence::Source;
-use crate::snapshots::{
-    CodexParentProofOwed, CodexParentProofState, LoadOrigin, OwedOrigin, SnapshotSource,
-};
+use crate::snapshots::{LoadOrigin, SnapshotSource};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -87,19 +85,6 @@ fn codex_fixture() -> ScanIndex {
         .file_snapshot_fingerprints
         .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
     index.accepted_snapshot_fingerprints.insert(fingerprint);
-    let owed = CodexParentProofOwed::new(
-        "parent".into(),
-        1,
-        crate::snapshots::CAUSE_NO_EVIDENCE,
-        OwedOrigin::Lineage,
-    );
-    index
-        .codex_parent_prefix_proofs
-        .insert("child".into(), CodexParentProofState::Owed(owed));
-    let stamp = json!({"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]});
-    let seal = json!({"stamp":stamp,"scope":crate::snapshots::codex_parent_side_scope().0,
-        "sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),
-        "verified_unix_seconds":1,"sealed_unix_seconds":1});
     let mut value = serde_json::to_value(&index).unwrap();
     for (field, replacement) in [
         (
@@ -114,32 +99,6 @@ fn codex_fixture() -> ScanIndex {
         ("codex_state_only_blocked_unattributed", json!(["member"])),
         ("codex_state_only_blocked_legacy", json!(["member"])),
         ("codex_state_only_blocked_attributed", json!(true)),
-        ("codex_parent_ownership_refs", json!(["member"])),
-        (
-            "codex_parent_ownership_ledgers",
-            json!({"parent":{"signatures":["signature"],"scan_complete":true}}),
-        ),
-        (
-            "codex_parent_side_requests",
-            json!({"parent":{"dev_ino":[1,2],"needed_extent":1,"state":{"kind":"live"},
-                "state_extent":1,"state_ctime":[1,0],"attempt_extent":1,"attempt_ctime":[1,0],
-                "attempts":1,"not_before_unix_seconds":1}}),
-        ),
-        (
-            "codex_parent_side",
-            json!({"parent":{"verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,
-                "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
-                "seal":seal}}),
-        ),
-        ("codex_parent_side_generation", json!(1)),
-        ("codex_parent_proof_wrap_epoch", json!(1)),
-        ("codex_parent_proof_cursor", json!("child")),
-        ("codex_parent_side_cursor", json!("parent")),
-        ("codex_parent_proof_seq", json!(1)),
-        (
-            "codex_proof_index_incarnation",
-            json!("0123456789abcdef0123456789abcdef"),
-        ),
         (
             "codex_counting_tombstones",
             json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}}),
@@ -201,7 +160,6 @@ fn assert_same(expected: &ScanIndex, actual: &ScanIndex) {
 }
 fn page(mut index: ScanIndex) -> ScanIndex {
     index.accepted_snapshot_fingerprints.insert("f".repeat(64));
-    index.codex_parent_side_generation += 1;
     index
 }
 
@@ -215,9 +173,9 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     let filled = serde_json::to_value(codex_fixture()).unwrap();
     let codex = catalogue::LAYOUTS
         .iter()
-        .filter(|(_, field, _)| field.starts_with("codex_"))
+        .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired_root(kind))
         .collect::<Vec<_>>();
-    assert_eq!(codex.len(), 19, "persisted Codex kinds");
+    assert_eq!(codex.len(), 8, "persisted Codex kinds");
     for (kind, field, introduced) in codex {
         assert_eq!(*introduced, 1, "{kind}: no layout bump for Codex-ON");
         assert_ne!(
@@ -251,12 +209,11 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     }
 }
 
-/// [behaviour] A state v2 reload whose store holds no incarnation mints a
-/// fresh RAM nonce each time, though its fence is unchanged; the path's
-/// first-load flag and seq high-water still come from the memo.
+/// [behaviour] The per-path first-load marker survives v2 reloads without
+/// retaining a proof incarnation or sequence high-water.
 #[test]
-fn v2_reload_without_a_persisted_incarnation_mints_fresh_and_keeps_high_water() {
-    let scratch = crate::test_scratch::ScratchDir::canonical("codex-on-d62");
+fn v2_reload_keeps_per_path_first_load_membership() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("codex-first-load");
     let (custody, published) = money_test_support::ColdSession::publish(
         Source::Codex,
         &ScanIndex::default(),
@@ -264,28 +221,20 @@ fn v2_reload_without_a_persisted_incarnation_mints_fresh_and_keeps_high_water() 
     );
     let path = custody.path();
     assert!(state_v2_growth_retention_active(&published));
-    assert!(published.codex_proof_index_incarnation.is_empty());
-    crate::snapshots::raise_codex_proof_seq_high_water(&published.codex_proof_index_minted, 7);
-    let mut nonces = BTreeSet::from([published.codex_proof_index_minted.clone()]);
+    ScanIndex::default().note_first_index_load(path);
     for _ in 0..2 {
-        let (mut index, origin) = ScanIndex::load_inner_with_support(
+        let (index, origin) = ScanIndex::load_inner_with_support(
             path,
             Some(SnapshotSource::Codex),
             None,
             SystemTime::now(),
         )
         .unwrap();
-        assert!(matches!(origin, LoadOrigin::Loaded(_)));
+        assert!(matches!(origin, LoadOrigin::Loaded));
         assert!(state_v2_growth_retention_active(&index));
         assert!(
-            !index.mint_or_reuse_codex_proof_incarnation(path, origin),
+            !index.note_first_index_load(path),
             "not the path's first load"
-        );
-        assert_eq!(index.codex_parent_proof_seq, 7, "the path's high-water");
-        assert!(index.codex_proof_index_incarnation.is_empty());
-        assert!(
-            nonces.insert(index.codex_proof_index_minted.clone()),
-            "a fresh RAM nonce"
         );
     }
 }

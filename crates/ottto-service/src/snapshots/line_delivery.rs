@@ -99,10 +99,7 @@ impl OwnedSourceScan {
 impl OwnedActiveFile {
     /// Shared primary-reader role gate for borrowed consumers.
     pub(super) fn is_primary_for(&self, source: SnapshotSource) -> bool {
-        self.parser.source == source
-            && self.side_origin.is_none()
-            && !self.comparison_target
-            && self.group.is_none()
+        self.parser.source == source && !self.comparison_target && self.group.is_none()
     }
 }
 impl LineDelivery {

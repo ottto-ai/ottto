@@ -727,19 +727,40 @@ crate::durable_tail_codec::durable_struct!(SessionArtifact {
 });
 
 macro_rules! head_fields {
-    ($($c:ident $f:ident : $ty:ty),* $(,)?) => {
+    (@put $c:ident, $e:ident, $f:ident, $ty:ty) => {
+        durable_field!(put $c, $e, $f, $ty, concat!("SnapshotAccumulator.", stringify!($f)));
+    };
+    (@put $c:ident, $e:ident, $f:ident, $ty:ty = $empty:expr => $old:ident : $shape:ty) => {
+        let _ = $f;
+        let value: &$ty = &$empty;
+        durable_field!(put $c, $e, value, $ty, concat!("SnapshotAccumulator.", stringify!($old)));
+    };
+    (@take $c:ident, $d:ident, $ty:ty) => {
+        durable_field!(take $c, $d, $ty)
+    };
+    (@take $c:ident, $d:ident, $ty:ty = $empty:expr => $old:ident : $shape:ty) => {{
+        let _ = durable_field!(take $c, $d, $ty);
+        $empty
+    }};
+    (@shape $c:ident, $s:ident, $f:ident, $ty:ty) => {
+        durable_field!(shape $c, $s, $f, $ty);
+    };
+    (@shape $c:ident, $s:ident, $f:ident, $ty:ty = $empty:expr => $old:ident : $shape:ty) => {
+        durable_field!(shape $c, $s, $old, $shape);
+    };
+    ($($c:ident $f:ident : $ty:ty $(= $empty:expr => $old:ident : $shape:ty)?),* $(,)?) => {
         fn put_fields(acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
             let SnapshotAccumulator { $($f),* } = acc;
-            $(durable_field!(put $c, e, $f, $ty, concat!("SnapshotAccumulator.", stringify!($f)));)*
+            $(head_fields!(@put $c, e, $f, $ty $(= $empty => $old : $shape)?);)*
             Ok(())
         }
         fn take_fields(d: &mut Dec<'_>) -> Result<SnapshotAccumulator, Corrupt> {
-            Ok(SnapshotAccumulator { $($f: durable_field!(take $c, d, $ty)),* })
+            Ok(SnapshotAccumulator { $($f: head_fields!(@take $c, d, $ty $(= $empty => $old : $shape)?)),* })
         }
         /// Test only: the head-field walk's shape, for the layout pin.
         #[cfg(test)]
         fn shape_fields(s: &mut crate::durable_tail_codec::Shape) {
-            $(durable_field!(shape $c, s, $f, $ty);)*
+            $(head_fields!(@shape $c, s, $f, $ty $(= $empty => $old : $shape)?);)*
         }
     };
 }
@@ -798,7 +819,8 @@ head_fields! {
     D codex_ownership_boundary: CodexOwnershipBoundary,
     N codex_legacy_trigger_seen: bool,
     N codex_legacy_bootstrap_valid: bool,
-    I codex_parent_ownership_ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    // D203: retired positional slots keep their original empty bytes and shape.
+    I retired_codex_parent_ownership_ledgers: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_parent_ownership_ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     N codex_sidecar_created_thread: bool,
     D codex_path_sidecar_candidates: Vec<CodexPathSidecarCandidate>,
     U codex_resolved_path_identity: Option<String>,
@@ -808,28 +830,28 @@ head_fields! {
     N codex_bind_seed_len: Option<u64>,
     I codex_sidecar_projected_next_ordinal: Option<u64>,
     U codex_parent_session_ref: Option<String>,
-    I codex_parent_signatures: Option<CodexParentPrefix>,
-    H codex_parent_prefix_digest: PrefixDigest,
-    D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
-    I codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
-    I codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
-    N codex_parent_proof_mismatch: bool,
-    I codex_parent_proof_refusal: Option<ProofRefusal>,
-    N codex_proof_decision_only: bool,
-    N codex_boundary_buffer_count: u8,
-    H codex_proof_ledger_row: Option<String>,
-    H codex_parent_ledger_identity_used: Option<String>,
-    D codex_parent_unresolvable: Option<CodexParentUnresolvable>,
-    N codex_parent_ledger_consulted: bool,
-    N codex_parent_signature_index: usize,
+    I retired_codex_parent_signatures: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_parent_signatures: Option<CodexParentPrefix>,
+    H retired_codex_parent_prefix_digest: PrefixDigest = [0; 32] => codex_parent_prefix_digest: PrefixDigest,
+    D retired_codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)> = None => codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
+    I retired_codex_parent_prefix_proof: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    I retired_codex_parent_proof_used: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
+    N retired_codex_parent_proof_mismatch: bool = false => codex_parent_proof_mismatch: bool,
+    I retired_codex_parent_proof_refusal: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_parent_proof_refusal: Option<ProofRefusal>,
+    N retired_codex_proof_decision_only: bool = false => codex_proof_decision_only: bool,
+    N retired_codex_boundary_buffer_count: u8 = 0 => codex_boundary_buffer_count: u8,
+    H retired_codex_proof_ledger_row: Option<String> = None => codex_proof_ledger_row: Option<String>,
+    H retired_codex_parent_ledger_identity_used: Option<String> = None => codex_parent_ledger_identity_used: Option<String>,
+    D retired_codex_parent_unresolvable: Option<CodexParentUnresolvable> = None => codex_parent_unresolvable: Option<CodexParentUnresolvable>,
+    N retired_codex_parent_ledger_consulted: bool = false => codex_parent_ledger_consulted: bool,
+    N retired_codex_parent_signature_index: usize = 0 => codex_parent_signature_index: usize,
     N codex_native_created_thread_valid: bool,
     N codex_created_thread_native_only: bool,
     N codex_native_created_thread_header_nanos: Option<i128>,
     N codex_native_created_thread_last_nanos: Option<i128>,
     L codex_native_created_thread_task_turn_id: Option<String>,
     N codex_native_created_thread_first_turn_bound: bool,
-    I codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
-    N codex_physical_signatures_complete: bool,
+    I retired_codex_physical_signatures: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
+    N retired_codex_physical_signatures_complete: bool = true => codex_physical_signatures_complete: bool,
     N codex_ordinal_expected: Option<u64>,
     N codex_ordinal_sequence_valid: bool,
     N codex_owned_record_seen: bool,
@@ -907,4 +929,59 @@ head_fields! {
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
+}
+
+#[cfg(test)]
+mod retired_slot_tests {
+    use super::*;
+
+    /// [format] Retired head slots always write the previous empty bytes;
+    /// decoded state cannot restore a legacy decision or retained allocation.
+    #[test]
+    fn retired_head_slots_are_inert_and_keep_empty_bytes() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+            SnapshotSource::Codex,
+        ] {
+            let mut acc = SnapshotAccumulator::new(source);
+            let empty = encode(|e| put_fields(&acc, e)).unwrap();
+            acc.retired_codex_parent_prefix_digest = [1; 32];
+            acc.retired_codex_parent_prefix_decided = Some((7, [2; 32], true));
+            acc.retired_codex_parent_proof_mismatch = true;
+            acc.retired_codex_proof_decision_only = true;
+            acc.retired_codex_boundary_buffer_count = 7;
+            acc.retired_codex_proof_ledger_row = Some("old".into());
+            acc.retired_codex_parent_ledger_identity_used = Some("old".into());
+            acc.retired_codex_parent_unresolvable = Some(CodexParentUnresolvable::Absent);
+            acc.retired_codex_parent_ledger_consulted = true;
+            acc.retired_codex_parent_signature_index = 7;
+            acc.retired_codex_physical_signatures_complete = false;
+            assert_eq!(encode(|e| put_fields(&acc, e)).unwrap(), empty);
+            let mut d = Dec::new(&empty);
+            let restored = take_fields(&mut d).unwrap();
+            d.finish().unwrap();
+            assert_eq!(encode(|e| put_fields(&restored, e)).unwrap(), empty);
+            assert!(restored.retired_codex_parent_prefix_decided.is_none());
+            assert!(restored.retired_codex_parent_unresolvable.is_none());
+            assert!(restored.retired_codex_physical_signatures_complete);
+        }
+    }
+
+    /// [format] Shipped ordinal 3 remains readable, and no writer emits it.
+    #[test]
+    fn ownership_ordinal_three_is_a_decode_only_tombstone() {
+        let mut d = Dec::new(&[3]);
+        let retired = CodexOwnershipBoundary::take(&mut d).unwrap();
+        d.finish().unwrap();
+        assert!(matches!(
+            retired,
+            CodexOwnershipBoundary::AwaitingParentPrefix
+        ));
+        assert!(encode(|e| retired.put(e)).is_err());
+        assert_eq!(
+            encode(|e| CodexOwnershipBoundary::AllLocal.put(e)).unwrap(),
+            [1]
+        );
+    }
 }

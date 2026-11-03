@@ -865,6 +865,100 @@ fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
     assert!(!fixture.root.exists());
 }
 
+fn replay_indexed(index: &mut ScanIndex, key: &str) {
+    index.files.insert(
+        key.into(),
+        crate::snapshots::tests::manifest_index_entry(Some("synthetic-fingerprint")),
+    );
+}
+
+fn replay_delivered(index: &ScanIndex, key: &str) -> bool {
+    index
+        .files
+        .get(key)
+        .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some())
+}
+
+/// [behaviour] A pass replays through the sync expression
+/// `pending && index.prepare_historical_replay(generation)`, which takes no
+/// source, so Claude, Codex and Pi share it: no pending replay changes
+/// nothing; a pending one resets delivery and records its generation; a
+/// repeated same-generation replay resets nothing indexed since; a new
+/// generation replays again.
+#[test]
+fn historical_replay_runs_once_per_generation_only_when_pending() {
+    let key = "/s/replay.jsonl";
+    let replay = |index: &mut ScanIndex, pending: bool, generation: &str| {
+        pending && index.prepare_historical_replay(generation.into())
+    };
+    let mut index = ScanIndex::default();
+    replay_indexed(&mut index, key);
+
+    assert!(!replay(&mut index, false, "g1"));
+    assert_eq!(index.historical_replay_generation, None);
+    assert!(replay_delivered(&index, key));
+
+    assert!(replay(&mut index, true, "g1"));
+    assert_eq!(index.historical_replay_generation.as_deref(), Some("g1"));
+    assert!(!replay_delivered(&index, key));
+
+    // The replay pass indexes the file again.
+    replay_indexed(&mut index, key);
+    assert!(!replay(&mut index, true, "g1"));
+    assert!(
+        replay_delivered(&index, key),
+        "a repeated replay resets nothing"
+    );
+
+    assert!(replay(&mut index, true, "g2"));
+    assert_eq!(index.historical_replay_generation.as_deref(), Some("g2"));
+    assert!(!replay_delivered(&index, key));
+}
+
+/// [behaviour] Replay custody on a real index file: a replay whose save
+/// fails leaves the pre-replay file, so the reloaded pass replays again;
+/// once saved, the reloaded generation holds, nothing is pending, and a
+/// repeated replay resets nothing indexed since.
+#[test]
+fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
+    const GENERATION: &str = "codex:replay-custody:g1";
+    let key = "/s/replay-custody.jsonl";
+    let scratch = crate::test_scratch::private_dir("replay-custody");
+    let path = scratch.join("index.json");
+    let pending =
+        |index: &ScanIndex| index.historical_replay_generation.as_deref() != Some(GENERATION);
+    let mut disk = ScanIndex::default();
+    replay_indexed(&mut disk, key);
+    disk.save(&path).unwrap();
+
+    // The replay resets the loaded copy; its save fails.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert!(pending(&index));
+    assert!(index.prepare_historical_replay(GENERATION.into()));
+    assert!(!replay_delivered(&index, key));
+    drop(index);
+
+    // The reloaded file is still pre-replay: the replay re-runs, and the
+    // pass that indexes the file again saves.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(index.historical_replay_generation, None);
+    assert!(replay_delivered(&index, key));
+    assert!(pending(&index));
+    assert!(index.prepare_historical_replay(GENERATION.into()));
+    replay_indexed(&mut index, key);
+    index.save(&path).unwrap();
+
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        index.historical_replay_generation.as_deref(),
+        Some(GENERATION)
+    );
+    assert!(!pending(&index));
+    assert!(!index.prepare_historical_replay(GENERATION.into()));
+    assert!(replay_delivered(&index, key));
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
 // F10: count surviving complete offers at the real post-policy finalizer.
 // Parser completion and an equal body suppressed as a semantic noop are not
 // publication. This runs portably; Pi has no production durable source registration.

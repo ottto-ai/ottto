@@ -1085,10 +1085,6 @@ mod hydrate_parity {
                 .collect::<Vec<_>>()
         };
         assert_eq!(custody(actual), custody(expected));
-        assert_eq!(
-            actual.codex_parent_proof_parents_live,
-            expected.codex_parent_proof_parents_live
-        );
     }
     fn unix_now() -> u64 {
         SystemTime::now()
@@ -1708,7 +1704,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_view = materialized(&committed);
     let committed_generation = current.generation;
     let committed_context = current.historical_replay_generation.clone();
-    current.historical_replay_generation = Some("uncommitted-context".into());
+    assert!(current.prepare_historical_replay("uncommitted-context".into()));
     fill_session(&mut current);
     assert!(save_locked(
         &f.path,
@@ -1746,6 +1742,9 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     );
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.historical_replay_generation, committed_context);
+    let mut replay_again = restored.clone();
+    assert!(replay_again.prepare_historical_replay("uncommitted-context".into()));
+    assert!(!replay_again.prepare_historical_replay("uncommitted-context".into()));
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 
     let path = seed.files.keys().next().unwrap();

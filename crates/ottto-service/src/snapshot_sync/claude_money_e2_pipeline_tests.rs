@@ -3474,6 +3474,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("copy_route_oracle_tests.rs");
     }
     #[cfg(unix)]
+    mod codex_legacy_fork_tests {
+        include!("../snapshots/codex_legacy_fork_tests.rs");
+    }
+    #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
     }

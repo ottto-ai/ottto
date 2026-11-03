@@ -296,8 +296,7 @@ no authority and do not imply a continuation page ran. No raw ticket means no
 mint decision; authority/lifetime refusals remain outside these five outcomes.
 
 The inventory check performs at most one `lstat` per carried rollout path
-(up to 32,768), stopping on the first mismatch. It includes ledger parents and
-the held file. Any changed rollout holds continuation, so active Codex sessions
+(up to 32,768), stopping on the first mismatch. It includes the held file. Any changed rollout holds continuation, so active Codex sessions
 usually leave it idle. Additions wait for the ordinary census; an EOF park that
 cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
 keeping the prior body rather than emitting a zero replacement.
@@ -566,8 +565,8 @@ written. Counts saturate at `u64::MAX`.
 
 `counts.line_delivery` is keyed by the fixed name of the page's one registered
 line observer, for example `{"footprint": {...}}`. The observer receives the
-physical lines the page's primary reads already consumed; proof, parent, side,
-group, native-comparison and one-shot reads deliver nothing. All values are
+physical lines the page's primary reads already consumed; group,
+native-comparison and one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
 
 - `lines`: newline-complete physical lines delivered, including blank,
@@ -582,8 +581,7 @@ page events, not gauges, and are never summed across observers:
 
 **Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
 one shared exemption from the discovery window, used by every age gate: the
-Claude/Pi walk, candidate revalidation and open, the Codex roster and
-`codex_parent_outside_window`. A key owed by a registered source stays
+Claude/Pi walk, candidate revalidation and open, and the Codex roster. A key owed by a registered source stays
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
@@ -624,7 +622,7 @@ registered, and counts decisions rather than distinct files or bytes.
 exceeds its committed indexed `size_bytes`, using metadata already available at
 the age gate. Grown since committed: retention ends when the growth is committed
 (`size_bytes` catches up). Untouched and truncated files gain no exemption. This
-covers the walk, candidate/open rechecks, Codex roster and opened parent.
+covers the walk, candidate/open rechecks and Codex roster.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by
 source on the #799 page line, drained per page and omitted at zero. It counts
 one event per gate check, even if another retention source also matches; a file
@@ -1681,12 +1679,12 @@ sessions, decoded bytes or money. No path or session id is included.
 | Cause | Unsupported boundary |
 | --- | --- |
 | `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
-| `CompressedProofParentUnsupported` | Proof parent reader |
-| `CompressedProofChildUnsupported` | Proof child reader |
-| `CompressedParentSideUnsupported` | Parent side acquisition |
+| `CompressedProofParentUnsupported` | Retired proof parent reader; not emitted by current builds |
+| `CompressedProofChildUnsupported` | Retired proof child reader; not emitted by current builds |
+| `CompressedParentSideUnsupported` | Retired parent side acquisition; not emitted by current builds |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Parent rollout is compressed and cannot supply ledger evidence, or the shared ownership parser held an ordinary archive fork after Full decoding without proven parent-prefix evidence |
+| `CompressedParentLedgerUnbound` | Retired parent-ledger hold; not emitted by current builds. A compressed legacy user fork counts best effort like a plain one |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
@@ -1699,7 +1697,7 @@ legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
 retained → cursor before taking the durable Stores leaf lock. It keeps a
-fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
+fixed admission floor (one 8 MiB primary entry) free
 for primary Tail reads and never charges retained bytes twice. When free room is
 short and the claim can fit beside the whole cursor state, it reclaims optional
 header facts, then releases retained copies, counted in
@@ -1792,7 +1790,7 @@ scalar remain separate from S and the bucket partition.
 | --- | --- |
 | 1. `inventory_hold` | Compound A1/group-preparation refusal: group member count. Incomplete-inventory remaining-singleton clear: remaining candidate count. |
 | 2. `other_group_receipt_legacy` | Strict group member count; one per terminal member disclosure or failed tier replay candidate; receipt-cap alias members (minimum one); incomplete joined-replacement alias members; distinct affected keys per legacy-hold invocation. |
-| 3. `parent_unresolvable` | One per held parsed rollout with an exact parent cause, including Absent, DeferredRef and DeferredRestart. |
+| 3. `parent_unresolvable` | Retired: no current build increments it, because no rollout is held for its parent. The slot stays for decode compatibility and reads zero. |
 | 4. `created_thread_proof` | One per held parsed rollout in the native-created-thread-only path, including failed parentless A2 conjuncts, after parent precedence. |
 | 5. `protected_absent` | Newly missing protected path index keys excluded by the existing traversal residue set. |
 | 6. `other_parser` | One per remaining ownership-incomplete parsed rollout. |

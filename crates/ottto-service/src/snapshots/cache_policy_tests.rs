@@ -170,7 +170,6 @@ fn retained_reduction(fixture: &ScanFixture) -> Retained<sampled_jsonl::CachedJs
         apply_claude_code_line,
         Some(&metadata),
         None,
-        None,
     )
     .unwrap();
     let scope = Scope("cache-policy-filler".into());

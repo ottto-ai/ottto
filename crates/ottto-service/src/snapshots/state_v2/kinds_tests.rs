@@ -1775,3 +1775,113 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
         }
     }
 }
+
+/// [format] Old -> new -> old -> new: the shipped member layout is accepted,
+/// its generic empty roots remain readable, and each ordinary save retires
+/// the old contents without changing unrelated money or request custody.
+#[test]
+fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
+    use mapper::Members::{Field, Map, Set};
+    use serde_json::json;
+    let rows = [
+        (
+            "codex_parent_ownership_refs",
+            Set,
+            json!(["parent"]),
+            json!([]),
+        ),
+        (
+            "codex_parent_ownership_ledgers",
+            Map,
+            json!({"parent":{"signatures":["signature"],"scan_complete":true}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_side_requests",
+            Map,
+            json!({"parent":{"dev_ino":[1,2],"needed_extent":1,"state":{"kind":"live"},"state_extent":1,"state_ctime":[1,0],"attempt_extent":1,"attempt_ctime":[1,0],"attempts":1,"not_before_unix_seconds":1}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_side",
+            Map,
+            json!({"parent":{"verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,"parsed":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},"seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},"scope":"retired","sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+            json!({}),
+        ),
+        ("codex_parent_side_generation", Field, json!(7), json!(0)),
+        ("codex_parent_proof_wrap_epoch", Field, json!(2), json!(0)),
+        (
+            "codex_parent_prefix_proofs",
+            Map,
+            json!({"child":{"state":"owed","parent":"parent","seq":9,"cause":255,"origin":"lineage","wake":{"kind":"due"},"outcome":0,"attempts":0,"not_before_unix_seconds":0}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_proof_cursor",
+            Field,
+            json!("child"),
+            json!(null),
+        ),
+        (
+            "codex_parent_side_cursor",
+            Field,
+            json!("parent"),
+            json!(null),
+        ),
+        ("codex_parent_proof_seq", Field, json!(9), json!(0)),
+        (
+            "codex_proof_index_incarnation",
+            Field,
+            json!("0123456789abcdef0123456789abcdef"),
+            json!(""),
+        ),
+    ];
+    let (scratch, mut db) = Scratch::store();
+    let original = fixture();
+    commit_populate(&mut db, &original);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    db.finish_import().unwrap();
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    for round in 0..2 {
+        // The old writer's existing split-field representation.
+        let generation: u64 = db.read_control("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let mut old = mapper::Rows {
+            tx: Some(&mut tx),
+            ..Default::default()
+        };
+        for (field, mode, value, _) in &rows {
+            mapper::field_write(&mut old, &format!("v1_field.{field}"), value, *mode).unwrap();
+        }
+        old.finish().unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        let (mut upgraded, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let mut expected = original.clone();
+        expected.generation = upgraded.generation;
+        assert_persisted(&mut db, &expected);
+        let before = baseline(&upgraded, &mut cx).unwrap();
+        super::save_graph(&mut db, &identity, before, &mut upgraded, &mut cx).unwrap();
+        expected.generation = upgraded.generation;
+        assert_persisted(&mut db, &expected);
+        // A previous writer can still read all eleven required roots. It
+        // sees no retired content, even after another upgrade/save cycle.
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for (field, mode, _, empty) in &rows {
+            let kind = format!("v1_field.{field}");
+            let value: serde_json::Value =
+                mapper::field_read(&mut tx, &kind, *mode, None, || empty.clone()).unwrap();
+            assert_eq!(&value, empty, "round {round}: {field}");
+            let mut count = 0;
+            mapper::rows(&mut tx, &kind, |_, _| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(count, 1, "only the empty compatibility root remains");
+        }
+    }
+}

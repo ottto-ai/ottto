@@ -1454,7 +1454,13 @@ pub(crate) use durable_struct;
 /// `durable_enum!(T { 0 => A, 1 => B(N x: u64), 2 => C { N p: u8 } })`.
 /// Tags are explicit and never reused.
 macro_rules! durable_enum {
-    ($t:ident { $($tag:literal => $v:ident
+    (@tag $e:ident, $tag:literal) => { $e.varint($tag) };
+    (@tag $e:ident, $tag:literal, decode_only) => {
+        Err::<(), $crate::durable_tail_codec::Refuse>(
+            $crate::durable_tail_codec::Refuse::NonEmpty("retired enum variant")
+        )
+    };
+    ($t:ident { $($tag:literal => $v:ident $([$decode_only:ident])?
         $(( $($tc:ident $tf:ident : $tty:ty),* $(,)? ))?
         $({ $($sc:ident $sf:ident : $sty:ty),* $(,)? })?
     ),* $(,)? }) => {
@@ -1465,7 +1471,7 @@ macro_rules! durable_enum {
             ) -> Result<(), $crate::durable_tail_codec::Refuse> {
                 match self {
                     $(Self::$v $(( $($tf),* ))? $({ $($sf),* })? => {
-                        e.varint($tag)?;
+                        $crate::durable_tail_codec::durable_enum!(@tag e, $tag $(, $decode_only)?)?;
                         $($($crate::durable_tail_codec::durable_field!(
                             put $tc, e, $tf, $tty,
                             concat!(stringify!($t), "::", stringify!($v), ".", stringify!($tf))

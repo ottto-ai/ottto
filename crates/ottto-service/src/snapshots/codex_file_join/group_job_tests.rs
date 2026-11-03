@@ -1448,7 +1448,7 @@ fn group_with_legacy_tee_is_byte_charged() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-            ledgers: None,
+
             index: &previous,
         })
         .unwrap();
@@ -1592,7 +1592,7 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-            ledgers: None,
+
             index: &previous,
         })
         .unwrap();
@@ -2173,7 +2173,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         reconciliation_started: false,
         watcher_hint_seen: false,
         codex_freshness_yield: false,
-        codex_parent_resolution_retry_required: false,
+        retired_codex_parent_resolution_retry_required: serde::de::IgnoredAny,
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,
         counts: crate::snapshots::ScanTraversalCounts::default(),
@@ -2559,7 +2559,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &compressed,
             &metadata,
             None,
-            None,
             codex_counting_version::AckEvidence::None
         )
         .is_err());
@@ -2570,7 +2569,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             &compressed,
             &File::open(&compressed.path).unwrap(),
             &metadata,
-            None,
             None,
         )
         .is_err());
@@ -2587,7 +2585,7 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-            ledgers: None,
+
             index: &index,
         })
         .unwrap();

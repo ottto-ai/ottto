@@ -343,17 +343,6 @@ impl Serialize for ScanIndex {
         field!(codex_state_only_blocked_unattributed, BTreeSet::is_empty);
         field!(codex_state_only_blocked_legacy, BTreeSet::is_empty);
         field!(codex_state_only_blocked_attributed, std::ops::Not::not);
-        field!(codex_parent_ownership_refs, BTreeSet::is_empty);
-        field!(codex_parent_ownership_ledgers, BTreeMap::is_empty);
-        field!(codex_parent_side_requests, BTreeMap::is_empty);
-        field!(codex_parent_side, BTreeMap::is_empty);
-        field!(codex_parent_side_generation, is_zero_u64);
-        field!(codex_parent_proof_wrap_epoch, is_zero_u64);
-        field!(codex_parent_prefix_proofs, BTreeMap::is_empty);
-        field!(codex_parent_proof_cursor, Option::is_none);
-        field!(codex_parent_side_cursor, Option::is_none);
-        field!(codex_parent_proof_seq, is_zero_u64);
-        field!(codex_proof_index_incarnation, String::is_empty);
         field!(claude_desktop_title_files, BTreeMap::is_empty);
         field!(held claude_account_family_witnesses);
         field!(held claude_account_family_pending);
@@ -586,13 +575,7 @@ enum Pass {
 fn header_field(name: &str) -> bool {
     matches!(
         name,
-        "schema_version"
-            | "generation"
-            | "accepted_snapshot_fingerprint_ledger_version"
-            | "codex_parent_side_generation"
-            | "codex_parent_proof_wrap_epoch"
-            | "codex_parent_proof_seq"
-            | "codex_proof_index_incarnation"
+        "schema_version" | "generation" | "accepted_snapshot_fingerprint_ledger_version"
     )
 }
 /// The session-identity state a user Repair override rebuild
@@ -1050,8 +1033,6 @@ fn read_persistence_mode<R: BufRead + Seek>(
     map_only: bool,
     partial: Option<[Option<scan_index_persistence::MapUnavailable>; 3]>,
 ) -> std::result::Result<ScanIndex, Error> {
-    take_dropped_codex_side_requests();
-    let _side_request_counts = SideRequestCountGuard;
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
     let census_resources = validate_original(&mut reader)?;
@@ -1156,7 +1137,6 @@ fn finish_decode(
         ],
     );
     if !map_only && index.persistence_available() {
-        index.retain_decodable_codex_parent_state();
         index.drop_unbound_claude_authority_records(stage);
         settle_retired_family_decode(index);
     }
@@ -1483,17 +1463,6 @@ pub(super) fn read_identity_carry(
         return Err(Error::Refused("input changed during decode"));
     }
     Ok(carry)
-}
-
-struct SideRequestCountGuard;
-impl Drop for SideRequestCountGuard {
-    fn drop(&mut self) {
-        let dropped = take_dropped_codex_side_requests();
-        crate::local_resource_diagnostics::codex_side_lifecycle::add(
-            crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
-            dropped,
-        );
-    }
 }
 
 pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::Result<(), Error> {
@@ -2210,43 +2179,18 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "codex_state_only_blocked_attributed" => {
                             index.codex_state_only_blocked_attributed = self.typed(value)?
                         }
-                        "codex_parent_ownership_refs" => {
-                            index.codex_parent_ownership_refs = self.typed(value)?
-                        }
-                        "codex_parent_ownership_ledgers" => {
-                            index.codex_parent_ownership_ledgers = self.typed(value)?
-                        }
-                        "codex_parent_side_requests" => {
-                            index.codex_parent_side_requests = self
-                                .census(value, "codex_parent_side_requests")?
-                                .codex_parent_side_requests
-                        }
-                        "codex_parent_side" => {
-                            index.codex_parent_side =
-                                self.census(value, "codex_parent_side")?.codex_parent_side
-                        }
-                        "codex_parent_side_generation" => {
-                            index.codex_parent_side_generation = self.typed(value)?
-                        }
-                        "codex_parent_proof_wrap_epoch" => {
-                            index.codex_parent_proof_wrap_epoch = self.typed(value)?
-                        }
-                        "codex_parent_prefix_proofs" => {
-                            index.codex_parent_prefix_proofs = self
-                                .census(value, "codex_parent_prefix_proofs")?
-                                .codex_parent_prefix_proofs
-                        }
-                        "codex_parent_proof_cursor" => {
-                            index.codex_parent_proof_cursor = self.typed(value)?
-                        }
-                        "codex_parent_side_cursor" => {
-                            index.codex_parent_side_cursor = self.typed(value)?
-                        }
-                        "codex_parent_proof_seq" => {
-                            index.codex_parent_proof_seq = self.typed(value)?
-                        }
-                        "codex_proof_index_incarnation" => {
-                            index.codex_proof_index_incarnation = self.typed(value)?
+                        "codex_parent_ownership_refs"
+                        | "codex_parent_ownership_ledgers"
+                        | "codex_parent_side_requests"
+                        | "codex_parent_side"
+                        | "codex_parent_side_generation"
+                        | "codex_parent_proof_wrap_epoch"
+                        | "codex_parent_prefix_proofs"
+                        | "codex_parent_proof_cursor"
+                        | "codex_parent_side_cursor"
+                        | "codex_parent_proof_seq"
+                        | "codex_proof_index_incarnation" => {
+                            let _: serde::de::IgnoredAny = self.typed(value)?;
                         }
                         "claude_desktop_title_files" => {
                             index.claude_desktop_title_files = self.typed(value)?

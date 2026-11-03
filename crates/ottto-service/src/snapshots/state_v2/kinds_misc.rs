@@ -12,6 +12,15 @@ fn field_mode(kind: &str) -> mapper::Members {
         };
         ($($t:tt)*) => {};
     }
+    macro_rules! retired {
+        ($f:ident, Misc, (retired root $mode:ident $empty:tt), [$kind:literal], $h:ident) => {
+            if kind == $kind {
+                return mapper::Members::$mode;
+            }
+        };
+        ($($t:tt)*) => {};
+    }
+    scan_index_fields!(each retired);
     scan_index_fields!(each lookup);
     mapper::Members::Field
 }
@@ -344,6 +353,9 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         &serde_json::to_vec(&index.schema_version)?,
     )?;
     macro_rules! save {
+        ($f:ident, Misc, (retired root $mode:ident $empty:tt), [$kind:literal], $h:ident) => {
+            write_field(&serde_json::json!($empty), stringify!($f), $kind, rows, cx)?;
+        };
         (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             // Like the v1 serializer: only versioned cursor fences persist.
             let inventory = &index.claude_desktop_store_inventory;
@@ -396,6 +408,15 @@ pub(super) fn hydrate_txn(
         "state_v2_unknown_presence_field"
     );
     macro_rules! load {
+        ($f:ident, Misc, (retired root $mode:ident $empty:tt), [$kind:literal], $h:ident) => {
+            // Consume and seed old bytes without installing any retired state.
+            mapper::root(tx, $kind)?;
+            mapper::rows(tx, $kind, |tx, h| {
+                let _: Box<serde_json::value::RawValue> =
+                    mapper::read(tx, &h, Some(&mut cx.digests))?;
+                Ok(())
+            })?;
+        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };

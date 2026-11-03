@@ -2045,51 +2045,28 @@ fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
     assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
 }
 
-/// N4 (fe-seam-ack §5, #660 second-lander parity): only a completion that
-/// retains a copy retires a suspended Codex proof beside it. An ordinary
-/// retaining Claude Full still passes its copy budget to the retire
-/// (unchanged); an H3c grown Claude read retains nothing, so it passes none
-/// (`retaining && !h3c_route`) and the suspended proof is kept.
+/// [behaviour] An H3c grown Claude read retains nothing and supplies no
+/// copy budget, so the pre-clone reclamation site does not run.
 #[test]
-fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
-    use crate::snapshots::sampled_scan::codex_cursor::{ProofJob, ProofLease};
+fn fe_n4_h3c_grown_read_runs_no_budgeted_reclamation() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let suspend = |cache: &Arc<sampled_scan::SharedCache>| {
-        let job = Box::new(ProofJob {
-            namespace: "n4-proof".to_owned(),
-            index_path: PathBuf::from("/n4/index.json"),
-            incarnation: "n4".to_owned(),
-            entries: vec![("k".repeat(1 << 20), 1)],
-            next_row_end: 0,
-            touched_page: 0,
-            readers: None,
-        });
-        assert!(
-            ProofLease::new(cache, job).suspend(),
-            "precondition: suspended"
-        );
-        assert!(cache.proof_suspended_for_test().is_some());
-        sampled_scan::copy_retire_probe();
-    };
-
     // H3c: the grown in-page Full publishes its sealed prefix and passes no
-    // copy budget, so no budgeted retire runs and the proof is kept.
+    // copy budget, so no budgeted reclamation runs.
     let mut base = baseline(CLAUDE, 4, 2);
     crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
         &base.cache,
         &base.index,
     );
-    suspend(&base.cache);
+    sampled_scan::copy_retire_probe();
     let path = base.path.clone();
     let index = std::mem::take(&mut base.index);
-    let ((index, _, seen, read), counts) = observe_side(|| {
+    let (index, _, seen, read) = {
         page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
             append_raw(&path, &row_bytes(CLAUDE, 6..9))
         })
-    });
+    };
     assert!(is_full(read.mode), "precondition: an in-page Full");
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
     assert!(
@@ -2101,22 +2078,16 @@ fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
         sampled_scan::copy_retire_probe().is_none(),
         "no budgeted retire on the H3c route"
     );
-    assert!(
-        base.cache.proof_suspended_for_test().is_some(),
-        "proof kept"
-    );
-    assert_eq!(counts.side_proof_drops, 0);
 }
 
 /// #665/#702 second-lander control. The same continued Tail is short of
 /// copy room in both worlds. Without growth it proves and executes a release;
-/// H3c growth keeps every resident and the suspended proof, with no copy,
+/// H3c growth keeps every resident, with no copy,
 /// X_out proof, reserved retention peak or deferred release. Pressure uses
 /// R0's existing test-only insert-term seam; all ranks and releases are real.
 #[test]
-fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
-    use crate::snapshots::sampled_scan::codex_cursor::{bound_for_main, ProofJob, ProofLease};
+fn fe_second_lander_h3c_release_pressure_keeps_victims() {
+    use crate::snapshots::sampled_scan::codex_cursor::bound_for_main;
     use sampled_scan::test_hooks;
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -2184,40 +2155,26 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
         .filter(|(key, _, _)| key != &base.key)
         .collect::<Vec<_>>();
     assert_eq!(before.len(), older.len(), "precondition: older residents");
-    let job = Box::new(ProofJob {
-        namespace: "fe-second-lander-proof".to_owned(),
-        index_path: PathBuf::from("/fe-second-lander/index.json"),
-        incarnation: "fe-second-lander".to_owned(),
-        entries: vec![("k".repeat(1 << 20), 1)],
-        next_row_end: 0,
-        touched_page: 0,
-        readers: None,
-    });
-    assert!(ProofLease::new(&base.cache, job).suspend());
-    let proof = base.cache.proof_suspended_for_test();
-    assert!(proof.is_some(), "precondition: suspended proof");
     sampled_scan::copy_retire_probe();
     test_hooks::clear();
     let mut read = None;
     let index = std::mem::take(&mut base.index);
-    let (((index, result, seen), counts), side_counts) = observe_side(|| {
-        observe(|| {
-            page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
-                if read.is_some() {
-                    return;
-                }
-                if let Some(opened) = opened(scan) {
-                    assert!(is_tail(opened.mode), "precondition: continued Tail");
-                    let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
-                        .expect("precondition: measured residents");
-                    // Give the insert term exactly the remaining room:
-                    // b_ins = 0. Only a completion-time release can fund
-                    // retention; this never changes the production limit.
-                    test_hooks::set_ins_extra(Some(state_bytes - resident));
-                    append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
-                    read = Some(opened);
-                }
-            })
+    let ((index, result, seen), counts) = observe(|| {
+        page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
+            if read.is_some() {
+                return;
+            }
+            if let Some(opened) = opened(scan) {
+                assert!(is_tail(opened.mode), "precondition: continued Tail");
+                let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
+                    .expect("precondition: measured residents");
+                // Give the insert term exactly the remaining room:
+                // b_ins = 0. Only a completion-time release can fund
+                // retention; this never changes the production limit.
+                test_hooks::set_ins_extra(Some(state_bytes - resident));
+                append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
+                read = Some(opened);
+            }
         })
     });
     let read = read.expect("precondition: opened read");
@@ -2237,8 +2194,6 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
     );
     assert!(index.files[&base.key].has_prefix_provenance());
     assert_eq!(base.cache.retained().unwrap().victims(), before);
-    assert_eq!(base.cache.proof_suspended_for_test(), proof, "proof kept");
-    assert_eq!(side_counts.side_proof_drops, 0);
     assert!(sampled_scan::copy_retire_probe().is_none());
     assert!(
         test_hooks::decisions().is_empty(),

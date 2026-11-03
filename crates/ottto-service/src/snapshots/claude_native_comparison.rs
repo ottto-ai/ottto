@@ -247,7 +247,6 @@ impl TerminalTraversal {
                     && traversal.pending_candidates.is_empty()
                     && !traversal.counts.has_errors()
                     && !traversal.watcher_hint_seen
-                    && !traversal.codex_parent_resolution_retry_required
             })
         {
             return None;
@@ -682,8 +681,8 @@ impl NativePhase {
                                                 // never eligible targets and cannot borrow this Claude prepayment.
             if !parsed.state_only_blocked_session_ids.is_empty()
                 || parsed.codex_parent_session_ref.is_some()
-                || parsed.codex_parent_ownership_ledger.is_some()
-                || parsed.codex_parent_resolution_pending
+                // Unchanged refusal: any parse that saw a source session id.
+                || parsed.source_session_id_seen
             {
                 return None;
             }

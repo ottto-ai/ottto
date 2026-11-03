@@ -64,7 +64,14 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         ..Default::default()
     };
     let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
+    // Members intentionally omitted by normalization remain in the committed
+    // baseline, so the existing delta removes them on the next ordinary save.
+    let retired = std::mem::take(&mut rows.seed)
+        .into_iter()
+        .filter(|(key, _)| matches!(key, RowKey::Record { kind, .. } if catalogue::retired_root(kind.name())))
+        .collect::<BTreeMap<_, _>>();
     let mut stored = rows.finish()?;
+    stored.extend(retired);
     // Defaults are logical state, not rows the older store actually owns. They
     // must be absent from the baseline so the first save writes them all.
     stored.retain(|key, _| match key {

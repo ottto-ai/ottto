@@ -1802,7 +1802,6 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
                 apply_claude_code_line,
                 Some(&CodexTitleMetadata::default()),
                 None,
-                None,
             )
             .unwrap();
             assert_eq!(
@@ -1999,7 +1998,6 @@ fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> u
                 SnapshotSource::ClaudeCode,
                 apply_claude_code_line,
                 Some(&CodexTitleMetadata::default()),
-                None,
                 None,
             )
             .unwrap();

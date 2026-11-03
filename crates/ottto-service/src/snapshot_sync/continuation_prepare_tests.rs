@@ -207,28 +207,10 @@ impl ContinuationFixture {
         .unwrap()
     }
 
-    /// An ordinary Codex pass's C14 on this destination, and its C15 when
-    /// its save succeeded. Returns that pass's gate.
-    fn ordinary_side_pass(
-        &self,
-        cache: &crate::snapshots::sampled_scan::SharedCache,
-        saved: bool,
-    ) -> bool {
-        let (_, mut index) = self.load();
-        let pass = crate::snapshots::begin_codex_side_pass(cache, &self.index_path, &mut index);
-        if saved {
-            let mark = crate::snapshots::codex_side_save_mark(cache, &self.index_path);
-            crate::snapshots::note_codex_side_pass_saved(cache, &self.index_path, false, mark);
-        }
-        pass.side_allowed_for_test()
-    }
-
-    /// A refused continuation prepare after a saved ordinary pass: the
-    /// refusal, no save, the context still cached, and the next ordinary
-    /// pass not gated.
+    /// A refused continuation prepare: the refusal, no save and the context
+    /// still cached.
     fn assert_refused(&self, refusal: ContinuationRefusal) {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
-        self.ordinary_side_pass(&cache, true);
         let mut minted = self.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
@@ -239,7 +221,6 @@ impl ContinuationFixture {
         assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
         assert_eq!(self.disk(), before, "no save, no claim, no reset");
         assert!(inputs.holds_attribution(), "a refusal keeps it cached");
-        assert!(self.ordinary_side_pass(&cache, true), "no gate reset");
     }
 }
 
@@ -405,16 +386,10 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert!(prepared.native_comparison_lease.is_none());
     assert!(prepared.scan.is_some());
 
-    // The ordinary tail on the same loaded state (C14 as the continuation
-    // runs it; no hint, budget, save or reset).
+    // The ordinary tail on the same loaded state (no hint, budget, save or
+    // reset).
     let source = SnapshotSource::Codex;
     let (mut progress, mut index) = fixture.load();
-    let side_cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
-    let _pass = crate::snapshots::begin_codex_continuation_side_pass(
-        &side_cache,
-        &fixture.index_path,
-        &mut index,
-    );
     let checkpoint = prepared
         .attribution_context
         .as_ref()
@@ -609,7 +584,7 @@ fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
 }
 
 /// K1 (a″, C-1 lease): a due quarantine retry the ordinary selection would
-/// lease (and save) refuses at the pure probe, before C14.
+/// lease (and save) refuses at the pure probe.
 #[test]
 fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
     let fixture = ContinuationFixture::quiescent("continuation-prepare-claim");
@@ -632,7 +607,7 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
 
 /// K1 (a″, C-1 lease): a due, exactly bound reason re-offer. The ordinary
 /// selection that activates a re-offer always reports a claim, so the page
-/// refuses at the pure probe, before C14 (UploadClaim); the post-claim
+/// refuses at the pure probe (UploadClaim); the post-claim
 /// ReasonReoffer arm stays the backstop and is not reachable from disk.
 #[test]
 fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
@@ -691,38 +666,4 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
         "a claimed re-offer"
     );
     fixture.assert_refused(ContinuationRefusal::UploadClaim);
-}
-
-/// C-1 (a), (b), (d) on the production continuation prepare: its C14 runs
-/// (the page prepares; it is non-EOF, never saved, or dropped as a refusal
-/// after C14 drops it) and the next ordinary pass keeps the last ordinary
-/// save's outcome.
-#[test]
-fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
-    for ordinary_saved in [true, false] {
-        let fixture = ContinuationFixture::quiescent(if ordinary_saved {
-            "continuation-prepare-gate-saved"
-        } else {
-            "continuation-prepare-gate-failed"
-        });
-        let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
-        assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
-        let mut minted = fixture.preparation(true);
-        let mut inputs = take_continuation_inputs(
-            &mut minted,
-            &std::sync::Arc::default(),
-            std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
-        );
-        let before = fixture.disk();
-        let prepared = fixture
-            .prepare_on(&cache, &mut inputs)
-            .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
-        drop(prepared);
-        assert_eq!(fixture.disk(), before);
-        assert_eq!(
-            fixture.ordinary_side_pass(&cache, true),
-            ordinary_saved,
-            "the next ordinary pass"
-        );
-    }
 }

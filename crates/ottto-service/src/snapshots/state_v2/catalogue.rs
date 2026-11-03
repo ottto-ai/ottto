@@ -10,7 +10,8 @@ use super::*;
 
 /// `field => Group (codec check [Members]) [owned kinds] heap`. Codecs:
 /// `control`/`misc`/`map`/`scalar` are generated, `hook` is hand code, and
-/// `runtime`/`retired` are never stored. `own` heap has its own RetainedHeap
+/// `runtime`/`retired none` are never stored; `retired root` keeps an empty
+/// compatibility root while an ordinary save removes its retired members. `own` heap has its own RetainedHeap
 /// category; `side` is summed into side_maps. The heap walk destructures every
 /// field, so adding or deleting a ScanIndex slot fails to compile until its
 /// entry is chosen here.
@@ -31,17 +32,17 @@ macro_rules! scan_index_fields {
             codex_state_only_blocked_unattributed => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
             codex_state_only_blocked_legacy => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
             codex_state_only_blocked_attributed => Misc (misc check_field Field) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
-            codex_parent_ownership_refs => Misc (misc check_field Set) ["v1_field.codex_parent_ownership_refs" => 1] side,
-            codex_parent_ownership_ledgers => Misc (misc check_field Map) ["v1_field.codex_parent_ownership_ledgers" => 1] side,
-            codex_parent_side_requests => Misc (misc check_field Map) ["v1_field.codex_parent_side_requests" => 1] side,
-            codex_parent_side => Misc (misc check_field Map) ["v1_field.codex_parent_side" => 1] side,
-            codex_parent_side_generation => Misc (misc check_field Field) ["v1_field.codex_parent_side_generation" => 1] side,
-            codex_parent_proof_wrap_epoch => Misc (misc check_field Field) ["v1_field.codex_parent_proof_wrap_epoch" => 1] side,
-            codex_parent_prefix_proofs => Misc (misc check_field Map) ["v1_field.codex_parent_prefix_proofs" => 1] side,
-            codex_parent_proof_cursor => Misc (misc check_field Field) ["v1_field.codex_parent_proof_cursor" => 1] side,
-            codex_parent_side_cursor => Misc (misc check_field Field) ["v1_field.codex_parent_side_cursor" => 1] side,
-            codex_parent_proof_seq => Misc (misc check_field Field) ["v1_field.codex_parent_proof_seq" => 1] side,
-            codex_proof_index_incarnation => Misc (misc check_field Field) ["v1_field.codex_proof_index_incarnation" => 1] side,
+            codex_parent_ownership_refs => Misc (retired root Set []) ["v1_field.codex_parent_ownership_refs" => 1] side,
+            codex_parent_ownership_ledgers => Misc (retired root Map {}) ["v1_field.codex_parent_ownership_ledgers" => 1] side,
+            codex_parent_side_requests => Misc (retired root Map {}) ["v1_field.codex_parent_side_requests" => 1] side,
+            codex_parent_side => Misc (retired root Map {}) ["v1_field.codex_parent_side" => 1] side,
+            codex_parent_side_generation => Misc (retired root Field 0) ["v1_field.codex_parent_side_generation" => 1] side,
+            codex_parent_proof_wrap_epoch => Misc (retired root Field 0) ["v1_field.codex_parent_proof_wrap_epoch" => 1] side,
+            codex_parent_prefix_proofs => Misc (retired root Map {}) ["v1_field.codex_parent_prefix_proofs" => 1] side,
+            codex_parent_proof_cursor => Misc (retired root Field null) ["v1_field.codex_parent_proof_cursor" => 1] side,
+            codex_parent_side_cursor => Misc (retired root Field null) ["v1_field.codex_parent_side_cursor" => 1] side,
+            codex_parent_proof_seq => Misc (retired root Field 0) ["v1_field.codex_parent_proof_seq" => 1] side,
+            codex_proof_index_incarnation => Misc (retired root Field "") ["v1_field.codex_proof_index_incarnation" => 1] side,
             claude_duplicate_fence_rearm_attempt => Misc (misc check_field Field) ["scan_state.claude_duplicate_fence_rearm_attempt" => 1] side,
             claude_duplicate_fence_next_full_rearm_unix_seconds => Misc (misc check_field Field) ["scan_state.claude_duplicate_fence_next_full_rearm_unix_seconds" => 1] side,
             claude_full_rearm_progress => Misc (misc check_field Field) ["scan_state.claude_full_rearm_progress" => 1] side,
@@ -116,8 +117,6 @@ macro_rules! scan_index_fields {
             persistence_legacy_recovery => Misc (runtime none) [] side,
             claude_account_window_retention => Accounts (runtime none) [] side,
             withheld_memo => Accounts (runtime none) [] side,
-            codex_proof_index_minted => Misc (runtime none) [] side,
-            codex_parent_proof_parents_live => Misc (runtime none) [] side,
             codex_counting_moved_evidence => Misc (runtime none) [] side,
             active_quarantine_witness => Misc (runtime none) [] side,
             active_upload_context_fingerprint => Files (runtime none) [] side,
@@ -248,6 +247,19 @@ pub(super) fn group(kind: &str) -> Option<Group> {
 pub(super) fn accepts(kind: &str) -> bool {
     group(kind).is_some() || RESERVED.contains(&kind)
 }
+/// Retired data keeps only the generic layout-1 root required by older readers.
+pub(super) fn retired_root(kind: &str) -> bool {
+    macro_rules! lookup {
+        ($f:ident, Misc, (retired root $mode:ident $empty:tt), [$kind:literal], $h:ident) => {
+            if kind == $kind {
+                return true;
+            }
+        };
+        ($($t:tt)*) => {};
+    }
+    scan_index_fields!(each lookup);
+    false
+}
 /// Original v1 inventory: each stored field keeps its exact typed checker.
 pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     field: &str,
@@ -255,6 +267,12 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     model: &ScanIndex,
 ) -> std::result::Result<bool, A::Error> {
     macro_rules! check {
+        ($f:ident, $g:ident, (retired root $mode:ident $empty:tt), $kinds:tt, $heap:ident) => {
+            if field == stringify!($f) {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                return Ok(true);
+            }
+        };
         ($f:ident, $g:ident, ($codec:ident none), $kinds:tt, $heap:ident) => {};
         ($f:ident, $g:ident, ($codec:ident $check:ident $($mode:ident)?), $kinds:tt, $heap:ident) => {
             if field == stringify!($f) {
