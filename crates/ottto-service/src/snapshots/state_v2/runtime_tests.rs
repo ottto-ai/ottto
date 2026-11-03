@@ -1693,7 +1693,8 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
                 index.generation
             )
             .is_err());
-            index = load_with(&f.path, false).unwrap().unwrap();
+            // Reload through the production route, as publication did.
+            index = ScanIndex::load(&f.path).unwrap();
             assert_eq!(index.generation, G);
             assert!(!index.file_snapshot_fingerprints.contains_key("oversize"));
             guard_external(
