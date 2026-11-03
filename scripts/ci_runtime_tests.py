@@ -71,6 +71,9 @@ DOC_TESTS = re.compile(r"^\s*Doc-tests (\S+)")
 # Cargo's line for each test binary that exited non-zero (--no-fail-fast keeps going).
 PROCESS_FAILED = re.compile(r"process didn't exit successfully: `(\S+)[^`]*` \(([^)]*)\)")
 DOCTEST_FAILED = re.compile(r"error: doctest failed")
+NOT_EXECUTED = re.compile(r"could not execute process")
+RERUN = re.compile(r"error: test failed, to rerun pass ")
+TARGETS_FAILED = re.compile(r"error: (\d+) targets? failed")
 SERVICE_LIB = ["-p", "ottto-service", "--lib"]
 # Money suites must fail on the first red; a retry never hides one. Every
 # module whose file calls the money oracle is added at startup (oracle_modules).
@@ -213,12 +216,16 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
     last summary counts exactly those. Anything else is unretriable: a crash or
     abort, a failed doc-test, a binary that exited non-zero with no FAILED name
     (a child probe's summary can look clean), FAILED names in a binary cargo did
-    not report as failing, or a count mismatch.
+    not report as failing, a count mismatch, any binary without a summary
+    (never ran, or ran into a crash), a binary cargo could not start, or cargo
+    failure lines that do not add up to its exit lines.
     """
     failed: dict[str, set[str]] = {}
     summary_failed: dict[str, int] = {}
     exits: dict[str, str] = {}
-    doctest_failed = False
+    doctest_failed = not_executed = False
+    reruns = 0
+    targets_failed = None
     current = None
     for raw in lines:
         line = libtest_log.clean(raw)
@@ -226,8 +233,12 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
         if process:
             exits[Path(process.group(1)).name] = process.group(2)
             continue
-        if DOCTEST_FAILED.search(line):
-            doctest_failed = True
+        doctest_failed = doctest_failed or bool(DOCTEST_FAILED.search(line))
+        not_executed = not_executed or bool(NOT_EXECUTED.search(line))
+        reruns += bool(RERUN.search(line))
+        total = TARGETS_FAILED.search(line)
+        if total:
+            targets_failed = int(total.group(1))
         running, doc = RUNNING.match(line), DOC_TESTS.match(line)
         if running or doc:
             current = Path(running.group(1)).name if running else f"doc-tests {doc.group(1)}"
@@ -242,28 +253,41 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
         if summary:
             # Tests that re-run their binary print a summary first; the last one wins.
             summary_failed[current] = int(summary.group(2))
-    unretriable = sorted({
+    unretriable = {binary for binary in failed if binary not in summary_failed}
+    unretriable |= {
         binary for binary, names in failed.items()
         if (names or binary in exits or summary_failed.get(binary)) and (
-            binary not in summary_failed
-            or summary_failed[binary] != len(names)
+            summary_failed.get(binary) != len(names)
             or not names
             or exits.get(binary) != "exit status: 101"
             or binary.startswith("doc-tests ")
         )
-    } | {binary for binary in exits if binary not in failed} | ({"doc-tests"} if doctest_failed else set()))
+    }
+    unretriable |= {binary for binary in exits if binary not in failed}
+    if doctest_failed:
+        unretriable.add("doc-tests")
+    if not_executed:
+        unretriable.add("a binary cargo could not execute")
+    if reruns != len(exits) or (targets_failed is not None and targets_failed != len(exits)):
+        unretriable.add("cargo failure lines that do not match its exit lines")
+    unretriable = sorted(unretriable)
     return {binary: sorted(names) for binary, names in failed.items() if names}, unretriable
 
 
 def retry_plan(groups, required: set[str], limit: int,
                modules: frozenset[str] | set[str] = NEVER_RETRY_MODULES) -> tuple[list[tuple[str, list[str]]], str | None]:
-    """(test, cargo scope) to retry for (lines, scope_of_binary) groups, or the
-    reason to retry nothing."""
+    """(test, cargo scope) to retry for (lines, scope_of_binary, exit status)
+    groups, or the reason to retry nothing. Every group that exited non-zero
+    must name at least one failed test."""
     plan = []
-    for lines, scope_of in groups:
+    for lines, scope_of, status in groups:
+        if status == 0:
+            continue
         failed, unretriable = failures_by_binary(lines)
         if unretriable:
-            return [], f"cannot retry by test name: {', '.join(sorted(unretriable))}"
+            return [], f"cannot retry by test name: {', '.join(unretriable)}"
+        if not failed:
+            return [], "a group exited non-zero without a failed test name"
         for binary, names in failed.items():
             scope = scope_of(binary)
             if scope is None:
@@ -360,12 +384,13 @@ def retry_failures(cargo: str, groups, args, out_lock: threading.Lock, problems:
             left = min(args.retry_timeout, deadline - time.monotonic())
             if left <= 0:
                 print(f"ci_runtime_tests: retry budget of {args.retry_budget:.0f} s used up; {name} not retried", flush=True)
+                still.append(f"{name}: not retried, retry budget used up")
                 break
             if retry_alone(cargo, name, scope, left, out_lock):
                 attempt = k
                 break
-        if attempt is None:
-            still.append(f"{name}: failed again on {args.retry_failed} retry(s)")
+        if attempt is None and not (still and still[-1].startswith(f"{name}: not retried")):
+            still.append(f"{name}: failed again on retry")
         else:
             flaky.append((name, attempt))
     if flaky:
@@ -573,8 +598,8 @@ def main() -> int:
         # The serial group, and the main group of shares after 1, ran SERVICE_LIB only.
         problems = retry_failures(
             cargo,
-            [(main_run[2], binaries.get if first else lambda _binary: SERVICE_LIB),
-             (serial_run[2], lambda _binary: SERVICE_LIB)],
+            [(main_run[2], binaries.get if first else lambda _binary: SERVICE_LIB, main_run[0].returncode),
+             (serial_run[2], lambda _binary: SERVICE_LIB, serial_run[0].returncode)],
             args,
             out_lock,
             problems,

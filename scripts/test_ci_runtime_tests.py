@@ -155,15 +155,16 @@ class RetryTests(unittest.TestCase):
 
     @staticmethod
     def exited(binary, status='exit status: 101'):
-        return (f"  process didn't exit successfully: `/w/target/debug/deps/{binary} --nocapture --exact` "
+        """Cargo's two lines for a failing test binary."""
+        return (f'error: test failed, to rerun pass `--lib`\nCaused by:\n'
+                f"  process didn't exit successfully: `/w/target/debug/deps/{binary} --nocapture --exact` "
                 f'({status})\n')
 
-    def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary]):
-        return runner.retry_plan([(lines, scope_of)], set(required), limit)
+    def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary], status=101):
+        return runner.retry_plan([(lines, scope_of, status)], set(required), limit)
 
     def test_failed_names_map_to_their_binary(self):
         lines = [self.LIB, 'test a::one ... FAILED\n', 'test a::two ... ok\n', self.summary(1, 1),
-                 'error: test failed, to rerun pass `-p ottto-service --lib`\n', 'Caused by:\n',
                  self.exited('ottto_service-89abcdef'),
                  self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'),
                  '   Doc-tests ottto_service\n', self.summary(2, 0)]
@@ -186,6 +187,13 @@ class RetryTests(unittest.TestCase):
             'doc-test': ['   Doc-tests ottto_core\n', self.summary(1, 1),
                          'error: doctest failed, to rerun pass `-p ottto-core --doc`\n'],
             'no names': ['error: could not compile\n'],
+            # Cargo could not start the binary: Running line, no summary.
+            'never executed': [self.LIB, 'error: test failed, to rerun pass `-p ottto-service --lib`\n',
+                               'Caused by:\n', '  could not execute process `/w/x` (never executed)\n'] + flaky_one,
+            'exit line missed': lib_fail + [self.summary(0, 1), 'error: test failed, to rerun pass `--lib`\n',
+                                            'error: test failed, to rerun pass `--test cli`\n'] + flaky_one,
+            'target total off': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'),
+                                            'error: 2 targets failed:\n'],
         }
         for label, lines in cases.items():
             with self.subTest(label):
@@ -195,6 +203,16 @@ class RetryTests(unittest.TestCase):
         plan, reason = self.plan(lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef')],
                                  scope_of=lambda _b: None)
         self.assertIn('unknown test binary', reason)
+        # A failed group with nothing to retry blocks the other group's retry.
+        retried = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd')]
+        plan, reason = runner.retry_plan([(['error: build failed\n'], lambda b: [b], 101),
+                                          (retried, lambda b: [b], 101)], set(), 3)
+        self.assertEqual(plan, [])
+        self.assertIn('without a failed test name', reason)
+        # A group that passed is not read at all.
+        plan, reason = runner.retry_plan([(['test x ... FAILED\n'], lambda b: [b], 0),
+                                          (retried, lambda b: [b], 101)], set(), 3)
+        self.assertEqual((plan, reason), ([('case', ['cli-0123abcd'])], None))
 
     def test_limit_money_and_receipts_are_never_retried(self):
         four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4),
