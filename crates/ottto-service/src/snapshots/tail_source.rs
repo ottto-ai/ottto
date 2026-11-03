@@ -597,19 +597,27 @@ const SESSION_FACTS: CollectionSpec = CollectionSpec {
 /// The session facts (D168-1): content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. A kind or version this build does not
-/// know is incompatible: new ones come with a reduction revision.
+/// know is incompatible: new ones come with a reduction revision. Kinds are
+/// shared by every codec; a kind its source never sets is never stored (the
+/// Codex agent label and prelude on Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact {
     Title = 0,
     FirstPrompt = 1,
     Workspace = 2,
     OpeningSettings = 3,
+    /// Codex: the agent label (nickname or role) a subagent rollout carries.
+    AgentLabel = 4,
+    /// Codex: the session-start prelude parser, with its loaded texts.
+    CodexPrelude = 5,
 }
-const FACTS: [Fact; 4] = [
+const FACTS: [Fact; 6] = [
     Fact::Title,
     Fact::FirstPrompt,
     Fact::Workspace,
     Fact::OpeningSettings,
+    Fact::AgentLabel,
+    Fact::CodexPrelude,
 ];
 const FACT_VERSION: u64 = 1;
 
@@ -622,6 +630,8 @@ impl Fact {
             }
             Self::Workspace => acc.workspace_path.is_some(),
             Self::OpeningSettings => acc.session_start.has_opening_fact(),
+            Self::AgentLabel => acc.codex_agent_label.is_some(),
+            Self::CodexPrelude => acc.session_start.has_codex_prelude(),
         }
     }
 
@@ -647,6 +657,8 @@ impl Fact {
                 .transpose()?
                 .put(e),
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
+            Self::AgentLabel => acc.codex_agent_label.put(e),
+            Self::CodexPrelude => acc.session_start.put_codex_prelude_fact(e),
         }
     }
 
@@ -677,6 +689,8 @@ impl Fact {
                 into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
             }
             Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
+            Self::AgentLabel => into.codex_agent_label = <Option<String> as Durable>::take(&mut d)?,
+            Self::CodexPrelude => into.session_start.take_codex_prelude_fact(&mut d)?,
         }
         d.finish()?;
         // A stored slot holds its fact: an empty one is corrupt.
@@ -738,8 +752,8 @@ macro_rules! head_fields {
 // The head-field core every codec writes: each accumulator field by its Tail
 // home. Stored fields keep their record class, except that skill labels are
 // plain data and the fork parent and artifacts are stored. `X` fields are
-// content a codec keeps as session facts (Claude: `tail.page.session_facts`),
-// except the Codex agent label, which a Claude parse never sets. `I` marks a
+// content every codec keeps as session facts (`tail.page.session_facts`); the
+// Codex agent label is Codex's fact, and a Claude head refuses it. `I` marks a
 // field this walk does not store: a codec keeps its own `I` fields in its
 // pages or in a trailer after this walk, or never stores them (finish-only
 // and live fields, listed in its `finish_field_nonempty`). Claude's: pages
