@@ -2,11 +2,11 @@
 //! home round-trips, including the usage ledger, the hourly usage buckets,
 //! the accepted totals and the fork state; missing or inconsistent state is a
 //! reconstruction cause.
-use super::super::stage_full;
+use super::super::seam::TailBase;
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
-use crate::snapshots::state_v2::StagedFile;
+use crate::snapshots::state_v2::{Change, StagedFile};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,10 +83,22 @@ fn identity() -> HeadIdentity {
     )
 }
 
+/// A complete stage: an empty base's `Reset`.
+fn stage_full(
+    view: &PreFinalization<'_>,
+    certificate: &DurableCertificate,
+    id: &HeadIdentity,
+) -> StagedFile {
+    TailBase::default()
+        .stage::<Pi>(view, certificate, id, Change::Reset)
+        .unwrap()
+        .expect("a reset always stages")
+}
+
 fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
     let (acc, report, scalars) = reduction.finish_view();
     let view = PreFinalization::new(acc, report, scalars);
-    stage_full::<Pi>(&view, certificate, &identity()).unwrap()
+    stage_full(&view, certificate, &identity())
 }
 
 fn copy(staged: &StagedFile) -> StagedFile {
@@ -195,7 +207,7 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
 
     // The loaded state encodes to exactly the stored head and pages.
     let view = PreFinalization::new(&loaded, &head.report, head.scalars);
-    let again = stage_full::<Pi>(&view, &head.certificate, &identity()).unwrap();
+    let again = stage_full(&view, &head.certificate, &identity());
     assert_eq!(
         (
             again.revision,
@@ -246,7 +258,7 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
     );
     assert_eq!(
         load_edited(&|staged| staged.revision = 0),
-        Err(ReconstructCause::Revision)
+        Err(ReconstructCause::Incompatible)
     );
     let mut loaded = fresh();
     Pi::decode_head(staged.revision, &staged.head, &mut loaded).unwrap();
