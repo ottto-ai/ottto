@@ -883,7 +883,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
                 assert!(matches!(
                     parser
                         .prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
-                        .unwrap(),
+                        .unwrap_or_else(|_| panic!("unchanged session prepares Tail")),
                     ReadMode::Tail
                 ));
                 Some(base)

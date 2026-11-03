@@ -1,6 +1,7 @@
 //! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
@@ -10546,8 +10547,8 @@ fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex,
 
 /// §7 D: a continuation page selects only the paused job's pending paths:
 /// it resumes the job and leaves every other pending path queued and
-/// unread. It never plans or starts an attempt (`jobs_started`,
-/// the group remains parked) and pages the job to its one completion,
+/// unread. It never plans or starts an attempt and pages the job to its
+/// one completion without a group replay,
 /// with the unpaged read's output.
 #[test]
 fn continuation_selects_only_job_paths_and_never_starts_attempts() {
@@ -10558,6 +10559,14 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
     let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
     let other = fixture.file(SESSION_B);
     let cache = Arc::new(SharedCache::default());
+    let group_replays = || {
+        use crate::snapshots::tail_source::counters::total;
+        (
+            total("tail_reconstruct", "group_replay"),
+            total("tail_reconstruct_bytes", "group_replay"),
+        )
+    };
+    let before = group_replays();
     with_test_limits(2048, 1024, 64, || {
         let (mut index, _) = paused_singleton(&fixture, &cache);
         // SESSION_B was read as a singleton; queue it again as a fresh
@@ -10589,6 +10598,7 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
             index = next;
             assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             assert_eq!(counter(&cache, |c| c.jobs_started), started);
+            assert_eq!(group_replays(), before, "no group replay on continuation");
             assert!(pending_hint(&index, &other).is_some(), "still queued");
             assert_eq!(entry(&index), other_entry, "never read");
             assert!(
@@ -10605,6 +10615,11 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
         }
         let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
         assert!(cache.cursor_slot_free());
+        assert_eq!(
+            group_replays(),
+            before,
+            "no group replay on ordinary finish"
+        );
         // Only the job's file publishes, as the unpaged read does.
         let unpaged = fingerprints(&unpaged);
         let published = fingerprints(&published);
@@ -10678,6 +10693,17 @@ fn continuation_prepares_no_group_attempt() {
         )
     };
     let cache = Arc::new(SharedCache::default());
+    let expected = fs::metadata(sessions.join("a.jsonl")).unwrap().len()
+        + fs::metadata(sessions.join("b.jsonl")).unwrap().len();
+    let group_replays = || {
+        use crate::snapshots::tail_source::counters::total;
+        (
+            total("tail_reconstruct", "group_replay"),
+            total("tail_reconstruct_bytes", "group_replay"),
+        )
+    };
+    let replay_before = group_replays();
+    NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
     with_test_limits(2048, 1024, 64, || {
         // Ordinary pages until the group job pauses (a group whose probes
         // outran a page takes a page of its own first).
@@ -10689,6 +10715,11 @@ fn continuation_prepares_no_group_attempt() {
             }
         }
         let first = cache.counters_for_test();
+        assert_eq!(
+            group_replays(),
+            replay_before,
+            "the first group is still paused"
+        );
         assert!(first.jobs_paused > 0, "{first:?}");
         let members = cache.paused_members_for_test().expect("paused group");
         assert_eq!(members.len(), 2, "both members belong to the job");
@@ -10728,18 +10759,25 @@ fn continuation_prepares_no_group_attempt() {
                 &members,
             );
             CARRIED.with(|v| v.borrow_mut().insert(sessions.clone(), evidence));
-            let ((next, scan), records) = crate::local_resource_diagnostics::capture(|| {
-                continuation_page_in(
-                    &sessions,
-                    index,
-                    &cache,
-                    "group-fixture",
-                    AT,
-                    7,
-                    None,
-                    |_| {},
-                )
+            let (((next, scan), records), bytes) = observe_consumed(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    continuation_page_in(
+                        &sessions,
+                        index,
+                        &cache,
+                        "group-fixture",
+                        AT,
+                        7,
+                        None,
+                        |_| {},
+                    )
+                })
             });
+            assert_eq!(
+                bytes, 0,
+                "the continuation never reads or restarts the group"
+            );
+            assert_eq!(group_replays(), replay_before, "no replay or replay bytes");
             let holds = records
                 .iter()
                 .filter(|row| row["stage"] == "codex_continuation")
@@ -10763,6 +10801,15 @@ fn continuation_prepares_no_group_attempt() {
             index = ordinary(index, &cache).0;
             let now = cache.counters_for_test();
             if now.jobs_certified + now.jobs_uncertified > 0 {
+                assert_eq!(
+                    group_replays().0,
+                    replay_before.0 + 1,
+                    "ordinary completes once"
+                );
+                assert!(
+                    group_replays().1 > replay_before.1,
+                    "completion records replay bytes"
+                );
                 assert!(cache.cursor_slot_free());
                 GROUP_EOF_APPLIED.with(|v| assert!(v.get() > 0, "ordinary group EOF observed"));
                 return;
@@ -10773,6 +10820,18 @@ fn continuation_prepares_no_group_attempt() {
             cache.counters_for_test()
         );
     });
+    let bytes = NATIVE_RANGES.with(|v| {
+        v.borrow_mut()
+            .take()
+            .unwrap()
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>()
+    });
+    assert_eq!(
+        bytes, expected,
+        "ordinary resumes the same group; no byte re-read"
+    );
 }
 
 /// §7 ready: `cursor_continuation_ready` readies the exact paused,
