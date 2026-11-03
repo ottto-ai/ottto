@@ -372,6 +372,7 @@ they reset at process start and never decide anything.
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed and the file was set aside. |
 | `tail_head_migrated{source}` | A head rewritten for a lower revision with no other change. |
+| `tail_refold{reason}` | A file selected for late evidence on an unchanged transcript (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) re-folded from stored state with 0 transcript bytes, and its body was not the ACKed one: sent as an ordinary update on the head CAS, the body a native read sends. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead. |
 | `quiet_retirement{staged,retired,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. |
 
 `tail_restart_full_alarm` is emitted on the first reconstruction after a head,

@@ -3827,22 +3827,9 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
-            let mut quiet = ready(&c, &scanner, prior, 100, sampled);
-            if sampled {
-                // The expired hold's stored re-finalization differs from the
-                // accepted body, so it was withheld unsent (D142). Its owed native
-                // read has a census: it proves the two copied requests and removes
-                // them, and is that body's one delivery; nothing selects afterwards.
-                assert_eq!(quiet.modes, (1, 0, 0), "the read D142 owes");
-                let copy = body(&quiet, COPY).expect("the withheld body is delivered");
-                assert_eq!(
-                    (copy.request_count, copy.removed_request_count),
-                    (1, Some(2)),
-                    "the owed read's census removes the proven copies"
-                );
-                let settled = settle(&c, &quiet.committed.clone(), quiet, &mut progress);
-                quiet = ready(&c, &scanner, settled, 100, sampled);
-            }
+            // The expired hold's body went on its own pass, a stored re-fold
+            // sent as an ordinary update (L02); nothing selects afterwards.
+            let quiet = ready(&c, &scanner, prior, 100, sampled);
             assert!(
                 body(&quiet, COPY).is_none(),
                 "expired retry debt never selects forever"
@@ -3851,11 +3838,11 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
     }
 }
 
-/// D62 guard: the census deadline holds through the expired hold's owed
-/// native read too. That read still ends the hold and is the body's one
-/// delivery; the hold never restarts, and nothing selects afterwards.
+/// D62 guard: the census deadline holds past the expired hold's pass too.
+/// That pass's body was the hold's one delivery; the hold never restarts, and
+/// nothing selects afterwards.
 #[test]
-fn e2_pipeline_resumed_prefix_hold_owed_read_under_deadline_never_restarts_the_hold() {
+fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hold() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
         c.root(ROOT, &resumed(ROOT, &[A, B]));
@@ -3880,16 +3867,7 @@ fn e2_pipeline_resumed_prefix_hold_owed_read_under_deadline_never_restarts_the_h
             let page = under_deadline(prior.clone());
             prior = settle(&c, &prior, page, &mut progress);
         }
-        let owed = under_deadline(prior);
-        assert_eq!(owed.modes, (1, 0, 0), "the read D142 owes");
-        let copy = body(&owed, COPY).expect("the withheld body is delivered");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (3, Some(0)),
-            "with no census the hold has expired: its copies stay unproven"
-        );
-        let settled = settle(&c, &owed.committed.clone(), owed, &mut progress);
-        let after = under_deadline(settled);
+        let after = under_deadline(prior);
         assert!(
             body(&after, COPY).is_none(),
             "the expired hold never restarts"

@@ -36,15 +36,6 @@ pub(in crate::snapshots) fn add(name: &'static str, label: &'static str, n: u64)
     });
 }
 
-/// A maximum: since the last line, and over the process.
-pub(in crate::snapshots) fn max(name: &'static str, label: &'static str, n: u64) {
-    with(|counts| {
-        for count in counts.entry((name, label)).or_default() {
-            *count = (*count).max(n);
-        }
-    });
-}
-
 /// At most once per 24 h while reconstructions after a head persist. RAM only:
 /// a restart alarms again.
 pub(in crate::snapshots) fn restart_full_alarm_due() -> bool {
@@ -57,30 +48,6 @@ pub(in crate::snapshots) fn restart_full_alarm_due() -> bool {
     }
     *last = Some(now);
     true
-}
-
-#[cfg(not(test))]
-static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static PASSES: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
-}
-
-/// Claude's passes this process has begun: the unit a wait is counted in.
-pub(in crate::snapshots) fn begin_pass() {
-    #[cfg(not(test))]
-    PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    PASSES.with(|passes| passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-}
-
-pub(in crate::snapshots) fn pass() -> u64 {
-    #[cfg(not(test))]
-    {
-        PASSES.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    PASSES.with(|passes| passes.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// This page's line, when anything counted since the last one.

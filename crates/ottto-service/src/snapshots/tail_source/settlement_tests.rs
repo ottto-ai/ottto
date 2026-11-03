@@ -1,7 +1,7 @@
 //! Settlement on real committed Tail state: a first-read crash leaves nothing
 //! to trust, the accepted floor is replayed through and never relaxed, a load
 //! earns no credit, lower revisions reconstruct or migrate, and a stored reuse
-//! either finishes the ACKed body with no native byte or owes one native Full.
+//! that finishes the ACKed body reads no native byte and sends nothing.
 use super::super::claude::tests::lines;
 use super::super::seam::tests::{route, scope, Route, NOW};
 use super::tests::{append, cold, committed, counted, len, loaded, read};
@@ -11,13 +11,12 @@ use crate::snapshots::claude_request_census::{
 };
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
 use crate::snapshots::state_v2::BaselineRelease;
-use crate::snapshots::stored_refinalize::{reuse_label, reuses_stored, take_native};
 use crate::snapshots::tail_source::counters;
 use crate::snapshots::tail_source::floor::AcceptedFloor;
 use crate::snapshots::tests::manifest_index_entry;
 use crate::transcript_acquisition::ReadMode;
 
-const REASON: CandidateParseReason = CandidateParseReason::Rearmed;
+pub(super) const REASON: CandidateParseReason = CandidateParseReason::Rearmed;
 
 pub(super) fn candidate(path: &Path) -> CandidateFile {
     CandidateFile {
@@ -38,7 +37,7 @@ pub(super) fn candidate(path: &Path) -> CandidateFile {
 }
 
 /// The bodies a stored read of a committed file finishes, and its native bytes.
-fn stored_finish(route: &Route, path: &Path, key: &str) -> (Vec<SnapshotItem>, u64) {
+pub(super) fn stored_finish(route: &Route, path: &Path, key: &str) -> (Vec<SnapshotItem>, u64) {
     let (Load::Reused(taken, Some(base)), _) = loaded(route, path, key) else {
         panic!("the committed head is reused");
     };
@@ -50,7 +49,7 @@ fn stored_finish(route: &Route, path: &Path, key: &str) -> (Vec<SnapshotItem>, u
 
 /// One finalization of `items` for an entry whose ACKed tuple is theirs, or
 /// another body when `identical` is false.
-fn finalize(
+pub(super) fn finalize(
     route: &mut Route,
     key: &str,
     mut items: Vec<SnapshotItem>,
@@ -320,8 +319,8 @@ fn an_unchanged_lower_revision_migrates_the_head_alone() {
     assert_eq!(head.body, body);
 }
 
-/// [money] D142: a stored reuse that finishes the ACKed body reads no native
-/// byte and sends nothing.
+/// [money] A stored reuse that finishes the ACKed body reads no native byte
+/// and sends nothing.
 #[test]
 fn an_identical_stored_body_takes_the_ack_path() {
     let mut route = route();
@@ -334,52 +333,7 @@ fn an_identical_stored_body_takes_the_ack_path() {
     assert!(scan.snapshots.is_empty());
     assert_eq!(scan.semantic_noop_count, count);
     assert!(!route.index.files[&key].rearmed());
-    assert!(!take_native(&route.path, &key));
-    assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 0);
-}
-
-/// [money] D142: a stored reuse that finishes another body sends nothing and
-/// never claims a rescan: the entry keeps its ACKed tuple, stays selected, and
-/// owes exactly one native read, which then sends the body as a Full does.
-/// §12: that read's wait is counted, one pass here.
-#[test]
-fn a_differing_stored_body_falls_back_to_one_native_read() {
-    let mut route = route();
-    let (path, key) = committed(&mut route, "a.jsonl", 3);
-    let (items, _) = stored_finish(&route, &path, &key);
-    let scan = finalize(&mut route, &key, items.clone(), false, Some(REASON));
-    assert!(scan.snapshots.is_empty(), "the differing body is withheld");
-    assert_eq!(scan.semantic_noop_count, 0);
-    let entry = &route.index.files[&key];
-    assert!(entry.rearmed());
-    assert_eq!(
-        entry.last_upload_body_witness.as_deref(),
-        Some("acked-before")
-    );
-    assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 1);
-    counters::begin_pass();
-    assert!(take_native(&route.path, &key));
-    assert!(!take_native(&route.path, &key), "one use");
-    assert_eq!(counters::total("tail_reuse_wait", "reads"), 1);
-    assert_eq!(counters::total("tail_reuse_wait", "passes"), 1);
-    assert_eq!(counters::total("tail_reuse_wait", "max_passes"), 1);
-
-    let count = items.len();
-    let scan = finalize(&mut route, &key, items, false, None);
-    assert_eq!(
-        scan.snapshots.len(),
-        count,
-        "the native read's body is sent"
-    );
-    assert!(!take_native(&route.path, &key));
-    assert_eq!(counters::total("tail_reuse_differs", "rearmed"), 1);
-    let wire = serde_json::to_value(snapshot_semantic_envelope(
-        SnapshotSource::ClaudeCode,
-        &scan.snapshots[0],
-        SnapshotUploadPolicy::default(),
-    ))
-    .unwrap();
-    assert!(wire.get("forced_full_rescan").is_none());
+    assert_eq!(counters::total("tail_refold", "rearmed"), 0);
 }
 
 /// [behaviour] A file proven changed takes its Full under the proven reason.
@@ -404,6 +358,8 @@ fn a_proven_change_names_its_full() {
 /// [behaviour] §6: which selections continue from stored state.
 #[test]
 fn the_shipped_selections_reuse_stored_state() {
+    let index = ScanIndex::default();
+    let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew);
     for reason in [
         CandidateParseReason::TranscriptChanged,
         CandidateParseReason::Audit,
@@ -416,8 +372,8 @@ fn the_shipped_selections_reuse_stored_state() {
     ] {
         assert!(reuses_stored(Some(reason), false), "{reason:?}");
     }
-    assert!(reuse_label(CandidateParseReason::TranscriptChanged).is_none());
-    assert!(reuse_label(CandidateParseReason::Audit).is_none());
+    assert!(!late_evidence(CandidateParseReason::TranscriptChanged));
+    assert!(!late_evidence(CandidateParseReason::Audit));
     for reason in [
         CandidateParseReason::NewFile,
         CandidateParseReason::UploadContext,
@@ -441,6 +397,8 @@ fn the_shipped_selections_reuse_stored_state() {
 #[test]
 #[ignore = "D138"]
 fn the_held_selections_reuse_stored_state_when_enabled() {
+    let index = ScanIndex::default();
+    let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew);
     assert!(reuses_stored(
         Some(CandidateParseReason::UploadContext),
         false

@@ -161,10 +161,6 @@ struct RouteState {
     custody_retry_at: Option<Instant>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
-    // Files whose stored re-finalization differed from the ACKed body: each
-    // one's next read is native. Losing this costs one more 0-byte try.
-    // The value is the pass the read was owed in.
-    tail_native_owed: BTreeMap<String, u64>,
     // Files the accepted floor held in this process, so each exit is named
     // once. A restart re-learns a file at its next hold.
     tail_floor_held: BTreeSet<String>,
@@ -238,7 +234,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     pass_written_start: None,
                     custody_retry_at: None,
                     tail: Default::default(),
-                    tail_native_owed: Default::default(),
                     tail_floor_held: Default::default(),
                 }))
             })

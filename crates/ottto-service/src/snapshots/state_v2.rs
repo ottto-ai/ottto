@@ -49,8 +49,8 @@ use kinds::KindCx;
 pub(in crate::snapshots) use runtime::tail_route::{forget_ram_for_test, staged_head_for_test};
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
-    hold_floor, load_head, load_tail, owe_native_read, release_floor, retire_tail, set_aside_tail,
-    stage_tail, tail_head_keys, tail_set_aside, take_native_read,
+    hold_floor, load_head, load_tail, release_floor, retire_tail, set_aside_tail, stage_tail,
+    tail_head_keys, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]

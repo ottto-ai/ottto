@@ -340,47 +340,7 @@ fn compare_claude(
         mode,
     );
     finish_claude_pages(c, &mut pages);
-    settle_withheld(c, retained, &restart, &mut pages);
     compare_claude_uploads(&pages)
-}
-
-/// D142: a stored re-finalization whose body differs from the ACKed one
-/// sends nothing and owes one native read. That read, the same owner's next
-/// page, is each Tail arm's emission, compared with the cold Full.
-pub(super) fn settle_withheld(
-    c: &Corpus,
-    retained: &E2ScanFixture,
-    restart: &E2ScanFixture,
-    pages: &mut [Page; 3],
-) {
-    let withheld = pages[0].scan.snapshots.is_empty();
-    assert_eq!(
-        pages[2].scan.snapshots.is_empty(),
-        withheld,
-        "both Tail arms withhold the same re-finalization"
-    );
-    if !withheld || pages[1].scan.snapshots.is_empty() {
-        return;
-    }
-    let tail = owed_native_page(c, retained, pages[0].index.clone());
-    let disk = owed_native_page(c, restart, pages[2].index.clone());
-    pages[0] = tail;
-    pages[2] = disk;
-}
-
-/// The native read a withheld stored re-finalization owes: the same owner's
-/// next page reads the file natively and finishes it as the pipeline does.
-fn owed_native_page(c: &Corpus, owner: &E2ScanFixture, index: ScanIndex) -> Page {
-    let mut page = c.raw(owner, index, 100, true, &[]);
-    assert_eq!(
-        page.modes.1 + page.modes.2,
-        0,
-        "the owed read is native, never stored reuse"
-    );
-    assert!(page.modes.0 > 0, "the owed read happens on the next page");
-    page.enrich(c);
-    page.finish();
-    page
 }
 
 fn claude_pages(
@@ -527,74 +487,72 @@ fn claude_case(name: &str) {
                         item.reasoning_output_tokens,
                     ]
                 }
-                let finish_phase =
-                    |pages: &mut [Page; 3], complete: bool, restart: &E2ScanFixture| {
-                        for page in pages.iter_mut() {
-                            assert_eq!(page.scan.snapshots.len(), 1, "must scan the live session");
-                            page.enrich(&c);
-                            assert!(
-                                page.disposition
-                                    .quarantined_fingerprints(&page.scan.snapshots)
-                                    .is_empty(),
-                                "live estimates must not be request-owned quarantined"
+                let finish_phase = |pages: &mut [Page; 3], complete: bool| {
+                    for page in pages.iter_mut() {
+                        assert_eq!(page.scan.snapshots.len(), 1, "must scan the live session");
+                        page.enrich(&c);
+                        assert!(
+                            page.disposition
+                                .quarantined_fingerprints(&page.scan.snapshots)
+                                .is_empty(),
+                            "live estimates must not be request-owned quarantined"
+                        );
+                        page.finish();
+                    }
+                    for page in pages.iter() {
+                        literal(page);
+                        assert_eq!(page.scan.snapshots.len(), 1);
+                        let item = &page.scan.snapshots[0];
+                        assert_eq!(item.source_session_id, ROOT);
+                        assert_eq!(counts(item), [1, 10, 10, 3, 5, 2, 0, 0]);
+                        assert_eq!(item.telemetry_owned_complete, Some(complete));
+                        let expected_cost = complete.then_some("0.0001");
+                        if complete {
+                            let cost = item.cost.as_ref().expect("reported item cost");
+                            assert_eq!(cost.total_cost_usd.as_deref(), expected_cost);
+                            assert_eq!(cost.evidence_source, "claude_code_api_request");
+                            assert!(cost.input_cost_usd.is_none());
+                            assert!(cost.output_cost_usd.is_none());
+                            assert!(cost.cache_read_cost_usd.is_none());
+                            assert!(cost.cache_creation_cost_usd.is_none());
+                        } else {
+                            assert!(item.cost.is_none(), "unpriced estimate is never $0");
+                        }
+                        assert_eq!(item.model_usage.len(), 1);
+                        assert_eq!(item.usage_buckets.len(), 1);
+                        assert_eq!(item.usage_buckets[0].model_usage.len(), 1);
+                        for row in item.model_usage.iter().chain(
+                            item.usage_buckets
+                                .iter()
+                                .flat_map(|bucket| &bucket.model_usage),
+                        ) {
+                            assert_eq!(
+                                [
+                                    row.request_count,
+                                    row.input_tokens,
+                                    row.output_tokens,
+                                    row.cache_read_tokens,
+                                    row.cache_creation_5m_tokens,
+                                    row.cache_creation_1h_tokens,
+                                    row.unattributed_total_tokens,
+                                    row.reasoning_output_tokens
+                                ],
+                                counts(item),
                             );
-                            page.finish();
+                            assert_eq!(row.cost_usd.as_deref(), expected_cost);
+                            assert!(row.input_cost_usd.is_none());
+                            assert!(row.output_cost_usd.is_none());
+                            assert!(row.cache_read_cost_usd.is_none());
+                            assert!(row.cache_creation_cost_usd.is_none());
+                            assert_eq!(
+                                row.selector_context
+                                    .get("request_usage_origin")
+                                    .map(String::as_str),
+                                complete.then_some("telemetry_matched"),
+                            );
                         }
-                        settle_withheld(&c, &scanner, restart, pages);
-                        for page in pages.iter() {
-                            literal(page);
-                            assert_eq!(page.scan.snapshots.len(), 1);
-                            let item = &page.scan.snapshots[0];
-                            assert_eq!(item.source_session_id, ROOT);
-                            assert_eq!(counts(item), [1, 10, 10, 3, 5, 2, 0, 0]);
-                            assert_eq!(item.telemetry_owned_complete, Some(complete));
-                            let expected_cost = complete.then_some("0.0001");
-                            if complete {
-                                let cost = item.cost.as_ref().expect("reported item cost");
-                                assert_eq!(cost.total_cost_usd.as_deref(), expected_cost);
-                                assert_eq!(cost.evidence_source, "claude_code_api_request");
-                                assert!(cost.input_cost_usd.is_none());
-                                assert!(cost.output_cost_usd.is_none());
-                                assert!(cost.cache_read_cost_usd.is_none());
-                                assert!(cost.cache_creation_cost_usd.is_none());
-                            } else {
-                                assert!(item.cost.is_none(), "unpriced estimate is never $0");
-                            }
-                            assert_eq!(item.model_usage.len(), 1);
-                            assert_eq!(item.usage_buckets.len(), 1);
-                            assert_eq!(item.usage_buckets[0].model_usage.len(), 1);
-                            for row in item.model_usage.iter().chain(
-                                item.usage_buckets
-                                    .iter()
-                                    .flat_map(|bucket| &bucket.model_usage),
-                            ) {
-                                assert_eq!(
-                                    [
-                                        row.request_count,
-                                        row.input_tokens,
-                                        row.output_tokens,
-                                        row.cache_read_tokens,
-                                        row.cache_creation_5m_tokens,
-                                        row.cache_creation_1h_tokens,
-                                        row.unattributed_total_tokens,
-                                        row.reasoning_output_tokens
-                                    ],
-                                    counts(item),
-                                );
-                                assert_eq!(row.cost_usd.as_deref(), expected_cost);
-                                assert!(row.input_cost_usd.is_none());
-                                assert!(row.output_cost_usd.is_none());
-                                assert!(row.cache_read_cost_usd.is_none());
-                                assert!(row.cache_creation_cost_usd.is_none());
-                                assert_eq!(
-                                    row.selector_context
-                                        .get("request_usage_origin")
-                                        .map(String::as_str),
-                                    complete.then_some("telemetry_matched"),
-                                );
-                            }
-                        }
-                    };
+                    }
+                };
                 let failed_owner = disk.owner(SnapshotSource::ClaudeCode);
                 let mut failed = claude_pages(
                     &c,
@@ -603,7 +561,7 @@ fn claude_case(name: &str) {
                     [prior.clone(), prior.clone(), prior],
                     (0, 0, 1),
                 );
-                finish_phase(&mut failed, false, &failed_owner);
+                finish_phase(&mut failed, false);
                 let failed_wire = compare_claude_uploads(&failed);
                 let failed_items = failed.each_ref().map(|page| page.scan.snapshots[0].clone());
                 // The Full arm continues from its own finished index; the new
@@ -625,7 +583,7 @@ fn claude_case(name: &str) {
                     [disk_prior.clone(), full_failed.index, disk_prior],
                     (0, 0, 1),
                 );
-                finish_phase(&mut healthy, true, &healthy_owner);
+                finish_phase(&mut healthy, true);
                 let healthy_wire = compare_claude_uploads(&healthy);
                 for (before, after) in failed_items.iter().zip(&healthy) {
                     let after = &after.scan.snapshots[0];
