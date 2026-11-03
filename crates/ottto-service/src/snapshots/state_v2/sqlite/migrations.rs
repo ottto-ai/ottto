@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn compressed_tail_fences_capability_four() {
         let scratch = crate::test_scratch::ScratchDir::canonical("tail-writer-fence");
-        let mut db = Sqlite::create_import(&scratch.join("index.sqlite")).unwrap();
+        let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
         db.control("minimum_writer_capability", &5_u64).unwrap();
         let conn = db.conn().unwrap();
         assert_eq!(WRITER_CAPABILITY, 5);
