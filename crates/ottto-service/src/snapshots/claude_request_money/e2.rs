@@ -2489,6 +2489,58 @@ fn parent_proves(
             .is_some_and(|holder| holder < order)
 }
 
+/// 2026-11-04T00:00:00Z (UTC ms). Only a copy whose own turns start at or
+/// after it takes the same-session page proof; an earlier copy keeps the
+/// count it already had.
+const TWIN_ID_PROOF_FROM: i64 = 1_793_750_400_000;
+
+/// The held copies of `items[at]` that an EARLIER fold of the same session
+/// on this page holds, by that fold's parse (the `Witness::Page` evidence):
+/// that fold already counts them. Transient: never stored, so a page
+/// without that fold decides as before.
+fn twin_page_held(
+    items: &[SnapshotItem],
+    page_folds: &BTreeMap<&str, Vec<usize>>,
+    at: usize,
+    order: (i128, LocationKey),
+) -> BTreeSet<u64> {
+    let item = &items[at];
+    let earlier = page_folds
+        .get(item.source_session_id.as_str())
+        .into_iter()
+        .flatten()
+        .filter(|&&other| {
+            items[other]
+                .claude_money
+                .as_deref()
+                .and_then(FileFold::copy_order)
+                .is_some_and(|earlier| earlier < order)
+        })
+        .map(|&other| &items[other].claude_usage_request_ids)
+        .collect::<Vec<_>>();
+    if earlier.is_empty() || !twin_copy_born_from_cutoff(item, &earlier) {
+        return BTreeSet::new();
+    }
+    skipped_ids(item)
+        .filter(|id| earlier.iter().any(|ids| ids.contains(*id)))
+        .map(|id| claude_request_hash(id))
+        .collect()
+}
+
+/// The copy's birth from its lines alone: the time of its first response
+/// no earlier twin holds (its first own turn). Never a file system birth,
+/// which a copy, rewrite or restore resets, so cold and stored reads agree.
+/// An unknown time keeps today's decision.
+fn twin_copy_born_from_cutoff(item: &SnapshotItem, earlier: &[&BTreeSet<String>]) -> bool {
+    item.claude_usage_occurrences
+        .iter()
+        .filter(|(id, _)| !earlier.iter().any(|ids| ids.contains(*id)))
+        .min_by_key(|(_, occurrence)| occurrence.sequence)
+        .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
+        .and_then(rfc3339_unix_nanos)
+        .is_some_and(|at| at >= i128::from(TWIN_ID_PROOF_FROM) * 1_000_000)
+}
+
 /// One census walk for every all-pre-birth main file of the page. A holder
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
@@ -2530,8 +2582,23 @@ fn decide_holders(
         unaccepted: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
+        /// Hashes an earlier same-session fold on this page counts
+        /// (`twin_page_held`): removed, never stored.
+        twin_held: BTreeSet<u64>,
     }
     let live = std::cell::OnceCell::<BTreeMap<LocationKey, &str>>::new();
+    // The page's folds by session, for the same-session page proof. By
+    // session id alone: path twins live under different folders and roots.
+    let page: &[SnapshotItem] = items;
+    let mut page_folds = BTreeMap::<&str, Vec<usize>>::new();
+    for (at, item) in page.iter().enumerate() {
+        if item.claude_money.is_some() {
+            page_folds
+                .entry(item.source_session_id.as_str())
+                .or_default()
+                .push(at);
+        }
+    }
     let mut wanted = folds
         .iter()
         .filter_map(|&at| {
@@ -2586,6 +2653,7 @@ fn decide_holders(
                 at,
                 session: item.source_session_id.clone(),
                 order,
+                twin_held: twin_page_held(page, &page_folds, at, order),
                 hashes,
                 covered: BTreeMap::new(),
                 stored,
@@ -2669,12 +2737,17 @@ fn decide_holders(
     }
 
     for wanted in wanted {
+        let decided =
+            |hash: &u64| wanted.covered.contains_key(hash) || wanted.stored.contains(hash);
         let uncovered = wanted
             .hashes
             .iter()
             .copied()
-            .filter(|hash| !wanted.covered.contains_key(hash) && !wanted.stored.contains(hash))
+            .filter(|hash| !decided(hash) && !wanted.twin_held.contains(hash))
             .collect::<Vec<_>>();
+        let twin_removed = wanted.twin_held.iter().filter(|&h| !decided(h)).count() as u64;
+        diag("copy_prefix_twin_page_removed", twin_removed);
+        record_counts(Counts::one(30, twin_removed));
         let reused = wanted
             .stored
             .iter()
@@ -4485,8 +4558,10 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // A forked subagent's first-line copy counted because its root was not
     // read at its current revision; its next page decides again.
     "family_copy_deferred",
+    // Copied requests an earlier same-session fold on the page counts.
+    "copy_prefix_twin_page_removed",
 ];
-const COUNT_LEN: usize = 30;
+const COUNT_LEN: usize = 31;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4560,7 +4635,7 @@ impl Counts {
         all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..29) by `n`.
+    /// One enable-readiness counter (index 24..30) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;
