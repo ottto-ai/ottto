@@ -481,57 +481,89 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         (CandidateDecision::Skip, None),
         "metadata alone cannot select TranscriptChanged or another acquisition"
     );
+    // Within one preparation (the index in memory): the bound fragment is
+    // neither growth nor owed growth.
     let metadata = fs::metadata(&f.path).unwrap();
-    for _ in 0..2 {
-        let page = discovery_growth::Page::default();
-        let retention = discovery_retention!(index, &page);
-        retention.observe_stamped_growth(
-            &f.path,
-            metadata.len(),
-            candidate.modified_unix_seconds,
-            codex_fragment::Stamp::metadata(&metadata),
-        );
-        let (_, rows) = capture(|| {
-            assert!(
-                retention.owes_stamped(
-                    source,
-                    &f.path,
-                    metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata)
-                ),
-                "audit still owes it"
-            )
-        });
-        assert!(!rows
-            .iter()
-            .any(|row| row.to_string().contains("\"grown\":1")));
-        assert_eq!(
-            page.counts(&index, now)
-                .discovery_retained_grown_fate
-                .still_retained,
-            0,
-            "known fragment is excluded from growth population"
-        );
+    let page = discovery_growth::Page::default();
+    let retention = discovery_retention!(index, &page);
+    retention.observe_stamped_growth(
+        &f.path,
+        metadata.len(),
+        candidate.modified_unix_seconds,
+        codex_fragment::Stamp::metadata(&metadata),
+    );
+    let (_, rows) = capture(|| {
+        assert!(
+            retention.owes_stamped(
+                source,
+                &f.path,
+                metadata.len(),
+                codex_fragment::Stamp::metadata(&metadata)
+            ),
+            "audit still owes it"
+        )
+    });
+    assert!(!rows
+        .iter()
+        .any(|row| row.to_string().contains("\"grown\":1")));
+    assert_eq!(
+        page.counts(&index, now)
+            .discovery_retained_grown_fate
+            .still_retained,
+        0,
+        "known fragment is excluded from growth population"
+    );
+    // Main reloads the index every pass (snapshot_sync's per-pass load) and
+    // never serializes the RAM-only fragment custody, so each reloaded pass
+    // re-reads the fragment only: a Tail from the committed prefix, bounded
+    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
+    // The withheld record adds no usage.
+    let bound = index.clone();
+    let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
+    let baseline_input: u64 = baseline.snapshots.iter().map(|s| s.input_tokens).sum();
+    for pass in 0..2 {
         let (next, scan, reads, rows) = f.page(source, index);
-        assert_eq!(
-            scan.scanned_file_count, 0,
-            "unchanged aged fragment: no acquisition"
-        );
-        assert!(scan.snapshots.is_empty());
-        assert!(reads.0.lock().unwrap().0.is_empty());
+        let modes = reads.0.lock().unwrap().0.clone();
         assert!(
-            !rows
-                .iter()
-                .any(|row| row["counts"]["discovery_retained"]["grown"]
-                    .as_u64()
-                    .is_some_and(|n| n != 0)),
-            "no grown events"
+            modes.iter().all(|mode| *mode == growth_mode()),
+            "pass {pass}: never a Full: {modes:?}"
         );
         assert!(
-            !rows
+            scan.scanned_file_count <= 1 && modes.len() <= 1,
+            "pass {pass}: at most the one fragment re-read"
+        );
+        let repeats = rows
+            .iter()
+            .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
+            .map(|repeat| {
+                assert_eq!(repeat["files"], json!(1), "pass {pass}");
+                repeat["bytes"].as_u64().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            repeats.iter().all(|bytes| *bytes == fragment_bytes),
+            "pass {pass}: byte-bounded to the fragment ({fragment_bytes}): {repeats:?}"
+        );
+        if pass == 0 {
+            assert_eq!(
+                scan.scanned_file_count, 1,
+                "the reloaded pass re-reads the fragment"
+            );
+            assert_eq!(modes, vec![growth_mode()]);
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(repeats, vec![fragment_bytes], "one fragment-only Tail");
+            }
+        }
+        eprintln!(
+            "CODEX_FRAGMENT_REREAD pass={pass} reads={} fragment_bytes={fragment_bytes} repeat_bytes={}",
+            modes.len(),
+            repeats.iter().sum::<u64>()
+        );
+        assert!(
+            scan.snapshots
                 .iter()
-                .any(|row| row["counts"].get("codex_fragment_tail_repeat").is_some()),
-            "retained witness within a preparation: zero repeat counter"
+                .all(|snapshot| snapshot.input_tokens <= baseline_input),
+            "pass {pass}: the withheld record adds no usage"
         );
         assert!(next.files[&key].has_unverified_source());
         index = next;
@@ -541,7 +573,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     // fragment only. This does not claim a native cache-owner test on Linux.
     for _preparation in 0..2 {
         let reloaded: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            serde_json::from_slice(&serde_json::to_vec(&bound).unwrap()).unwrap();
         let entry = &reloaded.files[&key];
         assert!(entry.codex_fragment.is_none());
         let mut file = File::open(&f.path).unwrap();
@@ -607,7 +639,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         );
     }
     // Missing binding/object changes must not turn a length heuristic into Skip.
-    let mut without = index.clone();
+    let mut without = bound.clone();
     without.files.get_mut(&key).unwrap().codex_fragment = None;
     assert_eq!(
         without.candidate_decision(&candidate),
