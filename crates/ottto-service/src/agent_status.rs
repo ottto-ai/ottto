@@ -3424,19 +3424,11 @@ fn collect_codex_status_for_home(
             );
         }
     }
-    snapshot.context = Some(AgentContextStatus {
-        status: AgentContextState::Unsupported,
-        active_tokens: None,
-        max_tokens: None,
-        used_percent: None,
-        remaining_tokens: None,
-        source: Some("codex_cli_v1".to_string()),
-        recent_samples: Vec::new(),
-        observed_at: None,
-        completeness: Some(AgentContextCompleteness::Unavailable),
-        reason: Some("codex_active_context_not_collected".to_string()),
-        posture: None,
-    });
+    snapshot.context = Some(unsupported_context(
+        "codex_cli_v1",
+        "codex_active_context_not_collected",
+        None,
+    ));
     snapshot.capabilities = vec![
         supported_capability("account_status", "Detected with Codex CLI/config probes."),
         quota_capability,
@@ -15120,19 +15112,7 @@ fn claude_statusline_context_unavailable(
     reason: &str,
     observed_at: Option<String>,
 ) -> AgentContextStatus {
-    AgentContextStatus {
-        status: AgentContextState::Unsupported,
-        active_tokens: None,
-        max_tokens: None,
-        used_percent: None,
-        remaining_tokens: None,
-        source: Some("claude_statusline_context_window".to_string()),
-        recent_samples: Vec::new(),
-        observed_at,
-        completeness: Some(AgentContextCompleteness::Unavailable),
-        reason: Some(reason.to_string()),
-        posture: None,
-    }
+    unsupported_context("claude_statusline_context_window", reason, observed_at)
 }
 
 fn current_unix_seconds() -> u64 {
@@ -15201,19 +15181,11 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         ));
     }
     snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-    snapshot.context = Some(AgentContextStatus {
-        status: AgentContextState::Unsupported,
-        active_tokens: None,
-        max_tokens: None,
-        used_percent: None,
-        remaining_tokens: None,
-        source: Some("pi_cli_v1".to_string()),
-        recent_samples: Vec::new(),
-        observed_at: None,
-        completeness: Some(AgentContextCompleteness::Unavailable),
-        reason: Some("pi_active_context_not_collected".to_string()),
-        posture: None,
-    });
+    snapshot.context = Some(unsupported_context(
+        "pi_cli_v1",
+        "pi_active_context_not_collected",
+        None,
+    ));
     snapshot.capabilities = vec![
         supported_capability(
             "model_list",
@@ -19207,6 +19179,26 @@ fn unsupported_quota_window(name: &str) -> AgentQuotaWindow {
         used_percent: None,
         left_percent: None,
         ..Default::default()
+    }
+}
+
+fn unsupported_context(
+    source: &str,
+    reason: &str,
+    observed_at: Option<String>,
+) -> AgentContextStatus {
+    AgentContextStatus {
+        status: AgentContextState::Unsupported,
+        active_tokens: None,
+        max_tokens: None,
+        used_percent: None,
+        remaining_tokens: None,
+        source: Some(source.to_string()),
+        recent_samples: Vec::new(),
+        observed_at,
+        completeness: Some(AgentContextCompleteness::Unavailable),
+        reason: Some(reason.to_string()),
+        posture: None,
     }
 }
 

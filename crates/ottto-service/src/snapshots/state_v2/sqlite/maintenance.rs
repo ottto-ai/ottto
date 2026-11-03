@@ -11,7 +11,7 @@ pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
     pub(in super::super) work: Duration,
     pub(super) space: fn(&Path) -> Option<u64>,
-    /// Hard charged-work ceiling for one save.
+    /// Counts-only charged-work alarm threshold for one save.
     pub(super) save_ceiling: u64,
     /// Memory for one transaction's old-row string sets; past it, erasure is
     /// required without a diff.
@@ -35,6 +35,24 @@ pub(super) fn size_budget(bytes: u64, ms_per_mib: u64) -> Duration {
     Duration::from_millis(
         2_000_u64.saturating_add(bytes.div_ceil(1024 * 1024).saturating_mul(ms_per_mib)),
     )
+}
+/// True when `seconds` have passed since `last`, or it never happened.
+fn elapsed(last: Option<u64>, now: u64, seconds: u64) -> bool {
+    last.map_or(true, |s| {
+        now.checked_sub(s).is_some_and(|age| age >= seconds)
+    })
+}
+/// Fixed label for a SQLite failure; None when SQLite did not raise it.
+fn sqlite_cause(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .and_then(|e| e.sqlite_error_code())
+        .map(|code| match code {
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => "busy",
+            rusqlite::ErrorCode::OperationInterrupted => "timeout",
+            rusqlite::ErrorCode::DiskFull => "disk_full",
+            _ => "engine",
+        })
 }
 fn retry_seconds(failures: u64) -> u64 {
     3600 * (1_u64 << failures.saturating_sub(1).min(2))
@@ -69,6 +87,7 @@ pub(in super::super) struct MaintenanceStats {
     cache_used_bytes: Option<u64>,
     db_bytes: Option<u64>,
     pub(super) encoded_bytes_per_save: u64,
+    // Retain the existing name for refused or over-threshold charged work.
     #[serde(skip)]
     pub(super) refused_save_bytes: u64,
     pub(super) dirty_rows_per_save: u64,
@@ -85,6 +104,7 @@ pub(in super::super) struct MaintenanceStats {
     erasure_resume_refusals: u64,
     reference_drift: u64,
     reference_check_failed: u64,
+    reference_check_failed_causes: BTreeMap<&'static str, u64>,
 }
 #[derive(Clone, Default, Debug, Serialize)]
 struct ErasureVacuum {
@@ -293,19 +313,7 @@ impl Sqlite {
             self.stats.erasure_vacuum.bytes = self.stats.erasure_vacuum.bytes.saturating_add(bytes);
         }
         if let Err(error) = &result {
-            let reason = error
-                .downcast_ref::<rusqlite::Error>()
-                .and_then(|e| e.sqlite_error_code())
-                .map(|code| match code {
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
-                        "busy"
-                    }
-                    rusqlite::ErrorCode::OperationInterrupted => "timeout",
-                    rusqlite::ErrorCode::DiskFull => "disk_full",
-                    _ => "engine",
-                })
-                .unwrap_or("space_or_io");
-            self.erasure_failed(reason);
+            self.erasure_failed(sqlite_cause(error).unwrap_or("space_or_io"));
         }
         result
     }
@@ -540,6 +548,39 @@ impl Sqlite {
         crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         result
     }
+    /// Daily counts on any between-cycles window, under its own budget, so
+    /// neither a busy store nor a slow reference check can starve it. One
+    /// sample per day, partial or not.
+    fn store_growth_sample(&mut self, now: u64) -> Result<()> {
+        use super::super::super::scan_index_persistence::Source;
+        if !elapsed(self.read_control("store_growth_success")?, now, 86400) {
+            return Ok(());
+        }
+        self.control("store_growth_success", &now)?;
+        let identity = self.read_control::<super::super::Identity>("identity")?;
+        // Stores share one process: a per-store name keeps each latest sample.
+        let name = match identity.context("state_v2_identity")?.binding.source {
+            Source::Claude => "store_growth.claude",
+            Source::Codex => "store_growth.codex",
+            Source::Pi => "store_growth.pi",
+        };
+        // Stays partial unless the closure completes the sample.
+        let mut growth = StoreGrowth {
+            partial: true,
+            ..Default::default()
+        };
+        let budget = size_budget(self.logical_bytes()?, 10);
+        self.conn()?.execute_batch("BEGIN")?;
+        let started = Instant::now();
+        let sampled = limited(self.conn()?, budget, || {
+            growth.pages(self.conn()?)?;
+            growth.rows(self.conn()?, started, budget)
+        });
+        growth.partial = sampled.is_err();
+        self.conn()?.execute_batch("ROLLBACK")?;
+        super::super::telemetry::event(name, &growth);
+        Ok(())
+    }
     fn maintenance_inner(&mut self, window: Option<bool>, resume: bool) -> Result<()> {
         migrations::check_current(self.conn()?)?;
         if self.import {
@@ -635,32 +676,21 @@ impl Sqlite {
             self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
         }
 
+        if idle {
+            self.store_growth_sample(now)?;
+        }
         if window == Some(true) {
             let extract = self.references;
             let last = self.read_control::<u64>("reference_check_success")?;
             let attempt = self.read_control::<u64>("reference_check_attempt")?;
-            if last.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 86400))
-                && attempt.map_or(true, |s| now.checked_sub(s).is_some_and(|age| age >= 3600))
-            {
+            if elapsed(last, now, 86400) && elapsed(attempt, now, 3600) {
                 self.control("reference_check_attempt", &now)?;
-                // Stays partial unless the closure completes the sample.
-                let mut growth = StoreGrowth {
-                    partial: true,
-                    ..Default::default()
-                };
                 self.conn()?.execute_batch("BEGIN")?;
                 let budget = size_budget(self.logical_bytes()?, 10);
-                let started = Instant::now();
                 let result = limited(self.conn()?, budget, || {
-                    // Reference verification runs first; the sample shares its VM budget.
-                    let result = references::verify_counts(self.conn()?, extract);
-                    let complete = growth.pages(self.conn()?).is_ok()
-                        && growth.rows(self.conn()?, started, budget).is_ok();
-                    growth.partial = !complete;
-                    result
+                    references::verify_counts(self.conn()?, extract)
                 });
                 self.conn()?.execute_batch("ROLLBACK")?;
-                super::super::telemetry::event("store_growth", &growth);
                 match result {
                     Ok(()) => self.control("reference_check_success", &now)?,
                     Err(error)
@@ -672,9 +702,16 @@ impl Sqlite {
                         self.control("reference_drift", &1_u64)?;
                         return Err(error);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.stats.reference_check_failed =
                             self.stats.reference_check_failed.saturating_add(1);
+                        let cause = sqlite_cause(&error).unwrap_or("decode");
+                        let count = self
+                            .stats
+                            .reference_check_failed_causes
+                            .entry(cause)
+                            .or_default();
+                        *count = count.saturating_add(1);
                     }
                 }
             }

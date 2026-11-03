@@ -132,7 +132,7 @@ impl Stage {
             return;
         }
         self.finished = true;
-        let (_cpu, steady, peak) = self.probe.finish();
+        let (cpu, steady, peak) = self.probe.finish();
         if let Ok(mut stats) = stats().lock() {
             match self.kind {
                 Kind::Import => {
@@ -151,7 +151,12 @@ impl Stage {
                     } else {
                         "hydrate"
                     },
-                    MemoryWindow { current, peak },
+                    MemoryWindow {
+                        current,
+                        peak,
+                        cpu_us: cpu,
+                        wall_us: Some(self.probe.wall_us()),
+                    },
                 );
             }
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -255,6 +260,8 @@ pub(in super::super) fn phase(name: &'static str) {
             MemoryWindow {
                 current: memory,
                 peak: Default::default(),
+                cpu_us: None,
+                wall_us: None,
             },
         );
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -390,6 +397,11 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 struct MemoryWindow {
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
+    /// Process CPU and wall across the stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wall_us: Option<u64>,
 }
 /// RAII stage window; fixed label, two bounded shared samplers, no identifiers.
 pub(in super::super) struct Window {
@@ -410,11 +422,18 @@ impl Window {
 }
 impl Drop for Window {
     fn drop(&mut self) {
+        let (cpu, _, _) = self.probe.finish();
         let (current, peak) = self.probe.memory();
         if let Ok(mut stats) = stats().lock() {
-            stats
-                .stage_memory
-                .insert(self.name, MemoryWindow { current, peak });
+            stats.stage_memory.insert(
+                self.name,
+                MemoryWindow {
+                    current,
+                    peak,
+                    cpu_us: cpu,
+                    wall_us: Some(self.probe.wall_us()),
+                },
+            );
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
     }
@@ -516,6 +535,48 @@ mod ops_tests {
         drop(index);
         super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [regress] The outer save window preserves CPU/wall in later records.
+    #[test]
+    fn stage_windows_carry_cpu_and_wall() {
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            let previous = PASS.with(|pass| {
+                std::mem::replace(
+                    &mut *pass.borrow_mut(),
+                    Pass {
+                        active: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            {
+                let _window = Window::begin("save").unwrap();
+                drop(Stage::new(Kind::Save));
+            }
+            save_work(1, 1);
+            PASS.with(|pass| *pass.borrow_mut() = previous);
+            let mut window = crate::local_resource_diagnostics::StageSum::begin(
+                "claude_code",
+                "evidence_cross_root",
+            );
+            window.time(|| std::hint::black_box((0..10_000_u64).sum::<u64>()));
+        });
+        let save = records
+            .iter()
+            .rev()
+            .find(|record| record["stage"] == "claude_state_v2")
+            .map(|record| &record["counts"]["stage_memory"]["save"])
+            .unwrap();
+        let cross = records
+            .iter()
+            .find(|record| record["stage"] == "evidence_cross_root")
+            .map(|record| &record["observation"])
+            .unwrap();
+        assert!(save["wall_us"].is_u64() && cross["wall_elapsed_us"].is_u64());
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(save["cpu_us"].is_u64() && cross["shared_process_cpu_delta_us"].is_u64());
+        }
     }
 
     /// [behaviour] Claude passes with no route preserve even stale active v2 telemetry state.

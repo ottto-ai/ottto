@@ -131,8 +131,8 @@ impl Hold {
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
     }
-    /// Content-free cause of save pressure: the charged-work ceiling or one
-    /// logical row over its value cap. Both hold as `SaveCeiling`.
+    /// Content-free cause of refused save pressure. Logical value admission
+    /// still holds as `SaveCeiling`; aggregate charged work only alarms.
     fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
         error.chain().find_map(|e| match e.to_string().as_str() {
             "state_v2_save_ceiling" => Some("charged_work"),

@@ -662,17 +662,21 @@ fn string_env(value: Option<&Value>) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Extract disabled server names from settings.
+/// Extract disabled server names from settings or a `~/.claude.json` project
+/// entry, where `/mcp` records its toggle (legacy key until Claude Code migrates
+/// it). Each list is an array of names or a single name.
 fn get_disabled_servers(value: &Value) -> Vec<String> {
-    value
-        .get("disabledMcpjsonServers")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut names = Vec::new();
+    for key in ["disabledMcpjsonServers", "disabledMcpServers"] {
+        match value.get(key) {
+            Some(Value::Array(list)) => {
+                names.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+            }
+            Some(Value::String(name)) => names.push(name.clone()),
+            _ => {}
+        }
+    }
+    names
 }
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
@@ -839,7 +843,9 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     }
     if let Some(root) = claude_json.as_ref() {
         if let Some(projects) = root.get("projects").and_then(Value::as_object) {
-            for project_dir in projects.keys() {
+            for (project_dir, project_cfg) in projects {
+                // No cwd here: a server off in any project is treated as off.
+                disabled_names.extend(get_disabled_servers(project_cfg));
                 for settings in [
                     Path::new(project_dir).join(".claude").join("settings.json"),
                     Path::new(project_dir)
@@ -858,6 +864,12 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     // user can re-enable is information worth reporting. The backend excludes
     // disabled servers from server_count / tool_count / grand_total_tokens.
     for name in disabled_names {
+        // `/mcp` names a plugin server `plugin:<plugin>:<server>`; its row here is
+        // `plugin_<plugin>_<server>`.
+        let name = match name.strip_prefix("plugin:") {
+            Some(rest) => format!("plugin_{}", rest.replacen(':', "_", 1)),
+            None => name,
+        };
         if let Some(server) = servers.get_mut(&name) {
             server.disabled = true;
         }
