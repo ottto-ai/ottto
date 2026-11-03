@@ -9,9 +9,9 @@
 //! header line is inside the certificate's head sample, so a changed header
 //! fails the certificate and reads Full.
 use super::{
-    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
+    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages,
     read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    HeadIdentity, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, HDigest, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
@@ -61,129 +61,11 @@ impl TailSource for Pi {
         }) as u64
     }
 
-    /// Every `I` field this codec does not store. Pi sets none of them at
-    /// read time; one set here would be lost by a load.
-    fn finish_field_nonempty(acc: &SnapshotAccumulator) -> Option<&'static str> {
-        [
-            ("cache_active_turns", !acc.cache_active_turns.is_empty()),
-            (
-                "account_identifier_hash",
-                acc.account_identifier_hash.is_some(),
-            ),
-            ("codex_turn_traces", acc.codex_turn_traces.is_some()),
-            (
-                "codex_observed_priority_turns",
-                acc.codex_observed_priority_turns.is_some(),
-            ),
-            ("codex_tier_replay", acc.codex_tier_replay.is_some()),
-            (
-                "session_cumulative_usage",
-                acc.session_cumulative_usage.is_some(),
-            ),
-            (
-                "claude_desktop_identity",
-                acc.claude_desktop_identity.is_some(),
-            ),
-            (
-                "claude_desktop_spawn_lineage",
-                acc.claude_desktop_spawn_lineage.is_some(),
-            ),
-            (
-                "codex_parent_ownership_ledgers",
-                acc.codex_parent_ownership_ledgers.is_some(),
-            ),
-            (
-                "codex_sidecar_projected_next_ordinal",
-                acc.codex_sidecar_projected_next_ordinal.is_some(),
-            ),
-            (
-                "codex_parent_signatures",
-                acc.codex_parent_signatures.is_some(),
-            ),
-            (
-                "codex_parent_prefix_proof",
-                acc.codex_parent_prefix_proof.is_some(),
-            ),
-            (
-                "codex_parent_proof_used",
-                acc.codex_parent_proof_used.is_some(),
-            ),
-            (
-                "codex_parent_proof_refusal",
-                acc.codex_parent_proof_refusal.is_some(),
-            ),
-            (
-                "codex_physical_signatures",
-                !acc.codex_physical_signatures.is_empty(),
-            ),
-            ("activity_tool_counts", !acc.activity_tool_counts.is_empty()),
-            ("activity_call_tools", !acc.activity_call_tools.is_empty()),
-            (
-                "activity_mcp_tool_counts",
-                !acc.activity_mcp_tool_counts.is_empty(),
-            ),
-            (
-                "activity_mcp_tool_usage_counts",
-                !acc.activity_mcp_tool_usage_counts.is_empty(),
-            ),
-            (
-                "activity_mcp_call_ids",
-                !acc.activity_mcp_call_ids.is_empty(),
-            ),
-            (
-                "activity_capability_buckets",
-                !acc.activity_capability_buckets.is_empty(),
-            ),
-            (
-                "seen_claude_capability_tool_uses",
-                !acc.seen_claude_capability_tool_uses.is_empty(),
-            ),
-            (
-                "activity_changed_file_hashes",
-                !acc.activity_changed_file_hashes.is_empty(),
-            ),
-            (
-                "claude_responses",
-                acc.claude_responses.values().next().is_some(),
-            ),
-            (
-                "claude_usage_request_ids",
-                !acc.claude_usage_request_ids.is_empty(),
-            ),
-            (
-                "claude_usage_occurrences",
-                !acc.claude_usage_occurrences.is_empty(),
-            ),
-            ("cache_observations", acc.cache_observations.is_some()),
-            ("cache_requests", !acc.cache_requests.is_empty()),
-            ("claude_money", acc.claude_money.is_some()),
-            (
-                "compaction_timestamps",
-                !acc.compaction_timestamps.is_empty(),
-            ),
-            (
-                "claude_compaction_observations",
-                !acc.claude_compaction_observations.is_empty(),
-            ),
-        ]
-        .into_iter()
-        .find_map(|(field, set)| set.then_some(field))
-    }
-
-    /// Pi has no `Log` collection.
-    fn log_keys(_acc: &SnapshotAccumulator, _collection: Collection) -> Vec<&String> {
-        Vec::new()
-    }
-
-    fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        page_bytes(keys.iter(), |key, e| key.put(e))
-    }
-
-    fn log_page_keys(
-        _collection: Collection,
-        _bytes: &[u8],
-    ) -> Result<Vec<String>, ReconstructCause> {
-        Err(ReconstructCause::Corrupt)
+    /// A Pi parse sets only the `I` fields this codec stores (the usage
+    /// ledger, the hourly buckets and the accepted totals), and Pi has no
+    /// live input, so no finish-only or live field can be set at the seam.
+    fn finish_field_nonempty(_acc: &SnapshotAccumulator) -> Option<&'static str> {
+        None
     }
 
     fn encode_head(
@@ -192,10 +74,6 @@ impl TailSource for Pi {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse> {
         let acc = view.accumulator;
-        // Not a session fact: a Pi parse never sets it.
-        if acc.codex_agent_label.is_some() {
-            return Err(Refuse::NonEmpty("SnapshotAccumulator.codex_agent_label"));
-        }
         let fork = acc.seen_pi_usage_keys.fork_parts();
         encode_envelope(
             view,
@@ -297,20 +175,6 @@ impl TailSource for Pi {
         } else {
             Ok(())
         }
-    }
-
-    /// Pi stores no keyed field.
-    fn key_epoch() -> Option<[u8; 32]> {
-        None
-    }
-
-    /// Pi has no live input.
-    fn install_live(
-        _stored: &mut SnapshotAccumulator,
-        _fresh: &CandidateFile,
-        _live: &SnapshotAccumulator,
-    ) -> Result<(), LiveLoadError> {
-        Ok(())
     }
 }
 

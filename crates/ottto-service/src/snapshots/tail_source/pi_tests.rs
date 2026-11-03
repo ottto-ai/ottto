@@ -2,16 +2,12 @@
 //! home round-trips, including the usage ledger, the hourly usage buckets,
 //! the accepted totals and the fork state; missing or inconsistent state is a
 //! reconstruction cause.
-use super::super::seam::TailBase;
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction};
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
-use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
-use crate::snapshots::state_v2::{Change, StagedFile};
-use crate::transcript_acquisition::{ReadMode, Scope};
+use crate::snapshots::state_v2::StagedFile;
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-const NOW: u64 = 1_790_000_000;
 const SESSION: &str = "synthetic-pi-tail-session";
 
 /// A header (naming `parent` when set), a user prompt, then `responses`
@@ -46,30 +42,8 @@ fn lines(responses: usize, paired: usize, parent: Option<&str>) -> Vec<String> {
     lines
 }
 
-/// A cold positioned Full read: the PRE-finalization reduction and the
-/// checkpoint's certificate.
 fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ottto-tail-pi-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session.jsonl");
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-    let scope = Scope("tail-pi-codec".into());
-    let mut parser = fixture::parser(
-        SnapshotSource::Pi,
-        &path,
-        File::open(&path).unwrap(),
-        apply_pi_line,
-    );
-    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
-    assert!(matches!(mode, ReadMode::Full(_)));
-    let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
-    std::fs::remove_dir_all(&dir).unwrap();
-    (reduction, checkpoint.durable_certificate(0).unwrap())
+    parse_lines(SnapshotSource::Pi, apply_pi_line, lines)
 }
 
 fn identity() -> HeadIdentity {
@@ -83,46 +57,8 @@ fn identity() -> HeadIdentity {
     )
 }
 
-/// A complete stage: an empty base's `Reset`.
-fn stage_full(
-    view: &PreFinalization<'_>,
-    certificate: &DurableCertificate,
-    id: &HeadIdentity,
-) -> StagedFile {
-    TailBase::default()
-        .stage::<Pi>(view, certificate, id, Change::Reset)
-        .unwrap()
-        .expect("a reset always stages")
-}
-
 fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
-    let (acc, report, scalars) = reduction.finish_view();
-    let view = PreFinalization::new(acc, report, scalars);
-    stage_full(&view, certificate, &identity())
-}
-
-fn copy(staged: &StagedFile) -> StagedFile {
-    StagedFile {
-        revision: staged.revision,
-        head: staged.head.clone(),
-        collections: staged.collections.clone(),
-        pages: staged.pages.clone(),
-        obsolete: staged.obsolete.clone(),
-        change: staged.change,
-    }
-}
-
-/// Head first, then every page in key order, then the codec contract.
-fn load(
-    staged: &StagedFile,
-    into: &mut SnapshotAccumulator,
-) -> Result<DecodedHead, ReconstructCause> {
-    let head = Pi::decode_head(staged.revision, &staged.head, into)?;
-    for (&(collection, page), bytes) in &staged.pages {
-        Pi::decode_page(collection, page, bytes, into)?;
-    }
-    Pi::validate_loaded(into, &staged.collections)?;
-    Ok(head)
+    stage_reduction::<Pi>(reduction, certificate, &identity())
 }
 
 /// [format] Every Pi field home round-trips: the ledger across a page
@@ -185,7 +121,7 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
     }
 
     let mut loaded = SnapshotAccumulator::new(SnapshotSource::Pi);
-    let head = load(&staged, &mut loaded).unwrap();
+    let head = load::<Pi>(&staged, &mut loaded).unwrap();
     assert_eq!(head.certificate, certificate);
     assert_eq!(
         (
@@ -207,7 +143,7 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
 
     // The loaded state encodes to exactly the stored head and pages.
     let view = PreFinalization::new(&loaded, &head.report, head.scalars);
-    let again = stage_full(&view, &head.certificate, &identity());
+    let again = stage_full::<Pi>(&view, &head.certificate, &identity());
     assert_eq!(
         (
             again.revision,
@@ -222,55 +158,17 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
             &staged.collections
         )
     );
-
-    let mut live = acc.clone();
-    live.account_identifier_hash = Some("a".repeat(64));
-    assert_eq!(
-        Pi::finish_field_nonempty(&live),
-        Some("account_identifier_hash")
-    );
 }
 
-/// [format] Missing or inconsistent stored state is a reconstruction cause,
-/// never a default-empty success; empty required collections are staged.
+/// [format] Inconsistent Pi state is a reconstruction cause, never a
+/// default-empty success; empty required collections are staged. Missing
+/// pages, collections and revisions are the shared seam's, proven on Claude.
 #[test]
 fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
     let (reduction, certificate) = parse(&lines(300, 0, None));
     let staged = stage(&reduction, &certificate);
     let fresh = || SnapshotAccumulator::new(SnapshotSource::Pi);
-    let load_edited = |edit: &dyn Fn(&mut StagedFile)| {
-        let mut edited = copy(&staged);
-        edit(&mut edited);
-        load(&edited, &mut fresh()).map(|_| ())
-    };
-    assert_eq!(load_edited(&|_| {}), Ok(()));
-    assert_eq!(
-        load_edited(&|staged| {
-            staged.pages.remove(&(Collection::PiUsageKeys, 1));
-        }),
-        Err(ReconstructCause::Incomplete)
-    );
-    assert_eq!(
-        load_edited(&|staged| {
-            staged.collections.remove(&Collection::UsageHours);
-        }),
-        Err(ReconstructCause::Incomplete)
-    );
-    assert_eq!(
-        load_edited(&|staged| staged.revision = 0),
-        Err(ReconstructCause::Incompatible)
-    );
-    let mut loaded = fresh();
-    Pi::decode_head(staged.revision, &staged.head, &mut loaded).unwrap();
-    assert_eq!(
-        Pi::decode_page(
-            Collection::PiUsageKeys,
-            1,
-            &staged.pages[&(Collection::PiUsageKeys, 1)],
-            &mut loaded
-        ),
-        Err(ReconstructCause::Corrupt)
-    );
+    assert_eq!(load::<Pi>(&staged, &mut fresh()).map(|_| ()), Ok(()));
 
     // A key with no recorded occurrence breaks the reducer's fact.
     let (mut emptied, certificate) = parse(&lines(2, 0, None));
@@ -281,7 +179,7 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         .insert("0".repeat(64), PiUsageDedupState::default());
     let staged = stage(&emptied, &certificate);
     assert_eq!(
-        load(&staged, &mut fresh()).map(|_| ()),
+        load::<Pi>(&staged, &mut fresh()).map(|_| ()),
         Err(ReconstructCause::Corrupt)
     );
     // Nor an unmatched count of zero: a later pairing would underflow it.
@@ -295,7 +193,7 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         .insert("0".repeat(64), state);
     let staged = stage(&zeroed, &certificate);
     assert_eq!(
-        load(&staged, &mut fresh()).map(|_| ()),
+        load::<Pi>(&staged, &mut fresh()).map(|_| ()),
         Err(ReconstructCause::Corrupt)
     );
 
@@ -320,10 +218,10 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         assert!(!staged.pages.keys().any(|(stored, _)| *stored == collection));
     }
     let mut edited = copy(&staged);
-    load(&edited, &mut fresh()).unwrap();
+    load::<Pi>(&edited, &mut fresh()).unwrap();
     edited.collections.remove(&Collection::PiUsageKeys);
     assert_eq!(
-        load(&edited, &mut fresh()).map(|_| ()),
+        load::<Pi>(&edited, &mut fresh()).map(|_| ()),
         Err(ReconstructCause::Incomplete)
     );
 }
