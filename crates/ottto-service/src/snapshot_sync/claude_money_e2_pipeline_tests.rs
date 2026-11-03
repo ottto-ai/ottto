@@ -3827,19 +3827,18 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
-            let g3_removals = format!("{:?}", prior.claude_copy_removals);
             let mut quiet = ready(&c, &scanner, prior, 100, sampled);
             if sampled {
                 // The expired hold's stored re-finalization differs from the
                 // accepted body, so it was withheld unsent (D142). Its owed native
-                // read decides the expiry again and is that body's one delivery;
-                // nothing selects afterwards.
+                // read has a census: it proves the two copied requests and removes
+                // them, and is that body's one delivery; nothing selects afterwards.
                 assert_eq!(quiet.modes, (1, 0, 0), "the read D142 owes");
                 let copy = body(&quiet, COPY).expect("the withheld body is delivered");
                 assert_eq!(
                     (copy.request_count, copy.removed_request_count),
-                    (3, Some(0)),
-                    "removals before this read: {g3_removals}"
+                    (1, Some(2)),
+                    "the owed read's census removes the proven copies"
                 );
                 let settled = settle(&c, &quiet.committed.clone(), quiet, &mut progress);
                 quiet = ready(&c, &scanner, settled, 100, sampled);
@@ -3850,6 +3849,52 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
             );
         });
     }
+}
+
+/// D62 guard: the census deadline holds through the expired hold's owed
+/// native read too. That read still ends the hold and is the body's one
+/// delivery; the hold never restarts, and nothing selects afterwards.
+#[test]
+fn e2_pipeline_resumed_prefix_hold_owed_read_under_deadline_never_restarts_the_hold() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let mut progress = e2_progress();
+        let scanner = E2ScanFixture::default();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, true);
+        let mut prior = settle(&c, &old, original, &mut progress);
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        let under_deadline = |prior: ScanIndex| {
+            let mut page = c.raw(&scanner, prior, 100, true, &[]);
+            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                page.enrich(&c);
+            });
+            page
+        };
+        for _ in 1..=3 {
+            let page = under_deadline(prior.clone());
+            prior = settle(&c, &prior, page, &mut progress);
+        }
+        let owed = under_deadline(prior);
+        assert_eq!(owed.modes, (1, 0, 0), "the read D142 owes");
+        let copy = body(&owed, COPY).expect("the withheld body is delivered");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (3, Some(0)),
+            "with no census the hold has expired: its copies stay unproven"
+        );
+        let settled = settle(&c, &owed.committed.clone(), owed, &mut progress);
+        let after = under_deadline(settled);
+        assert!(
+            body(&after, COPY).is_none(),
+            "the expired hold never restarts"
+        );
+    });
 }
 
 #[test]

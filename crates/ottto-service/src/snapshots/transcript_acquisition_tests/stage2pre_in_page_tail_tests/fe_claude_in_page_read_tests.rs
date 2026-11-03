@@ -213,18 +213,8 @@ fn next_read(
         claude_reemission_exclusions: index.claude_reemission_exclusions.clone(),
         ..ScanIndex::default()
     };
-    let ((index, next, seen), rows) = crate::local_resource_diagnostics::capture(|| {
-        plain(&base.fixture, CLAUDE, index, &base.cache)
-    });
-    let loads = rows
-        .iter()
-        .filter(|row| row["stage"] == "tail_db_loads" || row["stage"] == "tail_reconstruct")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        seen.modes, modes,
-        "{id}: the next page's read; unreadable={} causes={:?} scanned={} loads={loads:?}",
-        seen.unreadable, seen.causes, next.scanned_file_count
-    );
+    let (index, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, modes, "{id}: the next page's read");
     if let Some(reason) = reason {
         assert_eq!(seen.full_reasons[reason], 1, "{id}: next Full reason");
     }
@@ -1134,6 +1124,9 @@ fn fe_claude_census_reread_in_window_gives_member_changed() {
         "census member_changed: no unreadable; causes={:?}",
         grown.seen.causes
     );
+    // The observation driver accumulates on a resident graph; a cold routed
+    // one accumulates nothing (the inactive v1 driver), so read resident.
+    grown.index = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&grown.index);
     let _ = record_claude_native_observations(&grown.result, &mut grown.index);
     // Past the growth pace, so the re-read lands in this census window.
     sampled_scan::set_test_now(Some(
@@ -1151,12 +1144,11 @@ fn fe_claude_census_reread_in_window_gives_member_changed() {
         next.census_window_end, grown.result.census_window_end,
         "precondition: one census window"
     );
+    index = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&index);
     let observed = record_claude_native_observations(&next, &mut index);
     assert_eq!(
-        observed.counts.page_invalidated_member_changed_count,
-        1,
-        "census member_changed: counted once; cold loaded={}",
-        crate::snapshots::state_v2::money_test_support::usage_loaded(&index, SESSION),
+        observed.counts.page_invalidated_member_changed_count, 1,
+        "census member_changed: counted once"
     );
     assert!(
         crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&index)

@@ -29,9 +29,11 @@ pub(super) fn reuse_label(reason: CandidateParseReason) -> Option<&'static str> 
 /// against the committed head, as main's against its RAM copy: an unchanged
 /// file retires quietly, and only what the file proves changed reads Full.
 /// An `UnknownOutcome` re-read of a file with a head continues as well: main
-/// continued it from RAM. `NewFile`, the D138 held reasons and every legacy
-/// reason stay native.
-pub(super) fn reuses_stored(reason: Option<CandidateParseReason>) -> bool {
+/// continued it from RAM. Growth beats an upload-context selection: a file
+/// that `grew` past its committed entry continues as for `TranscriptChanged`
+/// (main continued it from RAM); a context-only one stays native (D138).
+/// `NewFile`, the other D138 held reason and every legacy reason stay native.
+pub(super) fn reuses_stored(reason: Option<CandidateParseReason>, grew: bool) -> bool {
     match reason {
         None
         | Some(
@@ -39,6 +41,7 @@ pub(super) fn reuses_stored(reason: Option<CandidateParseReason>) -> bool {
             | CandidateParseReason::Audit
             | CandidateParseReason::UnknownOutcome,
         ) => true,
+        Some(CandidateParseReason::UploadContext) => grew,
         Some(reason) => reuse_label(reason).is_some(),
     }
 }
@@ -51,12 +54,6 @@ pub(super) fn withhold_for_native(
     pending: &PendingIndexFinalization,
     reason: CandidateParseReason,
 ) {
-    // The withheld body carried the end of this file's copy hold, so the owed
-    // native read decides again, or the hold restarts and the body never goes.
-    let file = claude_money_birth_store::location_key(&pending.index_key);
-    if index.claude_copy_removals.hold_ended(file) {
-        index.claude_copy_removals.owe_last_hold(file);
-    }
     if let Some(entry) = index.files.get_mut(&pending.index_key) {
         entry.last_snapshot_fingerprint = pending.previous_snapshot_fingerprint.clone();
         entry.last_upload_body_witness = pending.previous_upload_body_witness.clone();

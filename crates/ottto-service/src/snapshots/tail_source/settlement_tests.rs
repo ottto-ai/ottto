@@ -414,7 +414,7 @@ fn the_shipped_selections_reuse_stored_state() {
         CandidateParseReason::AuthorityQuarantine,
         CandidateParseReason::ActivityOrQuarantineRetry,
     ] {
-        assert!(reuses_stored(Some(reason)), "{reason:?}");
+        assert!(reuses_stored(Some(reason), false), "{reason:?}");
     }
     assert!(reuse_label(CandidateParseReason::TranscriptChanged).is_none());
     assert!(reuse_label(CandidateParseReason::Audit).is_none());
@@ -423,18 +423,32 @@ fn the_shipped_selections_reuse_stored_state() {
         CandidateParseReason::UploadContext,
         CandidateParseReason::BodyWitnessAdoption,
     ] {
-        assert!(!reuses_stored(Some(reason)), "{reason:?}");
+        assert!(!reuses_stored(Some(reason), false), "{reason:?}");
     }
+    // Growth beats an upload-context selection: the grown file continues.
+    assert!(reuses_stored(
+        Some(CandidateParseReason::UploadContext),
+        true
+    ));
+    assert!(!reuses_stored(Some(CandidateParseReason::NewFile), true));
+    assert!(!reuses_stored(
+        Some(CandidateParseReason::BodyWitnessAdoption),
+        true
+    ));
 }
 
 /// D138: runs once upload-context and body-witness selections are enabled.
 #[test]
 #[ignore = "D138"]
 fn the_held_selections_reuse_stored_state_when_enabled() {
-    assert!(reuses_stored(Some(CandidateParseReason::UploadContext)));
-    assert!(reuses_stored(Some(
-        CandidateParseReason::BodyWitnessAdoption
-    )));
+    assert!(reuses_stored(
+        Some(CandidateParseReason::UploadContext),
+        false
+    ));
+    assert!(reuses_stored(
+        Some(CandidateParseReason::BodyWitnessAdoption),
+        false
+    ));
 }
 
 /// [money] §6: a forced member reads natively only for evidence stored state

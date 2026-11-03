@@ -42,24 +42,8 @@ pub(crate) fn routed_for_test(
     // A save and reload drops the runtime-only fields; the RAM-era fixture
     // passed every prior in memory, so each page keeps them.
     let runtime = runtime_only(&index);
-    let g3_prior = index.traversal.clone();
     let carry = |mut loaded: ScanIndex| {
         carry_runtime(&runtime, &mut loaded);
-        if serde_json::to_vec(&g3_prior).ok() != serde_json::to_vec(&loaded.traversal).ok() {
-            eprintln!(
-                "G3DIAG traversal differs across route reload: prior={:?} loaded={:?}",
-                g3_prior.as_ref().map(|t| (
-                    t.pending_candidates.len(),
-                    t.pending_directories.len(),
-                    t.listing_started_unix_seconds
-                )),
-                loaded.traversal.as_ref().map(|t| (
-                    t.pending_candidates.len(),
-                    t.pending_directories.len(),
-                    t.listing_started_unix_seconds
-                )),
-            );
-        }
         loaded
     };
     let mut own = cache.test_route.lock().unwrap();
@@ -108,24 +92,6 @@ pub(crate) fn routed_for_test(
         others,
     });
     carry(cold)
-}
-
-/// Which keys have a committed head on `index`'s route, and each set-aside mark.
-pub(crate) fn head_facts_for_test(index: &ScanIndex) -> String {
-    let keys = index.files.keys().map(|key| {
-        (
-            key.rsplit('/').next().unwrap_or_default().to_owned(),
-            state_v2::tail_set_aside(index, key)
-                .ok()
-                .flatten()
-                .is_some(),
-        )
-    });
-    format!(
-        "heads={:?} entries(set_aside)={:?}",
-        state_v2::tail_head_keys(index).map(|heads| heads.len()),
-        keys.collect::<Vec<_>>()
-    )
 }
 
 /// `settled` (a settlement saved beside its own files) back on `from`'s route.
@@ -323,6 +289,27 @@ pub(crate) fn route_claude_for_test(
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     routed_for_test(cache, index, &dir)
+}
+
+/// The time a fixture's next visit is taken to come after its last. The
+/// fixtures' `collected_at` never moves, so a kept generation's metadata
+/// re-listing (`LISTING_INTERVAL_SECONDS`) and its owed-file pace
+/// (`LISTING_OWED_PACE_SECONDS`) would never come due; production's clock
+/// moves on. Age the walk's listing clocks by the longer of the two, as a
+/// visit that much later sees them. Only the listing clocks move.
+pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
+    let Some(walk) = index.traversal.as_mut() else {
+        return;
+    };
+    let age = |at: &mut u64| {
+        *at = at.saturating_sub(LISTING_INTERVAL_SECONDS.max(LISTING_OWED_PACE_SECONDS));
+    };
+    if let Some(started) = walk.listing_started_unix_seconds.as_mut() {
+        age(started);
+    }
+    walk.listing_owed_requeued_unix_seconds
+        .values_mut()
+        .for_each(age);
 }
 
 /// The state database `index` is bound to, if any.

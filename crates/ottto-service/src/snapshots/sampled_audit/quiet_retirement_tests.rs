@@ -650,28 +650,6 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
     }
 }
 
-fn g3_page_facts(rows: &[Value]) -> String {
-    rows.iter()
-        .filter(|row| {
-            row["stage"] == "native_collection_page"
-                || row["stage"] == "tail_db_loads"
-                || row["stage"] == "tail_reconstruct"
-        })
-        .map(|row| {
-            let counts = &row["counts"];
-            format!(
-                "{}:{}/scanned={}/parse={}/adm={}",
-                row["stage"],
-                counts["cause"],
-                counts["scanned_files"],
-                counts["sampled_acquisition"]["full_by_parse_reason"],
-                counts["sampled_acquisition"]["acquisition_admission"]["attempts"],
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[test]
 fn cap_delayed_growth_survives_age_and_replacement_traversal() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -718,12 +696,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
                 .iter()
                 .filter(|row| row["stage"] == "sampled_audit_cap_delay")
                 .collect::<Vec<_>>();
-            assert_eq!(
-                delays.len() as u64,
-                delay,
-                "{source:?} full={full} {}",
-                g3_page_facts(rows),
-            );
+            assert_eq!(delays.len() as u64, delay);
             if delay > 0 {
                 assert_eq!(delays[0]["counts"]["audit_cap_delay"], delay);
             }
@@ -748,6 +721,9 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         let actual_size = fs::metadata(&fixture.file.0).unwrap().len();
         assert!(actual_size > committed_size, "real unpaid growth");
         sampled_scan::set_test_now(Some(START + 60));
+        let mut committed = committed;
+        // The growth is seen by the next visit's re-listing.
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut committed);
         let ((delayed, raw, modes), diagnostics) =
             crate::local_resource_diagnostics::capture(|| {
                 production_scan(
@@ -926,26 +902,13 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     sampled_scan::set_test_now(Some(due + 1));
     let index_path = fixture.dir.join("held-index.json");
     for _ in 0..2 {
+        // Each visit is a later one: the owed held file is listed again.
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         let committed = index.clone();
-        let g3_traversal = format!(
-            "{:?}",
-            index.traversal.as_ref().map(|t| (
-                t.pending_candidates.len(),
-                t.pending_directories.len(),
-                t.listing_started_unix_seconds,
-                t.scan_roots.clone(),
-            ))
-        );
         let ((working, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&fixture, source, index, Some(cache.clone()), "held-quiet")
         });
-        assert_eq!(
-            modes,
-            (0, 0, 1),
-            "{} traversal_before={g3_traversal} due={due} files={}",
-            g3_page_facts(&diagnostics),
-            working.files.len(),
-        );
+        assert_eq!(modes, (0, 0, 1));
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(working.files[&key].has_unverified_source());
         // Exercise the actual partial-save/held-body reconciliation. An
@@ -978,6 +941,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         &BTreeMap::new(),
     ));
     assert!(!index.claude_account_deferred_holds.contains_key(&key));
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
     let ((mut retired, _, modes, _), diagnostics) =
         crate::local_resource_diagnostics::capture(|| {
             production_scan_at_with_setup(
@@ -993,8 +957,9 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
     assert_eq!(modes, (0, 0, 1));
     assert_held_audit_diagnostics(&diagnostics, 1);
     assert!(!retired.files[&key].has_unverified_source());
-    let loaded =
+    let mut loaded =
         crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(&mut retired, &index_path);
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut loaded);
     let (_, _, modes, _) = production_scan_at_with_setup(
         &fixture,
         source,
@@ -1045,14 +1010,13 @@ fn held_fresh_debt_at_cap_is_not_cap_full_or_a_new_marker() {
         // UnknownOutcome forces the second quiet visit while the account
         // deferral still owns this retry; it confers no audit authority.
         index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         let ((next, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&fixture, source, index, Some(cache.clone()), "held-cap")
         });
         assert_eq!(
-            modes,
-            expected,
-            "neither cap decision may preempt a held retry {}",
-            g3_page_facts(&diagnostics)
+            modes, expected,
+            "neither cap decision may preempt a held retry"
         );
         assert_held_audit_diagnostics(&diagnostics, 0);
         assert!(next.claude_account_deferred_holds.contains_key(&key));
@@ -1227,8 +1191,11 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         );
         assert!(selected.files[&quiet_key].has_unverified_source());
         assert!(!selected.files[&held_key].has_unverified_source());
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut selected, &index_path);
-        index = ScanIndex::load(&index_path).unwrap();
+        // The next turn continues on this route, not from the unrouted copy.
+        index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            &mut selected,
+            &index_path,
+        );
         assert_eq!(
             index
                 .files

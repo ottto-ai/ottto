@@ -391,18 +391,10 @@ fn claude_pages(
     mode: (usize, usize, usize),
 ) -> [Page; 3] {
     save_inputs(c);
-    let (tail, rows) =
-        crate::local_resource_diagnostics::capture(|| c.raw(retained, tail_prior, 100, true, &[]));
+    let tail = c.raw(retained, tail_prior, 100, true, &[]);
     assert_eq!(
-        tail.modes,
-        mode,
-        "must exercise the named retained acquisition; {:?}",
-        rows.iter()
-            .filter(|row| row["stage"] == "tail_db_loads"
-                || row["stage"] == "tail_reconstruct"
-                || row["stage"] == "native_collection_page")
-            .map(|row| (row["stage"].clone(), row["counts"].clone()))
-            .collect::<Vec<_>>()
+        tail.modes, mode,
+        "must exercise the named retained acquisition"
     );
     let full = c.raw(&E2ScanFixture::default(), full_prior, 100, true, &[]);
     assert_eq!(

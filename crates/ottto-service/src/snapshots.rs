@@ -34154,7 +34154,12 @@ impl OwnedSourceScan {
                                 && allow_sample
                                 && !native_owed
                                 && !native_edit_proven
-                                && stored_refinalize::reuses_stored(parse_reason)
+                                && stored_refinalize::reuses_stored(
+                                    parse_reason,
+                                    index.files.get(&key).is_some_and(|entry| {
+                                        candidate.size_bytes > entry.size_bytes
+                                    }),
+                                )
                                 && !parser.reader.reader.is_compressed()
                         });
                         #[cfg(unix)]

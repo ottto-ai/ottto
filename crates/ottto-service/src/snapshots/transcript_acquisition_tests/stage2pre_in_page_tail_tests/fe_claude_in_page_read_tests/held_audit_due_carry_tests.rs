@@ -157,6 +157,9 @@ fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
     // No committed head on the state database: main's growth pacing holds the
     // Full until its interval, then it audits the file.
     now += sampled_audit::GROWTH_FULL_INTERVAL;
+    // That much later, the kept walk's re-listing queues the owed file again.
+    let mut index = index;
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
     let (index, _, fulls) = turn(index, now);
     assert_eq!(fulls, 1, "retried once");
     assert_eq!(sampled_audit::held_audit_open_failed(now).0, 0);
