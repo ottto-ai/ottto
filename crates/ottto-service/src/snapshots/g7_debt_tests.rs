@@ -211,7 +211,11 @@ impl Fixture {
         path
     }
     fn walk(&mut self) -> serde_json::Value {
-        walk(self.source, &[self.root.clone()], &mut self.index)
+        walk(
+            self.source,
+            std::slice::from_ref(&self.root),
+            &mut self.index,
+        )
     }
     /// The walk's observations commit with the next full save; reload them.
     fn save(&mut self) {
