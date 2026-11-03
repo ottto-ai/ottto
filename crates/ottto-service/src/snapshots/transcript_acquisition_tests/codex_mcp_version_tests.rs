@@ -247,6 +247,11 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
     let mut priority = usage(SnapshotSource::Codex, 140, 1, "fixture-model");
     priority["payload"]["service_tier"] = json!("priority");
     f.file.append(&priority);
+    let replays = |name| crate::snapshots::tail_source::counters::total(name, "tier_prefix_replay");
+    let before = (
+        replays("tail_reconstruct"),
+        replays("tail_reconstruct_bytes"),
+    );
     let (_, _, modes, _) = production_scan_at_with_setup(
         &f,
         SnapshotSource::Codex,
@@ -257,6 +262,11 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
         setup,
     );
     assert_eq!(modes, (1, 1, 0), "real Tail followed by TierReplay Full");
+    // The Full is the protected-tier replay: counted once, with the bytes it
+    // re-read from the file's start (D168 `tier_prefix_replay`).
+    assert_eq!(replays("tail_reconstruct"), before.0 + 1);
+    let read = replays("tail_reconstruct_bytes") - before.1;
+    assert!(read > 0 && read <= fs::metadata(&f.file.0).unwrap().len());
     assert_eq!(projection.snapshot().1, 3, "both EOF edges published");
     assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
 }
