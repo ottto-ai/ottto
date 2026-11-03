@@ -695,7 +695,12 @@ fn entity_stamp_dropped_by_old_decoder_is_owed() {
         &BTreeMap::from([(entity.clone(), "c".repeat(64))]),
         &BTreeMap::from([(entity.clone(), "d".repeat(64))]),
     );
-    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 0);
+    assert_eq!(
+        f.index
+            .upload_context_owed_counts(f.source)
+            .no_proof_entities,
+        0
+    );
     let saved_path = f._scratch.join("entity-stamp-index.json");
     f.index.save(&saved_path).unwrap();
     let mut encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
@@ -713,7 +718,12 @@ fn entity_stamp_dropped_by_old_decoder_is_owed() {
     assert!(serde_json::to_value(&f.index).unwrap()["upload_context_fingerprint"].is_null());
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
-    assert_eq!(f.index.upload_context_owed_counts().no_proof_entities, 1);
+    assert_eq!(
+        f.index
+            .upload_context_owed_counts(f.source)
+            .no_proof_entities,
+        1
+    );
     assert!(f.entry().upload_context_receipt.is_some());
 }
 
