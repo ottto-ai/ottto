@@ -4471,7 +4471,7 @@ fn assert_admitted_once(
         counter(cache, |c| c.memo_hits),
         counter(cache, |c| c.memo_records),
     );
-    let (index, again) = home.generation(index, cache, n);
+    let (_, again) = home.generation(index, cache, n);
     let usage = created_usage(&again);
     assert!(
         usage.is_empty()
@@ -4828,7 +4828,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     );
     assert_oracle(&home, &cache, &held, 0, true);
     home.project(home.bytes(3), 3);
-    let (index, woken) = home.generation(index, &cache, 1);
+    let (_, woken) = home.generation(index, &cache, 1);
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         0,
@@ -4910,7 +4910,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
     );
     let entry = home.memo_entry(&cache).expect("re-recorded entry");
     assert_eq!(entry.parent_ref(), None);
-    let (index, unchanged) = home.generation(index, &cache, 3);
+    let (_, unchanged) = home.generation(index, &cache, 3);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
     assert_oracle(&home, &cache, &unchanged, 3, true);
@@ -4983,7 +4983,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
             rusqlite::params![CREATED],
         )
         .unwrap();
-    let (index, cured) = home.generation(index, &cache, 2);
+    let (_, cured) = home.generation(index, &cache, 2);
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         1,
@@ -5155,8 +5155,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
         .unwrap()
         .write_all(&extra)
         .unwrap();
-    let ((index, grown), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
+    let ((_, grown), counts) = codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
     assert_eq!(
         (
             counts.memo_miss_exact_stamp,
@@ -5539,8 +5538,7 @@ fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
     );
     let hits = counter(&cache, |c| c.memo_hits);
     let (_, twin) = home.twin(&index, n);
-    let ((index, hit), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
+    let ((_, hit), counts) = codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         hits + 1,
@@ -5756,7 +5754,7 @@ fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
         counters(&cache)
     );
     let hits = counter(&cache, |c| c.memo_hits);
-    let ((index, quiet), parsed) = parses(|| {
+    let ((_, quiet), parsed) = parses(|| {
         let (index, _) = home.generation(index, &cache, n);
         home.generation(index, &cache, n + 1)
     });
@@ -5919,7 +5917,7 @@ fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
         Some(CodexParentUnresolvable::Absent)
     );
     fs::rename(&away, &parent).unwrap();
-    let (index, settled, n) = home.settle(index, &cache, 4);
+    let (_, settled, n) = home.settle(index, &cache, 4);
     assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
     assert_eq!(
         parent_causes(&settled),
@@ -6078,7 +6076,7 @@ fn parent_appended_after_page_start_still_gets_its_ledger() {
     assert!(ledger.scan_complete);
     assert_ne!(ledger.opened_object_identity, before);
     assert_eq!(ledger.signatures.len(), 6);
-    let (index, settled, n) = home.settle(index, &cache, n + 1);
+    let (_, settled, n) = home.settle(index, &cache, n + 1);
     let (_, oracle) = home.oracle(n);
     assert_eq!(census(&settled), census(&oracle));
 }
@@ -6125,7 +6123,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
         counters(&cache)
     );
     assert!(home.memo_entry(&cache).is_none());
-    let (index, admitted) = home.generation(index, &cache, 1);
+    let (_, admitted) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&admitted),
         vec![(200, 3)],
@@ -6173,8 +6171,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
         .unwrap()
         .write_all(&extra)
         .unwrap();
-    let ((index, grown), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
+    let ((_, grown), counts) = codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
     assert_eq!(
         (
             counts.memo_miss_exact_stamp,
@@ -6303,7 +6300,7 @@ fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
         (1, 0),
         "{counts:?}"
     );
-    let (index, settled, n) = home.settle(index, &cache, n + 2);
+    let (_, settled, n) = home.settle(index, &cache, n + 2);
     let (_, oracle) = home.oracle(n);
     assert_eq!(census(&settled), census(&oracle));
 }
@@ -6626,7 +6623,7 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
                 census_member: true,
                 watcher_hint: false,
             });
-        let (index, page_one) = finish(first);
+        let (mut index, page_one) = finish(first);
         assert!(!page_one.census_complete);
         let checkpoint = fixture
             ._dir
@@ -7363,7 +7360,7 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     index
         .codex_parent_ownership_refs
         .retain(|parent| !parent.starts_with("prefilled-"));
-    let (index, settled, n) = home.settle(index, &cache, 3);
+    let (_, settled, n) = home.settle(index, &cache, 3);
     assert_eq!(
         parent_causes(&settled),
         only(CodexParentUnresolvable::Absent, 0)
@@ -7832,7 +7829,7 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
         counters(&cache)
     );
     set_modified(std::time::SystemTime::now());
-    let (index, settled, n) = home.settle(index, &cache, 4);
+    let (_, settled, n) = home.settle(index, &cache, 4);
     assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
     let (_, oracle) = home.oracle(n);
     assert_eq!(census(&settled), census(&oracle));

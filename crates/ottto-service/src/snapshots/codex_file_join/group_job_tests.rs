@@ -942,7 +942,7 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
         &root.join("sessions/b.jsonl"),
         &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
     );
-    let (index, again) = next_generation(&root, index, &cache, 1);
+    let (_, again) = next_generation(&root, index, &cache, 1);
     let after = counters(&cache);
     assert_eq!(after.group_memo_hits, 1, "{after:?}");
     assert_eq!(
