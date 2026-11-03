@@ -3210,7 +3210,6 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         &mut index,
         BACKFILL_WINDOW_DAYS,
         None,
-        None,
     );
     index.archive_pass.power = true;
     let header = archive_header_pass(&mut index, &archive, &cache);
@@ -3503,7 +3502,6 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         SnapshotSource::Codex,
         &mut index,
         BACKFILL_WINDOW_DAYS,
-        None,
         None,
     );
     index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(PoweredArchiveGates));
