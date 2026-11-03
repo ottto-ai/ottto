@@ -306,6 +306,65 @@ fn shared_json(
         created,
     })
 }
+/// Leaves a shipped writer emitted that the current types retired, per kind.
+/// Dropped before the exact read so those rows still decode; never written
+/// again. Every other unknown or noncanonical key still refuses.
+const RETIRED_LEAVES: &[(&str, &[&str])] = &[
+    // 0.1.215 writes it every source cycle; retired by #1287.
+    ("v1_field.upload_context_proof", &["direction"]),
+    // 0.1.208-0.1.215 nonzero counters; retired by #1290.
+    (
+        "scan_state.traversal",
+        &["counts", "caps", "inventory_hold_keys_discarded"],
+    ),
+    (
+        "scan_state.traversal",
+        &["counts", "listing_owed_pace_evicted"],
+    ),
+];
+fn strip_retired(kind: &str, mut json: Vec<u8>) -> Result<Vec<u8>> {
+    for (_, path) in RETIRED_LEAVES.iter().filter(|(k, _)| *k == kind) {
+        if let Some(next) = strip_leaf(&json, path)? {
+            json = next;
+        }
+    }
+    Ok(json)
+}
+/// `json` without the object member at `path`, also dropping objects that
+/// removal empties below the root (their writers skip empty objects).
+/// `None`: absent, so the original bytes stand. Untouched subtrees stay raw.
+fn strip_leaf(json: &[u8], path: &[&str]) -> Result<Option<Vec<u8>>> {
+    let Some((first, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let Ok(mut map) =
+        serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(json)
+    else {
+        // Not an object (e.g. an absent Option): the exact read decides.
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        if map.remove(*first).is_none() {
+            return Ok(None);
+        }
+    } else {
+        let Some(child) = map.get(*first) else {
+            return Ok(None);
+        };
+        let Some(next) = strip_leaf(child.get().as_bytes(), rest)? else {
+            return Ok(None);
+        };
+        if next == b"{}" {
+            map.remove(*first);
+        } else {
+            map.insert(
+                (*first).to_owned(),
+                serde_json::value::RawValue::from_string(String::from_utf8(next)?)?,
+            );
+        }
+    }
+    Ok(Some(serde_json::to_vec(&map)?))
+}
 /// Row commitments recorded while one hydrate decodes; its seed consumes them.
 pub(super) type Digests = BTreeMap<RowKey, [u8; 32]>;
 const ROW_DOMAIN: &[u8] = b"ottto.state-v2.row.v1\0";
@@ -321,7 +380,8 @@ pub(super) fn read<T: DeserializeOwned + Serialize>(
         _ => "",
     };
     let projection = shared_json(tx, kind, &json, false)?;
-    let (value, canonical) = codec::exact_json(&projection.json)?;
+    let json = strip_retired(kind, projection.json)?;
+    let (value, canonical) = codec::exact_json(&json)?;
     if let Some(seed) = seed {
         // Same bytes and domain as `digest(&value)`, without serializing again.
         use sha2::Digest;
