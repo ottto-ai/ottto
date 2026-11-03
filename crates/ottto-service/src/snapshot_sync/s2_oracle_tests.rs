@@ -209,6 +209,150 @@ fn append_after_restart_and_eviction_preserves_placement() {
     });
 }
 
+/// [money] A body the server deferred for its identity (503) waits as a due
+/// retry. Its unchanged file re-folds from the committed Tail, with no Full,
+/// to the cold Full's body and placement (two accounts, a mid-session switch,
+/// a side call and an evidence gap). The retried body is one finalized item,
+/// POSTed once per upload and cleared only by its exact ACK. A session that
+/// owes a head-CAS answer reads the same body through a native Full.
+#[test]
+fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
+    with_e2(|| {
+        let (c, _) = placement_corpus("s2-identity-deferred-retry");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        seed.finish();
+        let refused = seed
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .expect("the root body")
+            .snapshot_fingerprint
+            .clone();
+        // The server sheds the root for its identity; its siblings ACK.
+        let shed =
+            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+                match batch
+                    .iter()
+                    .position(|item| item.snapshot_fingerprint == refused)
+                {
+                    Some(index) => Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(60)),
+                        code: Some(
+                            crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable,
+                        ),
+                    })
+                    .context(ShedSnapshotIndexes(vec![index]))),
+                    None => ack(batch),
+                }
+            };
+        let mut progress = e2_progress();
+        let _ = upload(&seed.scan.snapshots, &mut progress, shed);
+        assert!(!progress.accepted_fingerprints.contains(&refused));
+        let held = progress.quarantined_fingerprints.get_mut(&refused).unwrap();
+        assert_eq!(
+            held.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        held.retry_after_unix_seconds = 0; // due now
+        seed.index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut seed.index,
+            &seed.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        seed.index
+            .retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        let mut prior = session.save_reload(&mut seed.index).0;
+        prior.activate_quarantine_witness_for_test(SOURCE);
+
+        let mut cold_page = page(&c, ScanIndex::default(), 100, false);
+        cold_page
+            .scan
+            .snapshots
+            .retain(|item| item.source_session_id == ROOT);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert!(
+            accounts(&cold).len() >= 2,
+            "positive control: two placed accounts in the retried session"
+        );
+
+        let retried = page(&c, prior.clone(), 100, true);
+        assert_eq!(retried.modes.0, 0, "the due retry re-folds, never Full");
+        let bodies = retried
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == ROOT)
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 1, "finalize carries the retried body once");
+        assert_eq!(bodies[0].snapshot_fingerprint, refused, "the same body");
+        let warm = result(&retried, Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &warm);
+        let mut wrong = warm.clone();
+        wrong.snapshots.get_mut(ROOT).unwrap()["request_evidence"][0]["provider_workspace_hash"] =
+            json!("f".repeat(64));
+        assert!(
+            std::panic::catch_unwind(|| money_oracle::assert_equivalent(&cold, &wrong)).is_err()
+        );
+
+        // The held body is leased, POSTed once, and only an exact ACK clears it.
+        progress.prepare_quarantine_retries(&prior.quarantined_snapshot_fingerprints);
+        assert!(progress.active_quarantine_retries.contains(&refused));
+        let posts = |sent: &[Vec<u8>]| {
+            sent.iter()
+                .map(|bytes| {
+                    let wire: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                    json_array(&wire["snapshots"])
+                        .iter()
+                        .filter(|item| item["snapshot_fingerprint"] == refused.as_str())
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let mut inexact = progress.clone();
+        let (status, _, _) = upload(&retried.scan.snapshots, &mut inexact, |batch| {
+            let mut response = ack(batch)?;
+            for entity in &mut response.accepted_entities {
+                entity.body_witness_digest = Some("0".repeat(64));
+            }
+            Ok(response)
+        });
+        assert!(!matches!(status, Ok(ResumableUploadResult::Completed)));
+        assert!(!inexact.accepted_fingerprints.contains(&refused));
+        assert_eq!(
+            inexact.quarantined_fingerprints[&refused].disposition,
+            SnapshotQuarantineDisposition::RetryPending,
+            "a witness-mismatched ACK clears nothing"
+        );
+        let (status, sent, _) = upload(&retried.scan.snapshots, &mut progress, ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(posts(&sent), 1, "POSTed exactly once");
+        assert!(progress.accepted_fingerprints.contains(&refused));
+        assert!(!progress.quarantined_fingerprints.contains_key(&refused));
+
+        // A session that owes a head-CAS answer reads Full, to the same body.
+        let mut owed = prior;
+        owed.activate_head_conflict_sessions([cache_session_key(ROOT)].into());
+        let answered = page(&c, owed, 100, true);
+        assert!(answered.modes.0 > 0, "the owed answer reads a native Full");
+        money_oracle::assert_equivalent(&cold, &result(&answered, Mode::ColdFull));
+    });
+}
+
+fn json_array(value: &serde_json::Value) -> &[serde_json::Value] {
+    value.as_array().map_or(&[], Vec::as_slice)
+}
+
 /// [money] A census deadline withholds a NEW copied file, so it gains no
 /// index entry. After the save and reload its committed head, custody and
 /// never acceptance, still continues it: the unchanged walk reads no

@@ -1466,7 +1466,7 @@ fn cache_head_index_key(index_key: &str) -> String {
     )
 }
 
-fn cache_session_key(session: &str) -> String {
+pub(crate) fn cache_session_key(session: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(session.as_bytes()))
 }
@@ -9384,7 +9384,8 @@ fn prepare_upload_progress_for_cycle(
     )
 }
 
-/// Ordinary and continuation prepares bind both runtime witnesses together.
+/// Ordinary and continuation prepares bind both runtime witnesses together,
+/// and mirror the open head-CAS challenge sessions into the index.
 /// Neither retained body ACKs nor receipt candidates acquire new authority here.
 fn activate_source_upload_context(
     source: SnapshotSource,
@@ -9396,6 +9397,10 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
+    // A session that owes a head-CAS answer reads natively, never from Tail.
+    index.activate_head_conflict_sessions(
+        progress.head_conflict_challenges.keys().cloned().collect(),
+    );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);

@@ -128,6 +128,7 @@ macro_rules! scan_index_fields {
             claude_reemission_exclusions => Misc (runtime none) [] side,
             reason_reoffer_retries => Misc (runtime none) [] side,
             terminal_contract_retries => Misc (runtime none) [] side,
+            head_conflict_sessions => Misc (runtime none) [] side,
             refusal_exposure => Misc (runtime none) [] side,
             claude_history_unverified_in_process => Misc (runtime none) [] side,
             claude_rebuild_read_load_eligible => Misc (runtime none) [] side,

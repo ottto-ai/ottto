@@ -154,6 +154,7 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
         .clone();
     into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
+    into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
     into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
