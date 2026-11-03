@@ -152,9 +152,6 @@ fn native_comparison_selected_restore_membership_matches_canonical_without_globa
     index
         .file_snapshot_fingerprints
         .insert("empty".into(), BTreeSet::new());
-    index
-        .codex_state_only_snapshot_fingerprints
-        .insert("state".into(), "codex-state".into());
     let queries = [
         "exact-0",
         "legacy-0",
@@ -163,7 +160,6 @@ fn native_comparison_selected_restore_membership_matches_canonical_without_globa
         "legacy-2047",
         "shared",
         "shadowed-empty",
-        "codex-state",
         "absent",
     ];
     let (canonical, old) =
@@ -195,14 +191,13 @@ fn native_comparison_selected_restore_membership_matches_canonical_without_globa
             .files
             .keys()
             .filter(|key| !index.file_snapshot_fingerprints.contains_key(*key))
-            .count()
-        + index.codex_state_only_snapshot_fingerprints.len();
+            .count();
     assert_eq!(
         visits, expected_visits,
         "one universe pass, not affected bodies times the full index"
     );
     assert!(borrowed.requested_peak_with_overlap < old.requested_peak_with_overlap);
-    eprintln!("native comparison selected restore: unrelated_files=2048 affected_queries={} universe_visits={visits} old_global_requested_peak={} selected_set_requested_peak={} one_universe_pass=true exact_empty_overrides_legacy=true codex_state_preserved=true not_RSS=true", queries.len(), old.requested_peak_with_overlap, borrowed.requested_peak_with_overlap);
+    eprintln!("native comparison selected restore: unrelated_files=2048 affected_queries={} universe_visits={visits} old_global_requested_peak={} selected_set_requested_peak={} one_universe_pass=true exact_empty_overrides_legacy=true not_RSS=true", queries.len(), old.requested_peak_with_overlap, borrowed.requested_peak_with_overlap);
 }
 
 fn reports(root: &str, extra: bool) -> (Api, Trace) {

@@ -1019,18 +1019,11 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
             cloned.decode_held_codex_owners().collect::<Vec<_>>(),
             vec![valid.then_some(owner.as_str())]
         );
-        assert!(cloned.decode_holds_codex_owner("held-owner"));
-        assert_eq!(cloned.decode_holds_codex_owner("unrelated-owner"), !valid);
         cloned.save(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(
             restarted.decode_held_codex_owners().collect::<Vec<_>>(),
             vec![valid.then_some(owner.as_str())]
-        );
-        assert!(restarted.decode_holds_codex_owner("held-owner"));
-        assert_eq!(
-            restarted.decode_holds_codex_owner("unrelated-owner"),
-            !valid
         );
         assert_eq!(
             raw_slot(&fs::read(&path).unwrap(), "files", key),
@@ -1606,6 +1599,12 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                     "reread_guard"
                         | "upload_context_fingerprint"
                         | "claude_desktop_census_witness"
+                        | "codex_state_only_snapshot_fingerprints"
+                        | "codex_state_only_blocked_session_ids"
+                        | "codex_state_only_blocked_by_file"
+                        | "codex_state_only_blocked_unattributed"
+                        | "codex_state_only_blocked_legacy"
+                        | "codex_state_only_blocked_attributed"
                         | "claude_desktop_store_inventory"
                         | "context_curve_capability_enabled"
                         | "context_curve_replay_epoch"
@@ -1630,6 +1629,59 @@ fn retired_desktop_census_witness_decodes_and_drops() {
     older["claude_desktop_census_witness"] = serde_json::json!({
         "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
     });
+    let bytes = serde_json::to_vec(&older).unwrap();
+    let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+    let streaming =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    for decoded in [native, streaming, bounded] {
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
+    }
+}
+
+/// [format] An older index holding the retired Codex state-only fields and the
+/// residue witness's blocked leaf still loads on every decoder; each is dropped
+/// and never written again.
+#[test]
+fn retired_codex_state_only_fields_decode_and_drop() {
+    let mut current = serde_json::to_value(fixture()).unwrap();
+    current["scan_residue_witness"] =
+        serde_json::json!({"census_window_end": "2026-10-22T00:00:00Z", "index_keys": ["file"]});
+    let current =
+        serde_json::to_value(serde_json::from_value::<ScanIndex>(current).unwrap()).unwrap();
+    let mut older = current.clone();
+    for (field, value) in [
+        (
+            "codex_state_only_snapshot_fingerprints",
+            serde_json::json!({"session": "a".repeat(64)}),
+        ),
+        (
+            "codex_state_only_blocked_session_ids",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_by_file",
+            serde_json::json!({"file": ["session"]}),
+        ),
+        (
+            "codex_state_only_blocked_unattributed",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_legacy",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_attributed",
+            serde_json::json!(true),
+        ),
+    ] {
+        assert!(current.get(field).is_none(), "{field} is never written");
+        older[field] = value;
+    }
+    older["scan_residue_witness"]["codex_state_only_blocked_session_ids"] =
+        serde_json::json!(["session"]);
     let bytes = serde_json::to_vec(&older).unwrap();
     let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
     let streaming =
@@ -2272,12 +2324,18 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
         "collision" => {
             let mut index = fixture();
             let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-            index
-                .codex_state_only_snapshot_fingerprints
-                .insert(key.to_string(), "lower".to_string());
-            index
-                .codex_state_only_snapshot_fingerprints
-                .insert(key.to_ascii_uppercase(), "upper".to_string());
+            for (id, signature) in [
+                (key.to_string(), "lower"),
+                (key.to_ascii_uppercase(), "upper"),
+            ] {
+                index.codex_parent_ownership_ledgers.insert(
+                    id,
+                    CodexParentOwnershipLedger {
+                        signatures: vec![signature.to_string()],
+                        ..Default::default()
+                    },
+                );
+            }
             serde_json::to_vec(&index).unwrap()
         }
         _ => panic!("unknown synthetic damage"),
@@ -2616,10 +2674,18 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             _ => {
                 let mut seed = seed.clone();
                 let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-                seed.codex_state_only_snapshot_fingerprints
-                    .insert(key.to_string(), "lower".to_string());
-                seed.codex_state_only_snapshot_fingerprints
-                    .insert(key.to_ascii_uppercase(), "upper".to_string());
+                for (id, signature) in [
+                    (key.to_string(), "lower"),
+                    (key.to_ascii_uppercase(), "upper"),
+                ] {
+                    seed.codex_parent_ownership_ledgers.insert(
+                        id,
+                        CodexParentOwnershipLedger {
+                            signatures: vec![signature.to_string()],
+                            ..Default::default()
+                        },
+                    );
+                }
                 serde_json::to_vec(&seed).unwrap()
             }
         };
@@ -3754,8 +3820,8 @@ fn repair_identity_carry_keeps_retirement_evidence_with_its_own_decode_policy() 
 
 fn write_repair_collision(path: &Path, value: &mut Value) -> Vec<u8> {
     let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-    value["codex_state_only_snapshot_fingerprints"] = serde_json::json!({
-        key: "lower", key.to_ascii_uppercase(): "upper"
+    value["codex_parent_ownership_ledgers"] = serde_json::json!({
+        key: {"signatures": ["lower"]}, key.to_ascii_uppercase(): {"signatures": ["upper"]}
     });
     let bytes = serde_json::to_vec(value).unwrap();
     fs::write(path, &bytes).unwrap();
@@ -4176,12 +4242,12 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "terminal_jsonl_dispositions",
             "known_configured_scan_roots",
             "legacy_unresolved_root_file_witnesses",
-            "codex_state_only_snapshot_fingerprints",
-            "codex_state_only_blocked_session_ids",
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
+            "codex_state_only_snapshot_fingerprints", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_session_ids", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_by_file", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_unattributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_legacy", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_attributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "codex_parent_ownership_refs",
             "codex_parent_ownership_ledgers",
             "codex_parent_side_requests",

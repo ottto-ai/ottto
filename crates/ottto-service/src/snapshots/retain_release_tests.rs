@@ -1021,7 +1021,6 @@ fn x_out_coverage_witness_names_every_finished_field() {
             dropped_usage_record_count: _,              // I
             claude_compaction_unlinked_parent_count: _, // I
             terminal_line_loss_count: _,                // I
-            state_only_blocked_session_ids: _,          // M (Codex only; empty on Claude)
             codex_parent_session_ref: _,                // M (Codex only)
             codex_parent_ledger_identity_used: _,       // M (Codex only)
             codex_parent_resolution_pending: _,         // I

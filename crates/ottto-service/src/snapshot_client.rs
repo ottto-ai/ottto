@@ -1549,14 +1549,11 @@ pub struct SnapshotStatusRequest {
     #[serde(default)]
     pub last_census_residue_settled: bool,
     /// Cardinalities of the local residue witness, COUNTS ONLY. The witness
-    /// itself holds local filesystem index keys and Codex session ids; neither
-    /// ever reaches the wire.
+    /// itself holds local filesystem index keys; they never reach the wire.
     #[serde(default)]
     pub last_census_residue_index_key_count: u64,
     #[serde(default)]
     pub last_census_residue_archived_rollout_count: u64,
-    #[serde(default)]
-    pub last_census_residue_blocked_session_count: u64,
     /// Census-member queue plus carry replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_census_pending_file_count: Option<u64>,
@@ -1643,7 +1640,6 @@ impl SnapshotStatusRequest {
             last_census_residue_settled,
             last_census_residue_index_key_count,
             last_census_residue_archived_rollout_count,
-            last_census_residue_blocked_session_count,
             last_census_pending_file_count,
             last_census_block_cause,
             consecutive_failures,
@@ -1785,10 +1781,6 @@ impl SnapshotStatusRequest {
             (
                 "last_census_residue_archived_rollout_count",
                 *last_census_residue_archived_rollout_count,
-            ),
-            (
-                "last_census_residue_blocked_session_count",
-                *last_census_residue_blocked_session_count,
             ),
             ("consecutive_failures", *consecutive_failures),
         ] {
@@ -3791,7 +3783,6 @@ mod tests {
             "last_census_residue_settled",
             "last_census_residue_index_key_count",
             "last_census_residue_archived_rollout_count",
-            "last_census_residue_blocked_session_count",
         ] {
             assert!(body.remove(name).is_some(), "{name} is on the wire");
         }
@@ -4173,7 +4164,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 0,
@@ -4378,10 +4368,6 @@ mod tests {
                 Box::new(|r| r.last_census_residue_archived_rollout_count = 1),
             ),
             (
-                "last_census_residue_blocked_session_count",
-                Box::new(|r| r.last_census_residue_blocked_session_count = 1),
-            ),
-            (
                 "consecutive_failures",
                 Box::new(|r| r.consecutive_failures = 1),
             ),
@@ -4477,7 +4463,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 1,
@@ -4551,7 +4536,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 0,

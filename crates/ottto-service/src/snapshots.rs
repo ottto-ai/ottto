@@ -2885,23 +2885,13 @@ struct ScanTraversalResidue {
     /// Local index keys of the residue files (the same key space as `files`).
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     index_keys: BTreeSet<String>,
-    /// Codex session ids those files hold out of the inclusive state-only
-    /// fallback. They are never pruned from
-    /// `ScanIndex::codex_state_only_blocked_session_ids` by settling: the block
-    /// records what the rollout's content proved about its ownership, and
-    /// releasing it would publish inclusive `tokens_used` for a thread whose
-    /// exclusive usage is exactly what could not be determined.
-    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
-    blocked_session_ids: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_inventory_hold: Option<CodexInventoryHold>,
 }
 
 impl ScanTraversalResidue {
     fn is_empty(&self) -> bool {
-        self.index_keys.is_empty()
-            && self.blocked_session_ids.is_empty()
-            && self.codex_inventory_hold.is_none()
+        self.index_keys.is_empty() && self.codex_inventory_hold.is_none()
     }
 }
 
@@ -2935,9 +2925,8 @@ struct CodexInventoryHold {
 /// Durable record of the residue disclosed by the last census that completed
 /// with named, non-progressing loss. Written when a generation completes and
 /// cleared when a generation completes clean, so an operator reading the index
-/// can see which files the machine cannot checkpoint and which Codex sessions
-/// are held out of the state-only fallback, rather than inferring it from
-/// per-cycle log lines.
+/// can see which files the machine cannot checkpoint, rather than inferring it
+/// from per-cycle log lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct ScanResidueWitness {
@@ -2947,8 +2936,6 @@ struct ScanResidueWitness {
     dropped_usage_record_count: u64,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     index_keys: BTreeSet<String>,
-    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
-    codex_state_only_blocked_session_ids: BTreeSet<String>,
 }
 
 impl ScanResidueWitness {
@@ -2958,8 +2945,6 @@ impl ScanResidueWitness {
             && self.zero_snapshot_usage_evidence_count == other.zero_snapshot_usage_evidence_count
             && self.dropped_usage_record_count == other.dropped_usage_record_count
             && self.index_keys == other.index_keys
-            && self.codex_state_only_blocked_session_ids
-                == other.codex_state_only_blocked_session_ids
     }
 
     /// Residue files that live under an archived Codex sessions root. An
@@ -3650,37 +3635,20 @@ pub struct ScanIndex {
     /// paths clear when a resolved root covers them or the root context changes.
     #[serde(default)]
     legacy_unresolved_root_file_witnesses: BTreeSet<String>,
-    /// Last accepted semantic fingerprint for Codex sessions that exist only
-    /// in the local state database and have no usage-bearing rollout file.
-    ///
-    /// These snapshots are rebuilt every scan from `state_*.sqlite`. Keeping
-    /// their fingerprints beside the file index lets a successful upload
-    /// acknowledge them exactly like file-backed snapshots, without turning
-    /// every later state-database observation into another upload.
-    #[serde(default)]
-    pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
-    /// Codex rollout sessions whose physical file is known to contain an
-    /// inherited prefix but whose exclusive ownership boundary is unresolved.
-    /// Persisting the session id prevents a later incremental page (where the
-    /// unchanged rollout is not reparsed) from publishing inclusive
-    /// `state_5.sqlite.tokens_used` as session-local usage.
-    #[serde(default)]
-    codex_state_only_blocked_session_ids: BTreeSet<String>,
-    /// L-SB: what each local index key's latest settleable disclosure blocked
-    /// (strict disclosures add). A re-parse or memo replay that no longer
-    /// blocks an id releases it unless another holder remains. Never pruned by
-    /// census absence. Never a settling rule.
-    #[serde(default)]
-    codex_state_only_blocked_by_file: BTreeMap<String, BTreeSet<String>>,
-    /// Ids the group paths block with no file attribution: queued or paused
-    /// join owners and capture-boundary held owners.
-    #[serde(default)]
-    codex_state_only_blocked_unattributed: BTreeSet<String>,
-    /// Ids blocked before L-SB existed: never released by attribution.
-    #[serde(default)]
-    codex_state_only_blocked_legacy: BTreeSet<String>,
-    #[serde(default)]
-    codex_state_only_blocked_attributed: bool,
+    /// retired_<old>: decode-only placeholders; keep positional slots; never written.
+    /// The Codex state-only usage fallback and its blocks, retired with it.
+    #[serde(rename = "codex_state_only_snapshot_fingerprints", default)]
+    retired_codex_state_only_snapshot_fingerprints: serde::de::IgnoredAny,
+    #[serde(rename = "codex_state_only_blocked_session_ids", default)]
+    retired_codex_state_only_blocked_session_ids: serde::de::IgnoredAny,
+    #[serde(rename = "codex_state_only_blocked_by_file", default)]
+    retired_codex_state_only_blocked_by_file: serde::de::IgnoredAny,
+    #[serde(rename = "codex_state_only_blocked_unattributed", default)]
+    retired_codex_state_only_blocked_unattributed: serde::de::IgnoredAny,
+    #[serde(rename = "codex_state_only_blocked_legacy", default)]
+    retired_codex_state_only_blocked_legacy: serde::de::IgnoredAny,
+    #[serde(rename = "codex_state_only_blocked_attributed", default)]
+    retired_codex_state_only_blocked_attributed: serde::de::IgnoredAny,
     /// Parent ids requested by unresolved legacy ordinary forks. This bounded
     /// set forces an unchanged parent through one structural prepass instead
     /// of retaining every Codex transcript signature in the index.
@@ -4342,12 +4310,12 @@ impl Default for ScanIndex {
             terminal_jsonl_dispositions: BTreeMap::new(),
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
-            codex_state_only_snapshot_fingerprints: BTreeMap::new(),
-            codex_state_only_blocked_session_ids: BTreeSet::new(),
-            codex_state_only_blocked_by_file: BTreeMap::new(),
-            codex_state_only_blocked_unattributed: BTreeSet::new(),
-            codex_state_only_blocked_legacy: BTreeSet::new(),
-            codex_state_only_blocked_attributed: false,
+            retired_codex_state_only_snapshot_fingerprints: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_session_ids: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_by_file: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_unattributed: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_legacy: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_attributed: serde::de::IgnoredAny,
             codex_parent_ownership_refs: BTreeSet::new(),
             codex_parent_ownership_ledgers: BTreeMap::new(),
             codex_parent_side_requests: BTreeMap::new(),
@@ -5772,12 +5740,6 @@ fn claude_index_file_body_accepted(
                                 .contains_key(fingerprint)
                     })
             })
-}
-
-// Coverage requires a non-quarantined body ACK, not a refusal checkpoint.
-fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
-    codex_counting_version::proven_owner(entry).is_some()
-        && claude_index_file_body_accepted(index, key, entry)
 }
 
 /// Whether the accepted ledger is current and not being rebuilt by the
@@ -8038,7 +8000,6 @@ pub struct SourceScanResult {
     /// earlier census, not this scan) and when it completed clean.
     pub census_residue_index_key_count: usize,
     pub census_residue_archived_rollout_count: usize,
-    pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
     /// Exact selection deferrals from this page, diagnostic only; never persisted.
     pub(crate) claude_queued_family_deferred_paths: BTreeSet<claude_money_birth_store::LocationKey>,
@@ -8242,7 +8203,6 @@ impl SourceScanResult {
             if previous.confirmed_empty_files.contains(key) {
                 index.confirmed_empty_files.insert(key.clone());
             }
-            index.revert_codex_blocked_attribution(previous, key);
         }
         self.pending_finalization
             .retain(|pending| !keys.contains(&pending.index_key));
@@ -8256,10 +8216,6 @@ impl SourceScanResult {
                 .counts
                 .record_unreadable(UnreadableCause::LegacyHold, 1);
             traversal.residue.index_keys.extend(keys);
-            traversal
-                .residue
-                .blocked_session_ids
-                .extend(held.iter().cloned());
             let now = rfc3339_unix_seconds(&self.census_window_end).unwrap_or_default();
             traversal.unhealthy_retry_attempt = traversal
                 .unhealthy_retry_attempt
@@ -8269,12 +8225,6 @@ impl SourceScanResult {
                 unhealthy_scan_retry_delay_seconds(traversal.unhealthy_retry_attempt),
             ));
         }
-        index
-            .codex_state_only_blocked_session_ids
-            .extend(held.iter().cloned());
-        index
-            .codex_state_only_blocked_unattributed
-            .extend(held.iter().cloned());
         if let Some(validation) = &mut self.codex_join_validation {
             validation
                 .groups
@@ -8479,10 +8429,6 @@ pub(crate) fn prepare_codex_recovery_diagnostics(
                 }
             }
         }
-        sample.before_current |= index
-            .codex_state_only_snapshot_fingerprints
-            .values()
-            .any(|current| current == fingerprint);
         diagnostic.lineage[slot] = Some(sample);
     }
 }
@@ -8833,37 +8779,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
 
-    // State-only Codex entities do not have a source-file fingerprint, so they
-    // cannot use the file finalization table above. Rebind their durable map to
-    // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
-    // is also where no-op suppression belongs: parser-time equality is not
-    // authoritative when a privacy policy or account cutoff changed.
-    if source == SnapshotSource::Codex && result.state_census_complete {
-        let previous = index.codex_state_only_snapshot_fingerprints.clone();
-        let mut current = BTreeMap::new();
-        let mut noop_state_only = BTreeSet::new();
-        for snapshot in &result.snapshots {
-            if snapshot.source_file_fingerprint.is_none()
-                && snapshot.provenance.collector == "codex_state_sqlite"
-            {
-                let fingerprint = snapshot.snapshot_fingerprint.clone();
-                if previous.get(&snapshot.source_session_id) == Some(&fingerprint)
-                    && index.snapshot_activity_at.contains_key(&fingerprint)
-                    && !index.quarantine_requires_retry(&fingerprint)
-                {
-                    noop_state_only.insert(snapshot.source_session_id.clone());
-                    result.semantic_noop_count = result.semantic_noop_count.saturating_add(1);
-                }
-                current.insert(snapshot.source_session_id.clone(), fingerprint);
-            }
-        }
-        index.codex_state_only_snapshot_fingerprints = current;
-        result.snapshots.retain(|snapshot| {
-            snapshot.source_file_fingerprint.is_some()
-                || snapshot.provenance.collector != "codex_state_sqlite"
-                || !noop_state_only.contains(&snapshot.source_session_id)
-        });
-    }
     if result.census_complete {
         index.bounded_sweep_had_unsettled_upload = false;
         index.bounded_sweep_unsettled_causes = 0;
@@ -8874,7 +8789,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .file_snapshot_fingerprints
         .values()
         .flat_map(BTreeSet::iter)
-        .chain(index.codex_state_only_snapshot_fingerprints.values())
         .collect::<BTreeSet<_>>();
     index
         .snapshot_activity_at
@@ -18778,23 +18692,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn codex_state_only_blocked_session_ids(&self) -> BTreeSet<String> {
-        if let Some(identity) = self.codex_resolved_path_identity.as_ref() {
-            return BTreeSet::from([identity.clone()]);
-        }
-        if self.codex_sidecar_identity_ambiguous {
-            let candidates = self
-                .codex_path_sidecar_candidates
-                .iter()
-                .map(|candidate| candidate.identity.clone())
-                .collect::<BTreeSet<_>>();
-            if !candidates.is_empty() {
-                return candidates;
-            }
-        }
-        self.source_session_id.iter().cloned().collect()
-    }
-
     fn configure_codex_ownership(&mut self, value: &Value) {
         let Some(meta) = codex_session_meta_payload(value) else {
             return;
@@ -24921,47 +24818,6 @@ fn validate_codex_parent_ownership_ledgers(
     (validated, rewitnessed)
 }
 
-/// L-1 release (§d.1.3) of every owner whose recorded members all left the
-/// clean walk's census. Exact authority: only those member keys' claims on
-/// that owner go (`accept_codex_block`); any other key still blocking it, and
-/// every other owner, stay. A missing traversal skips the release: it is
-/// never read as an empty census.
-/// Owners in the traversal's residue set keep their provenance and claims.
-fn release_departed_join_owners(
-    index: &mut ScanIndex,
-    cache: &sampled_scan::SharedCache,
-    keep: impl Fn(&str) -> bool,
-) {
-    /// Puts the taken traversal back on every exit, an unwind included.
-    struct Restore<'a> {
-        index: &'a mut ScanIndex,
-        traversal: Option<ScanTraversalCheckpoint>,
-    }
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            self.index.traversal = self.traversal.take();
-        }
-    }
-    // Moved out (no copy) so the census is borrowed beside `&mut index`;
-    // `accept_codex_block` never reads `traversal`.
-    let Some(traversal) = index.traversal.take() else {
-        return;
-    };
-    let mut restore = Restore {
-        index,
-        traversal: Some(traversal),
-    };
-    let Restore { index, traversal } = &mut restore;
-    let Some(traversal) = traversal.as_ref() else {
-        return;
-    };
-    cache.release_join_owners(
-        &traversal.codex_rollout_paths,
-        |owner| traversal.residue.blocked_session_ids.contains(owner) || keep(owner),
-        |owner, members| index.accept_codex_block(members, owner),
-    );
-}
-
 /// U1a-2a (row 6, design rev 18.2 §2.3–2.4): what the side fence decided for
 /// one child use of P's side record at sealed offset `needed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26082,11 +25938,9 @@ pub(crate) struct OwnedSourceScan {
     /// This page's history-upgrade budget and count-only gate diagnostics.
     history_upgrade: HistoryPage,
     context_read_budget: upload_context_read::Budget,
-    codex_state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_resolution_retry_required: bool,
     residue_index_keys: BTreeSet<String>,
     settled_residue_index_keys: BTreeSet<String>,
-    residue_blocked_session_ids: BTreeSet<String>,
     pending_finalization: Vec<PendingIndexFinalization>,
     claude_authority_preflight: bool,
     forced_claude_family_reparses: BTreeSet<String>,
@@ -26616,11 +26470,9 @@ impl OwnedSourceScan {
             semantic_noop_count: 0,
             history_upgrade: HistoryPage::with_twin_groups(Default::default(), BTreeSet::new()),
             context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
-            codex_state_only_blocked_session_ids: Default::default(),
             codex_parent_resolution_retry_required: false,
             residue_index_keys: Default::default(),
             settled_residue_index_keys: Default::default(),
-            residue_blocked_session_ids: Default::default(),
             pending_finalization: Vec::new(),
             claude_authority_preflight: false,
             forced_claude_family_reparses: Default::default(),
@@ -26712,7 +26564,6 @@ impl OwnedSourceScan {
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
         let codex_title_metadata = if source == SnapshotSource::Codex {
             let mut metadata = CodexTitleMetadata::load_from_roots(roots);
-            metadata.count_prior_state_only_conflicts(index);
             metadata.scope_created_thread_census(index, roots);
             metadata
         } else {
@@ -26802,11 +26653,6 @@ impl OwnedSourceScan {
             Some(&resource_probe.discovery_growth),
         );
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
-        if source == SnapshotSource::Codex {
-            // L-SB: an index from before blocked-set attribution moves its
-            // whole blocked set to `legacy` once.
-            index.migrate_codex_blocked_attribution();
-        }
         // L-5: no census copy; parent lookups borrow the index's own census,
         // which this page no longer writes until it finishes.
         let codex_parent_identities = CodexParentIdentities::new(source, index.traversal.as_ref());
@@ -27206,11 +27052,9 @@ impl OwnedSourceScan {
         let scanned_file_count = 0;
         let scanned_session_count = 0;
         let semantic_noop_count = 0;
-        let codex_state_only_blocked_session_ids = BTreeSet::new();
         let codex_parent_resolution_retry_required = false;
         let residue_index_keys = BTreeSet::new();
         let settled_residue_index_keys = BTreeSet::new();
-        let residue_blocked_session_ids = BTreeSet::new();
         let pending_finalization = Vec::new();
         let claude_authority_preflight = source == SnapshotSource::ClaudeCode
             && !index.claude_usage_authority_quarantine.is_empty();
@@ -27532,11 +27376,9 @@ impl OwnedSourceScan {
                 claude_queued_family_deferred_paths,
             ),
             context_read_budget: upload_context_read::Budget::new(source),
-            codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
             settled_residue_index_keys,
-            residue_blocked_session_ids,
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
@@ -27760,11 +27602,9 @@ impl OwnedSourceScan {
             mut semantic_noop_count,
             mut history_upgrade,
             mut context_read_budget,
-            mut codex_state_only_blocked_session_ids,
             mut codex_parent_resolution_retry_required,
             mut residue_index_keys,
             mut settled_residue_index_keys,
-            mut residue_blocked_session_ids,
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
@@ -27821,12 +27661,6 @@ impl OwnedSourceScan {
             codex_parent_identities.parents_applied = true;
         }
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
-        // A prior page's ownership refusal still vetoes inclusive fallback
-        // after its page-local block set has been lost to save/reload.
-        if let Some(traversal) = index.traversal.as_ref() {
-            codex_state_only_blocked_session_ids
-                .extend(traversal.residue.blocked_session_ids.iter().cloned());
-        }
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
         // callers even though the retained scanner state is unchanged.
@@ -27843,9 +27677,6 @@ impl OwnedSourceScan {
                     sampled_scan::codex_cursor::DisclosureTargets {
                         census: &mut census,
                         residue_index_keys: &mut residue_index_keys,
-                        residue_blocked_session_ids: &mut residue_blocked_session_ids,
-                        codex_state_only_blocked_session_ids:
-                            &mut codex_state_only_blocked_session_ids,
                         pending_finalization: &mut pending_finalization,
                     }
                 };
@@ -28076,8 +27907,6 @@ impl OwnedSourceScan {
                                     .iter()
                                     .map(|member| local_index_key(&member.path)),
                             );
-                            residue_blocked_session_ids.insert(group.owner.clone());
-                            codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
                         // G1: a group whose attempt already ended in this
@@ -28197,36 +28026,9 @@ impl OwnedSourceScan {
                                 .pending_candidates
                                 .retain(|pending| !paths.contains(pending.path.as_path()));
                         }
-                        // F8 (§d.1.3): a queued group's owner has no state-only
-                        // body in this scan object or across a restart until
-                        // its exclusive body is accepted; B records the
-                        // provenance for the L-1 release.
-                        codex_state_only_blocked_session_ids.insert(group.owner.clone());
-                        index
-                            .codex_state_only_blocked_session_ids
-                            .insert(group.owner.clone());
-                        index
-                            .codex_state_only_blocked_unattributed
-                            .insert(group.owner.clone());
-                        if let Some(context) = sampling.as_ref() {
-                            context
-                                .cache
-                                .record_join_owner(&group.owner, &group.members);
-                        }
                         if !fenced {
                             codex_join_groups.push_back(group);
                         }
-                    }
-                    // F8: the paused group job's owner, in every scan object.
-                    if let Some(owner) = sampling
-                        .as_ref()
-                        .and_then(|context| context.cache.cursor_group_owner())
-                    {
-                        codex_state_only_blocked_session_ids.insert(owner.clone());
-                        index
-                            .codex_state_only_blocked_unattributed
-                            .insert(owner.clone());
-                        index.codex_state_only_blocked_session_ids.insert(owner);
                     }
                     identified_candidates.retain(|candidate| {
                         !grouped_paths.contains(&local_index_key(&candidate.path))
@@ -28257,16 +28059,6 @@ impl OwnedSourceScan {
                                 .iter()
                                 .map(|candidate| local_index_key(&candidate.path)),
                         );
-                        let held_owners = inventory
-                            .headers
-                            .iter()
-                            .filter(|header| {
-                                selected.contains(&local_index_key(&header.candidate.path))
-                            })
-                            .map(|header| header.owner.clone())
-                            .collect::<BTreeSet<_>>();
-                        residue_blocked_session_ids.extend(held_owners.iter().cloned());
-                        codex_state_only_blocked_session_ids.extend(held_owners);
                         identified_candidates.clear();
                     }
                     while !identified_candidates.is_empty()
@@ -28435,24 +28227,8 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     codex_file_join::Boot::Unchanged => {
-                        // The accepted joined body is current, with no
-                        // job or debt: the persisted block F8 (or a previous
-                        // process) set is released, as an accepted exclusive
-                        // body releases it, unless this scan holds the owner
-                        // as residue.
-                        if !residue_blocked_session_ids.contains(&boot.group.owner) {
-                            // L-SB: the accepted joined body supersedes the
-                            // members' own block on the owner; any other key
-                            // still blocking it keeps it.
-                            index.accept_codex_block(
-                                boot.group
-                                    .members
-                                    .iter()
-                                    .map(|member| local_index_key(&member.path)),
-                                &boot.group.owner,
-                            );
-                        }
-                        // Nothing read for a job; it does not wait.
+                        // The accepted joined body is current, with no job
+                        // or debt. Nothing read for a job; it does not wait.
                         if let Some(context) = sampling.as_ref() {
                             context.cache.cursor_unwait(&context.namespace, &boot.key);
                         }
@@ -28465,11 +28241,7 @@ impl OwnedSourceScan {
                         if let Some(context) = sampling.as_ref() {
                             context.cache.cursor_unwait(&context.namespace, &boot.key);
                         }
-                        codex_file_join::disclose_strict(
-                            &boot.group.owner,
-                            &boot.group.members,
-                            targets!(),
-                        );
+                        codex_file_join::disclose_strict(&boot.group.members, targets!());
                         pending!();
                     }
                     codex_file_join::Boot::Refused(reason) => {
@@ -28484,7 +28256,7 @@ impl OwnedSourceScan {
                             );
                         }
                         codex_file_join::disclose_members(
-                            &codex_file_join::refusal_disclosure(&boot.group.owner),
+                            &codex_file_join::refusal_disclosure(),
                             &boot.group.members,
                             index,
                             targets!(),
@@ -28626,7 +28398,6 @@ impl OwnedSourceScan {
                         |member| member.opened_object_identity.clone(),
                     )
                 });
-                let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
                 let job = boot.into_job(codex_file_join::JobInputs {
@@ -28641,7 +28412,7 @@ impl OwnedSourceScan {
                     if let Some(context) = sampling.as_ref() {
                         context.cache.cursor_unwait(&context.namespace, &boot_key);
                     }
-                    codex_file_join::disclose_strict(&owner, &group_members, targets!());
+                    codex_file_join::disclose_strict(&group_members, targets!());
                     pending!();
                 };
                 if let Some(context) = sampling.as_ref().filter(|_| paged) {
@@ -28683,7 +28454,6 @@ impl OwnedSourceScan {
                                 ),
                                 None => census.record_unreadable(UnreadableCause::OpenRead, 1),
                             }
-                            codex_state_only_blocked_session_ids.insert(owner);
                             pending!();
                         }
                     }
@@ -29117,11 +28887,7 @@ impl OwnedSourceScan {
                         }
                         if let Some(group) = active.group.as_ref() {
                             // A member read failure: strict, as before P2.
-                            codex_file_join::disclose_strict(
-                                &group.owner,
-                                &group.members,
-                                targets!(),
-                            );
+                            codex_file_join::disclose_strict(&group.members, targets!());
                             sampled_scan::codex_cursor::dequeue_members(index, &group.members);
                             pending!();
                         }
@@ -29749,11 +29515,6 @@ impl OwnedSourceScan {
                             census.causes.add(ownership::GROUP, 1);
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.insert(local_index_key(&candidate.path));
-                            if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
-                                residue_blocked_session_ids.insert(resolve_codex_identity(owner));
-                                codex_state_only_blocked_session_ids
-                                    .insert(resolve_codex_identity(owner));
-                            }
                             pending!();
                         }
                     }
@@ -29794,15 +29555,6 @@ impl OwnedSourceScan {
                     residue_index_keys.insert(local_index_key(&candidate.path));
                     residue_index_keys
                         .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                    if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
-                        residue_blocked_session_ids.insert(resolve_codex_identity(owner));
-                        codex_state_only_blocked_session_ids.insert(resolve_codex_identity(owner));
-                    }
-                    codex_state_only_blocked_session_ids.extend(
-                        aliases
-                            .iter()
-                            .flat_map(|member| codex_session_id_candidates_from_path(&member.path)),
-                    );
                     pending!();
                 }
                 // The existing copy budget funds two simultaneous allocations:
@@ -30630,13 +30382,6 @@ impl OwnedSourceScan {
                     census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys
                         .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                    let owners = parsed_file
-                        .snapshots
-                        .iter()
-                        .map(|item| resolve_codex_identity(&item.source_session_id));
-                    codex_state_only_blocked_session_ids.extend(owners);
-                    codex_state_only_blocked_session_ids
-                        .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
                     pending!();
                 }
                 if !aliases.is_empty() {
@@ -30857,30 +30602,6 @@ impl OwnedSourceScan {
                 } else {
                     settled_residue_index_keys.insert(index_key.clone());
                 }
-                let blocked = parsed_file
-                    .state_only_blocked_session_ids
-                    .iter()
-                    .map(|session_id| resolve_codex_identity(session_id.as_str()))
-                    .collect::<BTreeSet<_>>();
-                for session_id in &blocked {
-                    if non_progressing_residue {
-                        residue_blocked_session_ids.insert(session_id.clone());
-                    }
-                    codex_state_only_blocked_session_ids.insert(session_id.clone());
-                    index
-                        .codex_state_only_blocked_session_ids
-                        .insert(session_id.clone());
-                }
-                if source == SnapshotSource::Codex {
-                    // L-SB: this (settleable) parse is each member's whole
-                    // contribution. `aliases` includes the candidate itself, so
-                    // `index_key` repeats: intentional and idempotent.
-                    for key in std::iter::once(index_key.clone())
-                        .chain(aliases.iter().map(|member| local_index_key(&member.path)))
-                    {
-                        index.attribute_codex_blocked(&key, blocked.clone());
-                    }
-                }
                 let report = parsed_file.report;
                 let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
                 let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
@@ -30981,11 +30702,6 @@ impl OwnedSourceScan {
                                         ownership_incomplete_file_count,
                                         cause: parsed_file.cause,
                                         zero_snapshot_usage_evidence,
-                                        state_only_blocked_session_ids: parsed_file
-                                            .state_only_blocked_session_ids
-                                            .iter()
-                                            .cloned()
-                                            .collect(),
                                         diagnostic_reason,
                                         parsed_snapshot_count: parsed_file.snapshots.len(),
                                         held: sampled_scan::codex_cursor::HeldCounts {
@@ -31173,24 +30889,6 @@ impl OwnedSourceScan {
                             &codex_title_metadata,
                             &candidate.path,
                         );
-                    }
-                    for snapshot in &parsed {
-                        if snapshot.usage_accounting_contract.as_deref()
-                            == Some("session_exclusive_reported_usage:v1")
-                        {
-                            // L-SB: the accepted exclusive body supersedes this
-                            // file's (and its aliases') own block; any other key
-                            // still blocking the id keeps it. `aliases` includes
-                            // the candidate, so `index_key` repeats: intentional,
-                            // the second is a no-op.
-                            index.accept_codex_block(
-                                std::iter::once(index_key.clone()).chain(
-                                    aliases.iter().map(|member| local_index_key(&member.path)),
-                                ),
-                                resolve_codex_identity(snapshot.source_session_id.as_str())
-                                    .as_str(),
-                            );
-                        }
                     }
                 }
                 if parse_complete && !aliases.is_empty() {
@@ -31745,10 +31443,6 @@ impl OwnedSourceScan {
                         record_codex_inventory_hold(traversal, inventory, &residue_index_keys);
                     }
                     traversal.residue.index_keys.extend(residue_index_keys);
-                    traversal
-                        .residue
-                        .blocked_session_ids
-                        .extend(residue_blocked_session_ids);
                     // Exact watcher remove/rename hints must amend the same durable
                     // observation set used by directory census reconciliation. Apply
                     // removals first so a valid observation later in this page wins.
@@ -31897,11 +31591,10 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
-                    if !index.codex_residue_holds_entry(index_key)
-                        && !index
-                            .files
-                            .get(index_key)
-                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    if !index
+                        .files
+                        .get(index_key)
+                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt;
@@ -31998,32 +31691,6 @@ impl OwnedSourceScan {
                     if let Some(traversal) = index.traversal.as_mut() {
                         traversal.counts.settle_non_progressing_residue();
                     }
-                    // L-1 (§d.1.3): on a clean completed walk, release every
-                    // owner B blocked for a group whose members all left the
-                    // rollout census, unless an inventoried header or a live,
-                    // paused or queued group job still holds it.
-                    let clean = index
-                        .traversal
-                        .as_ref()
-                        .is_some_and(|traversal| !traversal.counts.has_retryable_problems());
-                    let inventory = codex_join_inventory
-                        .as_ref()
-                        .filter(|inventory| inventory.complete);
-                    if let (SnapshotSource::Codex, true, Some(context), Some(inventory)) =
-                        (source, clean, sampling.as_ref(), inventory)
-                    {
-                        // Read before the release: `keep` runs under the cursor
-                        // lock and must not take it again.
-                        let paused = context.cache.cursor_group_owner();
-                        release_departed_join_owners(index, &context.cache, |owner| {
-                            inventory.headers.iter().any(|header| header.owner == owner)
-                                || paused.as_deref() == Some(owner)
-                                || codex_join_groups.iter().any(|group| group.owner == owner)
-                                || codex_join_active
-                                    .as_ref()
-                                    .is_some_and(|boot| boot.group.owner == owner)
-                        });
-                    }
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
                     traversal.counts.caps.drain(source.api_slug());
@@ -32080,29 +31747,6 @@ impl OwnedSourceScan {
                 // the inventory, even while that file's parse is deferred.
                 if let Some(inventory) = codex_join_inventory.as_ref() {
                     codex_counting_version::note_inventory_created(index, inventory);
-                }
-                if source == SnapshotSource::Codex
-                    && traversal_discovery_done
-                    && traversal_healthy
-                    && clean_frozen_generation
-                    && state_census_complete
-                    && sidecar_census_complete
-                    && reconciliation_complete
-                {
-                    // Reconcile authoritative transcript deletions before deciding which
-                    // state-database threads are file-backed. Otherwise a vanished rollout
-                    // remains "covered" for this whole generation, the state-only fallback
-                    // is delayed one cycle, and a complete terminal manifest can briefly
-                    // omit a thread the local state database still proves exists.
-                    let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
-                        &mut snapshots,
-                        &codex_title_metadata,
-                        collected_at.as_str(),
-                        index,
-                        &codex_state_only_blocked_session_ids,
-                    );
-                    scanned_session_count += state_only_scanned;
-                    semantic_noop_count += state_only_noops;
                 }
                 // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
@@ -32367,26 +32011,22 @@ impl OwnedSourceScan {
                 // The witness just recorded above describes THIS generation only when the
                 // generation completed; otherwise the durable one is an earlier census's
                 // and must not be reported as this scan's evidence. Counts only: the
-                // witness's index keys and session ids never leave the local index.
-                let (
-                    census_residue_index_key_count,
-                    census_residue_archived_rollout_count,
-                    census_residue_blocked_session_count,
-                ) = if raw_census_complete {
-                    index
-                        .scan_residue_witness
-                        .as_ref()
-                        .map(|witness| {
-                            (
-                                witness.index_keys.len(),
-                                witness.archived_residue_file_count(),
-                                witness.codex_state_only_blocked_session_ids.len(),
-                            )
-                        })
-                        .unwrap_or_default()
-                } else {
-                    (0, 0, 0)
-                };
+                // witness's index keys never leave the local index.
+                let (census_residue_index_key_count, census_residue_archived_rollout_count) =
+                    if raw_census_complete {
+                        index
+                            .scan_residue_witness
+                            .as_ref()
+                            .map(|witness| {
+                                (
+                                    witness.index_keys.len(),
+                                    witness.archived_residue_file_count(),
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        (0, 0)
+                    };
                 // Full context-curve upload is retired: a restored old curve
                 // never leaves the Mac.
                 for snapshot in &mut snapshots {
@@ -32548,7 +32188,6 @@ impl OwnedSourceScan {
                     terminal_over_line_cap_count: counts.terminal_over_line_cap_count,
                     census_residue_index_key_count,
                     census_residue_archived_rollout_count,
-                    census_residue_blocked_session_count,
                     snapshots,
                     pending_finalization,
                     codex_legacy_join_baselines,
@@ -34394,11 +34033,9 @@ impl OwnedSourceScan {
             semantic_noop_count,
             history_upgrade,
             context_read_budget,
-            codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
             settled_residue_index_keys,
-            residue_blocked_session_ids,
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
@@ -34570,284 +34207,6 @@ fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMeta
     item.provenance.state_total_tokens = Some(thread.tokens_used);
     item.provenance.state_archived = Some(thread.archived);
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
-}
-
-fn append_codex_state_only_snapshots(
-    snapshots: &mut Vec<SnapshotItem>,
-    metadata: &CodexTitleMetadata,
-    collected_at: &str,
-    index: &mut ScanIndex,
-    blocked_session_ids: &BTreeSet<String>,
-) -> (usize, usize) {
-    let snapshots_before = snapshots.len();
-    let blocked_session_ids = blocked_session_ids
-        .union(&index.codex_state_only_blocked_session_ids)
-        .map(|session_id| resolve_codex_identity(session_id.as_str()))
-        .collect::<BTreeSet<_>>();
-    let covered_session_ids: BTreeSet<String> = snapshots
-        .iter()
-        .map(|snapshot| resolve_codex_identity(snapshot.source_session_id.as_str()))
-        .collect();
-    // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
-    // The incremental scan skips unchanged rollout files, so they are absent
-    // from this run's `snapshots`, but their split snapshot already reached the
-    // backend — re-emitting a state-only total would overwrite it with an
-    // unattributed "Other". We recover those session ids from the persisted
-    // scan index, and also cover accepted header owners when the filename is
-    // ambiguous. Two correctness points:
-    //   * Only entries that actually produced a snapshot count
-    //     (`last_snapshot_fingerprint` is set). `index.record` runs for every
-    //     scanned file, including a rollout that parsed to zero usage rows; such
-    //     a session has no split snapshot, so it MUST still fall through to a
-    //     state-only total or its tokens would be dropped entirely.
-    //   * Session ids are derived from the rollout filename, so coverage does
-    //     not depend on the state DB `rollout_path` matching the scan path
-    //     byte-for-byte (home symlinks, relative paths, case differences).
-    let mut covered_in_prior_runs = BTreeSet::new();
-    let mut ambiguous_observations = 0_u64;
-    let mut ambiguous_tokens = 0_u64;
-    for (path, entry) in &index.files {
-        if entry.last_snapshot_fingerprint.is_none() {
-            continue; // No body was produced: preserve main's state-only fallback.
-        }
-        if let Some(identity) = metadata.identity_from_path_evidence(Path::new(path)) {
-            covered_in_prior_runs.insert(identity);
-        } else if !codex_index_file_body_accepted(index, path, entry) {
-            let supported = codex_session_id_candidates_from_path(Path::new(path))
-                .into_iter()
-                .filter(|identity| metadata.has_identity_evidence(identity))
-                .collect::<Vec<_>>();
-            if supported.len() == 2 {
-                for identity in &supported {
-                    if let Some(thread) = metadata.state_threads.get(identity) {
-                        ambiguous_tokens = ambiguous_tokens.saturating_add(thread.tokens_used);
-                    }
-                }
-                covered_in_prior_runs.extend(supported);
-                ambiguous_observations += 1;
-            }
-        }
-    }
-    crate::local_resource_diagnostics::codex_state_only_ambiguous_identity(
-        ambiguous_observations,
-        ambiguous_tokens,
-    );
-    let mut scanned_session_count = 0;
-    let protected = index
-        .files
-        .values()
-        .filter(|entry| entry.codex_history_is_protected())
-        .collect::<Vec<_>>();
-    let unknown_protected_owner = protected.iter().any(|entry| {
-        entry
-            .codex_protected_owner
-            .as_ref()
-            .map_or(true, |owner| !valid_codex_protected_owner(owner))
-    });
-    let protected_owners = protected
-        .iter()
-        .filter_map(|entry| entry.codex_protected_owner.as_deref())
-        .chain(
-            index
-                .files
-                .iter()
-                .filter(|(key, entry)| codex_index_file_body_accepted(index, key, entry))
-                .filter_map(|(_, entry)| entry.codex_counting_owner.as_deref()),
-        )
-        .collect::<BTreeSet<_>>();
-    for (source_session_id, thread) in &metadata.state_threads {
-        if thread.tokens_used == 0
-            || unknown_protected_owner
-            || protected_owners.contains(codex_protected_owner(source_session_id).as_str())
-            || covered_session_ids.contains(source_session_id)
-            || covered_in_prior_runs.contains(source_session_id)
-            || blocked_session_ids.contains(source_session_id)
-            || metadata
-                .family_position(source_session_id.as_str())
-                .is_some()
-        {
-            continue;
-        }
-        let snapshot = codex_state_only_snapshot(source_session_id, thread, collected_at);
-        scanned_session_count += 1;
-        // The final fingerprint can still change during enrichment, privacy
-        // policy application, or account-cutoff filtering. Always carry the
-        // provisional item to `finalize_scan_after_policy`, which owns both
-        // durable state and semantic no-op suppression.
-        snapshots.push(snapshot);
-    }
-    crate::local_resource_diagnostics::codex_state_only(
-        scanned_session_count,
-        snapshots.len().saturating_sub(snapshots_before),
-        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
-    );
-    (scanned_session_count, 0)
-}
-
-fn codex_state_only_snapshot(
-    source_session_id: &str,
-    thread: &CodexStateThread,
-    collected_at: &str,
-) -> SnapshotItem {
-    let model = thread
-        .model
-        .clone()
-        .and_then(normalize_title)
-        .unwrap_or_else(|| "unknown".to_string());
-    let display_name = thread
-        .title
-        .clone()
-        .and_then(|title| normalize_display_title(title, "session_index"));
-    let row = SnapshotModelUsage {
-        evidence_ref: None,
-        identity_parts: None,
-        copy_unproven: false,
-        identity_retained: false,
-        copy_invalidated: false,
-        model,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        reasoning_output_tokens: 0,
-        reasoning_effort: None,
-        unattributed_total_tokens: thread.tokens_used,
-        request_count: 0,
-        selector_context: BTreeMap::new(),
-        selector_sources: BTreeMap::new(),
-        auth_mode: None,
-        billing_channel: None,
-        billing_provider: None,
-        gateway_provider: None,
-        model_provider: None,
-        subscription_product: None,
-        account_identifier_hash: None,
-        cost_usd: None,
-        input_cost_usd: None,
-        output_cost_usd: None,
-        cache_read_cost_usd: None,
-        cache_creation_cost_usd: None,
-    };
-    // v6 requires usage_buckets whenever the snapshot reports any usage.
-    // State-only snapshots have no per-line activity to bucket on, so we
-    // synthesize one bucket at the hour of the most recent state evidence
-    // (updated_at), falling back to created_at, then collected_at. If even
-    // that fails to parse, the snapshot is emitted without buckets — the
-    // backend will then reject it, but that's strictly better than crashing
-    // the daemon's snapshot scan.
-    let bucket_seed = thread
-        .updated_at
-        .clone()
-        .or_else(|| thread.created_at.clone())
-        .unwrap_or_else(|| collected_at.to_string());
-    let usage_buckets = match activity_bucket_from_timestamp(&bucket_seed) {
-        Some((bucket_start, normalized_timestamp)) => vec![SnapshotUsageBucket {
-            bucket_start,
-            model_usage: vec![row.clone()],
-            first_activity_at: Some(normalized_timestamp.clone()),
-            last_activity_at: Some(normalized_timestamp),
-        }],
-        None => Vec::new(),
-    };
-    let model_usage = vec![row];
-    let has_display_name = display_name.is_some();
-    let mut item = SnapshotItem {
-        request_evidence: Vec::new(),
-        request_identity_refusals: 0,
-        claude_org_markers: None,
-        claude_account_withheld_reason: None,
-        claude_account_display: None,
-        source_session_id: source_session_id.to_string(),
-        snapshot_fingerprint: String::new(),
-        status: "final".to_string(),
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        reasoning_output_tokens: 0,
-        unattributed_total_tokens: thread.tokens_used,
-        request_count: 0,
-        usage_accounting_contract: None,
-        removed_request_count: None,
-        removed_usage: None,
-        telemetry_owned_complete: None,
-        resolver_conflict_count: None,
-        copy_unproven_counts: None,
-        claude_money: None,
-        session_account_evidence: None,
-        claude_usage_request_ids: BTreeSet::new(),
-        claude_usage_occurrences: BTreeMap::new(),
-        cache_observations: None,
-        cache_observations_state: None,
-        cache_base_head_etag: None,
-        cache_conflict_answer: None,
-        cache_requests: Vec::new(),
-        cache_requests_complete: true,
-        avg_duration_ms: None,
-        avg_time_to_first_token_ms: None,
-        max_duration_ms: None,
-        max_time_to_first_token_ms: None,
-        peak_context_fill_tokens: None,
-        first_turn_context_tokens: None,
-        last_turn_context_tokens: None,
-        first_turn_context_window_tokens: None,
-        peak_context_fill_window_tokens: None,
-        last_turn_context_window_tokens: None,
-        compaction_count: None,
-        compaction_timestamps: Vec::new(),
-        compaction_events: Vec::new(),
-        first_own_request_at: None,
-        local_context_points: Vec::new(),
-        compaction_total_pre_tokens: None,
-        compaction_total_post_tokens: None,
-        compaction_total_cumulative_dropped_tokens: None,
-        compaction_total_duration_ms: None,
-        context_curve: None,
-        claude_context_curve_boundaries: Vec::new(),
-        claude_context_curve_identity_complete: false,
-        claude_context_curve_request_index_complete: false,
-        claude_context_curve_owned_start_proven: false,
-        claude_file_birth: Default::default(),
-        claude_file_birth_verdict: None,
-        activity_summary: None,
-        tool_usage: None,
-        tool_usage_truncated: false,
-        session_start: None,
-        model_usage,
-        usage_buckets,
-        cost: None,
-        session_display_name: display_name,
-        session_display_name_source: has_display_name.then(|| "session_index".to_string()),
-        source_started_at: thread.created_at.clone(),
-        source_ended_at: None,
-        source_last_activity_at: thread.updated_at.clone(),
-        collected_at: collected_at.to_string(),
-        workspace_hash: None,
-        workspace_display_label: None,
-        workspace_label_source: None,
-        repository_hash: None,
-        repository_label: None,
-        repository_label_source: None,
-        repository_identity_source: None,
-        workspace_kind: None,
-        source_file_fingerprint: None,
-        session_artifacts: Vec::new(),
-        provenance: SnapshotProvenance {
-            collector: "codex_state_sqlite".to_string(),
-            source_file_count: 1,
-            input_token_scope: Some("total_only".to_string()),
-            state_total_tokens: Some(thread.tokens_used),
-            state_archived: Some(thread.archived),
-        },
-        // Codex state-index summaries carry no session_meta -> no raw origin.
-        origin: None,
-        originator: None,
-        attribution_facts: Vec::new(),
-    };
-    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
-    item
 }
 
 #[cfg(test)]
@@ -35101,9 +34460,6 @@ struct ParsedJsonlFile {
     /// own event). Counted before ownership filtering.
     claude_compaction_unlinked_parent_count: usize,
     terminal_line_loss_count: usize,
-    /// A rollout whose exclusive ownership could not be proven must not fall
-    /// through to the inclusive state_5.sqlite tokens_used snapshot.
-    state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_session_ref: Option<String>,
     /// Exact parent object whose ledger authorized an ordinary fork boundary.
     /// The scanner rechecks it immediately after the child parse before any
@@ -35706,16 +35062,6 @@ impl OwnedJsonlParser {
             // on the next scan generation.
             ownership_incomplete_file_count = 1;
         }
-        let state_only_blocked_session_ids =
-            if codex_ownership_incomplete || accumulator.codex_is_fork {
-                // Classification was seeded from every syntactically valid rollout
-                // path identity. Preserve all unresolved candidates so a damaged or
-                // conflicting header cannot redirect inclusive state fallback to the
-                // other grammar interpretation.
-                accumulator.codex_state_only_blocked_session_ids()
-            } else {
-                BTreeSet::new()
-            };
         let codex_parent_session_ref = accumulator.codex_parent_session_ref.clone();
         let codex_parent_ledger_identity_used =
             accumulator.codex_parent_ledger_identity_used.clone();
@@ -35869,7 +35215,6 @@ impl OwnedJsonlParser {
             dropped_usage_record_count: recognized_usage_drop_count as u64,
             claude_compaction_unlinked_parent_count,
             terminal_line_loss_count: report.over_line_cap_count,
-            state_only_blocked_session_ids,
             codex_parent_session_ref,
             codex_parent_ledger_identity_used,
             codex_parent_resolution_pending,
@@ -41308,26 +40653,6 @@ impl CodexTitleMetadata {
         self.local_diagnostics.created_thread_scoped_rollouts = saturating_count_u32(scoped.len());
         self.created_thread_scoped = scoped;
     }
-
-    /// Diagnostics only: conflict keys the prior scan published as durable
-    /// state-only entities. Must run before this scan rebinds that map.
-    fn count_prior_state_only_conflicts(&mut self, index: &ScanIndex) {
-        if self.identity_conflicts.is_empty() {
-            return;
-        }
-        self.local_diagnostics
-            .identity_conflict_taxonomy
-            .conflict_keys_prior_state_only = saturating_count_u32(
-            self.identity_conflicts
-                .iter()
-                .filter(|key| {
-                    index
-                        .codex_state_only_snapshot_fingerprints
-                        .contains_key(key.as_str())
-                })
-                .count(),
-        );
-    }
 }
 
 // `logs_2.sqlite` can be ~1GB+ with a live WAL and a concurrent writer (Codex
@@ -44197,8 +43522,8 @@ fn requeue_observed_keys(
 /// files a retained generation observed but never indexed. Its partial
 /// checkpoint kept the page's traversal (file dequeued and observed) without
 /// the unacknowledged entry, so the file waited for the next generation (K7).
-/// Files another record owns (residue, inventory hold, state-only block,
-/// terminal disposition, decode hold), or gone are left alone.
+/// Files another record owns (residue, inventory hold, terminal disposition,
+/// decode hold), or gone are left alone.
 fn requeue_unindexed_observed(source: SnapshotSource, index: &mut ScanIndex) {
     let Some(traversal) = index.traversal.as_ref() else {
         return;
@@ -44214,7 +43539,6 @@ fn requeue_unindexed_observed(source: SnapshotSource, index: &mut ScanIndex) {
                     .codex_inventory_hold
                     .as_ref()
                     .is_some_and(|hold| hold.owed.contains(*key))
-                && !index.codex_state_only_blocked_by_file.contains_key(*key)
                 && !index.terminal_jsonl_dispositions.contains_key(*key)
                 && !index.claude_account_deferred_holds.contains_key(*key)
                 && !index.decode_holds_file(key)
@@ -45191,7 +44515,6 @@ fn reconcile_missing_index_entries_with_side(
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
         if !observed
-            && !index.codex_residue_holds_entry(key)
             && !index.decode_holds_file(key)
             && !index
                 .files
@@ -46903,15 +46226,8 @@ impl ScanIndex {
     /// deserialization as an identity ingress: normalize every Codex set/map
     /// once, and reject conflicting values that collapse to one UUID key.
     fn canonicalize_codex_identity_keys(&mut self) -> bool {
-        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_session_ids);
-        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_unattributed);
-        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_legacy);
-        for blocked in self.codex_state_only_blocked_by_file.values_mut() {
-            canonicalize_codex_identity_set(blocked);
-        }
         canonicalize_codex_identity_set(&mut self.codex_parent_ownership_refs);
-        canonicalize_codex_identity_map(&mut self.codex_state_only_snapshot_fingerprints)
-            && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
+        canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
     }
 
     /// Delivery proofs only: no acquisition-reuse decision reads it.
@@ -48329,16 +47645,6 @@ impl ScanIndex {
                 zero_snapshot_usage_evidence_count: residue.zero_snapshot_usage_evidence_count,
                 dropped_usage_record_count: residue.dropped_usage_record_count,
                 index_keys: traversal.residue.index_keys.clone(),
-                codex_state_only_blocked_session_ids: traversal
-                    .residue
-                    .blocked_session_ids
-                    .iter()
-                    .filter(|session_id| {
-                        self.codex_state_only_blocked_session_ids
-                            .contains(session_id.as_str())
-                    })
-                    .cloned()
-                    .collect(),
             });
         match (self.scan_residue_witness.as_ref(), next.as_ref()) {
             (Some(previous), Some(next)) if previous.same_residue(next) => {}
@@ -48346,16 +47652,14 @@ impl ScanIndex {
             (_, Some(next)) => eprintln!(
                 "ottto-service: {} census completed with non-progressing residue: {} \
                  ownership-incomplete Codex rollout(s) ({} under an archived root), {} file(s) \
-                 with usage evidence but no entity, {} dropped usage record(s); {} Codex \
-                 session(s) stay held out of the state-only fallback; the residue is re-derived \
-                 every generation and clears only when its files, their sidecar, or the parser \
-                 change",
+                 with usage evidence but no entity, {} dropped usage record(s); the residue is \
+                 re-derived every generation and clears only when its files, their sidecar, or \
+                 the parser change",
                 source.api_slug(),
                 next.ownership_incomplete_file_count,
                 next.archived_residue_file_count(),
                 next.zero_snapshot_usage_evidence_count,
                 next.dropped_usage_record_count,
-                next.codex_state_only_blocked_session_ids.len(),
             ),
             (Some(_), None) => eprintln!(
                 "ottto-service: {} census residue cleared; every previously non-progressing \
@@ -49137,7 +48441,6 @@ impl ScanIndex {
             }
         }
         self.terminal_jsonl_dispositions.clear();
-        self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
         self.codex_parent_ownership_ledgers.clear();
         self.codex_parent_side_requests.clear();
@@ -50556,7 +49859,6 @@ impl ScanIndex {
                     .values()
                     .filter_map(|entry| entry.last_snapshot_fingerprint.as_ref()),
             )
-            .chain(index.codex_state_only_snapshot_fingerprints.values())
             .cloned()
             .collect::<BTreeSet<_>>();
         for fingerprint in fingerprints {
@@ -50720,11 +50022,7 @@ impl ScanIndex {
             .iter()
             .filter(|(key, _)| !self.file_snapshot_fingerprints.contains_key(*key))
             .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
-        exact.chain(legacy).chain(
-            self.codex_state_only_snapshot_fingerprints
-                .values()
-                .map(String::as_str),
-        )
+        exact.chain(legacy)
     }
 
     /// The subset of this scan's index that is safe to commit when the upload
@@ -51522,7 +50820,6 @@ impl ScanIndex {
             } else {
                 self.confirmed_empty_files.remove(key);
             }
-            self.revert_codex_blocked_attribution(previous, key);
             match previous.terminal_jsonl_dispositions.get(key) {
                 Some(disposition) => {
                     self.terminal_jsonl_dispositions
@@ -51780,28 +51077,6 @@ impl ScanIndex {
         for (key, entry) in previous.files.iter_shared() {
             files.entry(key.clone()).or_insert_with(|| entry.clone());
         }
-        let mut codex_state_only_snapshot_fingerprints = BTreeMap::new();
-        for (session_id, fingerprint) in &self.codex_state_only_snapshot_fingerprints {
-            let committed = previous
-                .codex_state_only_snapshot_fingerprints
-                .get(session_id);
-            if settled(fingerprint) || committed == Some(fingerprint) {
-                codex_state_only_snapshot_fingerprints
-                    .insert(session_id.clone(), fingerprint.clone());
-            } else if let Some(committed) = committed {
-                codex_state_only_snapshot_fingerprints
-                    .insert(session_id.clone(), committed.clone());
-            }
-        }
-        // A partial upload cannot make an absent state-only entity authoritative
-        // any more than it can publish a vanished transcript. No request in
-        // this pass settled deletion of the old server entity, so preserve it
-        // until a fully completed census can commit the absence.
-        for (session_id, fingerprint) in &previous.codex_state_only_snapshot_fingerprints {
-            codex_state_only_snapshot_fingerprints
-                .entry(session_id.clone())
-                .or_insert_with(|| fingerprint.clone());
-        }
         let mut confirmed_empty_files = previous.confirmed_empty_files.clone();
         let mut file_snapshot_fingerprints = previous.file_snapshot_fingerprints.clone();
         for key in &safe_keys {
@@ -51824,7 +51099,6 @@ impl ScanIndex {
         let committable_fingerprints = file_snapshot_fingerprints
             .values()
             .flat_map(BTreeSet::iter)
-            .chain(codex_state_only_snapshot_fingerprints.values())
             .collect::<BTreeSet<_>>();
         let mut retained_quarantine = quarantined.clone();
         // If an old quarantine was retried under a newer contract but this
@@ -51947,14 +51221,12 @@ impl ScanIndex {
             legacy_unresolved_root_file_witnesses: self
                 .legacy_unresolved_root_file_witnesses
                 .clone(),
-            codex_state_only_snapshot_fingerprints,
-            codex_state_only_blocked_session_ids: self.codex_state_only_blocked_session_ids.clone(),
-            codex_state_only_blocked_by_file: self.codex_state_only_blocked_by_file.clone(),
-            codex_state_only_blocked_unattributed: self
-                .codex_state_only_blocked_unattributed
-                .clone(),
-            codex_state_only_blocked_legacy: self.codex_state_only_blocked_legacy.clone(),
-            codex_state_only_blocked_attributed: self.codex_state_only_blocked_attributed,
+            retired_codex_state_only_snapshot_fingerprints: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_session_ids: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_by_file: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_unattributed: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_legacy: serde::de::IgnoredAny,
+            retired_codex_state_only_blocked_attributed: serde::de::IgnoredAny,
             codex_parent_ownership_refs: self.codex_parent_ownership_refs.clone(),
             codex_parent_ownership_ledgers: self.codex_parent_ownership_ledgers.clone(),
             codex_parent_side_requests: self.codex_parent_side_requests.clone(),
@@ -52144,7 +51416,6 @@ impl ScanIndex {
             .file_snapshot_fingerprints
             .values()
             .flat_map(BTreeSet::iter)
-            .chain(self.codex_state_only_snapshot_fingerprints.values())
             .collect::<BTreeSet<_>>();
         let replay_safe_absent_terminals = self
             .quarantined_snapshot_fingerprints
@@ -52381,18 +51652,6 @@ impl ScanIndex {
         }
     }
 
-    /// Ownership uncertainty survives absence until the traversal resolves it.
-    /// Filename candidates veto retirement only; they grant no ownership.
-    fn codex_residue_holds_entry(&self, key: &str) -> bool {
-        let Some(traversal) = self.traversal.as_ref() else {
-            return false;
-        };
-        let owners = &traversal.residue.blocked_session_ids;
-        codex_session_id_candidates_from_path(Path::new(key))
-            .iter()
-            .any(|owner| owners.contains(owner))
-    }
-
     fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
         if !self.persistence_available() {
             return;
@@ -52489,127 +51748,6 @@ impl ScanIndex {
         let holds = &self.decode_holds;
         self.terminal_jsonl_dispositions
             .retain(|key, _| files.contains_key(key) || holds.contains("files", key));
-    }
-
-    /// L-SB upgrade. Idempotent; the Codex page start calls it first.
-    fn migrate_codex_blocked_attribution(&mut self) {
-        if !self.codex_state_only_blocked_attributed {
-            self.codex_state_only_blocked_legacy
-                .extend(self.codex_state_only_blocked_session_ids.iter().cloned());
-            self.codex_state_only_blocked_attributed = true;
-        }
-    }
-
-    /// L-SB: `key`'s latest settleable disclosure blocks exactly `blocked`;
-    /// release every id it blocked before and no longer does.
-    pub(in crate::snapshots) fn attribute_codex_blocked(
-        &mut self,
-        key: &str,
-        blocked: BTreeSet<String>,
-    ) {
-        let previous = if blocked.is_empty() {
-            self.codex_state_only_blocked_by_file.remove(key)
-        } else {
-            self.codex_state_only_blocked_by_file
-                .insert(key.to_owned(), blocked.clone())
-        }
-        .unwrap_or_default();
-        for session_id in previous.difference(&blocked) {
-            self.release_codex_block(session_id);
-        }
-    }
-
-    /// L-SB: a strict or parked disclosure keeps the prior body, so it keeps
-    /// the prior attribution and adds its own ids. Releases nothing.
-    pub(in crate::snapshots) fn extend_codex_blocked_attribution(
-        &mut self,
-        key: &str,
-        blocked: BTreeSet<String>,
-    ) {
-        if !blocked.is_empty() {
-            self.codex_state_only_blocked_by_file
-                .entry(key.to_owned())
-                .or_default()
-                .extend(blocked);
-        }
-    }
-
-    /// Releases a block no persistent holder keeps (the page set is not a
-    /// holder). O(map) per released id; releases follow shrinking settleable
-    /// disclosures, join-owner releases and acceptances
-    /// (`accept_codex_block`) only.
-    pub(in crate::snapshots) fn release_codex_block(&mut self, session_id: &str) {
-        if self
-            .codex_state_only_blocked_unattributed
-            .contains(session_id)
-            || self.codex_state_only_blocked_legacy.contains(session_id)
-            || self
-                .codex_state_only_blocked_by_file
-                .values()
-                .any(|blocked| blocked.contains(session_id))
-        {
-            return;
-        }
-        self.codex_state_only_blocked_session_ids.remove(session_id);
-    }
-
-    /// L-SB: an accepted exclusive body (publication) or joined body
-    /// (`Boot::Unchanged`) supersedes the accepting keys' own block on
-    /// `session_id`. Any other key whose latest disclosure still blocks it
-    /// keeps it blocked; the accepted body covers it meanwhile. A legacy-only
-    /// claim is cleared here, as on main (class (h), disclosed).
-    pub(in crate::snapshots) fn accept_codex_block<K: AsRef<str>>(
-        &mut self,
-        accepting_keys: impl IntoIterator<Item = K>,
-        session_id: &str,
-    ) {
-        for key in accepting_keys {
-            let key = key.as_ref();
-            let emptied = self
-                .codex_state_only_blocked_by_file
-                .get_mut(key)
-                .is_some_and(|blocked| {
-                    blocked.remove(session_id);
-                    blocked.is_empty()
-                });
-            if emptied {
-                self.codex_state_only_blocked_by_file.remove(key);
-            }
-        }
-        self.codex_state_only_blocked_unattributed
-            .remove(session_id);
-        self.codex_state_only_blocked_legacy.remove(session_id);
-        self.release_codex_block(session_id);
-    }
-
-    /// L-SB revert: the reverted parse's attribution stays beside the
-    /// committed one, so the key's next parse releases what it no longer
-    /// blocks. Re-block only committed ids that were still blocked then, and
-    /// keep attribution only for ids blocked after the revert.
-    pub(in crate::snapshots) fn revert_codex_blocked_attribution(
-        &mut self,
-        previous: &ScanIndex,
-        key: &str,
-    ) {
-        let committed = previous.codex_state_only_blocked_by_file.get(key);
-        if let Some(committed) = committed {
-            self.codex_state_only_blocked_session_ids.extend(
-                committed
-                    .intersection(&previous.codex_state_only_blocked_session_ids)
-                    .cloned(),
-            );
-        }
-        let current = self.codex_state_only_blocked_by_file.remove(key);
-        let mut blocked = committed.cloned().unwrap_or_default();
-        blocked.extend(current.unwrap_or_default());
-        blocked.retain(|session_id| {
-            self.codex_state_only_blocked_session_ids
-                .contains(session_id)
-        });
-        if !blocked.is_empty() {
-            self.codex_state_only_blocked_by_file
-                .insert(key.to_owned(), blocked);
-        }
     }
 
     /// Whether `parent` fits the interim ref cap (lifted by L-R).
@@ -58534,7 +57672,6 @@ mod tests {
         assert_eq!(first.terminal_dropped_usage_record_count, 0);
         assert_eq!(first.census_residue_index_key_count, 0);
         assert_eq!(first.census_residue_archived_rollout_count, 0);
-        assert_eq!(first.census_residue_blocked_session_count, 0);
         let now = rfc3339_unix_seconds(started).expect("fixture clock");
         {
             let traversal = index.traversal.as_ref().expect("red witness stays durable");
@@ -58787,12 +57924,11 @@ mod tests {
     }
 
     /// Residue rollouts under the archived root and under the active root are
-    /// handled alike: both sessions stay held out of the inclusive state-only
-    /// fallback (the block is never pruned by settling), the witness names
-    /// which of them sits under an archived root, and - because the census
-    /// now completes - the fallback resumes for the threads it may publish.
+    /// handled alike: the witness names which of them sits under an archived
+    /// root, and a state row without a rollout emits nothing even once the
+    /// census completes.
     #[test]
-    fn residue_rollouts_under_archived_and_active_roots_stay_blocked_while_the_fallback_resumes() {
+    fn archived_and_active_residue_is_witnessed_and_state_rows_emit_nothing() {
         let fixture = CodexResidueFixture::create("codex-residue-archived-and-active");
         fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
         let archived_path =
@@ -58827,7 +57963,7 @@ mod tests {
         // What the terminal receipt will read off this scan: every disclosed
         // loss class equals its settled counterpart, and the witness is
         // reported as counts only (two residue keys, one under an archived
-        // root, two sessions held out of the fallback).
+        // root).
         assert_eq!(scan.terminal_ownership_incomplete_file_count, 2);
         assert_eq!(
             scan.terminal_zero_snapshot_usage_evidence_count,
@@ -58844,7 +57980,6 @@ mod tests {
         assert_eq!(scan.terminal_over_line_cap_count, scan.over_line_cap_count);
         assert_eq!(scan.census_residue_index_key_count, 2);
         assert_eq!(scan.census_residue_archived_rollout_count, 1);
-        assert_eq!(scan.census_residue_blocked_session_count, 2);
         let emitted = scan
             .snapshots
             .iter()
@@ -58852,21 +57987,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             emitted,
-            BTreeSet::from([HEALTHY_SESSIONS[0], state_only]),
-            "the file-backed entity and the unblocked state-only thread, nothing else"
+            BTreeSet::from([HEALTHY_SESSIONS[0]]),
+            "the file-backed entity only; {state_only} has no rollout"
         );
-        let fallback = scan
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.source_session_id == state_only)
-            .expect("state-only fallback resumed");
-        assert_eq!(fallback.unattributed_total_tokens, 77);
-        for blocked in [RESIDUE_SESSION, ACTIVE_RESIDUE_SESSION] {
-            assert!(
-                index.codex_state_only_blocked_session_ids.contains(blocked),
-                "{blocked} stays blocked"
-            );
-        }
         let witness = index.scan_residue_witness.clone().expect("residue witness");
         assert_eq!(witness.ownership_incomplete_file_count, 2);
         assert_eq!(
@@ -58877,13 +58000,6 @@ mod tests {
             ])
         );
         assert_eq!(witness.archived_residue_file_count(), 1);
-        assert_eq!(
-            witness.codex_state_only_blocked_session_ids,
-            BTreeSet::from([
-                RESIDUE_SESSION.to_string(),
-                ACTIVE_RESIDUE_SESSION.to_string()
-            ])
-        );
 
         // The witness survives a round trip and an unchanged generation.
         let persisted = serde_json::to_vec(&index).expect("serialize index");
@@ -58925,7 +58041,6 @@ mod tests {
         assert_eq!(resolved.terminal_dropped_usage_record_count, 0);
         assert_eq!(resolved.census_residue_index_key_count, 0);
         assert_eq!(resolved.census_residue_archived_rollout_count, 0);
-        assert_eq!(resolved.census_residue_blocked_session_count, 0);
         let emitted = resolved
             .snapshots
             .iter()
@@ -59913,7 +59028,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_state_sqlite_supplies_total_only_fallback_snapshots() {
+    fn codex_state_sqlite_annotates_rollouts_and_never_emits_total_only_snapshots() {
         let codex_dir = temp_dir("codex-state-total-only");
         let sessions_dir = codex_dir.join("sessions");
         let archived_dir = codex_dir.join("archived_sessions");
@@ -59985,14 +59100,14 @@ mod tests {
         let mut index = ScanIndex::default();
         let scan = scan_source_roots(
             SnapshotSource::Codex,
-            &[sessions_dir.clone(), archived_dir.clone()],
+            &[sessions_dir, archived_dir],
             &mut index,
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
         )
         .expect("scan");
 
-        assert_eq!(scan.snapshots.len(), 2);
+        assert_eq!(scan.snapshots.len(), 1);
         let matched = scan
             .snapshots
             .iter()
@@ -60003,162 +59118,13 @@ mod tests {
         assert_eq!(matched.provenance.state_total_tokens, Some(37));
         assert_eq!(matched.provenance.state_archived, Some(false));
 
-        let state_only = scan
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.source_session_id == "019e253c-8888-7000-9000-bbbbbbbbbbbb")
-            .expect("state-only snapshot");
-        assert_eq!(state_only.input_tokens, 0);
-        assert_eq!(state_only.output_tokens, 0);
-        assert_eq!(state_only.cache_read_tokens, 0);
-        assert_eq!(state_only.unattributed_total_tokens, 1_234);
-        assert_eq!(state_only.model_usage[0].unattributed_total_tokens, 1_234);
-        assert_eq!(
-            state_only.provenance.collector.as_str(),
-            "codex_state_sqlite"
-        );
-        assert_eq!(
-            state_only.provenance.input_token_scope.as_deref(),
-            Some("total_only")
-        );
-        assert_eq!(state_only.provenance.state_archived, Some(true));
-        assert_eq!(state_only.source_file_fingerprint, None);
-        assert_eq!(
-            state_only.session_display_name.as_deref(),
-            Some("Archived State Only")
-        );
-        assert_eq!(
-            index
-                .codex_state_only_snapshot_fingerprints
-                .get(&state_only.source_session_id),
-            Some(&state_only.snapshot_fingerprint),
-            "durable state-only witness must use the final emitted fingerprint"
-        );
-
-        let no_titles_context = "policy-no-titles".to_string();
-        index.activate_upload_context(no_titles_context.clone());
-        let mut suppressed = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            &[sessions_dir.clone(), archived_dir.clone()],
-            &mut index,
-            "2026-05-14T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-        )
-        .expect("privacy suppression scan");
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut suppressed.snapshots,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                ..SnapshotUploadPolicy::default()
-            },
-        );
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut suppressed, &mut index);
-        let suppressed_state = suppressed
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.provenance.collector == "codex_state_sqlite")
-            .expect("state-only privacy correction");
-        assert!(suppressed_state.session_display_name.is_none());
-        assert_eq!(
-            index
-                .codex_state_only_snapshot_fingerprints
-                .get(&suppressed_state.source_session_id),
-            Some(&suppressed_state.snapshot_fingerprint)
-        );
-
-        index.activate_upload_context("policy-titles-restored".to_string());
-        let mut restored = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            &[sessions_dir, archived_dir],
-            &mut index,
-            "2026-05-14T10:06:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-        )
-        .expect("privacy restoration scan");
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut restored.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut restored, &mut index);
-        assert!(restored.snapshots.iter().any(|snapshot| {
-            snapshot.provenance.collector == "codex_state_sqlite"
-                && snapshot.session_display_name.as_deref() == Some("Archived State Only")
-        }));
-
-        index.activate_upload_context("account-cutoff".to_string());
-        let mut cutoff = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            &[
-                codex_dir.join("sessions"),
-                codex_dir.join("archived_sessions"),
-            ],
-            &mut index,
-            "2026-05-14T10:07:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-        )
-        .expect("account cutoff scan");
-        cutoff.snapshots.clear();
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut cutoff, &mut index);
         assert!(
-            index.codex_state_only_snapshot_fingerprints.is_empty(),
-            "a cutoff-filtered state-only entity must not remain in the manifest index"
-        );
-
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
-    fn unreadable_codex_state_census_preserves_prior_durable_state_only_entities() {
-        let codex_dir = temp_dir("codex-state-census-failure");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        fs::write(codex_dir.join("state_5.sqlite"), b"not a sqlite database")
-            .expect("write corrupt state fixture");
-
-        let session_id = "019e253c-8888-7000-9000-bbbbbbbbbbbb";
-        let fingerprint = "a".repeat(64);
-        let activity = Some("2026-05-14T10:03:00Z".to_string());
-        let mut index = ScanIndex {
-            codex_state_only_snapshot_fingerprints: BTreeMap::from([(
-                session_id.to_string(),
-                fingerprint.clone(),
-            )]),
-            snapshot_activity_at: SharedMap::from([(fingerprint.clone(), activity.clone())]),
-            ..ScanIndex::default()
-        };
-        index.activate_upload_context("next-context".to_string());
-
-        let mut scan = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            &[sessions_dir],
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-        )
-        .expect("state DB failure is source-local evidence, not a process failure");
-        assert!(!scan.state_census_complete);
-        assert!(!scan.census_complete);
-        assert!(scan.snapshots.is_empty());
-
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-        assert_eq!(
-            index.codex_state_only_snapshot_fingerprints,
-            BTreeMap::from([(session_id.to_string(), fingerprint.clone())])
-        );
-        assert_eq!(
-            index.snapshot_activity_at.get(&fingerprint),
-            Some(&activity)
-        );
-        assert_eq!(
-            index.upload_context_owed_counts().no_proof_entities,
-            1,
-            "an incomplete state census grants no upload-context proof"
+            scan.snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id
+                    != "019e253c-8888-7000-9000-bbbbbbbbbbbb"
+                    && snapshot.provenance.collector != "codex_state_sqlite"),
+            "a state row without a rollout emits nothing"
         );
         let _ = fs::remove_dir_all(codex_dir);
     }
@@ -60263,291 +59229,125 @@ mod tests {
         let _ = fs::remove_dir_all(codex_dir);
     }
 
-    fn ambiguous_state_only_fixture(owner: &str) -> (CodexTitleMetadata, ScanIndex, SnapshotItem) {
-        let modern = "019e253c-9999-7000-9000-cccccccccccc";
-        let legacy = format!("2026-05-14T10-00-00-{modern}");
-        let dir = temp_dir("codex-ambiguous-state-only");
-        let path = dir.join(format!("rollout-{legacy}.jsonl"));
-        fs::write(
-            &path,
-            [
-                json!({"timestamp":"2026-05-14T10:00:00Z","type":"session_meta","payload":{"id":owner}}),
-                json!({"timestamp":"2026-05-14T10:00:01Z","type":"turn_context","payload":{"turn_id":"fixture-turn","model":"gpt-5.6-sol"}}),
-                codex_test_token_line("2026-05-14T10:00:02Z", None, (50, 8, 9, 1), Some((50, 8, 9, 1))),
-            ]
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n") + "\n",
-        )
-        .unwrap();
-        let mut index = ScanIndex::default();
-        let mut scan = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&dir),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-        let native = scan.snapshots.remove(0);
-        assert_eq!(native.source_session_id, owner);
-        assert_eq!(native.input_tokens, 50);
-        assert_eq!(native.cache_read_tokens, 8);
-        assert_eq!(native.output_tokens, 9);
-        assert_eq!(native.reasoning_output_tokens, 1);
-        assert_eq!(native.unattributed_total_tokens, 0);
-        assert_eq!(native.model_usage[0].model, "gpt-5.6-sol");
-        assert_eq!(
-            native.usage_accounting_contract.as_deref(),
-            Some("session_exclusive_reported_usage:v1")
-        );
-        let mut metadata = CodexTitleMetadata::default();
-        for identity in [legacy, modern.to_string()] {
-            metadata.state_threads.insert(
-                identity,
-                CodexStateThread {
-                    tokens_used: 900,
-                    model: Some("state-model".into()),
-                    ..Default::default()
-                },
-            );
-        }
-        assert!(metadata.identity_from_path_evidence(&path).is_none());
-        index = index.committable_subset(
-            &ScanIndex::default(),
-            &BTreeSet::from([native.snapshot_fingerprint.clone()]),
-            &BTreeMap::new(),
-        );
-        assert_eq!(
-            index.files[&local_index_key(&path)].codex_counting_owner,
-            Some(codex_protected_owner(owner).into_boxed_str())
-        );
-        fs::remove_dir_all(dir).unwrap();
-        (metadata, index, native)
-    }
-
+    /// [money] Positive control for the removed Codex state-only fallback: the
+    /// previous build emitted a `codex_state_sqlite` total-only item for each
+    /// state row below; head emits none. Two accounts, each with a state row
+    /// that never had a rollout, a tagged one, and a rollout deleted after its
+    /// split body was accepted.
     #[test]
-    fn codex_ambiguous_filename_keeps_both_forms_of_committed_exclusive_body() {
-        for owner in [
-            "019e253c-9999-7000-9000-cccccccccccc",
-            "2026-05-14T10-00-00-019e253c-9999-7000-9000-cccccccccccc",
-        ] {
-            let (metadata, index, native) = ambiguous_state_only_fixture(owner);
-            for mut index in [
-                index.clone(),
-                serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap(),
-            ] {
-                let before = serde_json::to_value(&index).unwrap();
-                let mut replacements = Vec::new();
-                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                    append_codex_state_only_snapshots(
-                        &mut replacements,
-                        &metadata,
-                        "2026-05-14T11:04:00Z",
-                        &mut index,
-                        &BTreeSet::new(),
-                    )
-                });
-                assert!(!replacements
-                    .iter()
-                    .any(|item| item.source_session_id == owner));
-                assert_eq!(
-                    replacements.len(),
-                    1,
-                    "the other, unowned state row still falls back"
-                );
-                assert!(
-                    rows.iter().all(|row| row["stage"] == "codex_state_only"),
-                    "a committed owner supplies coverage"
-                );
-                // Model an already-uploaded exclusive body and apply the new batch.
-                let witness = snapshot_upload_body_witness(&native);
-                let mut uploaded = BTreeMap::from([(owner.to_string(), native.clone())]);
-                for replacement in replacements {
-                    uploaded.insert(replacement.source_session_id.clone(), replacement);
-                }
-                assert_eq!(uploaded[owner].model_usage, native.model_usage);
-                assert_eq!(snapshot_upload_body_witness(&uploaded[owner]), witness);
-                assert_eq!(serde_json::to_value(&index).unwrap(), before);
-            }
-        }
-    }
-
-    #[test]
-    fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
-        for (tokens, expected_sum) in [([900, 900], 1800), ([0, 0], 0), ([u64::MAX, 1], u64::MAX)] {
-            for binding in [None, Some("malformed".to_string())] {
-                let (mut metadata, mut index, _) =
-                    ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
-                for (thread, tokens_used) in metadata.state_threads.values_mut().zip(tokens) {
-                    thread.tokens_used = tokens_used;
-                }
-                index
-                    .files
-                    .values_mut()
-                    .next()
-                    .unwrap()
-                    .codex_counting_owner = binding.map(String::into_boxed_str);
-                let mut replacements = Vec::new();
-                let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
-                    append_codex_state_only_snapshots(
-                        &mut replacements,
-                        &metadata,
-                        "2026-05-14T11:04:00Z",
-                        &mut index,
-                        &BTreeSet::new(),
-                    )
-                });
-                assert_eq!(count, 0);
-                assert!(replacements.is_empty());
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0]["stage"], "codex_state_only_ambiguous_identity");
-                assert_eq!(rows[0]["source"], "codex");
-                assert_eq!(
-                    rows[0]["counts"],
-                    json!({
-                        "codex_state_only_ambiguous_identity": 1,
-                        "codex_state_only_ambiguous_identity_tokens": expected_sum,
-                    })
-                );
-            }
-        }
-        let (metadata, mut index, _) =
-            ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
-        index
-            .files
-            .values_mut()
-            .next()
-            .unwrap()
-            .last_snapshot_fingerprint = None;
-        let mut replacements = Vec::new();
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            append_codex_state_only_snapshots(
-                &mut replacements,
-                &metadata,
-                "2026-05-14T11:04:00Z",
-                &mut index,
-                &BTreeSet::new(),
+    fn codex_state_rows_without_a_rollout_emit_nothing_across_accounts() {
+        for account in ["account-a", "account-b"] {
+            let codex_dir = temp_dir(&format!("codex-state-no-fallback-{account}"));
+            let sessions_dir = codex_dir.join("sessions");
+            fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+            let deleted = "019e253c-bbbb-7000-9000-ffffffffffff";
+            let never = "019e253c-cccc-7000-9000-ffffffffffff";
+            let tagged = "019e253c-dddd-7000-9000-ffffffffffff";
+            let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{deleted}.jsonl"));
+            fs::write(
+                &rollout,
+                format!(
+                    "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{deleted}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
+                ),
             )
-        });
-        assert_eq!(
-            replacements.len(),
-            2,
-            "no produced body means both state rows retain main's fallback"
-        );
-        assert!(
-            rows.iter().all(|row| row["stage"] == "codex_state_only"),
-            "no replacement risk without a fingerprint"
-        );
-    }
-
-    #[test]
-    fn codex_unambiguous_legacy_and_modern_state_only_controls_are_unchanged() {
-        let modern = "019e253c-9999-7000-9000-cccccccccccc";
-        let legacy = format!("2026-05-14T10-00-00-{modern}");
-        for (name, owner) in [
-            (
-                "rollout-plain-legacy.jsonl".to_string(),
-                "plain-legacy".to_string(),
-            ),
-            (format!("rollout-{modern}.jsonl"), modern.to_string()),
-            (format!("rollout-{legacy}.jsonl"), legacy.clone()),
-            (format!("rollout-{legacy}.jsonl"), modern.to_string()),
-        ] {
-            for accepted in [false, true] {
-                let (_, mut index, _) = ambiguous_state_only_fixture(modern);
-                let mut entry = index.files.pop_first().unwrap().1;
-                entry.codex_counting_owner = None;
-                entry.last_snapshot_fingerprint = accepted.then(|| "accepted".to_string());
-                index.files.insert(name.clone(), entry);
-                let mut metadata = CodexTitleMetadata::default();
-                metadata.state_threads.insert(
-                    owner.clone(),
-                    CodexStateThread {
-                        tokens_used: 900,
-                        ..Default::default()
-                    },
-                );
-                assert_eq!(
-                    metadata.identity_from_path_evidence(Path::new(&name)),
-                    Some(owner.clone())
-                );
-                let mut replacements = Vec::new();
-                let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
-                    append_codex_state_only_snapshots(
-                        &mut replacements,
-                        &metadata,
-                        "2026-05-14T11:04:00Z",
-                        &mut index,
-                        &BTreeSet::new(),
+            .expect("write rollout");
+            let connection =
+                Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+            connection
+                .execute(CODEX_THREADS_DDL, [])
+                .expect("create threads");
+            for (id, tokens) in [(deleted, 59_i64), (never, 1_234_i64), (tagged, 77_i64)] {
+                connection
+                    .execute(
+                        CODEX_THREADS_INSERT,
+                        (
+                            id,
+                            account,
+                            tokens,
+                            0_i64,
+                            1_777_777_000_i64,
+                            1_777_777_100_i64,
+                            1_777_777_000_000_i64,
+                            1_777_777_100_000_i64,
+                            "gpt-5.5",
+                        ),
                     )
-                });
-                assert_eq!(count, usize::from(!accepted));
-                assert_eq!(replacements.len(), usize::from(!accepted));
-                if !accepted {
-                    assert_eq!(replacements[0].source_session_id, owner);
-                    assert_eq!(replacements[0].unattributed_total_tokens, 900);
+                    .expect("insert thread");
+            }
+            connection
+                .execute(
+                    "UPDATE threads SET thread_source = 'user' WHERE id = ?1",
+                    [tagged],
+                )
+                .expect("tag thread");
+            drop(connection);
+            let no_state_total = |label: &str, scan: &SourceScanResult| {
+                for snapshot in &scan.snapshots {
+                    assert_ne!(
+                        snapshot.provenance.collector.as_str(),
+                        "codex_state_sqlite",
+                        "{account} {label}"
+                    );
+                    assert_ne!(
+                        snapshot.provenance.input_token_scope.as_deref(),
+                        Some("total_only"),
+                        "{account} {label}"
+                    );
+                    assert!(
+                        ![never, tagged].contains(&snapshot.source_session_id.as_str()),
+                        "{account} {label}"
+                    );
                 }
-                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
-            }
-        }
-    }
-
-    #[test]
-    fn codex_state_only_falls_back_after_main_retires_quarantined_body() {
-        let owner = "019e253c-9999-7000-9000-cccccccccccc";
-        for reconcile in [false, true] {
-            let (metadata, mut index, native) = ambiguous_state_only_fixture(owner);
-            let key = index.files.keys().next().unwrap().clone();
-            index.accepted_snapshot_fingerprints.clear();
-            index.quarantined_snapshot_fingerprints.insert(
-                native.snapshot_fingerprint.clone(),
-                snapshot_quarantine_record(SnapshotSource::Codex),
-            );
-            assert!(!codex_index_file_body_accepted(
-                &index,
-                &key,
-                &index.files[&key]
-            ));
-            if reconcile {
-                let mut traversal = terminal_unhealthy_traversal("fixture".into());
-                traversal.reconciliation_upper_bound = Some(key.clone());
-                index.traversal = Some(traversal);
-                assert!(reconcile_missing_index_entries_with_limit(&mut index, 10));
-            } else {
-                index.remove_file_entry(&key);
-            }
-            assert!(!index.files.contains_key(&key));
-            let mut replacements = Vec::new();
-            append_codex_state_only_snapshots(
-                &mut replacements,
-                &metadata,
-                "2026-05-14T11:04:00Z",
+            };
+            let mut index = ScanIndex::default();
+            let first = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions_dir),
                 &mut index,
-                &BTreeSet::new(),
-            );
-            assert!(replacements.iter().any(
-                |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
-            ));
+                "2026-05-14T10:04:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("scan file-backed session");
+            assert!(first.census_complete);
+            assert_eq!(first.snapshots.len(), 1, "{account}: the split body only");
+            assert_eq!(first.snapshots[0].source_session_id, deleted);
+            no_state_total("first", &first);
+
+            fs::remove_file(&rollout).expect("remove rollout while state row remains");
+            let after = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions_dir),
+                &mut index,
+                "2026-05-14T10:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("reconcile deletion");
+            assert!(after.census_complete);
+            assert!(index.files.is_empty());
+            no_state_total("after deletion", &after);
+            let _ = fs::remove_dir_all(codex_dir);
         }
     }
 
+    /// [money] Positive control, held `.zst` case: the previous build emitted
+    /// a `codex_state_sqlite` total for a session whose only rollout is a
+    /// compressed archive the scan holds; head emits no state total for it.
     #[test]
-    fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
-        let codex_dir = temp_dir("codex-state-deleted-rollout");
+    fn codex_held_compressed_rollout_never_emits_a_state_total() {
+        let codex_dir = temp_dir("codex-state-held-zst");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let session_id = "019e253c-bbbb-7000-9000-ffffffffffff";
-        let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{session_id}.jsonl"));
+        let session_id = "019e253c-eeee-7000-9000-ffffffffffff";
+        let plain = format!(
+            "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
+        );
         fs::write(
-            &rollout,
-            format!(
-                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
-            ),
+            sessions_dir.join(format!(
+                "rollout-2026-05-14T10-00-00-{session_id}.jsonl.zst"
+            )),
+            zstd::stream::encode_all(plain.as_bytes(), 1).expect("compress rollout"),
         )
-        .expect("write rollout");
+        .expect("write compressed rollout");
         let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
         connection
             .execute(CODEX_THREADS_DDL, [])
@@ -60557,7 +59357,7 @@ mod tests {
                 CODEX_THREADS_INSERT,
                 (
                     session_id,
-                    "Deleted Rollout",
+                    "Held Archive",
                     59_i64,
                     0_i64,
                     1_777_777_000_i64,
@@ -60570,127 +59370,38 @@ mod tests {
             .expect("insert thread");
         drop(connection);
         let mut index = ScanIndex::default();
-
-        let first = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan file-backed session");
-        assert!(first.census_complete);
-        assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
-
-        fs::remove_file(&rollout).expect("remove rollout while state row remains");
-        let replacement = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-05-14T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("reconcile deletion and state fallback together");
-
-        assert!(replacement.census_complete);
-        assert!(index.files.is_empty());
-        let state_only = replacement
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.source_session_id == session_id)
-            .expect("same complete generation emits the state-only replacement");
-        assert_eq!(state_only.unattributed_total_tokens, 59);
-        assert_eq!(
-            state_only.provenance.input_token_scope.as_deref(),
-            Some("total_only")
-        );
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
-    fn codex_state_only_waits_until_later_candidate_pages_prove_absence() {
-        let codex_dir = temp_dir("codex-state-page-before-ambiguous");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        fs::write(
-            sessions_dir.join("a-first.jsonl"),
-            "{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"first-empty\"}}\n",
-        )
-        .expect("write first page fixture");
-        let session_id = "019fcafe-bbbb-7000-9000-ffffffffffff";
-        fs::write(
-            sessions_dir.join(format!("z-rollout-{session_id}.jsonl")),
-            format!(
-                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"user\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n"
-            ),
-        )
-        .expect("write later ambiguous fixture");
-        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
-        connection
-            .execute(CODEX_THREADS_DDL, [])
-            .expect("create threads");
-        connection
-            .execute(
-                CODEX_THREADS_INSERT,
-                (
-                    session_id,
-                    "Later Ambiguous Fork",
-                    1_100_i64,
-                    0_i64,
-                    1_775_300_400_i64,
-                    1_775_300_460_i64,
-                    1_775_300_400_000_i64,
-                    1_775_300_460_000_i64,
-                    "gpt-5.6-sol",
-                ),
+        for at in ["2026-05-14T10:04:00Z", "2026-05-14T10:05:00Z"] {
+            let scan = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions_dir),
+                &mut index,
+                at,
+                BACKFILL_WINDOW_DAYS,
             )
-            .expect("insert thread");
-        drop(connection);
-
-        let mut index = ScanIndex::default();
-        let first = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-08-02T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            1,
-        )
-        .expect("scan first bounded page");
-        assert!(!first.census_complete);
-        assert!(first
-            .snapshots
-            .iter()
-            .all(|snapshot| snapshot.source_session_id != session_id));
-
-        let second = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            &[sessions_dir],
-            &mut index,
-            "2026-08-02T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-            1,
-        )
-        .expect("scan later ambiguous page");
-        assert!(second
-            .snapshots
-            .iter()
-            .all(|snapshot| snapshot.source_session_id != session_id));
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(session_id));
+            .expect("scan held archive");
+            for snapshot in &scan.snapshots {
+                assert_ne!(
+                    snapshot.provenance.collector.as_str(),
+                    "codex_state_sqlite",
+                    "{at}"
+                );
+                assert_ne!(
+                    snapshot.provenance.input_token_scope.as_deref(),
+                    Some("total_only"),
+                    "{at}"
+                );
+                assert_eq!(snapshot.unattributed_total_tokens, 0, "{at}");
+            }
+        }
         let _ = fs::remove_dir_all(codex_dir);
     }
 
     #[test]
-    fn codex_state_only_preserved_when_rollout_parses_to_no_usage() {
-        // Regression guard: a rollout that exists but yields zero usage rows
-        // (e.g. only session_meta, or a legacy/unknown token payload) is still
-        // recorded in the scan index, but it produced NO split snapshot. Such a
-        // thread must surface its tokens as a state-only "Other" once, suppress
-        // identical observations after acknowledgement, and emit again when
-        // the state-backed semantic payload really changes.
+    fn codex_rollout_without_usage_stays_uncounted_without_a_state_total() {
+        // A rollout that exists but yields zero usage rows (e.g. only
+        // session_meta) is recorded in the scan index with no split snapshot.
+        // Its state row's total is not sent in its place, even after the
+        // state-backed total changes: such a rollout stays uncounted.
         let codex_dir = temp_dir("codex-state-empty-rollout");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -60726,21 +59437,7 @@ mod tests {
 
         let roots = [sessions_dir];
         let mut index = ScanIndex::default();
-
-        let assert_state_only = |label: &str, scan: &SourceScanResult| {
-            let state_only = scan
-                .snapshots
-                .iter()
-                .find(|s| s.source_session_id == "019e253c-aaaa-7000-9000-eeeeeeeeeeee")
-                .unwrap_or_else(|| panic!("{label}: expected a state-only snapshot"));
-            assert_eq!(state_only.unattributed_total_tokens, 4_321, "{label}");
-            assert_eq!(
-                state_only.provenance.input_token_scope.as_deref(),
-                Some("total_only"),
-                "{label}",
-            );
-        };
-
+        let session = "019e253c-aaaa-7000-9000-eeeeeeeeeeee";
         let first = scan_source_roots(
             SnapshotSource::Codex,
             &roots,
@@ -60749,22 +59446,7 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("first scan");
-        assert_state_only("first scan", &first);
-
-        // Incremental re-scan: the state-only snapshot is evaluated but its
-        // already-acknowledged semantic identity is not returned for upload.
-        let second = scan_source_roots(
-            SnapshotSource::Codex,
-            &roots,
-            &mut index,
-            "2026-05-14T11:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("second scan");
-        assert!(second.snapshots.is_empty());
-        assert_eq!(second.scanned_session_count, 1);
-        assert_eq!(second.semantic_noop_count, 1);
-        assert_eq!(index.codex_state_only_snapshot_fingerprints.len(), 1);
+        assert!(first.snapshots.is_empty(), "{:?}", first.snapshots);
 
         let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("reopen sqlite");
         connection
@@ -60773,16 +59455,10 @@ mod tests {
                     "UPDATE threads SET tokens_used = ?1, updated_at = ?2, updated_at_ms = ?3 ",
                     "WHERE id = ?4",
                 ),
-                (
-                    4_322_i64,
-                    1_777_777_200_i64,
-                    1_777_777_200_000_i64,
-                    "019e253c-aaaa-7000-9000-eeeeeeeeeeee",
-                ),
+                (4_322_i64, 1_777_777_200_i64, 1_777_777_200_000_i64, session),
             )
             .expect("update semantic state");
         drop(connection);
-
         let changed = scan_source_roots(
             SnapshotSource::Codex,
             &roots,
@@ -60791,25 +59467,7 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("changed scan");
-        let changed_state = changed
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.source_session_id == "019e253c-aaaa-7000-9000-eeeeeeeeeeee")
-            .expect("changed state-only snapshot");
-        assert_eq!(changed_state.unattributed_total_tokens, 4_322);
-        assert_eq!(changed.semantic_noop_count, 0);
-
-        let settled = scan_source_roots(
-            SnapshotSource::Codex,
-            &roots,
-            &mut index,
-            "2026-05-14T13:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled scan");
-        assert!(settled.snapshots.is_empty());
-        assert_eq!(settled.semantic_noop_count, 1);
-
+        assert!(changed.snapshots.is_empty(), "{:?}", changed.snapshots);
         let _ = fs::remove_dir_all(codex_dir);
     }
 
@@ -75059,10 +73717,6 @@ mod tests {
         assert_eq!(parsed.recognized_usage_drop_count, 1);
         assert_eq!(parsed.ownership_incomplete_file_count, 1);
         assert_eq!(parsed.dropped_usage_record_count, 1);
-        assert_eq!(
-            parsed.state_only_blocked_session_ids,
-            BTreeSet::from([child_id.to_string()])
-        );
         assert!(parsed.codex_parent_ledger_identity_used.is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -75168,10 +73822,6 @@ mod tests {
         assert!(!parsed.report.complete());
         assert!(!parsed.complete());
         assert_eq!(parsed.report.malformed_json_line_count, 1);
-        assert_eq!(
-            parsed.state_only_blocked_session_ids,
-            BTreeSet::from([child_id.to_string()])
-        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -75310,11 +73960,6 @@ mod tests {
             assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
             assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
             assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
-            assert_eq!(
-                parsed.state_only_blocked_session_ids,
-                BTreeSet::from([child_id.clone()]),
-                "{name}"
-            );
             assert!(parsed.codex_parent_ledger_identity_used.is_none(), "{name}");
         }
         let _ = fs::remove_dir_all(home);
@@ -75385,7 +74030,7 @@ mod tests {
                 codex_session_id_from_path(&path),
                 Some(expected_key.clone())
             );
-            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            let (scan, _) = scan_codex_test_root(&sessions_dir);
             assert_eq!(scan.discovered_file_count, 1, "{name}");
             assert_eq!(scan.scanned_file_count, 1, "{name}");
             assert_eq!(scan.scanned_session_count, 0, "{name}");
@@ -75395,12 +74040,6 @@ mod tests {
             assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
             assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
             assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
-            assert!(
-                index
-                    .codex_state_only_blocked_session_ids
-                    .contains(expected_key.as_str()),
-                "{name}"
-            );
 
             database
                 .execute(
@@ -75409,7 +74048,7 @@ mod tests {
                 )
                 .expect("turn identity into ordinary control");
             drop(database);
-            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            let (scan, _) = scan_codex_test_root(&sessions_dir);
             assert!(scan.census_complete, "{name}: {scan:#?}");
             assert_eq!(scan.scanned_session_count, 1, "{name}");
             assert_eq!(scan.snapshots.len(), 1, "{name}");
@@ -75422,12 +74061,6 @@ mod tests {
             assert_eq!(scan.recognized_usage_drop_count, 0, "{name}");
             assert_eq!(scan.ownership_incomplete_file_count, 0, "{name}");
             assert_eq!(scan.dropped_usage_record_count, 0, "{name}");
-            assert!(
-                !index
-                    .codex_state_only_blocked_session_ids
-                    .contains(expected_key.as_str()),
-                "{name}"
-            );
             let _ = fs::remove_dir_all(home);
         }
     }
@@ -75519,7 +74152,7 @@ mod tests {
         assert!(metadata.state_threads.contains_key(healthy_created));
         assert!(metadata.state_threads.contains_key(ordinary));
 
-        let (collision_scan, collision_index) = scan_codex_test_root(&collision_root);
+        let (collision_scan, _) = scan_codex_test_root(&collision_root);
         assert_eq!(collision_scan.discovered_file_count, 1);
         assert_eq!(collision_scan.scanned_file_count, 1);
         assert_eq!(collision_scan.scanned_session_count, 0);
@@ -75530,11 +74163,8 @@ mod tests {
         assert_eq!(collision_scan.recognized_usage_drop_count, 1);
         assert_eq!(collision_scan.ownership_incomplete_file_count, 1);
         assert_eq!(collision_scan.dropped_usage_record_count, 1);
-        assert!(collision_index
-            .codex_state_only_blocked_session_ids
-            .contains(collided));
 
-        let (control_scan, control_index) = scan_codex_test_root(&control_root);
+        let (control_scan, _) = scan_codex_test_root(&control_root);
         assert_eq!(control_scan.discovered_file_count, 2);
         assert_eq!(control_scan.scanned_file_count, 2);
         assert_eq!(control_scan.scanned_session_count, 1);
@@ -75544,12 +74174,6 @@ mod tests {
         assert_eq!(control_scan.recognized_usage_drop_count, 1);
         assert_eq!(control_scan.ownership_incomplete_file_count, 1);
         assert_eq!(control_scan.dropped_usage_record_count, 1);
-        assert!(control_index
-            .codex_state_only_blocked_session_ids
-            .contains(healthy_created));
-        assert!(!control_index
-            .codex_state_only_blocked_session_ids
-            .contains(ordinary));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -75585,7 +74209,7 @@ mod tests {
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert!(!metadata.created_thread_census_failed_homes.is_empty());
-        let (scan, index) = scan_codex_test_root(&sessions_dir);
+        let (scan, _) = scan_codex_test_root(&sessions_dir);
         assert_eq!(scan.discovered_file_count, 1);
         assert_eq!(scan.scanned_file_count, 1);
         assert_eq!(scan.scanned_session_count, 0);
@@ -75595,9 +74219,6 @@ mod tests {
         assert_eq!(scan.recognized_usage_drop_count, 1);
         assert_eq!(scan.ownership_incomplete_file_count, 1);
         assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(session_id));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -76166,7 +74787,7 @@ mod tests {
                 !metadata.created_thread_census_failed_homes.is_empty(),
                 "{name}"
             );
-            let (scan, index) = scan_codex_test_root(&sessions_dir);
+            let (scan, _) = scan_codex_test_root(&sessions_dir);
             assert_eq!(scan.discovered_file_count, 1, "{name}");
             assert_eq!(scan.scanned_file_count, 1, "{name}");
             assert_eq!(scan.scanned_session_count, 0, "{name}");
@@ -76176,12 +74797,6 @@ mod tests {
             assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
             assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
             assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
-            assert!(
-                index
-                    .codex_state_only_blocked_session_ids
-                    .contains(session_id),
-                "{name}"
-            );
             let _ = fs::remove_dir_all(home);
         }
 
@@ -76299,7 +74914,7 @@ mod tests {
                 .as_deref(),
             Some(modern)
         );
-        let (scan, index) = scan_codex_test_root(&sessions_dir);
+        let (scan, _) = scan_codex_test_root(&sessions_dir);
         assert_eq!(scan.discovered_file_count, 2);
         assert_eq!(scan.scanned_file_count, 2);
         assert_eq!(scan.scanned_session_count, 1);
@@ -76313,8 +74928,6 @@ mod tests {
         assert_eq!(scan.recognized_usage_drop_count, 1);
         assert_eq!(scan.ownership_incomplete_file_count, 1);
         assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(index.codex_state_only_blocked_session_ids.contains(legacy));
-        assert!(!index.codex_state_only_blocked_session_ids.contains(modern));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -76323,13 +74936,7 @@ mod tests {
         let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let uppercase = lowercase.to_ascii_uppercase();
         let mut index = ScanIndex::default();
-        index
-            .codex_state_only_blocked_session_ids
-            .insert(uppercase.clone());
         index.codex_parent_ownership_refs.insert(uppercase.clone());
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert(uppercase.clone(), "state-fingerprint".to_string());
         index.codex_parent_ownership_ledgers.insert(
             uppercase,
             CodexParentOwnershipLedger {
@@ -76343,22 +74950,22 @@ mod tests {
             },
         );
         assert!(index.canonicalize_codex_identity_keys());
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(lowercase));
         assert!(index.codex_parent_ownership_refs.contains(lowercase));
-        assert!(index
-            .codex_state_only_snapshot_fingerprints
-            .contains_key(lowercase));
         assert!(index.codex_parent_ownership_ledgers.contains_key(lowercase));
 
         let mut conflicting = ScanIndex::default();
-        conflicting
-            .codex_state_only_snapshot_fingerprints
-            .insert(lowercase.to_string(), "lower".to_string());
-        conflicting
-            .codex_state_only_snapshot_fingerprints
-            .insert(lowercase.to_ascii_uppercase(), "upper".to_string());
+        for (key, signature) in [
+            (lowercase.to_string(), "lower"),
+            (lowercase.to_ascii_uppercase(), "upper"),
+        ] {
+            conflicting.codex_parent_ownership_ledgers.insert(
+                key,
+                CodexParentOwnershipLedger {
+                    signatures: vec![signature.to_string()],
+                    ..Default::default()
+                },
+            );
+        }
         assert!(!conflicting.canonicalize_codex_identity_keys());
     }
 
@@ -76552,16 +75159,9 @@ mod tests {
         );
     }
 
-    fn assert_parentless_held(parsed: &ParsedJsonlFile, case: &str, session_id: &str) {
+    fn assert_parentless_held(parsed: &ParsedJsonlFile, case: &str) {
         assert!(parsed.snapshots.is_empty(), "{case}: {parsed:#?}");
         assert_eq!(parsed.ownership_incomplete_file_count, 1, "{case}");
-        assert!(
-            parsed
-                .state_only_blocked_session_ids
-                .contains(&resolve_codex_identity(session_id)),
-            "{case}: {:?}",
-            parsed.state_only_blocked_session_ids
-        );
     }
 
     #[test]
@@ -76679,7 +75279,7 @@ mod tests {
             &jsonl_body(&reheader),
             |_, _| {},
         );
-        assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
+        assert_parentless_held(&parsed, "appended header");
     }
 
     /// The tail-cache lineage lift admits only forks whose
@@ -77140,7 +75740,7 @@ mod tests {
                 .cloned()
         };
 
-        let (first, index) = scan("first");
+        let (first, _) = scan("first");
         let admitted_item = item(&first, admitted).expect("parentless snapshot");
         assert_eq!(
             (admitted_item.input_tokens, admitted_item.request_count),
@@ -77153,16 +75753,9 @@ mod tests {
                 .and_then(|origin| origin.parent_session_ref.clone()),
             None
         );
-        assert!(!index
-            .codex_state_only_blocked_session_ids
-            .contains(admitted));
         assert!(item(&first, ordinary).is_some());
         for held in [wrapped, unknown] {
             assert!(item(&first, held).is_none(), "{held}");
-            assert!(
-                index.codex_state_only_blocked_session_ids.contains(held),
-                "{held}"
-            );
         }
         assert_eq!(first.ownership_incomplete_file_count, 2);
 
@@ -77947,203 +76540,6 @@ mod tests {
         );
         assert!(ids.last.is_none());
         let _ = fs::remove_dir_all(root);
-    }
-
-    fn sb_ids(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|id| (*id).to_owned()).collect()
-    }
-
-    /// SB-T18: every attributed id is blocked, and no attribution is empty.
-    fn assert_attribution_blocked(index: &ScanIndex) {
-        for (key, ids) in &index.codex_state_only_blocked_by_file {
-            assert!(!ids.is_empty(), "{key}: empty attribution");
-            for id in ids {
-                assert!(
-                    index.codex_state_only_blocked_session_ids.contains(id),
-                    "{key}: {id} attributed but not blocked"
-                );
-            }
-        }
-    }
-
-    /// The fresh finish (site 2) or a settleable replay (site 3) of `key`:
-    /// the page inserts every blocked id, then attributes them.
-    fn sb_disclose(index: &mut ScanIndex, key: &str, blocked: &[&str]) {
-        let blocked = sb_ids(blocked);
-        index
-            .codex_state_only_blocked_session_ids
-            .extend(blocked.iter().cloned());
-        index.attribute_codex_blocked(key, blocked);
-        assert_attribution_blocked(index);
-    }
-
-    /// Publication of `id`'s exclusive body by `key` (site 2, then the
-    /// holder-checked acceptance).
-    fn sb_publish(index: &mut ScanIndex, key: &str, id: &str) {
-        sb_disclose(index, key, &[]);
-        index.accept_codex_block([key.to_owned()], id);
-        assert_attribution_blocked(index);
-    }
-
-    fn sb_blocked(index: &ScanIndex, id: &str) -> bool {
-        index.codex_state_only_blocked_session_ids.contains(id)
-    }
-
-    /// A cold index: every listed key's latest disclosure (space-separated
-    /// ids), from scratch.
-    fn sb_cold(latest: &[(&str, &str)]) -> ScanIndex {
-        let mut index = ScanIndex::default();
-        index.migrate_codex_blocked_attribution();
-        for (key, blocked) in latest {
-            sb_disclose(
-                &mut index,
-                key,
-                &blocked.split_whitespace().collect::<Vec<_>>(),
-            );
-        }
-        index
-    }
-
-    /// SB-T5b (zero-usage cure), both legs, each with a variant where another
-    /// stored key still names the id. (a) A held fork with ambiguous
-    /// candidates {X, Y} re-parses complete resolved to X: Y is released and
-    /// X, its own id, stays (a complete fork still blocks it). (b) A held
-    /// non-fork session re-parses complete with zero usage: it blocks
-    /// nothing, and its own id is released.
-    #[test]
-    fn l_sb_zero_usage_cure_legs_release_only_holderless_ids() {
-        for other_names_it in [false, true] {
-            let mut index = sb_cold(&[]);
-            if other_names_it {
-                sb_disclose(&mut index, "other", &["y"]);
-            }
-            sb_disclose(&mut index, "fork", &["x", "y"]);
-            sb_disclose(&mut index, "fork", &["x"]);
-            assert!(sb_blocked(&index, "x"));
-            assert_eq!(sb_blocked(&index, "y"), other_names_it);
-            let mut latest = vec![("fork", "x")];
-            if other_names_it {
-                latest.push(("other", "y"));
-            }
-            assert_eq!(
-                index.codex_state_only_blocked_session_ids,
-                sb_cold(&latest).codex_state_only_blocked_session_ids,
-                "leg (a), other={other_names_it}"
-            );
-
-            let mut index = sb_cold(&[]);
-            if other_names_it {
-                sb_disclose(&mut index, "other", &["s"]);
-            }
-            sb_disclose(&mut index, "session", &["s"]);
-            sb_disclose(&mut index, "session", &[]);
-            assert_eq!(sb_blocked(&index, "s"), other_names_it);
-            assert!(!index
-                .codex_state_only_blocked_by_file
-                .contains_key("session"));
-            let mut latest = vec![("session", "")];
-            if other_names_it {
-                latest.push(("other", "s"));
-            }
-            assert_eq!(
-                index.codex_state_only_blocked_session_ids,
-                sb_cold(&latest).codex_state_only_blocked_session_ids,
-                "leg (b), other={other_names_it}"
-            );
-        }
-    }
-
-    /// SB-T19 (DB2, multi-holder control). K is a complete, unchanged fork
-    /// whose ambiguous candidates are {X, Z}; F (X's own rollout) publishes
-    /// X; H (held) blocks X again; F is deleted; H resolves away from X. X
-    /// stays blocked at every step, equal to cold. The 2-file form, and the
-    /// positive control: a single rollout with usage publishes, and X leaves
-    /// the set as on main (this also covers main's older hole: F publishes,
-    /// F is deleted, K still claims X).
-    #[test]
-    fn l_sb_acceptance_keeps_ids_another_key_still_claims() {
-        let mut index = sb_cold(&[]);
-        sb_disclose(&mut index, "k", &["x", "z"]);
-        sb_publish(&mut index, "f", "x");
-        assert!(sb_blocked(&index, "x"), "K still claims X");
-        sb_disclose(&mut index, "h", &["x"]);
-        assert!(sb_blocked(&index, "x"));
-        // F is deleted: nothing runs for it (no retirement).
-        sb_disclose(&mut index, "h", &[]);
-        assert!(sb_blocked(&index, "x"));
-        let cold = sb_cold(&[("k", "x z"), ("h", "")]);
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .is_superset(&cold.codex_state_only_blocked_session_ids));
-        assert_eq!(
-            index.codex_state_only_blocked_session_ids,
-            cold.codex_state_only_blocked_session_ids
-        );
-
-        // The 2-file form: F publishes X, goes held (re-blocks X), is
-        // rewritten complete with zero usage while K still claims X.
-        let mut index = sb_cold(&[]);
-        sb_disclose(&mut index, "k", &["x"]);
-        sb_publish(&mut index, "f", "x");
-        sb_disclose(&mut index, "f", &["x"]);
-        sb_disclose(&mut index, "f", &[]);
-        assert!(sb_blocked(&index, "x"));
-        assert_eq!(
-            index.codex_state_only_blocked_session_ids,
-            sb_cold(&[("k", "x"), ("f", "")]).codex_state_only_blocked_session_ids
-        );
-
-        // Positive control: a single rollout, held, then complete with usage.
-        let mut index = sb_cold(&[]);
-        sb_disclose(&mut index, "f", &["x"]);
-        sb_publish(&mut index, "f", "x");
-        assert!(!sb_blocked(&index, "x"));
-        assert!(index.codex_state_only_blocked_by_file.is_empty());
-    }
-
-    /// SB-T15: a join-owner release keeps an owner a held key (including a
-    /// deleted one, never retired) still attributes. SB-T6/SB-T6b: a revert
-    /// restores the committed attribution and block, and keeps a reverted
-    /// parse's still-blocked addition attributed so the next clean parse
-    /// releases it.
-    #[test]
-    fn l_sb_join_release_and_revert_keep_holders() {
-        let mut index = sb_cold(&[]);
-        index
-            .codex_state_only_blocked_session_ids
-            .insert("owner".to_owned());
-        index
-            .codex_state_only_blocked_unattributed
-            .insert("owner".to_owned());
-        sb_disclose(&mut index, "deleted-held", &["owner"]);
-        index.codex_state_only_blocked_unattributed.remove("owner");
-        index.codex_state_only_blocked_legacy.remove("owner");
-        index.release_codex_block("owner");
-        assert!(sb_blocked(&index, "owner"));
-        sb_disclose(&mut index, "deleted-held", &[]);
-        assert!(!sb_blocked(&index, "owner"));
-
-        // SB-T6: a shrinking parse of K is reverted.
-        let mut previous = sb_cold(&[]);
-        sb_disclose(&mut previous, "k", &["x"]);
-        let mut index = previous.clone();
-        sb_disclose(&mut index, "k", &[]);
-        assert!(!sb_blocked(&index, "x"));
-        index.revert_codex_blocked_attribution(&previous, "k");
-        assert!(sb_blocked(&index, "x"));
-        assert_eq!(index.codex_state_only_blocked_by_file["k"], sb_ids(&["x"]));
-        // SB-T6b: a growing parse adds Y, then is reverted; the next clean
-        // parse releases Y.
-        let mut index = previous.clone();
-        sb_disclose(&mut index, "k", &["x", "y"]);
-        index.revert_codex_blocked_attribution(&previous, "k");
-        assert_eq!(
-            index.codex_state_only_blocked_by_file["k"],
-            sb_ids(&["x", "y"])
-        );
-        sb_disclose(&mut index, "k", &["x"]);
-        assert!(sb_blocked(&index, "x") && !sb_blocked(&index, "y"));
-        assert_attribution_blocked(&index);
     }
 
     #[test]
@@ -80977,14 +79373,6 @@ mod tests {
             "became-empty.jsonl".to_string(),
             BTreeSet::from(["old-empty-entity".to_string()]),
         );
-        committed.codex_state_only_snapshot_fingerprints.insert(
-            "removed-state-only".to_string(),
-            "old-state-entity".to_string(),
-        );
-        committed.quarantined_snapshot_fingerprints.insert(
-            "old-state-entity".to_string(),
-            snapshot_quarantine_record(SnapshotSource::Codex),
-        );
 
         let mut scanned = committed.clone();
         // A semantic no-op: same fingerprint as the committed entry, so the
@@ -81015,8 +79403,8 @@ mod tests {
         scanned
             .confirmed_empty_files
             .insert("empty.jsonl".to_string());
-        // This file and state-only row previously had server entities. Their
-        // absence cannot become authoritative during a shed/partial commit.
+        // This file previously had a server entity. Its absence cannot become
+        // authoritative during a shed/partial commit.
         scanned
             .files
             .insert("became-empty.jsonl".to_string(), manifest_index_entry(None));
@@ -81026,9 +79414,6 @@ mod tests {
         scanned
             .file_snapshot_fingerprints
             .remove("became-empty.jsonl");
-        scanned
-            .codex_state_only_snapshot_fingerprints
-            .remove("removed-state-only");
 
         let accepted = BTreeSet::from(["bb".to_string()]);
         let committable = scanned.committable_subset(&committed, &accepted, &BTreeMap::new());
@@ -81048,16 +79433,6 @@ mod tests {
         assert!(!committable
             .confirmed_empty_files
             .contains("became-empty.jsonl"));
-        assert_eq!(
-            committable
-                .codex_state_only_snapshot_fingerprints
-                .get("removed-state-only")
-                .map(String::as_str),
-            Some("old-state-entity")
-        );
-        assert!(committable
-            .quarantined_snapshot_fingerprints
-            .contains_key("old-state-entity"));
         assert_eq!(
             committable.files["pending.jsonl"]
                 .last_snapshot_fingerprint
@@ -81806,9 +80181,6 @@ mod tests {
             "late-sidecar.jsonl".to_string(),
             BTreeSet::from(["bb".to_string(), "aa".to_string()]),
         );
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert("state-only".to_string(), "aa".to_string());
         index.snapshot_activity_at = SharedMap::from([
             ("aa".to_string(), Some("2026-01-01T00:00:00Z".to_string())),
             ("bb".to_string(), Some("2026-06-30T23:59:59Z".to_string())),
@@ -81839,12 +80211,13 @@ mod tests {
                     "late-sidecar.jsonl".to_string(),
                     BTreeSet::from([inside_late_sidecar.clone(), excluded_end.clone()]),
                 ),
+                (
+                    "start.jsonl".to_string(),
+                    BTreeSet::from([inside_start.clone()]),
+                ),
             ]),
             ..ScanIndex::default()
         };
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert("state-only".to_string(), inside_start.clone());
         index.snapshot_activity_at = SharedMap::from([
             (inside_start, Some("2026-01-01T00:00:00Z".to_string())),
             (
@@ -82561,7 +80934,7 @@ crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles,
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
-    terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
+    terminal_line_loss_count, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
@@ -82615,7 +80988,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt, evidence_owed);
-crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
+crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
@@ -82626,7 +80999,7 @@ crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, co
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
-crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
+crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(ActivityCallId; id);
 crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });

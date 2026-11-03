@@ -930,15 +930,6 @@ impl ScanIndex {
                 counts.no_proof_bytes = counts.no_proof_bytes.saturating_add(entry.size_bytes);
             }
         }
-        for entity in self.codex_state_only_snapshot_fingerprints.values() {
-            match stamps.get(entity) {
-                None => counts.no_proof_entities += 1,
-                Some(stamp) if stamp.context_fingerprint != *active => {
-                    counts.wrong_context_entities += 1;
-                }
-                Some(_) => {}
-            }
-        }
         counts
     }
 

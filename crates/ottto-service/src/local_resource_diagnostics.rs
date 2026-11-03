@@ -436,34 +436,6 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
     cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
 }
 
-/// Per-pass observations, not distinct entries/files or a lifetime counter.
-pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
-    if observations > 0 {
-        traversal_point(
-            "codex_state_only_ambiguous_identity",
-            "codex",
-            &BTreeMap::from([
-                ("codex_state_only_ambiguous_identity", observations),
-                ("codex_state_only_ambiguous_identity_tokens", tokens),
-            ]),
-        );
-    }
-}
-
-/// One terminal append call, before later policy/no-op suppression; never wire data.
-pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
-    if scanned != 0 || emitted != 0 || noops != 0 {
-        traversal_point(
-            "codex_state_only",
-            "codex",
-            &BTreeMap::from([(
-                "codex_state_only",
-                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
-            )]),
-        );
-    }
-}
-
 pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
     traversal_point(
         "codex_zst_held",

@@ -796,13 +796,11 @@ pub(crate) struct IdentityConflictTaxonomy {
     pub state_cross_root_progress_only_keys: u32,
     pub state_cross_root_identity_field_keys: u32,
     pub state_cross_root_field_differs: StateRowFieldDiffs,
-    /// All loaders' conflict keys after every home, and the subsets the merged
-    /// created classification and the prior scan's durable state-only
-    /// entities still name. Spawn edges whose parent is a conflict key count
-    /// once per child.
+    /// All loaders' conflict keys after every home, and the subset the merged
+    /// created classification still names. Spawn edges whose parent is a
+    /// conflict key count once per child.
     pub conflict_keys_total: u32,
     pub conflict_keys_state_created: u32,
-    pub conflict_keys_prior_state_only: u32,
     pub conflict_parent_child_edges: u32,
 }
 impl IdentityConflictTaxonomy {
@@ -1045,7 +1043,7 @@ crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evi
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
-crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
+crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_parent_child_edges);
 crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::unit_enum!(false;
     LoaderReason: Complete | Io | SqliteBusy | SqliteOpenOrQuery | SqliteRowDecode
@@ -1279,7 +1277,6 @@ mod tests {
             state_cross_root_field_differs: field_differs,
             conflict_keys_total: u32::MAX,
             conflict_keys_state_created: u32::MAX,
-            conflict_keys_prior_state_only: u32::MAX,
             conflict_parent_child_edges: u32::MAX,
         };
         // Counters saturate instead of wrapping.

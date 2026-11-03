@@ -14,7 +14,6 @@ fn parsed() -> ParsedJsonlFile {
         dropped_usage_record_count: 0,
         terminal_line_loss_count: 0,
         claude_compaction_unlinked_parent_count: 0,
-        state_only_blocked_session_ids: BTreeSet::new(),
         codex_parent_session_ref: None,
         codex_parent_ledger_identity_used: None,
         codex_parent_resolution_pending: false,
@@ -623,16 +622,13 @@ fn side_requests_decode_per_entry_and_drop_only_the_malformed_one() {
 }
 
 /// All requests malformed still loads, and the rest of the index (ACK
-/// fingerprints, held sessions, side records) is what the same file without
+/// fingerprints, side records) is what the same file without
 /// any request loads as. A legacy index without the map keeps the defaults.
 /// The map's outer shape is not relaxed: a non-object still quarantines.
 #[test]
 fn malformed_or_absent_side_requests_leave_the_rest_of_the_index_alone() {
     let mut index = ScanIndex::default();
     index.accepted_snapshot_fingerprints.insert("a".repeat(64));
-    index
-        .codex_state_only_blocked_session_ids
-        .insert("held-session".into());
     index
         .codex_parent_side
         .insert("/p.jsonl".into(), extreme_record());
