@@ -173,9 +173,17 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
                 let key = path.to_str().unwrap();
                 base.files.remove(key);
                 base.file_snapshot_fingerprints.remove(key);
-                let mut cold = c.raw(&E2ScanFixture::default(), base, 100, true, &[]);
+                // Listing is paced: the watcher's hint names the copy.
+                let hint = std::slice::from_ref(&path);
+                let mut cold = c.raw(&E2ScanFixture::default(), base, 100, true, hint);
                 cold.enrich(&c);
                 cold.finish();
+                assert!(
+                    body(&p, COPY).is_some() && body(&cold, COPY).is_some(),
+                    "page 3 and the cold arm both send the copy (modes {:?}, {:?})",
+                    p.modes,
+                    cold.modes
+                );
                 money_oracle::assert_equivalent(
                     &route(Mode::ColdFull, &cold),
                     &route(Mode::DiskRestore, &p),
