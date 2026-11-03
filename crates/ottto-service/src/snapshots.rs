@@ -47254,7 +47254,7 @@ impl ScanIndex {
             kind,
             &claude_history_upgrade::PolicyInputs {
                 exclusions: &self.claude_reemission_exclusions,
-                listed: self.claude_reemission_excluded(candidate),
+                listed: self.claude_family_listed(&candidate.path),
                 birth_unix_seconds,
                 latched: claude_reemission_stop_latched(),
                 active_revision: self.active_effective_upload_body_witness_revision,
@@ -47339,7 +47339,7 @@ impl ScanIndex {
             self.claude_reemission_exclusions
                 .close_over_roots(std::iter::once((root, stem)));
         }
-        if self.claude_reemission_excluded(candidate) {
+        if self.claude_family_listed(&candidate.path) {
             return;
         }
         let root_directory;
@@ -47578,8 +47578,6 @@ impl ScanIndex {
         )
     }
 
-    /// True when the list names the family of this indexed Claude file (its
-    /// root or the member itself), as the candidate decision reads it.
     /// The re-emission list's status reason (`missing_after_install` raises
     /// the local alarm each cycle).
     #[cfg(test)]
@@ -47587,9 +47585,12 @@ impl ScanIndex {
         self.claude_reemission_exclusions.status()
     }
 
-    fn claude_family_listed(&self, index_key: &str) -> bool {
+    /// True when the list names the family of this Claude file (its root or
+    /// the member itself): the one listed predicate for candidates, indexed
+    /// keys and the `e2` fold.
+    fn claude_family_listed(&self, path: impl AsRef<Path>) -> bool {
         !self.claude_reemission_exclusions.is_empty()
-            && claude_index_path_member_ref(Path::new(index_key)).is_some_and(|member| {
+            && claude_index_path_member_ref(path.as_ref()).is_some_and(|member| {
                 self.claude_reemission_exclusions
                     .excludes(member.root, member.subagent_stem)
             })
@@ -47694,6 +47695,8 @@ impl ScanIndex {
         // literal never stamps a listed family, or any file while the list is
         // paused, whatever this cycle decided (a covering ACK, below-floor or
         // confirmed-empty settlement of a file that was not a candidate).
+        // The pause holds adoption only: a file that uploads `e2` under it
+        // keeps its stamp and is owed again once the list is back.
         if claude_history_upgrade::denies_request_owned_literal(allowed_active)
             && (self.claude_reemission_exclusions.pauses_adoption()
                 || self.claude_family_listed(index_key))
@@ -52715,16 +52718,6 @@ impl ScanIndex {
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_with_reason_gated(candidate, now, true, false)
-    }
-
-    /// True when the local list names this Claude file's family root or the
-    /// member itself.
-    fn claude_reemission_excluded(&self, candidate: &CandidateFile) -> bool {
-        !self.claude_reemission_exclusions.is_empty()
-            && claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
-                self.claude_reemission_exclusions
-                    .excludes(member.root, member.subagent_stem)
-            })
     }
 
     /// True when only the body-witness revision selects this candidate: the
