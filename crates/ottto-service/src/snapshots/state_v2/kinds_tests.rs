@@ -1891,13 +1891,13 @@ fn transcript_codec_compatibility() {
     assert_eq!(serde_json::to_value(&v1).unwrap(), rows);
     let (_scratch, mut db) = Scratch::store();
     let mut index = fixture();
-    for (name, _) in rows.as_object().unwrap() {
+    for name in rows.as_object().unwrap().keys() {
         let record = v1.get(name).expect("decoded").clone();
         index.claude_request_census.insert(name.clone(), record);
     }
     commit_populate(&mut db, &index);
     let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
-    for (name, _) in rows.as_object().unwrap() {
+    for name in rows.as_object().unwrap().keys() {
         assert_eq!(
             restored.claude_request_census.get(name),
             v1.get(name),
