@@ -340,8 +340,8 @@ fn head_identity_binds_route_file_and_capture_mode_only() {
     acc.artifacts_enabled = !acc.artifacts_enabled;
     let after = stage(&reduction, &certificate);
     let id = identity("session.jsonl", false);
-    assert_eq!(id.check(&before.head), Ok(()));
-    assert_eq!(id.check(&after.head), Ok(()));
+    assert_eq!(id.check(&before.head), Ok(false));
+    assert_eq!(id.check(&after.head), Ok(false));
     assert_eq!(
         identity("other.jsonl", false).check(&before.head),
         Err(ReconstructCause::Identity)

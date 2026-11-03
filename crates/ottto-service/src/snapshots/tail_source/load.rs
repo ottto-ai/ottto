@@ -14,8 +14,10 @@
 //! a live input that is not available now, holds the file, untouched. A head
 //! bound to another route, scan root or path is retired before anything else
 //! in it is read (C′), whatever the Full that follows achieves. A head made
-//! under another key epoch is an explicit-action reconstruction: counted, but
-//! neither a release-gate failure nor an alarm.
+//! under another key (a rotation) is an explicit-action reconstruction:
+//! counted, but neither a release-gate failure nor an alarm. Attribution
+//! toggled on or off since the head is no rotation: the head is reused with
+//! its context digest scrubbed, as main scrubs a retained parse's (D168-2).
 use super::counters;
 use super::seam::TailBase;
 use super::{HeadIdentity, LiveLoadError, ReconstructCause, TailSource};
@@ -248,7 +250,7 @@ fn stored<S: TailSource>(
         }
         Err(_) => return Err(Miss::Unreadable),
     };
-    id.check(&head.body).map_err(Miss::Reconstruct)?;
+    let toggled = id.check(&head.body).map_err(Miss::Reconstruct)?;
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     let decoded = S::decode_head(head.revision, &head.body, &mut acc).map_err(Miss::Reconstruct)?;
     // The file against the certificate, before any page.
@@ -280,7 +282,10 @@ fn stored<S: TailSource>(
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),
     })?;
-    let reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
+    let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
+    if toggled {
+        reduction.scrub_context_digest();
+    }
     let content = Decoded::stored(reduction, decoded.rederive);
     let plan = content
         .rederive_plan_within(u64::MAX, u64::MAX)

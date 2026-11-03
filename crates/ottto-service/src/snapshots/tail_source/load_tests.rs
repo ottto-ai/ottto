@@ -15,7 +15,16 @@ use serde_json::Value;
 
 /// A first completion of `responses` committed as `name`.
 pub(super) fn committed(route: &mut Route, name: &str, responses: usize) -> (PathBuf, String) {
-    let (tail, native) = route.complete(name, &lines(responses), None, |_| {});
+    committed_lines(route, name, &lines(responses))
+}
+
+/// A first completion of `lines` committed as `name`.
+pub(super) fn committed_lines(
+    route: &mut Route,
+    name: &str,
+    lines: &[String],
+) -> (PathBuf, String) {
+    let (tail, native) = route.complete(name, lines, None, |_| {});
     let key = tail.key_for_test().to_owned();
     assert!(tail.publish(&native));
     route.save(false);

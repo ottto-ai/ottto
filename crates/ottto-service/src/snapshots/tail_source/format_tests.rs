@@ -1,15 +1,18 @@
 //! S2 c7 on real committed Tail state: a shorter file reads main's counted
-//! Full (D158), a key epoch change is a counted explicit-action
-//! reconstruction, the legacy record directory is erased and counted before
-//! the first load, the first format round-trips the lineage clocks and the
-//! rule epoch, and only Claude has a codec.
+//! Full (D158), a key rotation is a counted explicit-action reconstruction
+//! while an attribution toggle scrubs and reuses, the legacy record directory
+//! is erased and counted before the first load, the first format round-trips
+//! the lineage clocks and the rule epoch, the shared hour pages carry usage
+//! buckets, and only Claude has a codec.
 use super::super::claude::tests::lines;
 use super::super::claude::Claude;
 use super::super::seam::tests::{route, scope};
-use super::tests::{committed, counted, len, loaded};
+use super::tests::{append, cold, committed, committed_lines, counted, len, loaded, read};
 use super::*;
 use crate::local_resource_diagnostics::capture;
-use crate::snapshots::tail_source::{counters, has_codec, tail_route};
+use crate::snapshots::sampled_jsonl::durable::test_finish_items;
+use crate::snapshots::tail_source::{counters, has_codec, hour_pages, read_hour_page, tail_route};
+use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
 /// [behaviour] D158: a file shorter than its committed head reads main's
@@ -36,6 +39,7 @@ fn a_shorter_file_reads_full_and_is_counted() {
 #[test]
 fn a_key_epoch_change_is_a_counted_reconstruction() {
     let mut route = route();
+    claude_request_identity::bind_test_session_context_key(Some([1; 32]));
     let (path, key) = committed(&mut route, "a.jsonl", 3);
     claude_request_identity::bind_test_session_context_key(Some([7; 32]));
     let (load, records) = loaded(&route, &path, &key);
@@ -52,12 +56,74 @@ fn a_key_epoch_change_is_a_counted_reconstruction() {
         counters::total("tail_reconstruct_after_head", "key_epoch"),
         0
     );
+}
 
-    // No key at all is its own epoch, too.
-    claude_request_identity::bind_test_session_context_key(None);
-    let (load, _) = loaded(&route, &path, &key);
-    assert!(matches!(load, Load::Cold(None)));
-    assert_eq!(counters::total("tail_reconstruct", "key_epoch"), 2);
+/// `lines(responses)` with the user's email ahead of the first response, so
+/// a head made under a key stores a keyed context digest.
+fn keyed_lines(responses: usize) -> Vec<String> {
+    let mut lines = lines(responses);
+    let sentence = serde_json::json!({"type": "attachment", "attachment": {
+        "type": "session_context", "context": {"userEmail": "one@example.invalid"}}});
+    lines.insert(1, sentence.to_string());
+    lines
+}
+
+/// [behaviour] D168-2: session attribution toggled off, then on, is a
+/// settings change applied forward only, never a reconstruction: each load
+/// reuses the head with its context digest scrubbed, as main scrubs a
+/// retained parse's, and the continued body equals a cold read's under the
+/// new setting.
+#[test]
+fn an_attribution_toggle_scrubs_the_digest_and_reuses_the_head() {
+    const KEY: [u8; 32] = [1; 32];
+    let mut route = route();
+    for (name, stored, current) in [
+        ("off.jsonl", Some(KEY), None),
+        ("on.jsonl", None, Some(KEY)),
+    ] {
+        claude_request_identity::bind_test_session_context_key(stored);
+        let (path, key) = committed_lines(&mut route, name, &keyed_lines(3));
+        let (Load::Reused(mut unscrubbed, _), _) = loaded(&route, &path, &key) else {
+            panic!("{name}: the same key reuses the head");
+        };
+        claude_request_identity::bind_test_session_context_key(current);
+        append(&path, 3);
+        claude_request_identity::take_context_digest_scrubs_for_test();
+        let (load, records) = loaded(&route, &path, &key);
+        let Load::Reused(mut taken, Some(_)) = load else {
+            panic!("{name}: a toggle reuses the head");
+        };
+        assert_eq!(counted(&records), ("hit".into(), vec![]), "{name}");
+        assert_eq!(
+            claude_request_identity::take_context_digest_scrubs_for_test(),
+            1,
+            "{name}"
+        );
+        if current.is_none() {
+            // The stored digest is gone: the markers are a no-key cold read's.
+            let (fresh, _, _) = read(&route, &path, None);
+            let markers = &taken
+                .retained
+                .state
+                .accumulator_for_test()
+                .claude_org_markers;
+            assert!(fresh.accumulator.claude_org_markers.is_some());
+            assert_eq!(markers, &fresh.accumulator.claude_org_markers);
+            assert_ne!(
+                markers,
+                &unscrubbed
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_org_markers
+            );
+        }
+        let (parser, mode, _) = read(&route, &path, Some(taken));
+        assert!(matches!(mode, ReadMode::Tail), "{name}");
+        let warm = test_finish_items(parser, &path, SnapshotSource::ClaudeCode);
+        assert_eq!(warm, cold(&route, &path), "{name}");
+    }
+    assert_eq!(counters::total("tail_reconstruct", "key_epoch"), 0);
 }
 
 /// [behaviour] #1255: the pass's start removes the retired record directory,
@@ -158,4 +224,39 @@ fn only_claude_has_a_codec_and_counters_stay_per_source() {
     assert!(codex.is_empty());
     let ((), claude) = capture(|| counters::emit(SnapshotSource::ClaudeCode));
     assert_eq!(claude.len(), 1);
+}
+
+/// [format] The one hourly page codec carries usage buckets (`UsageHours`,
+/// for Pi and Codex): each bucket on its hour's page, and the pages decode
+/// back to the same pages.
+#[test]
+fn usage_buckets_round_trip_through_the_shared_hour_pages() {
+    let start = String::as_str;
+    let mut buckets = BTreeMap::new();
+    for (bucket, at) in [
+        ("2026-10-20T10:00:00Z", "2026-10-20T10:07:00Z"),
+        ("2026-10-20T10:30:00Z", "2026-10-20T10:31:00Z"),
+        ("2026-10-20T12:00:00Z", "2026-10-20T12:59:00Z"),
+    ] {
+        let mut state = UsageBucketState::default();
+        state.note_activity_at(at);
+        buckets.insert(bucket.to_owned(), state);
+    }
+    let pages = hour_pages(&buckets, start).unwrap();
+    assert_eq!(pages.len(), 2);
+    let mut decoded = BTreeMap::<String, UsageBucketState>::new();
+    for (page, bytes) in &pages {
+        read_hour_page(*page, bytes, &mut decoded, start).unwrap();
+    }
+    assert_eq!(hour_pages(&decoded, start).unwrap(), pages);
+    let (page, bytes) = &pages[0];
+    assert_eq!(
+        read_hour_page(
+            page + 1,
+            bytes,
+            &mut BTreeMap::<String, UsageBucketState>::new(),
+            start
+        ),
+        Err(ReconstructCause::Corrupt)
+    );
 }

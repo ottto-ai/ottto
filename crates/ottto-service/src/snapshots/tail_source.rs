@@ -9,7 +9,7 @@
 //! cause the caller counts, never a default-empty success.
 use super::state_v2::{Change, Collection, CollectionMeta, Shape as PageShape, StagedFile};
 use super::*;
-use crate::durable_tail_codec::{Corrupt, Dec, Durable, Enc, HDigest, Refuse};
+use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
@@ -129,7 +129,8 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// A re-derived content field no longer matches its stored digest.
     NotRederivable,
     /// The head's keyed fields were made under another attribution key: an
-    /// explicit action (a key change), not a failure.
+    /// explicit action (a key rotation), not a failure. Attribution toggled
+    /// on or off is no rotation (`HeadIdentity::check`).
     KeyEpoch,
 }
 impl ReconstructCause {
@@ -215,8 +216,11 @@ impl HeadIdentity {
     }
     /// Decodes only the head's leading identity, before any page or private
     /// field: another route is `Identity`, another capture mode
-    /// `Incompatible`, another key epoch `KeyEpoch`.
-    pub(in crate::snapshots) fn check(&self, head: &[u8]) -> Result<(), ReconstructCause> {
+    /// `Incompatible`, another key `KeyEpoch`. `Ok(true)`: a key on one side
+    /// only, so session attribution was toggled since. That is a settings
+    /// change, applied forward only (D168-2): the head is reused with its
+    /// keyed fields scrubbed, as a retained parse's are, never re-read.
+    pub(in crate::snapshots) fn check(&self, head: &[u8]) -> Result<bool, ReconstructCause> {
         let stored = Self::take(&mut Dec::new(head))?;
         if stored.binding != self.binding {
             return Err(ReconstructCause::Identity);
@@ -224,10 +228,10 @@ impl HeadIdentity {
         if stored.capture != self.capture {
             return Err(ReconstructCause::Incompatible);
         }
-        if stored.key_epoch != self.key_epoch {
-            return Err(ReconstructCause::KeyEpoch);
+        match (stored.key_epoch, self.key_epoch) {
+            (Some(stored), Some(current)) if stored != current => Err(ReconstructCause::KeyEpoch),
+            (stored, current) => Ok(stored != current),
         }
-        Ok(())
     }
 }
 
@@ -299,7 +303,7 @@ pub(in crate::snapshots) trait TailSource {
     /// Facts the decoded state must satisfy beyond its counts.
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
     /// The epoch of the key every keyed field this codec stores is made
-    /// under; `None` without a key. A head from another epoch is never reused.
+    /// under; `None` without a key. A head from another key is never reused.
     fn key_epoch() -> Option<[u8; 32]>;
     /// Installs the live inputs of this read into a validated stored state,
     /// before the load publishes it as reused.
@@ -434,4 +438,239 @@ fn slot_start(page: u64, g: u32, held: usize) -> Result<(), ReconstructCause> {
     } else {
         Err(ReconstructCause::Corrupt)
     }
+}
+
+/// An hourly bucket's page: its hour since the epoch. A start that does not
+/// parse (the parser never writes one) shares the last page.
+fn hour_page(bucket_start: &str) -> u64 {
+    OffsetDateTime::parse(bucket_start, &Rfc3339).map_or(u64::MAX, |start| {
+        start.unix_timestamp().div_euclid(3600) as u64
+    })
+}
+
+/// `Hour` pages of `map`, the one hourly page codec (capability buckets, and
+/// `UsageHours` for the sources that store usage buckets): each entry on its
+/// bucket start's hour page in map order, a page a count then each key and
+/// value.
+fn hour_pages<K: Durable, V: Durable>(
+    map: &BTreeMap<K, V>,
+    start: impl Fn(&K) -> &str,
+) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+    let mut hours: BTreeMap<u64, Vec<(&K, &V)>> = BTreeMap::new();
+    for (key, value) in map {
+        hours
+            .entry(hour_page(start(key)))
+            .or_default()
+            .push((key, value));
+    }
+    hours
+        .into_iter()
+        .map(|(hour, entries)| {
+            let bytes = page_bytes(entries.iter(), |(key, value), e| {
+                key.put(e)?;
+                value.put(e)
+            })?;
+            Ok((hour, bytes))
+        })
+        .collect()
+}
+
+/// One stored `Hour` page into `map`. An entry off its own hour's page, or a
+/// key stored twice, is corrupt.
+fn read_hour_page<K: Durable + Ord, V: Durable>(
+    page: u64,
+    bytes: &[u8],
+    map: &mut BTreeMap<K, V>,
+    start: impl Fn(&K) -> &str,
+) -> Result<(), ReconstructCause> {
+    read_page(bytes, 0, |d| {
+        let key = K::take(d)?;
+        let value = V::take(d)?;
+        if hour_page(start(&key)) != page || map.insert(key, value).is_some() {
+            return Err(ReconstructCause::Corrupt);
+        }
+        Ok(())
+    })
+}
+
+// Artifacts are head data: collected whatever the upload toggle says, and
+// filtered only when an item is built.
+crate::durable_tail_codec::durable_struct!(SessionArtifact {
+    U kind: String,
+    U value: String,
+});
+
+macro_rules! head_fields {
+    ($($c:ident $f:ident : $ty:ty),* $(,)?) => {
+        fn put_fields(acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
+            let SnapshotAccumulator { $($f),* } = acc;
+            $(durable_field!(put $c, e, $f, $ty, concat!("SnapshotAccumulator.", stringify!($f)));)*
+            Ok(())
+        }
+        fn take_fields(d: &mut Dec<'_>) -> Result<SnapshotAccumulator, Corrupt> {
+            Ok(SnapshotAccumulator { $($f: durable_field!(take $c, d, $ty)),* })
+        }
+    };
+}
+// The head-field core every codec writes: each accumulator field by its Tail
+// home. Stored fields keep their record class, except that skill labels are
+// plain data and the fork parent and artifacts are stored. `X` fields are
+// re-derived. `I` marks a field this walk does not store: a codec keeps its
+// own `I` fields in its pages or in a trailer after this walk, or never
+// stores them (finish-only and live fields). Claude's: pages (responses, tool
+// uses, changed files, capability buckets, compactions), finish-only fields
+// (usage ids and occurrences, money, cache observations and requests, usage
+// buckets and totals), live fields (Desktop identity and spawn lineage,
+// account hash) and the Pi ledger.
+head_fields! {
+    N source: SnapshotSource,
+    H cache_configuration_witness: Option<String>,
+    N cache_task_complete_at: Option<String>,
+    N cache_pending_idle: Option<u64>,
+    L cache_active_turns: BTreeSet<String>,
+    N context_curve_enabled: bool,
+    U source_session_id: Option<String>,
+    I account_identifier_hash: Option<String>,
+    X title: Option<String>,
+    N title_source: Option<String>,
+    X first_prompt_title: Option<String>,
+    X first_prompt_material: Option<String>,
+    N provider_skills: BTreeSet<String>,
+    N started_at: Option<String>,
+    N ended_at: Option<String>,
+    N last_activity_at: Option<String>,
+    U workspace_hash: Option<String>,
+    X workspace_path: Option<PathBuf>,
+    U latest_model: Option<String>,
+    U latest_reasoning_effort: Option<String>,
+    L latest_turn_id: Option<String>,
+    I codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    L codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
+    N codex_priority_witnesses_uncapped: bool,
+    E codex_tier_replay: Option<codex_file_join::TierReplay>,
+    D codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
+    D current_selector: SelectorCapture,
+    I session_cumulative_usage: Option<UsageTotals>,
+    N codex_session_meta_seen: bool,
+    N codex_record_seen: bool,
+    U codex_creator_header_id: Option<String>,
+    D codex_creator_evidence: Option<SessionAccountEvidence>,
+    N codex_creator_evidence_conflicted: bool,
+    I claude_desktop_identity: Option<SessionAccountEvidence>,
+    I claude_desktop_spawn_lineage: Option<ClaudeDesktopSpawnLineage>,
+    N claude_owned_session_id_observed: bool,
+    N claude_owned_session_id_conflicted: bool,
+    D codex_ownership_boundary: CodexOwnershipBoundary,
+    N codex_legacy_trigger_seen: bool,
+    N codex_legacy_bootstrap_valid: bool,
+    I codex_parent_ownership_ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    N codex_sidecar_created_thread: bool,
+    D codex_path_sidecar_candidates: Vec<CodexPathSidecarCandidate>,
+    U codex_resolved_path_identity: Option<String>,
+    N codex_sidecar_identity_ambiguous: bool,
+    U codex_sidecar_parent: Option<(String, String)>,
+    N codex_sidecar_child_created_at_nanos: Option<i128>,
+    N codex_bind_seed_len: Option<u64>,
+    I codex_sidecar_projected_next_ordinal: Option<u64>,
+    U codex_parent_session_ref: Option<String>,
+    E codex_parent_signatures: Option<CodexParentPrefix>,
+    H codex_parent_prefix_digest: PrefixDigest,
+    D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
+    E codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    E codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
+    N codex_parent_proof_mismatch: bool,
+    E codex_parent_proof_refusal: Option<ProofRefusal>,
+    N codex_proof_decision_only: bool,
+    N codex_boundary_buffer_count: u8,
+    H codex_proof_ledger_row: Option<String>,
+    H codex_parent_ledger_identity_used: Option<String>,
+    D codex_parent_unresolvable: Option<CodexParentUnresolvable>,
+    N codex_parent_ledger_consulted: bool,
+    N codex_parent_signature_index: usize,
+    N codex_native_created_thread_valid: bool,
+    N codex_created_thread_native_only: bool,
+    N codex_native_created_thread_header_nanos: Option<i128>,
+    N codex_native_created_thread_last_nanos: Option<i128>,
+    L codex_native_created_thread_task_turn_id: Option<String>,
+    N codex_native_created_thread_first_turn_bound: bool,
+    H codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
+    N codex_physical_signatures_complete: bool,
+    N codex_ordinal_expected: Option<u64>,
+    N codex_ordinal_sequence_valid: bool,
+    N codex_owned_record_seen: bool,
+    N codex_is_fork: bool,
+    N codex_inherited_usage_records_skipped: u64,
+    N codex_duplicate_usage_records_skipped: u64,
+    N codex_cumulative_reset_count: u64,
+    D codex_context_curve_candidates: crate::owned_heap::OwnedVec<ContextCurveCandidatePoint>,
+    D codex_context_curve_boundaries: crate::owned_heap::OwnedVec<ContextCurveCandidateBoundary>,
+    N codex_context_curve_exact_supported: bool,
+    H codex_last_usage_event_identity: Option<String>,
+    E codex_legacy_bootstrap_buffer: Vec<Value>,
+    I accepted_usage_totals: UsageTotals,
+    I usage_buckets: BTreeMap<String, UsageBucketState>,
+    D origin: SnapshotOrigin,
+    U codex_root_session_ref: Option<String>,
+    N codex_spawn_depth: Option<u64>,
+    X codex_agent_label: Option<String>,
+    U activity_tool_counts: BTreeMap<String, u64>,
+    D activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
+    U activity_mcp_tool_counts: BTreeMap<String, u64>,
+    U activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    L activity_mcp_call_ids: BTreeMap<String, bool>,
+    I activity_capability_buckets: BTreeMap<(String, String, String), u64>,
+    I seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
+    N activity_skills: BTreeSet<String>,
+    N skill_detector_incomplete: bool,
+    I activity_changed_file_hashes: BTreeSet<String>,
+    N activity_patch_operations: u64,
+    N activity_lines_added: u64,
+    N activity_lines_deleted: u64,
+    N activity_web_searches: u64,
+    N activity_mcp_calls: u64,
+    N activity_subagent_spawns: u64,
+    U artifacts: Vec<SessionArtifact>,
+    N artifacts_enabled: bool,
+    N latency_duration_ms_sum: u64,
+    N latency_duration_ms_count: u64,
+    N latency_ttft_ms_sum: u64,
+    N latency_ttft_ms_count: u64,
+    N latency_duration_ms_max: u64,
+    N latency_ttft_ms_max: u64,
+    I claude_responses: ClaudeResponseBook,
+    N claude_response_sequence: u64,
+    N claude_response_record_count: usize,
+    I claude_usage_request_ids: BTreeSet<String>,
+    I claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    N claude_request_identity_capture: bool,
+    D claude_org_markers: Option<Box<claude_request_identity::OrgMarkers>>,
+    I cache_observations: Option<CacheObservations>,
+    I cache_requests: crate::owned_heap::OwnedVec<OwnedRequest>,
+    N cache_requests_complete: bool,
+    N claude_context_curve_identity_complete: bool,
+    N claude_context_curve_request_index_complete: bool,
+    N claude_context_curve_owned_start_proven: bool,
+    D claude_file_birth: ClaudeFileBirth,
+    L claude_fork_parent: Option<String>,
+    I claude_money: Option<Box<claude_request_money::e2::FileFold>>,
+    U tool_usage_counts: BTreeMap<String, u64>,
+    N tool_usage_truncated: bool,
+    I seen_pi_usage_keys: PiLedger,
+    N dropped_usage_record_count: u64,
+    N claude_last_user_ts: Option<String>,
+    N claude_line_clocks: Option<(i128, i128)>,
+    N peak_context_fill_tokens: u64,
+    N first_turn_context_tokens: Option<u64>,
+    N last_turn_context_tokens: Option<u64>,
+    N first_turn_context_window_tokens: Option<u64>,
+    N peak_context_fill_window_tokens: Option<u64>,
+    N last_turn_context_window_tokens: Option<u64>,
+    N compaction_count: u64,
+    N compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    D codex_compaction_sizes: CodexCompactionSizes,
+    D local_context_points: LocalContextPoints,
+    I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
+    L claude_compaction_link_tip: Option<(u64, String)>,
+    D session_start: Box<session_start::SessionStartState>,
+    D durable_marks: crate::durable_tail_codec::DurableMarks,
 }
