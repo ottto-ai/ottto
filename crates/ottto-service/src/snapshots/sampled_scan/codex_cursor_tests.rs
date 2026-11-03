@@ -952,7 +952,7 @@ fn retain_fixture_copy(pi: &PiRoot, cache: &Arc<SharedCache>) {
         parser
             .prepare_acquisition(None, &context.namespace, None, now)
             .unwrap(),
-        ReadMode::Full(_)
+        crate::transcript_acquisition::ReadMode::Full(_)
     ));
     while !parser.step().unwrap() {}
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
