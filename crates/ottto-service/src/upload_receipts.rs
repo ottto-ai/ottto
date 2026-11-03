@@ -482,28 +482,6 @@ pub fn upload_receipts_path(state_dir: &Path) -> PathBuf {
     state_dir.join(UPLOAD_RECEIPTS_FILENAME)
 }
 
-/// Remove the active ring and any quarantined corrupt predecessors.
-pub fn clear(state_dir: &Path) -> Result<()> {
-    let _guard = RECEIPT_FILE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let active = upload_receipts_path(state_dir);
-    if active.exists() {
-        std::fs::remove_file(&active).context("remove upload receipt ring")?;
-    }
-    let Ok(entries) = std::fs::read_dir(state_dir) else {
-        return Ok(());
-    };
-    let corrupt_prefix = format!("{UPLOAD_RECEIPTS_FILENAME}.corrupt.");
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with(&corrupt_prefix) && entry.path().is_file() {
-            std::fs::remove_file(entry.path()).context("remove quarantined upload receipt ring")?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub fn append_success(
     state_dir: &Path,
@@ -1559,8 +1537,6 @@ mod tests {
         let migrated = load_locked(&upload_receipts_path(&dir)).unwrap();
         assert!(migrated.receipts[0].validated_evidence.is_none());
         assert_eq!(read(&dir, 1, None, None).unwrap().receipts.len(), 1);
-        clear(&dir).unwrap();
-        assert!(!upload_receipts_path(&dir).exists());
     }
 
     #[test]

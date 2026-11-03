@@ -35,9 +35,9 @@ pub(crate) use recent::recent_scopes;
 mod scope;
 mod upload;
 
+pub(crate) use harvest::drop_upload_acks;
 pub use harvest::run_context_composition_worker;
 pub(super) use harvest::spawn_v2_sync;
-pub(crate) use harvest::{erase_all_state, erase_source_state};
 
 use std::time::Duration;
 

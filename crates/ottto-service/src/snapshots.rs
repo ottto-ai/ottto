@@ -83135,10 +83135,6 @@ const _: () = {
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4928
     );
 };
-/// Explicit privacy erasure hooks. Source-disable and Repair must not call this.
-pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
-    state_v2::erase_tree(support)
-}
 pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
     let result = state_v2::idle(path, index, quiet);
     state_v2::telemetry::retained_pass_end(index);

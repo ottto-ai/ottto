@@ -104,9 +104,8 @@ still require platform qualification before routing or enabling conversion.
 Verified completion covers the current DB/WAL/SHM and the removed migration
 backup. The retained read-only v1 baseline is an explicit policy exception:
 it is never used to resurrect a forgotten file, and its 14-day hard age raises
-an escalation alarm. Forget, uninstall and source removal immediately delete
-that source's DB/WAL/SHM, v1-readonly and private remnants under their existing
-exclusive cleanup owner. Temporary remnants and external restart records have
+an escalation alarm. Uninstall deletes the DB/WAL/SHM, v1-readonly and private
+remnants under its existing cleanup owner; source removal and forget keep them. Temporary remnants and external restart records have
 separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
 APFS snapshots and physical SSD erasure are outside the promise. No application
 deletion or money-debt retirement is authorized merely by this storage maintenance.

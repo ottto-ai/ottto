@@ -276,19 +276,9 @@ pub(super) struct TailStage {
     debt: BTreeMap<Vec<u8>, Debt>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
-    /// Every Tail row of every file goes, debt included (`erase_every`).
-    every: bool,
     peak_bytes: u64,
 }
 impl TailStage {
-    /// Account removal: every `tail.*` row of the route, of any file and kind,
-    /// debt and markers included. Graph, index and census rows stay.
-    pub(super) fn erase_every() -> Self {
-        Self {
-            every: true,
-            ..Default::default()
-        }
-    }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]
     pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
@@ -302,7 +292,6 @@ impl TailStage {
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
-            && !self.every
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         self.replace_observation(key, observation);
@@ -932,23 +921,6 @@ fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result
         purge(tx, gone.collect())?;
     }
 }
-/// Every row of every Tail kind, read from headers alone: no head is decoded,
-/// so a damaged or future one never vetoes it. The number of rows removed.
-fn erase_every(tx: &mut dyn Transaction) -> Result<u64> {
-    let mut erased = 0;
-    for name in catalogue::TAIL_KINDS {
-        let kind = RecordKind::parse(name)?;
-        loop {
-            let rows = tx.scan_kind(&kind, None, HEADER_PAGE)?;
-            let count = rows.len() as u64;
-            if !purge(tx, rows)? {
-                break;
-            }
-            erased += count;
-        }
-    }
-    Ok(erased)
-}
 /// The file's committed revision rows, from headers alone.
 fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
     let kind = RecordKind::parse(REVISION)?;
@@ -986,8 +958,6 @@ struct Applied {
     disposed_absence: u64,
     disposed_settled: u64,
     erased: u64,
-    /// Rows removed by an `erase_every` stage.
-    erased_rows: u64,
 }
 impl Applied {
     fn absorb(&mut self, one: Self) {
@@ -1387,9 +1357,6 @@ pub(super) fn apply(
         delete_rows(tx, file, false)?;
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
-    }
-    if stage.is_some_and(|stage| stage.every) {
-        applied.erased_rows = erase_every(tx)?;
     }
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);

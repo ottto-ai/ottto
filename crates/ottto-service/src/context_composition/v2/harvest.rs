@@ -74,51 +74,27 @@ pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
     support_dir.join("context_composition").join(STATE_DIR)
 }
 
-/// Source removal: every file this source owns in the composition state, shared
-/// counts-only run records and opt-out markers kept. A running worker holds the
-/// lease and is finishing its run, so busy is an error the erase turn retries.
-pub(crate) fn erase_source_state(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+/// A resumed source: its scope upload ACKs go, so its next daily run re-sends
+/// every kept scope. Scope state, pins, install records and run health stay.
+/// A running worker holds the lease, so busy is an error the resume retries.
+pub(crate) fn drop_upload_acks(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let dir = state_dir(support_dir);
+    let scopes = dir.join("scopes");
+    if !scopes.exists() {
+        return Ok(());
+    }
     let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
-    let label = agent_source_label(source);
-    let prefixes = [
-        format!("{label}-"),
-        format!("index-{label}."),
-        format!("install-{label}."),
-    ];
-    for folder in [
-        dir.join("scopes"),
-        dir.join("quarantined-scopes"),
-        dir.join("quarantine"),
-        dir,
-    ] {
-        if !folder.exists() {
-            continue;
+    let prefix = format!("{}-", agent_source_label(source));
+    for entry in fs::read_dir(&scopes)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".upload.json") {
+            fs::remove_file(entry.path())?;
         }
-        for entry in fs::read_dir(&folder)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        super::checkpoint::sync_dir(&folder)?;
     }
+    super::checkpoint::sync_dir(&scopes)?;
     Ok(())
-}
-
-/// Forget: the whole composition state. Opt-out markers live one folder up.
-pub(crate) fn erase_all_state(support_dir: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(state_dir(support_dir)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
-    }
 }
 
 // -------------------------------------------------------------------------

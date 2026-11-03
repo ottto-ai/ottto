@@ -747,13 +747,10 @@ struct LogoutArgs {
     local_only: bool,
     #[arg(
         long,
-        help = "Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto"
+        help = "Forget installation identity and credentials; collected local state stays; without --local-only, first release this Mac in Ottto"
     )]
     forget_installation: bool,
-    #[arg(
-        long,
-        help = "Confirm destructive installation reset and local receipt removal"
-    )]
+    #[arg(long, help = "Confirm the installation identity and credential reset")]
     confirm: bool,
 }
 
@@ -963,7 +960,7 @@ fn validate_cli(cli: &Cli) -> Result<(), CliError> {
     ) {
         return Err(CliError {
             code: CliErrorCode::InvalidRequest,
-            message: "--forget-installation clears local receipts and first-sweep progress; rerun with --confirm after backing up the Ottto support directory if needed".to_string(),
+            message: "--forget-installation clears this Mac's installation identity and credentials; collected local state stays; rerun with --confirm".to_string(),
             retryable: false,
             details: BTreeMap::new(),
         });

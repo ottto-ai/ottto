@@ -6208,8 +6208,6 @@ fn install_staged_account_switch(
             return Err(LocalApiError::StatePoisoned);
         }
         write_and_verify_pending_claim_commit(pending, candidate_secret)?;
-        crate::snapshot_sync::owe_login_address_erase(&default_support_dir())
-            .or_state_poisoned()?;
         let response = daemon.install_switched_account(
             staged.new_account.clone(),
             staged.setup_run_id.clone(),
@@ -7352,12 +7350,14 @@ fn auth_reset(
     Ok(reset)
 }
 
+const FORGOTTEN_INSTALLATION: &str = "Installation identity and credentials were cleared. Collected state and local sync receipts stay; only uninstall deletes them. Agent source data was not changed. Restart ottto-service before pairing.";
+
 /// `device_released` is `None` for a local-only reset, which never contacts
 /// Ottto, and the server's answer for a cloud reset.
 fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
     const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
     const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
-    const FORGOTTEN: &str = "Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing.";
+    const FORGOTTEN: &str = FORGOTTEN_INSTALLATION;
     let (code, text) = match (forget_installation, device_released) {
         (true, None) => (
             "installation_forgotten",
@@ -7401,9 +7401,7 @@ fn released_without_setup_run_message(forget_installation: bool) -> StableMessag
     if forget_installation {
         StableMessage {
             code: "installation_forgotten".to_string(),
-            text: format!(
-                "{RELEASED} Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
-            ),
+            text: format!("{RELEASED} {FORGOTTEN_INSTALLATION}"),
         }
     } else {
         StableMessage {
@@ -7422,22 +7420,8 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         clear_local_release(&stores)?;
         stores.browser.delete().or_state_poisoned()?;
     }
-    FileMachineStore::default().reset().or_state_poisoned()?;
-    let support_dir = default_support_dir();
-    crate::upload_receipts::clear(&support_dir).or_state_poisoned()?;
-    // Closing registered native handles must not prevent the established
-    // whole-tree privacy cleanup, including unregistered/legacy namespaces.
-    let v2_erasure = crate::snapshots::erase_claude_state_v2_artifacts(&support_dir);
-    let path = support_dir.join("snapshots");
-    if path.is_dir() {
-        fs::remove_dir_all(&path).or_state_poisoned()?;
-    } else if path.exists() {
-        fs::remove_file(&path).or_state_poisoned()?;
-    }
-    crate::snapshot_sync::erase_all_source_caches(&support_dir).or_state_poisoned()?;
-    crate::context_composition::erase_all_state(&support_dir).or_state_poisoned()?;
-    crate::backfill::remove_backfill_state(&support_dir).or_state_poisoned()?;
-    v2_erasure.or_state_poisoned()
+    // Collected state, caches and receipts stay; only uninstall deletes them.
+    FileMachineStore::default().reset().or_state_poisoned()
 }
 
 #[cfg(test)]
@@ -7453,7 +7437,6 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    crate::snapshot_sync::owe_login_address_erase(&default_support_dir()).or_state_poisoned()?;
     FileAccountStore::default().reset().or_state_poisoned()?;
     FileConnectionStore::default().reset().or_state_poisoned()?;
     FileDeviceStore::default().reset().or_state_poisoned()?;
@@ -21828,8 +21811,10 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
-    fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+    /// [format] Forget-installation clears identity and credentials only: every
+    /// collected store, cache, composition state, backfill state and receipt
+    /// stays, so a re-pair reads this Mac's Claude history as moved.
+    fn forget_installation_clears_identity_and_credentials_and_keeps_collected_state() {
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
@@ -21907,16 +21892,50 @@ for line in sys.stdin:
             b"receipt",
         )
         .unwrap();
-        fs::write(
-            support_root.join("snapshot_backfill_state.json"),
-            b"backfill",
-        )
+        crate::backfill::update_backfill_state(&support_root, |state| {
+            crate::backfill::mark_backfill_complete_for_destination(
+                state,
+                crate::snapshots::SnapshotSource::ClaudeCode,
+                "old",
+            );
+        })
         .unwrap();
         fs::write(
             support_root.join("snapshot_upload_receipts.json"),
             b"upload receipt",
         )
         .unwrap();
+        let mut kept = vec![
+            support_root.join("snapshots/destinations/old/codex-scan-index.json"),
+            crate::backfill::backfill_state_path(&support_root),
+            support_root.join("snapshot_upload_receipts.json"),
+            support_root.join("context_composition/v2/scopes/codex-scope.json"),
+            support_root.join("context_composition/v2/scopes/codex-scope.upload.json"),
+            support_root.join("context_footprint/workspace.json"),
+            support_root.join("mcp_inventory/disabled"),
+            support_root.join("context_composition/disabled"),
+        ];
+        for source in crate::snapshots::durable_sources::SOURCES {
+            let source = source.snapshot;
+            kept.push(crate::active_sessions::active_session_cache_path(
+                &support_root,
+                source,
+            ));
+            kept.push(crate::mcp_inventory::cache_path(&support_root, source));
+            kept.push(crate::snapshot_sync::detected_uses_cache_path(
+                &support_root,
+                source,
+            ));
+        }
+        for path in &kept {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !path.exists() {
+                fs::write(path, b"synthetic-forget-canary").unwrap();
+            }
+        }
+        kept.push(crate::snapshots::state_v2::retired_record_dir(
+            &support_root.join("snapshots/destinations/other/claude_code-scan-index.json"),
+        ));
         let source_data = root.join("codex-source.jsonl");
         fs::write(&source_data, b"source data").unwrap();
 
@@ -21953,9 +21972,14 @@ for line in sys.stdin:
         assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .load()
             .is_err());
-        assert!(!support_root.join("snapshots").exists());
-        assert!(!support_root.join("snapshot_backfill_state.json").exists());
-        assert!(!support_root.join("snapshot_upload_receipts.json").exists());
+        for path in &kept {
+            assert!(path.exists(), "{path:?}: collected state stays");
+        }
+        assert_eq!(
+            crate::snapshot_sync::claude_prior_history_for_new_destination(&support_root, "new"),
+            crate::snapshots::PriorHistory::Moved,
+            "a re-pair after forget reads this Mac's Claude history as moved"
+        );
         assert_eq!(fs::read(source_data).unwrap(), b"source data");
         assert_eq!(
             response.payload.unwrap()["message"]["code"],
@@ -23236,65 +23260,6 @@ for line in sys.stdin:
         );
     }
 
-    /// [regress] forget removes more than 64 legacy claude namespaces and progress files.
-    #[test]
-    #[serial]
-    fn forget_removes_more_than_64_legacy_claude_namespaces_and_progress_files() {
-        let _lock = lock_backend_test_env();
-        let env = history_choice_test_env();
-        let snapshots = env.root.join("snapshots");
-        for namespace in 0..70 {
-            let dir = snapshots
-                .join("destinations")
-                .join(format!("{namespace:064x}"));
-            fs::create_dir_all(&dir).unwrap();
-            for name in [
-                "claude_code-legacy-scan-index.json",
-                "claude_code-legacy-scan-index-upload-progress.json",
-                "claude_code-scan-index-v3.json.v2.sqlite",
-            ] {
-                fs::write(dir.join(name), b"synthetic-forget-canary").unwrap();
-            }
-        }
-        {
-            let _identity_lock = lock_setup_run_binding();
-            forget_installation_state_locked().unwrap();
-        }
-        assert!(!snapshots.exists());
-    }
-
-    #[test]
-    #[serial]
-    fn forget_erases_source_caches_and_composition_state_and_keeps_opt_outs() {
-        use crate::snapshots::SnapshotSource;
-        let _lock = lock_backend_test_env();
-        let env = history_choice_test_env();
-        fs::create_dir_all(env.root.join("snapshots")).unwrap();
-        let mut erased = vec![env
-            .root
-            .join("context_composition/v2/scopes/codex-scope.json")];
-        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-            erased.push(crate::active_sessions::active_session_cache_path(
-                &env.root, source,
-            ));
-            erased.push(crate::mcp_inventory::cache_path(&env.root, source));
-        }
-        let kept = [
-            env.root.join("mcp_inventory/disabled"),
-            env.root.join("context_composition/disabled"),
-        ];
-        for path in erased.iter().chain(&kept) {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"synthetic-forget-canary").unwrap();
-        }
-        {
-            let _identity_lock = lock_setup_run_binding();
-            forget_installation_state_locked().unwrap();
-        }
-        assert!(erased.iter().all(|path| !path.exists()));
-        assert!(kept.iter().all(|path| path.exists()));
-    }
-
     #[test]
     #[serial]
     fn history_choice_forget_installation_invalidates_old_browser_credentials() {
@@ -23911,7 +23876,9 @@ for line in sys.stdin:
         assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
             .load()
             .is_err());
-        assert!(!support_root.join("snapshots").exists());
+        assert!(support_root
+            .join("snapshots/destinations/old/codex-scan-index.json")
+            .exists());
         let _ = fs::remove_dir_all(root);
     }
 
