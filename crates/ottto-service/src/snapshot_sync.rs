@@ -12965,7 +12965,6 @@ fn erase_owed_login_addresses(
     }
     crate::claude_status_coverage::forget_addresses();
     cache.forget_retained_transcripts();
-    cache.durable_forget_source(SnapshotSource::ClaudeCode);
     let erased = erase_claude_durable_tails(support_dir).and_then(|()| {
         std::fs::remove_file(&marker)?;
         sync_progress_parent(&marker)

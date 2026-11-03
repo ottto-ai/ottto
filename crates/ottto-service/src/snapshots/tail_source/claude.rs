@@ -108,12 +108,6 @@ impl TailSource for Claude {
                 acc.session_cumulative_usage.is_some(),
             ),
             (
-                "org_markers_home",
-                acc.claude_org_markers
-                    .as_ref()
-                    .is_some_and(|markers| markers.home_bound()),
-            ),
-            (
                 "claude_desktop_identity",
                 acc.claude_desktop_identity.is_some(),
             ),

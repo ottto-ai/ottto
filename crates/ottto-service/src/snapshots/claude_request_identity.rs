@@ -3098,10 +3098,6 @@ impl OrgMarkers {
             .chain(self.context_position)
             .chain(self.context_flip_position)
     }
-    /// The status-coverage key is bound at item build, never by the parser.
-    pub(crate) fn home_bound(&self) -> bool {
-        self.home.is_some()
-    }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
     /// read, so position 0 stands in when none was recorded: the next sentence
