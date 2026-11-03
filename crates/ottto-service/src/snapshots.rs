@@ -60254,7 +60254,9 @@ mod tests {
                 first.census_complete,
                 &first.census_window_end,
             );
-            if generation == 2 {
+            if generation == 4 {
+                // Ownership correction now follows the real source change above;
+                // terminal completion does not replay unchanged history.
                 let stable_item = first
                     .snapshots
                     .iter()
@@ -66989,7 +66991,7 @@ mod tests {
             (None, None, None, None)
         );
         assert!(index.claude_duplicate_request_witness_overflowed);
-        assert!(!index
+        assert!(index
             .claude_usage_family_pending
             .contains_key(hidden_copy_id));
         assert!(index.claude_duplicate_request_owners.is_empty());
@@ -68544,7 +68546,7 @@ mod tests {
         assert!(old_version
             .files
             .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+            .all(|entry| !entry.source_file_fingerprint.is_empty()));
         assert_eq!(old_version.accepted_snapshot_fingerprints, acks);
         assert_eq!(old_version.session_account_bindings, bindings);
         let pending = index.claude_account_family_pending.get_mut(&root).unwrap();
@@ -69227,7 +69229,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
+    fn claude_account_family_legacy_witness_keeps_progress_and_rebuilds_on_observation() {
         let (root, parent, items) = claude_account_family_fixture(false);
         let account_hash = "a".repeat(64);
         let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
@@ -69275,14 +69277,14 @@ mod tests {
             "2026-08-02T07:10:00Z",
         );
         assert!(!index.claude_account_family_witnesses.contains_key(&parent));
-        assert!(index.files[&parent_index_key]
+        assert!(!index.files[&parent_index_key]
             .source_file_fingerprint
             .is_empty());
-        assert!(index.files[&child_index_key]
+        assert!(!index.files[&child_index_key]
             .source_file_fingerprint
             .is_empty());
 
-        // The scheduled bounded replay reconstructs request-set proof across
+        // Independent later observations reconstruct request-set proof across
         // pages and mints a v30 witness at the terminal census.
         let mut parent_page = vec![items[0].clone()];
         apply_claude_effort_evidence_with_index(
@@ -71507,7 +71509,7 @@ mod tests {
             true,
             "2026-08-20T10:02:00Z",
         );
-        assert!(index.files[&local_index_key(&path)]
+        assert!(!index.files[&local_index_key(&path)]
             .source_file_fingerprint
             .is_empty());
         let _ = fs::remove_file(path);
@@ -71716,13 +71718,13 @@ mod tests {
             true,
             "2026-08-20T11:04:00Z",
         );
-        assert!(paged_index
+        assert!(!paged_index
             .files
             .get(&local_index_key(&child_path))
             .expect("child index entry")
             .source_file_fingerprint
             .is_empty());
-        assert!(paged_index
+        assert!(!paged_index
             .files
             .get(&local_index_key(&sibling_path))
             .expect("sibling index entry")
@@ -71901,7 +71903,7 @@ mod tests {
         );
         assert!(!paged_index.claude_duplicate_request_witness_overflowed);
         assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
-        assert!(paged_index
+        assert!(!paged_index
             .files
             .get(&local_index_key(&child_path))
             .expect("child index entry")
@@ -71978,7 +71980,7 @@ mod tests {
             "2026-08-20T11:05:00Z",
         );
         assert!(paged_index.claude_duplicate_request_owners.is_empty());
-        assert!(paged_index
+        assert!(!paged_index
             .files
             .get(&local_index_key(&child_path))
             .expect("child index entry")

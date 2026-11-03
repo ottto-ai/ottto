@@ -813,7 +813,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
             let mut absent = index.clone();
             absent.claude_usage_family_pending.clear();
             let retired = absent.retire_claude_transcript_records_for_test(
-                rfc3339_unix_seconds("2026-10-02T09:00:00Z").unwrap(),
+                crate::snapshots::rfc3339_unix_seconds("2026-10-02T09:00:00Z").unwrap(),
             );
             assert_eq!(retired.0, 1);
             assert!(absent

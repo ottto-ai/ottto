@@ -310,7 +310,10 @@ fn c1b_invalid_stale_family_cannot_reopen_so_the_witnessed_family_is_carried() {
         pending.invalid = true;
     };
     let ((fix, row), (_, base_row)) = carry_arms(&mutate, BACKFILL_WINDOW_DAYS);
-    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(
+        base_row["rearmed_index_files"], 2,
+        "invalid family is not owed"
+    );
     // FLIPS: BASE re-arms every member.
     assert_eq!(row["carried_pending_families"], 1);
     assert_eq!(row["rearmed_index_files"], 1);
@@ -1825,7 +1828,7 @@ fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
             while !parser.step().unwrap() {}
             healthy_full += 1;
         }
-        assert_eq!(healthy_full, expected_healthy_full);
+        assert_eq!(healthy_full, 0, "refusals never select an unchanged Full");
         assert_eq!(held_reads_before_deadline, 0);
         // Control: the held families still select when their own deadline is
         // due. This changes no binding, accepted body or identity latch.
@@ -2346,7 +2349,15 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
             if !matches!(case, "context" | "mid_walk") {
                 assert_eq!(row["rearmed_index_files"], 32, "{case}");
             }
-            assert_eq!(healthy_full, 32, "{case}");
+            assert_eq!(
+                healthy_full,
+                if matches!(case, "context" | "mid_walk") {
+                    32
+                } else {
+                    0
+                },
+                "{case}"
+            );
         }
     }
 }
@@ -2533,8 +2544,8 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
             .unwrap();
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 0),
-            CandidateDecision::Parse,
-            "{case}"
+            CandidateDecision::Skip,
+            "{case}: refused unchanged evidence remains owed"
         );
         if case != "list_missing" {
             assert_eq!(
@@ -2715,7 +2726,11 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
         } else {
             assert_eq!(
                 owed_decision(&mut fixture.index, &fixture.candidates[0], 0),
-                CandidateDecision::Parse,
+                if case == "changed" {
+                    CandidateDecision::Parse
+                } else {
+                    CandidateDecision::Skip
+                },
                 "{case}"
             );
             if case != "changed" {
@@ -2786,7 +2801,11 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
         }
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 1),
-            CandidateDecision::Parse,
+            if matches!(case, "identity_latch" | "missing_replay") {
+                CandidateDecision::Skip
+            } else {
+                CandidateDecision::Parse
+            },
             "{case}"
         );
         if case == "identity_latch" {
@@ -3570,7 +3589,11 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         }
         assert_eq!(
             owed_decision(&mut fixture.index, candidate, 1),
-            CandidateDecision::Parse,
+            if matches!(case, "content" | "sidecar" | "account") {
+                CandidateDecision::Parse
+            } else {
+                CandidateDecision::Skip
+            },
             "{case}"
         );
         if matches!(case, "content" | "sidecar" | "account") {
@@ -4622,7 +4645,7 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
             rearm_cause::Cause::TerminalUnhealthyRetry,
         );
         let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let mut reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
+        let reads = owed_reads(&mut owed, &candidates, CARRY_RETRY);
         let counts = scope.finish().contract.evidence_owed;
         assert_eq!(
             (

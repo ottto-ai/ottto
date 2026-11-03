@@ -227,11 +227,13 @@ impl Page {
             unobserved(|| {
                 let mut whole = twin(self);
                 let mut accepted = accepted.as_deref().cloned();
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(true));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(true));
                 let reads = api_reads(|| {
                     whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
                 });
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE.with(|whole_corpus| whole_corpus.set(false));
+                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
+                    .with(|whole_corpus| whole_corpus.set(false));
                 (whole, accepted, reads)
             })
         });
@@ -374,12 +376,7 @@ impl StreamedChecks {
     /// without normalization for bodies (contract-5 tags included), the
     /// persisted index, stats, holds and the finalized wire; the money oracle
     /// for totals and account placement.
-    fn compare(
-        &mut self,
-        terminal: bool,
-        whole: ComparedSide<'_>,
-        streamed: ComparedSide<'_>,
-    ) {
+    fn compare(&mut self, terminal: bool, whole: ComparedSide<'_>, streamed: ComparedSide<'_>) {
         use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
         let ((whole, whole_accepted, whole_reads), (streamed, accepted, reads)) = (whole, streamed);
         assert_eq!(
@@ -448,17 +445,33 @@ fn api_reads(read: impl FnOnce()) -> usize {
 
 /// (session, login, org, requests) of every share placed by a carried-forward
 /// account.
-fn carried_forward(snapshots: &[SnapshotItem]) -> Vec<(String, Option<String>, Option<String>, u64)> {
+fn carried_forward(
+    snapshots: &[SnapshotItem],
+) -> Vec<(String, Option<String>, Option<String>, u64)> {
     let mut carried = Vec::new();
     for item in snapshots {
         let evidence = |at: Option<u16>| at.map(|at| &item.request_evidence[usize::from(at)]);
-        for row in item.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage) {
+        for row in item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+        {
             let shares = match &row.identity_parts {
                 Some(parts) => parts
                     .iter()
-                    .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                    .map(|part| {
+                        (
+                            &part.account_identifier_hash,
+                            part.evidence_ref,
+                            part.request_count,
+                        )
+                    })
                     .collect(),
-                None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+                None => vec![(
+                    &row.account_identifier_hash,
+                    row.evidence_ref,
+                    row.request_count,
+                )],
             };
             for (login, at, requests) in shares {
                 if let Some(evidence) = evidence(at).filter(|evidence| {
@@ -595,7 +608,10 @@ fn five_root_sweep(multi_root: bool) {
                 api_login(LOGINS, "d-own", 5, '1', Some('9')),
                 api_for(LOGINS, "resumed", 15, 150),
             ],
-            &[trace_for(LOGINS, "d-own", ""), trace_for(LOGINS, "resumed", "")],
+            &[
+                trace_for(LOGINS, "d-own", ""),
+                trace_for(LOGINS, "resumed", ""),
+            ],
         );
         c.write_at(
             &format!("{MALFORMED}.jsonl"),
@@ -1252,14 +1268,18 @@ fn twins(reverse: bool) {
             "opposite discovery orders count each request once on the first page"
         );
         assert_eq!(first.scan.snapshots.len(), 1);
-        let expected = canonical(&first.scan.snapshots);
         first.finish();
+        let expected = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
         let repeated = ready(&c, &scanner, prior, 100, false);
+        assert!(
+            repeated.scan.snapshots.is_empty(),
+            "unchanged twins stay quiet"
+        );
         assert_eq!(
-            canonical(&repeated.scan.snapshots),
+            stored_bodies(&repeated.index),
             expected,
-            "repeated page cannot add money"
+            "accepted bodies keep all money"
         );
     });
 }
@@ -2354,9 +2374,17 @@ fn overlapping_restored(reverse: bool) {
         assert_eq!(first.scan.snapshots[0].input_tokens, 30);
         assert_eq!(first.scan.snapshots[0].removed_request_count, Some(1));
         let prior = settle(&c, &old, first, &mut progress);
+        let stored = stored_bodies(&prior);
         let again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&again);
-        assert_eq!(total(&again), 2, "settled and re-read: unchanged");
+        assert!(
+            again.scan.snapshots.is_empty(),
+            "settled history is not replayed"
+        );
+        assert_eq!(
+            stored_bodies(&again.index),
+            stored,
+            "the accepted union stays unchanged"
+        );
     });
 }
 #[test]
@@ -2859,13 +2887,12 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
             })
         });
         assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
-        let kept = rows
-            .iter()
-            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
-            .expect("the terminal reports the kept records");
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
-        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["stage"] == "claude_census_retire_kept_overlap"),
+            "cohort retention precedes overlap retirement"
+        );
         let census = prior.claude_request_census_for_test();
         let record = |session: &str| {
             let name = format!("{session}.jsonl");

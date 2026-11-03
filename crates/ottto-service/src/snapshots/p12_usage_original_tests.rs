@@ -392,8 +392,8 @@ impl Family {
         assert_eq!(child[0].usage_accounting_contract.as_deref(), REPORTED);
         let first_witness = self.witness();
         assert!(
-            !self.armed(&self.parent_key),
-            "the first exact proof re-arms the earlier-page root once"
+            self.armed(&self.parent_key),
+            "the first exact proof keeps earlier-page progress"
         );
         assert!(self.armed(&self.child_key));
         self.reload();
