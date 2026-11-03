@@ -208,8 +208,12 @@ pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> 
 pub(crate) struct Continuation {
     audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
     last_full_verified: u64,
+    sealed_offset: u64,
 }
 impl Continuation {
+    pub(crate) fn sealed_offset(&self) -> u64 {
+        self.sealed_offset
+    }
     pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
         self.audit_debt
     }
@@ -237,6 +241,7 @@ pub(crate) fn continuation_for_test(
                 .map(|checkpoint| Continuation {
                     audit_debt: checkpoint.audit_debt(),
                     last_full_verified: checkpoint.last_full_verified(),
+                    sealed_offset: checkpoint.sealed_offset(),
                 })
         }
     };
@@ -245,6 +250,7 @@ pub(crate) fn continuation_for_test(
             .audit_debt_unix_seconds
             .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
         last_full_verified: certificate.verified_unix_seconds,
+        sealed_offset: certificate.sealed_offset,
     })
 }
 
