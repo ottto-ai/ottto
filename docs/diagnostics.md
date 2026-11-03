@@ -1780,7 +1780,7 @@ sessions, decoded bytes or money. No path or session id is included.
 | `CompressedDurableTailUnsupported` | Durable certificate restore and rederive |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
+| `CompressedParentLedgerUnbound` | Shared ownership parser held an ordinary fork after Full decoding because parent-prefix evidence was not proven |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |

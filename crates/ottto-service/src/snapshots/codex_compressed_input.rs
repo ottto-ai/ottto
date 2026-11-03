@@ -1927,6 +1927,10 @@ pub(in crate::snapshots) mod tests {
                         result.snapshots.is_empty(),
                         "held fork emits no copied prefix: {case}"
                     );
+                    let work = index.archives[&key].work.as_ref().unwrap();
+                    assert_eq!(work.attempts, 1);
+                    assert!(work.retry_after > sampled_scan::now_seconds());
+                    assert!(index.archives[&key].full_paced());
                 }
                 assert_eq!(
                     result.unreadable_path_count, 0,
