@@ -246,15 +246,21 @@ impl TailSource for Pi {
         }
     }
 
-    /// Every ledger key holds a recorded occurrence or a pair: the reducer
-    /// never leaves a key with an empty state.
+    /// Every ledger key holds a recorded occurrence or a pair, and every
+    /// unmatched count is positive: the reducer removes a digest whose count
+    /// reaches zero and never leaves a key with an empty state.
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause> {
-        let empty = acc.seen_pi_usage_keys.usage_keys().values().any(|state| {
-            state.message.is_empty()
+        let broken = acc.seen_pi_usage_keys.usage_keys().values().any(|state| {
+            (state.message.is_empty()
                 && state.message_end.is_empty()
-                && state.paired_digests.is_empty()
+                && state.paired_digests.is_empty())
+                || state
+                    .message
+                    .values()
+                    .chain(state.message_end.values())
+                    .any(|count| *count == 0)
         });
-        if empty {
+        if broken {
             Err(ReconstructCause::Corrupt)
         } else {
             Ok(())

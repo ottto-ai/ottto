@@ -1333,9 +1333,11 @@ impl PiPageExpect<'_> {
     }
 }
 
-// Return each arm's own finished index, so a later page cannot borrow another
-// arm's settlement. Quarantined files have no emitted body; compare their
-// disposition and retryability instead of inventing a successful upload.
+// Return each arm's own finished index. Callers continue every arm from the
+// restart arm's committed index (`pi_committed`): on the Tail route the arms
+// share one saved graph and differ in what they recompute from it.
+// Quarantined files have no emitted body; compare their disposition and
+// retryability instead of inventing a successful upload.
 fn pi_pages(
     proof: &mut PiProof,
     c: &Corpus,

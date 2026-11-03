@@ -253,6 +253,20 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         load(&staged, &mut fresh()).map(|_| ()),
         Err(ReconstructCause::Corrupt)
     );
+    // Nor an unmatched count of zero: a later pairing would underflow it.
+    let (mut zeroed, certificate) = parse(&lines(2, 0, None));
+    let mut state = PiUsageDedupState::default();
+    state.message.insert("1".repeat(64), 0);
+    zeroed
+        .accumulator_for_test()
+        .seen_pi_usage_keys
+        .usage_keys_mut()
+        .insert("0".repeat(64), state);
+    let staged = stage(&zeroed, &certificate);
+    assert_eq!(
+        load(&staged, &mut fresh()).map(|_| ()),
+        Err(ReconstructCause::Corrupt)
+    );
 
     // A header time without a parent never comes from the reducer.
     let (mut orphan, certificate) = parse(&lines(2, 0, None));
