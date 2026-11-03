@@ -170,7 +170,7 @@ fn slots_cover_live_maps(acc: &SnapshotAccumulator) -> bool {
         && acc
             .codex_observed_priority_turns
             .as_ref()
-            .is_none_or(|observed| {
+            .map_or(true, |observed| {
                 observed.len() == slots.priority_turns.len()
                     && observed
                         .keys()
