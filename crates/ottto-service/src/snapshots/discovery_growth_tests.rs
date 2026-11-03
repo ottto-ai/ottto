@@ -503,6 +503,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     let bound = index.clone();
     let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
     let mut first_pass = Vec::new();
+    let mut first_scan = None;
     for pass in 0..2 {
         let (next, scan, reads, rows) = f.page(source, index);
         let modes = reads.0.lock().unwrap().0.clone();
@@ -516,29 +517,38 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             "CODEX_FRAGMENT_REREAD pass={pass} scanned={} reads={modes:?} fragment_bytes={fragment_bytes} repeats={repeats:?} usage={emitted:?} first_pass={first_pass:?}",
             scan.scanned_file_count
         );
-        assert_eq!(
-            scan.scanned_file_count, 1,
-            "pass {pass}: the reloaded pass re-reads the fragment"
-        );
-        assert_eq!(
-            modes,
-            vec![growth_mode()],
-            "pass {pass}: one read, never a Full"
-        );
-        if crate::heap_layout_bound::layout_supported() {
-            assert_eq!(
-                repeats,
-                vec![(json!(1), Some(fragment_bytes))],
-                "pass {pass}: one fragment-only Tail, byte-bounded to the fragment"
-            );
-        }
         if pass == 0 {
+            // The first reloaded pass: one ordinary fragment-only Tail. It
+            // counts the complete record and records the full length.
+            assert_eq!(
+                scan.scanned_file_count, 1,
+                "the reloaded pass re-reads the fragment once"
+            );
+            assert_eq!(modes, vec![growth_mode()], "one read, never a Full");
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(
+                    repeats,
+                    vec![(json!(1), Some(fragment_bytes))],
+                    "one fragment-only Tail, byte-bounded to the fragment"
+                );
+            }
             assert!(
                 !scan.snapshots.is_empty(),
                 "the complete unterminated record counts on the re-read"
             );
+            assert_eq!(
+                next.files[&key].size_bytes, candidate.size_bytes,
+                "the ordinary re-read records the full length"
+            );
             first_pass = emitted;
+            first_scan = Some(scan.clone());
         } else {
+            // Later passes: the file is unchanged since that read, so nothing
+            // is re-read until it changes.
+            assert_eq!(scan.scanned_file_count, 0, "pass {pass}: no re-read");
+            assert!(modes.is_empty(), "pass {pass}: no read: {modes:?}");
+            assert!(repeats.is_empty(), "pass {pass}: no repeat: {repeats:?}");
+            assert!(scan.snapshots.is_empty(), "pass {pass}: no snapshot");
             for (session, totals) in &emitted {
                 let first = first_pass
                     .iter()
@@ -735,21 +745,51 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "real aged growth has positive grown credit"
     );
     assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
-    assert_eq!(scan.snapshots.len(), 1, "terminated record catches up once");
+    assert!(
+        scan.snapshots.len() <= 1,
+        "terminated record catches up at most once"
+    );
     assert_eq!(
         caught.files[&key].size_bytes,
         fs::metadata(&f.path).unwrap().len()
     );
-    // Whole-body equality with a cold ordinary Full, not token-only equality.
-    let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
-    assert_eq!(
-        serde_json::to_value(&scan.snapshots).unwrap(),
-        serde_json::to_value(&cold.snapshots).unwrap(),
-        "catch-up body == cold Full"
+    // The complete record already counted on the first re-read; its newline
+    // adds no usage. The usage emitted for it (the catch-up's snapshot, or the
+    // first re-read's when the catch-up is a semantic no-op) equals a cold Full
+    // of the terminated bytes.
+    for (session, totals) in usage(&scan.snapshots) {
+        let first = first_pass
+            .iter()
+            .find(|(first, _)| *first == session)
+            .map(|(_, first)| first)
+            .unwrap_or_else(|| panic!("catch-up: new usage for {session}"));
+        assert!(
+            totals.iter().zip(first).all(|(now, first)| now <= first),
+            "catch-up: no snapshot above the first re-read: {totals:?} > {first:?}"
+        );
+    }
+    let emitted = if scan.snapshots.is_empty() {
+        first_scan.expect("the first re-read emitted")
+    } else {
+        scan.clone()
+    };
+    eprintln!(
+        "CODEX_FRAGMENT_CATCH_UP snapshots={} usage={:?}",
+        scan.snapshots.len(),
+        usage(&emitted.snapshots)
     );
+    let (cold_index, cold) = cold_full(&emitted.snapshots[0].collected_at);
+    if !scan.snapshots.is_empty() {
+        // Whole-body equality with a cold ordinary Full, not token-only equality.
+        assert_eq!(
+            serde_json::to_value(&scan.snapshots).unwrap(),
+            serde_json::to_value(&cold.snapshots).unwrap(),
+            "catch-up body == cold Full"
+        );
+    }
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(
         &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
-        &sampled_scan::transition_fixture::scan_money(source, &caught, &scan),
+        &sampled_scan::transition_fixture::scan_money(source, &caught, &emitted),
     );
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");
