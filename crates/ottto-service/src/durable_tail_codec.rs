@@ -1473,11 +1473,6 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
-    (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
-        $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
-        impl $t {
-        }
-    };
     (key $t:ident $body:tt) => {
         $crate::durable_tail_codec::durable_struct!($t $body);
         $crate::durable_tail_codec::durable_struct!(@key $t $body);
