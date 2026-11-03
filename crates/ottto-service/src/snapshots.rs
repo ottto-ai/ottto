@@ -9240,25 +9240,6 @@ pub fn apply_claude_effort_evidence_with_index(
     if census_complete {
         // Legacy count-only witnesses cannot prove current request coverage.
         // Prune them without scheduling a historical reparse.
-        let _legacy_witness_roots = index
-            .claude_account_family_witnesses
-            .iter()
-            .filter_map(|(root_session_id, witness)| {
-                let fingerprint_members = witness
-                    .member_request_id_fingerprints
-                    .keys()
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                let witness_members = witness.members.keys().cloned().collect::<BTreeSet<_>>();
-                ((fingerprint_members != witness_members
-                    || witness
-                        .member_request_id_fingerprints
-                        .values()
-                        .any(|fp| !is_snapshot_fingerprint(fp)))
-                    && complete_family_members.contains_key(root_session_id))
-                .then_some(root_session_id.clone())
-            })
-            .collect::<BTreeSet<_>>();
         index
             .claude_account_family_witnesses
             .retain(|root_session_id, witness| {
@@ -9335,11 +9316,6 @@ pub fn apply_claude_effort_evidence_with_index(
             index.claude_account_family_witnesses.remove(root);
         }
     }
-    let witness_roots_before = index
-        .claude_account_family_witnesses
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
     apply_claude_effort_evidence_with_families(
         snapshots,
         evidence_by_session,
@@ -9352,19 +9328,6 @@ pub fn apply_claude_effort_evidence_with_index(
                 pending.census_complete = true;
             }
         }
-        let _current_source_session_ids = snapshots
-            .iter()
-            .map(|snapshot| snapshot.source_session_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let _newly_proven_roots = proven_families
-            .keys()
-            .filter(|root_session_id| {
-                !witness_roots_before.contains(*root_session_id)
-                    && index
-                        .claude_account_family_witnesses
-                        .contains_key(*root_session_id)
-            })
-            .collect::<BTreeSet<_>>();
         // Earlier bodies remain unchanged; later dead-code cut removes reproof scheduling.
     }
 }
@@ -9575,33 +9538,6 @@ type ClaudeProofRows<'r> = (
 );
 
 impl ClaudeEvidenceRows<'_> {
-    fn root_has_shared_rows(
-        self,
-        root: &str,
-        api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-        trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-        join: &terminal_join::TerminalJoin,
-    ) -> bool {
-        match self {
-            Self::Streamed(cross) => cross.root_has_shared_rows(root, join),
-            Self::Whole(_) => api
-                .evidence
-                .get(root)
-                .into_iter()
-                .flatten()
-                .map(|row| row.request_id.as_str())
-                .chain(
-                    trace
-                        .evidence
-                        .get(root)
-                        .into_iter()
-                        .flatten()
-                        .map(|row| row.request_id.as_str()),
-                )
-                .any(|id| join.other_root_holds(root, &Sha256::digest(id.as_bytes()).into())),
-        }
-    }
-
     /// One root's rows for the terminal proof: the reports' rows, else a
     /// strict reread of a pair this pass read healthy but did not keep.
     /// `Err`: that pair changed since, so its family stays unproven.
@@ -10406,19 +10342,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
     note_claude_reemission_stop(&context_file_birth, file_birth_tripwire.over_bound_roots());
 
-    let _owned_start_reparse_ids = index
-        .claude_owned_start_census
-        .iter()
-        .filter_map(|(source_session_id, witness)| {
-            witness
-                .verified_source_file_fingerprint
-                .as_ref()
-                .filter(|verified| {
-                    witness.emitted_source_file_fingerprint.as_ref() != Some(*verified)
-                })
-                .map(|_| source_session_id.clone())
-        })
-        .collect::<BTreeSet<_>>();
     // Owned-start observations do not schedule historical body corrections.
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
@@ -10640,10 +10563,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             &duplicate_witnesses_after,
             max_duplicate_owners,
         );
-        let _closed_only_by_witnessed_families = overflowed_before
-            && coverage_missing_member_count > 0
-            && owners_within_bound
-            && claude_fence_held_only_by_witnessed_families(index, census_window_end);
         if duplicate_census_invalid
             // A closed fence reopens only after a census that observed every
             // indexed family member in this window. Unchanged files skipped by
@@ -10727,7 +10646,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && index.claude_request_identity_contract.as_deref()
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
-        let _would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
         let full_rearm = false; // A complete census never schedules transcript reads.
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
@@ -10979,10 +10897,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
-            let _settled_unchanged_proof = proof_candidate
-                && unchanged_proof_roots
-                    .as_ref()
-                    .is_some_and(|roots| roots.get(root_session_id.as_str()) == Some(&true));
             let other_rearm = full_rearm
                 || identity_contract_rearm
                 || fence_recovery_rearm
@@ -11055,10 +10969,62 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             })
             .map(|(root, _)| root.clone())
             .collect::<Vec<_>>();
-        let shared = vanished
+        // Collect vanished sidecar keys once, then query only matching join
+        // runs. Each run names its transcript root without scanning the join
+        // per sidecar row; retained root ordinals need no second row index.
+        let vanished_set = vanished.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let mut sidecar_roots = BTreeMap::<[u8; 32], BTreeSet<&str>>::new();
+        match evidence_rows {
+            ClaudeEvidenceRows::Streamed(cross) => {
+                for &(hash, ordinal) in &cross.request_roots.0 {
+                    let root = cross.roots[ordinal as usize].as_str();
+                    if vanished_set.contains(root) {
+                        sidecar_roots.entry(hash).or_default().insert(root);
+                    }
+                }
+            }
+            ClaudeEvidenceRows::Whole(_) => {
+                for (root, id) in api_report
+                    .evidence
+                    .iter()
+                    .flat_map(|(root, rows)| {
+                        rows.iter()
+                            .map(move |row| (root.as_str(), row.request_id.as_str()))
+                    })
+                    .chain(trace_report.evidence.iter().flat_map(|(root, rows)| {
+                        rows.iter()
+                            .map(move |row| (root.as_str(), row.request_id.as_str()))
+                    }))
+                {
+                    if vanished_set.contains(root) {
+                        sidecar_roots
+                            .entry(Sha256::digest(id.as_bytes()).into())
+                            .or_default()
+                            .insert(root);
+                    }
+                }
+            }
+        }
+        let keys = sidecar_roots.keys().copied().collect();
+        let sharing_roots = join.roots_with_hashes(&keys);
+        let mut shared_sidecar_roots = BTreeSet::new();
+        if sharing_roots
             .iter()
-            .filter(|root| evidence_rows.root_has_shared_rows(root, api_report, trace_report, join))
-            .count();
+            .any(|root| indexed_claude_family_ids.contains(*root))
+        {
+            for (key, owner, flags) in join.runs(&keys) {
+                let holder = join.owners[*owner as usize].0.as_str();
+                if flags & terminal_join::HASH != 0 && indexed_claude_family_ids.contains(holder) {
+                    shared_sidecar_roots.extend(
+                        sidecar_roots[key]
+                            .iter()
+                            .copied()
+                            .filter(|root| *root != holder),
+                    );
+                }
+            }
+        }
+        let shared = shared_sidecar_roots.len();
         claude_contract::note(|c| c.vanished_roots_with_shared_rows += shared as u64);
         for root in vanished {
             index.claude_usage_family_pending.discard(&root);
@@ -12920,53 +12886,6 @@ fn claude_earliest_request(
     rows.iter()
         .filter_map(|row| rfc3339_unix_seconds(&row.observed_at))
         .min()
-}
-
-/// Whether witnessed families this window did not read are all that keep a
-/// closed fence closed: every pending is valid, and current unless its root
-/// has a retained witness; and every indexed Claude file this window did not
-/// observe belongs to a witnessed family with no current pending. A file
-/// counts as observed when its own root's current, valid pending names it, or
-/// it is confirmed empty. A family read in this window that still leaves a
-/// member unobserved does not qualify, so one recovery re-arm cannot repeat
-/// for a family it already made current.
-fn claude_fence_held_only_by_witnessed_families(
-    index: &ScanIndex,
-    census_window_end: &str,
-) -> bool {
-    if !index.persistence_available() {
-        return false;
-    }
-
-    let witnessed = |root_session_id: &str| {
-        index
-            .claude_usage_family_witnesses
-            .contains_key(root_session_id)
-    };
-    index
-        .claude_usage_family_pending
-        .views()
-        .all(|(root_session_id, pending)| {
-            !pending.invalid()
-                && (pending.window() == census_window_end || witnessed(root_session_id))
-        })
-        && index.files.keys().all(|index_key| {
-            let Some((root_session_id, member)) =
-                claude_index_path_family_member(Path::new(index_key.as_str()))
-            else {
-                return true;
-            };
-            let pending = index.claude_usage_family_pending.view(&root_session_id);
-            (witnessed(&root_session_id)
-                && !pending.is_some_and(|pending| pending.window() == census_window_end))
-                || index.confirmed_empty_files.contains(index_key.as_str())
-                || pending.is_some_and(|pending| {
-                    !pending.invalid()
-                        && pending.window() == census_window_end
-                        && pending.hash_members().any(|hashed| *hashed == member)
-                        && pending.has_occurrence_member(&member)
-                })
-        })
 }
 
 fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
@@ -45608,7 +45527,7 @@ fn ensure_bounded_traversal(
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
-        claude_contract::compare_context(claude_contract::TraversalContext {
+        let mut parts = claude_contract::compare_context(claude_contract::TraversalContext {
             retained: index
                 .traversal
                 .as_ref()
@@ -45625,7 +45544,14 @@ fn ensure_bounded_traversal(
             replay: index.historical_replay_generation.as_deref(),
             roots,
             identity: &scan_traversal_context_fingerprint_with(source, &[], None, None, 0),
-        })
+        });
+        parts.origin_matches = index.traversal.is_none()
+            && index
+                .claude_full_rearm_progress
+                .traversal_origin
+                .as_ref()
+                .is_some_and(|origin| origin.context_fingerprint == context_fingerprint);
+        parts
     });
     let prior_admission = index
         .claude_stale_family_carry
@@ -45811,13 +45737,7 @@ fn ensure_bounded_traversal(
         source,
         index,
         collected_at,
-        prior_traversal_context_matches
-            || (index.traversal.is_none()
-                && index
-                    .claude_full_rearm_progress
-                    .traversal_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.context_fingerprint == context_fingerprint)),
+        prior_traversal_context_matches,
         context_observation,
         retry_attempt,
     );

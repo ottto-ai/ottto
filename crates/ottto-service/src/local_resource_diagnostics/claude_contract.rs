@@ -118,6 +118,9 @@ pub(crate) struct ContextParts {
     /// A known start's replay and scanner derivations still match. Unknown
     /// process history is never treated as an observed context-only change.
     pub(crate) restamp_only: bool,
+    /// A missing walk may still have an exactly matching retained origin.
+    /// This authorizes restamping without changing the start's telemetry.
+    pub(crate) origin_matches: bool,
 }
 #[derive(Default)]
 struct ContextState {
@@ -202,6 +205,7 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> ContextParts {
         ContextParts {
             parts,
             restamp_only,
+            origin_matches: false,
         }
     })
 }
@@ -212,7 +216,7 @@ pub(crate) fn started_context(key: &str, parts: ContextParts, roots: &[PathBuf])
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// [regress] Only observed context parts can owe evidence. Replay,
+    /// [behaviour] Only observed context parts can owe evidence. Replay,
     /// scanner identities and unknown start provenance still require clearing.
     #[test]
     fn restamp_requires_observed_context_and_unchanged_replay_and_identity() {

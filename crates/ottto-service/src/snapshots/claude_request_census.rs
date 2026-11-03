@@ -2986,26 +2986,17 @@ fn insert_transcript_record(
         if window > 0 {
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
-            let cohort = super::claude_pending_family_session_ids(index)
-                .into_iter()
-                .collect::<BTreeSet<_>>();
             let held = |key: &str| {
-                index
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| entry.evidence_owed)
-                    || super::claude_index_path_member_ref(Path::new(key))
-                        .is_some_and(|member| cohort.contains(member.root))
-                    || (super::restart_restore::enabled()
-                        && (page_held.contains(key)
-                            || index
-                                .traversal
-                                .as_ref()
-                                .is_some_and(|walk| walk.residue.index_keys.contains(key))
-                            || index
-                                .scan_residue_witness
-                                .as_ref()
-                                .is_some_and(|witness| witness.index_keys.contains(key))))
+                super::restart_restore::enabled()
+                    && (page_held.contains(key)
+                        || index
+                            .traversal
+                            .as_ref()
+                            .is_some_and(|walk| walk.residue.index_keys.contains(key))
+                        || index
+                            .scan_residue_witness
+                            .as_ref()
+                            .is_some_and(|witness| witness.index_keys.contains(key)))
             };
             let excluded = |key: &str| {
                 active
@@ -3298,6 +3289,23 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> Trans
     retire_claude_transcript_records_excluding(index, window, None)
 }
 
+/// Age is not absence: cohort holders keep their hashes, and owed members
+/// remain available for a read-free restamp. Admission-pressure releases keep
+/// main's policy; neither age rule retires Tail state.
+fn age_retirement_family_hold(index: &ScanIndex) -> impl Fn(&str) -> bool + '_ {
+    let cohort = super::claude_pending_family_session_ids(index)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    move |key| {
+        index
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.evidence_owed)
+            || super::claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| cohort.contains(member.root))
+    }
+}
+
 fn retire_claude_transcript_records_excluding(
     index: &mut ScanIndex,
     window: u64,
@@ -3323,19 +3331,9 @@ fn retire_claude_transcript_records_excluding(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
-    let cohort = super::claude_pending_family_session_ids(index)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let family_held = age_retirement_family_hold(index);
     let held = |key: &str| {
-        // Age is not an absence proof. Keep own-family off-page holders while
-        // their root is in the cohort, and keep owed members available for a
-        // read-free re-stamp. Neither path retires Tail state.
-        index
-            .files
-            .get(key)
-            .is_some_and(|entry| entry.evidence_owed)
-            || super::claude_index_path_member_ref(Path::new(key))
-                .is_some_and(|member| cohort.contains(member.root))
+        family_held(key)
             || (super::restart_restore::enabled()
                 && terminal_residue.is_some_and(|held| held.contains(key)))
     };
@@ -3427,6 +3425,7 @@ fn retire_claude_transcript_records_excluding(
         retirement.kept_overlap_records -= records;
         retirement.kept_overlap_hashes -= hashes;
     }
+    drop(family_held);
     index.claude_request_census = owned_census;
     retirement
 }

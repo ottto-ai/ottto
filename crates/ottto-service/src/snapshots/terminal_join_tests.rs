@@ -296,7 +296,7 @@ fn a_patched_head_is_read_and_saved_with_its_flag() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [regress] A completed terminal retains the same cohort cold and resident,
+/// [behaviour] A completed terminal retains the same cohort cold and resident,
 /// including after saving/reloading its completed-window marker.
 #[test]
 fn completed_terminal_keeps_cold_and_resident_cohort() {

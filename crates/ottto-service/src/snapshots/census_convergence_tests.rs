@@ -5,7 +5,6 @@ use super::*;
 
 const WINDOW: &str = "2026-08-02T07:10:00Z";
 const OLDER_WINDOW: &str = "2026-08-01T00:00:00Z";
-const CENSUS_CLOCK: u64 = 1_785_654_600;
 
 fn hex64(seed: char) -> String {
     seed.to_string().repeat(64)
@@ -3174,7 +3173,7 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// [regress] Kept old invalid rows are cohort inputs, not fresh census
+/// [behaviour] Kept old invalid rows are cohort inputs, not fresh census
 /// invalidations. An open fence stays open over two completed empty pages;
 /// an already closed fence still needs positive coverage to open.
 #[test]
@@ -3239,7 +3238,7 @@ fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
     }
 }
 
-/// [regress] A completion drops only an absent root, retains a root with
+/// [behaviour] A completion drops only an absent root, retains a root with
 /// only an indexed member, and counts the absent root's shared sidecar rows.
 #[test]
 fn vanished_root_discard_counts_shared_rows_and_keeps_indexed_members() {

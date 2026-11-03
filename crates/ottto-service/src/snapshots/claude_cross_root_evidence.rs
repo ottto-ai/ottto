@@ -27,7 +27,7 @@ const NO_SINGLE_OWNER: u32 = u32::MAX;
 pub(crate) struct CrossRootEvidence {
     support_dir: PathBuf,
     /// Every root added, by ordinal; tripwire rows name their root this way.
-    roots: Vec<String>,
+    pub(super) roots: Vec<String>,
     /// (a) Each healthy root's API and trace request ids, for fork and resume
     /// copies under another root.
     pub(crate) request_roots: RequestRootIndex,
@@ -139,18 +139,6 @@ impl CrossRootEvidence {
                     },
                 ))
             }));
-    }
-
-    pub(super) fn root_has_shared_rows(
-        &self,
-        root: &str,
-        join: &super::terminal_join::TerminalJoin,
-    ) -> bool {
-        let Some(ordinal) = self.roots.iter().position(|known| known == root) else {
-            return false;
-        };
-        join.other_root_hashes(root)
-            .any(|hash| self.request_roots.root_holds_hash(ordinal as u32, hash))
     }
 
     pub(super) fn tripwire(

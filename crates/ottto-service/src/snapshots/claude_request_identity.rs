@@ -4580,13 +4580,13 @@ pub(crate) struct ScanEvidence<'a> {
 }
 
 /// Each request id named by healthy API or trace rows, as its SHA-256, with
-/// the ordinal of the one root holding it, or `SEVERAL` when rows
-/// under several roots name it. Rows are keyed by trace root, so this is how a
+/// each root ordinal holding it. Ownership lookup refuses requests named
+/// by several roots. Rows are keyed by trace root, so this is how a
 /// fork or resume copy under another root sees that the request already has
 /// an owner. A root's API and trace rows of one request are one claim: each
-/// root's ids are deduplicated as the root is added, before the collapse.
+/// root's ids are deduplicated as the root is added.
 #[derive(Default)]
-pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
+pub(crate) struct RequestRootIndex(pub(super) Vec<([u8; 32], u32)>);
 
 impl RequestRootIndex {
     /// Adds one root's API and trace request ids, in any order. Call once per root.
@@ -4602,7 +4602,7 @@ impl RequestRootIndex {
     /// Once every root is in: sort and keep one entry per request and root.
     pub(crate) fn finish(&mut self) {
         self.0.sort_unstable();
-        // Keep each root ordinal so terminal discard can count shared rows.
+        // Keep each root ordinal for the terminal's batched shared-row count.
         self.0.dedup();
         self.0.shrink_to_fit();
     }
@@ -4613,10 +4613,6 @@ impl RequestRootIndex {
         let at = self.0.partition_point(|(known, _)| *known < id);
         let (_, root) = self.0.get(at).filter(|(known, _)| *known == id)?;
         Some((self.0.get(at + 1).map_or(true, |(next, _)| *next != id)).then_some(*root))
-    }
-
-    pub(super) fn root_holds_hash(&self, root: u32, hash: &[u8; 32]) -> bool {
-        self.0.binary_search(&(*hash, root)).is_ok()
     }
 }
 

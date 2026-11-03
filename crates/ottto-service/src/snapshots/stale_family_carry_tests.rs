@@ -4933,7 +4933,7 @@ fn owed_evidence_old_contract_refuses_without_read_then_independent_read_equals_
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [regress] A refused unchanged member stays owed without selecting a
+/// [behaviour] A refused unchanged member stays owed without selecting a
 /// Full or adding a retry to the traversal, regardless of the old allowance.
 #[test]
 fn refused_owed_evidence_never_reads_or_requeues() {

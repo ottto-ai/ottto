@@ -3724,8 +3724,11 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         }
         assert_eq!(counts["index_entry_present"]["matched"], 0);
         assert_eq!(counts["sampling_allowed"]["matched"], 0);
-        assert_eq!(counts["prepare_started"], usize::from(!blocked));
-        assert_eq!(counts["prepare_failed"], 0);
+        assert_eq!(
+            counts["prepare_started"].as_u64().unwrap_or_default(),
+            u64::from(!blocked)
+        );
+        assert_eq!(counts["prepare_failed"].as_u64().unwrap_or_default(), 0);
         let (_, control, _, _) = production_scan_at_with_setup(
             &f,
             SnapshotSource::ClaudeCode,

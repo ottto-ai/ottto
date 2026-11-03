@@ -527,7 +527,7 @@ mod tests {
         .unwrap()
     }
 
-    /// [regress] All census restart causes may owe unchanged evidence. Context
+    /// [behaviour] All census restart causes may owe unchanged evidence. Context
     /// classification at Starting still clears replay and identity changes.
     #[test]
     fn census_restart_causes_may_owe() {

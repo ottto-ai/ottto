@@ -78,10 +78,13 @@ pub(super) struct Starting {
 
 impl Starting {
     /// This start's re-arm owes evidence (keeps the fingerprint): only the
-    /// terminal-unhealthy retry.
+    /// observed context-only changes or a matching retained origin.
     pub(super) fn owes(&self) -> bool {
         super::evidence_owed::owes(self.rearm_cause())
-            && (self.context_matches || self.context_parts.is_some_and(|p| p.restamp_only))
+            && (self.context_matches
+                || self
+                    .context_parts
+                    .is_some_and(|p| p.restamp_only || p.origin_matches))
     }
     pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
         use crate::local_resource_diagnostics::rearm_cause::Cause;

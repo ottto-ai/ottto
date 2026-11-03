@@ -259,7 +259,7 @@ fn insert_file(index: &mut ScanIndex, key: &str, source: &str, size_bytes: u64) 
     index.files.insert(key.to_string(), entry);
 }
 
-/// [regress] Neither missing nor retained structural progress can re-arm
+/// [behaviour] Neither missing nor retained structural progress can re-arm
 /// history across completed walks. Fresh invalid observations keep the fence
 /// closed and diagnostics still describe the structural set.
 #[test]
@@ -455,7 +455,7 @@ fn non_structural_invalidation_does_not_rearm_history() {
     );
 }
 
-/// [regress] Missing contracts and a set identity latch remain fail-closed
+/// [behaviour] Missing contracts and a set identity latch remain fail-closed
 /// without terminal reads. The latch counter survives and may stay set.
 #[test]
 fn identity_contract_latch_or_unrecorded_contract_never_rearms() {
@@ -1086,12 +1086,12 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 run.counts.fence_before && run.counts.fence_after,
                 "{cause}: {run:?}"
             );
+            assert!(!run.counts.full_rearm, "{cause}: {run:?}");
             if !matches!(cause, "unpaired" | "malformed-pair") {
                 assert!(
                     run.suppression.full_rearm_suppressed,
                     "{cause} cannot be fixed by a transcript re-read: {run:?}"
                 );
-                assert!(!run.counts.full_rearm);
                 assert_eq!(run.rearmed_files, 0);
                 if let Some(record) = &mut record {
                     record.suppressed_since_unix_seconds = Some(CENSUS_CLOCK);
@@ -1102,7 +1102,6 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                     record.suppressed_since_unix_seconds = None;
                     record.skipped_full_rearms = 0;
                 }
-                assert!(!run.counts.full_rearm, "{cause}: {run:?}");
                 assert!(!run.suppression.full_rearm_suppressed, "{cause}");
                 assert_eq!(run.rearmed_files, 0, "{cause}");
             }
