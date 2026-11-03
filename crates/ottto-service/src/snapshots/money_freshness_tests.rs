@@ -304,7 +304,6 @@ fn never_indexed_file_over_6h_alarms_until_indexed() {
                     BACKFILL_WINDOW_DAYS,
                     16,
                     None,
-                    None,
                 )
             });
             alarm_rows(&rows)[0].clone()
