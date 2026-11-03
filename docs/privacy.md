@@ -397,6 +397,12 @@ effort tier to the turn that used it, so only the tier ever leaves. Any
 transcript usage not exactly covered by local evidence remains explicitly
 effort-unknown.
 
+While Claude is turned off for this device, or not granted to it, the daemon
+acknowledges these exports and stores nothing; evidence already stored is
+kept. A session's sidecars are deleted once every transcript of that session
+is gone from every configured Claude folder and no other transcript, pending
+upload or retained state still reads them.
+
 ## Repair Boundaries
 
 `ottto fix --json` returns repair authority metadata. Terminal repair is allowed

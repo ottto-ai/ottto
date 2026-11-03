@@ -155,6 +155,7 @@ pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
+pub(crate) mod claude_telemetry_retention;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
 pub(crate) mod state_v2;
@@ -44594,7 +44595,7 @@ fn advance_bounded_directory_traversal_with_budget(
             if source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(&path)
             {
-                debt.excluded(&path);
+                debt.excluded(&path, entry.metadata().ok().as_ref());
                 continue;
             }
             if source == SnapshotSource::Codex {
@@ -44770,6 +44771,7 @@ fn advance_bounded_directory_traversal_with_budget(
         &mut relisted_members,
     );
     if walk_issues(&traversal.counts) != issues_before {
+        debt.walk_issue();
         if let Some(census) = traversal.codex_join_directory_census.as_mut() {
             census.invalidate_walk();
         }

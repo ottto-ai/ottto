@@ -617,6 +617,7 @@ fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_a
         let activity = open.activity.clone();
         let capture_dir = ScratchDir::new("legacy-revoked-capture");
         let positive_dir = ScratchDir::new("legacy-approved-capture");
+        super::super::tests::grant_claude(&positive_dir);
         let body = super::super::tests::CLAUDE_API_REQUEST_LOG;
         let positive = HttpRequest {
             method: "POST".into(),

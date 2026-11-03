@@ -814,7 +814,7 @@ pub(crate) struct ClaudeFamilyHolders {
 }
 
 /// The sorted unique `candidates` a transcript record holds.
-fn held_candidates<'a>(
+pub(super) fn held_candidates<'a>(
     record: &'a ClaudeRequestCensusRecord,
     candidates: &'a [u64],
 ) -> impl Iterator<Item = u64> + 'a {
@@ -1044,7 +1044,7 @@ impl ClaudeRequestCensus {
 
     /// One walk of the transcript records (a borrowed path parse per key).
     /// None when `deadline` passes (checked every 256 records).
-    fn walk_transcript_holders<'a>(
+    pub(super) fn walk_transcript_holders<'a>(
         &'a self,
         deadline: std::time::Instant,
         mut visit: impl FnMut(

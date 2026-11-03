@@ -7709,6 +7709,11 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Telemetry retention keeps the sessions this page names, read before any
+    // page filter drops a snapshot.
+    let telemetry_named = claude_scan_roots
+        .as_ref()
+        .map(|_| claude_evidence_session_ids(&scan_result.snapshots));
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
@@ -9013,6 +9018,9 @@ fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
+        crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
+    });
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
@@ -9068,6 +9076,20 @@ fn finish_sync_source(
         &mut index,
         &index_path,
     );
+    if let Some(((roots, removed), named)) = claude_scan_roots
+        .as_deref()
+        .zip(telemetry_removed.as_ref())
+        .zip(telemetry_named.as_deref())
+        .filter(|_| upload_fully_settled)
+    {
+        crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
+            support_dir,
+            &index,
+            roots,
+            removed,
+            named,
+        );
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
@@ -23209,6 +23231,10 @@ mod tests {
         #[cfg(unix)]
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
+        }
+        #[cfg(unix)]
+        mod claude_telemetry_retention_tests {
+            include!("snapshot_sync/claude_telemetry_retention_tests.rs");
         }
     }
     mod p12_pipeline_original_tests {
