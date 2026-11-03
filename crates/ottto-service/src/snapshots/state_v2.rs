@@ -4,7 +4,8 @@
 //! Keep the engine boundary here: callers must not depend on SQLite handles,
 //! statements, SQL, or checkpoint tuples.
 //!
-//! Restart records live elsewhere; joined by key digest, never referenced here.
+//! Tail heads and pages are kinds of this store (`tail`), committed with the
+//! index; the retired restart-record directory is only removed, never read.
 use super::ScanIndex;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

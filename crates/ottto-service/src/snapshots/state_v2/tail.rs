@@ -156,7 +156,6 @@ impl StagedFile {
 #[serde(rename_all = "snake_case")]
 pub(in crate::snapshots) enum SetAsideCause {
     Encode,
-    UnexpectedFinishField,
     Row,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

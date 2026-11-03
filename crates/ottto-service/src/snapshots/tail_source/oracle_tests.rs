@@ -36,12 +36,11 @@ fn stored(route: &Route, path: &Path, key: &str) -> (PendingTail, RouteResult, R
         panic!("committed Tail must load");
     };
     assert_eq!(counted(&records), ("hit".into(), vec![]));
-    // The load receipt counts database bytes independently of native bytes;
-    // content is a stored session fact, never re-read from the file.
-    assert!(records.iter().any(|record| record["counts"]["head_bytes"]
-        .as_u64()
-        .is_some_and(|bytes| bytes > 0)));
+    // The load counts database bytes independently of native bytes; content
+    // is a stored session fact, never re-read from the file.
+    assert!(counters::total("tail_db_load_bytes", "head") > 0);
     assert!(records
+        .records
         .iter()
         .all(|record| record["counts"].get("rederive_bytes").is_none()));
     let (parser, mode, _) = read(route, path, Some(taken));
@@ -259,7 +258,10 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
             );
         } else {
             assert!(matches!(load, Load::Cold(None)));
-            assert_eq!(counted(&records), ("error".into(), vec!["revision".into()]));
+            assert_eq!(
+                counted(&records),
+                ("error".into(), vec!["incompatible".into()])
+            );
             let (parser, mode, _) = read(&route, &path, None);
             assert!(matches!(mode, ReadMode::Full(_)));
             let (_, native) = route.finish(&path, parser, None, |_| {});
@@ -280,7 +282,9 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
 
 /// [money] A late-evidence re-fold whose body is not the ACKed one reads 0
 /// native bytes and is sent as an ordinary update (L02): its body is the
-/// cold Full's whole body, and nothing is owed afterwards.
+/// cold Full's whole body, never a rescan claim or a challenge answer,
+/// counted by its reason, and nothing is owed afterwards. An append's body
+/// is not a re-fold.
 #[test]
 fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let mut route = route();
@@ -288,11 +292,28 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let (items, bytes) = stored_finish(&route, &path, &key);
     assert_eq!(bytes, 0);
     let count = items.len();
-    let scan = finalize(&mut route, &key, items, false, Some(REASON));
+    let scan = finalize(&mut route, &key, items.clone(), false, Some(REASON));
     assert_eq!(scan.snapshots.len(), count, "the re-fold is sent");
+    assert_eq!(scan.semantic_noop_count, 0);
+    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
     money_oracle::assert_equivalent(
         &full(&route, &path),
         &emitted(Mode::Restart, &scan.snapshots),
     );
+    for item in &scan.snapshots {
+        let envelope = serde_json::to_value(snapshot_semantic_envelope(
+            SOURCE,
+            item,
+            SnapshotUploadPolicy::default(),
+        ))
+        .unwrap();
+        assert!(envelope.get("forced_full_rescan").is_none());
+        assert!(envelope.get("conflict_head_challenge").is_none());
+        assert!(envelope.get("rescan_from_revision_hash").is_none());
+    }
     assert!(reuses_stored(&route.index, &key, Some(REASON), false));
+
+    let scan = finalize(&mut route, &key, items, false, None);
+    assert_eq!(scan.snapshots.len(), count);
+    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
 }

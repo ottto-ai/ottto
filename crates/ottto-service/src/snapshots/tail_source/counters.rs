@@ -43,10 +43,10 @@ pub(in crate::snapshots) fn add(
     });
 }
 
-/// One executed D168 replay on the reconstruction record: the
-/// `tail_reconstruct` point and its counters, with the bytes the replay read.
-/// A replay is no failure after a head: it raises no alarm and opens no
-/// window. Its bytes are also in `tail_replay_bytes{full}`, as every Full's.
+/// One executed D168 replay on the reconstruction counters, with the bytes
+/// the replay read. A replay is no failure after a head: it raises no alarm
+/// and opens no window. Its bytes are also in the page's
+/// `completed_full_native_bytes`, as every Full's.
 #[expect(dead_code, reason = "Codex's codec (S2b) counts its replays")]
 pub(in crate::snapshots) fn replay(
     source: SnapshotSource,
@@ -54,16 +54,6 @@ pub(in crate::snapshots) fn replay(
     bytes: u64,
 ) {
     let label = cause.label();
-    crate::local_resource_diagnostics::traversal_point(
-        "tail_reconstruct",
-        source.api_slug(),
-        &serde_json::json!({
-            "cause": label,
-            "after_head": false,
-            "explicit_action": false,
-            "bytes": bytes,
-        }),
-    );
     bump(source, "tail_reconstruct", label);
     add(source, "tail_reconstruct_bytes", label, bytes);
 }
@@ -104,6 +94,18 @@ pub(in crate::snapshots) fn emit(source: SnapshotSource) {
     if let Some(line) = line {
         crate::local_resource_diagnostics::durable_tail_alarm(source.api_slug(), &line);
     }
+}
+
+/// Every process total by name and label, summed over sources.
+#[cfg(test)]
+pub(in crate::snapshots) fn totals() -> BTreeMap<(&'static str, &'static str), u64> {
+    with(|counts| {
+        let mut totals = BTreeMap::new();
+        for ((_, name, label), count) in counts.iter() {
+            *totals.entry((*name, *label)).or_default() += count[1];
+        }
+        totals
+    })
 }
 
 /// A process total, summed over sources.

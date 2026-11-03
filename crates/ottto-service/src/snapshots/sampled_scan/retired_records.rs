@@ -1,10 +1,7 @@
 //! The retired restart-record directory beside each scan index. Nothing reads
 //! it; each pass removes it whole under the writer lock and syncs the parent.
-//! A failed removal keeps its first-failure age in RAM, retries every pass,
-//! and alarms past a day. A restart restarts the age, not the retry.
+//! A failed removal is counted in that pass's point and retried every pass.
 use super::*;
-
-const FAILED_ALARM_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl SharedCache {
     /// The caller holds the state-directory lock.
@@ -14,63 +11,17 @@ impl SharedCache {
         index_path: &Path,
     ) {
         let dir = state_v2::retired_record_dir(index_path);
-        let removed = match state_v2::remove_retired_record_dir(&dir) {
-            Ok(false) => {
-                self.note_retired_removal(source, None);
-                return;
-            }
-            Ok(true) => Ok(()),
-            Err(error) => Err(error),
+        let (removed, failed) = match state_v2::remove_retired_record_dir(&dir) {
+            Ok(false) => return,
+            Ok(true) => (1, 0),
+            Err(_) => (0, 1),
         };
-        if removed.is_ok() {
-            self.note_retired_removal(source, None);
-            tail_legacy_dir(source, 1, 0, None);
-            return;
-        }
-        let age = self
-            .note_retired_removal(source, Some(std::time::Instant::now()))
-            .map_or(std::time::Duration::ZERO, |at| at.elapsed());
-        tail_legacy_dir(source, 0, 1, Some(age));
+        crate::local_resource_diagnostics::traversal_point(
+            "tail_legacy_dir",
+            source.api_slug(),
+            &serde_json::json!({"removed": removed, "failed": failed}),
+        );
     }
-
-    /// `failed_at`: keep the first failure's instant. `None`: the directory is
-    /// gone, so its age ends. Returns the first failure's instant.
-    fn note_retired_removal(
-        &self,
-        source: SnapshotSource,
-        failed_at: Option<std::time::Instant>,
-    ) -> Option<std::time::Instant> {
-        let mut quiet = self.quiet.lock().unwrap_or_else(|p| p.into_inner());
-        let failed = &mut quiet.retired_failed_since;
-        let at = failed.iter().position(|(owner, _)| *owner == source);
-        match (failed_at, at) {
-            (Some(_), Some(at)) => Some(failed[at].1),
-            (Some(first), None) => {
-                failed.push((source, first));
-                Some(first)
-            }
-            (None, Some(at)) => Some(failed.remove(at).1),
-            (None, None) => None,
-        }
-    }
-}
-
-fn tail_legacy_dir(
-    source: SnapshotSource,
-    removed: u64,
-    failed: u64,
-    oldest_failed_age: Option<std::time::Duration>,
-) {
-    crate::local_resource_diagnostics::traversal_point(
-        "tail_legacy_dir",
-        source.api_slug(),
-        &serde_json::json!({
-            "removed": removed,
-            "failed": failed,
-            "oldest_failed_age": oldest_failed_age.map(|age| age.as_secs()),
-            "alarm": oldest_failed_age.is_some_and(|age| age > FAILED_ALARM_AFTER),
-        }),
-    );
 }
 
 #[cfg(all(test, unix))]
@@ -85,8 +36,8 @@ mod tests {
     }
 
     /// [behaviour] Removal reaches the record directory only. A failed removal
-    /// is counted, retried by the next pass, and reports its age; a removed
-    /// directory ends the age. Erasure failure never reads as healthy.
+    /// is counted in each pass and retried by the next. Erasure failure never
+    /// reads as healthy.
     #[test]
     fn failed_removal_stays_counted_until_the_directory_is_gone() {
         let scratch = crate::test_scratch::ScratchDir::new("retired-record-dir");
@@ -114,7 +65,6 @@ mod tests {
                 assert_eq!(row.len(), 1);
                 assert_eq!(row[0]["counts"]["failed"], 1);
                 assert_eq!(row[0]["counts"]["removed"], 0);
-                assert!(row[0]["counts"]["oldest_failed_age"].is_u64());
                 assert!(dir.exists(), "the failed directory is kept for the retry");
             }
             assert!(index_path.exists());

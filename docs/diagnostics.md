@@ -139,7 +139,7 @@ cause; explicit integrity repair, lost fences, foreign bindings and reference
 drift also retain repair advice. A successful compatible load clears retrying;
 a different current refusal replaces the old reason.
 
-There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
+There is no rebuild. The retired restart-record directory is removed whole each pass (`tail_legacy_dir`) and never read.
 
 The existing service error log contains content-free JSON lines prefixed
 `ottto-service: local_resources`. The macOS app/dev LaunchAgent writes
@@ -376,28 +376,28 @@ they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
-| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know (cause `future_fact`), or a live input not available now; the file waits and census stays red), `error`. The traversal point of a hit also carries `head_bytes` and `page_bytes` read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: its point says `explicit_action`, and it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
+| `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
 | `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
-| `tail_replay_bytes{full,tail}` | Native reduction bytes. |
-| `tail_validation_bytes{sample}` | Sample and guard bytes, apart from native. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
-| `tail_full_encode{failed}` | Encoding failed and the file was set aside. |
-| `tail_head_migrated{heads}` | A head rewritten for a lower revision with no other change. |
+| `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
 | `tail_refold{reason}` | A file selected for late evidence on an unchanged transcript (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) re-folded from stored state with 0 transcript bytes, and its body was not the ACKed one: sent as an ordinary update on the head CAS, the body a native read sends. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead. |
-| `quiet_retirement{staged,retired,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. |
+| `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
 
 `tail_restart_full_alarm` is emitted on the first reconstruction after a head,
 then at most once per 24 h; the time is RAM only, so a restart alarms again.
 
-`tail_legacy_dir{removed,failed,oldest_failed_age,alarm}` reports removal of a
-retired restart-record directory beside a scan index. Each pass removes the
-record directory alone under the writer lock and syncs the parent. A failed
-removal is retried every pass and keeps reporting its age (seconds since this
-process first failed); `alarm` is true past 24 h. A restart restarts the age,
-not the retry, and an absent directory emits nothing.
+`tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
+directory beside a scan index. Each pass removes the record directory alone
+under the writer lock and syncs the parent. A failed removal is counted in
+each pass's point and retried by the next; an absent directory emits nothing.
+
+The page's `sampled_acquisition` block splits native reduction bytes:
+`completed_full_native_bytes` is the Full reads' part of
+`completed_native_bytes`; the rest is Tail.
 
 The old restart-record counters map as follows. Nothing below became zero by
 disappearing: where a failure stayed possible, its new counter is named.
@@ -412,13 +412,13 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
 | `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
 | `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
-| `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `tail_validation_bytes` |
-| Sampled native bytes | `tail_replay_bytes`, `tail_bootstrap_full` |
+| `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `completed_guard_bytes` |
+| Sampled native bytes | `completed_native_bytes`, `completed_full_native_bytes`, `tail_bootstrap_full` |
 | `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage`, `tail_stage_dropped`, `tail_publish{dropped}` |
 | `disk_records`, `disk_bytes`, `max_record_bytes`, `bytes_written`, `records_written`, `records_clean`, `batches`, `native_flushes`, `peak_codec_bytes`, `store_bytes_alarm` | Retired with `.rec`; `tail_apply`, `store_growth`, `wal_size_alarm` at database level, with no source label on engine statistics |
 | `retail_*`, `stale_full`, `pace_anomaly`, `pace_evicted`, `upgrade_missing_full`, `d3`, `restore_pending_quiet` | Retired with their mechanisms |
 | `store_disabled`, `t14_*`, `mode_repaired`, `stale_record_refused`, `temp_*`, `resource_pause*`, `memo_evicted`, `receipt_*`, `uninventoried_records`, `owed_overflow_discovery_only`, `native_stage_skipped`, `restore_unavailable_*` | Retired, `.rec` mechanics. A corrupt row is `tail_reconstruct{corrupt}`; the database owner's mode is the store's own |
-| `gc_*`, `rec_orphans_erased`, `native_class_*`, `records_invalidated`, `off_v1_*` | `tail_legacy_dir`, `tail_apply.retired`, the erasure epoch and deadline, `tail_identity_failure` |
+| `gc_*`, `rec_orphans_erased`, `native_class_*`, `records_invalidated`, `off_v1_*` | `tail_legacy_dir`, `tail_apply.retired`, the erasure epoch and deadline, `tail_reconstruct{identity}` |
 | `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
 
 Not built, and so absent from the counters: `tail_candidate_owed`,
@@ -1676,9 +1676,9 @@ Pi fork files exclude copied usage entries whose envelope timestamp is strictly
 before their session header time. If the envelope time is absent, the provider
 time can establish the cutoff. Entries at or after the header time retain normal
 identity and deduplication. Missing or invalid cutoff evidence never proves a
-copy; ordinary timestamp validation still applies. A fork's durable Pi section
-stores `has_parent` (N) and the local header timestamp (L) alongside its H usage
-ledger. The L cutoff never enters logs, diagnostics or uploads.
+copy; ordinary timestamp validation still applies. Pi has no stored section
+until its Tail codec: a fork's `has_parent` and local header timestamp live in
+the RAM reduction only. The cutoff never enters logs, diagnostics or uploads.
 The `parentSession` value is checked at the header and never retained in the
 ledger or included in records, logs, diagnostics or uploads.
 
@@ -1711,8 +1711,7 @@ reads a counted cap Full (or waits); already-marked files keep Tailing.
 An indexed Pi file that changes without an available RAM reduction reads Full under the shared `state_missing`
 planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
 fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
-A Pi usage ledger above 65,536 keys refuses persistence through the shared
-`not_persisted{wa.entry_cap}` class; the ledger is never truncated.
+A Pi usage ledger has no key cap and is never truncated.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves

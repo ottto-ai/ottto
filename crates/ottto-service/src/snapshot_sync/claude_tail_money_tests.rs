@@ -2462,21 +2462,19 @@ fn refuse_root(
 }
 
 /// Three arms over one prior: the warm owner, a cold Full, and a new owner
-/// whose load records are captured.
-fn arms(
-    c: &Corpus,
-    warm: &E2ScanFixture,
-    disk: &mut Disk,
-    prior: &ScanIndex,
-) -> ([Page; 3], Vec<Value>) {
+/// whose Tail load hits are counted.
+fn arms(c: &Corpus, warm: &E2ScanFixture, disk: &mut Disk, prior: &ScanIndex) -> ([Page; 3], u64) {
+    let hits = || {
+        crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test("tail_db_loads", "hit")
+    };
     let restart = disk.owner(SnapshotSource::ClaudeCode);
     let tail = c.raw(warm, prior.clone(), 100, true, &[]);
     let full = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
-    let (disk, records) = crate::local_resource_diagnostics::capture(|| {
-        c.raw(&restart, prior.clone(), 100, true, &[])
-    });
+    let before = hits();
+    let disk = c.raw(&restart, prior.clone(), 100, true, &[]);
+    let disk_hits = hits() - before;
     assert_eq!(full.modes.1 + full.modes.2, 0, "cold arm reads Full");
-    ([tail, full, disk], records)
+    ([tail, full, disk], disk_hits)
 }
 
 /// The owed answer rides exactly ROOT's outgoing body.
@@ -2592,7 +2590,7 @@ fn conflict_then_append() {
             ],
             &[],
         );
-        let (mut pages, records) = arms(&c, &warm, &mut disk, &prior);
+        let (mut pages, disk_hits) = arms(&c, &warm, &mut disk, &prior);
         assert_eq!(
             pages[0].modes,
             (0, 1, 0),
@@ -2604,9 +2602,7 @@ fn conflict_then_append() {
             "the restored arm continues the append"
         );
         assert!(
-            records
-                .iter()
-                .any(|r| r["stage"] == "tail_db_loads" && r["counts"]["outcome"] == "hit"),
+            disk_hits > 0,
             "the saved head matches the bytes already read"
         );
         finish_claude_pages(&c, &mut pages);

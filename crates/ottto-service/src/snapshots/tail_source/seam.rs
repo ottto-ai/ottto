@@ -15,9 +15,10 @@
 //! of another shape that the new encode no longer holds is obsolete. A
 //! rewritten or obsolete page of a private collection (the session facts)
 //! stages `DropsPrivate`, so its old value is purged. Without a base (a Full
-//! read, or a retry of a set-aside file) the stage is a `Reset` that replaces
-//! every stored row.
-use super::{stage_full, CollectionSpec, HeadIdentity, ReconstructCause, TailSource};
+//! read, or a retry of a set-aside file) the stage is an empty base's, a
+//! `Reset` that replaces every stored row. A finish-only or live field set at
+//! PRE is refused as an `E` field is: that file alone is set aside.
+use super::{CollectionSpec, HeadIdentity, ReconstructCause, TailSource};
 use crate::durable_tail_codec::Refuse;
 use crate::snapshots::sampled_jsonl::CompletedNativeAcquisition;
 use crate::snapshots::state_v2::{
@@ -42,13 +43,9 @@ pub(in crate::snapshots) struct PendingTail {
     encoded: Option<Encoded>,
 }
 
-/// What PRE encoded, held until the verdict. A refusal is held too.
-pub(in crate::snapshots) struct Encoded {
-    /// `None`: nothing differs from the committed head.
-    staged: Result<Option<StagedFile>, Refuse>,
-    /// A finish-only or live field already set at PRE.
-    finish_field: Option<&'static str>,
-}
+/// What PRE encoded, held until the verdict; a refusal is held too. `None`:
+/// nothing differs from the committed head.
+type Encoded = Result<Option<StagedFile>, Refuse>;
 
 impl PendingTail {
     /// A certified `S` completion on a state database route. `None`: no
@@ -110,46 +107,31 @@ impl PendingTail {
             return false;
         }
         // Staging only fails on a poisoned route lock; the predecessor stays.
-        match (encoded.staged, encoded.finish_field) {
-            (Err(_), _) => {
+        match encoded {
+            Err(_) => {
                 super::counters::bump(self.source, "tail_full_encode", "failed");
                 let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
                 false
             }
-            (Ok(_), Some(_)) => {
-                let _ = state_v2::set_aside_tail(
-                    &self.route,
-                    &self.key,
-                    SetAsideCause::UnexpectedFinishField,
-                );
-                false
-            }
-            (Ok(Some(staged)), None) => {
-                state_v2::stage_tail(&self.route, &self.key, staged).is_ok()
-            }
-            (Ok(None), None) => true,
+            Ok(Some(staged)) => state_v2::stage_tail(&self.route, &self.key, staged).is_ok(),
+            Ok(None) => true,
         }
     }
 }
 
 fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) -> Encoded {
-    let staged = match tail.base.as_ref().filter(|_| !tail.full) {
-        Some(base) => base.stage::<S>(view, &tail.certificate, &tail.id),
-        None => stage_full::<S>(view, &tail.certificate, &tail.id).map(Some),
-    };
-    Encoded {
-        staged,
-        finish_field: S::finish_field_nonempty(view.accumulator),
+    match tail.base.as_ref().filter(|_| !tail.full) {
+        Some(base) => base.stage::<S>(view, &tail.certificate, &tail.id, Change::Ordinary),
+        None => TailBase::default().stage::<S>(view, &tail.certificate, &tail.id, Change::Reset),
     }
 }
 
 /// The committed head a read continued: its digest, each page's digest, and
 /// each `Log`'s committed elements and last page. Flat sorted vectors, so its
-/// heap is one bounded charge.
+/// heap is one bounded charge. The empty base is a Full's: nothing committed.
+#[derive(Default)]
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
-    /// The head is from a lower revision: an unchanged read still restates it.
-    migrate: bool,
     /// In load order: by collection, then page.
     pages: Vec<((Collection, u64), [u8; 32])>,
     logs: Vec<(Collection, LogBase)>,
@@ -173,14 +155,11 @@ fn page_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 impl TailBase {
-    /// The base of a committed head whose source body is `head`; `migrate`
-    /// when that head was written at a lower revision.
-    pub(in crate::snapshots) fn new(head: &[u8], migrate: bool) -> Self {
+    /// The base of a committed head whose source body is `head`.
+    pub(in crate::snapshots) fn new(head: &[u8]) -> Self {
         Self {
             head: page_digest(head),
-            migrate,
-            pages: Vec::new(),
-            logs: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -223,20 +202,22 @@ impl TailBase {
 
     /// The new head, every collection's metadata, and only the pages whose
     /// bytes differ from the committed ones; `None` when neither the head
-    /// nor any page differs. A lower-revision head with nothing else to write
-    /// is restated alone: same stamp, verification and debt, so it earns no
-    /// acquisition or Full credit and touches no ACK or receipt.
-    fn stage<S: TailSource>(
+    /// nor any page differs. A `Reset` (an empty base's) always stages.
+    pub(super) fn stage<S: TailSource>(
         &self,
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,
         id: &HeadIdentity,
+        change: Change,
     ) -> Result<Option<StagedFile>, Refuse> {
         let acc = view.accumulator;
+        if let Some(field) = S::finish_field_nonempty(acc) {
+            return Err(Refuse::NonEmpty(field));
+        }
         let mut staged = StagedFile {
             revision: S::REDUCTION_REVISION,
             head: S::encode_head(view, certificate, id)?,
-            change: Change::Ordinary,
+            change,
             ..StagedFile::default()
         };
         for spec in S::collections() {
@@ -282,13 +263,11 @@ impl TailBase {
                 staged.change = Change::DropsPrivate;
             }
         }
-        let changed = !staged.pages.is_empty()
+        let changed = change == Change::Reset
+            || !staged.pages.is_empty()
             || !staged.obsolete.is_empty()
             || page_digest(&staged.head) != self.head;
-        if self.migrate && !changed {
-            super::counters::bump(S::SOURCE, "tail_head_migrated", "heads");
-        }
-        Ok((changed || self.migrate).then_some(staged))
+        Ok(changed.then_some(staged))
     }
 }
 

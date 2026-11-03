@@ -6,8 +6,9 @@
 //! live inputs. Content is never read back from the file: a quiet restart
 //! reads 0 transcript bytes.
 //!
-//! Each load counts once in `tail_db_loads{outcome}` on its source's line,
-//! with the head and page bytes it read on a hit. Stored state that cannot be
+//! Each load counts once in `tail_db_loads{outcome}` on its source's line; a
+//! hit adds the bytes it read to `tail_db_load_bytes{head,page}`. Counters
+//! only: no point repeats them (§13). Stored state that cannot be
 //! reused is a counted reconstruction (`tail_reconstruct`) and the read starts
 //! at once as a Full; a file shorter than its head reads Full (`Shrunk`) and
 //! is counted in `tail_shorter_file_full`. Only a head from a newer build, a
@@ -247,75 +248,47 @@ pub(super) fn load<S: TailSource>(
     live: &SnapshotAccumulator,
 ) -> Load {
     let source = S::SOURCE;
-    let slug = source.api_slug();
-    let point = |stage, counts: serde_json::Value| {
-        crate::local_resource_diagnostics::traversal_point(stage, slug, &counts)
-    };
-    // (outcome, cause, counted reconstruction, load)
+    // (outcome, counted reconstruction, load)
     let loaded = stored::<S>(index, key, id, held, scope, fresh, live);
-    let (outcome, cause, reconstruct, load) = match loaded {
+    let (outcome, reconstruct, load) = match loaded {
         Ok(hit) => {
             let base = (!set_aside(index, key)).then_some(hit.base);
-            point(
-                "tail_db_loads",
-                serde_json::json!({
-                    "outcome": "hit",
-                    "head_bytes": hit.head_bytes,
-                    "page_bytes": hit.page_bytes,
-                }),
-            );
             counters::bump(source, "tail_db_loads", "hit");
+            counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
+            counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
             return Load::Reused(hit.taken, base);
         }
-        Err(Miss::Future) => ("held", "future_revision".into(), None, Load::Held),
-        Err(Miss::FutureFact) => ("held", "future_fact".into(), None, Load::Held),
-        Err(Miss::LiveUnavailable) => ("held", "live_unavailable".into(), None, Load::Held),
+        Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
         // shorter file is main's counted Full; no floor holds it (D158).
         Err(Miss::Changed(reason)) => {
             if reason == FullReason::Shrunk {
                 counters::bump(source, "tail_shorter_file_full", "files");
             }
-            (
-                "miss",
-                serde_json::json!(reason),
-                None,
-                Load::Cold(Some(reason)),
-            )
+            ("miss", None, Load::Cold(Some(reason)))
         }
         Err(Miss::NoHead) => {
             counters::bump(source, "tail_bootstrap_full", "no_head");
-            ("miss", "no_head".into(), Some("no_head"), Load::Cold(None))
+            ("miss", Some("no_head"), Load::Cold(None))
         }
         // Debt or inventory only: the file's first read, no reconstruction.
         Err(Miss::MetadataOnly) => {
             counters::bump(source, "tail_bootstrap_full", "metadata_only");
-            ("miss", "metadata_only".into(), None, Load::Cold(None))
+            ("miss", None, Load::Cold(None))
         }
-        Err(Miss::Unreadable) => (
-            "error",
-            "unreadable".into(),
-            Some("unreadable"),
-            Load::Cold(None),
-        ),
+        Err(Miss::Unreadable) => ("error", Some("unreadable"), Load::Cold(None)),
         Err(Miss::Reconstruct(cause)) => {
             if cause == ReconstructCause::Identity {
                 // C′: void before any reuse; a fresh `Reset` stage of this
                 // key in the same pass cancels the retirement.
                 let _ = state_v2::retire_tail(route, [key.to_owned()]);
-                point("tail_identity_failure", serde_json::json!({"files": 1}));
             }
             let outcome = if cause == ReconstructCause::KeyEpoch {
                 "miss"
             } else {
                 "error"
             };
-            (
-                outcome,
-                cause.label().into(),
-                Some(cause.label()),
-                Load::Cold(None),
-            )
+            (outcome, Some(cause.label()), Load::Cold(None))
         }
     };
     if let Some(cause) = reconstruct {
@@ -325,31 +298,18 @@ pub(super) fn load<S: TailSource>(
         let explicit_action = cause == ReconstructCause::KeyEpoch.label();
         let after_head = !matches!(cause, "no_head" | "unreadable") && !explicit_action;
         let bytes = held.metadata().map_or(0, |metadata| metadata.len());
-        point(
-            "tail_reconstruct",
-            serde_json::json!({
-                "cause": cause,
-                "after_head": after_head,
-                "explicit_action": explicit_action,
-                "bytes": bytes,
-            }),
-        );
         counters::bump(source, "tail_reconstruct", cause);
         counters::add(source, "tail_reconstruct_bytes", cause, bytes);
         if after_head {
             counters::bump(source, "tail_reconstruct_after_head", cause);
             if counters::restart_full_alarm_due(source) {
                 crate::local_resource_diagnostics::tail_restart_full_alarm(
-                    slug,
+                    source.api_slug(),
                     &serde_json::json!({ "cause": cause }),
                 );
             }
         }
     }
-    point(
-        "tail_db_loads",
-        serde_json::json!({"outcome": outcome, "cause": cause}),
-    );
     counters::bump(source, "tail_db_loads", outcome);
     load
 }
@@ -387,7 +347,7 @@ fn stored<S: TailSource>(
         Err(CertificateRefusal::Changed(reason)) => return Err(Miss::Changed(reason)),
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
-    let mut base = TailBase::new(&head.body, head.revision < S::REDUCTION_REVISION);
+    let mut base = TailBase::new(&head.body);
     let mut failed = None;
     let mut page_bytes = 0u64;
     let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
@@ -441,6 +401,9 @@ mod facts_tests;
 #[cfg(test)]
 #[path = "format_tests.rs"]
 mod format_tests;
+#[cfg(test)]
+#[path = "held_original_tests.rs"]
+mod held_original_tests;
 #[cfg(test)]
 #[path = "refold_tests.rs"]
 mod refold_tests;

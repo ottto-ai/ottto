@@ -523,6 +523,8 @@ pub(super) struct Context {
     pub(super) tail_files: usize,
     pub(super) unchanged_files: usize,
     pub(super) native_bytes: u64,
+    /// Of `native_bytes`, a Full read's; the rest is Tail.
+    pub(super) full_native_bytes: u64,
     pub(super) sample_bytes: u64,
     pub(super) full_reasons: [usize; 11],
     pub(super) priority_replays: usize,
@@ -537,7 +539,7 @@ pub(super) struct Context {
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
-    full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
+    full_files, tail_files, unchanged_files, native_bytes, full_native_bytes, sample_bytes, full_reasons,
     priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, start_overdue_seconds,
     completion_overdue_seconds, admission);
 
@@ -641,8 +643,15 @@ impl Context {
             ReadMode::Unchanged => self.unchanged_files += 1,
         }
     }
-    pub(super) fn record_input(&mut self, metrics: crate::transcript_acquisition::ReadMetrics) {
+    pub(super) fn record_input(
+        &mut self,
+        metrics: crate::transcript_acquisition::ReadMetrics,
+        full: bool,
+    ) {
         self.native_bytes = self.native_bytes.saturating_add(metrics.native_bytes);
+        if full {
+            self.full_native_bytes = self.full_native_bytes.saturating_add(metrics.native_bytes);
+        }
         self.sample_bytes = self
             .sample_bytes
             .saturating_add(metrics.sample_bytes as u64);
@@ -666,10 +675,8 @@ impl OwnedSourceScan {
             self.resource_probe
                 .set_withheld_memo(self.index.withheld_memo.clone());
         }
-        #[cfg(unix)]
-        let admitted = durable_sources::DurableSource::from_snapshot(self.source).is_some();
-        #[cfg(not(unix))]
-        let admitted = self.source != SnapshotSource::Pi;
+        // Every source is admitted on unix.
+        let admitted = cfg!(unix) || self.source != SnapshotSource::Pi;
         if admitted {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
@@ -694,6 +701,7 @@ impl OwnedSourceScan {
                 tail_files: 0,
                 unchanged_files: 0,
                 native_bytes: 0,
+                full_native_bytes: 0,
                 sample_bytes: 0,
                 full_reasons: [0; 11],
                 priority_replays: 0,
@@ -1057,6 +1065,7 @@ fn context_overhead(context: &Context) -> Option<usize> {
         tail_files: _,
         unchanged_files: _,
         native_bytes: _,
+        full_native_bytes: _,
         sample_bytes: _,
         full_reasons: _,
         priority_replays: _,

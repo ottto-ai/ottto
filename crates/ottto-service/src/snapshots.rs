@@ -10565,19 +10565,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
         let full_rearm = would_full_rearm;
-        // Disclosed repeat: a stored pass cannot seal a complete rebuild read.
-        #[cfg(unix)]
-        if full_rearm
-            && !complete_rebuild_read
-            && index.claude_duplicate_request_witness_overflowed
-            && tail_source::tail_route(SnapshotSource::ClaudeCode, index).is_some()
-        {
-            tail_source::counters::bump(
-                SnapshotSource::ClaudeCode,
-                "full_rearm_stored_repeat",
-                "rearms",
-            );
-        }
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -29437,26 +29424,13 @@ impl OwnedSourceScan {
                 // U1a-2a G10b: a side read is not main's input.
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
-                        context.record_input(plan.metrics());
-                        if tail_source::has_codec(source) {
-                            let metrics = plan.metrics();
-                            let cause = match plan.mode() {
-                                crate::transcript_acquisition::ReadMode::Full(_) => "full",
-                                _ => "tail",
-                            };
-                            tail_source::counters::add(
-                                source,
-                                "tail_replay_bytes",
-                                cause,
-                                metrics.native_bytes,
-                            );
-                            tail_source::counters::add(
-                                source,
-                                "tail_validation_bytes",
-                                "sample",
-                                metrics.sample_bytes as u64,
-                            );
-                        }
+                        context.record_input(
+                            plan.metrics(),
+                            matches!(
+                                plan.mode(),
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            ),
+                        );
                         resource_probe.rearm_full_completed(
                             &local_index_key(&active.candidate.path),
                             plan.mode(),
@@ -30474,13 +30448,9 @@ impl OwnedSourceScan {
                 let mut tail = completed_acquisition
                     .as_ref()
                     .zip(file_sampling.as_ref())
-                    .filter(|_| {
-                        tail_source::has_codec(source)
-                            && sampling.is_some()
-                            && !comparison_target
-                            && side_origin.is_none()
-                    })
+                    .filter(|_| sampling.is_some() && !comparison_target && side_origin.is_none())
                     .and_then(|(completed, active)| {
+                        // `None` off a Tail route or without a codec.
                         tail_source::pending(
                             source,
                             index,
@@ -30507,9 +30477,7 @@ impl OwnedSourceScan {
                 // On a Tail route: whether this file's committed head stays
                 // its continuation (staged, or nothing to restate).
                 #[cfg(unix)]
-                let tail_reused = tail
-                    .map(|tail| tail.publish(&parsed_file))
-                    .filter(|_| tail_source::tail_route(source, index).is_some());
+                let tail_reused = tail.map(|tail| tail.publish(&parsed_file));
                 #[cfg(not(unix))]
                 let parsed_file = parser.finish_boxed_native(finish_request, None);
                 #[cfg(test)]
@@ -31732,13 +31700,15 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            // No Claude reduction lives in RAM: a Claude completion
-                            // has its committed head, or no continuation.
+                            // No reduction on a Tail route lives in RAM: its
+                            // completion has its committed head, or no
+                            // continuation. Off a route it is admitted, by the
+                            // rule retention and the take key on.
                             #[cfg(unix)]
                             let quiet_proven = quiet_retired
                                 && context.cache.quiet_certified(&key, &completed.checkpoint);
                             #[cfg(unix)]
-                            let admitted = if source == SnapshotSource::ClaudeCode {
+                            let admitted = if !tail_source::keeps_ram(source, index) {
                                 drop(completed);
                                 tail_reused == Some(true)
                             } else {
@@ -32852,6 +32822,7 @@ impl OwnedSourceScan {
                         tail_selections: context.tail_files,
                         unchanged_selections: context.unchanged_files,
                         completed_native_bytes: context.native_bytes,
+                        completed_full_native_bytes: context.full_native_bytes,
                         completed_guard_bytes: context.sample_bytes,
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
@@ -40357,9 +40328,7 @@ impl PiUsageDedupState {
 }
 
 /// The accumulator's Pi-only state: the usage dedup ledger and the fork
-/// state. A labelled `E` field (`durable_tail_codec::PI_ONLY_E_LABELS`):
-/// Claude and Codex leave it empty and never persist it; Pi persists it only
-/// in the Pi record section.
+/// state. Claude and Codex leave it empty and never store it.
 #[derive(Clone, Default)]
 pub(crate) struct PiLedger {
     usage_keys: BTreeMap<String, PiUsageDedupState>,
@@ -40488,19 +40457,6 @@ impl PiLedger {
         add(Event::PiForkCopiesSkippedTokens, usage.total_tokens());
         true
     }
-}
-
-impl crate::durable_tail_codec::DurableEmpty for PiLedger {
-    /// Claude and Codex: a fork state is as non-empty as a ledger key, so a
-    /// present one refuses the record (counted), never drops silently.
-    fn durable_empty(&self) -> bool {
-        self.usage_keys.is_empty() && self.fork.is_none()
-    }
-}
-
-impl crate::durable_tail_codec::PiOnlyDurable for PiLedger {
-    const FIELD: &'static str = "SnapshotAccumulator.seen_pi_usage_keys";
-    type Label = BTreeMap<String, PiUsageDedupState>;
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -83702,159 +83658,6 @@ crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
 });
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
 crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
-crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
-    N source: SnapshotSource,
-    H cache_configuration_witness: Option<String>,
-    N cache_task_complete_at: Option<String>,
-    N cache_pending_idle: Option<u64>,
-    L cache_active_turns: BTreeSet<String>,
-    N context_curve_enabled: bool,
-    U source_session_id: Option<String>,
-    U account_identifier_hash: Option<String>,
-    X title: Option<String>,
-    N title_source: Option<String>,
-    X first_prompt_title: Option<String>,
-    X first_prompt_material: Option<String>,
-    PL provider_skills: BTreeSet<String>,
-    N started_at: Option<String>,
-    N ended_at: Option<String>,
-    N last_activity_at: Option<String>,
-    // Uploaded verbatim (`SnapshotItem.workspace_hash`): U, not H.
-    U workspace_hash: Option<String>,
-    X workspace_path: Option<PathBuf>,
-    U latest_model: Option<String>,
-    U latest_reasoning_effort: Option<String>,
-    L latest_turn_id: Option<String>,
-    I codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
-    L codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
-    N codex_priority_witnesses_uncapped: bool,
-    E codex_tier_replay: Option<codex_file_join::TierReplay>,
-    D codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
-    D current_selector: SelectorCapture,
-    D session_cumulative_usage: Option<UsageTotals>,
-    N codex_session_meta_seen: bool,
-    N codex_record_seen: bool,
-    U codex_creator_header_id: Option<String>,
-    D codex_creator_evidence: Option<SessionAccountEvidence>,
-    N codex_creator_evidence_conflicted: bool,
-    E claude_desktop_identity: Option<SessionAccountEvidence>,
-    E claude_desktop_spawn_lineage: Option<ClaudeDesktopSpawnLineage>,
-    N claude_owned_session_id_observed: bool,
-    N claude_owned_session_id_conflicted: bool,
-    D codex_ownership_boundary: CodexOwnershipBoundary,
-    N codex_legacy_trigger_seen: bool,
-    N codex_legacy_bootstrap_valid: bool,
-    I codex_parent_ownership_ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-    N codex_sidecar_created_thread: bool,
-    D codex_path_sidecar_candidates: Vec<CodexPathSidecarCandidate>,
-    U codex_resolved_path_identity: Option<String>,
-    N codex_sidecar_identity_ambiguous: bool,
-    U codex_sidecar_parent: Option<(String, String)>,
-    N codex_sidecar_child_created_at_nanos: Option<i128>,
-    N codex_bind_seed_len: Option<u64>,
-    I codex_sidecar_projected_next_ordinal: Option<u64>,
-    U codex_parent_session_ref: Option<String>,
-    E codex_parent_signatures: Option<CodexParentPrefix>,
-    H codex_parent_prefix_digest: PrefixDigest,
-    // (N offset, 32-byte domain-seeded SHA-256 chain digest, N flag).
-    D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
-    E codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
-    E codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
-    N codex_parent_proof_mismatch: bool,
-    E codex_parent_proof_refusal: Option<ProofRefusal>,
-    N codex_proof_decision_only: bool,
-    N codex_boundary_buffer_count: u8,
-    H codex_proof_ledger_row: Option<String>,
-    H codex_parent_ledger_identity_used: Option<String>,
-    D codex_parent_unresolvable: Option<CodexParentUnresolvable>,
-    N codex_parent_ledger_consulted: bool,
-    N codex_parent_signature_index: usize,
-    N codex_native_created_thread_valid: bool,
-    N codex_created_thread_native_only: bool,
-    N codex_native_created_thread_header_nanos: Option<i128>,
-    N codex_native_created_thread_last_nanos: Option<i128>,
-    L codex_native_created_thread_task_turn_id: Option<String>,
-    N codex_native_created_thread_first_turn_bound: bool,
-    H codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
-    N codex_physical_signatures_complete: bool,
-    N codex_ordinal_expected: Option<u64>,
-    N codex_ordinal_sequence_valid: bool,
-    N codex_owned_record_seen: bool,
-    N codex_is_fork: bool,
-    N codex_inherited_usage_records_skipped: u64,
-    N codex_duplicate_usage_records_skipped: u64,
-    N codex_cumulative_reset_count: u64,
-    D codex_context_curve_candidates: crate::owned_heap::OwnedVec<ContextCurveCandidatePoint>,
-    D codex_context_curve_boundaries: crate::owned_heap::OwnedVec<ContextCurveCandidateBoundary>,
-    N codex_context_curve_exact_supported: bool,
-    H codex_last_usage_event_identity: Option<String>,
-    E codex_legacy_bootstrap_buffer: Vec<Value>,
-    D accepted_usage_totals: UsageTotals,
-    D usage_buckets: BTreeMap<String, UsageBucketState>,
-    D origin: SnapshotOrigin,
-    U codex_root_session_ref: Option<String>,
-    N codex_spawn_depth: Option<u64>,
-    X codex_agent_label: Option<String>,
-    U activity_tool_counts: BTreeMap<String, u64>,
-    D activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
-    U activity_mcp_tool_counts: BTreeMap<String, u64>,
-    U activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
-    L activity_mcp_call_ids: BTreeMap<String, bool>,
-    U activity_capability_buckets: BTreeMap<(String, String, String), u64>,
-    L seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
-    PL activity_skills: BTreeSet<String>,
-    N skill_detector_incomplete: bool,
-    H activity_changed_file_hashes: BTreeSet<String>,
-    N activity_patch_operations: u64,
-    N activity_lines_added: u64,
-    N activity_lines_deleted: u64,
-    N activity_web_searches: u64,
-    N activity_mcp_calls: u64,
-    N activity_subagent_spawns: u64,
-    E artifacts: Vec<SessionArtifact>,
-    N artifacts_enabled: bool,
-    N latency_duration_ms_sum: u64,
-    N latency_duration_ms_count: u64,
-    N latency_ttft_ms_sum: u64,
-    N latency_ttft_ms_count: u64,
-    N latency_duration_ms_max: u64,
-    N latency_ttft_ms_max: u64,
-    D claude_responses: ClaudeResponseBook,
-    N claude_response_sequence: u64,
-    N claude_response_record_count: usize,
-    E claude_usage_request_ids: BTreeSet<String>,
-    E claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
-    N claude_request_identity_capture: bool,
-    D claude_org_markers: Option<Box<claude_request_identity::OrgMarkers>>,
-    E cache_observations: Option<CacheObservations>,
-    D cache_requests: crate::owned_heap::OwnedVec<OwnedRequest>,
-    N cache_requests_complete: bool,
-    N claude_context_curve_identity_complete: bool,
-    N claude_context_curve_request_index_complete: bool,
-    N claude_context_curve_owned_start_proven: bool,
-    D claude_file_birth: ClaudeFileBirth,
-    E claude_fork_parent: Option<String>,
-    E claude_money: Option<Box<claude_request_money::e2::FileFold>>,
-    U tool_usage_counts: BTreeMap<String, u64>,
-    N tool_usage_truncated: bool,
-    E seen_pi_usage_keys: PiLedger as BTreeMap<String, PiUsageDedupState>,
-    N dropped_usage_record_count: u64,
-    N claude_last_user_ts: Option<String>,
-    N claude_line_clocks: Option<(i128, i128)>,
-    N peak_context_fill_tokens: u64,
-    N first_turn_context_tokens: Option<u64>,
-    N last_turn_context_tokens: Option<u64>,
-    N first_turn_context_window_tokens: Option<u64>,
-    N peak_context_fill_window_tokens: Option<u64>,
-    N last_turn_context_window_tokens: Option<u64>,
-    N compaction_count: u64,
-    N compaction_timestamps: crate::owned_heap::OwnedVec<String>,
-    D codex_compaction_sizes: CodexCompactionSizes,
-    D local_context_points: LocalContextPoints,
-    D claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
-    L claude_compaction_link_tip: Option<(u64, String)>,
-    D session_start: Box<session_start::SessionStartState>,
-});
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);

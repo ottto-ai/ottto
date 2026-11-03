@@ -1575,14 +1575,15 @@ fn staged_quiet_retirement_commits_only_with_its_second_save() {
     assert!(cache.quiet_stage(source, &key, &body, true));
     let blocked = state.join("not-a-directory");
     fs::write(&blocked, b"").unwrap();
-    let ((), rows) = crate::local_resource_diagnostics::capture(|| {
-        let failing = blocked.join("index.json");
-        assert_eq!(
-            cache.quiet_reconcile(&state, source, &mut index, &failing),
-            0
-        );
-    });
-    assert!(rows.iter().any(|row| row["stage"] == "quiet_retirement"));
+    let failing = blocked.join("index.json");
+    assert_eq!(
+        cache.quiet_reconcile(&state, source, &mut index, &failing),
+        0
+    );
+    assert_eq!(
+        crate::snapshots::tail_source::counters::total("quiet_retirement", "save_failed"),
+        1
+    );
     assert!(index.files[&key].has_unverified_source());
     // The next pass's reconcile commits it, and a reload agrees.
     assert_eq!(

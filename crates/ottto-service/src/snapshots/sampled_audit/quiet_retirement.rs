@@ -24,20 +24,16 @@ struct Pass {
 pub(in crate::snapshots) struct QuietRetirements {
     passes: Vec<Pass>,
     pending: BTreeMap<String, Pending>,
-    /// Each source's first failed removal of its retired record directory.
-    pub(in crate::snapshots) retired_failed_since: Vec<(SnapshotSource, std::time::Instant)>,
 }
 
 fn digest(fingerprint: &str) -> [u8; 32] {
     Sha256::digest(fingerprint.as_bytes()).into()
 }
 
-fn counted(source: SnapshotSource, counts: &serde_json::Value) {
-    crate::local_resource_diagnostics::traversal_point(
-        "quiet_retirement",
-        source.api_slug(),
-        counts,
-    );
+/// `quiet_retirement{staged,save_failed}` on the source's counter line; a
+/// committed retirement is `sampled_audit_retirement`'s.
+fn counted(source: SnapshotSource, label: &'static str) {
+    crate::snapshots::tail_source::counters::bump(source, "quiet_retirement", label);
 }
 
 impl SharedCache {
@@ -125,7 +121,7 @@ impl SharedCache {
                 proven,
             },
         );
-        counted(source, &serde_json::json!({"staged": 1}));
+        counted(source, "staged");
         true
     }
 
@@ -182,14 +178,13 @@ impl SharedCache {
                     entry.scan_identity_version = previous;
                 }
             }
-            counted(source, &serde_json::json!({"save_failed": 1}));
+            counted(source, "save_failed");
             return 0;
         }
         let retired = undo.len();
         for key in undo.keys() {
             state.pending.remove(key);
         }
-        counted(source, &serde_json::json!({"retired": retired}));
         crate::local_resource_diagnostics::traversal_point(
             "sampled_audit_retirement",
             source.api_slug(),

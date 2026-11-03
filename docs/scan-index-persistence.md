@@ -108,8 +108,8 @@ separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
 APFS snapshots and physical SSD erasure are outside the promise. No application
 deletion or money-debt retirement is authorized merely by this storage maintenance.
 
-There is no rebuild; old restart records are re-pinned lazily by M3 only when a file grows.
-Conversion does not add a re-pin admission gate or require transcript re-read hours.
+There is no rebuild. The retired restart-record directory is removed whole each pass and never
+read; conversion adds no admission gate and requires no transcript re-read hours.
 
 ## Active reader behavior
 

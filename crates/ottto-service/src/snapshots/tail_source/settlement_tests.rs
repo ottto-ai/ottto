@@ -247,50 +247,10 @@ fn a_lower_revision_without_a_decoder_reconstructs() {
     route.save(false);
     let (load, records) = loaded(&route, &route.dir.join("a.jsonl"), &key);
     assert!(matches!(load, Load::Cold(None)));
-    assert_eq!(counted(&records), ("error".into(), vec!["revision".into()]));
-}
-
-/// [behaviour] R9: an unchanged file over a lower-revision head writes the
-/// head alone, with the same certificate and no page; a same-revision read of
-/// the same file writes nothing.
-#[test]
-fn an_unchanged_lower_revision_migrates_the_head_alone() {
-    let mut route = route();
-    let (mut tail, _native) = route.complete("a.jsonl", &lines(3), None, |_| {});
-    let key = tail.key_for_test().to_owned();
-    let mut staged = tail.take_staged_for_test();
-    staged.revision = Claude::REDUCTION_REVISION - 1;
-    state_v2::stage_tail(&route.path, &key, staged).unwrap();
-    route.save(false);
-    let path = route.dir.join("a.jsonl");
-    let base = |route: &Route, migrate| {
-        let head = route.head(&key).unwrap();
-        let mut base = TailBase::new(&head.body, migrate);
-        state_v2::load_tail(&route.index, &key, &head, |collection, page, bytes| {
-            base.observe::<Claude>(collection, page, &bytes).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        base
-    };
-    let body = route.head(&key).unwrap().body;
-
-    let (parser, _, _) = read(&route, &path, None);
-    let (tail, native) = route.finish(&path, parser, Some(base(&route, false)), |_| {});
-    assert!(tail.staged_for_test().is_none());
-    assert_eq!(counters::total("tail_head_migrated", "heads"), 0);
-    drop((tail, native));
-
-    let (parser, _, _) = read(&route, &path, None);
-    let (tail, native) = route.finish(&path, parser, Some(base(&route, true)), |_| {});
-    let staged = tail.staged_for_test().expect("the head is restated");
-    assert!(staged.pages.is_empty());
-    assert_eq!(counters::total("tail_head_migrated", "heads"), 1);
-    assert!(tail.publish(&native));
-    route.save(false);
-    let head = route.head(&key).unwrap();
-    assert_eq!(head.revision, Claude::REDUCTION_REVISION);
-    assert_eq!(head.body, body);
+    assert_eq!(
+        counted(&records),
+        ("error".into(), vec!["incompatible".into()])
+    );
 }
 
 /// [money] A stored reuse that finishes the ACKed body reads no native byte

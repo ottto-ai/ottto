@@ -198,6 +198,12 @@ pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
     publish_route(&state_v2::money_test_support::resident(index), dir).1
 }
 
+/// This thread's process total of the Tail counter `name{label}`, summed over
+/// sources.
+pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> u64 {
+    tail_source::counters::total(name, label)
+}
+
 /// The certified checkpoint a key continues from, read back for assertions.
 pub(crate) struct Continuation {
     audit_debt: Option<crate::transcript_acquisition::AuditDebt>,

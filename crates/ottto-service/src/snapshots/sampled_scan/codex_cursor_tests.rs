@@ -9785,6 +9785,7 @@ pub(in crate::snapshots) fn zero_context(
         tail_files: 0,
         unchanged_files: 0,
         native_bytes: 0,
+        full_native_bytes: 0,
         sample_bytes: 0,
         full_reasons: [0; 11],
         priority_replays: 0,

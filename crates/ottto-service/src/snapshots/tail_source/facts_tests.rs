@@ -13,7 +13,7 @@ use crate::transcript_acquisition::ReadMode;
 /// The committed head of `key` as a read's base.
 fn base(route: &Route, key: &str) -> TailBase {
     let head = route.head(key).unwrap();
-    let mut base = TailBase::new(&head.body, false);
+    let mut base = TailBase::new(&head.body);
     state_v2::load_tail(&route.index, key, &head, |collection, page, bytes| {
         base.observe::<Claude>(collection, page, &bytes).unwrap();
         Ok(())
@@ -231,6 +231,6 @@ fn session_facts_never_reach_diagnostics() {
         acc.session_start.call_files_for_test("toolu_opening"),
         Some(&[literal("PATH")][..])
     );
-    let all = serde_json::to_string(&(records, load_records)).unwrap();
+    let all = serde_json::to_string(&(records, &load_records.records)).unwrap();
     assert!(!all.contains(CANARY), "a session fact reached diagnostics");
 }

@@ -1,17 +1,17 @@
 //! L02 (D168-3): a late-evidence re-fold from stored state is the body a
 //! fresh native read sends now, byte for byte. It goes as an ordinary update,
-//! with no rescan claim, counted by its reason. Stored state that is
+//! with no rescan claim, counted by its reason (the row is
+//! `oracle_tests::differing_stored_body_is_sent_as_the_cold_full_body`). Stored state that is
 //! incomplete for the file, or a body waiting on a server retry (a head-CAS
 //! conflict), reads natively instead. The scan-level sidecar rows
 //! (`claude_tail_money_tests`: `quiet_sidecar_growth`, `side_owner`, ...)
 //! compare the same re-fold's upload with a cold Full on real evidence.
 use super::super::claude::tests::lines;
 use super::super::seam::tests::{route, Route};
-use super::settlement_tests::{finalize, stored_finish, REASON};
+use super::settlement_tests::stored_finish;
 use super::tests::{append, cold, committed, loaded, read};
 use super::*;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
-use crate::snapshots::tail_source::counters;
 use crate::transcript_acquisition::ReadMode;
 
 /// The late-evidence selections: they re-fold an unchanged transcript.
@@ -64,6 +64,7 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
         let (path, key) = committed(&mut route, name, responses);
         let native = wire(&fresh(&route, &path));
         assert!(!native.is_empty());
+        // The reason reaches only eligibility: one re-fold serves them all.
         let unchanged = LATE.into_iter().chain([
             CandidateParseReason::Audit,
             CandidateParseReason::UnknownOutcome,
@@ -73,10 +74,10 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
                 reuses_stored(&route.index, &key, Some(reason), false),
                 "{reason:?}"
             );
-            let (refold, native_bytes) = stored_finish(&route, &path, &key);
-            assert_eq!(native_bytes, 0, "{reason:?} {name}");
-            assert_eq!(wire(&refold), native, "{reason:?} {name}");
         }
+        let (refold, native_bytes) = stored_finish(&route, &path, &key);
+        assert_eq!(native_bytes, 0, "{name}");
+        assert_eq!(wire(&refold), native, "{name}");
     }
 
     let (path, key) = committed(&mut route, "grown.jsonl", 300);
@@ -100,38 +101,6 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
     let (parser, _, _) = read(&route, &path, Some(taken));
     let money = test_finish_items(parser, &path, SnapshotSource::ClaudeCode);
     assert_eq!(money, cold(&route, &path));
-}
-
-/// [money] A re-fold that is not the ACKed body is sent as an ordinary
-/// update: never a rescan claim or a challenge answer, counted by its reason,
-/// and nothing is owed afterwards. An append's body is not a re-fold.
-#[test]
-fn a_differing_refold_is_sent_as_an_ordinary_update() {
-    let mut route = route();
-    let (path, key) = committed(&mut route, "a.jsonl", 3);
-    let (items, native_bytes) = stored_finish(&route, &path, &key);
-    assert_eq!(native_bytes, 0);
-    let count = items.len();
-    let scan = finalize(&mut route, &key, items.clone(), false, Some(REASON));
-    assert_eq!(scan.snapshots.len(), count, "the re-fold is sent");
-    assert_eq!(scan.semantic_noop_count, 0);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
-    for item in &scan.snapshots {
-        let envelope = serde_json::to_value(snapshot_semantic_envelope(
-            SnapshotSource::ClaudeCode,
-            item,
-            SnapshotUploadPolicy::default(),
-        ))
-        .unwrap();
-        assert!(envelope.get("forced_full_rescan").is_none());
-        assert!(envelope.get("conflict_head_challenge").is_none());
-        assert!(envelope.get("rescan_from_revision_hash").is_none());
-    }
-    assert!(reuses_stored(&route.index, &key, Some(REASON), false));
-
-    let scan = finalize(&mut route, &key, items, false, None);
-    assert_eq!(scan.snapshots.len(), count);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
 }
 
 /// [money] SOURCE (c): while a body of the file waits on a server retry (a

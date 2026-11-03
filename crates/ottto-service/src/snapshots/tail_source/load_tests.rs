@@ -48,7 +48,14 @@ pub(super) fn len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, Vec<Value>) {
+/// One load's diagnostics: its points, and what it counted.
+pub(super) struct Loaded {
+    pub(super) records: Vec<Value>,
+    outcome: String,
+    causes: Vec<String>,
+}
+
+fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, Loaded) {
     let id = HeadIdentity::new(
         index_path,
         SnapshotSource::ClaudeCode,
@@ -58,7 +65,8 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, V
     );
     let mut held = File::open(path).unwrap();
     let fresh = super::settlement_tests::candidate(path);
-    capture(|| {
+    let before = counters::totals();
+    let (load, records) = capture(|| {
         load::<Claude>(
             &route.index,
             &route.path,
@@ -69,10 +77,31 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, V
             &fresh,
             &SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
         )
-    })
+    });
+    let after = counters::totals();
+    // Each label once per count the load added to `name`.
+    let added = |name: &str| -> Vec<String> {
+        after
+            .iter()
+            .filter(|((counted, _), _)| *counted == name)
+            .flat_map(|(at, total)| {
+                let grown = total - before.get(at).copied().unwrap_or(0);
+                std::iter::repeat(at.1.to_owned()).take(grown as usize)
+            })
+            .collect()
+    };
+    let [outcome] = &added("tail_db_loads")[..] else {
+        panic!("one counted load: {:?}", added("tail_db_loads"));
+    };
+    let loaded = Loaded {
+        records,
+        outcome: outcome.clone(),
+        causes: added("tail_reconstruct"),
+    };
+    (load, loaded)
 }
 
-pub(super) fn loaded(route: &Route, path: &Path, key: &str) -> (Load, Vec<Value>) {
+pub(super) fn loaded(route: &Route, path: &Path, key: &str) -> (Load, Loaded) {
     load_as(route, path, key, &route.path)
 }
 
@@ -84,16 +113,9 @@ fn points<'a>(records: &'a [Value], stage: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// The single `tail_db_loads` point's outcome and the reconstruction causes.
-pub(super) fn counted(records: &[Value]) -> (String, Vec<String>) {
-    let [load] = points(records, "tail_db_loads")[..] else {
-        panic!("one load point: {records:?}");
-    };
-    let causes = points(records, "tail_reconstruct")
-        .iter()
-        .map(|counts| counts["cause"].as_str().unwrap().to_owned())
-        .collect();
-    (load["outcome"].as_str().unwrap().to_owned(), causes)
+/// The load's counted outcome and reconstruction causes.
+pub(super) fn counted(loaded: &Loaded) -> (String, Vec<String>) {
+    (loaded.outcome.clone(), loaded.causes.clone())
 }
 
 /// A prepared read of `path` over `taken`, its start, and its consumed bytes.
@@ -374,7 +396,6 @@ fn an_identity_mismatch_retires_before_reuse() {
     let (load, records) = load_as(&route, &path, &key, &other);
     assert!(matches!(load, Load::Cold(_)));
     assert_eq!(counted(&records), ("error".into(), vec!["identity".into()]));
-    assert_eq!(points(&records, "tail_identity_failure").len(), 1);
     route.save(false);
     assert!(route.head(&key).is_none() && route.marker(&key).is_none());
 }

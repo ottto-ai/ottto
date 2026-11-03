@@ -1992,6 +1992,8 @@ pub(crate) struct ReadCounts {
     pub(crate) tail_selections: usize,
     pub(crate) unchanged_selections: usize,
     pub(crate) completed_native_bytes: u64,
+    /// Of `completed_native_bytes`, Full reads'; the rest is Tail.
+    pub(crate) completed_full_native_bytes: u64,
     pub(crate) completed_guard_bytes: u64,
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
@@ -2561,6 +2563,7 @@ mod tests {
             tail_selections: usize::MAX,
             unchanged_selections: usize::MAX,
             completed_native_bytes: u64::MAX,
+            completed_full_native_bytes: u64::MAX,
             completed_guard_bytes: u64::MAX,
             acquisition_admission: AcquisitionAdmission {
                 attempts: usize::MAX,

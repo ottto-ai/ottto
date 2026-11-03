@@ -147,12 +147,12 @@ impl PendingTail {
     /// What PRE encoded, `None` when nothing differs from the committed head.
     pub(in crate::snapshots::tail_source) fn staged_for_test(&self) -> Option<&StagedFile> {
         let encoded = self.encoded.as_ref().expect("PRE encoded");
-        encoded.staged.as_ref().ok()?.as_ref()
+        encoded.as_ref().ok()?.as_ref()
     }
     /// The encoded stage, for a test that commits a damaged copy.
     pub(in crate::snapshots::tail_source) fn take_staged_for_test(&mut self) -> StagedFile {
         let encoded = self.encoded.take().expect("PRE encoded");
-        let Ok(Some(staged)) = encoded.staged else {
+        let Ok(Some(staged)) = encoded else {
             panic!("a full encode stages every row");
         };
         staged
@@ -236,8 +236,8 @@ fn claim_only_saves_publish_nothing_and_the_exit_commits() {
     assert!(route.head(&key).is_some());
 }
 
-/// [behaviour] A finish-only or live field already set at PRE sets that file
-/// aside, counted by cause; its sibling commits.
+/// [behaviour] A finish-only or live field already set at PRE is refused as an
+/// `E` field is: that file alone is set aside, counted; its sibling commits.
 #[test]
 fn a_finish_field_at_pre_sets_only_its_file_aside() {
     let mut route = route();
@@ -252,7 +252,11 @@ fn a_finish_field_at_pre_sets_only_its_file_aside() {
     route.save(false);
     assert_eq!(
         route.marker(&a).map(|marker| marker.cause),
-        Some(SetAsideCause::UnexpectedFinishField)
+        Some(SetAsideCause::Encode)
+    );
+    assert_eq!(
+        super::super::counters::total("tail_full_encode", "failed"),
+        1
     );
     assert!(route.head(&a).is_none());
     assert!(route.head(&b).is_some() && route.marker(&b).is_none());
@@ -269,7 +273,7 @@ fn an_append_restates_only_the_open_pages() {
     tail.publish(&native);
     route.save(false);
     let head = route.head(&key).unwrap();
-    let mut base = TailBase::new(&head.body, false);
+    let mut base = TailBase::new(&head.body);
     state_v2::load_tail(&route.index, &key, &head, |collection, page, bytes| {
         base.observe::<Claude>(collection, page, &bytes).unwrap();
         Ok(())
@@ -280,7 +284,7 @@ fn an_append_restates_only_the_open_pages() {
     assert!(committed.contains(&(Collection::ToolUses, 1)));
 
     let (tail, native) = route.complete("a.jsonl", &lines(301), Some(base), |_| {});
-    let staged = tail.encoded.as_ref().unwrap().staged.as_ref().unwrap();
+    let staged = tail.encoded.as_ref().unwrap().as_ref().unwrap();
     let staged = staged.as_ref().expect("an append restates its open pages");
     assert_eq!(staged.change, Change::Ordinary);
     let restated: Vec<_> = staged.pages.keys().copied().collect();

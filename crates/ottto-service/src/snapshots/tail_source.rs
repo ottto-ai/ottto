@@ -7,7 +7,7 @@
 //! Encoding refuses no record for policy: labels are data, filtered only at
 //! upload. Stored state that is missing or inconsistent is a reconstruction
 //! cause the caller counts, never a default-empty success.
-use super::state_v2::{Change, Collection, CollectionMeta, Shape as PageShape, StagedFile};
+use super::state_v2::{Collection, CollectionMeta, Shape as PageShape};
 use super::*;
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
@@ -158,12 +158,11 @@ pub(in crate::snapshots) struct CollectionSpec {
 pub(in crate::snapshots) enum ReconstructCause {
     /// Bytes that do not decode, or decoded facts that contradict each other.
     Corrupt,
-    /// A capture mode or page geometry this build does not read this way.
+    /// A capture mode, page geometry or revision this build does not read
+    /// this way.
     Incompatible,
     /// A required collection, or some of its elements, is missing.
     Incomplete,
-    /// A lower revision this build has no decoder for.
-    Revision,
     /// The head was written for another route, scan root or path.
     Identity,
     /// The head's keyed fields were made under another attribution key: an
@@ -186,7 +185,6 @@ impl ReconstructCause {
             Self::Corrupt => "corrupt",
             Self::Incompatible => "incompatible",
             Self::Incomplete => "incomplete",
-            Self::Revision => "revision",
             Self::Identity => "identity",
             Self::KeyEpoch => "key_epoch",
             Self::GroupReplay => "group_replay",
@@ -317,7 +315,8 @@ pub(in crate::snapshots) trait TailSource {
     fn collections() -> &'static [CollectionSpec];
     /// How many elements of `collection` the accumulator holds.
     fn elements(acc: &SnapshotAccumulator, collection: Collection) -> u64;
-    /// A finish-only or live field that must still be empty at the seam.
+    /// A finish-only or live field that must still be empty at the seam: the
+    /// stage refuses it as an `E` field, setting that file aside alone.
     fn finish_field_nonempty(acc: &SnapshotAccumulator) -> Option<&'static str>;
     fn encode_head(
         view: &PreFinalization<'_>,
@@ -393,39 +392,6 @@ pub(in crate::snapshots) trait TailSource {
         }
         Self::facts(acc)
     }
-}
-
-/// A complete stage of one file: its head and every page, replacing all
-/// stored rows.
-pub(in crate::snapshots) fn stage_full<S: TailSource>(
-    view: &PreFinalization<'_>,
-    certificate: &DurableCertificate,
-    id: &HeadIdentity,
-) -> Result<StagedFile, Refuse> {
-    let mut staged = StagedFile {
-        revision: S::REDUCTION_REVISION,
-        head: S::encode_head(view, certificate, id)?,
-        change: Change::Reset,
-        ..StagedFile::default()
-    };
-    for spec in S::collections() {
-        let elements = S::elements(view.accumulator, spec.collection);
-        if elements == 0 && !spec.required {
-            continue;
-        }
-        staged.collections.insert(
-            spec.collection,
-            CollectionMeta {
-                shape: spec.shape,
-                elements_per_page: spec.g,
-                elements,
-            },
-        );
-        for (page, bytes) in S::encode_pages(view.accumulator, spec.collection)? {
-            staged.pages.insert((spec.collection, page), bytes);
-        }
-    }
-    Ok(staged)
 }
 
 /// One exactly sized value: the field walk counts, then writes.
@@ -698,12 +664,13 @@ macro_rules! head_fields {
 // except the Codex agent label, which a Claude parse never sets. `I` marks a
 // field this walk does not store: a codec keeps its own `I` fields in its
 // pages or in a trailer after this walk, or never stores them (finish-only
-// and live fields), and lists every `I` field it never stores in
-// `finish_field_nonempty`. Claude's: pages (responses, tool uses, changed
-// files, capability buckets, compactions), finish-only fields (usage ids and
-// occurrences, money, cache observations and requests, usage buckets and
-// totals), live fields (Desktop identity and spawn lineage, account hash),
-// the Pi ledger, and Codex's paged, trailer and live fields, empty on Claude.
+// and live fields, listed in its `finish_field_nonempty`). Claude's: pages
+// (responses, tool uses, changed files, capability buckets, compactions),
+// finish-only fields (usage ids and occurrences, money, cache observations
+// and requests, usage buckets and totals), live fields (Desktop identity and
+// spawn lineage, account hash). The Pi ledger and Codex's `I` fields are
+// written only by those sources' parsers (Codex's by
+// `apply_codex_owned_line`), so a Claude parse leaves them empty (D62).
 head_fields! {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,

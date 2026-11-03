@@ -3868,43 +3868,6 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
     }
 }
 
-/// D62 guard: the census deadline holds past the expired hold's pass too.
-/// That pass's body was the hold's one delivery; the hold never restarts, and
-/// nothing selects afterwards.
-#[test]
-fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hold() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
-        c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let mut progress = e2_progress();
-        let scanner = E2ScanFixture::default();
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, true);
-        let mut prior = settle(&c, &old, original, &mut progress);
-        c.write_at(
-            &file(COPY),
-            &resumed(COPY, &[A, B, C]),
-            "2026-08-02T07:03:00Z",
-        );
-        let under_deadline = |prior: ScanIndex| {
-            let mut page = c.raw(&scanner, prior, 100, true, &[]);
-            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                page.enrich(&c);
-            });
-            page
-        };
-        for _ in 1..=3 {
-            let page = under_deadline(prior.clone());
-            prior = settle(&c, &prior, page, &mut progress);
-        }
-        let after = under_deadline(prior);
-        assert!(
-            body(&after, COPY).is_none(),
-            "the expired hold never restarts"
-        );
-    });
-}
-
 #[test]
 fn e2_pipeline_lossy_holder_hits_prove_but_absences_are_flagged() {
     with_e2(|| {

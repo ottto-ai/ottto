@@ -1,5 +1,10 @@
 # Restart restore
 
+> **Superseded (2026-11-03).** The restart-record store (M3) described here is
+> deleted. Claude continues from the state database's Tail
+> (`snapshots/tail_source/`); see `crates/ottto-service/ARCHITECTURE.md` and the
+> Tail counters in `docs/diagnostics.md`. Kept for history only.
+
 The durable-tail store uses v3 write-ahead records prepared at native settlement,
 before publication effects and index save. Restore validates the record against
 its source, scope, file certificate and committed index evidence, then replays
