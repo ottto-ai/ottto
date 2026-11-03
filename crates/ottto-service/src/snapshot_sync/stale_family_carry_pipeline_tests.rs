@@ -1741,6 +1741,16 @@ fn source_t2_quantify_forward_only(fixture: &RearmFixture) {
         rearm_member_session(Some(REARM_AGENTS[1])),
         REARM_SIBLING.to_owned(),
     ];
+    // Emit every synthetic member before the first equality guard can stop the
+    // comparison. Keep raw wire rows separate from aggregate placement: row
+    // splitting, selector shape and cost spelling are not owner changes.
+    for (ordinal, session) in sessions.iter().enumerate() {
+        eprintln!(
+            "CENSUS_EXIT_T2_ROWS role={ordinal} main={} forward={}",
+            serde_json::to_string(&source_t2_placement(&base.finalizer_bodies[session])).unwrap(),
+            serde_json::to_string(&source_t2_placement(&actual.finalizer_bodies[session])).unwrap(),
+        );
+    }
     for (ordinal, session) in sessions.iter().enumerate() {
         let a = &actual.finalizer_bodies[session];
         let b = &base.finalizer_bodies[session];
