@@ -49030,7 +49030,7 @@ impl ScanIndex {
         };
         // Compressed rollouts are cold history, even when their new path
         // has no emission record. Forward-only naming leaves them Unknown.
-        if key.ends_with(".zst") {
+        if is_compressed_codex_rollout(Some(Path::new(key)), None) {
             return false;
         }
         let emitted = self.file_snapshot_fingerprints.get(key);
