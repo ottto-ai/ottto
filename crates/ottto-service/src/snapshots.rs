@@ -47377,11 +47377,8 @@ fn advance_bounded_directory_traversal_with_budget(
                 continue;
             }
             // Inside the window and unread: outstanding. Archives keep their own
-            // debt and an oversized file its own disclosure.
-            if !codex_archive_path(&path)
-                && metadata.len() <= max_jsonl_file_bytes(source)
-                && !index.files.contains_key(&local_index_key(&path))
-            {
+            // debt.
+            if !codex_archive_path(&path) && !index.files.contains_key(&local_index_key(&path)) {
                 freshness.never_indexed_file(
                     index.authority_terminal_member(&path),
                     listed_at.saturating_sub(modified_unix_seconds),
