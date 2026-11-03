@@ -283,6 +283,65 @@ fn absent_heads_retire() {
     );
 }
 
+/// [behaviour] A4d classifies absent heads by custody, never by set
+/// difference alone: a reduction retires and its revisions stay under a
+/// metadata-only head, which the next complete census keeps (absence never
+/// clears debt); a head that fails to load is set aside, not retired (F4).
+/// The metadata-only head is no checkpoint: its file reads as a first read,
+/// with no reconstruction.
+#[test]
+fn absent_heads_are_classified_by_custody() {
+    let mut route = route();
+    let (path, owed) = committed(&mut route, "owed.jsonl", 3);
+    // F1: an observation restates the head's current summary.
+    let common = route.head(&owed).unwrap().common;
+    state_v2::observe_tail(
+        &route.path,
+        &owed,
+        state_v2::Observation {
+            representation: common.representation,
+            summary: common.debt,
+            added: vec![b"debt".to_vec()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (mut future, _native) = route.complete("future.jsonl", &lines(3), None, |_| {});
+    let future_key = future.key_for_test().to_owned();
+    let mut staged = future.take_staged_for_test();
+    staged.revision = Claude::REDUCTION_REVISION + 1;
+    state_v2::stage_tail(&route.path, &future_key, staged).unwrap();
+    route.save(false);
+
+    let none = BTreeSet::new();
+    for census in 0..2 {
+        let ((), records) =
+            capture(|| retire_absent(SnapshotSource::ClaudeCode, &route.index, &none, &none));
+        route.save(false);
+        let keys = state_v2::tail_head_keys(&route.index).unwrap();
+        assert!(
+            keys.contains(&owed) && keys.contains(&future_key),
+            "{census}"
+        );
+        assert!(route.head(&owed).unwrap().metadata_only, "{census}");
+        assert!(route.marker(&future_key).is_some(), "{census}");
+        let [counts] = points(&records, "tail_absent")[..] else {
+            panic!("one classification point: {records:?}");
+        };
+        let retired = u64::from(census == 0);
+        let count = |name: &str| counts[name].as_u64();
+        assert_eq!(
+            [count("retired"), count("kept_debt"), count("set_aside")],
+            [Some(retired), Some(1 - retired), Some(1)],
+            "{census}"
+        );
+    }
+
+    let (load, records) = loaded(&route, &path, &owed);
+    assert!(matches!(load, Load::Cold(None)));
+    assert_eq!(counted(&records), ("miss".into(), vec![]));
+}
+
 /// [behaviour] C′: a head bound to another destination's route is retired
 /// before anything in it is reused.
 #[test]

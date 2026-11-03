@@ -8,7 +8,8 @@
 //! Each load counts once in `tail_db_loads{source, outcome}`. Stored state
 //! that cannot be reused is a counted reconstruction (`tail_reconstruct`) and
 //! the read starts at once as a Full; only a head from a newer build holds
-//! the file, untouched. A head bound to another route, scan root or path is
+//! the file, untouched. A metadata-only head (revisions or inventory, no
+//! reduction) is no checkpoint: the file's first read, with no credit. A head bound to another route, scan root or path is
 //! retired before anything else in it is read (C′), whatever the Full that
 //! follows achieves.
 use super::claude::Claude;
@@ -48,7 +49,12 @@ pub(in crate::snapshots) fn set_aside(index: &ScanIndex, key: &str) -> bool {
 
 /// A4d: after a complete census with no decode hold, a head whose file the
 /// census did not observe, that is no residue and has no index entry, is
-/// absent; its rows retire at the next save. A read error retires nothing.
+/// absent. Each absent head is classified by its custody, never deleted by
+/// set difference: a reduction retires at the next save (the store keeps its
+/// unresolved revisions under a metadata-only head); a metadata-only head
+/// with revisions keeps its debt, which absence never clears; one with no
+/// revisions retires. A head that fails to load is set aside, not retired
+/// (F4). A read error of the key set, or a database hold, retires nothing.
 /// A set-aside marker with no head is not listed.
 pub(in crate::snapshots) fn retire_absent(
     source: SnapshotSource,
@@ -65,7 +71,44 @@ pub(in crate::snapshots) fn retire_absent(
     absent.retain(|key| {
         !observed.contains(key) && !residue.contains(key) && !index.files.contains_key(key)
     });
-    let _ = state_v2::retire_tail(&route, absent);
+    let mut retire = BTreeSet::new();
+    let (mut kept_debt, mut set_aside) = (0_u64, 0_u64);
+    for key in absent {
+        match state_v2::load_head(index, &key, Claude::REDUCTION_REVISION) {
+            Ok(Some(head))
+                if head.metadata_only
+                    && head.table.contains_key(&state_v2::Collection::Revisions) =>
+            {
+                kept_debt += 1;
+            }
+            Ok(Some(_)) => {
+                retire.insert(key);
+            }
+            Ok(None) => {}
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<Hold>(),
+                    Some(Hold::DbUnavailable | Hold::ReloadRequired)
+                ) =>
+            {
+                return;
+            }
+            Err(_) => {
+                let _ = state_v2::set_aside_tail(&route, &key, state_v2::SetAsideCause::Row);
+                set_aside += 1;
+            }
+        }
+    }
+    if kept_debt + set_aside > 0 {
+        crate::local_resource_diagnostics::traversal_point(
+            "tail_absent",
+            source.api_slug(),
+            &serde_json::json!({
+                "retired": retire.len(), "kept_debt": kept_debt, "set_aside": set_aside
+            }),
+        );
+    }
+    let _ = state_v2::retire_tail(&route, retire);
 }
 
 /// Claude's load of `candidate` on `route`; `held` is the read's opened file.
@@ -96,6 +139,8 @@ pub(in crate::snapshots) fn claude(
 
 enum Miss {
     NoHead,
+    /// A head with no reduction: no checkpoint to continue.
+    MetadataOnly,
     Future,
     /// The file is no longer the certified one: an ordinary Full.
     Changed(FullReason),
@@ -135,6 +180,11 @@ pub(super) fn load<S: TailSource>(
         Err(Miss::NoHead) => {
             counters::bump("tail_bootstrap_full", "no_head");
             ("miss", "no_head".into(), Some("no_head"), Load::Cold(None))
+        }
+        // Debt or inventory only: the file's first read, no reconstruction.
+        Err(Miss::MetadataOnly) => {
+            counters::bump("tail_bootstrap_full", "metadata_only");
+            ("miss", "metadata_only".into(), None, Load::Cold(None))
         }
         Err(Miss::Unreadable) => (
             "error",
@@ -203,6 +253,10 @@ fn stored<S: TailSource>(
         }
         Err(_) => return Err(Miss::Unreadable),
     };
+    // Before any decode: a metadata-only head has nothing to restore.
+    if head.metadata_only {
+        return Err(Miss::MetadataOnly);
+    }
     id.check(&head.body).map_err(Miss::Reconstruct)?;
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     let decoded = S::decode_head(head.revision, &head.body, &mut acc).map_err(Miss::Reconstruct)?;
