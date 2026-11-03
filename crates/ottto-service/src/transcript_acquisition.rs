@@ -369,6 +369,7 @@ impl Checkpoint {
     }
 
     /// `seal_as` under this checkpoint's own scope.
+    #[cfg(test)]
     pub(crate) fn seal(&self, now: u64) -> PrefixSeal {
         self.seal_as(now, &self.scope)
     }
@@ -388,6 +389,7 @@ impl Checkpoint {
     /// edit at the checkpoint's length, or a shrink to a length above `s`, is
     /// growth to the seal and is not refused (see `PrefixSeal::admits`).
     /// `commit_sealed_prefix` checkpoints already store `length = s`.
+    #[cfg(test)]
     pub(crate) fn seal_as(&self, now: u64, scope: &Scope) -> PrefixSeal {
         let mut stamp = self.stamp.clone();
         stamp.length = self.samples.sealed_offset;
@@ -415,6 +417,7 @@ impl Checkpoint {
 /// file's decision depends on: the stamp (length = sealed `s`), scope and
 /// verification time, with both samples kept only as SHA-256. Minted only by
 /// `Checkpoint::seal_as`, so only from a committed checkpoint.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrefixSeal {
     stamp: FileStamp,
@@ -430,16 +433,11 @@ pub(crate) struct PrefixSeal {
     audit_debt_unix_seconds: Option<u64>,
 }
 
+#[cfg(test)]
 impl PrefixSeal {
-    pub(crate) fn sealed_offset(&self) -> u64 {
-        self.stamp.length
-    }
     #[cfg(test)]
     pub(crate) fn has_debt(&self) -> bool {
         self.audit_debt_unix_seconds.is_some()
-    }
-    pub(crate) fn scope_is(&self, scope: &Scope) -> bool {
-        self.scope == scope.0
     }
 
     /// Whether this seal was minted already outlived: it carries staged debt
@@ -449,27 +447,6 @@ impl PrefixSeal {
     pub(crate) fn outlived(&self) -> bool {
         self.audit_debt_unix_seconds
             .is_some_and(|due| due <= self.sealed_unix_seconds)
-    }
-
-    /// U1a-2a (fix round 4, AutoReview #3), metadata only: whether this seal
-    /// is in `scope` and inside its horizon at `now` for `admits` (no clock
-    /// regression, no due or out-of-range staged debt, verified less than
-    /// `AUDIT_INTERVAL_SECONDS` ago). It reads no byte and admits nothing:
-    /// `admits` still decides on the FD.
-    pub(crate) fn admits_in_time(&self, scope: &Scope, now: u64) -> bool {
-        let debt_ok = self.audit_debt_unix_seconds.map_or(true, |due| {
-            now < due
-                && now
-                    .checked_add(AUDIT_INTERVAL_SECONDS)
-                    .is_some_and(|latest| due <= latest)
-        });
-        self.scope == scope.0
-            && now >= self.verified_unix_seconds
-            && debt_ok
-            && self
-                .verified_unix_seconds
-                .checked_add(AUDIT_INTERVAL_SECONDS)
-                .is_some_and(|due| now < due)
     }
 
     /// `prepare`'s decision (`select_mode`) with this seal as the checkpoint
@@ -1476,6 +1453,7 @@ crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
 crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
+#[cfg(test)]
 crate::heap_layout_bound::fields!(PrefixSeal; stamp, scope, sample_len, head_sha256, boundary_sha256,
     verified_unix_seconds, sealed_unix_seconds, audit_debt_unix_seconds);
 crate::heap_layout_bound::fields!(ParkedSamples; sealed_offset, head_len, head_sha256, boundary_len,

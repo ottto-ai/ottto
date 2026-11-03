@@ -199,7 +199,6 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
             source: SnapshotSource::Codex,
             metadata: &metadata,
             traces: None,
-            parents: None,
             identity_capture: false,
             cache: None,
         },

@@ -560,10 +560,6 @@ impl OpenStamp {
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
     }
-
-    pub(in crate::snapshots) fn dev_ino(&self) -> (u64, u64) {
-        (self.dev, self.ino)
-    }
 }
 
 impl crate::transcript_acquisition::StampIdentity for OpenStamp {
@@ -634,6 +630,7 @@ impl SharedCache {
     /// A cheap content-qualified identity for retained wake decisions only.
     /// Missing/evicted evidence or any content/object mismatch keeps live ctime.
     /// Samples use pread so neither a parser nor a boot reader is repositioned.
+    #[cfg(test)]
     pub(in crate::snapshots) fn retained_open(
         &self,
         path: &Path,
@@ -1965,15 +1962,6 @@ pub(in crate::snapshots) struct Publication {
     overdue_age: Option<u64>,
     /// This read's withheld final record was applied at genuine EOF.
     eof_applied: bool,
-}
-impl Publication {
-    /// Whether the withheld final record was applied at EOF, so the reduction is not
-    /// the reduction through the certified prefix. Read before
-    /// `cursor_published` consumes the publication; `eof_applied(job)` is not
-    /// valid after `finish_job`.
-    pub(in crate::snapshots) fn eof_applied(&self) -> bool {
-        self.eof_applied
-    }
 }
 
 /// A completed attempt on a file that did not grow withheld an unterminated

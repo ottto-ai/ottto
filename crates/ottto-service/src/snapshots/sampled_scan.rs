@@ -454,8 +454,7 @@ impl SharedCache {
         let live_bytes = taken.finalization_charge;
         let reserved =
             self.retained_reservation(&cache, &key, taken, live_bytes, taken.modified_hint);
-        let result = cache.insert_taken_reserving(key, incoming, reserved);
-        result
+        cache.insert_taken_reserving(key, incoming, reserved)
     }
     // Refusal returns the original inline graph; boxing adds an unfunded allocation.
     #[allow(

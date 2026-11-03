@@ -25660,7 +25660,7 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                let mut parsed_file = match parsed_file {
+                let parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
 
                     Err(error) => {
@@ -39767,10 +39767,6 @@ fn opened_candidate_is_within_frozen_window(
         is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
     })
 }
-
-/// PR-P: the opened parent is outside this traversal's backfill window and
-/// has no verification rescue, the exact discovery filter. Discovery never
-/// makes it a candidate, so no parse can produce its ledger.
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
