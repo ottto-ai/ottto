@@ -59,6 +59,8 @@ pub(super) const WINDOW_REQUESTS: usize = 3;
 const MEMORY_CUT_MARKER: &str = "> WARNING: MEMORY.md is";
 const CLAUDE_INSTRUCTIONS_PREFIX: &str = "<system-reminder>\nCodebase and user instructions";
 
+/// Append-only: stored heads keep `parts` by this order (`G` class), and a
+/// shorter stored array pads the appended parts with 0, i.e. not seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {
     Tools,
@@ -522,7 +524,7 @@ crate::durable_tail_codec::durable_struct!(OpeningRequest {
 });
 crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
 crate::durable_tail_codec::durable_struct!(ClaudeBlob {
-    N parts: [u64; PARTS],
+    G parts: [u64; PARTS],
     N unmeasurable: bool,
     // A reversible rolling digest of instruction text (F1): content, never
     // in a record body; stored with the opening-settings session fact.
@@ -565,11 +567,11 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N user_turns: u8,
     N inherited_prefix: bool,
     N frozen: bool,
-    N requests: [Option<OpeningRequest>; WINDOW_REQUESTS],
+    G requests: [Option<OpeningRequest>; WINDOW_REQUESTS],
     N codex_requests: u8,
     N response_tool_calls: [u64; 2],
     N truncated_outputs: [u64; 2],
-    N parts: [u64; PARTS],
+    G parts: [u64; PARTS],
     N parts_closed: bool,
     N parts_unmeasurable: bool,
     N codex_tools_logged: bool,
@@ -589,6 +591,83 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N shell_moved: bool,
     N collapsed_requests: bool,
 });
+
+#[cfg(test)]
+impl SessionStartState {
+    /// Distinct opening parts and three present requests, so their stored
+    /// bytes occur once in a head.
+    pub(in crate::snapshots) fn set_grown_for_test(&mut self) {
+        for (i, part) in self.parts.iter_mut().enumerate() {
+            *part = 7_000_001 + i as u64;
+        }
+        for (i, request) in self.requests.iter_mut().enumerate() {
+            *request = Some(OpeningRequest {
+                context_tokens: 9_000_001 + i as u64,
+                output_tokens: 8_000_001 + i as u64,
+                ..OpeningRequest::default()
+            });
+        }
+    }
+
+    pub(in crate::snapshots) fn parts_for_test(&self) -> Vec<u64> {
+        self.parts.to_vec()
+    }
+
+    pub(in crate::snapshots) fn requests_present_for_test(&self) -> Vec<bool> {
+        self.requests.iter().map(Option::is_some).collect()
+    }
+
+    /// `parts` and `requests` stored as a build with these lengths wrote them.
+    pub(in crate::snapshots) fn grown_bytes_for_test(
+        &self,
+        parts: usize,
+        requests: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        (
+            crate::durable_tail_codec::grown_bytes_for_test(&self.parts, parts),
+            crate::durable_tail_codec::grown_bytes_for_test(&self.requests, requests),
+        )
+    }
+
+    /// `Part` in stored order. The match is exhaustive, so a new variant
+    /// must be listed here.
+    pub(in crate::snapshots) fn part_order_for_test() -> Vec<&'static str> {
+        let name = |part: Part| match part {
+            Part::Tools => "Tools",
+            Part::System => "System",
+            Part::Instructions => "Instructions",
+            Part::Memory => "Memory",
+            Part::Skills => "Skills",
+            Part::Agents => "Agents",
+            Part::McpNames => "McpNames",
+            Part::McpInstructions => "McpInstructions",
+            Part::HooksEnv => "HooksEnv",
+            Part::Prompt => "Prompt",
+            Part::Other => "Other",
+        };
+        let all = [
+            Part::Tools,
+            Part::System,
+            Part::Instructions,
+            Part::Memory,
+            Part::Skills,
+            Part::Agents,
+            Part::McpNames,
+            Part::McpInstructions,
+            Part::HooksEnv,
+            Part::Prompt,
+            Part::Other,
+        ];
+        assert_eq!(all.len(), PARTS);
+        all.iter()
+            .enumerate()
+            .map(|(i, part)| {
+                assert_eq!(*part as usize, i, "{part:?}");
+                name(*part)
+            })
+            .collect()
+    }
+}
 
 impl SessionStartState {
     pub(super) fn client_version(&self) -> Option<&str> {

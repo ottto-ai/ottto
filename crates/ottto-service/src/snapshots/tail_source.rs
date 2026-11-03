@@ -723,6 +723,11 @@ macro_rules! head_fields {
         fn take_fields(d: &mut Dec<'_>) -> Result<SnapshotAccumulator, Corrupt> {
             Ok(SnapshotAccumulator { $($f: durable_field!(take $c, d, $ty)),* })
         }
+        /// Test only: the head-field walk's shape, for the layout pin.
+        #[cfg(test)]
+        fn shape_fields(s: &mut crate::durable_tail_codec::Shape) {
+            $(durable_field!(shape $c, s, $f, $ty);)*
+        }
     };
 }
 // The head-field core every codec writes: each accumulator field by its Tail

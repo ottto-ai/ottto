@@ -423,6 +423,9 @@ mod facts_tests;
 #[path = "format_tests.rs"]
 mod format_tests;
 #[cfg(test)]
+#[path = "grown_head_tests.rs"]
+mod grown_head_tests;
+#[cfg(test)]
 #[path = "held_original_tests.rs"]
 mod held_original_tests;
 #[cfg(test)]

@@ -22,6 +22,10 @@
 //!   record, and the entry reads in Full;
 //! - `I` a live input re-injected every pass. Never encoded;
 //! - `D` a nested persisted type, encoded by its own field classes.
+//! - `G` an `N` fixed-size array stored with its length (`GrownArray`), so a
+//!   build that appends slots still reads old records: a shorter stored array
+//!   pads the new slots with `Default`, a longer one is corrupt. Slots are
+//!   append-only: never insert, reorder or remove one.
 //! - `P` pass-through: a shared payload (an enum variant used by several
 //!   fields) whose class is the enclosing field's, so an `L` span is only
 //!   ever the leaf field that holds the id.
@@ -1170,6 +1174,65 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
     }
 }
 
+/// A fixed-size array stored with its length, so the array may grow by
+/// appended slots without breaking stored records. Decode keeps the stored
+/// slots and fills the slots this build appended with `pad`; a stored array
+/// longer than this build's is corrupt. Slots are append-only.
+pub(crate) trait GrownArray: Sized {
+    type Item;
+    fn put_grown(&self, e: &mut Enc) -> Result<(), Refuse>;
+    fn take_grown(d: &mut Dec<'_>, pad: impl FnMut() -> Self::Item) -> Result<Self, Corrupt>;
+    fn verify_grown(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    fn shape_grown(s: &mut Shape);
+}
+
+impl<T: Durable, const N: usize> GrownArray for [T; N] {
+    type Item = T;
+    fn put_grown(&self, e: &mut Enc) -> Result<(), Refuse> {
+        e.varint(N as u64)?;
+        self.iter().try_for_each(|item| item.put(e))
+    }
+    fn take_grown(d: &mut Dec<'_>, pad: impl FnMut() -> Self::Item) -> Result<Self, Corrupt> {
+        let stored = grown_len::<N>(d)?;
+        d.slots::<T>(N)?;
+        let mut out = Vec::with_capacity(N);
+        for _ in 0..stored {
+            out.push(T::take(d)?);
+        }
+        out.resize_with(N, pad);
+        out.try_into().map_err(|_| Corrupt)
+    }
+    fn verify_grown(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..grown_len::<N>(d)? {
+            T::verify(d)?;
+        }
+        Ok(())
+    }
+    fn shape_grown(s: &mut Shape) {
+        // No `N`: appending a slot keeps stored records readable.
+        s.push("[len]");
+        T::shape(s);
+    }
+}
+
+/// Test only: a grown array's stored bytes at `len` slots (cycling `items`
+/// past their end), as a build with `len` slots would write them.
+#[cfg(test)]
+pub(crate) fn grown_bytes_for_test<T: Durable>(items: &[T], len: usize) -> Vec<u8> {
+    let mut e = Enc::bytes(1 << 16);
+    e.varint(len as u64).unwrap();
+    for item in items.iter().cycle().take(len) {
+        item.put(&mut e).unwrap();
+    }
+    e.into_bytes()
+}
+
+/// A grown array's stored length: at most this build's `N`.
+fn grown_len<const N: usize>(d: &mut Dec<'_>) -> Result<usize, Corrupt> {
+    let len = usize::try_from(d.varint()?).map_err(|_| Corrupt)?;
+    (len <= N).then_some(len).ok_or(Corrupt)
+}
+
 impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
         put_seq(e, self.len(), self.iter())
@@ -1382,6 +1445,10 @@ macro_rules! durable_field {
     (put D, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
+    (put G, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::GrownArray::put_grown(value, $e)?;
+    }};
     (put P, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
@@ -1421,6 +1488,9 @@ macro_rules! durable_field {
     (take P, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take G, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::GrownArray>::take_grown($d, ::std::default::Default::default)?
+    };
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
@@ -1434,6 +1504,7 @@ macro_rules! durable_field {
     (verify L, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
     (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify G, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::GrownArray>::verify_grown($d)? };
     (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
     (key_type PL, $ty:ty, $lt:lifetime) => { compile_error!("PL fields cannot appear in durable keys") };
     (key PL, $d:ident, $ty:ty) => { compile_error!("PL fields cannot appear in durable keys") };
@@ -1458,6 +1529,10 @@ macro_rules! durable_field {
     (shape H, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("H ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::HDigest>::shape_h($s);
+    }};
+    (shape G, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("G ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::GrownArray>::shape_grown($s);
     }};
     (shape E, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("E ", stringify!($f), ": ", stringify!($ty)))

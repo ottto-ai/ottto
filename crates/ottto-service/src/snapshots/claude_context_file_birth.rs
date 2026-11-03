@@ -45,6 +45,11 @@ const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 /// timestamp when they write a copy (`/branch`, `/resume` copy, fork). Only
 /// such a writer lets the money birth rule skip pre-birth records; any other
 /// or mixed writer counts and discloses them.
+///
+/// Frozen. Never append (an append re-enables a copy route for new resumes).
+/// Append-only is only a decode guarantee for stored heads: `ClaudeWriterRun`
+/// stores a position and `ClaudeOwnWriters` one slot per entry, so an insert,
+/// reorder or removal would silently remap stored writers.
 pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
 
 /// Sticky response writer certificate. Zero = no responses, 255 = invalid.
@@ -74,12 +79,47 @@ crate::heap_layout_bound::no_heap!(true; ClaudeWriterRun);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClaudeOwnWriters {
     latest: i64,
-    others: [i64; KNOWN_COPY_WRITERS.len()],
+    others: ClaudeWriterSlots,
 }
-crate::durable_tail_codec::durable_struct!(ClaudeOwnWriters {
-    N latest: i64,
-    N others: [i64; KNOWN_COPY_WRITERS.len()],
-});
+type ClaudeWriterSlots = [i64; KNOWN_COPY_WRITERS.len()];
+/// Stored as `latest`, then `others` with its length (`GrownArray`), so a
+/// head written before a writer was appended still loads. The appended slot
+/// takes the stored `latest`: a stored line from that version was observed
+/// while it was unlisted, which moved every listed slot (`observe`), so no
+/// stored line is known to be the new writer's own. The listed slots keep
+/// their values, so a stored certificate stays as it was.
+impl crate::durable_tail_codec::Durable for ClaudeOwnWriters {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        <i64 as crate::durable_tail_codec::Durable>::put(&self.latest, e)?;
+        crate::durable_tail_codec::GrownArray::put_grown(&self.others, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        let latest = <i64 as crate::durable_tail_codec::Durable>::take(d)?;
+        let others =
+            <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::take_grown(d, || latest)?;
+        Ok(Self { latest, others })
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <i64 as crate::durable_tail_codec::Durable>::verify(d)?;
+        <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::verify_grown(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        if s.enter("ClaudeOwnWriters") {
+            s.push("N latest");
+            <i64 as crate::durable_tail_codec::Durable>::shape(s);
+            s.push("G others");
+            <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::shape_grown(s);
+            s.leave();
+        }
+    }
+}
 impl Default for ClaudeOwnWriters {
     fn default() -> Self {
         Self {
@@ -1309,5 +1349,33 @@ impl ClaudeFileBirth {
 
     pub(crate) fn tagged_responses_for_test(&self) -> u64 {
         self.tagged_responses
+    }
+
+    pub(crate) fn set_writer_for_test(
+        &mut self,
+        latest: i64,
+        others: [i64; KNOWN_COPY_WRITERS.len()],
+    ) {
+        self.writer = ClaudeOwnWriters { latest, others };
+    }
+
+    pub(crate) fn writer_for_test(&self) -> (i64, [i64; KNOWN_COPY_WRITERS.len()]) {
+        (self.writer.latest, self.writer.others)
+    }
+
+    pub(crate) fn writer_certified_from_for_test(&self, cutoff: i128) -> bool {
+        self.writer.certified_from(cutoff)
+    }
+
+    /// The writer's stored bytes as a build with `slots` writers wrote them.
+    pub(crate) fn writer_bytes_for_test(&self, slots: usize) -> Vec<u8> {
+        let mut e = crate::durable_tail_codec::Enc::bytes(1 << 10);
+        crate::durable_tail_codec::Durable::put(&self.writer.latest, &mut e).unwrap();
+        let mut out = e.into_bytes();
+        out.extend(crate::durable_tail_codec::grown_bytes_for_test(
+            &self.writer.others,
+            slots,
+        ));
+        out
     }
 }
