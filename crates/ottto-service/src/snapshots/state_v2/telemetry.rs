@@ -79,6 +79,8 @@ pub(super) fn latest_for_test(name: &str) -> Option<serde_json::Value> {
 thread_local! {
     static THREAD_EVENTS: std::cell::RefCell<BTreeMap<&'static str, serde_json::Value>> =
         Default::default();
+    static THREAD_CHECKPOINTS: std::cell::RefCell<Vec<(&'static str, serde_json::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 /// Test evidence only: takes this thread's latest value of an event, so a
 /// concurrent test cannot supply or overwrite it.
@@ -113,13 +115,7 @@ pub(super) struct Stage {
 impl Stage {
     pub(super) fn new(kind: Kind) -> Self {
         if matches!(kind, Kind::Hydrate) {
-            // The first adopted load has no active runtime at prepare entry.
-            // Start its v2 window here, after publication has been verified.
-            if !PASS.with(|pass| pass.borrow().started) {
-                pass_start();
-            }
-            PASS.with(|pass| pass.borrow_mut().active = true);
-            initialize_pass();
+            start_hydrate();
         }
         Self {
             kind,
@@ -156,6 +152,7 @@ impl Stage {
                         peak,
                         cpu_us: cpu,
                         wall_us: Some(self.probe.wall_us()),
+                        ..Default::default()
                     },
                 );
             }
@@ -167,6 +164,49 @@ impl Drop for Stage {
     fn drop(&mut self) {
         self.record();
     }
+}
+
+fn start_hydrate() {
+    // The first adopted load has no active runtime at prepare entry.
+    // Start its v2 window here, after publication has been verified.
+    if !PASS.with(|pass| pass.borrow().started) {
+        pass_start();
+    }
+    PASS.with(|pass| pass.borrow_mut().active = true);
+    initialize_pass();
+}
+/// Instantaneous counts-only checkpoints; CPU is cumulative process CPU, so
+/// adjacent readings can be subtracted even across ACK work outside hydrate.
+pub(super) fn hydrate_checkpoint(
+    name: &'static str,
+    save_digests: usize,
+    cx: Option<&kinds::KindCx>,
+) {
+    if !PASS.with(|pass| pass.borrow().active) {
+        return;
+    }
+    initialize_pass();
+    let window = MemoryWindow {
+        current: crate::local_resource_diagnostics::state_v2_memory(),
+        process_cpu_us: crate::local_resource_diagnostics::state_v2_cpu_us(),
+        save_digests: Some(save_digests),
+        // Hydrate-owned maps; no key/value walks or serialized size estimates.
+        kind_cx_entries: cx.map(|cx| {
+            cx.presence.len()
+                + cx.account_ids.len()
+                + cx.digests.len()
+                + cx.cold_rolled.len()
+                + cx.compaction.done.len()
+        }),
+        ..Default::default()
+    };
+    #[cfg(test)]
+    THREAD_CHECKPOINTS.with(|checkpoints| {
+        checkpoints
+            .borrow_mut()
+            .push((name, serde_json::to_value(&window).unwrap()));
+    });
+    record_memory(name, window);
 }
 
 pub(super) fn baseline(path: &Path) {
@@ -253,20 +293,21 @@ pub(in super::super) fn phase(name: &'static str) {
         return;
     }
     initialize_pass();
-    let memory = crate::local_resource_diagnostics::state_v2_memory();
+    record_memory(
+        name,
+        MemoryWindow {
+            current: crate::local_resource_diagnostics::state_v2_memory(),
+            ..Default::default()
+        },
+    );
+}
+fn record_memory(name: &'static str, window: MemoryWindow) {
     if let Ok(mut stats) = stats().lock() {
-        stats.stage_memory.insert(
-            name,
-            MemoryWindow {
-                current: memory,
-                peak: Default::default(),
-                cpu_us: None,
-                wall_us: None,
-            },
-        );
+        stats.stage_memory.insert(name, window);
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
+
 pub(in super::super) fn acquired(index: &ScanIndex) {
     if !super::state_v2_growth_retention_active(index) {
         return;
@@ -393,10 +434,16 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
     Some(bytes)
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct MemoryWindow {
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_digests: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind_cx_entries: Option<usize>,
     /// Process CPU and wall across the stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_us: Option<u64>,
@@ -432,6 +479,7 @@ impl Drop for Window {
                     peak,
                     cpu_us: cpu,
                     wall_us: Some(self.probe.wall_us()),
+                    ..Default::default()
                 },
             );
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
@@ -501,6 +549,65 @@ pub(super) fn row_cap_save() {
 #[cfg(test)]
 mod ops_tests {
     use super::*;
+
+    /// [behaviour] Cold and reused loads emit the hydrate checkpoints in order.
+    #[test]
+    fn hydrate_checkpoints_follow_load_order() {
+        let root = crate::test_scratch::canonical_private_dir("hydrate-checkpoints");
+        let parent = root.join("snapshots/destinations").join("a".repeat(64));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("claude_code-test-scan-index.json");
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        abort_pass();
+        THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
+        ScanIndex::load(&path).unwrap();
+        // Cold loads/checkpoints must not open or initialize a pass window.
+        hydrate_checkpoint("hydrate_route_entry", 0, None);
+        assert_eq!(PASS.with(|pass| pass.borrow().clone()), Pass::default());
+        THREAD_CHECKPOINTS.with(|checkpoints| assert!(checkpoints.borrow().is_empty()));
+        for cold in [true, false] {
+            pass_start();
+            THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
+            let loaded = if cold {
+                super::super::money_test_support::publish(&ScanIndex::default(), &path, &progress)
+            } else {
+                ScanIndex::load(&path).unwrap()
+            };
+            let checkpoints = THREAD_CHECKPOINTS
+                .with(|checkpoints| std::mem::take(&mut *checkpoints.borrow_mut()));
+            assert_eq!(
+                checkpoints
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+                [
+                    "hydrate_route_entry",
+                    "hydrate_after_ack",
+                    "hydrate_after_decode",
+                    "hydrate_after_baseline",
+                    "hydrate_exit",
+                ]
+            );
+            for (name, sample) in checkpoints {
+                assert!(sample["current"].is_object());
+                assert!(sample["save_digests"].is_u64());
+                if name == "hydrate_after_baseline" || name == "hydrate_exit" {
+                    assert!(sample["save_digests"].as_u64().unwrap() > 0);
+                    assert!(sample["kind_cx_entries"].is_u64());
+                }
+                if cfg!(any(target_os = "macos", target_os = "linux")) {
+                    assert!(sample["process_cpu_us"].is_u64());
+                }
+            }
+            drop(loaded);
+        }
+        super::super::erase_tree(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// [regress] Nested growth custody loads preserve measurements already
     /// accumulated by the enclosing preparation/acquisition pass.
