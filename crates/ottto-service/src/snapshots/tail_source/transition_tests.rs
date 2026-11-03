@@ -395,7 +395,7 @@ fn a_shrunk_collection_retires_its_vanished_pages() {
     assert!(pages::<Codex>(&route, &key).contains_key(&(Collection::Signatures, 1)));
 
     let committed = head::<Codex>(&route, &key);
-    let mut base = TailBase::new(&committed.body, false);
+    let mut base = TailBase::new(&committed.body);
     state_v2::load_tail(&route.index, &key, &committed, |collection, page, bytes| {
         base.observe::<Codex>(collection, page, &bytes)
             .map_err(|_| anyhow::anyhow!("page"))
@@ -451,7 +451,7 @@ fn a_codex_finish_field_sets_aside_only_its_own_file() {
 /// `path`'s committed head and pages as a read's base.
 fn base_of(route: &Route, key: &str) -> TailBase {
     let committed = head::<Codex>(route, key);
-    let mut base = TailBase::new(&committed.body, false);
+    let mut base = TailBase::new(&committed.body);
     state_v2::load_tail(&route.index, key, &committed, |collection, page, bytes| {
         base.observe::<Codex>(collection, page, &bytes)
             .map_err(|_| anyhow::anyhow!("page"))
