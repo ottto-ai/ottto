@@ -13786,15 +13786,7 @@ fn open_pi_session_root_from_home_io(
     home: &Path,
     sessions: &Path,
 ) -> std::io::Result<OpenPiSessionRoot> {
-    let components = pi_session_components(home, sessions)?;
-    let trusted_home = open_pi_session_root_direct_io(home)?;
-    let mut directory = trusted_home.directory;
-    let mut path = home.to_path_buf();
-    for component in components {
-        directory = open_pi_directory_component(&directory, component)?;
-        path.push(component);
-    }
-    Ok(OpenPiSessionRoot { path, directory })
+    walk_pi_session_root_from_home(home, sessions, open_pi_directory_component)
 }
 
 #[cfg(unix)]
@@ -13802,12 +13794,23 @@ fn open_or_create_pi_session_root_from_home_io(
     home: &Path,
     sessions: &Path,
 ) -> std::io::Result<OpenPiSessionRoot> {
+    walk_pi_session_root_from_home(home, sessions, open_or_create_pi_directory_component)
+}
+
+/// Walks `sessions` one component at a time from the trusted home directory,
+/// each opened by `open`.
+#[cfg(unix)]
+fn walk_pi_session_root_from_home(
+    home: &Path,
+    sessions: &Path,
+    open: fn(&fs::File, &std::ffi::OsStr) -> std::io::Result<fs::File>,
+) -> std::io::Result<OpenPiSessionRoot> {
     let components = pi_session_components(home, sessions)?;
     let trusted_home = open_pi_session_root_direct_io(home)?;
     let mut directory = trusted_home.directory;
     let mut path = home.to_path_buf();
     for component in components {
-        directory = open_or_create_pi_directory_component(&directory, component)?;
+        directory = open(&directory, component)?;
         path.push(component);
     }
     Ok(OpenPiSessionRoot { path, directory })
