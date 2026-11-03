@@ -17,19 +17,16 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
-pub(crate) use runtime::{
-    erase_source, erase_tail_rows, remove_retired_record_dir, retired_record_dir,
-    source_erasure_alarm,
-};
+pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, runtime_path,
-    save_locked, save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
+    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
+    idle, load_locked, load_usage, published, recovery_save_guard, runtime_path, save_locked,
+    save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
     visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
 };
 mod catalogue;

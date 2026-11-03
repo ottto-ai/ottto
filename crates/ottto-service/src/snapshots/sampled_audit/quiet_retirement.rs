@@ -79,13 +79,6 @@ impl SharedCache {
         self.quiet_state().passes.iter().any(|p| p.source == source)
     }
 
-    /// After a source's local copy is erased.
-    pub(crate) fn quiet_forget_source(&self, source: SnapshotSource) {
-        let mut state = self.quiet_state();
-        state.passes.retain(|p| p.source != source);
-        state.pending.retain(|_, p| p.source != source);
-    }
-
     /// The completion's own certificate is debt-free and names the object now
     /// at `key`'s path.
     pub(in crate::snapshots) fn quiet_certified(&self, key: &str, checkpoint: &Checkpoint) -> bool {

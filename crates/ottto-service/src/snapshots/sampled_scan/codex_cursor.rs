@@ -4541,21 +4541,6 @@ impl SharedCache {
         }))
     }
 
-    /// A Codex copy about to be erased: its paused job and suspended proof, with
-    /// their open readers, and header facts. The caller holds the sync cycle
-    /// lock, so no lease is active.
-    pub(crate) fn forget_codex_jobs(&self) {
-        // The paused job drops after the lock: its reader and credit may settle on drop.
-        drop(self.with_cursor(|cursor| {
-            retire_holder(cursor);
-            cursor.slot_key = None;
-            cursor.slot_members.clear();
-            cursor.slot_charge = 0;
-            cursor.headers.clear();
-            std::mem::replace(&mut cursor.slot, Slot::Empty)
-        }));
-    }
-
     pub(in crate::snapshots) fn cursor_slot_free(&self) -> bool {
         self.with_cursor(|cursor| matches!(cursor.slot, Slot::Empty))
             .unwrap_or(false)

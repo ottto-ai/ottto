@@ -789,6 +789,34 @@ struct UploadIndexSettlement {
 #[cfg(test)]
 pub(crate) mod withheld_support {
     use super::*;
+    /// A re-paired destination's Claude prior history, read as its first cycle
+    /// reads it: before any upload ledger record.
+    pub(crate) fn claude_prior_history_for_new_destination(
+        support_dir: &Path,
+        destination_namespace: &str,
+    ) -> crate::snapshots::PriorHistory {
+        let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
+        let scoped = snapshot_destination_scoped_index_path(&stable, destination_namespace);
+        claude_prior_history(
+            &load_backfill_state(support_dir),
+            destination_namespace,
+            &SnapshotUploadProgress::new(
+                destination_namespace.to_string(),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            ),
+            &snapshot_v3_index_path(&scoped),
+            support_dir,
+        )
+    }
+
+    pub(crate) fn source_erasure_failures_for_test(
+        support_dir: &Path,
+        source: SnapshotSource,
+    ) -> u32 {
+        let marker = source_marker_path(support_dir, source);
+        source_erasure_turn().get(&marker).copied().unwrap_or(0)
+    }
+
     pub(crate) fn settle_withheld(
         previous: &ScanIndex,
         mut index: ScanIndex,
@@ -5058,8 +5086,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Before credentials: a removed source erases even with no live device.
-    erase_disabled_sources(support_dir, &daemon.transcript_cache);
+    // Before credentials: a re-enabled source resumes even with no live device.
+    resume_reconnected_sources(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5869,10 +5897,19 @@ fn upload_local_health_projection_with(
 
 pub(crate) fn agent_status_source_enabled(source: &SourceKind) -> bool {
     load_snapshot_device_credentials().is_ok_and(|(device, _)| {
-        enabled_snapshot_sources(&device)
-            .into_iter()
-            .any(|item| &source_kind(item) == source)
+        agent_status_source_enabled_in(&device, &default_support_dir(), source)
     })
+}
+
+/// Granted and not paused: the source's automatic status passes run.
+pub(crate) fn agent_status_source_enabled_in(
+    device: &LocalDeviceBinding,
+    support_dir: &Path,
+    source: &SourceKind,
+) -> bool {
+    enabled_snapshot_sources_in(device, support_dir)
+        .into_iter()
+        .any(|item| &source_kind(item) == source)
 }
 
 pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Result<usize> {
@@ -12840,8 +12877,9 @@ fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
     device.sources.iter().any(|slug| slug == source.api_slug())
 }
 
-/// Consecutive failures per marker. Held across each erase turn, so a concurrent
-/// control-thread marker change cannot be overwritten by that turn's completion.
+/// Consecutive resume failures per marker. Held across each resume turn, so a
+/// concurrent control-thread marker change cannot be overwritten by that
+/// turn's completion.
 static SOURCE_ERASURE_TURN: Mutex<BTreeMap<PathBuf, u32>> = Mutex::new(BTreeMap::new());
 
 fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32>> {
@@ -12850,13 +12888,14 @@ fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32
         .unwrap_or_else(|p| p.into_inner())
 }
 
-/// Outside every erased file set: `pending`, `done` or `reconnect`.
+/// Any content but `reconnect` means paused (`pending`; `done` from older
+/// builds). Nothing local is erased while a source is off.
 fn source_marker_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     snapshot_index_path(support_dir, source)
         .with_file_name(format!("{}.source-disabled", source.api_slug()))
 }
 
-/// `None` only when clearly absent. An unreadable marker stays pending.
+/// `None` only when clearly absent. An unreadable marker stays paused.
 pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Option<String> {
     match std::fs::read_to_string(source_marker_path(support_dir, source)) {
         Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -12869,13 +12908,13 @@ fn write_source_marker(path: &Path, state: &str) -> Result<()> {
     sync_progress_parent(path)
 }
 
-/// Stops collection now; the next sync cycle erases. Never erases on this thread.
+/// Stops collection now and keeps every local file.
 pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let _turn = source_erasure_turn();
     write_source_marker(&source_marker_path(support_dir, source), "pending")
 }
 
-/// The explicit way back. A source that was never removed has nothing to erase.
+/// The explicit way back. A source that was never paused has nothing to resume.
 pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let _turn = source_erasure_turn();
     match source_marker(support_dir, source) {
@@ -12884,7 +12923,7 @@ pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSour
     }
 }
 
-/// A credential generation that drops a source removes it like an explicit disable.
+/// A credential generation that drops a source pauses it like an explicit disable.
 pub(crate) fn disable_sources_dropped_from_grant(
     support_dir: &Path,
     current: &LocalDeviceBinding,
@@ -12896,212 +12935,58 @@ pub(crate) fn disable_sources_dropped_from_grant(
         .try_for_each(|source| disable_snapshot_source(support_dir, source))
 }
 
-/// One attempt per owed source, under the cycle lock. Errors can name paths, so
-/// only counts are logged.
-pub(crate) fn erase_disabled_sources(
-    support_dir: &Path,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
-) {
-    erase_owed_login_addresses(support_dir, cache);
+/// One attempt per re-enabled source, under the cycle lock. The kept index,
+/// Tail rows and backfill progress make its next pass a warm Tail. Its upload
+/// witnesses go first and are synced, so what the server erased at source-off
+/// is sent again at each loop's own cadence; then the marker goes. A failure
+/// keeps the source paused for the next cycle. Errors can name paths, so only
+/// counts are logged.
+pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
-        let state = source_marker(support_dir, source);
-        if matches!(state.as_deref(), None | Some("done")) {
+        if source_marker(support_dir, source).as_deref() != Some("reconnect") {
             continue;
         }
-        // Transcript readers close before the first unlink.
-        if source == SnapshotSource::Codex {
-            cache.forget_codex_jobs();
-        }
-        if source == SnapshotSource::ClaudeCode {
-            crate::claude_status_coverage::forget_addresses();
-            cache.forget_retained_transcripts();
-        }
         let marker = source_marker_path(support_dir, source);
-        let erased = erase_source_files(support_dir, source, || {
-            cache.quiet_forget_source(source);
-            // Reconnect is this source's first bootstrap again: a full replay.
-            update_backfill_state(support_dir, |backfill| {
-                let slug = source.api_slug();
-                backfill.completed_parser_versions.remove(slug);
-                backfill.completed_replay_revisions.remove(slug);
-                backfill.completed_destination_namespaces.remove(slug);
-            })?;
-            if state.as_deref() == Some("reconnect") {
-                std::fs::remove_file(&marker)?;
-                sync_progress_parent(&marker)
-            } else {
-                write_source_marker(&marker, "done")
-            }
+        let resumed = drop_upload_witnesses(support_dir, source).and_then(|()| {
+            std::fs::remove_file(&marker)?;
+            sync_progress_parent(&marker)
         });
         let failures = turn.entry(marker).or_default();
-        *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+        *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
 }
 
-#[cfg(test)]
-pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
-    let marker = source_marker_path(support_dir, source);
-    source_erasure_turn().get(&marker).copied().unwrap_or(0)
-}
-
-/// `Some(consecutive failures)` while a login-address erase is owed.
-#[cfg(test)]
-pub(crate) fn login_address_erase_owed_for_test(support_dir: &Path) -> Option<u32> {
-    let marker = login_address_erase_marker(support_dir);
-    marker
-        .exists()
-        .then(|| source_erasure_turn().get(&marker).copied().unwrap_or(0))
-}
-
-fn login_address_erase_marker(support_dir: &Path) -> PathBuf {
-    snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
-        .with_file_name("claude-login-addresses.erase-owed")
-}
-
-/// Account removal: the next sync cycle erases what is kept of recorded login
-/// addresses, under the cycle lock and even with no live device.
-pub(crate) fn owe_login_address_erase(support_dir: &Path) -> Result<()> {
-    let marker = login_address_erase_marker(support_dir);
-    if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _turn = source_erasure_turn();
-    write_source_marker(&marker, "pending")
-}
-
-/// One attempt per owed erase. Only retained parses and Claude's Tail rows (a
-/// head's org markers) hold an address digest: the folder ledger holds none,
-/// and the rest of the index stays so the account's history is not replayed.
-/// The marker clears only once every route's erase succeeded.
-fn erase_owed_login_addresses(
-    support_dir: &Path,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
-) {
-    let marker = login_address_erase_marker(support_dir);
-    let mut turn = source_erasure_turn();
-    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == ErrorKind::NotFound)
-    {
-        return;
-    }
-    crate::claude_status_coverage::forget_addresses();
-    cache.forget_retained_transcripts();
-    let erased = erase_claude_tail_rows(support_dir).and_then(|()| {
-        std::fs::remove_file(&marker)?;
-        sync_progress_parent(&marker)
-    });
-    let failures = turn.entry(marker).or_default();
-    *failures = if erased.is_ok() { 0 } else { *failures + 1 };
-    if *failures > 3 {
-        crate::snapshots::state_v2::source_erasure_alarm(*failures);
-    }
-}
-
-/// Every Claude store's Tail rows, stable and in each destination namespace,
-/// and any retired restart-record directory beside them. Every route is tried;
-/// the first error is returned.
-fn erase_claude_tail_rows(support_dir: &Path) -> Result<()> {
-    let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
-    let family = stable.file_stem().and_then(|stem| stem.to_str());
-    let family = family.context("source_erasure_family")?;
-    let mut parents: Vec<PathBuf> = stable.parent().map(Path::to_path_buf).into_iter().collect();
-    match std::fs::read_dir(support_dir.join("snapshots/destinations")) {
-        Ok(namespaces) => {
-            for namespace in namespaces {
-                let namespace = namespace?.file_name();
-                let scoped =
-                    snapshot_destination_scoped_index_path(&stable, &namespace.to_string_lossy());
-                parents.extend(scoped.parent().map(Path::to_path_buf));
-            }
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let mut failed = None;
-    for parent in parents {
-        let entries = match std::fs::read_dir(&parent) {
-            Ok(entries) => entries,
+/// Every per-destination upload witness of `source`, each folder synced: its
+/// composition scope ACKs, its MCP inventory upload time (identity and version
+/// seed stay) and its footprint witnesses. No collected state is touched.
+fn drop_upload_witnesses(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    crate::context_composition::drop_upload_acks(support_dir, source)?;
+    crate::mcp_inventory::invalidate_upload_witness(support_dir, source)?;
+    let footprint = crate::snapshots::durable_sources::DurableSource::from_snapshot(source)
+        .map_or(&[][..], |row| row.properties().footprint_witnesses);
+    for dir in footprint {
+        let dir = support_dir.join(dir);
+        let entries = match std::fs::read_dir(&dir) {
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            entries => entries?,
         };
-        let mut stores = Vec::new();
+        // Opt-out markers beside them have no extension.
         for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with(family) {
-                continue;
-            }
-            if let Some(index) = name.strip_suffix(".v2.sqlite") {
-                stores.push(parent.join(index));
-            } else if name.ends_with(".durable-tail") {
-                crate::snapshots::state_v2::remove_retired_record_dir(&entry.path())?;
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                std::fs::remove_file(&path)?;
             }
         }
-        for index in stores {
-            if let Err(error) = crate::snapshots::state_v2::erase_tail_rows(&index) {
-                failed.get_or_insert(error);
-            }
-        }
-        sync_progress_parent(&parent.join("erased"))?;
-    }
-    failed.map_or(Ok(()), Err)
-}
-
-/// A source's caches outside `snapshots`, with their temp copies.
-fn source_cache_files(support_dir: &Path, source: SnapshotSource) -> Vec<PathBuf> {
-    [
-        crate::active_sessions::active_session_cache_path(support_dir, source),
-        detected_uses_cache_path(support_dir, source),
-        crate::mcp_inventory::cache_path(support_dir, source),
-    ]
-    .into_iter()
-    .flat_map(|path| [path.with_extension("json.tmp"), path])
-    .collect()
-}
-
-/// Forget: every source's caches. The opt-out markers beside them stay.
-pub(crate) fn erase_all_source_caches(support_dir: &Path) -> std::io::Result<()> {
-    for path in SNAPSHOT_SOURCES
-        .into_iter()
-        .flat_map(|source| source_cache_files(support_dir, source))
-    {
-        match std::fs::remove_file(path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
+        crate::context_composition::sync_dir(&dir)?;
     }
     Ok(())
-}
-
-fn erase_source_files(
-    support_dir: &Path,
-    source: SnapshotSource,
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    crate::context_composition::erase_source_state(support_dir, source)?;
-    let others = source_cache_files(support_dir, source);
-    let stable = snapshot_index_path(support_dir, source);
-    let destinations = support_dir.join("snapshots/destinations");
-    // Every parent exists, so an fsync of it fails only on a real I/O error.
-    for dir in others.iter().filter_map(|path| path.parent()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::create_dir_all(&destinations)?;
-    let mut indexes = vec![snapshot_v3_index_path(&stable)];
-    for namespace in std::fs::read_dir(&destinations)? {
-        let namespace = namespace?.file_name();
-        let namespace = namespace.to_string_lossy();
-        withdraw_source_manifest(&namespace, source);
-        let scoped = snapshot_destination_scoped_index_path(&stable, &namespace);
-        indexes.push(snapshot_v3_index_path(&scoped));
-    }
-    let family = stable.file_stem().and_then(|stem| stem.to_str());
-    let family = family.context("source_erasure_family")?;
-    crate::snapshots::state_v2::erase_source(&indexes, family, &others, complete)
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {
