@@ -546,8 +546,6 @@ impl PrefixSeal {
     /// admission. The caller keeps its object, extent, scope and freshness
     /// fences, and `admits` / `append_compatible` still decide admission.
     pub(crate) fn samples_match(&self, file: &mut File) -> bool {
-        #[cfg(test)]
-        SAMPLES_MATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
         let sealed = self.stamp.length;
         let len = self.sample_len as usize;
         if u64::from(self.sample_len) != sealed.min(SAMPLE_BYTES as u64)
@@ -1720,7 +1718,6 @@ thread_local! {
     pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A retained checkpoint `prepare` must refuse as `InvalidCheckpoint`.
     pub(crate) static OLD_CHECKPOINT_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1741,13 +1738,6 @@ fn between_guards() {
 #[cfg(test)]
 pub(crate) fn set_between_guards(hook: Option<Box<dyn FnMut()>>) {
     BETWEEN_GUARDS.with(|slot| *slot.borrow_mut() = hook);
-}
-
-/// Tests only: `PrefixSeal::samples_match` calls on this thread
-/// since the last call, which resets the count.
-#[cfg(test)]
-pub(crate) fn samples_match_calls() -> u64 {
-    SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
 }
 
 /// Test-only observations at the actual File::read call in read_sample.

@@ -6656,8 +6656,6 @@ fn corrupt_credit_accounting_fails_closed() {
 struct ProvenanceAdmission {
     _fixture: ScanRoot,
     cache: Arc<SharedCache>,
-    key: String,
-    members: Vec<CandidateFile>,
     floor: usize,
     empty: usize,
 }
@@ -6696,8 +6694,6 @@ fn provenance_admission() -> ProvenanceAdmission {
     ProvenanceAdmission {
         _fixture: fixture,
         cache,
-        key,
-        members,
         floor,
         empty,
     }

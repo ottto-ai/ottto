@@ -69006,7 +69006,7 @@ mod tests {
     fn codex_created_thread_no_marker_internal_parent_omission_never_uses_legacy_prefix() {
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
-        let parent = vec![
+        let parent = [
             json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
             json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
             codex_test_token_line(
