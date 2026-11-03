@@ -15,6 +15,7 @@ use crate::transcript_acquisition::DurableCertificate;
 pub(in crate::snapshots) mod claude;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
+pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
@@ -28,7 +29,11 @@ macro_rules! with_codec {
                 type $s = claude::Claude;
                 $arm
             }
-            SnapshotSource::Codex | SnapshotSource::Pi => $none,
+            SnapshotSource::Pi => {
+                type $s = pi::Pi;
+                $arm
+            }
+            SnapshotSource::Codex => $none,
         }
     };
 }
