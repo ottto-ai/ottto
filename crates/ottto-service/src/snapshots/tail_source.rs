@@ -28,7 +28,11 @@ macro_rules! with_codec {
                 type $s = claude::Claude;
                 $arm
             }
-            SnapshotSource::Codex | SnapshotSource::Pi => $none,
+            SnapshotSource::Codex => {
+                type $s = codex::Codex;
+                $arm
+            }
+            SnapshotSource::Pi => $none,
         }
     };
 }
