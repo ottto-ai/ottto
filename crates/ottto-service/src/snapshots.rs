@@ -73363,7 +73363,21 @@ mod tests {
         apply_codex_line(&no_base, &mut accumulator);
         assert!(accumulator.codex_creator_evidence.is_none());
         assert!(accumulator.codex_ordinal_expected.is_none());
-        assert!(codex_fork_creator_items(&[no_base, usage(1362)], id).is_empty());
+        // Without a history base or native start proof, this is the retired
+        // parent-ledger arm: AllLocal counts the available record, while the
+        // incomplete paginated creator evidence remains untrusted.
+        let local = codex_fork_creator_items(&[no_base, usage(1362)], id);
+        assert_eq!(local.len(), 1);
+        assert_eq!(
+            (
+                local[0].input_tokens,
+                local[0].output_tokens,
+                local[0].request_count
+            ),
+            (100, 5, 1)
+        );
+        assert!(local[0].usage_accounting_contract.is_some());
+        assert!(local[0].session_account_evidence.is_none());
         assert!(codex_fork_creator_items(
             &[header, usage(1362)],
             "019e253c-3333-7000-9000-cccccccccccc"
