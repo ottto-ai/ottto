@@ -13689,27 +13689,8 @@ fn serialized_json_digest<T: Serialize + ?Sized>(value: &T, domain: &[u8]) -> Op
 // Counts rejected interpretations, not unique requests: the same row can be
 // checked during proof, account coverage and rebuild. No content or identity is
 // retained, and this diagnostic never participates in an authority decision.
-#[cfg(not(test))]
-static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_API_CACHE_CREATION_REJECTIONS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-
-fn with_claude_api_cache_creation_rejections<T>(
-    operation: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
-) -> T {
-    #[cfg(test)]
-    {
-        CLAUDE_API_CACHE_CREATION_REJECTIONS.with(operation)
-    }
-    #[cfg(not(test))]
-    {
-        operation(&CLAUDE_API_CACHE_CREATION_REJECTIONS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_claude_api_cache_creation_rejections:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 pub(crate) fn claude_api_cache_creation_rejection_count() -> u64 {
     with_claude_api_cache_creation_rejections(|counter| {
@@ -26056,7 +26037,7 @@ pub(crate) struct OwnedSourceScan {
     launch_events: Option<Arc<crate::launch_events::LaunchEventInventory>>,
 }
 struct OwnedActiveFile {
-    first_read: Option<crate::local_resource_diagnostics::StageWindow>,
+    first_read: Option<crate::local_resource_diagnostics::FirstRead>,
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
     candidate: CandidateFile,
@@ -34106,7 +34087,7 @@ impl OwnedSourceScan {
                 index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
             }
             let mut active = Box::new(OwnedActiveFile {
-                first_read: crate::local_resource_diagnostics::StageWindow::first_read(
+                first_read: crate::local_resource_diagnostics::FirstRead::begin(
                     source,
                     candidate.size_bytes,
                     !index.files.contains_key(&local_index_key(&candidate.path)),
@@ -36503,13 +36484,11 @@ fn apply_physical_line(
             }
             Err(_) => {
                 report.malformed_json_line_count += 1;
-                crate::local_resource_diagnostics::jsonl::parse_failure();
                 None
             }
         },
         JsonlLineText::InvalidUtf8 => {
             report.invalid_utf8_line_count += 1;
-            crate::local_resource_diagnostics::jsonl::parse_failure();
             None
         }
     };
@@ -83048,7 +83027,7 @@ const _: () = {
     // Parser/custody boxing is unchanged; sampling counters are charged separately.
     assert!(
         size_of::<OwnedActiveFile>()
-            <= 880 + size_of::<Option<crate::local_resource_diagnostics::StageWindow>>()
+            <= 880 + size_of::<Option<crate::local_resource_diagnostics::FirstRead>>()
     );
     assert!(
         size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4928

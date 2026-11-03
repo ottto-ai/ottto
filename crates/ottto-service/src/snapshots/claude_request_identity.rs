@@ -2965,25 +2965,8 @@ pub(crate) fn note_marker_line(
     }
 }
 
-#[cfg(not(test))]
-static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-fn with_context_digest_scrubs<T>(
-    use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
-) -> T {
-    #[cfg(test)]
-    {
-        CONTEXT_DIGEST_SCRUBS.with(use_counter)
-    }
-    #[cfg(not(test))]
-    {
-        use_counter(&CONTEXT_DIGEST_SCRUBS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_context_digest_scrubs:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 /// This thread's count only, so a test takes no other test's identity counts.
 #[cfg(test)]
@@ -4368,24 +4351,8 @@ pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     IDENTITY_COUNTS[3].store(families, std::sync::atomic::Ordering::Relaxed);
     IDENTITY_COUNTS[4].store(files, std::sync::atomic::Ordering::Relaxed);
 }
-// Thread-local under test: another test's take must not race this count.
-#[cfg(not(test))]
-static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-fn with_no_key_flip_refusals<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
-    #[cfg(test)]
-    {
-        NO_KEY_FLIP_REFUSALS.with(use_counter)
-    }
-    #[cfg(not(test))]
-    {
-        use_counter(&NO_KEY_FLIP_REFUSALS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_no_key_flip_refusals:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {

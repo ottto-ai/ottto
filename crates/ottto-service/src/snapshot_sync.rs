@@ -7997,7 +7997,6 @@ fn finish_sync_source(
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
-        upload_policy,
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
     )
