@@ -3222,7 +3222,8 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         });
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
-            // These assertions run only in the macOS-specific tests below.
+            // On the database route the held-new certificate stays in RAM
+            // beside the committed head; a lost certificate reads Full.
             assert_eq!(
                 retry.modes,
                 if loss != 0 {
@@ -3289,19 +3290,16 @@ fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
     withheld_new_file_retries_from_retained_read(true, false, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
     withheld_new_file_retries_from_retained_read(false, true, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
     withheld_new_file_retries_from_retained_read(true, true, 0);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
     for loss in 1..=3 {

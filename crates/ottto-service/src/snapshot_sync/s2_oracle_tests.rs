@@ -209,6 +209,75 @@ fn append_after_restart_and_eviction_preserves_placement() {
     });
 }
 
+/// [money] A census deadline withholds a NEW copied file, so it gains no
+/// index entry. After the save and reload its committed head, custody and
+/// never acceptance, still continues it: the unchanged walk reads no
+/// transcript byte and growth reads Tail. The released body and its
+/// placement equal the cold Full's.
+#[test]
+fn held_new_file_continues_from_its_committed_head() {
+    use crate::snapshots::claude_request_census::with_walk_deadline_for_test as deadline;
+    with_e2(|| {
+        let mut c = corpus("s2-held-new-continues");
+        c.root(ROOT, &line(ROOT, "root", AT, 10));
+        c.evidence_for(
+            COPY,
+            &[api_login(COPY, "own", 20, '1', Some('7'))],
+            &[trace_for(COPY, "own", "")],
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        // The root, then the one-time identity-contract re-arm.
+        let mut prior = ScanIndex::default();
+        for _ in 0..2 {
+            let settled = ready(&c, &scanner, prior.clone(), 100, true);
+            prior = settle_captured_holds(&c, &prior, settled, &mut progress);
+        }
+        let accepted_before = progress.accepted_fingerprints.clone();
+        let path = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "root", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let key = path.to_string_lossy().into_owned();
+        let mut first = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        deadline(|| first.enrich(&c));
+        assert_withheld(&first, COPY, "external census unavailable");
+        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
+        assert!(
+            !prior.files.contains_key(&key),
+            "a held NEW file has no entry"
+        );
+
+        let (mut unchanged, consumed) =
+            fixture::observe_consumed(|| c.raw(&scanner, prior.clone(), 100, true, &[]));
+        assert_eq!(unchanged.modes, (0, 0, 1), "the committed head continues");
+        assert_eq!(
+            consumed, 0,
+            "an unchanged held file reads no transcript byte"
+        );
+        deadline(|| unchanged.enrich(&c));
+        assert_withheld(&unchanged, COPY, "external census still unavailable");
+        let prior = settle_captured_holds(&c, &prior, unchanged, &mut progress);
+        assert!(!prior.files.contains_key(&key));
+        assert_eq!(progress.accepted_fingerprints, accepted_before);
+
+        // Pre-birth, so growth alone cannot release the all-copied hold.
+        append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
+        let mut grown = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        assert_eq!(grown.modes, (0, 1, 0), "growth reads past the head only");
+        grown.enrich(&c);
+        let warm = result(&grown, Mode::Restart);
+        assert!(
+            warm.snapshots.contains_key(COPY),
+            "external evidence releases it"
+        );
+        let cold = result(&page(&c, prior, 100, false), Mode::ColdFull);
+        money_oracle::assert_equivalent(&cold, &warm);
+        grown.finish();
+    });
+}
+
 /// [money] Pages use fresh owners and cold graph loads at every boundary.
 /// Accumulated emitted bodies equal the single cold Full upload.
 #[test]

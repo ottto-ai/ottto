@@ -65,8 +65,10 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// what the file proves changed reads Full. An `UnknownOutcome` re-read
 /// continues as well. Growth beats an upload-context selection: a file that
 /// `grew` past its committed entry continues as for `TranscriptChanged`; a
-/// context-only one stays native, as do `NewFile`, `BodyWitnessAdoption` and
-/// every legacy selection.
+/// context-only one stays native, as do `BodyWitnessAdoption` and every
+/// legacy selection. A `NewFile` is a first read, except one `e2` withheld
+/// (`held_new`): its committed head is custody, never acceptance, and it
+/// continues as a changed file does.
 ///
 /// A late-evidence re-fold needs complete stored state and never answers a
 /// server challenge: a set-aside file, or one whose body waits on a retry (a
@@ -76,6 +78,7 @@ pub(in crate::snapshots) fn reuses_stored(
     key: &str,
     reason: Option<CandidateParseReason>,
     grew: bool,
+    held_new: bool,
 ) -> bool {
     match reason {
         None
@@ -85,6 +88,7 @@ pub(in crate::snapshots) fn reuses_stored(
             | CandidateParseReason::UnknownOutcome,
         ) => true,
         Some(CandidateParseReason::UploadContext) => grew,
+        Some(CandidateParseReason::NewFile) => held_new,
         Some(reason) => late_evidence(reason) && !set_aside(index, key) && !retry_held(index, key),
     }
 }

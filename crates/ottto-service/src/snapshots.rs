@@ -33912,8 +33912,15 @@ impl OwnedSourceScan {
                         taken.retained.state.usage_witness(),
                     )
                 });
+                // On a Tail route RAM keeps the held-new certificate alone;
+                // its continuation is the committed head.
+                #[cfg(unix)]
+                let tail_held_new = tail_route.is_some() && context.cache.tail_held_new(&key);
+                #[cfg(not(unix))]
+                let tail_held_new = false;
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
-                    && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
+                    && (tail_held_new
+                        || taken.as_ref().is_some_and(|taken| taken.e2_held_new_file));
                 let mut retained = taken;
                 let retained_present = retained.is_some();
                 let reinsertion =
@@ -34064,11 +34071,13 @@ impl OwnedSourceScan {
                                     index.files.get(&key).is_some_and(|entry| {
                                         candidate.size_bytes > entry.size_bytes
                                     }),
+                                    e2_held_new_file,
                                 )
                                 && !parser.reader.reader.is_compressed()
                         });
                         #[cfg(unix)]
                         if tail_route.is_some()
+                            && tail_load.is_none()
                             && parse_reason == Some(CandidateParseReason::NewFile)
                         {
                             tail_source::counters::bump(source, "tail_bootstrap_full", "new_file");
