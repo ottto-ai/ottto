@@ -82,7 +82,7 @@ pub(super) fn write_atomic<T>(
 }
 
 /// Flush a folder's entries to disk.
-pub(super) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     SYNCED_DIRS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
     File::open(dir)?.sync_all()

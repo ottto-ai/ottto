@@ -69,7 +69,7 @@ if [[ "$signer_workflow" != "ottto-ai/ottto/.github/workflows/macos-stable-relea
   echo "unexpected signer workflow: $signer_workflow" >&2
   exit 2
 fi
-if [[ "$source_ref" != "refs/heads/main" || "$source_digest" != "abcdef123456" ]]; then
+if [[ "$source_ref" != "refs/tags/v0.1.0" || "$source_digest" != "abcdef123456" ]]; then
   echo "unexpected source binding: $source_ref $source_digest" >&2
   exit 2
 fi
@@ -180,7 +180,20 @@ before_without_supply="$TMP_DIR/before-without-supply.json"
 after_without_supply="$TMP_DIR/after-without-supply.json"
 jq 'del(.supply_chain)' "$manifest" > "$before_without_supply"
 
-"$BINDER" \
+# [behaviour] The source ref has no default: without it the binder refuses to run.
+if (unset OTTTO_RELEASE_SOURCE_REF; "$BINDER" \
+  --manifest "$manifest" \
+  --subject-checksums "$TMP_DIR/subject.checksums.txt" \
+  --repo ottto-ai/ottto >"$TMP_DIR/no-ref.out" 2>&1); then
+  echo "Expected binder to fail without a source ref" >&2
+  exit 1
+fi
+if ! grep -Fq "Source ref is required" "$TMP_DIR/no-ref.out" || [[ -s "$GH_MOCK_LOG" ]]; then
+  echo "Binder without a source ref did not fail before attestation verification" >&2
+  exit 1
+fi
+
+OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" \
   --manifest "$manifest" \
   --subject-checksums "$TMP_DIR/subject.checksums.txt" \
   --repo ottto-ai/ottto \
@@ -198,7 +211,7 @@ jq -e '
   and .supply_chain.slsa_build.verified == true
   and .supply_chain.slsa_build.repository == "ottto-ai/ottto"
   and .supply_chain.slsa_build.signer_workflow == ".github/workflows/macos-stable-release.yml"
-  and .supply_chain.slsa_build.source_ref == "refs/heads/main"
+  and .supply_chain.slsa_build.source_ref == "refs/tags/v0.1.0"
   and .supply_chain.slsa_build.source_digest == "abcdef123456"
   and (.supply_chain.slsa_build.subjects | index("release-manifest.json") != null)
   and .supply_chain.materials[1].repository == "ottto-ai/coding-agents-observability"
@@ -226,7 +239,7 @@ if ! grep -Fq -- "--signer-workflow ottto-ai/ottto/.github/workflows/macos-stabl
   echo "Expected signer workflow attestation verification binding" >&2
   exit 1
 fi
-if ! grep -Fq -- "--source-ref refs/heads/main" "$GH_MOCK_LOG" || ! grep -Fq -- "--source-digest abcdef123456" "$GH_MOCK_LOG"; then
+if ! grep -Fq -- "--source-ref refs/tags/v0.1.0" "$GH_MOCK_LOG" || ! grep -Fq -- "--source-digest abcdef123456" "$GH_MOCK_LOG"; then
   echo "Expected source ref and digest attestation verification binding" >&2
   exit 1
 fi
@@ -237,7 +250,7 @@ jq '.supply_chain.slsa_build.verified = false | .supply_chain.sbom.verified = fa
   "$failed_manifest" > "$failed_manifest.next"
 mv "$failed_manifest.next" "$failed_manifest"
 export GH_ATTEST_FAIL=1
-if "$BINDER" \
+if OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" \
   --manifest "$failed_manifest" \
   --subject-checksums "$TMP_DIR/subject.checksums.txt" \
   --repo ottto-ai/ottto >/dev/null 2>&1; then

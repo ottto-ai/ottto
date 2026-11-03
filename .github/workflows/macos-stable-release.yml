@@ -54,9 +54,12 @@ concurrency:
 
 permissions:
   # contents: write is required only so the optional, input-gated GitHub Release
-  # verification mirror can create a tag/release. It never publishes to the CDN or
-  # promotes a channel; the CDN remains the install/update source of truth.
+  # verification mirror can publish a release for the existing tag. It never
+  # publishes to the CDN or promotes a channel; the CDN remains the install/update
+  # source of truth.
   contents: write
+  # Read the Public CI run and jobs that tested the tagged commit.
+  actions: read
   id-token: write
   attestations: write
   artifact-metadata: write
@@ -64,7 +67,6 @@ permissions:
 jobs:
   build-sign-notarize:
     name: Build, sign, notarize, attest
-    if: github.ref == 'refs/heads/main'
     environment: macos-stable-release
     timeout-minutes: 180
     # After AWS EC2 Mac migration, set OTTTO_MACOS_STABLE_RUNNER_LABELS to
@@ -76,6 +78,7 @@ jobs:
       OTTTO_NOTARY_WAIT_TIMEOUT: ${{ vars.OTTTO_NOTARY_WAIT_TIMEOUT || '30m' }}
       OTTTO_RELEASE_REPOSITORY: ${{ github.repository }}
       OTTTO_RELEASE_SIGNER_WORKFLOW: .github/workflows/macos-stable-release.yml
+      OTTTO_RELEASE_SOURCE_REF: ${{ github.ref }}
       OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
       OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
     steps:
@@ -83,6 +86,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          # Full history for the first-parent check on main.
+          fetch-depth: 0
 
       - name: Enforce dispatch policy
         env:
@@ -99,10 +104,12 @@ jobs:
             echo "macOS stable releases are workflow_dispatch only." >&2
             exit 1
           fi
-          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "macOS stable releases must run from main." >&2
+          # Releases build only from a v<X.Y.Z> release tag; any other ref fails.
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "macOS stable releases must run from a v<X.Y.Z> release tag, not $GITHUB_REF." >&2
             exit 1
           fi
+          tag_version="${GITHUB_REF#refs/tags/v}"
           # Reject any version that is not formula/installer-safe before it can
           # reach a run: block. Uses the SAME bash `[[ =~ ]]` construct as the
           # downstream scripts/homebrew_formula.sh and
@@ -136,8 +143,20 @@ jobs:
             echo "release_notes is required for macOS stable release artifacts." >&2
             exit 1
           fi
+          # Literal string compares, so the dots in the tag are not regex wildcards.
           case "$CHANNEL" in
-            stable-candidate|stable) ;;
+            stable)
+              if [[ "$VERSION" != "$tag_version" ]]; then
+                echo "Stable version $VERSION does not match tag v$tag_version." >&2
+                exit 1
+              fi
+              ;;
+            stable-candidate)
+              if [[ "$VERSION" != "$tag_version"-rc* || ! "${VERSION#"$tag_version"-rc}" =~ ^[0-9]+$ ]]; then
+                echo "Stable-candidate version $VERSION must be $tag_version-rc<N> for tag v$tag_version." >&2
+                exit 1
+              fi
+              ;;
             *)
               echo "Unsupported release channel: $CHANNEL" >&2
               exit 1
@@ -155,6 +174,13 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Verify release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/macos_release_source_check.sh release
 
       - name: Check signing runner readiness
         run: |
@@ -272,6 +298,8 @@ jobs:
             --output dist/macos/install-macos.sh
 
       - name: Generate attestation subject checksums
+        env:
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           (
@@ -283,7 +311,7 @@ jobs:
               ottto-local-platform-sbom.cdx.json
               release-manifest.json
             )
-            if [[ "${{ inputs.channel }}" == "stable" ]]; then
+            if [[ "$CHANNEL" == "stable" ]]; then
               subjects+=(install-macos.sh)
             fi
             shasum -a 256 "${subjects[@]}" > subject.checksums.txt
@@ -314,6 +342,8 @@ jobs:
 
       - name: Regenerate checksums for bound manifest
         if: inputs.release_mode == 'standard'
+        env:
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           (
@@ -325,7 +355,7 @@ jobs:
               ottto-local-platform-sbom.cdx.json
               release-manifest.json
             )
-            if [[ "${{ inputs.channel }}" == "stable" ]]; then
+            if [[ "$CHANNEL" == "stable" ]]; then
               subjects+=(install-macos.sh)
             fi
             shasum -a 256 "${subjects[@]}" > subject.checksums.txt
@@ -426,7 +456,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$VERSION"
-          tag="v${version}"
+          tag="${GITHUB_REF#refs/tags/}"
           # Verification mirror only: the CDN at install.ottto.net stays the install and
           # update source of truth. This step never promotes a channel pointer or writes
           # to the CDN; it only publishes signed verification assets to a GitHub Release.
@@ -434,9 +464,10 @@ jobs:
             echo "GitHub Release $tag already exists; refusing to overwrite a published release." >&2
             exit 1
           fi
+          # Publish a release for the existing release tag only; never create a tag.
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --verify-tag \
             --title "Ottto ${version}" \
             --notes "Public verification mirror for Ottto ${version}. Install and update source of truth is the CDN; these assets exist for signature and checksum verification only." \
             dist/macos/Ottto-macos-*.dmg \

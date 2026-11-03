@@ -28,7 +28,7 @@ candidate_manifest="$TMP_DIR/stable-candidate-release-manifest.json"
 jq -n '{
   schema_version: 1,
   product: "ottto-local-platform",
-  version: "0.1.0-stable-candidate.1",
+  version: "0.1.0-rc1",
   channel: "stable-candidate",
   commit: "abcdef123456"
 }' > "$candidate_manifest"
@@ -44,8 +44,9 @@ jq -n \
     candidate_manifest: {
       product: "ottto-local-platform",
       channel: "stable-candidate",
-      version: "0.1.0-stable-candidate.1",
+      version: "0.1.0-rc1",
       commit: "abcdef123456",
+      app_source_commit: "123456abcdef123456abcdef123456abcdef1234",
       sha256: $candidate_sha
     },
     environment: {
@@ -56,7 +57,7 @@ jq -n \
     local_platform: {
       runtime: "ottto-service",
       service_label: "net.ottto.service",
-      version: "0.1.0-stable-candidate.1",
+      version: "0.1.0-rc1",
       release_channel: "stable-candidate",
       protocol_version: 15,
       release_manifest_sha256: $candidate_sha
@@ -381,6 +382,15 @@ if "$PREFLIGHT" --manifest "$commit_mismatch_manifest" --dry-run >/dev/null 2>&1
   echo "Expected stable-candidate RC commit mismatch to fail stable preflight" >&2
   exit 1
 fi
+
+app_commit_mismatch_manifest="$TMP_DIR/stable-candidate-rc-app-commit-mismatch-manifest.json"
+jq '(.supply_chain.materials[] | select(.kind == "git_subtree") | .commit) = "999999abcdef123456abcdef123456abcdef1234"' \
+  "$stable_manifest" > "$app_commit_mismatch_manifest"
+if "$PREFLIGHT" --manifest "$app_commit_mismatch_manifest" --dry-run >"$TMP_DIR/app-commit-mismatch.out" 2>&1; then
+  echo "Expected stable-candidate RC app source commit mismatch to fail stable preflight" >&2
+  exit 1
+fi
+grep -q "stable manifest release identity (version, commit, app source commit)" "$TMP_DIR/app-commit-mismatch.out"
 
 bad_sha_manifest="$TMP_DIR/bad-sha-manifest.json"
 write_manifest \

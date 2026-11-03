@@ -222,17 +222,14 @@ fn a_held_original_conserves_its_dependent_copy_money() {
             last_accepted,
             "{arm}: the last accepted body is kept"
         );
-        // The Tail path keeps a held original's census record as last read
-        // (no invalidation runs off the restore gate); for a changed entry
-        // the copy's proof is reported above, not asserted.
-        if arm != "entry_changed" {
-            assert_eq!(
-                index.claude_request_census.get(&original),
-                Some(&record),
-                "{arm}"
-            );
-            assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash, "{arm}");
-            assert_eq!(Some(&copy_sent), cold.as_ref(), "{arm}: the copy's money");
-        }
+        // Every held arm, a changed entry included, keeps its census record
+        // as last read: the Tail path has no restore gate to invalidate it.
+        assert_eq!(
+            index.claude_request_census.get(&original),
+            Some(&record),
+            "{arm}"
+        );
+        assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash, "{arm}");
+        assert_eq!(Some(&copy_sent), cold.as_ref(), "{arm}: the copy's money");
     }
 }

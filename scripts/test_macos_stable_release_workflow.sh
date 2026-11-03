@@ -29,7 +29,13 @@ deny_grep() {
 
 require_grep '^  workflow_dispatch:$' 'workflow_dispatch trigger'
 deny_grep '^  (push|pull_request):$' 'stable release workflow must not run on push or PR'
-require_grep 'github\.ref == '\''refs/heads/main'\''' 'main branch guard'
+deny_grep 'refs/heads/main' 'stable releases must not build from main'
+deny_grep '^    if:' 'a wrong-ref dispatch must fail red in the policy step, not skip the job'
+require_grep 'refs/tags/v\[0-9\]' 'release tag guard'
+require_grep 'OTTTO_RELEASE_SOURCE_REF: \$\{\{ github\.ref \}\}' 'attestation source ref from the release tag'
+require_grep 'scripts/macos_release_source_check\.sh release' 'release source verification step'
+require_grep 'actions: read' 'actions read permission for the Public CI evidence check'
+require_grep 'fetch-depth: 0' 'full history for the first-parent check'
 require_grep 'environment: macos-stable-release' 'protected release environment'
 require_grep 'contents: write' 'contents write permission for the GitHub Release verification mirror'
 require_grep 'id-token: write' 'OIDC permission for attestations'
@@ -62,6 +68,8 @@ require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evid
 require_grep 'github_release_mirror:' 'github_release_mirror input'
 require_grep "inputs\.channel == 'stable' && inputs\.github_release_mirror == true" 'release mirror is stable-only and input-gated'
 require_grep 'gh release create' 'release mirror uses gh release create'
+require_grep '--verify-tag' 'release mirror publishes the existing release tag only'
+deny_grep '--target' 'release mirror must never create a tag'
 require_grep 'gh release view' 'release mirror refuses an existing tag/release'
 require_grep 'dist/macos/release-manifest\.json\.sig' 'release mirror uploads the signed manifest signature'
 require_grep 'dist/macos/subject\.checksums\.txt' 'release mirror uploads the subject checksums'
@@ -83,6 +91,89 @@ if unpinned:
 if workflow.count("actions/attest@") < 4:
     print("Expected initial and final provenance/SBOM attestation steps", file=sys.stderr)
     sys.exit(1)
+in_run = False
+for number, line in enumerate(workflow.splitlines(), 1):
+    stripped = line.strip()
+    if stripped == "run: |":
+        in_run, indent = True, len(line) - len(line.lstrip()) + 2
+        continue
+    if in_run and stripped and len(line) - len(line.lstrip()) < indent:
+        in_run = False
+    if in_run and "${{" in line:
+        print(f"Workflow line {number}: pass expressions to run blocks through env", file=sys.stderr)
+        sys.exit(1)
 PY
+
+# [behaviour] Run the dispatch policy step itself against tag and version cases.
+policy_dir="$(mktemp -d)"
+trap 'rm -rf "$policy_dir"' EXIT
+python3 - "$WORKFLOW" "$policy_dir/policy.sh" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = lines.index("      - name: Enforce dispatch policy")
+run = next(i for i in range(start, len(lines)) if lines[i] == "        run: |")
+body = []
+for line in lines[run + 1 :]:
+    if line.strip() and not line.startswith(" " * 10):
+        break
+    body.append(line[10:])
+Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
+PY
+
+# run_policy <ref> <channel> <version>
+run_policy() {
+  env -i PATH="$PATH" \
+    GITHUB_EVENT_NAME=workflow_dispatch \
+    GITHUB_REF="$1" \
+    CHANNEL="$2" \
+    VERSION="$3" \
+    ARTIFACT_BASE_URL="https://install.example.invalid/releases/$3" \
+    RELEASE_NOTES="Policy fixture" \
+    PUBLISH_INTENT=none \
+    RELEASE_MODE=standard \
+    OPERATOR_APPROVAL= \
+    bash "$policy_dir/policy.sh" >"$policy_dir/out" 2>&1
+}
+
+expect_policy_accept() {
+  if ! run_policy "$@"; then
+    echo "Dispatch policy rejected $*:" >&2
+    cat "$policy_dir/out" >&2
+    exit 1
+  fi
+}
+
+expect_policy_reject() {
+  local expected="$1"
+  shift
+  if run_policy "$@"; then
+    echo "Dispatch policy accepted $*" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$expected" "$policy_dir/out"; then
+    echo "Dispatch policy rejected $* without: $expected" >&2
+    cat "$policy_dir/out" >&2
+    exit 1
+  fi
+}
+
+expect_policy_accept refs/tags/v0.1.2 stable 0.1.2
+expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc1
+expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc12
+expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/heads/main stable 0.1.2
+expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/heads/v0.1.2 stable 0.1.2
+expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/tags/v0.1.2-rc1 stable-candidate 0.1.2-rc1
+expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/tags/release-0.1.2 stable 0.1.2
+expect_policy_reject "does not match tag" refs/tags/v0.1.2 stable 0.1.3
+expect_policy_reject "does not match tag" refs/tags/v0.1.2 stable 0.1.2-rc1
+expect_policy_reject "must be 0.1.2-rc<N>" refs/tags/v0.1.2 stable-candidate 0.1.2
+expect_policy_reject "must be 0.1.2-rc<N>" refs/tags/v0.1.2 stable-candidate 0.1.3-rc1
+expect_policy_reject "must be 0.1.2-rc<N>" refs/tags/v0.1.2 stable-candidate 0.1.2-rcx
+# The tag's dots are literal: tag v0.1.2 must not accept version 0.112-rc1.
+expect_policy_reject "must be 0.1.2-rc<N>" refs/tags/v0.1.2 stable-candidate 0.112-rc1
 
 echo "macos_stable_release_workflow tests passed"
