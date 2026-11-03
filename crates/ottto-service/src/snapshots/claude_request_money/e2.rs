@@ -2727,10 +2727,12 @@ fn decide_holders(
     );
     let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
     let pending_files = std::cell::OnceCell::new();
-    let mut updates = CopyRemovalUpdates::default();
-
-    // Stored removals leave only with their file (`ScanIndex::drop_file_entry`).
-    updates.state = Some(index.claude_copy_removals.clone());
+    let mut updates = CopyRemovalUpdates {
+        // Stored removals leave only with their file
+        // (`ScanIndex::drop_file_entry`); no page sweeps them.
+        state: Some(index.claude_copy_removals.clone()),
+        ..Default::default()
+    };
 
     for wanted in wanted {
         let decided =
