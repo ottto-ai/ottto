@@ -3156,10 +3156,11 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
 /// [regress] 0.1.214: with fresh appends on every page and census members
 /// queued, the Codex rotation alternated freshness (F) and census (C) turns
 /// and never ran an ordinary one, so a header-validated archive and a plain
-/// re-read, both queued non-members, were never selected. A census turn now
-/// owes the next selecting page to such work: C -> O -> F, and each queued
-/// item is selected within 3 selecting pages. Control: with no ordinary-only
-/// work, a census turn is still followed by a freshness turn (F, C, F).
+/// re-read, both queued non-members, were never selected. While such work
+/// waits, the turn a freshness page owes now alternates census (C) and
+/// ordinary (O): F O F C. Fresh keeps every second selecting page, and
+/// ordinary and census work are each served within 4 selecting pages.
+/// Control: with no ordinary-only work the order stays F C F C.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -3270,14 +3271,15 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             (index, kind, flags)
         };
 
-        // Control: no ordinary-only work, so F <-> C is unchanged.
+        // Control: no ordinary-only work, so F C F C is unchanged; the
+        // census bit set on page 2 does not divert page 4.
         let mut kinds = Vec::new();
-        for page in 1..=3 {
+        for page in 1..=4 {
             let (next, kind, _) = turn(index, page);
             index = next;
             kinds.push(kind);
         }
-        assert_eq!(kinds, ['F', 'C', 'F']);
+        assert_eq!(kinds, ['F', 'C', 'F', 'C']);
 
         // A plain non-member re-read and a hinted non-member archive.
         let traversal = index.traversal.as_mut().unwrap();
@@ -3289,21 +3291,22 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
                 watcher_hint,
             });
         }
+        // Ordinary debt waits: fresh keeps pages 5 and 7, the owed turn
+        // after census serves it on page 6, and census returns on page 8.
         let mut kinds = Vec::new();
-        let mut selected = BTreeMap::new();
-        for page in 4..=6 {
+        let mut pages = Vec::new();
+        for page in 5..=8 {
             let (next, kind, flags) = turn(index, page);
             index = next;
             kinds.push(kind);
-            selected.extend(flags);
+            pages.push(flags);
         }
-        assert_eq!(kinds, ['C', 'O', 'F']);
-        assert_eq!(selected.get(&reread_key), Some(&(false, false)));
-        assert_eq!(selected.get(&archive_key), Some(&(false, true)));
-        assert!(selected.contains_key(&session_key));
+        assert_eq!(kinds, ['F', 'O', 'F', 'C']);
+        assert_eq!(pages[1].get(&reread_key), Some(&(false, false)));
+        assert_eq!(pages[1].get(&archive_key), Some(&(false, true)));
         assert!(ids
             .iter()
-            .any(|id| selected.contains_key(&local_index_key(&fixture.file(id)))));
+            .any(|id| pages[3].contains_key(&local_index_key(&fixture.file(id)))));
     });
 }
 

@@ -27143,24 +27143,24 @@ impl OwnedSourceScan {
             });
         }
         // Fresh data gets a bounded page of its own, at most every other
-        // selecting page (every third while ordinary-only work waits).
-        // Mixing it behind 64 MiB of census revalidation
+        // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
         // Continuations never select new work. A hint alone does not trigger
         // a read: all selected paths still pass the unchanged candidate gate.
-        // After a census turn, queued work neither dedicated turn selects
-        // (archives, plain re-reads, audits) gets the next selecting page:
-        // neither dedicated turn runs, so the ordinary selection below does.
-        // F -> C -> O; with no such work it stays F <-> C. Order only.
+        // The turn a freshness page owes alternates census and ordinary work
+        // while queued work neither dedicated turn selects (archives, plain
+        // re-reads, audits) waits: on its ordinary turn neither dedicated
+        // turn runs, so the ordinary selection below does. F C F O; with no
+        // such work it stays F C F C. Fresh keeps its cadence. Order only.
         let ordinary_turn = source == SnapshotSource::Codex
             && selection_limit > 0
+            && traversal.codex_freshness_yield
             && codex_census_turn_was_last(&traversal.scan_roots)
             && traversal.pending_candidates.iter().any(|candidate| {
                 !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
             });
         let freshness_page = source == SnapshotSource::Codex
             && selection_limit > 0
-            && !ordinary_turn
             && !traversal.codex_freshness_yield
             && traversal
                 .pending_candidates
@@ -27177,7 +27177,9 @@ impl OwnedSourceScan {
                 .any(|candidate| candidate.census_member);
         if source == SnapshotSource::Codex && selection_limit > 0 {
             traversal.codex_freshness_yield = freshness_page;
-            note_codex_census_turn(&traversal.scan_roots, census_page);
+            if !freshness_page {
+                note_codex_census_turn(&traversal.scan_roots, census_page);
+            }
         }
         if freshness_page || census_page {
             let limit = if freshness_page {
@@ -45894,7 +45896,7 @@ fn codex_selection_may_exhaust_page(
     false
 }
 
-/// Codex scan-root sets whose last selecting page was a census turn.
+/// Codex scan-root sets whose last non-fresh selecting page was a census turn.
 /// Scheduling only and RAM only: the index is reloaded every page, and a
 /// restart costs at most one rotation. One entry per configured root set.
 static CODEX_CENSUS_TURN_LAST: Mutex<BTreeSet<Vec<PathBuf>>> = Mutex::new(BTreeSet::new());
