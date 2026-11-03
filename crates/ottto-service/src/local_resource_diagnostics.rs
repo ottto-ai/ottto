@@ -631,6 +631,8 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
+    /// A never-read file past the first-read bound.
+    FirstReadAge = 16,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
@@ -1126,6 +1128,7 @@ impl Probe {
                 source,
                 &[
                     ("age", 0),
+                    ("first_read_age", 16),
                     ("size", 1),
                     ("withheld_oversized", 2),
                     ("withheld_absence_ambiguous", 18),

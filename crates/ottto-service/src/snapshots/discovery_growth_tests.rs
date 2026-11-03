@@ -619,7 +619,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .unwrap()
         .write_all(b"\n")
         .unwrap();
-    f.age(91);
+    // Past the 7-day window, inside the 60-day first-read bound: the cold
+    // Full oracle below reads with an empty index.
+    f.age(59);
     let (caught, scan, reads, rows) = f.page(source, index);
     assert!(
         !rows

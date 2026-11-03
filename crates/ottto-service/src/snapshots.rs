@@ -240,6 +240,8 @@ pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
+mod first_read_tests;
+#[cfg(test)]
 mod held_audit_restore_tests;
 pub(crate) mod line_delivery;
 #[cfg(test)]
@@ -24664,14 +24666,11 @@ fn codex_parent_step_start(
                 },
                 Ok((path, identity, file))
                     if codex_parent_outside_window(
-                        discovery_retention!(index),
+                        index,
                         &path,
                         &file,
                         census_unix_seconds,
                         backfill_window_days,
-                        DiscoveryRecovery {
-                            files: &index.files,
-                        },
                     ) =>
                 {
                     ParentWitness {
@@ -26714,14 +26713,13 @@ impl OwnedSourceScan {
         let hinted_paths = changed_watcher_hints(index, hinted_paths);
         let next_generation_hints;
         {
-            let traversal = index.traversal.as_mut().expect("traversal initialized");
             refresh_retained_codex_roster(
                 source,
-                traversal,
+                index,
                 backfill_window_days,
-                discovery_retention!(index, &resource_probe.discovery_growth),
-                DiscoveryRecovery::from(&index.files),
+                Some(&resource_probe.discovery_growth),
             );
+            let traversal = index.traversal.as_mut().expect("traversal initialized");
             start_due_listing_pass(traversal, collected_at);
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
@@ -43780,14 +43778,31 @@ fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
 /// (ctime-only events included) is dropped; a vanished one is kept for the
 /// exact removal path. Owner requests keep their unchanged files: a leased reason re-offer
-/// here, the audit retry by calling the queue directly.
+/// here, the audit retry by calling the queue directly. A hint never admits a
+/// first read past the first-read bound.
 fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let census_unix_seconds = index
+        .traversal
+        .as_ref()
+        .and_then(|walk| rfc3339_unix_seconds(&walk.census_window_end));
     hinted_paths
         .iter()
         .filter(|path| {
             index.reason_reoffer_leased(&local_index_key(path))
-                || !fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.is_file() && index.hint_settled(path, &metadata))
+                || !fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && (index.hint_settled(path, &metadata)
+                            || first_read_aged(
+                                index,
+                                path,
+                                metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(unix_seconds)
+                                    .unwrap_or_default(),
+                                census_unix_seconds,
+                            ))
+                })
         })
         .cloned()
         .collect()
@@ -43898,14 +43913,30 @@ fn enqueue_watcher_hints(
 /// existing holds apply until a later tick or the next walk.
 fn refresh_retained_codex_roster(
     source: SnapshotSource,
+    index: &mut ScanIndex,
+    backfill_window_days: u64,
+    growth: Option<&discovery_growth::Page>,
+) {
+    let mut traversal = index.traversal.take().expect("traversal initialized");
+    refresh_retained_codex_directories(source, &mut traversal, backfill_window_days, index, growth);
+    index.traversal = Some(traversal);
+}
+
+fn refresh_retained_codex_directories(
+    source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
-    recovery: DiscoveryRecovery<'_>,
+    index: &ScanIndex,
+    growth: Option<&discovery_growth::Page>,
 ) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
     }
+    let recovery = DiscoveryRecovery::from(&index.files);
+    let retention = DiscoveryRetention {
+        growth,
+        ..discovery_retention!(index)
+    };
     let moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
@@ -44011,6 +44042,10 @@ fn refresh_retained_codex_roster(
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery && aged && !owes_stamped {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                continue;
+            }
+            if first_read_aged(index, &path, modified_unix_seconds, census_unix_seconds) {
+                line_delivery_unselected(source.api_slug(), UnselectedReason::FirstReadAge);
                 continue;
             }
             crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
@@ -44549,10 +44584,12 @@ fn advance_bounded_directory_traversal_with_budget(
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
+            let first_read_aged = !pending.contains_key(&path)
+                && first_read_aged(index, &path, modified_unix_seconds, census_unix_seconds);
             let listing = g7_debt::Listing {
                 path: &path,
                 metadata: &metadata,
-                in_window: !aged,
+                in_window: !(aged || first_read_aged),
             };
             debt.listed(index, listing);
             let owes_stamped = aged
@@ -44574,6 +44611,12 @@ fn advance_bounded_directory_traversal_with_budget(
             {
                 if !relisting {
                     line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                }
+                continue;
+            }
+            if first_read_aged {
+                if !relisting {
+                    line_delivery_unselected(source.api_slug(), UnselectedReason::FirstReadAge);
                 }
                 continue;
             }
@@ -45255,6 +45298,46 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
+/// The first-read bound in days. It is in no walk identity: the walk, its
+/// pruning and the uploaded window keep `backfill_window_days`.
+const FIRST_READ_WINDOW_DAYS: u64 = 60;
+
+/// First-seen bound: a file never read, whose mtime is older than
+/// `FIRST_READ_WINDOW_DAYS` at the census time, is not admitted for a first
+/// read. Any read evidence keeps the walk window: an index entry (it also
+/// carries every recovery and verification debt), confirmed-empty, an account
+/// hold, a committed Tail head (G7 debt included; an unreadable store counts
+/// as one), or archive read evidence (settled, or a retained body witness).
+/// Checked where a file is first admitted (the walk, a watcher hint, the Codex
+/// roster refresh and an opened Codex parent), independently of the archive
+/// age exemption. Queued work and the open recheck keep the walk window.
+fn first_read_aged(
+    index: &ScanIndex,
+    path: &Path,
+    modified_unix_seconds: u64,
+    census_unix_seconds: Option<u64>,
+) -> bool {
+    if census_unix_seconds.map_or(true, |now| {
+        is_recent_enough_at(modified_unix_seconds, now, FIRST_READ_WINDOW_DAYS)
+    }) {
+        return false;
+    }
+    let key = local_index_key(path);
+    let read = index.files.contains_key(&key)
+        || index.confirmed_empty_files.contains(&key)
+        || index.claude_account_deferred_holds.contains_key(&key)
+        || index.archives.get(&key).is_some_and(|archive| {
+            archive.owed_cause().is_none()
+                || archive
+                    .work
+                    .as_ref()
+                    .is_some_and(|work| work.body_witness.is_some())
+        })
+        || (!matches!(state_v2::tail_route_path(index), Ok(None))
+            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
+    !read
+}
+
 /// Per-caller derived view, bounded by the held inventory; never move proof.
 struct AccountMoveObservations {
     paths: BTreeMap<String, Vec<String>>,
@@ -45397,16 +45480,18 @@ fn opened_candidate_is_within_frozen_window(
 }
 
 /// PR-P: the opened parent is outside this traversal's backfill window and
-/// has no verification rescue, the exact discovery filter. Discovery never
-/// makes it a candidate, so no parse can produce its ledger.
+/// has no verification rescue, or past the first-read bound, the exact
+/// discovery filter. Discovery never makes it a candidate, so no parse can
+/// produce its ledger.
 fn codex_parent_outside_window(
-    retention: DiscoveryRetention<'_>,
+    index: &ScanIndex,
     path: &Path,
     file: &File,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    recovery: DiscoveryRecovery<'_>,
 ) -> bool {
+    let retention = discovery_retention!(index);
+    let recovery = DiscoveryRecovery::from(&index.files);
     let metadata = file.metadata().ok();
     let modified = metadata
         .as_ref()
@@ -45433,7 +45518,8 @@ fn codex_parent_outside_window(
         path,
         metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
     );
-    !requires_recovery && aged && !owes_stamped
+    (!requires_recovery && aged && !owes_stamped)
+        || first_read_aged(index, path, modified, census_unix_seconds)
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -56072,7 +56158,8 @@ mod tests {
                 "{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n{{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
             )).unwrap();
         }
-        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+        // Older than the receipt window, inside the first-read bound.
+        let old_mtime = OffsetDateTime::parse("2026-09-01T00:02:00Z", &Rfc3339)
             .unwrap()
             .unix_timestamp() as u64;
         for id in ["refused", "healthy"] {
