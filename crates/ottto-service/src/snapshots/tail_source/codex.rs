@@ -648,6 +648,10 @@ impl TailSource for Codex {
             _ => {}
         }
         install_parent(stored, live)?;
+        // TEMPORARY (D134): the account scope the head was read under.
+        if stored.codex_account_scope != live.codex_account_scope {
+            return Err(LiveLoadError::Reconstruct(ReconstructCause::ContextChanged));
+        }
         match crate::snapshots::codex_file_join::header_owner(fresh) {
             Ok(owner) if stored.codex_creator_header_id.as_deref() == Some(owner.as_str()) => {}
             Ok(_) => return Err(LiveLoadError::Reconstruct(ReconstructCause::Identity)),
@@ -751,6 +755,7 @@ struct Trailer {
     codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     codex_parent_proof_refusal: Option<ProofRefusal>,
     codex_sidecar_projected_next_ordinal: Option<u64>,
+    codex_account_scope: Option<String>,
 }
 durable_struct!(Trailer {
     N priority_present: bool,
@@ -759,6 +764,8 @@ durable_struct!(Trailer {
     D codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     D codex_parent_proof_refusal: Option<ProofRefusal>,
     N codex_sidecar_projected_next_ordinal: Option<u64>,
+    // TEMPORARY (D134): see `account_scope`.
+    H codex_account_scope: Option<String>,
 });
 impl Trailer {
     fn of(acc: &SnapshotAccumulator) -> Self {
@@ -769,6 +776,7 @@ impl Trailer {
             codex_parent_proof_used: acc.codex_parent_proof_used.clone(),
             codex_parent_proof_refusal: acc.codex_parent_proof_refusal.clone(),
             codex_sidecar_projected_next_ordinal: acc.codex_sidecar_projected_next_ordinal,
+            codex_account_scope: acc.codex_account_scope.clone(),
         }
     }
     fn restore(self, acc: &mut SnapshotAccumulator) {
@@ -778,7 +786,24 @@ impl Trailer {
         acc.codex_parent_proof_used = self.codex_parent_proof_used;
         acc.codex_parent_proof_refusal = self.codex_parent_proof_refusal;
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
+        acc.codex_account_scope = self.codex_account_scope;
     }
+}
+
+/// TEMPORARY exception, removed with the Codex D134 re-placement rows: the
+/// account-scope digest a Codex head keeps in its trailer. A Codex creator
+/// witness is carried in the stored state (captured at its header's read),
+/// not re-derived at finish from live account evidence as Claude's is, so a
+/// Codex head keeps main's RAM binding to the scope it was read under: a
+/// changed scope is a counted `ContextChanged` reconstruction (parity with
+/// main's Full, not a new cause). The digest is content-free and of
+/// acquisition evidence only: the cycle's sampled namespace (account
+/// witness, destination namespace, index path, capture mode), never a
+/// policy, receipt or etag.
+pub(in crate::snapshots) fn account_scope(
+    namespace: &crate::transcript_acquisition::Scope,
+) -> String {
+    sha256_hex(&["codex_tail_account_scope:v1", &namespace.0])
 }
 
 #[cfg(test)]
