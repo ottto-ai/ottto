@@ -252,6 +252,7 @@ impl Decoded {
                                             usage,
                                             last.clone(),
                                             identity,
+                                            codex_line_timestamp(value).as_deref(),
                                             count,
                                         )
                                         .is_some()

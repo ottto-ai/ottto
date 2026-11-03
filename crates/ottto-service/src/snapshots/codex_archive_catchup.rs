@@ -130,6 +130,7 @@ impl ScanIndex {
             crate::local_resource_diagnostics::codex_zst_held(cause, count);
         }
         archive_alarm(alarm);
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
     }
     /// A historical replay re-owes every acquired archive. No setting or
     /// capability does: they correct nothing in an archive's evidence.

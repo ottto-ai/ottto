@@ -101,6 +101,8 @@ pub struct SnapshotAuditSession {
     pub semantic_key: String,
     pub revision_key: String,
     pub legacy_revision_proof_available: bool,
+    /// Keys derived under policies this report did not apply; local to the verifier.
+    #[serde(skip_serializing)]
     pub legacy_policy_candidate_semantic_keys: Vec<String>,
     pub policy_neutral_component_keys: BTreeMap<String, String>,
     pub policy_sensitive_component_keys: BTreeMap<String, String>,

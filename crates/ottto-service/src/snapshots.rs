@@ -156,6 +156,8 @@ pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
+#[cfg(test)]
+mod upload_policy_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -1043,10 +1045,23 @@ const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
 /// usage accepted before the release keeps exactly the row it had.
 const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_794_182_400;
 
-fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+/// 2026-11-04T00:00:00Z, a 00:00Z expected on/after install of the release
+/// that carries the Legacy repeat gate. Legacy drops an equal-total repeat
+/// only when the repeated line itself is dated from here, so its row is a
+/// function of its file's bytes on every read route and history before this
+/// keeps exactly the rows it had. Correcting older repeats is an operator
+/// decision.
+const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+
+/// `false` for a missing or unparsable timestamp.
+fn dated_on_or_after(timestamp: Option<&str>, from_unix_seconds: u64) -> bool {
     timestamp
         .and_then(rfc3339_unix_seconds)
-        .is_some_and(|seconds| seconds >= CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
+        .is_some_and(|seconds| seconds >= from_unix_seconds)
+}
+
+fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
+    dated_on_or_after(timestamp, CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
 }
 
 /// One request's bucket from its prompt size, its model and its own usage
@@ -1796,11 +1811,7 @@ pub struct SnapshotActivityCount {
 /// One privacy-safe transcript-observed tool-name aggregate. Only the bounded
 /// name and count cross the wire; tool ids, arguments, results, and paths stay
 /// local to the parser.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotToolUsage {
-    pub name: String,
-    pub count: u64,
-}
+pub type SnapshotToolUsage = SnapshotActivityCount;
 
 /// One privacy-safe agent capability count. The identifiers are collector-owned
 /// constants; raw tool arguments, results, URLs, browser ids, and screenshots
@@ -2350,7 +2361,7 @@ const MAX_SESSION_ARTIFACTS: usize = 50;
 /// `Field(min_length=7, max_length=512)`, counted in characters after a strip
 /// (extracted values carry no surrounding whitespace). A longer value refuses
 /// the whole batch (422), so it is kept locally and never uploaded.
-const MAX_SESSION_ARTIFACT_VALUE_CHARS: usize = 512;
+pub(crate) const MAX_SESSION_ARTIFACT_VALUE_CHARS: usize = 512;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -8537,7 +8548,7 @@ struct PendingIndexFinalization {
     restored_behind_accepted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
@@ -8574,74 +8585,7 @@ impl Default for SnapshotUploadPolicy {
     }
 }
 
-pub fn apply_upload_policy(
-    source: SnapshotSource,
-    snapshots: &mut [SnapshotItem],
-    policy: SnapshotUploadPolicy,
-) {
-    let mut links_over_limit = 0_u64;
-    for item in snapshots {
-        let mut fingerprint_needs_refresh = false;
-        if !policy.session_titles_enabled
-            && (item.session_display_name.is_some() || item.session_display_name_source.is_some())
-        {
-            item.session_display_name = None;
-            item.session_display_name_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.workspace_labels_enabled
-            && (item.workspace_display_label.is_some()
-                || item.workspace_label_source.is_some()
-                || item.repository_label.is_some()
-                || item.repository_label_source.is_some())
-        {
-            item.workspace_display_label = None;
-            item.workspace_label_source = None;
-            item.repository_label = None;
-            item.repository_label_source = None;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
-            item.session_artifacts.clear();
-            fingerprint_needs_refresh = true;
-        }
-        let links = item.session_artifacts.len();
-        item.session_artifacts
-            .retain(|link| link.value.chars().count() <= MAX_SESSION_ARTIFACT_VALUE_CHARS);
-        if item.session_artifacts.len() != links {
-            links_over_limit += (links - item.session_artifacts.len()) as u64;
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
-            item.attribution_facts.clear();
-            fingerprint_needs_refresh = true;
-        } else if (!policy.session_titles_enabled || !policy.session_attribution_labels_enabled)
-            && crate::session_attribution::strip_display_labels(&mut item.attribution_facts)
-        {
-            fingerprint_needs_refresh = true;
-        }
-        if !policy.session_attribution_labels_enabled {
-            if let Some(summary) = item.activity_summary.as_mut() {
-                if !summary.skills.is_empty() {
-                    summary.skills.clear();
-                    fingerprint_needs_refresh = true;
-                }
-            }
-        }
-        if let Some(start) = item.session_start.as_mut() {
-            // Outside the fingerprint: consent changes only which identity an
-            // opening file carries, never the session's content.
-            start.apply_upload_policy(
-                policy.workspace_labels_enabled,
-                policy.session_attribution_enabled,
-            );
-        }
-        if fingerprint_needs_refresh {
-            item.snapshot_fingerprint = snapshot_fingerprint(source, item);
-        }
-    }
-    crate::local_resource_diagnostics::claude_reread::links_over_limit(links_over_limit);
-}
+pub use crate::upload_policy::apply_upload_policy;
 
 #[cfg(test)]
 pub(crate) fn snapshot_item_wire_size(
@@ -21166,6 +21110,7 @@ impl SnapshotAccumulator {
             usage,
             last_usage,
             usage_event_identity,
+            timestamp,
             implicit_request_count,
         )?;
         self.add_usage_with_selector(
@@ -21226,6 +21171,7 @@ impl SnapshotAccumulator {
         usage: UsageTotals,
         last_usage: Option<UsageTotals>,
         usage_event_identity: Option<String>,
+        timestamp: Option<&str>,
         implicit_request_count: Option<u64>,
     ) -> Option<(String, UsageTotals)> {
         let (resolved_model, previous, reset) =
@@ -21234,8 +21180,8 @@ impl SnapshotAccumulator {
         // correct across compaction/restart resets. Older rollouts lack it; in
         // that case use a cumulative delta, beginning a new additive epoch on
         // a reset. Never erase usage already accepted from the same rollout.
-        let mut delta = match last_usage {
-            Some(last) => last,
+        let mut delta = match &last_usage {
+            Some(last) => last.clone(),
             None => match &previous {
                 Some(previous) if !reset => usage.delta_from(previous),
                 Some(_) | None => usage.clone(),
@@ -21247,6 +21193,14 @@ impl SnapshotAccumulator {
             }
         }
         if delta.is_zero() {
+            return None;
+        }
+        // The V2 equal-total repeat gate: a re-emitted line with the same
+        // `last` and total as the previous counted one is not a new request.
+        // Forward only: earlier lines count as they always did, and still
+        // set the tuple a later dated repeat is compared with.
+        let may_drop = dated_on_or_after(timestamp, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS);
+        if self.codex_legacy_ui_repeat(last_usage, usage, &delta, may_drop) {
             return None;
         }
         Some((resolved_model, delta))
@@ -40638,9 +40592,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             string_at(value, &["session_meta", "payload", "agent_role"])
                 .or_else(|| string_at(value, &["payload", "agent_role"]));
     }
-    let timestamp = string_at(value, &["timestamp"])
-        .or_else(|| string_at(value, &["time"]))
-        .or_else(|| string_at(value, &["created_at"]));
+    let timestamp = codex_line_timestamp(value);
     accumulator.note_time(timestamp.clone());
     codex_prompt_content(value, accumulator);
     accumulator.set_model(
@@ -41820,6 +41772,13 @@ fn codex_model_context_window(value: &Value) -> Option<u64> {
         .or_else(|| raw_value_at(value, &["info", "model_context_window"]))
         .and_then(Value::as_u64)
         .filter(|window| *window > 0)
+}
+
+/// A Codex line's own envelope time, the same on every read route.
+fn codex_line_timestamp(value: &Value) -> Option<String> {
+    string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["time"]))
+        .or_else(|| string_at(value, &["created_at"]))
 }
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {
@@ -85901,7 +85860,6 @@ crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
 crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
-crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);

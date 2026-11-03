@@ -569,7 +569,6 @@ impl HeaderInventory {
                             let paced = a.header_paced();
                             let w = a.work.get_or_insert_with(Box::default);
                             if w.header.is_none() && !paced {
-                                w.header_attempts = w.header_attempts.saturating_add(1);
                                 w.header_retry_after = 0;
                                 w.reservation = ArchiveReservation::HeaderSave;
                                 index.archive_pass.dirty = true;

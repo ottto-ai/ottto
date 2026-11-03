@@ -12432,11 +12432,13 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
             + credit
             + floor
             + super::super::side_ledger::SIDE_LEDGER_BYTES;
-        with_test_state_budget(budget - 1, || {
+        with_test_state_budget(decoder_least_budget(&cache) - 1, || {
             assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                 .unwrap()
                 .is_none());
             assert_eq!(cache.cursor_reserved(), 0);
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert!(cache.retained_checkpoint(&peer_key).is_some());
         });
         with_test_state_budget(budget, || {
             let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
@@ -12465,15 +12467,82 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
     });
 }
 
-/// Header occupancy is observable, never a decoder eviction or a promise
-/// that an unrelated progress admission will run before the next attempt.
+/// The state budget at which a decoder claim just fits once every header fact
+/// and retained copy is gone: the whole cursor state without headers, an empty
+/// retained cache, D, the primary floor and both side ledger charges.
+fn decoder_least_budget(cache: &SharedCache) -> usize {
+    let empty =
+        crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), usize::MAX)
+            .unwrap();
+    cursor_without_header_facts(cache)
+        + empty
+        + codex_compressed_input::compressed_input_credit().unwrap()
+        + ENTRY_BYTES
+        + 2 * super::super::side_ledger::SIDE_LEDGER_BYTES
+}
+
+/// A cache warmed by real pages: a retained copy and optional header facts.
+fn warm_decoder_cache(fixture: &ScanRoot) -> (Arc<SharedCache>, String) {
+    let cache = Arc::new(SharedCache::default());
+    let key = local_index_key(&fixture.file(SESSION));
+    let mut index = ScanIndex::default();
+    for _ in 0..64 {
+        let (next, _) = page(fixture, index, Some(Arc::clone(&cache)));
+        index = next;
+        if cache.retained_checkpoint(&key).is_some() {
+            break;
+        }
+    }
+    assert!(cache.retained_checkpoint(&key).is_some());
+    assert!(
+        cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap()
+            > 0,
+        "production inventory warmed header facts"
+    );
+    (cache, key)
+}
+
+fn synthetic_archive(tag: &str) -> Temp {
+    Temp::new(
+        tag,
+        &zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap(),
+    )
+}
+
+/// Refuses under `budget` and leaves every resident as it was.
+fn assert_decoder_refused_evicting_nothing(
+    cache: &Arc<SharedCache>,
+    budget: usize,
+    archive: &Temp,
+) {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let resident = cache.cursor_resident();
+    let copies = cache.retained().unwrap().entry_count();
+    let reserved = cache.cursor_reserved();
+    let (funded, counts) = observe(|| {
+        with_test_state_budget(budget, || {
+            OpenedInput::funded(File::open(&archive.0).unwrap(), cache).unwrap()
+        })
+    });
+    assert!(funded.is_none());
+    assert_eq!(counts.cursor_reservation_entries_evicted, 0);
+    assert_eq!(cache.cursor_resident(), resident, "headers kept");
+    assert_eq!(cache.retained().unwrap().entry_count(), copies);
+    assert_eq!(cache.cursor_reserved(), reserved);
+}
+
+/// A busy cache admits: free room first, then header facts, then retained
+/// copies through the pause's eviction path and counter. The primary tail
+/// floor stays free after every eviction.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
-    use crate::local_resource_diagnostics::capture;
+fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12481,106 +12550,278 @@ fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
         let fixture = ScanRoot::new(40);
-        let cache = Arc::new(SharedCache::default());
-        let key = local_index_key(&fixture.file(SESSION));
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
-            index = next;
-            if cache.retained_checkpoint(&key).is_some() {
-                break;
-            }
-        }
-        assert!(cache.retained_checkpoint(&key).is_some());
+        let (cache, key) = warm_decoder_cache(&fixture);
         let resident = cache.cursor_resident();
-        let headers = cache
-            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-            .unwrap();
-        assert!(headers > 0, "production inventory warmed header facts");
         let cursor = cursor_without_header_facts(&cache);
-        assert_eq!(resident, cursor + headers);
+        let headers = resident - cursor;
         let retained = retained_floor(&cache);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
         let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
-        // T is the exact free-only decoder boundary WITHOUT optional facts:
-        // C + R + D + ENTRY_BYTES + 2*SIDE. With facts it needs T + H.
+        // Without facts the free-room bar is T; with them it is T + H.
         let budget = cursor + retained + credit + ENTRY_BYTES + 2 * side;
-        let archive = Temp::new(
-            "decoder-header-occupancy",
-            &zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap(),
-        );
-        let cause = "decoder_refused_header_occupancy";
-        let refuse = |limit, expected: usize| {
-            let ((), rows) = capture(|| {
+        let archive = synthetic_archive("decoder-reclaim");
+        let admit = |limit: usize| {
+            let (input, counts) = observe(|| {
                 with_test_state_budget(limit, || {
-                    assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                         .unwrap()
-                        .is_none());
-                });
+                        .expect("a claim that can fit is admitted")
+                })
             });
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row["counts"]["codex_zst_refused"][cause].is_u64())
-                    .count(),
-                expected
+            assert_eq!(cache.cursor_reserved(), credit);
+            let used = cache.cursor_resident() + retained_floor(&cache) + side;
+            assert!(
+                limit - used >= ENTRY_BYTES + side,
+                "the primary floor stays free"
             );
-            assert_eq!(rows.len(), expected + 1, "only refusal count records");
-            assert!(rows.iter().any(|row| {
-                row["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].is_u64()
-            }));
-            assert_eq!(cache.cursor_resident(), resident, "no header reclamation");
-            assert!(cache.retained_checkpoint(&key).is_some());
+            input.close();
             assert_eq!(cache.cursor_reserved(), 0);
+            counts.cursor_reservation_entries_evicted
         };
-        refuse(budget - 1, 0); // Even without facts it cannot fit.
-        for _ in 0..2 {
-            refuse(budget, 1); // Count each attempt; no bounded retry is claimed.
-        }
+        // Free room: nothing is reclaimed.
+        assert_eq!(admit(budget + headers), 0);
+        assert_eq!(cache.cursor_resident(), resident);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        // Short by the facts: only they go.
+        assert_eq!(admit(budget), 0);
+        assert_eq!(cache.cursor_resident(), cursor);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        // No room for any copy: retained copies go too, and are counted.
+        let copies = cache.retained().unwrap().entry_count() as u64;
+        assert!(copies > 0);
+        assert_eq!(admit(decoder_least_budget(&cache)), copies);
+        assert_eq!(cache.retained().unwrap().entry_count(), 0);
+        assert_eq!(cache.cursor_resident(), cursor);
+    });
+}
+
+/// A job that leaves no room refuses and evicts nothing, as does a busy
+/// singleton, and the refusal is counted once per attempt.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
+    use crate::local_resource_diagnostics::{capture, codex_zst_refused_flush};
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let (cache, key) = warm_decoder_cache(&fixture);
+        let job = cache.cursor_reserve(1024 * 1024).expect("a job's charge");
+        let budget = decoder_least_budget(&cache);
+        let archive = synthetic_archive("decoder-over-room");
+        let ((), rows) = capture(|| {
+            assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
+            assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
+            codex_zst_refused_flush();
+        });
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert_eq!(rows.len(), 1, "one line for the whole pass");
+        assert_eq!(
+            rows[0]["counts"]["codex_zst_refused"],
+            serde_json::json!({"CompressedAdmissionRefused": 2})
+        );
         let other = Arc::new(SharedCache::default());
         let owner = DecoderOwner::acquire(&other, 1).unwrap();
-        refuse(budget, 0); // Singleton busy is not header-occupancy refusal.
+        assert_decoder_refused_evicting_nothing(&cache, budget, &archive);
         owner.release();
-
-        // An actual decoder fits with the measured H bytes available, and
-        // success produces no occupancy refusal or header eviction.
-        let ((), rows) = capture(|| {
-            with_test_state_budget(budget + headers, || {
-                let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                    .unwrap()
-                    .unwrap();
-                input.read_exact(&mut [0; 1]).unwrap();
-                assert_eq!(cache.cursor_reserved(), credit);
-                input.close();
-            });
-        });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["stage"], "codex_zst_input");
-        assert!(
-            rows[0]["counts"]["codex_zst_decoded_bytes"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert_eq!(cache.cursor_resident(), resident);
+        job.refund();
         assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
 
-        // Test-only counterfactual control, not a production reclaim path:
-        // release ONLY H, then the same decoder fits the original exact T.
-        cache.with_cursor(|cursor| cursor.headers.clear()).unwrap();
-        assert_eq!(cache.cursor_resident(), cursor);
+/// A suspended proof counts in the whole state and survives: it is not room a
+/// decoder may take. Join owners and witnesses stay too.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn decoder_eviction_keeps_a_suspended_proof_and_join_state() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let (cache, key) = warm_decoder_cache(&fixture);
+        assert!(suspend(
+            &cache,
+            proof_job("cursor-fixture", "/idx/a.json", "inc-1", 4096)
+        ));
+        let proof = cache.proof_suspended_for_test();
+        assert!(proof.is_some());
+        let joined = |cache: &SharedCache| {
+            cache
+                .with_cursor(|cursor| (cursor.join_owners.len(), cursor.parents.len()))
+                .unwrap()
+        };
+        let before = joined(&cache);
+        let budget = decoder_least_budget(&cache);
+        let archive = synthetic_archive("decoder-proof-kept");
+        // Dropping the proof would make this fit: it refuses instead.
+        assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
+        assert_eq!(cache.proof_suspended_for_test(), proof);
+        with_test_state_budget(budget, || {
+            OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .expect("retained copies make the room")
+                .close();
+        });
+        assert!(cache.retained_checkpoint(&key).is_none());
+        assert_eq!(cache.proof_suspended_for_test(), proof);
+        assert_eq!(joined(&cache), before);
+    });
+}
+
+/// One pass's header attempt on an owed archive, through the production read.
+fn archive_header_pass(
+    index: &mut ScanIndex,
+    path: &Path,
+    cache: &Arc<SharedCache>,
+) -> codex_compressed_input::HeaderRead {
+    let archive = index
+        .archives
+        .entry(local_index_key(path))
+        .or_insert_with(|| {
+            codex_compressed_input::ArchiveEvidence::from_metadata(
+                fs::symlink_metadata(path).unwrap(),
+            )
+            .unwrap()
+        });
+    archive.work.get_or_insert_with(Box::default).reservation =
+        codex_compressed_input::ArchiveReservation::HeaderReady;
+    let mut candidate = codex_zst_refusal_tests::candidate(path);
+    candidate.size_bytes = fs::metadata(path).unwrap().len();
+    index
+        .inventory_archive_header(&candidate, Some(cache))
+        .unwrap()
+}
+
+fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
+    let root = crate::test_scratch::private_dir(tag);
+    let bytes = zstd::stream::encode_all(
+        &b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n"[..],
+        1,
+    )
+    .unwrap();
+    let paths = (0..count)
+        .map(|n| {
+            let path = root.join(format!("rollout-{n}.jsonl.zst"));
+            fs::write(&path, &bytes).unwrap();
+            path
+        })
+        .collect();
+    (root, paths)
+}
+
+/// A refused archive stays owed, spends no attempt, and is decoded by the next
+/// pass that has room.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn a_refused_archive_decoder_recovers_on_the_next_pass() {
+    use codex_compressed_input::HeaderRead;
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let (cache, key) = warm_decoder_cache(&fixture);
+        let (root, paths) = owed_archives("decoder-next-pass", 1);
+        let archive_key = local_index_key(&paths[0]);
+        let mut index = ScanIndex::default();
+        index.archive_pass.power = true;
+        let budget = decoder_least_budget(&cache);
+        let refused = with_test_state_budget(budget - 1, || {
+            archive_header_pass(&mut index, &paths[0], &cache)
+        });
+        assert!(matches!(refused, HeaderRead::Deferred));
+        assert_eq!(
+            index.archives[&archive_key].owed_cause(),
+            Some(CodexZstCause::AdmissionRefused)
+        );
+        assert!(index.archives[&archive_key].header().is_none());
+        let spent = |index: &ScanIndex| {
+            index.archives[&archive_key]
+                .work
+                .as_ref()
+                .unwrap()
+                .header_attempts
+        };
+        assert_eq!(spent(&index), 0);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        index.disclose_archive_debt();
+        let recovered = with_test_state_budget(budget, || {
+            archive_header_pass(&mut index, &paths[0], &cache)
+        });
+        assert!(matches!(recovered, HeaderRead::Validated(_)));
+        assert!(index.archives[&archive_key].header().is_some());
+        assert_eq!(spent(&index), 1);
+        assert_eq!(cache.cursor_reserved(), 0);
+        fs::remove_dir_all(root).unwrap();
+    });
+}
+
+/// [regress] 0.1.213: every pass refused every owed archive decoder, with no
+/// decode and one log line per archive. Retained copies held the budget near
+/// full and a decoder could only use free room. Now the first decoder makes
+/// the room, every archive reads its header and nothing is refused.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
+    use crate::local_resource_diagnostics::capture;
+    use codex_compressed_input::HeaderRead;
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let (cache, _) = warm_decoder_cache(&fixture);
+        let copies = cache.retained().unwrap().entry_count();
+        let (root, paths) = owed_archives("decoder-near-full", 3);
+        let mut index = ScanIndex::default();
+        index.archive_pass.power = true;
+        // One byte short of the old free-room bar without any header facts:
+        // headers alone cannot make the room, only a retained copy can.
+        let budget = decoder_least_budget(&cache) + retained_floor(&cache)
+            - crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), usize::MAX)
+                .unwrap()
+            - 1;
         let ((), rows) = capture(|| {
             with_test_state_budget(budget, || {
-                let input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                    .unwrap()
-                    .unwrap();
-                input.close();
+                for path in &paths {
+                    let read = archive_header_pass(&mut index, path, &cache);
+                    assert!(matches!(read, HeaderRead::Validated(_)));
+                    assert_eq!(cache.cursor_reserved(), 0);
+                }
             });
+            index.disclose_archive_debt();
         });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["stage"], "codex_zst_input");
-        assert_eq!(rows[0]["counts"]["codex_zst_decoded_bytes"], 0);
-        assert!(cache.retained_checkpoint(&key).is_some());
-        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(cache.retained().unwrap().entry_count() < copies);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["stage"] == "codex_zst_inventory")
+                .count(),
+            paths.len()
+        );
+        assert!(!rows.iter().any(|row| row["stage"] == "codex_zst_refused"));
+        fs::remove_dir_all(root).unwrap();
     });
 }
 
