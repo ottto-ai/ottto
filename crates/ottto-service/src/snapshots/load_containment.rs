@@ -343,13 +343,15 @@ impl ScanIndexRebuildOverrideState {
 #[cfg(not(test))]
 static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideState; 3]> =
     std::sync::Mutex::new([ScanIndexRebuildOverrideState::NONE; 3]);
-/// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
-/// this process.
-crate::local_resource_diagnostics::process_static!(fn with_manual_override:
+crate::local_resource_diagnostics::process_static!(
+    /// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
+    /// this process.
+    fn with_manual_override:
     std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
-/// Finite per-code counters: identity, carried-debt admission, persistence,
-/// and cooldown. No error strings or source contents become metric labels.
-crate::local_resource_diagnostics::process_static!(fn with_override_refused:
+crate::local_resource_diagnostics::process_static!(
+    /// Finite per-code counters: identity, carried-debt admission, persistence,
+    /// and cooldown. No error strings or source contents become metric labels.
+    fn with_override_refused:
     [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4]);
 #[cfg(test)]
 thread_local! {

@@ -103,7 +103,8 @@ macro_rules! sparse_lifetime_counters {
 /// A process-wide diagnostic static behind `$with`. Each test thread gets its
 /// own copy, so a fixture never reads or drains another test's counts.
 macro_rules! process_static {
-    ($vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+        $(#[$attr])*
         $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
             #[cfg(not(test))]
             {
@@ -640,8 +641,9 @@ const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const UNSELECTED_REASONS: usize = HOLD_WAKE_START + 2;
-/// Claude, Codex, Pi x reason, drained by that source's page line.
-process_static!(fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
+process_static!(
+    /// Claude, Codex, Pi x reason, drained by that source's page line.
+    fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
     [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS]);
 /// The one per-source slot of every process-local diagnostic array here.
 fn source_slot(source: &str) -> Option<usize> {
