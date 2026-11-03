@@ -662,6 +662,32 @@ fn continuable() -> SnapshotAccumulator {
     stored
 }
 
+/// [money] TEMPORARY (until the Codex D134 re-placement rows): a Codex head
+/// continues only under the account scope it was read under; another, or
+/// none, is a counted `ContextChanged` reconstruction. The digest is of the
+/// sampled namespace only.
+#[test]
+fn install_live_binds_the_account_scope_the_head_was_read_under() {
+    let scope = |namespace: &str| Some(super::account_scope(&Scope(namespace.into())));
+    assert_ne!(scope("a"), scope("b"));
+    assert_eq!(scope("a").unwrap().len(), 64);
+    let live = |namespace: Option<&str>| {
+        let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
+        live.codex_account_scope = namespace.and_then(scope);
+        live
+    };
+    let stored = || {
+        let mut stored = continuable();
+        stored.codex_account_scope = scope("a");
+        stored
+    };
+    let changed = Err(LiveLoadError::Reconstruct(ReconstructCause::ContextChanged));
+    assert_eq!(install(&mut stored(), &live(Some("a"))), Ok(()));
+    assert_eq!(install(&mut stored(), &live(Some("b"))), changed);
+    assert_eq!(install(&mut stored(), &live(None)), changed);
+    assert_eq!(ReconstructCause::ContextChanged.label(), "codex_scope");
+}
+
 /// [money] The lineage (D131): a head continues only the session its owning
 /// header named. Another id, or none stored, is a counted `Identity`
 /// reconstruction; a header this read cannot read waits.
