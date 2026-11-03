@@ -2403,3 +2403,204 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         println!("HEAD_CONFLICT_MONEY_ORACLE VERIFIED arms=cold_full,ram_tail,restored_tail accounts=2 requests=2 input_tokens=30 cost_usd=0.0003");
     });
 }
+
+/// A `/branch` session: a copied parent line (`forkedFrom`) proves the owned
+/// start, so the e2 body has strict posture and carries its cache patch.
+fn forked_root(c: &mut Corpus) -> PathBuf {
+    let mut copied: Value = serde_json::from_str(line(ROOT, "r0", AT, 5).trim()).unwrap();
+    copied["forkedFrom"] = serde_json::json!({
+        "sessionId": "3338a80a-f36e-4cbc-a5bb-50fc66430ba5", "messageUuid": "m-0"});
+    let path = c.root(
+        ROOT,
+        &(copied.to_string() + "\n" + &line(ROOT, "r1", AT, 10)),
+    );
+    input_clock(&path);
+    path
+}
+
+/// The production network projection: base head and cache patch per the ledger.
+fn under_cas(items: &[SnapshotItem], progress: &SnapshotUploadProgress) -> Vec<SnapshotItem> {
+    let mut items = items.to_vec();
+    for item in &mut items {
+        prepare_snapshot_cache_for_upload(item, progress, true, false, &BTreeSet::new());
+    }
+    items
+}
+
+/// The server's CAS check refuses ROOT's stale base and mints `challenge`;
+/// every other entity is accepted.
+fn refuse_root(
+    batch: &[SnapshotItem],
+    challenge: &str,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let mut response = ack(batch)?;
+    for mut reference in std::mem::take(&mut response.accepted_entities) {
+        if reference.source_session_id != ROOT {
+            response.accepted_entities.push(reference);
+            continue;
+        }
+        response.accepted -= 1;
+        response.sessions_reconciled -= 1;
+        reference.head_etag = None;
+        reference.body_witness_version = None;
+        reference.body_witness_digest = None;
+        reference.head_challenge = Some(challenge.to_owned());
+        response.conflict_entities.push(reference);
+    }
+    response.bind_conflict_rescans(&request(batch));
+    Ok(response)
+}
+
+/// Three arms over one prior: the warm owner, a cold Full, and a new owner
+/// whose load records are captured.
+fn arms(
+    c: &Corpus,
+    warm: &E2ScanFixture,
+    disk: &mut Disk,
+    prior: &ScanIndex,
+) -> ([Page; 3], Vec<Value>) {
+    let restart = disk.owner(SnapshotSource::ClaudeCode);
+    let tail = c.raw(warm, prior.clone(), 100, true, &[]);
+    let full = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
+    let (disk, records) = crate::local_resource_diagnostics::capture(|| {
+        c.raw(&restart, prior.clone(), 100, true, &[])
+    });
+    assert_eq!(full.modes.1 + full.modes.2, 0, "cold arm reads Full");
+    ([tail, full, disk], records)
+}
+
+/// The owed answer rides exactly ROOT's outgoing body.
+fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
+    let mut sent = under_cas(&page.scan.snapshots, progress);
+    let now = current_unix_seconds();
+    assert_eq!(attach_head_conflict_answers(&mut sent, progress, now), 1);
+    let root = sent.iter().find(|item| item.source_session_id == ROOT);
+    let answer = root.and_then(|item| item.cache_conflict_answer.clone());
+    assert_eq!(answer.map(|(c, _)| c), Some(challenge.to_owned()));
+}
+
+/// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS
+/// conflict with a challenge is recorded on a production-shaped Claude body.
+/// Then (a) a 0-new-byte late-evidence selection never re-folds: every arm
+/// reads a native Full, equal to the cold Full, and that Full answers; and
+/// (b) an append continues from the saved head (a counted `hit`: identity,
+/// certificate and offset match the bytes already read), byte-equal to the
+/// cold Full and the RAM arm, and its body carries the answer.
+#[test]
+fn conflict_then_append() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("conflict_then_append");
+        let path = forked_root(&mut c);
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let mut disk = Disk::new(&c);
+        let warm = E2ScanFixture::default();
+        disk.begin(&warm, SnapshotSource::ClaudeCode);
+        let mut progress = e2_progress();
+        let key = cache_session_key(ROOT);
+        let challenge = "c".repeat(64);
+
+        let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        first.finish();
+        let sent = under_cas(&first.scan.snapshots, &progress);
+        assert!(sent.iter().any(|item| item.cache_observations.is_some()));
+        let (result, _, _) = upload(&sent, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        settle_index_after_upload(&mut first.index, &first.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+        assert_eq!(
+            progress.accepted_cache_heads.get(&key),
+            Some(&"e".repeat(64))
+        );
+
+        // An append on the stale base: the server refuses it with a challenge.
+        append(&path, &line(ROOT, "r2", AT, 20));
+        input_clock(&path);
+        c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
+        let mut refused = c.raw(&warm, prior, 100, true, &[]);
+        assert_eq!(
+            refused.modes,
+            (0, 1, 0),
+            "the refused body is a Tail append"
+        );
+        refused.enrich(&c);
+        refused.finish();
+        let sent = under_cas(&refused.scan.snapshots, &progress);
+        let (result, _, _) = upload(&sent, &mut progress, |batch| refuse_root(batch, &challenge));
+        assert!(matches!(
+            result.unwrap(),
+            ResumableUploadResult::Deferred { .. }
+        ));
+        assert_eq!(progress.head_conflict_challenges[&key].challenge, challenge);
+        let fingerprint = &sent.iter().find(|i| i.source_session_id == ROOT).unwrap();
+        let fingerprint = fingerprint.snapshot_fingerprint.clone();
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        settle_index_after_upload(&mut refused.index, &refused.committed, &progress);
+        let prior = disk.commit(
+            &refused.cache,
+            SnapshotSource::ClaudeCode,
+            &mut refused.index,
+        );
+        assert!(prior
+            .quarantined_snapshot_fingerprints
+            .contains_key(&fingerprint));
+
+        // (a) 0 new bytes, late evidence: no arm re-folds; the answer is a Full.
+        let late = [
+            api("r1", 10, 100),
+            api("r2", 20, 200),
+            api("late-side", 5, 50),
+        ];
+        c.evidence(&late, &[]);
+        let (mut pages, _) = arms(&c, &warm, &mut disk, &prior);
+        assert_eq!(pages[0].modes, (1, 0, 0), "the RAM arm never re-folds");
+        assert_eq!(pages[2].modes, (1, 0, 0), "the restored arm never re-folds");
+        finish_claude_pages(&c, &mut pages);
+        compare_claude_uploads(&pages);
+        answers(&pages[2], &progress, &challenge);
+
+        // (b) An append continues from the saved head and carries the answer.
+        append(&path, &line(ROOT, "r3", AT, 30));
+        input_clock(&path);
+        c.evidence(
+            &[
+                api("r1", 10, 100),
+                api("r2", 20, 200),
+                api("late-side", 5, 50),
+                api("r3", 30, 300),
+            ],
+            &[],
+        );
+        let (mut pages, records) = arms(&c, &warm, &mut disk, &prior);
+        assert_eq!(
+            pages[0].modes,
+            (0, 1, 0),
+            "the RAM arm continues the append"
+        );
+        assert_eq!(
+            pages[2].modes,
+            (0, 1, 0),
+            "the restored arm continues the append"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["stage"] == "tail_db_loads" && r["counts"]["outcome"] == "hit"),
+            "the saved head matches the bytes already read"
+        );
+        finish_claude_pages(&c, &mut pages);
+        compare_claude_uploads(&pages);
+        answers(&pages[2], &progress, &challenge);
+    });
+}
