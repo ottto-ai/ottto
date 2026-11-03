@@ -199,8 +199,6 @@ mod context_curve;
 mod session_start;
 /// Tail state codecs: each source's head and pages in the state database.
 #[cfg(unix)]
-mod stored_refinalize;
-#[cfg(unix)]
 mod tail_source;
 pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
@@ -3310,9 +3308,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
     }
 }
 
-/// Starts `source`'s pass: Claude's wait unit, the context quiet retirements
-/// bind to, and removal of the retired record directory beside `index_path`
-/// when this process holds the state-directory lock.
+/// Starts `source`'s pass: the context quiet retirements bind to, and removal
+/// of the retired record directory beside `index_path` when this process
+/// holds the state-directory lock.
 #[cfg(unix)]
 pub(crate) fn begin_source_pass(
     cache: &sampled_scan::SharedCache,
@@ -3322,7 +3320,6 @@ pub(crate) fn begin_source_pass(
     namespace: &crate::transcript_acquisition::Scope,
     identity_capture: bool,
 ) {
-    tail_source::counters::begin_pass(source);
     cache.quiet_begin_pass(source, index_path, namespace, identity_capture);
     if crate::locked_state_dir::held_for(support_dir).is_some() {
         cache.remove_retired_records(source, index_path);
@@ -8313,8 +8310,8 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    /// This read continued from stored state for a selection other than a
-    /// transcript change: a body that is not the ACKed one must not be sent.
+    /// This read re-folded late evidence from stored state: a body that is
+    /// not the ACKed one goes as an ordinary update, counted by its reason.
     stored_reuse: Option<CandidateParseReason>,
 }
 
@@ -8596,14 +8593,18 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
             .map(snapshot_file_upload_body_set_hex);
+        // A late-evidence re-fold that is not the ACKed body is an ordinary
+        // update on the head CAS, the body a native read would send now.
         #[cfg(unix)]
         if let Some(reason) = pending.stored_reuse.filter(|_| {
             final_group_fingerprint != pending.previous_snapshot_fingerprint
                 || final_upload_body_witness != pending.previous_upload_body_witness
         }) {
-            stored_refinalize::withhold_for_native(index, pending, reason);
-            noop_source_files.insert(pending.source_file_fingerprint.clone());
-            continue;
+            tail_source::counters::bump(
+                source,
+                "tail_refold",
+                CANDIDATE_PARSE_REASON_NAMES[reason as usize],
+            );
         }
         if pending.sampled_audit_verified {
             crate::local_resource_diagnostics::sampled_audit_comparison(
@@ -30468,7 +30469,7 @@ impl OwnedSourceScan {
                     .take_stored_read()
                     .then_some(parse_reason)
                     .flatten()
-                    .filter(|reason| stored_refinalize::reuse_label(*reason).is_some())
+                    .filter(|reason| tail_source::load::late_evidence(*reason))
                     .filter(|_| {
                         file_sampling.as_ref().is_some_and(|active| {
                             !matches!(
@@ -34085,17 +34086,14 @@ impl OwnedSourceScan {
                             index,
                         );
                         // On a Tail route a RAM miss loads the committed
-                        // Tail, unless this file owes a native read.
-                        #[cfg(unix)]
-                        let native_owed = tail_route
-                            .as_deref()
-                            .is_some_and(|route| stored_refinalize::take_native(route, &key));
+                        // Tail.
                         #[cfg(unix)]
                         let tail_load = tail_route.as_deref().filter(|_| {
                             retained.is_none()
                                 && allow_sample
-                                && !native_owed
-                                && stored_refinalize::reuses_stored(
+                                && tail_source::load::reuses_stored(
+                                    index,
+                                    &key,
                                     parse_reason,
                                     index.files.get(&key).is_some_and(|entry| {
                                         candidate.size_bytes > entry.size_bytes

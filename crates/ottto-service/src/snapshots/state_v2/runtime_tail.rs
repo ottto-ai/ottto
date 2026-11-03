@@ -34,20 +34,6 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
-/// This file's next read is native, once; `pass` is when it was owed.
-pub(in crate::snapshots) fn owe_native_read(path: &Path, key: &str, pass: u64) -> Result<()> {
-    with_state(path, |state| {
-        state.tail_native_owed.insert(key.to_owned(), pass);
-        Ok(())
-    })
-}
-/// The pass this file's native read was owed in, if this read is it; the
-/// debt ends here.
-pub(in crate::snapshots) fn take_native_read(path: &Path, key: &str) -> Option<u64> {
-    with_state(path, |state| Ok(state.tail_native_owed.remove(key)))
-        .ok()
-        .flatten()
-}
 /// The head this pass staged on `path` for `key`, not yet committed.
 #[cfg(test)]
 pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Option<(u32, Vec<u8>)> {

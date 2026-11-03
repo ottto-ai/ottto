@@ -43,20 +43,6 @@ pub(in crate::snapshots) fn add(
     });
 }
 
-/// A maximum: since the last line, and over the process.
-pub(in crate::snapshots) fn max(
-    source: SnapshotSource,
-    name: &'static str,
-    label: &'static str,
-    n: u64,
-) {
-    with(|counts| {
-        for count in counts.entry((source.api_slug(), name, label)).or_default() {
-            *count = (*count).max(n);
-        }
-    });
-}
-
 /// Per source, at most once per 24 h while reconstructions after a head
 /// persist. RAM only: a restart alarms again.
 pub(in crate::snapshots) fn restart_full_alarm_due(source: SnapshotSource) -> bool {
@@ -73,35 +59,6 @@ pub(in crate::snapshots) fn restart_full_alarm_due(source: SnapshotSource) -> bo
     }
     last.insert(source.api_slug(), now);
     true
-}
-
-type Passes = BTreeMap<&'static str, u64>;
-#[cfg(not(test))]
-static PASSES: std::sync::Mutex<Passes> = std::sync::Mutex::new(BTreeMap::new());
-#[cfg(test)]
-thread_local! {
-    static PASSES: std::cell::RefCell<Passes> = const { std::cell::RefCell::new(BTreeMap::new()) };
-}
-fn with_passes<R>(visit: impl FnOnce(&mut Passes) -> R) -> R {
-    #[cfg(not(test))]
-    {
-        visit(
-            &mut PASSES
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
-    #[cfg(test)]
-    PASSES.with(|passes| visit(&mut passes.borrow_mut()))
-}
-
-/// `source`'s passes this process has begun: the unit a wait is counted in.
-pub(in crate::snapshots) fn begin_pass(source: SnapshotSource) {
-    with_passes(|passes| *passes.entry(source.api_slug()).or_default() += 1);
-}
-
-pub(in crate::snapshots) fn pass(source: SnapshotSource) -> u64 {
-    with_passes(|passes| passes.get(source.api_slug()).copied().unwrap_or(0))
 }
 
 /// `source`'s line on this page, when anything of it counted since the last.

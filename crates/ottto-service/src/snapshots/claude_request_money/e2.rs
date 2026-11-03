@@ -2097,9 +2097,8 @@ impl CopyRemovalUpdates {
     /// The bounded replacement carries stored decisions and retry debt in the
     /// same index save. A refused decision still removes proven copies.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
-        match self.state {
-            Some(state) => index.claude_copy_removals.adopt_page(state),
-            None => index.claude_copy_removals.no_page_decision(),
+        if let Some(state) = self.state {
+            index.claude_copy_removals = state;
         }
         diag("copy_removal_stored", self.added);
         diag("copy_removal_store_overflow", self.unrecorded);

@@ -28,7 +28,7 @@ const HASH_BYTES: usize = 8;
 /// One file's stored removals: (holder, sorted unique hashes), by holder.
 type Groups = Box<[(LocationKey, Box<[u64]>)]>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CopyRemovals {
     /// (file, prefix hold attempts, groups), sorted by key. Empty groups are
     /// allowed only for retry debt. Recorded decisions are never evicted.
@@ -36,19 +36,7 @@ pub(crate) struct CopyRemovals {
     /// The charged bytes of `files` (see `charge`).
     bytes: usize,
     metadata_lost: bool,
-    /// Files whose hold this page's decision ended. Runtime only: never
-    /// written, and not part of a store's value.
-    ended: Vec<LocationKey>,
 }
-
-impl PartialEq for CopyRemovals {
-    fn eq(&self, other: &Self) -> bool {
-        self.files == other.files
-            && self.bytes == other.bytes
-            && self.metadata_lost == other.metadata_lost
-    }
-}
-impl Eq for CopyRemovals {}
 
 /// What one `store` did, in hashes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -126,37 +114,6 @@ impl CopyRemovals {
             }
             Err(_) => false,
         }
-    }
-    /// The body that expired this file's hold was withheld, so its expiry must
-    /// be decided again: the next pass is the hold's last, not a new first.
-    pub(crate) fn owe_last_hold(&mut self, file: LocationKey) {
-        match self.files.binary_search_by_key(&file, |f| f.0) {
-            Ok(i) => self.files[i].1 = HOLD_PASSES - 1,
-            Err(i) if self.bytes + FILE_BYTES <= MAX_BYTES => {
-                self.files.insert(i, (file, HOLD_PASSES - 1, Box::new([])));
-                self.bytes += FILE_BYTES;
-            }
-            // A full debt store expires immediately.
-            Err(_) => {}
-        }
-    }
-    /// This page's decided store replaces this one, noting the holds it ended.
-    pub(crate) fn adopt_page(&mut self, mut next: Self) {
-        next.ended = self
-            .files
-            .iter()
-            .filter(|(file, attempts, _)| *attempts > 0 && !next.pending(*file))
-            .map(|(file, _, _)| *file)
-            .collect();
-        *self = next;
-    }
-    /// This page decided nothing, so it ended no hold.
-    pub(crate) fn no_page_decision(&mut self) {
-        self.ended = Vec::new();
-    }
-    /// This page's decision ended `file`'s hold.
-    pub(crate) fn hold_ended(&self, file: LocationKey) -> bool {
-        self.ended.contains(&file)
     }
     pub(crate) fn clear_hold(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
@@ -337,12 +294,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CopyRemovals {
             .files
             .capacity()
             .checked_mul(entry)?
-            .checked_add(std::mem::align_of::<(LocationKey, u64, Groups)>())?
-            .checked_add(
-                self.ended
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<LocationKey>())?,
-            )?;
+            .checked_add(std::mem::align_of::<(LocationKey, u64, Groups)>())?;
         for (_, _, groups) in &self.files {
             bytes = bytes.checked_add(groups.len().checked_mul(group)?)?;
             for (_, hashes) in groups.iter() {
@@ -425,7 +377,6 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
         files: Vec::with_capacity(files),
         bytes: 0,
         metadata_lost,
-        ended: Vec::new(),
     };
     for _ in 0..files {
         let file = LocationKey::from_bytes(take(&mut input)?);

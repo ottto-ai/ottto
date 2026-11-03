@@ -40,6 +40,68 @@ pub(in crate::snapshots) enum Load {
     Cold(Option<FullReason>),
 }
 
+/// A selection of an unchanged transcript for evidence read at finish (late
+/// telemetry or side calls, a family or account proof, a quarantine retry).
+/// Its re-fold from stored state reads 0 transcript bytes; a body that is not
+/// the ACKed one goes as an ordinary update, counted `tail_refold{reason}`.
+pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool {
+    matches!(
+        reason,
+        CandidateParseReason::SourceChanged
+            | CandidateParseReason::Rearmed
+            | CandidateParseReason::ForcedFamily
+            | CandidateParseReason::AuthorityQuarantine
+            | CandidateParseReason::ActivityOrQuarantineRetry
+    )
+}
+
+/// Whether this selection loads the committed Tail. A due `Audit` certifies
+/// against the committed head: an unchanged file retires quietly, and only
+/// what the file proves changed reads Full. An `UnknownOutcome` re-read
+/// continues as well. Growth beats an upload-context selection: a file that
+/// `grew` past its committed entry continues as for `TranscriptChanged`; a
+/// context-only one stays native, as do `NewFile`, `BodyWitnessAdoption` and
+/// every legacy selection.
+///
+/// A late-evidence re-fold needs complete stored state and never answers a
+/// server challenge: a set-aside file, or one whose body waits on a retry (a
+/// head-CAS conflict among them), reads natively instead.
+pub(in crate::snapshots) fn reuses_stored(
+    index: &ScanIndex,
+    key: &str,
+    reason: Option<CandidateParseReason>,
+    grew: bool,
+) -> bool {
+    match reason {
+        None
+        | Some(
+            CandidateParseReason::TranscriptChanged
+            | CandidateParseReason::Audit
+            | CandidateParseReason::UnknownOutcome,
+        ) => true,
+        Some(CandidateParseReason::UploadContext) => grew,
+        Some(reason) => late_evidence(reason) && !set_aside(index, key) && !retry_held(index, key),
+    }
+}
+
+/// A body of this file waits in the upload ledger for a retry: the server
+/// refused it (a head-CAS conflict, a held decrease) and the ledger keeps it.
+fn retry_held(index: &ScanIndex, key: &str) -> bool {
+    index
+        .file_snapshot_fingerprints
+        .get(key)
+        .is_some_and(|set| {
+            set.iter().any(|fingerprint| {
+                index
+                    .quarantined_snapshot_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|record| {
+                        record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    })
+            })
+        })
+}
+
 /// The per-candidate marker check, before an ordinary Skip: a file whose
 /// Tail failed alone re-reads from its committed head even when its graph
 /// stamps already match.
@@ -314,6 +376,9 @@ fn stored<S: TailSource>(
 #[cfg(test)]
 #[path = "format_tests.rs"]
 mod format_tests;
+#[cfg(test)]
+#[path = "refold_tests.rs"]
+mod refold_tests;
 #[cfg(test)]
 #[path = "settlement_tests.rs"]
 mod settlement_tests;
