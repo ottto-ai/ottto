@@ -15,8 +15,8 @@
 //! settings, agent label, prelude), so content never re-derives. Live fields come from this read's inputs through `install_live`;
 //! foreign and finish-only fields stay empty at the seam.
 use super::{
-    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages,
-    hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
+    capability_hour, changed_files, decode_envelope, encode_envelope, fact_count, fact_pages,
+    fixed_pages, hour_pages, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
     DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{durable_struct, Durable, HDigest, Refuse};
@@ -31,7 +31,6 @@ const PRIORITY_G: u32 = 256;
 const SIGNATURES_G: u32 = 256;
 const REQUESTS_G: u32 = 64;
 const COMPACTIONS_G: u32 = 64;
-const LOG_G: u32 = 256;
 const SLOTS_FIELD: &str = "SnapshotAccumulator.codex_dictionary_slots";
 
 const fn slot(collection: Collection, g: u32) -> CollectionSpec {
@@ -66,7 +65,7 @@ const COLLECTIONS: [CollectionSpec; 11] = [
     CollectionSpec {
         collection: Collection::ChangedFiles,
         shape: PageShape::Log,
-        g: LOG_G,
+        g: changed_files::G,
         required: true,
         private: false,
     },
@@ -210,17 +209,13 @@ impl TailSource for Codex {
         }) as u64
     }
 
-    /// The walk's `I` fields Codex never stores: the bootstrap buffer (raw
-    /// lines, which set the file aside while it holds any), the account hash
-    /// (joined at finish), and Claude's and Pi's fields. Parse-time totals,
+    /// The walk's `I` fields Codex never stores: the account hash (joined at
+    /// finish), and Claude's and Pi's fields. The shared walk already refuses
+    /// a non-empty bootstrap buffer (`E`). Parse-time totals,
     /// usage buckets and cache requests are ordinary Codex state, not on this
     /// list; the live fields are this read's, installed by `install_live`.
     fn finish_field_nonempty(acc: &SnapshotAccumulator) -> Option<&'static str> {
         [
-            (
-                "codex_legacy_bootstrap_buffer",
-                !acc.codex_legacy_bootstrap_buffer.is_empty(),
-            ),
             (
                 "account_identifier_hash",
                 acc.account_identifier_hash.is_some(),
@@ -259,28 +254,6 @@ impl TailSource for Codex {
         ]
         .into_iter()
         .find_map(|(field, set)| set.then_some(field))
-    }
-
-    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
-        match collection {
-            Collection::ChangedFiles => acc.activity_changed_file_hashes.iter().collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn log_page(_: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        page_bytes(keys.iter(), |hash, e| {
-            hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
-        })
-    }
-
-    fn log_page_keys(_: Collection, bytes: &[u8]) -> Result<Vec<String>, ReconstructCause> {
-        let mut keys = Vec::new();
-        read_page(bytes, LOG_G, |d| {
-            keys.push(String::take_h(d)?);
-            Ok(())
-        })?;
-        Ok(keys)
     }
 
     fn encode_head(
@@ -377,11 +350,7 @@ impl TailSource for Codex {
             Collection::CapabilityHours => {
                 hour_pages(&acc.activity_capability_buckets, capability_hour)
             }
-            Collection::ChangedFiles => Self::log_keys(acc, collection)
-                .chunks(LOG_G as usize)
-                .enumerate()
-                .map(|(page, keys)| Ok((page as u64, Self::log_page(collection, keys)?)))
-                .collect(),
+            Collection::ChangedFiles => changed_files::encode(acc),
             Collection::SessionFacts => fact_pages(acc),
             _ => Ok(Vec::new()),
         }
@@ -523,29 +492,14 @@ impl TailSource for Codex {
                 &mut into.activity_capability_buckets,
                 capability_hour,
             ),
-            Collection::ChangedFiles => read_page(bytes, LOG_G, |d| {
-                if into.activity_changed_file_hashes.insert(String::take_h(d)?) {
-                    Ok(())
-                } else {
-                    Err(ReconstructCause::Corrupt)
-                }
-            }),
+            Collection::ChangedFiles => changed_files::decode(bytes, into),
             Collection::SessionFacts => read_fact_page(page, bytes, into),
             _ => Err(ReconstructCause::Corrupt),
         }
     }
 
-    fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause> {
-        if acc.source == Self::SOURCE {
-            Ok(())
-        } else {
-            Err(ReconstructCause::Corrupt)
-        }
-    }
-
-    /// Codex stores no keyed field.
-    fn key_epoch() -> Option<[u8; 32]> {
-        None
+    fn facts(_acc: &SnapshotAccumulator) -> Result<(), ReconstructCause> {
+        Ok(())
     }
 
     /// The stored state continues only under this read's inputs, and each
@@ -567,6 +521,11 @@ impl TailSource for Codex {
         live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError> {
         let incompatible = LiveLoadError::Reconstruct(ReconstructCause::Incompatible);
+        // The same dependency that invalidates the RAM reduction: ownership
+        // classification/lineage changes require the existing counted Full.
+        if stored.codex_sidecar_binding != live.codex_sidecar_binding {
+            return Err(incompatible);
+        }
         if !codex_counting_version::reusable(
             stored.codex_counting.as_deref(),
             live.codex_counting.as_deref(),
@@ -697,6 +656,7 @@ struct Trailer {
     codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     codex_parent_proof_refusal: Option<ProofRefusal>,
     codex_sidecar_projected_next_ordinal: Option<u64>,
+    codex_sidecar_binding: Option<String>,
 }
 durable_struct!(Trailer {
     N priority_present: bool,
@@ -705,6 +665,7 @@ durable_struct!(Trailer {
     D codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     D codex_parent_proof_refusal: Option<ProofRefusal>,
     N codex_sidecar_projected_next_ordinal: Option<u64>,
+    H codex_sidecar_binding: Option<String>,
 });
 impl Trailer {
     fn of(acc: &SnapshotAccumulator) -> Self {
@@ -715,6 +676,7 @@ impl Trailer {
             codex_parent_proof_used: acc.codex_parent_proof_used.clone(),
             codex_parent_proof_refusal: acc.codex_parent_proof_refusal.clone(),
             codex_sidecar_projected_next_ordinal: acc.codex_sidecar_projected_next_ordinal,
+            codex_sidecar_binding: acc.codex_sidecar_binding.clone(),
         }
     }
     fn restore(self, acc: &mut SnapshotAccumulator) {
@@ -724,7 +686,36 @@ impl Trailer {
         acc.codex_parent_proof_used = self.codex_parent_proof_used;
         acc.codex_parent_proof_refusal = self.codex_parent_proof_refusal;
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
+        acc.codex_sidecar_binding = self.codex_sidecar_binding;
     }
+}
+
+/// The Codex-specific stored layout following the common head envelope.
+#[cfg(test)]
+pub(super) fn shape_layout(s: &mut crate::durable_tail_codec::Shape) {
+    Trailer::shape(s);
+    for spec in Codex::collections() {
+        s.push(&format!(
+            "{:?} {:?} g={}",
+            spec.collection, spec.shape, spec.g
+        ));
+    }
+    CodexActiveTurn::shape(s);
+    CodexOpenCall::shape(s);
+    CodexNameCount::shape(s);
+    CodexPriorityTurn::shape(s);
+    String::shape_h(s);
+    OwnedRequest::shape(s);
+    String::shape(s); // Compaction timestamps.
+    UsageBucketState::shape(s);
+    <(String, String, String)>::shape(s);
+    u64::shape(s);
+    String::shape_h(s); // Changed files.
+    s.push(&format!("fact-version={}", super::FACT_VERSION));
+    for fact in super::FACTS {
+        s.push(&format!("fact-kind={}", fact as u64));
+    }
+    crate::codex_prelude_footprint::CodexPreludeParser::shape_fact(s);
 }
 
 #[cfg(test)]

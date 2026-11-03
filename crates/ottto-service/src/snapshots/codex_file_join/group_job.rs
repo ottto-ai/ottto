@@ -1298,9 +1298,6 @@ pub(in crate::snapshots) fn end_group(
             ..
         } if group.probe_bound => {
             if let Some(context) = sampling {
-                context
-                    .cache
-                    .note_join_refusal(JoinRefusal::ProbeBudgetOrder);
                 // Converge under stable inputs. An
                 // order the page's remaining singleton budget forced gets a
                 // page of its own next; one `PROBE_BYTES` forced (or forced
@@ -1342,7 +1339,6 @@ pub(in crate::snapshots) fn end_group(
             let disclosure = refusal_disclosure(&group.owner);
             let live_failed = position + 1 == group.members.len();
             if let Some(context) = sampling {
-                context.cache.note_join_refusal(reason);
                 // §d.4: growth of the live member may cure this refusal, so
                 // its entry matches only the exact recorded stamp: any
                 // append or touch wakes it, an unchanged group is not re-read.

@@ -10,7 +10,6 @@ use super::tests::{route_for, scope, Route, NOW};
 use super::*;
 use crate::snapshot_sync::tail_ack_ledger::AckLedger;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
-use crate::snapshots::sampled_jsonl::SideCertificate;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::state_v2::{BaselineRelease, TailHead};
@@ -98,47 +97,12 @@ fn finish<S: FixtureSource>(
 fn finish_under<S: FixtureSource>(
     route: &Route,
     path: &Path,
-    mut parser: OwnedJsonlParser,
+    parser: OwnedJsonlParser,
     base: Option<TailBase>,
     at_pre: impl FnOnce(&mut SnapshotAccumulator),
     scope: &Scope,
 ) -> (PendingTail, Result<ParsedJsonlFile>) {
-    let SideCertificate::Certified { completed, .. } =
-        parser.certify_without_retention(scope, NOW).unwrap()
-    else {
-        panic!("a clean fixture is certified");
-    };
-    at_pre(&mut parser.accumulator);
-    let mut tail = PendingTail {
-        source: S::SOURCE,
-        route: route.path.clone(),
-        key: local_index_key(path),
-        id: id::<S>(route, path),
-        certificate: completed.checkpoint.durable_certificate(0).unwrap(),
-        unsealed: completed.unsealed,
-        full: base.is_none(),
-        base,
-        encode: tail_encode::<S>,
-        encoded: None,
-    };
-    let identity = opened_object_identity(S::SOURCE, &mut File::open(path).unwrap()).unwrap();
-    let request = FinishRequest {
-        expected_opened_object_identity: &identity,
-        path,
-        collected_at: "2026-10-20T16:00:00Z",
-        source_file_fingerprint: "a".repeat(64),
-        codex_title_metadata: None,
-        claude_title_metadata: None,
-        attribution_context: None,
-        repository_identity: None,
-        money_context: None,
-    };
-    let native = parser.finish_native(
-        request,
-        Some(&mut |live: PreFinalization<'_>| tail.encode(&live)),
-    );
-    assert!(tail.encoded.is_some(), "PRE encoded");
-    (tail, native)
+    route.finish_under::<S>(path, parser, base, at_pre, scope)
 }
 
 /// One certified Full read of `path` as it stands now.
@@ -842,4 +806,112 @@ fn a_future_codex_head_holds_without_a_smaller_reemit() {
         &codex_cold(&route, std::slice::from_ref(&path)),
         true,
     );
+}
+
+/// [money] An ownership-affecting sidecar change after a committed head
+/// reconstructs through the existing counted path; totals and placement equal
+/// a cold Full under the new evidence, including the newly withheld session.
+#[test]
+fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() {
+    let mut route = route_for(Source::Codex);
+    let paths = [
+        account_rollout(&route, SESSION, Some("a"), 3),
+        account_rollout(&route, ACCOUNT_B, Some("b"), 2),
+        account_rollout(&route, GAP, None, 2),
+    ];
+    let open_with = |path: &Path, metadata: &CodexTitleMetadata| {
+        OwnedJsonlParser::new(
+            File::open(path).unwrap(),
+            path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(metadata),
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    let before = CodexTitleMetadata::default();
+    for path in &paths {
+        let mut parser = open_with(path, &before);
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let (tail, native) = route.finish_under::<Codex>(path, parser, None, |_| {}, &scope());
+        assert!(!native.as_ref().unwrap().snapshots.is_empty());
+        assert!(tail.publish(&native));
+    }
+    route.save(false);
+    let mut after = before.clone();
+    after.state_created_threads.insert(SESSION.to_owned());
+    assert_ne!(
+        before.path_reduction_fingerprint(&paths[0]),
+        after.path_reduction_fingerprint(&paths[0])
+    );
+    for (n, path) in paths.iter().enumerate() {
+        append(path, if n == 0 { 3 } else { 2 }, if n == 0 { 4 } else { 3 });
+    }
+    let mut resumed = Vec::new();
+    let mut cold = Vec::new();
+    let reconstructions = super::super::counters::total("tail_reconstruct", "incompatible");
+    for (n, path) in paths.iter().enumerate() {
+        let key = local_index_key(path);
+        let mut parser = open_with(path, &after);
+        let mut held = File::open(path).unwrap();
+        let loaded = load::<Codex>(
+            &route.index,
+            &route.path,
+            &key,
+            &id::<Codex>(&route, path),
+            &mut held,
+            &scope(),
+            &candidate(path),
+            &parser.accumulator,
+        );
+        let base = match loaded {
+            Load::Cold(None) if n == 0 => {
+                assert!(matches!(
+                    parser
+                        .prepare_acquisition(None, &scope(), None, NOW)
+                        .unwrap(),
+                    ReadMode::Full(_)
+                ));
+                None
+            }
+            Load::Reused(taken, Some(base)) if n != 0 => {
+                assert!(matches!(
+                    parser
+                        .prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
+                        .unwrap(),
+                    ReadMode::Tail
+                ));
+                Some(base)
+            }
+            _ => panic!("changed ownership reconstructs, other sessions Tail"),
+        };
+        while !parser.step().unwrap() {}
+        let (_, native) = route.finish_under::<Codex>(path, parser, base, |_| {}, &scope());
+        resumed.extend(native.unwrap().snapshots);
+        let mut parser = open_with(path, &after);
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let (_, native) = route.finish_under::<Codex>(path, parser, None, |_| {}, &scope());
+        cold.extend(native.unwrap().snapshots);
+    }
+    assert_eq!(
+        super::super::counters::total("tail_reconstruct", "incompatible"),
+        reconstructions + 1
+    );
+    assert!(
+        !cold.iter().any(|item| item.source_session_id == SESSION),
+        "state-created without a rollout declaration is withheld"
+    );
+    let cold = codex_emitted(Mode::ColdFull, &route.index, &cold);
+    let resumed = codex_emitted(Mode::Restart, &route.index, &resumed);
+    assert!(evidence(&cold, ACCOUNT_B).is_object());
+    assert!(evidence(&cold, GAP).is_null());
+    money_oracle::assert_equivalent(&cold, &resumed);
 }

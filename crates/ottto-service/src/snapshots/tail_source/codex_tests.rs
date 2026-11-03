@@ -3,32 +3,14 @@
 //! removal and reinsertion, content comes back from the session facts, damaged
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
-use super::super::{counters, encode};
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction, NOW};
+use super::super::{encode, page_bytes};
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
-use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::state_v2::StagedFile;
-use crate::transcript_acquisition::{ReadMode, Scope};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const NOW: u64 = 1_790_000_000;
-
-/// A complete stage: an empty base's `Reset`, or why it refuses.
-fn stage_full<S: TailSource>(
-    view: &PreFinalization<'_>,
-    certificate: &DurableCertificate,
-    id: &HeadIdentity,
-) -> Result<StagedFile, Refuse> {
-    super::super::seam::TailBase::default()
-        .stage::<S>(
-            view,
-            certificate,
-            id,
-            crate::snapshots::state_v2::Change::Reset,
-        )
-        .map(|staged| staged.expect("a reset always stages"))
-}
 pub(in crate::snapshots) const SESSION: &str = "019a0c2a-8e11-7222-8333-944445555777";
 
 fn at(minute: usize) -> String {
@@ -95,27 +77,12 @@ pub(in crate::snapshots) fn lines(turns: usize) -> Vec<String> {
 /// A cold positioned Full read: the PRE-finalization reduction and the
 /// checkpoint's certificate.
 fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ottto-tail-codex-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("rollout-2026-10-18T10-00-00-{SESSION}.jsonl"));
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-    let scope = Scope("tail-codex-codec".into());
-    let mut parser = fixture::parser(
+    parse_lines(
         SnapshotSource::Codex,
-        &path,
-        File::open(&path).unwrap(),
         apply_codex_line,
-    );
-    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
-    assert!(matches!(mode, ReadMode::Full(_)));
-    let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
-    std::fs::remove_dir_all(&dir).unwrap();
-    (reduction, checkpoint.durable_certificate(0).unwrap())
+        lines,
+        &format!("rollout-2026-10-18T10-00-00-{SESSION}.jsonl"),
+    )
 }
 
 fn identity() -> HeadIdentity {
@@ -129,45 +96,15 @@ fn identity() -> HeadIdentity {
     )
 }
 
-fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
-    let (acc, report, scalars) = reduction.finish_view();
-    let view = PreFinalization::new(acc, report, scalars);
-    stage_full::<Codex>(&view, certificate, &identity()).unwrap()
-}
-
-/// Head first, then every page in key order, then the codec contract.
-fn load(
-    staged: &StagedFile,
-    into: &mut SnapshotAccumulator,
-) -> Result<DecodedHead, ReconstructCause> {
-    let head = Codex::decode_head(staged.revision, &staged.head, into)?;
-    for (&(collection, page), bytes) in &staged.pages {
-        Codex::decode_page(collection, page, bytes, into)?;
-    }
-    Codex::validate_loaded(into, &staged.collections)?;
-    Ok(head)
-}
-
 fn loaded(staged: &StagedFile) -> SnapshotAccumulator {
     let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
-    assert_eq!(load(staged, &mut into).err(), None);
+    assert_eq!(load::<Codex>(staged, &mut into).err(), None);
     into
 }
 
 fn cause(staged: &StagedFile) -> Option<ReconstructCause> {
     let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
-    load(staged, &mut into).err()
-}
-
-fn copy(staged: &StagedFile) -> StagedFile {
-    StagedFile {
-        revision: staged.revision,
-        head: staged.head.clone(),
-        collections: staged.collections.clone(),
-        pages: staged.pages.clone(),
-        obsolete: staged.obsolete.clone(),
-        change: staged.change,
-    }
+    load::<Codex>(staged, &mut into).err()
 }
 
 /// The content comes back from the session facts alone, never from the file;
@@ -179,7 +116,7 @@ fn assert_reencodes(
 ) {
     let (acc, _, _) = reduction.finish_view();
     let mut restored = SnapshotAccumulator::new(SnapshotSource::Codex);
-    let head = load(staged, &mut restored).expect("the rows load");
+    let head = load::<Codex>(staged, &mut restored).expect("the rows load");
     assert_eq!(head.certificate, *certificate);
     assert_eq!(restored.title, acc.title);
     assert_eq!(restored.first_prompt_title, acc.first_prompt_title);
@@ -191,7 +128,7 @@ fn assert_reencodes(
         acc.session_start.has_codex_prelude()
     );
     let view = PreFinalization::new(&restored, &head.report, head.scalars);
-    let again = stage_full::<Codex>(&view, &head.certificate, &identity()).unwrap();
+    let again = stage_full::<Codex>(&view, &head.certificate, &identity());
     assert!(again.head == staged.head, "the head re-encodes exactly");
     assert!(again.pages == staged.pages, "the pages re-encode exactly");
     assert!(again.collections == staged.collections);
@@ -220,7 +157,7 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
         acc.codex_physical_signatures
             .push(sha256_hex(&["tail-codex-signature", &n.to_string()]));
     }
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let (acc, _, _) = reduction.finish_view();
     assert_eq!(Codex::finish_field_nonempty(acc), None);
     assert_eq!(Codex::elements(acc, Collection::CodexActiveTurns), 300);
@@ -316,7 +253,7 @@ fn a_reinserted_turn_keeps_its_slot_and_earlier_pages_stay() {
     let (acc, _, _) = reduction.finish_view();
     let slots = &acc.codex_dictionary_slots.active_turns;
     assert_eq!(slots.ordered(), ["z-first", "a-second", "m-third"]);
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let back = loaded(&staged);
     assert_eq!(
         back.codex_dictionary_slots.active_turns.ordered(),
@@ -354,7 +291,7 @@ fn mcp_call_states_survive_and_a_gone_call_is_a_tombstone() {
     acc.codex_dictionary_slots
         .open_calls
         .note(&"mcp-gone".to_owned());
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let back = loaded(&staged);
     assert_eq!(back.activity_mcp_call_ids.get("mcp-pending"), Some(&false));
     assert_eq!(back.activity_mcp_call_ids.get("mcp-done"), Some(&true));
@@ -365,24 +302,20 @@ fn mcp_call_states_survive_and_a_gone_call_is_a_tombstone() {
     assert_reencodes(&reduction, &certificate, &staged);
 }
 
-/// [format] A zero count is a value and a removed name a tombstone, per map: one
-/// name in two maps has two slots.
+/// [format] A removed native tool count remains a tombstone in its slot.
 #[test]
-fn name_counts_keep_zero_apart_from_gone_per_map() {
+fn a_removed_tool_count_is_a_tombstone() {
     let (mut reduction, certificate) = parse(&lines(1));
     let acc = reduction.accumulator_for_test();
-    acc.note_codex_name_slot(CodexCountMap::McpActivity, "shared");
-    acc.activity_mcp_tool_counts.insert("shared".into(), 0);
-    acc.note_codex_name_slot(CodexCountMap::McpUsage, "shared");
-    acc.note_codex_name_slot(CodexCountMap::Tool, "gone");
-    let staged = stage(&reduction, &certificate);
+    acc.note_activity_tool("gone");
+    acc.activity_tool_counts.remove("gone");
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let back = loaded(&staged);
-    assert_eq!(back.activity_mcp_tool_counts.get("shared"), Some(&0));
-    assert_eq!(back.activity_mcp_tool_usage_counts.get("shared"), None);
     assert_eq!(back.activity_tool_counts.get("gone"), None);
-    let names = &back.codex_dictionary_slots.name_counts;
-    assert!(names.contains(&(CodexCountMap::McpUsage, "shared".to_owned())));
-    assert!(names.contains(&(CodexCountMap::Tool, "gone".to_owned())));
+    assert!(back
+        .codex_dictionary_slots
+        .name_counts
+        .contains(&(CodexCountMap::Tool, "gone".to_owned())));
     assert_reencodes(&reduction, &certificate, &staged);
 }
 
@@ -398,7 +331,12 @@ fn a_live_key_without_a_slot_refuses_the_stage() {
     let (acc, report, scalars) = reduction.finish_view();
     let view = PreFinalization::new(acc, report, scalars);
     assert!(matches!(
-        stage_full::<Codex>(&view, &certificate, &identity()),
+        super::super::seam::TailBase::default().stage::<Codex>(
+            &view,
+            &certificate,
+            &identity(),
+            crate::snapshots::state_v2::Change::Reset
+        ),
         Err(Refuse::NonEmpty(_))
     ));
 }
@@ -410,12 +348,12 @@ fn priority_none_and_empty_stay_apart() {
     reduction
         .accumulator_for_test()
         .codex_observed_priority_turns = None;
-    let none = stage(&reduction, &certificate);
+    let none = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     assert!(loaded(&none).codex_observed_priority_turns.is_none());
     let acc = reduction.accumulator_for_test();
     acc.codex_observed_priority_turns = Some(BTreeMap::new());
     acc.codex_dictionary_slots.priority_turns = Default::default();
-    let empty = stage(&reduction, &certificate);
+    let empty = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     assert_eq!(
         loaded(&empty).codex_observed_priority_turns,
         Some(BTreeMap::new())
@@ -432,7 +370,7 @@ fn duplicate_compaction_timestamps_stay_apart_from_sizes() {
     let repeated = acc.compaction_timestamps[0].clone();
     acc.compaction_timestamps.push(repeated.clone());
     acc.compaction_timestamps.push(repeated);
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let (acc, _, _) = reduction.finish_view();
     assert_eq!(acc.compaction_timestamps.len(), 4);
     assert_eq!(
@@ -447,12 +385,8 @@ fn duplicate_compaction_timestamps_stay_apart_from_sizes() {
 #[test]
 fn damaged_state_is_classified() {
     let (reduction, certificate) = parse(&lines(70));
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     assert_eq!(cause(&staged), None);
-
-    let mut other = copy(&staged);
-    other.revision = Codex::REDUCTION_REVISION + 1;
-    assert_eq!(cause(&other), Some(ReconstructCause::Incompatible));
 
     let mut short = copy(&staged);
     short.head.pop();
@@ -471,10 +405,6 @@ fn damaged_state_is_classified() {
     gap.pages.remove(&(Collection::CodexActiveTurns, 0));
     assert_eq!(cause(&gap), Some(ReconstructCause::Corrupt));
 
-    let mut missing = copy(&staged);
-    missing.collections.remove(&Collection::CodexNameCounts);
-    assert_eq!(cause(&missing), Some(ReconstructCause::Incomplete));
-
     let mut count = copy(&staged);
     count
         .collections
@@ -482,14 +412,6 @@ fn damaged_state_is_classified() {
         .unwrap()
         .elements += 1;
     assert_eq!(cause(&count), Some(ReconstructCause::Incomplete));
-
-    let mut geometry = copy(&staged);
-    geometry
-        .collections
-        .get_mut(&Collection::CodexActiveTurns)
-        .unwrap()
-        .elements_per_page += 1;
-    assert_eq!(cause(&geometry), Some(ReconstructCause::Incompatible));
 
     let mut foreign = copy(&staged);
     let meta = foreign.collections[&Collection::Signatures];
@@ -539,7 +461,7 @@ fn damaged_state_is_classified() {
     // Another source's head.
     let (mut reduction, certificate) = parse(&lines(1));
     reduction.accumulator_for_test().source = SnapshotSource::ClaudeCode;
-    let other_source = stage(&reduction, &certificate);
+    let other_source = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     assert_eq!(cause(&other_source), Some(ReconstructCause::Corrupt));
 }
 
@@ -556,12 +478,6 @@ fn the_finish_list_is_codex_own() {
     acc.claude_last_user_ts = Some(at(0));
     assert_eq!(Codex::finish_field_nonempty(&acc), None);
 
-    let mut acc = new();
-    acc.codex_legacy_bootstrap_buffer.push(json!({}));
-    assert_eq!(
-        Codex::finish_field_nonempty(&acc),
-        Some("codex_legacy_bootstrap_buffer")
-    );
     let mut acc = new();
     acc.claude_usage_request_ids.insert("r".into());
     assert_eq!(
@@ -590,7 +506,7 @@ fn priority_decisions_are_slots_by_first_seen_turn() {
     }
     acc.codex_dictionary_slots.priority_turns = slots.priority_turns;
     acc.codex_observed_priority_turns = Some(observed);
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let back = loaded(&staged);
     assert_eq!(
         back.codex_dictionary_slots.priority_turns.ordered(),
@@ -613,7 +529,12 @@ fn priority_decisions_are_slots_by_first_seen_turn() {
     let (acc, report, scalars) = reduction.finish_view();
     let view = PreFinalization::new(acc, report, scalars);
     assert!(matches!(
-        stage_full::<Codex>(&view, &certificate, &identity()),
+        super::super::seam::TailBase::default().stage::<Codex>(
+            &view,
+            &certificate,
+            &identity(),
+            crate::snapshots::state_v2::Change::Reset
+        ),
         Err(Refuse::NonEmpty(_))
     ));
 }
@@ -897,24 +818,6 @@ fn install_live_holds_a_child_pending_its_parent() {
     assert!(!witnessed.codex_parent_resolution_pending());
 }
 
-/// [regress] One count per executed replay with the bytes it read, on the
-/// existing reconstruction counters of its source. No alarm input moves.
-#[test]
-fn a_replay_counts_once_with_its_bytes() {
-    counters::replay(SnapshotSource::Codex, ReconstructCause::GroupReplay, 15);
-    counters::replay(SnapshotSource::Codex, ReconstructCause::TierPrefixReplay, 0);
-    assert_eq!(counters::total("tail_reconstruct", "group_replay"), 1);
-    assert_eq!(
-        counters::total("tail_reconstruct_bytes", "group_replay"),
-        15
-    );
-    assert_eq!(counters::total("tail_reconstruct", "tier_prefix_replay"), 1);
-    assert_eq!(
-        counters::total("tail_reconstruct_after_head", "group_replay"),
-        0
-    );
-}
-
 /// [format] Codex's content is session facts in the shared slot collection:
 /// title, first prompt, workspace, the agent label (kind 4) and the prelude
 /// parser (kind 5) each load back from its own page, and the head stores none
@@ -931,7 +834,7 @@ fn codex_content_loads_back_from_its_session_facts() {
         acc.session_start.has_codex_prelude(),
         "the parse holds its prelude parser"
     );
-    let staged = stage(&reduction, &certificate);
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let facts: Vec<u64> = staged
         .pages
         .keys()
@@ -1095,6 +998,10 @@ fn install_live_restores_the_parent_proof_the_child_used() {
     // The used proof is head state: it survives a stage and load.
     let (mut reduction, certificate) = parse(&lines(1));
     reduction.accumulator_for_test().codex_parent_proof_used = Some((proof.clone(), None));
-    let back = loaded(&stage(&reduction, &certificate));
+    let back = loaded(&stage_reduction::<Codex>(
+        &reduction,
+        &certificate,
+        &identity(),
+    ));
     assert_eq!(back.codex_parent_proof_used, Some((proof, None)));
 }

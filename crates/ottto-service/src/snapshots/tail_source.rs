@@ -367,12 +367,41 @@ pub(in crate::snapshots) trait TailSource {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse>;
     /// A `Log` collection's elements, in its full encode's (sorted) order.
-    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String>;
+    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
+        match collection {
+            Collection::ChangedFiles => changed_files::keys(acc),
+            _ => Vec::new(),
+        }
+    }
     /// One `Log` page holding `keys`, in this order.
-    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse>;
+    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        match collection {
+            Collection::ChangedFiles => changed_files::page(keys),
+            _ => page_bytes(keys.iter(), |key, e| key.put(e)),
+        }
+    }
     /// A stored `Log` page's elements, in stored order.
-    fn log_page_keys(collection: Collection, bytes: &[u8])
-        -> Result<Vec<String>, ReconstructCause>;
+    fn log_page_keys(
+        collection: Collection,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, ReconstructCause> {
+        match collection {
+            Collection::ChangedFiles => changed_files::page_keys(bytes),
+            _ => {
+                let g = Self::collections()
+                    .iter()
+                    .find(|spec| spec.collection == collection)
+                    .ok_or(ReconstructCause::Corrupt)?
+                    .g;
+                let mut keys = Vec::new();
+                read_page(bytes, g, |d| {
+                    keys.push(String::take(d)?);
+                    Ok(())
+                })?;
+                Ok(keys)
+            }
+        }
+    }
     /// Every page of `collection`, by position.
     fn encode_pages(
         acc: &SnapshotAccumulator,
@@ -395,7 +424,9 @@ pub(in crate::snapshots) trait TailSource {
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
     /// The epoch of the key every keyed field this codec stores is made
     /// under; `None` without a key. A head from another key is never reused.
-    fn key_epoch() -> Option<[u8; 32]>;
+    fn key_epoch() -> Option<[u8; 32]> {
+        None
+    }
     /// Installs the live inputs of this read into a validated stored state,
     /// before the load publishes it as reused. `live` is the read's fresh
     /// accumulator, configured before any line (traces, parent ledgers and
@@ -592,6 +623,48 @@ fn hour_pages<K: Durable, V: Durable>(
             Ok((hour, bytes))
         })
         .collect()
+}
+
+/// The hashed changed-file log shared by every source's codec. `G` is page
+/// geometry: additional keys create additional pages, never a total-data cap.
+mod changed_files {
+    use super::*;
+    pub(super) const G: u32 = 256;
+    pub(super) fn keys(acc: &SnapshotAccumulator) -> Vec<&String> {
+        acc.activity_changed_file_hashes.iter().collect()
+    }
+    pub(super) fn page(keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        page_bytes(keys.iter(), |hash, e| {
+            hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
+        })
+    }
+    pub(super) fn page_keys(bytes: &[u8]) -> Result<Vec<String>, ReconstructCause> {
+        let mut keys = Vec::new();
+        read_page(bytes, G, |d| {
+            keys.push(String::take_h(d)?);
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+    pub(super) fn encode(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+        keys(acc)
+            .chunks(G as usize)
+            .enumerate()
+            .map(|(n, keys)| Ok((n as u64, page(keys)?)))
+            .collect()
+    }
+    pub(super) fn decode(
+        bytes: &[u8],
+        into: &mut SnapshotAccumulator,
+    ) -> Result<(), ReconstructCause> {
+        read_page(bytes, G, |d| {
+            if into.activity_changed_file_hashes.insert(String::take_h(d)?) {
+                Ok(())
+            } else {
+                Err(ReconstructCause::Corrupt)
+            }
+        })
+    }
 }
 
 /// A capability bucket's start: the first part of its key.
@@ -947,4 +1020,5 @@ head_fields! {
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
     I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
+    I codex_sidecar_binding: Option<String>,
 }

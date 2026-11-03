@@ -1246,11 +1246,7 @@ pub(super) enum JoinRefusal {
     /// settleable or memoized.
     ProbeBudgetOrder,
 }
-pub(super) const JOIN_REFUSALS: usize = 20;
 impl JoinRefusal {
-    pub(super) fn slot(self) -> usize {
-        self as usize
-    }
     /// Growth of the live member may cure these (§d.4). Every other reason,
     /// and any reason whose first failing member is sealed, is append-incurable.
     pub(super) fn append_curable(self) -> bool {

@@ -1593,38 +1593,9 @@ macro_rules! cursor_counters {
             $($(#[$doc])* pub(in crate::snapshots) $event: u64,)+
             /// Largest `now - due` of an `audit_overdue` completion, in seconds.
             pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
-            /// P2 (RAM only; not yet in the diagnostics projection): group cursor
-            /// jobs started, group memo hits, group attempts skipped by the
-            /// generation fence, groups whose probe hit `PROBE_BYTES` or the
-            /// boot's probe allowance
-            /// (chronological order kept), and group refusals by `JoinRefusal` slot
-            /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
-            pub(in crate::snapshots) groups_started: u64,
-            pub(in crate::snapshots) group_memo_hits: u64,
-            pub(in crate::snapshots) groups_fenced: u64,
-            pub(in crate::snapshots) probe_bound: u64,
-            pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
-            /// PR-P (RAM/test only; not in the diagnostics projection, no export):
-            /// parent witnesses refused at admission, forgotten by a feasible
-            /// mandatory admission (one per witness), new namespaces refused past
-            /// `ROTATION_KEYS`, restart slots evicted past `ROTATION_KEYS`, and match
-            /// marks refused. Production sees their effects only through the census
-            /// `parent_unresolvable` counts and `parent_restarts_in_scope`.
-            pub(in crate::snapshots) parent_witness_refused: u64,
-            pub(in crate::snapshots) parent_witness_evicted: u64,
-            pub(in crate::snapshots) parent_namespace_refused: u64,
-            pub(in crate::snapshots) parent_restart_slot_evicted: u64,
-            pub(in crate::snapshots) parent_match_unmarked: u64,
-            /// Stage 1 guard (RAM/test only; not in the diagnostics projection): a
-            /// large ordinary start deferred before its last attempt's ordinary
-            /// equivalent (§6). Owed, like any deferral: never a waiter, a skip, a
-            /// loss or a completion, and no completeness meaning.
-            pub(in crate::snapshots) deferred_paced: u64,
+
         }
-        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds,
-            groups_started, group_memo_hits, groups_fenced, probe_bound, join_terminal_debt,
-            parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
-            parent_restart_slot_evicted, parent_match_unmarked, deferred_paced);
+        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds);
     };
 }
 crate::local_resource_diagnostics::codex_cursor_events!(cursor_counters);
@@ -3880,7 +3851,6 @@ fn evict_lru_parent_witnesses(cursor: &mut CursorState, deficit: usize) -> bool 
         return false;
     };
     let mut freed = 0_usize;
-    let mut evicted = 0_u64;
     let mut corrupt = false;
     if let Some(entry) = cursor
         .parents
@@ -3899,7 +3869,6 @@ fn evict_lru_parent_witnesses(cursor: &mut CursorState, deficit: usize) -> bool 
                     None => corrupt = true,
                 }
                 freed = freed.saturating_add(node).saturating_add(*stored);
-                evicted += 1;
                 false
             });
         }
@@ -3920,7 +3889,7 @@ fn evict_lru_parent_witnesses(cursor: &mut CursorState, deficit: usize) -> bool 
         }
         return false;
     }
-    cursor.counters.parent_witness_evicted += evicted;
+
     // Drop the processed entry (the first at `oldest`, as `find` saw it) only
     // when it holds no witness.
     let mut first = true;
@@ -3953,7 +3922,7 @@ fn parent_entry_charge(exists: bool, namespace: &str, scope: &str) -> Option<usi
 
 /// PR-P (N2): whether `namespace` would be a new entry past `ROTATION_KEYS`.
 /// Every caller is an optional admission and refuses it before admitting
-/// anything (`parent_namespace_refused`): the retained namespaces and their
+/// anything: the retained namespaces and their
 /// witnesses are never evicted for a newcomer (the count bound, not the memory
 /// valve). The newcomer's parents stay owed (re-read, fail-closed). An entry
 /// of another scope is not new: it is replaced in place.
@@ -4616,22 +4585,6 @@ impl SharedCache {
             .unwrap_or_default()
     }
 
-    /// Terminal group debt by reason (§d.1.1 S11 counter).
-    pub(in crate::snapshots) fn note_join_refusal(&self, reason: codex_file_join::JoinRefusal) {
-        self.with_cursor(|cursor| {
-            let slot = &mut cursor.counters.join_terminal_debt[reason.slot()];
-            *slot = slot.saturating_add(1);
-        });
-    }
-
-    pub(in crate::snapshots) fn note_group_memo_hit(&self) {
-        self.with_cursor(|cursor| cursor.counters.group_memo_hits += 1);
-    }
-
-    pub(in crate::snapshots) fn note_probe_bound(&self) {
-        self.with_cursor(|cursor| cursor.counters.probe_bound += 1);
-    }
-
     /// M-5: this group's attempt ended as terminal debt in generation
     /// `fence`; a later selection in the same generation is skipped.
     pub(in crate::snapshots) fn group_attempted(
@@ -4645,7 +4598,7 @@ impl SharedCache {
     }
 
     /// M-5 (b) at pop: the group's attempt already ended in this generation.
-    /// Counted in `groups_fenced`; its members are not processed again.
+    /// Its members are not processed again.
     pub(in crate::snapshots) fn group_fenced(
         &self,
         namespace: &Scope,
@@ -4653,14 +4606,8 @@ impl SharedCache {
         fence: Option<&str>,
     ) -> bool {
         let key = rotation_key(&namespace.0, key);
-        self.with_cursor(|cursor| {
-            let fenced = cursor.rotation.fenced(&key, fence);
-            if fenced {
-                cursor.counters.groups_fenced += 1;
-            }
-            fenced
-        })
-        .unwrap_or(false)
+        self.with_cursor(|cursor| cursor.rotation.fenced(&key, fence))
+            .unwrap_or(false)
     }
 
     /// PR-P: the namespace's parent state for one page, under the cursor lock.
@@ -4672,13 +4619,10 @@ impl SharedCache {
     pub(in crate::snapshots) fn parent_state(&self, namespace: &Scope, scope: &str) -> ParentState {
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
-            let (slot, evicted) = cursor
+            let (slot, _evicted) = cursor
                 .parent_restarts
                 .touch(parent_restart_key(&namespace.0, scope), page);
             let restarts = slot.restarts;
-            if evicted {
-                cursor.counters.parent_restart_slot_evicted += 1;
-            }
             if cursor
                 .parents
                 .get(&namespace.0)
@@ -4723,10 +4667,10 @@ impl SharedCache {
     /// charge is computed from lengths before any key is copied: the witness
     /// node, the key and the moved-in strings' capacities, plus a new entry's
     /// node, key, scope and empty-map root. Construction is checked against it. Unsupported
-    /// layout or no room: refused (`parent_witness_refused`), nothing kept.
+    /// layout or no room: refused, nothing kept.
     /// The count bound is separate: a witness for a new namespace past
     /// `ROTATION_KEYS` (the 65th) is refused before admission
-    /// (`parent_namespace_refused`, also `parent_witness_refused`); the 64
+    /// before changing the retained set; the 64
     /// retained namespaces keep their witnesses, and the newcomer's parent
     /// stays owed.
     pub(in crate::snapshots) fn witness_parent(
@@ -4736,10 +4680,6 @@ impl SharedCache {
         parent: &str,
         witness: ParentWitness,
     ) -> bool {
-        let refuse = |cache: &Self| {
-            cache.with_cursor(|cursor| cursor.counters.parent_witness_refused += 1);
-            false
-        };
         let stored = parent
             .len()
             .checked_add(witness.identity.as_ref().map_or(0, String::capacity))
@@ -4747,16 +4687,14 @@ impl SharedCache {
                 bytes.checked_add(witness.waits_on.as_ref().map_or(0, String::capacity))
             });
         let Some(stored) = stored else {
-            return refuse(self);
+            return false;
         };
         let Ok(mut retained) = self.retained() else {
-            return refuse(self);
+            return false;
         };
         let admitted = self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
             if parent_namespace_full(cursor, &namespace.0) {
-                cursor.counters.parent_namespace_refused += 1;
-                cursor.counters.parent_witness_refused += 1;
                 return false;
             }
             let exists = cursor
@@ -4768,13 +4706,11 @@ impl SharedCache {
                     .checked_add(stored)?
                     .checked_add(entry)
             }) else {
-                cursor.counters.parent_witness_refused += 1;
                 return false;
             };
             if !crate::heap_layout_bound::layout_supported()
                 || !admit_locked(&mut retained, cursor, charge, false, Admitter::Main)
             {
-                cursor.counters.parent_witness_refused += 1;
                 return false;
             }
             let key = exact_copy(parent);
@@ -4786,7 +4722,7 @@ impl SharedCache {
                 });
             if built != Some(stored) {
                 // Outside the accounting contract: refuse, freed here.
-                cursor.counters.parent_witness_refused += 1;
+
                 return false;
             }
             let Some(entry) = parent_entry(cursor, exists, &namespace.0, scope, page) else {
@@ -4854,7 +4790,7 @@ impl SharedCache {
     /// PR-P: marks the namespace matched for this traversal, admitted like
     /// `witness_parent` (the copied end, plus a new entry; a new namespace
     /// past `ROTATION_KEYS` is refused the same way). A refusal leaves it
-    /// unmarked, so the next page re-matches (`parent_match_unmarked`).
+    /// unmarked, so the next page re-matches.
     pub(in crate::snapshots) fn mark_parents_matched(
         &self,
         namespace: &Scope,
@@ -4862,17 +4798,13 @@ impl SharedCache {
         end: &str,
         restarts: u64,
     ) {
-        let unmarked = |cache: &Self| {
-            cache.with_cursor(|cursor| cursor.counters.parent_match_unmarked += 1);
-        };
+        let unmarked = |cache: &Self| {};
         let Ok(mut retained) = self.retained() else {
             return unmarked(self);
         };
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
             if parent_namespace_full(cursor, &namespace.0) {
-                cursor.counters.parent_namespace_refused += 1;
-                cursor.counters.parent_match_unmarked += 1;
                 return;
             }
             let exists = cursor
@@ -4882,17 +4814,14 @@ impl SharedCache {
             let Some(charge) = parent_entry_charge(exists, &namespace.0, scope)
                 .and_then(|entry| entry.checked_add(end.len()))
             else {
-                cursor.counters.parent_match_unmarked += 1;
                 return;
             };
             if !crate::heap_layout_bound::layout_supported()
                 || !admit_locked(&mut retained, cursor, charge, false, Admitter::Main)
             {
-                cursor.counters.parent_match_unmarked += 1;
                 return;
             }
             let Some(entry) = parent_entry(cursor, exists, &namespace.0, scope, page) else {
-                cursor.counters.parent_match_unmarked += 1;
                 return;
             };
             entry.matched = Some((exact_copy(end), restarts));
@@ -4910,14 +4839,11 @@ impl SharedCache {
     ) -> Option<u64> {
         self.with_cursor(|cursor| {
             let page = cursor.rotation.page;
-            let (slot, evicted) = cursor
+            let (slot, _evicted) = cursor
                 .parent_restarts
                 .touch(parent_restart_key(&namespace.0, scope), page);
             slot.restarts = slot.restarts.saturating_add(1);
             let restarts = slot.restarts;
-            if evicted {
-                cursor.counters.parent_restart_slot_evicted += 1;
-            }
             restarts
         })
     }
@@ -5213,7 +5139,7 @@ impl SharedCache {
     /// (`PaceTable::verdict`). A paced deferral is an ordinary `Defer`: the
     /// caller requeues the file, owed. It is never recorded as a waiter (it
     /// leaves `rotation.waiting`, so it blocks no turn) and is neither a
-    /// completion, a fence, a skip nor a loss; it counts `deferred_paced`.
+    /// completion, a fence, a skip nor a loss.
     /// The file's stamp is read before the cursor lock (no IO under it); an
     /// unreadable stamp plans as today (the start then refuses it).
     #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
@@ -5259,7 +5185,7 @@ impl SharedCache {
             if let Some((pace_key, rev)) = paced.as_ref() {
                 if cursor.pace.verdict(*pace_key, rev, pace_now()) == PaceVerdict::Defer {
                     cursor.rotation.waiting.remove(&key);
-                    cursor.counters.deferred_paced += 1;
+
                     return StartPlan::Defer;
                 }
             }
@@ -5462,7 +5388,7 @@ impl SharedCache {
                 cursor.slot_members = members;
                 cursor.rotation.waiting.remove(&waiter);
                 cursor.counters.jobs_started += 1;
-                cursor.counters.groups_started += 1;
+
                 Some(token)
             })
             .flatten()

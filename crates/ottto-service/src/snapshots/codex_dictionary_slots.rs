@@ -9,7 +9,7 @@ use crate::owned_heap::OwnedMap;
 
 /// One dictionary's first-seen order: key to slot, as the response book keeps it.
 pub(super) struct StableSlots<K> {
-    index: OwnedMap<K, u32>,
+    index: OwnedMap<K, usize>,
 }
 impl<K> Default for StableSlots<K> {
     fn default() -> Self {
@@ -42,12 +42,9 @@ impl<K: Ord + Clone + HeapLayoutBound> StableSlots<K> {
     }
 }
 impl<K: Ord + HeapLayoutBound> StableSlots<K> {
-    /// A decoded slot, in stored order. False: the key is a duplicate, or the
-    /// slot space is spent.
+    /// A decoded slot, in stored order. False: the key is a duplicate.
     pub(super) fn adopt(&mut self, key: K) -> bool {
-        let Ok(slot) = u32::try_from(self.index.len()) else {
-            return false;
-        };
+        let slot = self.index.len();
         if self.index.contains_key(&key) {
             return false;
         }
@@ -63,7 +60,8 @@ impl<K: Ord + HeapLayoutBound> StableSlots<K> {
     }
     /// The keys in slot order: the index inverted.
     pub(super) fn ordered(&self) -> Vec<&K> {
-        let mut keys: Vec<(u32, &K)> = self.index.iter().map(|(key, slot)| (*slot, key)).collect();
+        let mut keys: Vec<(usize, &K)> =
+            self.index.iter().map(|(key, slot)| (*slot, key)).collect();
         keys.sort_unstable_by_key(|(slot, _)| *slot);
         keys.into_iter().map(|(_, key)| key).collect()
     }

@@ -554,7 +554,7 @@ impl CodexPreludeParser {
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::{Durable, Refuse};
+        use crate::durable_tail_codec::{Durable, GrownArray, Refuse};
         let p = &self.prelude;
         if p.skills_body.is_some() {
             return Err(Refuse::NonEmpty("CodexPrelude.skills_body"));
@@ -569,7 +569,7 @@ impl CodexPreludeParser {
         p.base_instructions_chars.put(e)?;
         p.other_harness_chars.put(e)?;
         p.hook_chars.put(e)?;
-        p.block_chars.put(e)?;
+        p.block_chars.put_grown(e)?;
         p.blocks_incomplete.put(e)?;
         p.input_closed.put(e)?;
         p.world_state_seen.put(e)?;
@@ -584,11 +584,33 @@ impl CodexPreludeParser {
         self.keep_skills_body.put(e)
     }
 
+    /// Shape of the full-content fact, including its length-prefixed block array.
+    #[cfg(test)]
+    pub(crate) fn shape_fact(s: &mut crate::durable_tail_codec::Shape) {
+        use crate::durable_tail_codec::{Durable, GrownArray};
+        macro_rules! fields {
+            ($($field:ident: $ty:ty),* $(,)?) => {$(
+                s.push(stringify!($field)); <$ty>::shape(s);
+            )*};
+        }
+        s.push("CodexPreludeFact");
+        fields!(cwd: Option<String>, started_at: Option<i64>, is_fork: bool,
+            complete: bool, model: Option<String>, context_window: Option<u64>,
+            first_input_tokens: Option<u64>, base_instructions_chars: u64,
+            other_harness_chars: u64, hook_chars: u64);
+        s.push("G block_chars");
+        <[u64; BLOCK_KINDS]>::shape_grown(s);
+        fields!(blocks_incomplete: bool, input_closed: bool, world_state_seen: bool,
+            agents_md: Option<(Option<String>, String)>, agents_md_capped: bool,
+            session_id: Option<String>, rows_after_first_request: usize,
+            agents_md_cap: usize, keep_skills_body: bool);
+    }
+
     /// The parser [`Self::put_fact`] stored.
     pub(crate) fn take_fact(
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
-        use crate::durable_tail_codec::Durable;
+        use crate::durable_tail_codec::{Durable, GrownArray};
         let prelude = CodexPrelude {
             cwd: Durable::take(d)?,
             started_at: Durable::take(d)?,
@@ -600,7 +622,7 @@ impl CodexPreludeParser {
             base_instructions_chars: Durable::take(d)?,
             other_harness_chars: Durable::take(d)?,
             hook_chars: Durable::take(d)?,
-            block_chars: Durable::take(d)?,
+            block_chars: <[u64; BLOCK_KINDS]>::take_grown(d, || 0)?,
             blocks_incomplete: Durable::take(d)?,
             input_closed: Durable::take(d)?,
             world_state_seen: Durable::take(d)?,

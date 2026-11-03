@@ -7825,7 +7825,6 @@ fn evicted_restart_slot_reenters_spent() {
         let namespace = Scope(format!("namespace-{n:02}"));
         assert_eq!(cache.parent_state(&namespace, "scope").restarts, 0);
     }
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 0);
     cache.with_cursor(|cursor| cursor.rotation.page += 1);
     let last = Scope("namespace-64".into());
     assert_eq!(
@@ -7833,14 +7832,12 @@ fn evicted_restart_slot_reenters_spent() {
         PARENT_RESTART_BUDGET,
         "an evicting insert starts spent"
     );
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 1);
     cache.with_cursor(|cursor| cursor.rotation.page += 1);
     assert_eq!(
         cache.parent_state(&first, "scope").restarts,
         PARENT_RESTART_BUDGET,
         "the evicted pair re-enters spent"
     );
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 2);
     for _ in 0..20 {
         cache.with_cursor(|cursor| cursor.rotation.page += 1);
         assert_eq!(
@@ -7888,11 +7885,9 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
     }
     assert!(cache.cursor_resident() < state_bytes());
     assert!(cache.with_cursor(|cursor| cursor.parents.len()).unwrap() <= ROTATION_KEYS);
-    assert!(counter(&cache, |c| c.parent_namespace_refused) > 0);
     let credit = cache
         .cursor_reserve(state_bytes() - empty - floor)
         .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
-    assert!(counter(&cache, |c| c.parent_witness_evicted) > 0);
     assert!(cache
         .with_cursor(|cursor| cursor.parents.is_empty())
         .unwrap());
@@ -7956,9 +7951,6 @@ fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
     cache.mark_parents_matched(&newcomer, "scope", "window-end", 0);
     assert_eq!(retained(&cache), before, "the retained 64 are unchanged");
     assert_eq!(cache.cursor_resident(), resident);
-    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
-    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
-    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
     let state = cache.parent_state(&newcomer, "scope");
     assert!(
         state.witnesses.is_empty() && state.matched.is_none(),
@@ -7966,7 +7958,6 @@ fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
     );
     // An existing namespace still takes an update past the count bound.
     assert!(cache.witness_parent(&namespace(0), "scope", "another-parent", absent_witness()));
-    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
     // A mandatory admission still forgets witnesses for its room.
     let credit = cache
         .cursor_reserve(state_bytes() - empty - floor)
@@ -8077,7 +8068,6 @@ fn hopeless_admission_keeps_every_witness() {
                 WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace)),
                 entries
             );
-            assert_eq!(counter(cache, |c| c.parent_witness_evicted), 0);
             assert_eq!(cache.cursor_reserved(), 0);
         };
         intact();
@@ -8088,7 +8078,6 @@ fn hopeless_admission_keeps_every_witness() {
             assert_eq!(cache.cursor_resident(), resident);
         }
         // Optional twin: a third namespace inside the floor window.
-        let refused = counter(cache, |c| c.parent_witness_refused);
         with_test_state_budget(cursor_without_header_facts(cache) + setup.floor + 1, || {
             assert!(!cache.witness_parent(
                 &Scope("witness-namespace-3".into()),
@@ -8097,7 +8086,6 @@ fn hopeless_admission_keeps_every_witness() {
                 absent_witness()
             ));
         });
-        assert_eq!(counter(cache, |c| c.parent_witness_refused), refused + 1);
         intact();
         assert_eq!(cache.cursor_resident(), resident);
         // Proportional: room once both provenance entries and exactly one
@@ -8112,7 +8100,6 @@ fn hopeless_admission_keeps_every_witness() {
         let credit = cache
             .cursor_reserve(state_bytes() - setup.floor - after)
             .unwrap_or_else(|| panic!("fits after one witness: {}", counters(cache)));
-        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 1);
         assert_eq!(join_entry(cache, JOIN_OWNER), None);
         assert_eq!(join_entry(cache, JOIN_OTHER), None);
         assert_eq!(
@@ -8143,7 +8130,6 @@ fn feasible_reserve_forgets_provenance_then_witnesses() {
             .unwrap_or_else(|| panic!("feasible: {}", counters(cache)));
         assert_eq!(join_entry(cache, JOIN_OWNER), None);
         assert_eq!(join_entry(cache, JOIN_OTHER), None);
-        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 4);
         assert!(cache
             .with_cursor(|cursor| cursor.parents.is_empty())
             .unwrap());
@@ -10561,7 +10547,7 @@ fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex,
 /// §7 D: a continuation page selects only the paused job's pending paths:
 /// it resumes the job and leaves every other pending path queued and
 /// unread. It never plans or starts an attempt (`jobs_started`,
-/// `groups_started` unchanged) and pages the job to its one completion,
+/// the group remains parked) and pages the job to its one completion,
 /// with the unpaged read's output.
 #[test]
 fn continuation_selects_only_job_paths_and_never_starts_attempts() {
@@ -10596,7 +10582,6 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
         };
         let other_entry = entry(&index);
         let started = counter(&cache, |c| c.jobs_started);
-        let groups = counter(&cache, |c| c.groups_started);
         let mut published = None;
         for _ in 0..64 {
             let resumed = counter(&cache, |c| c.jobs_resumed);
@@ -10604,7 +10589,6 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
             index = next;
             assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             assert_eq!(counter(&cache, |c| c.jobs_started), started);
-            assert_eq!(counter(&cache, |c| c.groups_started), groups);
             assert!(pending_hint(&index, &other).is_some(), "still queued");
             assert_eq!(entry(&index), other_entry, "never read");
             assert!(
@@ -10633,7 +10617,7 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
 
 /// §7 D (N3): group preparation on a continuation page. The paused group's
 /// job stays parked: continuation refuses it before stepping or applying EOF.
-/// `groups_started` stays one until the ordinary pass completes the group.
+/// The ordinary pass continues the same group to completion.
 #[test]
 fn continuation_prepares_no_group_attempt() {
     use crate::snapshots::codex_file_join::tests::usage;
@@ -10705,7 +10689,6 @@ fn continuation_prepares_no_group_attempt() {
             }
         }
         let first = cache.counters_for_test();
-        assert_eq!(first.groups_started, 1, "{first:?}");
         assert!(first.jobs_paused > 0, "{first:?}");
         let members = cache.paused_members_for_test().expect("paused group");
         assert_eq!(members.len(), 2, "both members belong to the job");
@@ -10766,7 +10749,6 @@ fn continuation_prepares_no_group_attempt() {
             assert_eq!(holds[0]["counts"]["continuation_pages_run"], 0);
             index = next;
             let now = cache.counters_for_test();
-            assert_eq!(now.groups_started, 1, "never restarted: {now:?}");
             assert_eq!(now.jobs_started, started, "{now:?}");
             assert_eq!(
                 now.jobs_resumed, resumed,
@@ -10780,7 +10762,6 @@ fn continuation_prepares_no_group_attempt() {
         for _ in 0..128 {
             index = ordinary(index, &cache).0;
             let now = cache.counters_for_test();
-            assert_eq!(now.groups_started, 1, "ordinary resumes the same group");
             if now.jobs_certified + now.jobs_uncertified > 0 {
                 assert!(cache.cursor_slot_free());
                 GROUP_EOF_APPLIED.with(|v| assert!(v.get() > 0, "ordinary group EOF observed"));
@@ -10989,7 +10970,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             page(&fixture, index, Some(Arc::clone(&cache)))
         });
         let now = cache.counters_for_test();
-        assert_eq!(now.deferred_paced, 1, "{now:?}");
         assert_eq!(now.jobs_started, 1, "{now:?}");
         assert_eq!(now.deferred_next_generation, 0, "not fenced: {now:?}");
         assert_eq!(now.jobs_lost, 1, "not a loss: {now:?}");
@@ -11018,7 +10998,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             page(&fixture, index, Some(Arc::clone(&cache)))
         });
         let now = cache.counters_for_test();
-        assert_eq!(now.deferred_paced, 1, "{now:?}");
         assert_eq!(now.jobs_started, 2, "{now:?}");
         let accelerated = cache
             .with_cursor(|cursor| match &cursor.slot {

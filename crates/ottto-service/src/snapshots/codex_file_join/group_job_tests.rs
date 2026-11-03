@@ -359,7 +359,6 @@ fn reread_group_never_starves_a_waiting_census_singleton() {
         assert_eq!(closed, Some(1), "{case}: {:?}", counters(&cache));
         if case == "fenced" {
             // Decided at admission: fenced, and no allowance taken from `c`.
-            assert_eq!(counters(&cache).groups_fenced, 1, "{:?}", counters(&cache));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -948,10 +947,6 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
     let (index, result) = sampled(&root, ScanIndex::default(), 10, &cache);
     let after = counters(&cache);
     assert_eq!(after.memo_records, 0, "{after:?}");
-    assert!(
-        after.join_terminal_debt.iter().all(|count| *count == 0),
-        "{after:?}"
-    );
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
@@ -965,10 +960,9 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
 fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
     let root = refused_fixture();
     let cache = Arc::new(SharedCache::default());
-    let overlap = JoinRefusal::Overlap.slot();
+
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let first = counters(&cache);
-    assert_eq!(first.join_terminal_debt[overlap], 1, "{first:?}");
     assert_eq!(first.memo_records, 1, "{first:?}");
     // The live member grows; an append cannot cure an overlap before it.
     append_rows(
@@ -976,12 +970,7 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
         &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
     );
     let (index, again) = next_generation(&root, index, &cache, 1);
-    let after = counters(&cache);
-    assert_eq!(after.group_memo_hits, 1, "{after:?}");
-    assert_eq!(
-        after.join_terminal_debt[overlap], 1,
-        "a memo hit replays no byte: {after:?}"
-    );
+
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "re-disclosed as settleable residue");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
@@ -1017,26 +1006,21 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
             ui(50, 350, "2026-10-01T10:02:30Z"),
         ],
     );
-    let unmatched = JoinRefusal::UiUnmatched.slot();
+
     let cache = Arc::new(SharedCache::default());
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
-    assert_eq!(refused.join_terminal_debt[unmatched], 1, "{refused:?}");
     assert_eq!(refused.memo_records, 1, "recorded with an exact stamp");
     // Unchanged: the next generation does not re-read the group.
     let (index, _) = next_generation(&root, index, &cache, 1);
-    let unchanged = counters(&cache);
-    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
-    assert_eq!(unchanged.join_terminal_debt[unmatched], 1, "{unchanged:?}");
+
     // Any growth of the live member may cure it: one attempt.
     append_rows(
         &root.join("sessions/b.jsonl"),
         &[turn("55555555-aaaa-4aaa-8aaa-555555555555")],
     );
     let _ = next_generation(&root, index, &cache, 2);
-    let grown = counters(&cache);
-    assert_eq!(grown.group_memo_hits, 1, "{grown:?}");
-    assert_eq!(grown.join_terminal_debt[unmatched], 2, "{grown:?}");
+
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1071,23 +1055,17 @@ fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
             ui(10, 410, "2026-10-01T10:03:30Z"),
         ],
     );
-    let gap = JoinRefusal::Gap.slot();
+
     let cache = Arc::new(SharedCache::default());
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
-    assert_eq!(refused.join_terminal_debt[gap], 1, "{refused:?}");
     assert_eq!(
         refused.memo_records, 1,
         "recorded although the reader stopped mid-stream: {refused:?}"
     );
     let _ = next_generation(&root, index, &cache, 1);
-    let unchanged = counters(&cache);
-    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
+
     // One replay only: the unpaged group's attempt count is its refusals.
-    assert_eq!(
-        unchanged.join_terminal_debt[gap], 1,
-        "not re-read: {unchanged:?}"
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1106,17 +1084,12 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
         let bound = counters(&cache);
         assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
         assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(bound.groups_started, 1, "{bound:?}");
         assert!(first.snapshots.is_empty());
         assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
         // A new generation without a capacity or input change: no attempt.
         let (index, _) = next_generation(&root, index, &cache, 1);
         let parked = counters(&cache);
         assert_eq!(parked.parked_hits, 1, "{parked:?}");
-        assert_eq!(
-            parked.groups_started, 1,
-            "never retried per generation (R2-H1)"
-        );
         // Growth of the live member keeps it parked.
         append_rows(
             &root.join("sessions/b.jsonl"),
@@ -1125,7 +1098,6 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
         let (index, _) = next_generation(&root, index, &cache, 2);
         let grown = counters(&cache);
         assert_eq!(grown.parked_hits, 2, "{grown:?}");
-        assert_eq!(grown.groups_started, 1, "{grown:?}");
         // A sealed member's change wakes it: one new attempt.
         append_rows(
             &root.join("sessions/a.jsonl"),
@@ -1134,7 +1106,6 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
         let _ = next_generation(&root, index, &cache, 3);
         let woken = counters(&cache);
         assert_eq!(woken.parked_hits, 2, "{woken:?}");
-        assert_eq!(woken.groups_started, 2, "{woken:?}");
     });
     fs::remove_dir_all(root).unwrap();
 }
@@ -1172,10 +1143,6 @@ fn new_continuation_during_job_invalidates_and_never_emits_as_singleton() {
     assert!(
         after.jobs_invalidated >= 1,
         "invalidated at resume: {after:?}"
-    );
-    assert_eq!(
-        after.groups_started, 2,
-        "one restart with N+1 members: {after:?}"
     );
     let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
     assert_eq!(unpaged.snapshots.len(), 3, "one alias per member");
@@ -1223,7 +1190,6 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
         input_totals(&full),
         "the replacing body counts the prefix once"
     );
-    assert_eq!(counters(&cache).groups_started, 2);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1282,11 +1248,9 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
         let after = counters(&cache);
         if change == "chmod" {
             assert_eq!(after.jobs_invalidated, 0, "{change}: {after:?}");
-            assert_eq!(after.groups_started, 1, "{change}: {after:?}");
             assert_eq!(input_totals(&done), input_totals(&unpaged), "{change}");
         } else {
             assert!(after.jobs_invalidated >= 1, "{change}: {after:?}");
-            assert_eq!(after.groups_started, 2, "{change}: {after:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1328,11 +1292,7 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
                 .all(|snapshot| snapshot.source_session_id != OWNER)),
             "no body for the in-progress owner before its group completes"
         );
-        let counted = counters(&after);
-        assert_eq!(
-            counted.groups_started, 1,
-            "the group re-boots once: {counted:?}"
-        );
+
         assert_eq!(completions(&after), 1);
         assert_eq!(
             fingerprints(&done),
@@ -1346,7 +1306,7 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
 #[test]
 fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
     let root = refused_fixture();
-    let overlap = JoinRefusal::Overlap.slot();
+
     let cache = Arc::new(SharedCache::default());
     let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(first.census_complete, "{first:?}");
@@ -1371,7 +1331,6 @@ fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "{again:?}");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    assert_eq!(counters(&restarted).join_terminal_debt[overlap], 1);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1689,7 +1648,7 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
     let mut live = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
     live.push(ui(20, 620, "2026-10-01T10:10:20Z"));
     write_rows(&root.join("sessions/b.jsonl"), &live);
-    let unmatched = JoinRefusal::UiUnmatched.slot();
+
     let cache = Arc::new(SharedCache::default());
     let done = with_test_limits(2048, 1024, 64, || {
         let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
@@ -1701,7 +1660,7 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
             &[native(OWNER, "b-30", 20, 620)],
         );
         let (mut index, _, _) = pages(&root, index, &cache, || {
-            counters(&cache).join_terminal_debt[unmatched] > 0
+            cache.paused_group_position().is_none()
         });
         let refused = counters(&cache);
         assert_eq!(refused.memo_records, 0, "{refused:?}");
@@ -1711,10 +1670,7 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
         });
         done
     });
-    let after = counters(&cache);
-    assert_eq!(after.group_memo_hits, 0, "{after:?}");
-    assert_eq!(after.groups_started, 2, "one new attempt: {after:?}");
-    assert_eq!(after.join_terminal_debt[unmatched], 1, "{after:?}");
+
     let (_, full) = scan(&root, ScanIndex::default(), 10);
     assert_eq!(fingerprints(&done), fingerprints(&full), "a body accepted");
     fs::remove_dir_all(root).unwrap();
@@ -1758,7 +1714,6 @@ fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
         let (_, again) = next_generation(&root, index, &cache, 1);
         assert!(again.snapshots.is_empty());
     });
-    assert_eq!(counters(&cache).groups_started, 1, "no re-read");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1798,12 +1753,6 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
         sampled(&root, ScanIndex::default(), 10, &cache)
     });
     let after = counters(&cache);
-    assert!(after.probe_bound >= 1, "{after:?}");
-    assert_eq!(
-        after.join_terminal_debt[JoinRefusal::ProbeBudgetOrder.slot()],
-        1,
-        "{after:?}"
-    );
     assert_eq!(after.memo_records, 0, "{after:?}");
     assert!(result.snapshots.is_empty());
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
@@ -1936,21 +1885,16 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
     let expected = other(&unpaged);
     assert_eq!(expected.0, 2, "one alias per member");
-    let order = JoinRefusal::ProbeBudgetOrder.slot();
+
     let cache = Arc::new(SharedCache::default());
     with_test_limits(8192, singleton, 64, || {
         let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
-        let shared = counters(&cache);
-        assert_eq!(shared.join_terminal_debt[order], 1, "{shared:?}");
+
         index.traversal = None;
         let (_, joined, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
             completions(&cache) == 1
         });
         let after = counters(&cache);
-        assert_eq!(
-            after.join_terminal_debt[order], 1,
-            "no second refusal: {after:?}"
-        );
         assert_eq!(after.parked_hits, 0, "{after:?}");
         assert_eq!(after.jobs_certified, 1, "{after:?}");
         assert_eq!(other(&joined), expected, "counted once, as unpaged");
@@ -1980,12 +1924,6 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
             counters(&cache).memo_records == 1
         });
         let recorded = counters(&cache);
-        assert_eq!(
-            recorded.join_terminal_debt[JoinRefusal::Corrupt.slot()],
-            1,
-            "{recorded:?}"
-        );
-        assert_eq!(recorded.groups_started, 1, "{recorded:?}");
         // A large singleton takes the slot and pauses in it.
         write_rows(
             &root.join("sessions/s.jsonl"),
@@ -1999,7 +1937,7 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
         // The next generation: the group's lookup runs while `s` holds it.
         index.traversal = None;
         let _ = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            counters(&cache).group_memo_hits == 1 && completions(&cache) == 1
+            completions(&cache) == 1
         });
         let after = counters(&cache);
         assert_eq!(after.deferred, paused.deferred, "{after:?}");
@@ -2007,7 +1945,6 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
             after.deferred_rotation, paused.deferred_rotation,
             "{after:?}"
         );
-        assert_eq!(after.groups_started, 1, "no group job: {after:?}");
         assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
     });
     fs::remove_dir_all(root).unwrap();
@@ -2525,10 +2462,8 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
             let _ = next_generation(&root, index, &cache, 2);
             let after = counters(&cache);
             if change.starts_with("chmod") {
-                assert_eq!(after.groups_started, 1, "{change}: zero wakes: {after:?}");
                 assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
             } else {
-                assert_eq!(after.groups_started, 2, "{change}: must wake: {after:?}");
                 assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
             }
         });

@@ -10,11 +10,11 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    capability_hour, decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages,
-    hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
+    capability_hour, changed_files, decode_envelope, encode_envelope, fact_count, fact_pages,
+    fixed_pages, hour_pages, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
     DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
 };
-use crate::durable_tail_codec::{Durable, HDigest, Refuse};
+use crate::durable_tail_codec::{Durable, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -127,33 +127,9 @@ impl TailSource for Claude {
     fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
         match collection {
             Collection::ToolUses => acc.seen_claude_capability_tool_uses.keys().collect(),
-            Collection::ChangedFiles => acc.activity_changed_file_hashes.iter().collect(),
+            Collection::ChangedFiles => changed_files::keys(acc),
             _ => Vec::new(),
         }
-    }
-
-    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        match collection {
-            Collection::ChangedFiles => page_bytes(keys.iter(), |hash, e| {
-                hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
-            }),
-            _ => page_bytes(keys.iter(), |id, e| id.put(e)),
-        }
-    }
-
-    fn log_page_keys(
-        collection: Collection,
-        bytes: &[u8],
-    ) -> Result<Vec<String>, ReconstructCause> {
-        let mut keys = Vec::new();
-        read_page(bytes, LOG_G, |d| {
-            keys.push(match collection {
-                Collection::ChangedFiles => String::take_h(d)?,
-                _ => String::take(d)?,
-            });
-            Ok(())
-        })?;
-        Ok(keys)
     }
 
     fn encode_head(
@@ -178,7 +154,7 @@ impl TailSource for Claude {
                     response.put(e)
                 })
             }
-            Collection::ToolUses | Collection::ChangedFiles => Self::log_keys(acc, collection)
+            Collection::ToolUses => Self::log_keys(acc, collection)
                 .chunks(LOG_G as usize)
                 .enumerate()
                 .map(|(page, keys)| Ok((page as u64, Self::log_page(collection, keys)?)))
@@ -191,6 +167,7 @@ impl TailSource for Claude {
                 COMPACTIONS_G,
                 |observation, e| observation.put(e),
             ),
+            Collection::ChangedFiles => changed_files::encode(acc),
             Collection::SessionFacts => fact_pages(acc),
             _ => Ok(Vec::new()),
         }
@@ -234,13 +211,7 @@ impl TailSource for Claude {
                     Some(()) => Err(ReconstructCause::Corrupt),
                 }
             }),
-            Collection::ChangedFiles => read_page(bytes, LOG_G, |d| {
-                if into.activity_changed_file_hashes.insert(String::take_h(d)?) {
-                    Ok(())
-                } else {
-                    Err(ReconstructCause::Corrupt)
-                }
-            }),
+            Collection::ChangedFiles => changed_files::decode(bytes, into),
             Collection::CapabilityHours => read_hour_page(
                 page,
                 bytes,

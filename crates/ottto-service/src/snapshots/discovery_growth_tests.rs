@@ -741,43 +741,16 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "real aged growth has positive grown credit"
     );
     assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
-    assert!(
-        scan.snapshots.len() <= 1,
-        "terminated record catches up at most once"
-    );
+    assert!(scan.snapshots.is_empty(), "the newline adds no usage");
     assert_eq!(
         caught.files[&key].size_bytes,
         fs::metadata(&f.path).unwrap().len()
     );
     // The complete record already counted on the first re-read; its newline
-    // adds no usage. The usage emitted for it (the catch-up's snapshot, or the
-    // first re-read's when the catch-up is a semantic no-op) equals a cold Full
-    // of the terminated bytes.
-    for (session, totals) in usage(&scan.snapshots) {
-        let first = first_pass
-            .iter()
-            .find(|(first, _)| *first == session)
-            .map(|(_, first)| first)
-            .unwrap_or_else(|| panic!("catch-up: new usage for {session}"));
-        assert!(
-            totals.iter().zip(first).all(|(now, first)| now <= first),
-            "catch-up: no snapshot above the first re-read: {totals:?} > {first:?}"
-        );
-    }
-    let emitted = if scan.snapshots.is_empty() {
-        first_scan.expect("the first re-read emitted")
-    } else {
-        scan.clone()
-    };
+    // adds no usage. The first re-read's emitted usage equals a cold Full of
+    // the terminated bytes.
+    let emitted = first_scan.expect("the first re-read emitted");
     let (cold_index, cold) = cold_full(&emitted.snapshots[0].collected_at);
-    if !scan.snapshots.is_empty() {
-        // Whole-body equality with a cold ordinary Full, not token-only equality.
-        assert_eq!(
-            serde_json::to_value(&scan.snapshots).unwrap(),
-            serde_json::to_value(&cold.snapshots).unwrap(),
-            "catch-up body == cold Full"
-        );
-    }
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(
         &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
         &sampled_scan::transition_fixture::scan_money(source, &caught, &emitted),
