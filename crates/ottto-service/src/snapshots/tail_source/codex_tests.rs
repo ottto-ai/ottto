@@ -4,7 +4,6 @@
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
 use super::super::counters;
-use super::super::stage_full;
 use super::*;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
@@ -14,6 +13,22 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const NOW: u64 = 1_790_000_000;
+
+/// A complete stage: an empty base's `Reset`, or why it refuses.
+fn stage_full<S: TailSource>(
+    view: &PreFinalization<'_>,
+    certificate: &DurableCertificate,
+    id: &HeadIdentity,
+) -> Result<StagedFile, Refuse> {
+    super::super::seam::TailBase::default()
+        .stage::<S>(
+            view,
+            certificate,
+            id,
+            crate::snapshots::state_v2::Change::Reset,
+        )
+        .map(|staged| staged.expect("a reset always stages"))
+}
 pub(in crate::snapshots) const SESSION: &str = "019a0c2a-8e11-7222-8333-944445555777";
 
 fn at(minute: usize) -> String {
