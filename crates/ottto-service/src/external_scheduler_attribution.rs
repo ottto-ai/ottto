@@ -9,6 +9,7 @@
 mod live_owner;
 
 use crate::context_footprint::resolve_repository_identity;
+use crate::hex::sha256_lower as sha256_hex;
 use crate::session_attribution::{normalize_template_material, opaque_hmac_id};
 use crate::snapshots::SnapshotSource;
 use plist::{Dictionary, Value};
@@ -974,10 +975,6 @@ pub(crate) fn bounded_command_stdout_with_env(
         .filter(|value| value.success())
         .filter(|_| bytes.len() <= maximum)
         .map(|_| bytes)
-}
-
-fn sha256_hex(value: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(value))
 }
 
 #[cfg(test)]

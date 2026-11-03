@@ -18586,17 +18586,6 @@ fn parse_pi_token_count(value: &str) -> Option<u64> {
         .map(|value| (value * multiplier).round() as u64)
 }
 
-fn pi_billing_channel(provider: &str) -> &str {
-    match provider {
-        "openai-codex" | "anthropic" | "github-copilot" => "subscription",
-        "amazon-bedrock" => "amazon_bedrock",
-        "google-vertex" => "google_vertex",
-        "azure-openai-responses" => "azure_openai",
-        "cloudflare-ai-gateway" | "cloudflare-workers-ai" | "vercel-ai-gateway" => "gateway",
-        _ => "direct_api",
-    }
-}
-
 fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification {
     let provider = normalize_pi_provider(provider);
     let model_key = model.to_ascii_lowercase();
@@ -18663,9 +18652,7 @@ fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification
             gateway_classification("cloudflare", &model_key)
         }
         "openrouter" => gateway_classification("openrouter", &model_key),
-        "vercel-ai-gateway" | "vercel_ai_gateway" => {
-            gateway_classification("vercel_ai_gateway", &model_key)
-        }
+        "vercel-ai-gateway" => gateway_classification("vercel_ai_gateway", &model_key),
         "github-copilot" => PiRouteClassification {
             model_provider: infer_pi_model_provider_from_model(&model_key),
             billing_provider: Some("github".to_string()),
@@ -18687,7 +18674,7 @@ fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification
         other => PiRouteClassification {
             model_provider: infer_pi_model_provider_from_model(&model_key),
             billing_provider: Some(other.to_string()),
-            billing_channel: Some(pi_billing_channel(other).to_string()),
+            billing_channel: Some("direct_api".to_string()),
             auth_mode: Some("api_key".to_string()),
             gateway_provider: None,
             subscription_product: None,
@@ -32546,8 +32533,15 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
     }
 
+    /// [behaviour] Every named platform keeps its route; an unnamed provider
+    /// is a direct API key route billed by that provider.
     #[test]
     fn pi_route_classifier_maps_supported_platforms() {
+        let other = pi_route_classification("Mistral", "mistral-large");
+        assert_eq!(other.billing_channel.as_deref(), Some("direct_api"));
+        assert_eq!(other.billing_provider.as_deref(), Some("mistral"));
+        assert_eq!(other.auth_mode.as_deref(), Some("api_key"));
+
         let openai = pi_route_classification("openai", "gpt-5.4-mini");
         assert_eq!(openai.source_category.as_deref(), Some("openai_api_key"));
         assert_eq!(openai.auth_mode.as_deref(), Some("api_key"));

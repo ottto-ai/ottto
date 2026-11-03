@@ -2929,7 +2929,7 @@ impl SnapshotApiClient {
         grant_version: u64,
         timeout: Duration,
     ) -> Result<Value> {
-        if !valid_cloud_grant_id(grant_id) || grant_version == 0 {
+        if !crate::hex::is_uuid(grant_id) || grant_version == 0 {
             return Err(anyhow!("cloud-session authority identity is invalid"));
         }
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
@@ -3018,7 +3018,7 @@ impl SnapshotApiClient {
         operation: &'static str,
         timeout: Duration,
     ) -> Result<Value> {
-        if !valid_cloud_scan_id(scan_id)
+        if !crate::hex::is_uuid(scan_id)
             || request.get("scan_id").and_then(Value::as_str) != Some(scan_id)
         {
             return Err(anyhow!(
@@ -3226,19 +3226,6 @@ fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
         "pi" => ottto_protocol::SourceKind::Pi,
         _ => ottto_protocol::SourceKind::Codex,
     }
-}
-
-fn valid_cloud_scan_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
-fn valid_cloud_grant_id(value: &str) -> bool {
-    valid_cloud_scan_id(value)
 }
 
 fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {

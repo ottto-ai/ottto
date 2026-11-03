@@ -1,16 +1,22 @@
-//! Per-source local erasure: synthetic transcripts and canary files only.
+//! Per-source pause and resume: synthetic transcripts and canary files only.
+//! Turning a source off, dropping its grant or a credential promotion that
+//! drops it stops collection and keeps every local file; re-enabling resumes
+//! from the kept state and drops only the upload witnesses.
 use super::*;
 use crate::snapshot_sync::{
     detected_uses_cache_path, disable_snapshot_source, disable_sources_dropped_from_grant,
-    enabled_snapshot_sources_in, erase_disabled_sources, login_address_erase_owed_for_test,
-    reconnect_snapshot_source, source_erasure_failures_for_test, source_marker,
+    enabled_snapshot_sources_in, reconnect_snapshot_source, resume_reconnected_sources,
+    source_marker, withheld_support::source_erasure_failures_for_test,
 };
 use ottto_core::LocalDeviceBinding;
 use std::os::unix::fs::PermissionsExt;
 
-const CANARY: &str = "SOURCE-ERASURE-CANARY";
+const CANARY: &str = "SOURCE-PAUSE-CANARY";
 const NAMESPACE: &str = "e";
 const SESSION: &str = "5e551011-0000-4000-8000-00000000e256";
+const KEPT_SESSION: &str = "5e551011-0000-4000-8000-00000000e257";
+const REWRITTEN_SESSION: &str = "5e551011-0000-4000-8000-00000000e258";
+const NEW_SESSION: &str = "5e551011-0000-4000-8000-00000000e259";
 const SUFFIXES: &[&str] = &[
     "-v3.json",
     "-v3.json.tmp",
@@ -33,12 +39,11 @@ const SUFFIXES: &[&str] = &[
 struct Fixture {
     support: PathBuf,
     destination: PathBuf,
-    cache: sampled_scan::SharedCache,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let support = crate::test_scratch::canonical_private_dir("source-erasure");
+        let support = crate::test_scratch::canonical_private_dir("source-pause");
         let destination = support
             .join("snapshots/destinations")
             .join(NAMESPACE.repeat(64));
@@ -46,7 +51,6 @@ impl Fixture {
         Self {
             support,
             destination,
-            cache: sampled_scan::SharedCache::default(),
         }
     }
     /// Every source-owned shape in the stable directory and one destination.
@@ -105,22 +109,56 @@ impl Fixture {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        let mut transcript = String::new();
-        for n in 0..2 {
-            let line = json!({"type":"assistant", "sessionId":SESSION, "uuid":format!("u{n}"),
-                "cwd":"/synthetic", "timestamp":now, "requestId":format!("req_{n}"),
-                "message": {"id":format!("msg_{n}"), "model":"claude-opus-4-8",
-                "role":"assistant", "usage":{"input_tokens":10,"output_tokens":20}}});
-            transcript.push_str(&format!("{line}\n"));
-        }
-        fs::write(root.join(format!("{SESSION}.jsonl")), transcript).unwrap();
+        fs::write(session_file(&root, SESSION), requests(SESSION, 0..2, &now)).unwrap();
         (root, now)
     }
-    /// One cycle's erase turn, then `source`'s consecutive failure count.
-    fn erase(&self, source: SnapshotSource) -> u32 {
-        erase_disabled_sources(&self.support, &self.cache);
+    /// One cycle's resume turn, then `source`'s consecutive failure count.
+    fn resume(&self, source: SnapshotSource) -> u32 {
+        resume_reconnected_sources(&self.support);
         source_erasure_failures_for_test(&self.support, source)
     }
+    /// A per-destination upload witness of `source` in each of its folders,
+    /// and a kept opt-out marker beside each footprint witness.
+    fn witnesses(&self, source: SnapshotSource) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let label = match source {
+            SnapshotSource::ClaudeCode => "claude-code",
+            _ => "codex",
+        };
+        let composition = self.support.join("context_composition/v2/scopes");
+        let mut witnesses = vec![composition.join(format!("{label}-witness.upload.json"))];
+        let mut kept = vec![composition.join(format!("{label}-witness.json"))];
+        let row = durable_sources::DurableSource::from_snapshot(source).unwrap();
+        for dir in row.properties().footprint_witnesses {
+            witnesses.push(
+                self.support
+                    .join(dir)
+                    .join(format!("{}.json", "w".repeat(64))),
+            );
+            kept.push(self.support.join(dir).join("org_disabled"));
+        }
+        for path in witnesses.iter().chain(&kept) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, CANARY).unwrap();
+        }
+        (witnesses, kept)
+    }
+}
+
+fn session_file(root: &Path, session: &str) -> PathBuf {
+    root.join(format!("{session}.jsonl"))
+}
+
+/// Priced Claude requests `range` of `session`, each with its own ids.
+fn requests(session: &str, range: std::ops::Range<usize>, now: &str) -> String {
+    let mut transcript = String::new();
+    for n in range {
+        let line = json!({"type":"assistant", "sessionId":session, "uuid":format!("{session}-u{n}"),
+            "cwd":"/synthetic", "timestamp":now, "requestId":format!("req_{session}_{n}"),
+            "message": {"id":format!("msg_{session}_{n}"), "model":"claude-opus-4-8",
+            "role":"assistant", "usage":{"input_tokens":10 + n,"output_tokens":20}}});
+        transcript.push_str(&format!("{line}\n"));
+    }
+    transcript
 }
 
 pub(super) fn cold_full(
@@ -178,205 +216,41 @@ fn device() -> LocalDeviceBinding {
 
 fn assert_gone(paths: &[PathBuf]) {
     let left = paths.iter().filter(|path| path.exists()).count();
-    assert_eq!(left, 0, "local copy erased: no source-owned file remains");
+    assert_eq!(left, 0, "upload witnesses dropped");
 }
 
 fn assert_kept(paths: &[PathBuf]) {
     let left = paths.iter().filter(|path| path.exists()).count();
-    assert_eq!(left, paths.len(), "no owed erase touched these files");
+    assert_eq!(left, paths.len(), "a pause keeps every local file");
 }
 
-#[test]
-fn disable_erases_only_that_source_after_a_missing_root_was_not_a_trigger() {
-    let f = Fixture::new();
-    let codex = f.canaries(SnapshotSource::Codex);
-    let claude = f.canaries(SnapshotSource::ClaudeCode);
-    let rows = f.destination.join("claude_code-rows-scan-index.json");
-    let composition = f.support.join("context_composition");
-    let shared = [
-        composition.join("v2/run.json"),
-        composition.join("disabled"),
-    ];
-    for path in &shared {
-        fs::write(path, CANARY).unwrap();
+struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self(key, previous)
     }
-    let (root, now) = f.transcript();
-    let (index, _) = cold_full(&root, &now, ScanIndex::default());
-    let live = state_v2::money_test_support::publish(&index, &rows, &progress_bytes());
-
-    // No ~/.codex exists in this fixture, and nothing has been asked of it.
-    assert_eq!(f.erase(SnapshotSource::Codex), 0);
-    assert_kept(&codex);
-    assert_eq!(enabled_snapshot_sources_in(&device(), &f.support).len(), 2);
-
-    disable_snapshot_source(&f.support, SnapshotSource::Codex).unwrap();
-    assert_eq!(
-        enabled_snapshot_sources_in(&device(), &f.support),
-        vec![SnapshotSource::ClaudeCode],
-        "the marker alone stops collection, before any erase"
-    );
-    assert_eq!(f.erase(SnapshotSource::Codex), 0);
-    assert_gone(&codex);
-    assert_kept(&claude);
-    assert_kept(&shared);
-    let marker = source_marker(&f.support, SnapshotSource::Codex);
-    assert_eq!(marker.as_deref(), Some("done"));
-    assert_eq!(source_marker(&f.support, SnapshotSource::ClaudeCode), None);
-
-    // Done stays off: the source does not come back without install_source.
-    assert_eq!(
-        enabled_snapshot_sources_in(&device(), &f.support),
-        vec![SnapshotSource::ClaudeCode],
-    );
-    assert!(state_v2::published(&rows).unwrap(), "Claude custody intact");
-    assert_eq!(
-        ScanIndex::load(&rows).unwrap().files.len(),
-        1,
-        "rows intact"
-    );
-    drop(live);
-    state_v2::money_test_support::erase_published(&rows);
 }
-
-#[test]
-fn failed_erase_stays_pending_alarms_after_three_then_retries() {
-    let f = Fixture::new();
-    let codex = f.canaries(SnapshotSource::Codex);
-    disable_snapshot_source(&f.support, SnapshotSource::Codex).unwrap();
-    fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o500)).unwrap();
-    let take_alarm =
-        || state_v2::telemetry::take_thread_event_for_test("source_erasure_failure_alarm");
-    for attempt in 1..=3 {
-        assert_eq!(f.erase(SnapshotSource::Codex), attempt);
-        assert_eq!(take_alarm(), None, "no alarm at {attempt} failures");
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(previous) => std::env::set_var(self.0, previous),
+            None => std::env::remove_var(self.0),
+        }
     }
-    assert_eq!(f.erase(SnapshotSource::Codex), 4);
-    assert_eq!(take_alarm(), Some(json!(4)), "counts only");
-    let marker = source_marker(&f.support, SnapshotSource::Codex);
-    assert_eq!(
-        marker.as_deref(),
-        Some("pending"),
-        "never done after an Err"
-    );
-    assert!(enabled_snapshot_sources_in(&device(), &f.support)
-        .iter()
-        .all(|source| *source != SnapshotSource::Codex));
-
-    fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(
-        f.erase(SnapshotSource::Codex),
-        0,
-        "the retry completes and resets the count"
-    );
-    assert_gone(&codex);
-    let marker = source_marker(&f.support, SnapshotSource::Codex);
-    assert_eq!(marker.as_deref(), Some("done"));
 }
 
-/// [money] Reconnect's cold Full re-offers the same keys: a receiver that
-/// settles on the snapshot fingerprint holds the same rows, totals and placement.
-#[test]
-fn reconnect_is_a_cold_full_that_dedupes_on_existing_fingerprints() {
-    let source = SnapshotSource::ClaudeCode;
-    let f = Fixture::new();
-    let (root, now) = f.transcript();
-    let cold_full = |index| cold_full(&root, &now, index);
-    let (first_index, first) = cold_full(ScanIndex::default());
-    let path = f.destination.join("claude_code-scan-index-v3.json");
-    let live = state_v2::money_test_support::publish(&first_index, &path, &progress_bytes());
-    // A finished bootstrap here must not narrow reconnect to the receipt window.
-    let namespace = NAMESPACE.repeat(64);
-    crate::backfill::update_backfill_state(&f.support, |state| {
-        crate::backfill::mark_backfill_complete_for_destination(state, source, &namespace);
-        crate::backfill::mark_backfill_complete_for_destination(
-            state,
-            SnapshotSource::Codex,
-            &namespace,
-        );
-    })
-    .unwrap();
-    assert!(state_v2::published(&path).unwrap());
-
-    disable_snapshot_source(&f.support, source).unwrap();
-    assert_eq!(f.erase(source), 0);
-    assert!(!path.exists());
-    let pending = crate::backfill::pending_backfill_sources_for_destination(
-        &crate::backfill::load_backfill_state(&f.support),
-        &namespace,
-    );
-    assert!(pending.contains(&source), "reconnect owes a full replay");
-    assert!(
-        !pending.contains(&SnapshotSource::Codex),
-        "others untouched"
-    );
-    assert!(enabled_snapshot_sources_in(&device(), &f.support)
-        .iter()
-        .all(|enabled| *enabled != source));
-
-    reconnect_snapshot_source(&f.support, source).unwrap();
-    assert_eq!(f.erase(source), 0);
-    assert_eq!(source_marker(&f.support, source), None);
-    assert!(enabled_snapshot_sources_in(&device(), &f.support).contains(&source));
-    assert!(
-        !state_v2::published(&path).unwrap(),
-        "the erased route's latch does not survive into the new lineage"
-    );
-    drop(live);
-
-    let reloaded = ScanIndex::load(&path).unwrap();
-    assert!(reloaded.files.is_empty(), "nothing local survived");
-    let (second_index, second) = cold_full(reloaded);
-    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
-        &sampled_scan::transition_fixture::scan_money(source, &first_index, &first),
-        &sampled_scan::transition_fixture::scan_money(source, &second_index, &second),
-    );
-
-    let mut receiver = BTreeMap::new();
-    for item in first.snapshots.iter().chain(&second.snapshots) {
-        let mut later = item.clone();
-        later.collected_at = "2099-01-01T00:00:00Z".into();
-        assert_eq!(
-            snapshot_fingerprint(source, &later),
-            item.snapshot_fingerprint,
-            "a later re-read keeps the existing idempotency key"
-        );
-        receiver.insert(item.snapshot_fingerprint.clone(), item.input_tokens);
-    }
-    assert_eq!(receiver.len(), first.snapshots.len(), "no double count");
-}
-
-/// A credential generation that drops a source reaches the same marker and
-/// erase turn as an explicit removal, and only for the dropped source.
-#[test]
-#[serial_test::serial]
-fn promotion_that_drops_a_source_erases_only_that_source() {
+/// A credential promotion whose device grant no longer names Claude.
+fn promote_without_claude(support: &Path) {
     use ottto_core::token_store::MemoryTokenStore;
-    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self(key, previous)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(previous) => std::env::set_var(self.0, previous),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-    let f = Fixture::new();
-    let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &f.support);
+    let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support);
     // Promotion cleanup also touches the default pending setup-token store.
     let _secrets = EnvGuard::set(
         ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV,
-        &f.support.join("secrets"),
+        &support.join("secrets"),
     );
-    let codex = f.canaries(SnapshotSource::Codex);
-    let claude = f.canaries(SnapshotSource::ClaudeCode);
-    let device_store = ottto_core::FileDeviceStore::new(f.support.join("device.json"));
+    let device_store = ottto_core::FileDeviceStore::new(support.join("device.json"));
     device_store.save(&device()).unwrap();
     let candidate = "candidate-secret";
     let pending = ottto_core::PendingDeviceCredentialPreparation {
@@ -389,7 +263,7 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
         secret_commitment_sha256: format!("sha256:{:x}", Sha256::digest(candidate.as_bytes())),
         request_authority: None,
         device: LocalDeviceBinding {
-            sources: vec!["claude_code".into()],
+            sources: vec!["codex".into()],
             ..device()
         },
         confirmation_authorized: true,
@@ -400,107 +274,258 @@ fn promotion_that_drops_a_source_erases_only_that_source() {
     crate::control::promote_pending_device_credential_with_stores(
         &pending,
         candidate,
-        &ottto_core::FilePendingDeviceCredentialStore::new(f.support.join("pending.json")),
+        &ottto_core::FilePendingDeviceCredentialStore::new(support.join("pending.json")),
         &MemoryTokenStore::new(),
         &device_store,
         &MemoryTokenStore::new(),
     )
     .unwrap();
+}
 
-    assert_eq!(
-        source_marker(&f.support, SnapshotSource::Codex).as_deref(),
-        Some("pending"),
-        "the trigger only writes the marker"
-    );
-    assert_kept(&codex);
-    assert_eq!(source_marker(&f.support, SnapshotSource::ClaudeCode), None);
-    assert_eq!(f.erase(SnapshotSource::Codex), 0);
-    assert_gone(&codex);
-    assert_kept(&claude);
+/// [behaviour] Turning Claude off, a grant that drops it and a credential
+/// promotion that drops it each write the same pause marker. Paused, its
+/// index, every Tail row, caches, composition state and upload witnesses stay,
+/// a resume turn touches nothing, and Codex keeps running.
+#[test]
+#[serial_test::serial]
+fn pause_keeps_every_local_file_and_other_sources_run() {
+    let claude = SnapshotSource::ClaudeCode;
+    type Trigger = fn(&Path);
+    let arms: [(&str, Trigger); 2] = [
+        ("grant_drop", |support| {
+            let next = LocalDeviceBinding {
+                sources: vec!["codex".into()],
+                ..device()
+            };
+            disable_sources_dropped_from_grant(support, &device(), &next).unwrap()
+        }),
+        ("promotion", promote_without_claude),
+    ];
+    for (arm, trigger) in arms {
+        let f = Fixture::new();
+        trigger(&f.support);
+        assert_eq!(
+            source_marker(&f.support, claude).as_deref(),
+            Some("pending"),
+            "{arm}"
+        );
+        assert_eq!(
+            enabled_snapshot_sources_in(&device(), &f.support),
+            vec![SnapshotSource::Codex],
+            "{arm}"
+        );
+    }
+
+    let f = Fixture::new();
+    let mut kept = f.canaries(claude);
+    kept.extend(f.canaries(SnapshotSource::Codex));
+    let (witnesses, markers) = f.witnesses(claude);
+    kept.extend(witnesses);
+    kept.extend(markers);
+    let second = f
+        .support
+        .join("snapshots/destinations")
+        .join("d".repeat(64));
+    fs::create_dir_all(&second).unwrap();
+    let path = second.join(CLAUDE_INDEX);
+    let live = claude_tail_store(&f, &path);
+    crate::backfill::update_backfill_state(&f.support, |state| {
+        crate::backfill::mark_backfill_complete_for_destination(state, claude, &"d".repeat(64));
+    })
+    .unwrap();
+
+    // Nothing has been asked of either source yet.
+    assert_eq!(f.resume(claude), 0);
+    assert_eq!(enabled_snapshot_sources_in(&device(), &f.support).len(), 2);
+
+    disable_snapshot_source(&f.support, claude).unwrap();
     assert_eq!(
         enabled_snapshot_sources_in(&device(), &f.support),
-        vec![SnapshotSource::ClaudeCode],
+        vec![SnapshotSource::Codex],
+        "the marker alone stops collection"
     );
-}
-
-/// One retained parse, whose org markers an older build could have kept an
-/// address digest in.
-fn hold_login_address_state(f: &Fixture) {
-    let (root, _) = f.transcript();
-    let (retained, _, _) = crate::snapshots::claude_response_compaction_tests::acquire_items(
-        &root.join(format!("{SESSION}.jsonl")),
-        None,
-        100,
+    assert_eq!(f.resume(claude), 0);
+    assert_eq!(
+        source_marker(&f.support, claude).as_deref(),
+        Some("pending"),
+        "paused until re-enabled"
     );
-    assert!(f
-        .cache
-        .retained()
-        .unwrap()
-        .insert("retained".into(), retained.unwrap()));
-}
-
-fn assert_login_address_state_gone(f: &Fixture) {
-    assert!(f.cache.retained().unwrap().victims().is_empty());
-}
-
-/// [privacy] Source-off ends everything kept of a recorded login address.
-#[test]
-fn source_off_erase_clears_the_login_address() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let f = Fixture::new();
-    hold_login_address_state(&f);
-    let kept = f.canaries(SnapshotSource::ClaudeCode);
-    disable_snapshot_source(&f.support, SnapshotSource::ClaudeCode).unwrap();
-    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
-    assert_gone(&kept);
-    assert_login_address_state_gone(&f);
-}
-
-/// [privacy] Account removal erases the durable records, with no live device,
-/// and keeps the rest of the index so history is not replayed. Once only.
-#[test]
-fn account_removal_erase_clears_the_login_address_only() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let f = Fixture::new();
-    hold_login_address_state(&f);
-    let stable = f
-        .support
-        .join("snapshots/claude_code-scan-index-v3.durable-tail");
-    fs::create_dir_all(&stable).unwrap();
-    fs::write(stable.join("record.rec"), CANARY).unwrap();
-    let (mut tails, kept): (Vec<_>, Vec<_>) = f
-        .canaries(SnapshotSource::ClaudeCode)
-        .into_iter()
-        .partition(|path| path.to_string_lossy().ends_with(".durable-tail"));
-    assert_eq!(tails.len(), 1);
-    // A canary named as a store is no store: the erase cannot open it and keeps
-    // its marker. Real stores: `login_address_erase_removes_claude_tail_rows`.
-    let (stores, kept): (Vec<_>, Vec<_>) = kept
-        .into_iter()
-        .partition(|path| path.to_string_lossy().ends_with(".v2.sqlite"));
-    for store in &stores {
-        fs::remove_file(store).unwrap();
-    }
-    tails.push(stable);
-    let other = f.canaries(SnapshotSource::Codex);
-
-    crate::snapshot_sync::owe_login_address_erase(&f.support).unwrap();
-    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
-    assert_gone(&tails);
+    assert_eq!(source_marker(&f.support, SnapshotSource::Codex), None);
     assert_kept(&kept);
-    assert_kept(&other);
-    assert_login_address_state_gone(&f);
-
-    hold_login_address_state(&f);
-    assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
-    assert!(!f.cache.retained().unwrap().victims().is_empty());
+    drop(live);
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert!(state_v2::published(&path).unwrap(), "store kept");
+    assert_eq!(reloaded.files.len(), 1, "index rows kept");
+    let counts = state_v2::tail_kind_counts_for_test(&reloaded);
+    assert_eq!(
+        [
+            counts["tail.head"],
+            counts["tail.page.session_facts"],
+            counts["tail.revision"],
+            counts["tail.set_aside"],
+        ],
+        [1; 4],
+        "every Tail row kept: {counts:?}"
+    );
+    assert!(raw_holds(&path, TAIL_CANARY));
+    let pending = crate::backfill::pending_backfill_sources_for_destination(
+        &crate::backfill::load_backfill_state(&f.support),
+        &"d".repeat(64),
+    );
+    assert!(!pending.contains(&claude), "no bootstrap replay owed");
+    drop(reloaded);
+    state_v2::money_test_support::erase_published(&path);
 }
 
-const TAIL_CANARY: &str = "LOGIN-ADDRESS-TAIL-CANARY-20261103";
+/// [behaviour] A resume that cannot drop a witness keeps the source paused
+/// and counts the failure, alarms past three, and the next turn finishes:
+/// the Codex session-start watermark and composition ACK go, its opt-out
+/// marker, collected state and caches stay.
+#[test]
+fn failed_resume_stays_paused_alarms_after_three_then_retries() {
+    let codex = SnapshotSource::Codex;
+    let f = Fixture::new();
+    let (witnesses, markers) = f.witnesses(codex);
+    let canaries = f.canaries(codex);
+    let (dropped, mut kept): (Vec<_>, Vec<_>) = canaries
+        .into_iter()
+        .partition(|path| path.to_string_lossy().ends_with(".upload.json"));
+    assert_eq!(dropped.len(), 1, "the canary ACK is a witness");
+    kept.extend(markers);
+    disable_snapshot_source(&f.support, codex).unwrap();
+    reconnect_snapshot_source(&f.support, codex).unwrap();
+    let watermark = witnesses
+        .iter()
+        .find(|path| path.starts_with(f.support.join(crate::codex_prelude_footprint::STATE_DIR)))
+        .unwrap();
+    let locked = watermark.parent().unwrap();
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let take_alarm =
+        || state_v2::telemetry::take_thread_event_for_test("source_erasure_failure_alarm");
+    for attempt in 1..=3 {
+        assert_eq!(f.resume(codex), attempt);
+        assert_eq!(take_alarm(), None, "no alarm at {attempt} failures");
+    }
+    assert_eq!(f.resume(codex), 4);
+    assert_eq!(take_alarm(), Some(json!(4)), "counts only");
+    assert_eq!(
+        source_marker(&f.support, codex).as_deref(),
+        Some("reconnect"),
+        "never resumed after an Err"
+    );
+    assert!(enabled_snapshot_sources_in(&device(), &f.support)
+        .iter()
+        .all(|source| *source != codex));
+    assert!(watermark.exists());
+
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        f.resume(codex),
+        0,
+        "the retry completes and resets the count"
+    );
+    assert_eq!(source_marker(&f.support, codex), None);
+    assert!(enabled_snapshot_sources_in(&device(), &f.support).contains(&codex));
+    assert_gone(&witnesses);
+    assert_gone(&dropped);
+    assert_kept(&kept);
+}
+
+/// [money] Pause, then an append, a new file, an atomic rewrite and a restart
+/// while paused, then resume: the kept index reads on warm, no bootstrap
+/// replay is owed, and what a receiver holds (the first bodies, then the
+/// resumed pass's) equals a cold Full of the same tree, totals and account
+/// placement. Only the resumed source's upload witnesses go.
+#[test]
+fn pause_then_resume_reads_warm_and_equals_a_cold_full() {
+    use sampled_scan::transition_fixture::{money_oracle, scan_money};
+    let source = SnapshotSource::ClaudeCode;
+    let f = Fixture::new();
+    let (root, now) = f.transcript();
+    for (session, count) in [(KEPT_SESSION, 2), (REWRITTEN_SESSION, 1)] {
+        fs::write(
+            session_file(&root, session),
+            requests(session, 0..count, &now),
+        )
+        .unwrap();
+    }
+    let (first_index, first) = cold_full(&root, &now, ScanIndex::default());
+    let path = f.destination.join(CLAUDE_INDEX);
+    let live = state_v2::money_test_support::publish(&first_index, &path, &progress_bytes());
+    let namespace = NAMESPACE.repeat(64);
+    crate::backfill::update_backfill_state(&f.support, |state| {
+        crate::backfill::mark_backfill_complete_for_destination(state, source, &namespace);
+    })
+    .unwrap();
+    let (claude_witnesses, mut kept) = f.witnesses(source);
+    let (codex_witnesses, codex_markers) = f.witnesses(SnapshotSource::Codex);
+    kept.extend(codex_witnesses);
+    kept.extend(codex_markers);
+
+    disable_snapshot_source(&f.support, source).unwrap();
+    assert_eq!(f.resume(source), 0);
+    assert_kept(&claude_witnesses);
+    // While paused: growth, a new file, an atomic rewrite, then a restart.
+    let mut grown = fs::OpenOptions::new()
+        .append(true)
+        .open(session_file(&root, SESSION))
+        .unwrap();
+    std::io::Write::write_all(&mut grown, requests(SESSION, 2..3, &now).as_bytes()).unwrap();
+    drop(grown);
+    fs::write(
+        session_file(&root, NEW_SESSION),
+        requests(NEW_SESSION, 0..2, &now),
+    )
+    .unwrap();
+    let temp = f.support.join("rewrite.tmp");
+    fs::write(&temp, requests(REWRITTEN_SESSION, 0..2, &now)).unwrap();
+    fs::rename(&temp, session_file(&root, REWRITTEN_SESSION)).unwrap();
+    drop(live);
+
+    reconnect_snapshot_source(&f.support, source).unwrap();
+    assert_eq!(f.resume(source), 0);
+    assert_eq!(source_marker(&f.support, source), None);
+    assert!(enabled_snapshot_sources_in(&device(), &f.support).contains(&source));
+    assert_gone(&claude_witnesses);
+    assert_kept(&kept);
+    let pending = crate::backfill::pending_backfill_sources_for_destination(
+        &crate::backfill::load_backfill_state(&f.support),
+        &namespace,
+    );
+    assert!(!pending.contains(&source), "no bootstrap replay owed");
+
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(reloaded.files.len(), 3, "the kept index, not a cold start");
+    let (warm_index, warm) = cold_full(&root, &now, reloaded);
+    let (cold_index, cold) = cold_full(&root, &now, ScanIndex::default());
+    let cold = scan_money(source, &cold_index, &cold);
+    let mut receiver = scan_money(source, &first_index, &first);
+    receiver
+        .snapshots
+        .extend(scan_money(source, &warm_index, &warm).snapshots);
+    assert_eq!(cold.snapshots.len(), 4);
+    assert_eq!(
+        receiver.snapshots.keys().collect::<Vec<_>>(),
+        cold.snapshots.keys().collect::<Vec<_>>()
+    );
+    money_oracle::assert_placement_equivalent(&cold, &receiver);
+    let mut differences = Vec::new();
+    for (entity, body) in &cold.snapshots {
+        for field in money_oracle::FIELDS {
+            money_oracle::diff(
+                &format!("{entity}/{field}"),
+                &body[*field],
+                &receiver.snapshots[entity][*field],
+                &mut differences,
+            );
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    drop((warm_index, cold_index, first_index));
+    state_v2::money_test_support::erase_published(&path);
+}
+
+const TAIL_CANARY: &str = "PAUSED-SOURCE-TAIL-CANARY-20261103";
 const CLAUDE_INDEX: &str = "claude_code-scan-index-v3.json";
 
 /// The store's database, WAL and shared-memory files.
@@ -557,167 +582,4 @@ fn claude_tail_store(f: &Fixture, path: &Path) -> ScanIndex {
     );
     assert_eq!(live.files.len(), 1);
     live
-}
-
-/// [privacy] Source-off, by local removal or by a credential that drops the
-/// grant, erases every stored Claude Tail row with the store, and only it. A
-/// failed unlink keeps the marker unconfirmed; the next turn finishes.
-#[test]
-fn claude_source_off_erases_tail_rows() {
-    let claude = SnapshotSource::ClaudeCode;
-    type Trigger = fn(&Path);
-    let arms: [(&str, Trigger, bool); 3] = [
-        (
-            "disable",
-            |support| disable_snapshot_source(support, SnapshotSource::ClaudeCode).unwrap(),
-            false,
-        ),
-        (
-            "grant_drop",
-            |support| {
-                let next = LocalDeviceBinding {
-                    sources: vec!["codex".into()],
-                    ..device()
-                };
-                disable_sources_dropped_from_grant(support, &device(), &next).unwrap()
-            },
-            false,
-        ),
-        (
-            "disable_unlink_fails",
-            |support| disable_snapshot_source(support, SnapshotSource::ClaudeCode).unwrap(),
-            true,
-        ),
-    ];
-    let confirmed = || state_v2::telemetry::take_thread_event_for_test("source_erasure_confirmed");
-    for (arm, trigger, fail) in arms {
-        let f = Fixture::new();
-        let path = f.destination.join(CLAUDE_INDEX);
-        let live = claude_tail_store(&f, &path);
-        let codex_path = f.destination.join("codex-scan-index-v3.json");
-        let codex = state_v2::money_test_support::publish(
-            &ScanIndex::default(),
-            &codex_path,
-            &progress_bytes(),
-        );
-        let codex_db = fs::read(&store_files(&codex_path)[2]).unwrap();
-        confirmed();
-
-        trigger(&f.support);
-        assert_eq!(
-            source_marker(&f.support, claude).as_deref(),
-            Some("pending"),
-            "{arm}"
-        );
-        if fail {
-            fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o500)).unwrap();
-            assert_eq!(f.erase(claude), 1, "{arm}: the failure is counted");
-            assert_eq!(
-                source_marker(&f.support, claude).as_deref(),
-                Some("pending"),
-                "{arm}"
-            );
-            assert_eq!(confirmed(), None, "{arm}: never confirmed after an Err");
-            fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(raw_holds(&path, TAIL_CANARY), "{arm}: kept for the retry");
-        }
-        assert_eq!(f.erase(claude), 0, "{arm}");
-        assert_eq!(
-            source_marker(&f.support, claude).as_deref(),
-            Some("done"),
-            "{arm}"
-        );
-        assert!(confirmed().is_some(), "{arm}: confirmed on success");
-        for file in store_files(&path).iter().chain([&path]) {
-            assert!(
-                !file.exists(),
-                "{arm}: {file:?}: every Tail kind went with it"
-            );
-        }
-        assert_eq!(
-            fs::read(&store_files(&codex_path)[2]).unwrap(),
-            codex_db,
-            "{arm}"
-        );
-        assert!(
-            state_v2::published(&codex_path).unwrap(),
-            "{arm}: Codex intact"
-        );
-        assert_eq!(
-            source_marker(&f.support, SnapshotSource::Codex),
-            None,
-            "{arm}"
-        );
-        drop((live, codex));
-        state_v2::money_test_support::erase_published(&codex_path);
-    }
-}
-
-/// [privacy] Account removal erases every Claude Tail row (a head's login
-/// address digests among them) in every destination namespace, down to the
-/// raw database, WAL and shared-memory bytes, and keeps the graph and index
-/// rows so history is not replayed. A route that cannot be opened keeps the
-/// marker and counts the failure; the next turn finishes.
-#[test]
-fn login_address_erase_removes_claude_tail_rows() {
-    let claude = SnapshotSource::ClaudeCode;
-    let f = Fixture::new();
-    let second = f
-        .support
-        .join("snapshots/destinations")
-        .join("d".repeat(64));
-    fs::create_dir_all(&second).unwrap();
-    let paths = [f.destination.join(CLAUDE_INDEX), second.join(CLAUDE_INDEX)];
-    let lives: Vec<ScanIndex> = paths
-        .iter()
-        .map(|path| claude_tail_store(&f, path))
-        .collect();
-    let records = f.destination.join("claude_code-scan-index-v3.durable-tail");
-    fs::create_dir_all(&records).unwrap();
-    fs::write(records.join("record.rec"), CANARY).unwrap();
-
-    crate::snapshot_sync::owe_login_address_erase(&f.support).unwrap();
-    let db = store_files(&paths[1])[2].clone();
-    fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
-    f.erase(claude);
-    assert_eq!(
-        login_address_erase_owed_for_test(&f.support),
-        Some(1),
-        "an unopenable route keeps the marker and counts the failure"
-    );
-    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(raw_holds(&paths[1], TAIL_CANARY), "kept for the retry");
-    assert!(!records.exists(), "the retired records went regardless");
-
-    f.erase(claude);
-    assert_eq!(
-        login_address_erase_owed_for_test(&f.support),
-        None,
-        "done once"
-    );
-    assert_eq!(source_marker(&f.support, claude), None, "no source erase");
-    drop(lives);
-    for path in &paths {
-        assert!(
-            !raw_holds(path, TAIL_CANARY),
-            "{path:?}: no stored byte of it in the database, WAL or shared memory"
-        );
-        let reloaded = ScanIndex::load(path).unwrap();
-        assert!(
-            state_v2::published(path).unwrap(),
-            "{path:?}: the store stays"
-        );
-        assert_eq!(
-            reloaded.files.len(),
-            1,
-            "{path:?}: graph and index rows kept"
-        );
-        let counts = state_v2::tail_kind_counts_for_test(&reloaded);
-        assert!(
-            counts.values().all(|rows| *rows == 0),
-            "{path:?}: {counts:?}"
-        );
-        drop(reloaded);
-        state_v2::money_test_support::erase_published(path);
-    }
 }
