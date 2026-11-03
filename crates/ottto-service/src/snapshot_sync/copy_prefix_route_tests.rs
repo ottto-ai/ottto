@@ -14,21 +14,91 @@ fn route(mode: Mode, page: &Page) -> RouteResult {
 /// Deliver a finished page: its exact ACKs earn per-file upload-context
 /// receipts, as the service records them after settlement.
 fn deliver(page: &mut Page) {
-    deliver_counting(page);
+    deliver_into(page, &mut Ledger::new(), false);
 }
 
-/// `deliver`, also returning the page's POST count.
-fn deliver_counting(page: &mut Page) -> usize {
+/// Each session's last exact-ACKed body, as the server keeps it:
+/// `(request_count, removed_request_count)`. A refused POST leaves the old one.
+type Ledger = BTreeMap<String, (u64, u64)>;
+
+/// How many accepted bodies hold the shared ids A and B: (holder, copy). The
+/// holder's body is exactly A and B; the copy's is its own turn C plus the
+/// prefix unless it removed or deferred it.
+fn shared(ledger: &Ledger) -> (u64, u64) {
+    let holder = ledger.get(ROOT).map_or(0, |(count, _)| *count);
+    let copy = ledger
+        .get(COPY)
+        .map_or(0, |(count, _)| count.saturating_sub(1));
+    (holder, copy)
+}
+
+/// Deliver a page as `deliver` does; every exact-ACKed body replaces its
+/// session's ledger entry. `refuse_holder` permanently refuses each holder
+/// body of the page instead. Returns the POST count and the refused holder
+/// bodies.
+fn deliver_into(page: &mut Page, ledger: &mut Ledger, refuse_holder: bool) -> (usize, usize) {
     let mut progress = e2_progress();
-    let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
-    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let mut refused = 0;
+    let (status, sent, _) = upload(&page.scan.snapshots, &mut progress, |batch| {
+        let mut response = ack(batch)?;
+        if refuse_holder {
+            let (holder, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut response.accepted_entities)
+                .into_iter()
+                .partition(|entity| entity.source_session_id == ROOT);
+            response.accepted_entities = kept;
+            response.accepted -= holder.len() as u64;
+            response.sessions_reconciled = response.accepted;
+            refused += holder.len();
+            response.rejected_entities = holder
+                .into_iter()
+                .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                    source_session_id: entity.source_session_id,
+                    snapshot_fingerprint: entity.snapshot_fingerprint,
+                    occurrence_count: entity.occurrence_count,
+                    reason: "usage_accounting_authority_downgrade".into(),
+                    detail: "synthetic refusal".into(),
+                    permanent: true,
+                })
+                .collect();
+        }
+        for entity in &response.accepted_entities {
+            let item = batch
+                .iter()
+                .find(|item| item.snapshot_fingerprint == entity.snapshot_fingerprint)
+                .expect("an ACK names a sent body");
+            ledger.insert(
+                item.source_session_id.clone(),
+                (item.request_count, item.removed_request_count.unwrap_or(0)),
+            );
+        }
+        Ok(response)
+    });
+    if refused == 0 {
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    } else {
+        assert!(status.is_ok(), "a refusal settles the page: {status:?}");
+    }
     // The exact ACKs land as the service records them before it saves; the
     // committed Tail heads continue only from accepted bodies.
     page.index
         .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     let acks = std::mem::take(&mut progress.fresh_context_body_acks);
     accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
-    sent.len()
+    (sent.len(), refused)
+}
+
+/// #1253 at ACK granularity: a copy's prefix removal is decided only on
+/// holder acceptance already ACKed on an EARLIER page (`before`, the ledger
+/// before this page's POSTs), never on the page's own pending holder POST.
+fn assert_removal_follows_acceptance(page: usize, removed: bool, before: &Ledger) {
+    if removed {
+        assert_eq!(
+            shared(before).0,
+            2,
+            "page {page}: the copy removed its prefix before the holder's body \
+             was accepted (ledger {before:?})"
+        );
+    }
 }
 
 /// The warm owner reads Full, is delivered as the service delivers every
@@ -162,6 +232,7 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
         let mut posts = Vec::new();
         let mut pages = Vec::new();
         let mut removed_on = None;
+        let mut ledger = Ledger::new();
         for page in 1..=4 {
             let base = prior.clone();
             disk.begin(&scanner, SnapshotSource::ClaudeCode);
@@ -201,8 +272,21 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
                     &route(Mode::DiskRestore, &p),
                 );
             }
-            let sent = deliver_counting(&mut p);
+            assert_removal_follows_acceptance(
+                page,
+                copy.is_some_and(|(_, removed)| removed.unwrap_or(0) > 0),
+                &ledger,
+            );
+            let (sent, _) = deliver_into(&mut p, &mut ledger, false);
             posts.push(sent);
+            // After each page's ACKs the shared ids are in exactly one
+            // accepted body: never zero, never two.
+            let (in_holder, in_copy) = shared(&ledger);
+            assert!(
+                matches!((in_holder, in_copy), (2, 0) | (0, 2)),
+                "page {page}: A and B in holder {in_holder}, copy {in_copy} \
+                 (ledger {ledger:?}, {pages:#?})"
+            );
             if page == 1 {
                 assert!(reads[0], "the owed holder is re-read beside the new copy");
                 assert!(
@@ -225,6 +309,81 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             (&[false, false][..], &[1_usize, 1, 0, 0][..], Some(2)),
             "pages 3-4 never read the holder; only pages 1 and 2 POST, page 2 \
              the copy with its prefix removed (reads {reads:?}, posts {posts:?}, {pages:#?})"
+        );
+    });
+}
+
+/// [regress] #1253 negative: the never-delivered holder's POST is refused on
+/// page 1 (its first acceptance) or page 2. A refusal keeps the server's
+/// earlier body or none, so the copy removes its prefix only on a page after
+/// the holder's body was accepted; the shared ids are never in two accepted
+/// bodies and end in exactly one.
+#[test]
+fn refused_holder_post_never_lets_the_copy_drop_its_prefix() {
+    if !supported("refused_holder_copy_prefix") {
+        return;
+    }
+    for refused_on in [1, 2] {
+        refused_holder_case(refused_on);
+    }
+}
+
+fn refused_holder_case(refused_on: usize) {
+    with_e2(|| {
+        let mut c = corpus(&format!("refused_holder_copy_prefix_{refused_on}"));
+        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        input_clock(&holder);
+        let disk = Disk::new(&c);
+        let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
+        let path = c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        input_clock(&path);
+        let mut ledger = Ledger::new();
+        let mut refusals = 0;
+        let mut pages = Vec::new();
+        for page in 1..=6 {
+            disk.begin(&scanner, SnapshotSource::ClaudeCode);
+            let mut p = c.raw(&scanner, prior, 100, true, &[]);
+            p.enrich(&c);
+            p.finish();
+            let copy = body(&p, COPY).map(|copy| (copy.request_count, copy.removed_request_count));
+            pages.push(format!(
+                "page {page}: modes {:?}, sessions {:?}, copy {copy:?}",
+                p.modes,
+                p.scan
+                    .snapshots
+                    .iter()
+                    .map(|item| &item.source_session_id[..4])
+                    .collect::<Vec<_>>()
+            ));
+            assert_removal_follows_acceptance(
+                page,
+                copy.is_some_and(|(_, removed)| removed.unwrap_or(0) > 0),
+                &ledger,
+            );
+            let (_, refused) = deliver_into(&mut p, &mut ledger, page == refused_on);
+            refusals += refused;
+            let (in_holder, in_copy) = shared(&ledger);
+            assert!(
+                in_holder == 0 || in_copy == 0,
+                "refused on {refused_on}, page {page}: A and B in two accepted \
+                 bodies (ledger {ledger:?}, {pages:#?})"
+            );
+            prior = disk.commit(&p.cache, SnapshotSource::ClaudeCode, &mut p.index);
+        }
+        if refused_on == 1 {
+            assert_eq!(
+                refusals, 1,
+                "the holder's first POST is refused: {pages:#?}"
+            );
+        }
+        assert!(
+            matches!(shared(&ledger), (2, 0) | (0, 2)),
+            "refused on {refused_on} ({refusals} refusals): A and B end in exactly \
+             one accepted body (ledger {ledger:?}, {pages:#?})"
         );
     });
 }
