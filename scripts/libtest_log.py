@@ -13,6 +13,9 @@ SUMMARY = re.compile(
 NEXT_TARGET = re.compile(r"^(?: {5}Running| {3}Doc-tests) ")
 RESULT = re.compile(r"\btest (\S+) \.\.\. (ok|FAILED|ignored)\b")
 PANIC = re.compile(r"thread '([^']+)'(?: \(\d+\))? panicked at ([^\s:]+\.rs):(\d+)")
+# Printed by ci_runtime_tests.py --retry-failed for a test that failed, then
+# passed alone in a fresh process.
+FLAKY = re.compile(r"^ci_runtime_tests: FLAKY (\S+) ")
 
 
 def clean(raw: str) -> str:
@@ -69,3 +72,8 @@ def panics(lines: Iterable[str]) -> Dict[str, Set[str]]:
         if match:
             found.setdefault(match.group(1), set()).add(match.group(2))
     return found
+
+
+def flaky(lines: Iterable[str]) -> Set[str]:
+    """Names ci_runtime_tests.py reported as failed, then passed on retry."""
+    return {match.group(1) for match in (FLAKY.match(clean(raw)) for raw in lines) if match}

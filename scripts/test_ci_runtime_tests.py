@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import signal
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name('ci_runtime_tests.py').resolve()
 spec = importlib.util.spec_from_file_location('ci_runtime_tests', SCRIPT)
@@ -141,6 +143,166 @@ class SummaryTests(unittest.TestCase):
             ['b::flaky: did not pass (FAILED)', 'c::skipped: did not pass (ignored)', 'receipt: did not pass (not run)'],
         )
 
+
+class RetryTests(unittest.TestCase):
+    LIB = '     Running unittests src/lib.rs (target/debug/deps/ottto_service-89abcdef)\n'
+    CLI = '     Running tests/cli.rs (target/debug/deps/cli-0123abcd)\n'
+
+    @staticmethod
+    def summary(passed, failed):
+        state = 'FAILED' if failed else 'ok'
+        return f'test result: {state}. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n'
+
+    @staticmethod
+    def exited(binary, status=None):
+        """Cargo 1.95's lines after a failing test binary: the rerun line alone
+        for libtest's exit 101, plus the process line for a signal or other code."""
+        text = '\x1b[1m\x1b[91merror\x1b[0m: test failed, to rerun pass `-p ottto-service --lib`\n'
+        if status:
+            text += (f"Caused by:\n  process didn't exit successfully: `/w/target/debug/deps/{binary} "
+                     f'--nocapture` ({status})\n')
+        return text
+
+    @staticmethod
+    def total(n):
+        return f'\x1b[1m\x1b[91merror\x1b[0m: {n} target{"s" if n > 1 else ""} failed:\n    `--lib`\n'
+
+    def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary], status=101):
+        return runner.retry_plan([(lines, scope_of, status)], set(required), limit)
+
+    def test_failed_names_map_to_their_binary(self):
+        lines = [self.LIB, 'test a::one ... FAILED\n', 'test a::two ... ok\n', self.summary(1, 1),
+                 self.exited('ottto_service-89abcdef'),
+                 self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'),
+                 '   Doc-tests ottto_service\n', self.summary(2, 0), self.total(2)]
+        self.assertEqual(self.plan(lines), ([('a::one', ['ottto_service-89abcdef']), ('case', ['cli-0123abcd'])], None))
+
+    def test_retries_nothing_it_cannot_tie_to_a_name(self):
+        lib_fail = [self.LIB, 'test a::one ... FAILED\n']
+        flaky_one = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'), self.total(2)]
+        cases = {
+            'crash': lib_fail + [self.exited('ottto_service-89abcdef'), self.total(1)],
+            'count mismatch': lib_fail + [self.summary(0, 2), self.exited('ottto_service-89abcdef'), self.total(1)],
+            'signal': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'signal: 11, SIGSEGV'),
+                                  self.total(1)],
+            'other exit code': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'exit status: 1'),
+                                           self.total(1)],
+            'no cargo error line': lib_fail + [self.summary(0, 1), self.total(1)],
+            'no closing total': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef')],
+            # A child probe printed a clean summary, then the binary aborted; a
+            # retried flaky test elsewhere must not turn that green.
+            'crash after child summary': [self.LIB, 'running 1 test\n', self.summary(1, 0),
+                                          self.exited('ottto_service-89abcdef', 'signal: 6, SIGABRT')] + flaky_one,
+            'non-zero exit, clean summary': [self.LIB, self.summary(3, 0),
+                                             self.exited('ottto_service-89abcdef')] + flaky_one,
+            'doc-test': ['   Doc-tests ottto_core\n', self.summary(1, 1),
+                         'error: doctest failed, to rerun pass `-p ottto-core --doc`\n'],
+            'no names': ['error: could not compile\n'],
+            # Cargo could not start the binary: Running line, no summary.
+            'never executed': [self.LIB, 'error: test failed, to rerun pass `-p ottto-service --lib`\n',
+                               'Caused by:\n', '  could not execute process `/w/x` (never executed)\n'] + flaky_one,
+            'two rerun lines': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'),
+                                           self.exited('ottto_service-89abcdef'), self.total(2)],
+            'target total off': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(2)],
+            'cargo error before any binary': [self.exited('x')] + flaky_one,
+        }
+        for label, lines in cases.items():
+            with self.subTest(label):
+                plan, reason = self.plan(lines)
+                self.assertEqual(plan, [])
+                self.assertTrue(reason)
+        plan, reason = self.plan(lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(1)],
+                                 scope_of=lambda _b: None)
+        self.assertIn('unknown test binary', reason)
+        # A failed group with nothing to retry blocks the other group's retry.
+        retried = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'), self.total(1)]
+        plan, reason = runner.retry_plan([(['error: build failed\n'], lambda b: [b], 101),
+                                          (retried, lambda b: [b], 101)], set(), 3)
+        self.assertEqual(plan, [])
+        self.assertIn('without a failed test name', reason)
+        # A group that passed is not read at all.
+        plan, reason = runner.retry_plan([(['test x ... FAILED\n'], lambda b: [b], 0),
+                                          (retried, lambda b: [b], 101)], set(), 3)
+        self.assertEqual((plan, reason), ([('case', ['cli-0123abcd'])], None))
+
+    def test_limit_money_and_receipts_are_never_retried(self):
+        four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4),
+                self.exited('ottto_service-89abcdef'), self.total(1)]
+        self.assertIn('over the retry limit', self.plan(four)[1])
+        self.assertEqual(len(self.plan(four, limit=4)[0]), 4)
+        for name in ('snapshot_sync::claude_money_e2_pipeline_tests::x', 'snapshots::state_v2_money_tests::y',
+                     'a::money_equivalence_tests::m::z', 'layout::receipt'):
+            with self.subTest(name):
+                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1), self.exited('ottto_service-89abcdef'),
+                         self.total(1)]
+                plan, reason = self.plan(lines, required=['layout::receipt'])
+                self.assertEqual(plan, [])
+                self.assertIn('never retried', reason)
+
+    def test_binaries_from_cargo_json(self):
+        def artifact(kind, name, exe, test=True):
+            return runner.json.dumps({'reason': 'compiler-artifact', 'manifest_path': '/w/c/Cargo.toml',
+                                      'target': {'kind': kind, 'name': name}, 'profile': {'test': test},
+                                      'executable': exe})
+        output = '\n'.join([
+            artifact(['lib'], 'c', '/w/target/debug/deps/c-1'),
+            artifact(['test'], 'cli', '/w/target/debug/deps/cli-2'),
+            artifact(['bin'], 'tool', '/w/target/debug/deps/tool-3'),
+            artifact(['bin'], 'tool', '/w/target/debug/tool', test=False),
+            '{"reason": "build-finished", "success": true}',
+            'not json',
+        ])
+        self.assertEqual(runner.test_binaries(output), {
+            'c-1': ['--workspace', '--lib'],
+            'cli-2': ['--workspace', '--test', 'cli'],
+            'tool-3': ['--workspace', '--bin', 'tool'],
+        })
+
+    def test_modules_that_use_the_money_oracle_are_never_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'a').mkdir()
+            (root / 'a' / 'route_tests.rs').write_text('use x::money_oracle::assert_equivalent;\n')
+            (root / 'a' / 'mod.rs').write_text('money_oracle::assert_held();\n')
+            (root / 'a' / 'plain_tests.rs').write_text('fn t() {}\n')
+            modules = runner.oracle_modules(root)
+        self.assertEqual(modules, {'route_tests', 'a'})
+        self.assertTrue(runner.never_retry('s::route_tests::x', set(), modules))
+        self.assertFalse(runner.never_retry('s::plain_tests::x', set(), modules))
+        source = SCRIPT.parent.parent / 'crates'
+        self.assertIn('copy_prefix_route_tests', runner.oracle_modules(source))
+
+    def test_retry_passes_kills_on_timeout_and_reports(self):
+        lock = threading.Lock()
+
+        def fake_cargo(tmp, body):
+            # Stands in for cargo; ignores the `test <scope> -- ...` arguments.
+            path = Path(tmp) / 'cargo'
+            path.write_text(f'#!{sys.executable}\n{body}\n', encoding='utf-8')
+            path.chmod(0o755)
+            return str(path)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
+            passed = runner.retry_alone(fake_cargo(tmp, 'print("test a::b ... ok")'), 'a::b', ['--lib'], 30, lock)
+            failed = runner.retry_alone(fake_cargo(tmp, 'print("test a::b ... FAILED"); raise SystemExit(101)'),
+                                        'a::b', ['--lib'], 30, lock)
+            started = time.monotonic()
+            hung = runner.retry_alone(fake_cargo(tmp, 'import time; time.sleep(60)'), 'a::b', ['--lib'], 1, lock)
+        self.assertTrue(passed)
+        self.assertFalse(failed)
+        self.assertFalse(hung)
+        self.assertLess(time.monotonic() - started, 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'flaky.json'
+            out = io.StringIO()
+            # Keep the real CI step summary clean.
+            with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+                runner.record_flaky([('a::b', 1)], str(path), (2, 3))
+            record = runner.json.loads(path.read_text())
+        self.assertEqual(record['shard'], '2/3')
+        self.assertEqual(record['flaky'], [{'test': 'a::b', 'retry': 1}])
+        self.assertEqual(runner.libtest_log.flaky(out.getvalue().splitlines()), {'a::b'})
 
 
 class WatchdogTests(unittest.TestCase):
