@@ -36,8 +36,9 @@ pub(in crate::snapshots) fn retire_tail(
         Ok(())
     })
 }
-/// A debt-only change of one file, committed with the next save or at exit. It
-/// never publishes the file's graph progress and never clears its marker.
+/// A debt-only change of one file, committed with the next save or at exit; a
+/// later one of the same file before then replaces it. It never publishes the
+/// file's graph progress and never clears its marker.
 pub(in crate::snapshots) fn observe_tail(
     path: &Path,
     key: &str,
@@ -56,20 +57,6 @@ pub(in crate::snapshots) fn observe_tails(
     with_state(path, |state| {
         state.tail.observe_all(observations);
         Ok(())
-    })
-}
-/// Keys whose debt-only observation is staged and not yet committed. An
-/// observation is a delta from the committed rows, so its owner stages none
-/// again before the save: `added` revisions would be added twice.
-pub(in crate::snapshots) fn tail_observed_keys(
-    path: &Path,
-) -> Result<std::collections::BTreeSet<String>> {
-    with_state(path, |state| {
-        Ok(state
-            .tail
-            .observed_keys()
-            .filter_map(|key| String::from_utf8(key.to_vec()).ok())
-            .collect())
     })
 }
 /// The caller's authorised final disposition of the file's whole debt: its

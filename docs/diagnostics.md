@@ -2230,50 +2230,43 @@ proved rows sent with different proof.
 ### Freshness alarm (all sources)
 
 Each source emits one `local_resources` `freshness_alarm` point when a root walk
-ends and one on every failed pass. With `basis: "walk"`, `age_s` is the largest
-`now - live mtime` over indexed files whose live listing stamp differs from the
-stored settled stamp, and `changed_files` and `over_6h_files` count them.
-Members of an `UnprovenTerminal` Claude usage-authority family are reported
-apart, in `authority_terminal_files` and `authority_terminal_oldest_age_s`: their
-hold keeps the pre-growth stamp and no read reaches the growth, so they are real
-unuploaded data, never counted as accepted or $0. A failed pass may never reach
-the walk, so with `basis: "last_ack"` `age_s` is the time since the source's
-newest accepted upload receipt, the file counts are 0, and no receipt in the
-bounded ring gives `age_s: null`. `alarm` is true when `age_s` is null or above
-21,600 seconds, or when `authority_terminal_files` is above 0 at any age, which
-lasts until those files settle. Both inputs are durable and nothing new is
-stored, so the first complete walk after a restart reports the true age; only the
-in-progress fold is process-local, so a restart mid-walk under-reports for one
-walk and a retried page can count a file twice. A file appended to continuously
-reads as fresh until it pauses. Files refused by snapshot quarantine settle
-without acceptance and stay with the terminal counters. The row carries counts
-only.
-
-`debt` is the source's persisted per-file freshness debt (G7), `null` for a graph
-with no state-v2 store or when its store cannot be read. Each listed file's owed
-changes are kept as metadata of its `tail.head` and `tail.revision` rows, so they
-survive restarts: a create, append or rewrite adds a revision timed at the live
-mtime, and only the file's own matched exact upload receipt retires it, and only
-the prefix it covers (a newer suffix keeps its own time and bytes). A stamp match,
-a read, a hold or a newer receipt elsewhere retires nothing. A rewritten file
-folds its old debt into the new object with the earliest time. Files never
-indexed count with a lower-bound age, Claude subagent journals count until
-per-file evidence exists, and Codex archives count by compressed size; outside
-the discovery window no new debt starts. `outstanding_files` counts every owed
-file, `held_files` those whose debt is read or held rather than unread,
+ends and one on every failed pass. `debt` is the source's persisted per-file
+freshness debt, `null` for a graph with no state-v2 store or when its store
+cannot be read. Each listed file's owed changes are kept as metadata of its
+`tail.head` and `tail.revision` rows, so they survive restarts: a create, append
+or rewrite adds a revision timed at the live mtime, and only the file's own
+matched exact upload receipt retires it, and only the prefix it covers (a newer
+suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
+receipt elsewhere retires nothing. A rewritten file folds its old debt into the
+new object with the earliest time. Files never indexed count with a lower-bound
+age, and Codex archives count by compressed size; outside the discovery window no
+new debt starts. `outstanding_files` counts every owed file, `held_files` those
+whose debt is read or held rather than unread (every hold reason counts alike),
 `unread_bytes` the bytes no read reached, `over_6h_files` those whose oldest owed
 change is more than 21,600 seconds old, and `oldest_age_s` the oldest of those
 ages, with `oldest_age_lower_bound` true when that age is a lower bound or some
-debt has no known age. `no_upload_required_files` counts this walk's files with
-per-file evidence of no usage (a confirmed-empty file or an empty archive at its
-stamp). `deleted_unaccepted_files` is the cumulative count of files erased while
+debt has no known age. `no_upload_required_files` counts this walk's files that
+owe nothing by per-file evidence: a confirmed-empty file or an empty archive at
+its stamp, and a Claude subagent journal, which the snapshot rule excludes from
+upload. `deleted_unaccepted_files` is the cumulative count of files erased while
 still owed: a complete walk erases the debt of a file it no longer lists and
 whose index entry is gone. `last_complete_discovery_at` is the Unix time a walk
 that covered every root without a listing error last began. `debt.alarm` is true
 when a file is over 6 h, when any debt has no known age, or when there has been
-no complete discovery in 6 h, and the row's `alarm` is also true then. A failed
-pass carries the last walk's `debt` re-aged; before this process's first walk
-end it is `null` and `alarm` is true, whatever the newest receipt says.
+no complete discovery in 6 h.
+
+Members of an `UnprovenTerminal` Claude usage-authority family with debt are
+also reported apart, in `authority_terminal_files` and
+`authority_terminal_oldest_age_s`: their hold keeps the pre-growth stamp and no
+read reaches the growth, so they are real unuploaded data, never counted as
+accepted or $0. `alarm` is true when `debt.alarm` is, when `debt` is `null`, or
+when `authority_terminal_files` is above 0 at any age, which lasts until their
+debt settles. With `basis: "walk"` the row is the walk just ended; a failed pass
+may never reach the walk, so with `basis: "last_walk"` it carries this process's
+last walk aggregate re-aged, with no authority-terminal counts, and before this
+process's first walk end `debt` is `null` and `alarm` is true. Only the walk in
+progress is process-local, so a walk resumed after a restart erases nothing and
+records no complete discovery. The row carries counts only.
 
 ### Money freshness (Claude queue and replay)
 

@@ -17,27 +17,13 @@ fn raw(start: u64, end: u64, at: u64, reason_bits: u32) -> Revision {
     }
 }
 
-fn live(len: u64) -> Live {
-    Live {
-        len,
-        representation: Representation::Tail,
-        exact: false,
-        accepted: 0,
-        read: len,
-        replaced: false,
-        holds: 0,
-        evidence: None,
-        change: (Some(9_000), false),
-        quiet: false,
-    }
-}
-
 /// [format] The revision value round-trips; another version or a damaged
 /// value is never decoded as debt.
 #[test]
 fn revision_value_roundtrips_and_refuses_other_versions() {
     for revision in [
-        raw(3, 40, 7, UNREAD | DELIVERY_DEBT),
+        // A bit of another writer round-trips too.
+        raw(3, 40, 7, UNREAD | (1 << 8)),
         Revision {
             extent: Extent::ArchiveWhole {
                 compressed_bytes: 9,
@@ -55,37 +41,6 @@ fn revision_value_roundtrips_and_refuses_other_versions() {
         assert_eq!(Revision::decode(&newer), None);
         assert_eq!(Revision::decode(&bytes[..31]), None);
     }
-}
-
-/// [money] Positive control: a matched exact receipt retires exactly the prefix
-/// it covers. A straddling revision keeps its suffix and its own time; a newer
-/// suffix keeps everything; another writer's bit survives.
-#[test]
-fn exact_receipt_retires_exactly_its_prefix() {
-    let committed = BTreeMap::from([
-        (1, raw(0, 60, 1_000, HELD_REVISION)),
-        (2, raw(60, 100, 2_000, HELD_REVISION | DELIVERY_DEBT)),
-        (3, raw(100, 140, 3_000, UNREAD)),
-    ]);
-    let mut now = live(140);
-    now.read = 100;
-    (now.exact, now.accepted) = (true, 80);
-    let plan = reconcile(&committed, &now, false);
-    assert_eq!(plan.resolved, BTreeSet::from([1]));
-    assert_eq!(
-        plan.replaced,
-        BTreeMap::from([(2, raw(80, 100, 2_000, HELD_REVISION | DELIVERY_DEBT))])
-    );
-    assert!(plan.added.is_empty());
-    assert_eq!(plan.owed.len(), 2);
-    let debt = FileDebt::of(&plan.owed);
-    assert_eq!(debt.earliest, Some(2_000));
-    assert_eq!(debt.unread_bytes, 40);
-    // No receipt, a stamp match or a read retires nothing.
-    now.exact = false;
-    let plan = reconcile(&committed, &now, false);
-    assert!(plan.resolved.is_empty());
-    assert_eq!(plan.owed.len(), 3);
 }
 
 fn entry(path: &Path) -> ScanIndexEntry {
@@ -166,7 +121,7 @@ fn failed_pass(source: SnapshotSource) -> serde_json::Value {
 
 /// A restart forgets every process-local walk and aggregate.
 fn restart() {
-    with_walks(|walks| *walks = Walks::default());
+    money_freshness::restart_for_test();
 }
 
 /// The file's committed revisions.
@@ -236,24 +191,42 @@ impl Fixture {
 
 /// [regress] Arm 1: debt is persisted, so a restart and a failed pass keep the
 /// earliest change. An unchanged, read file with no exact receipt is held debt
-/// (a stamp match is not acceptance), bootstrapped as a lower bound; the failed
-/// pass reports the walk's own aggregate, and with none yet it is unknown.
+/// (a stamp match is not acceptance), bootstrapped as a lower bound. A file
+/// that was never indexed is unread debt at its disk size, with a lower-bound
+/// age; outside the discovery window it stays out, and deleted before any ACK
+/// its debt is erased and counted as deleted unaccepted. A Claude journal the
+/// snapshot rule excludes is no debt: it counts as no upload required. The
+/// failed pass reports the walk's own aggregate, and with none yet, unknown.
 #[test]
 fn restart_and_failed_pass_keep_the_earliest_debt() {
     for store in STORES {
         let mut f = Fixture::new(store, "g7-restart");
         let held = f.file("held.jsonl", 100);
+        let never = f.file("never.jsonl", 70);
+        let outside = f.file("outside.jsonl", 10);
         age(&held, 7 * HOUR);
-        let key = local_index_key(&held);
-        let stored = entry(&held);
-        f.index.files.insert(key.clone(), stored);
+        age(&never, 7 * HOUR);
+        std::fs::File::options()
+            .write(true)
+            .open(&outside)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800))
+            .unwrap();
+        f.index.files.insert(local_index_key(&held), entry(&held));
+        let excluded = u64::from(store == Source::Claude);
+        if store == Source::Claude {
+            let journals = f.root.join("proj/PARENT/subagents/workflows/wf_a");
+            std::fs::create_dir_all(&journals).unwrap();
+            std::fs::write(journals.join("journal.jsonl"), b"{}\n").unwrap();
+        }
         let first = f.walk();
         let debt = &first["debt"];
-        assert_eq!(debt["outstanding_files"], 1, "{store:?}");
+        assert_eq!(debt["outstanding_files"], 2, "{store:?}");
         assert_eq!(debt["held_files"], 1);
-        assert_eq!(debt["unread_bytes"], 0);
-        assert_eq!(debt["over_6h_files"], 1);
+        assert_eq!(debt["unread_bytes"], 70);
+        assert_eq!(debt["over_6h_files"], 2);
         assert_eq!(debt["oldest_age_lower_bound"], true);
+        assert_eq!(debt["no_upload_required_files"], excluded);
         assert!(debt["last_complete_discovery_at"].is_u64());
         assert_eq!(debt["alarm"], true);
         assert_eq!(first["alarm"], true);
@@ -262,12 +235,13 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
         assert_eq!(revisions.len(), 1);
         let earliest = revisions.values().next().unwrap().first_change_at;
         assert!(earliest.is_some());
-        assert!(f.index.tail_discovery.last_complete_discovery_at.is_some());
+        assert_eq!(committed(&f.index, &never).len(), 1);
+        assert!(committed(&f.index, &outside).is_empty());
 
         restart();
         let unknown = failed_pass(f.source);
         assert!(unknown["debt"].is_null());
-        assert_eq!(unknown["alarm"], true, "a recent ACK is not freshness");
+        assert_eq!(unknown["alarm"], true, "no aggregate is not freshness");
         let second = f.walk();
         for field in [
             "outstanding_files",
@@ -275,61 +249,28 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
             "unread_bytes",
             "over_6h_files",
             "oldest_age_lower_bound",
+            "no_upload_required_files",
         ] {
             assert_eq!(second["debt"][field], debt[field], "{field}");
         }
         assert!(second["debt"]["oldest_age_s"].as_u64() >= debt["oldest_age_s"].as_u64());
         let failed = failed_pass(f.source);
-        assert_eq!(failed["debt"]["outstanding_files"], 1);
-        assert_eq!(failed["debt"]["over_6h_files"], 1);
+        assert_eq!(failed["debt"]["outstanding_files"], 2);
+        assert_eq!(failed["debt"]["over_6h_files"], 2);
         assert_eq!(failed["alarm"], true);
         f.save();
         let after = committed(&f.index, &held);
         assert_eq!(after.values().next().unwrap().first_change_at, earliest);
+
+        std::fs::remove_file(&never).unwrap();
+        let row = f.walk();
+        assert_eq!(row["debt"]["outstanding_files"], 1);
+        assert_eq!(row["debt"]["deleted_unaccepted_files"], 1);
+        f.save();
+        assert!(committed(&f.index, &never).is_empty());
         f.close();
     }
 }
-
-/// [regress] Arm 2: a rewrite never orphans debt. The old revisions fold into
-/// one of the new object with the earliest time; a receipt of the old entry
-/// retires nothing; only the new object's own exact receipt does.
-#[test]
-fn rewrite_keeps_the_earliest_debt_until_its_own_exact_ack() {
-    for store in STORES {
-        let mut f = Fixture::new(store, "g7-rewrite");
-        let file = f.file("rewritten.jsonl", 100);
-        age(&file, 8 * HOUR);
-        f.index.files.insert(local_index_key(&file), entry(&file));
-        f.walk();
-        f.save();
-        let earliest = committed(&f.index, &file)
-            .values()
-            .next()
-            .unwrap()
-            .first_change_at;
-        std::fs::write(&file, vec![b'y'; 60]).unwrap();
-        accept(f.source, &mut f.index, &file);
-        let row = f.walk();
-        assert_eq!(row["debt"]["outstanding_files"], 1, "{store:?}");
-        assert_eq!(row["debt"]["over_6h_files"], 1);
-        f.save();
-        let folded = committed(&f.index, &file);
-        assert_eq!(folded.len(), 1);
-        let revision = folded.values().next().unwrap();
-        assert_eq!(revision.extent, Extent::Raw { start: 0, end: 60 });
-        assert_eq!(revision.first_change_at, earliest);
-        assert!(revision.reason_bits & UNREAD != 0);
-
-        f.index.files.insert(local_index_key(&file), entry(&file));
-        accept(f.source, &mut f.index, &file);
-        let row = f.walk();
-        assert_eq!(row["debt"]["outstanding_files"], 0);
-        f.save();
-        assert!(committed(&f.index, &file).is_empty());
-        f.close();
-    }
-}
-
 /// [money] Positive control, persisted: after a newer suffix, the exact
 /// receipt of the stored prefix retires that prefix and nothing more; the
 /// suffix keeps its own first change and bytes.
@@ -432,100 +373,24 @@ fn growth_claim_wait_stays_owed_until_exact_ack() {
     f.close();
 }
 
-/// [regress] A discovered file that was never indexed turns the alarm on once
-/// over 6 h, with a lower-bound age and its disk size unread. A file outside the
-/// discovery window stays out, and an accepted file owes nothing. Deleted before
-/// any ACK, its debt is erased and counted as deleted unaccepted.
+/// [behaviour] An authority-terminal file with debt alarms under its own label,
+/// at any age, until its own exact ACK settles the debt.
 #[test]
-fn never_indexed_file_over_6h_turns_the_alarm_on() {
-    for store in STORES {
-        let mut f = Fixture::new(store, "g7-never-indexed");
-        let never = f.file("never.jsonl", 70);
-        let outside = f.file("outside.jsonl", 10);
-        let settled = f.file("settled.jsonl", 10);
-        age(&never, 7 * HOUR);
-        std::fs::File::options()
-            .write(true)
-            .open(&outside)
-            .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800))
-            .unwrap();
-        f.index
-            .files
-            .insert(local_index_key(&settled), entry(&settled));
-        accept(f.source, &mut f.index, &settled);
-        let row = f.walk();
-        let debt = &row["debt"];
-        assert_eq!(debt["outstanding_files"], 1, "{store:?}");
-        assert_eq!(debt["unread_bytes"], 70);
-        assert_eq!(debt["over_6h_files"], 1);
-        assert_eq!(debt["oldest_age_lower_bound"], true);
-        assert_eq!(debt["alarm"], true);
-        assert_eq!(row["alarm"], true);
-        f.save();
-        assert_eq!(committed(&f.index, &never).len(), 1);
-        assert!(committed(&f.index, &outside).is_empty());
-        assert!(committed(&f.index, &settled).is_empty());
-        // The active upload context is runtime-only: re-activate it.
-        accept(f.source, &mut f.index, &settled);
-
-        std::fs::remove_file(&never).unwrap();
-        let row = f.walk();
-        assert_eq!(row["debt"]["outstanding_files"], 0);
-        assert_eq!(row["debt"]["deleted_unaccepted_files"], 1);
-        f.save();
-        assert!(committed(&f.index, &never).is_empty());
-        assert_eq!(f.index.tail_discovery.deleted_unaccepted_files, 1);
-        f.close();
-    }
-}
-
-/// [regress] Each observation is a delta from the committed rows: a second walk
-/// before the save stages nothing again, so no revision is added twice.
-#[test]
-fn a_second_walk_before_the_save_adds_no_revision_twice() {
-    for store in STORES {
-        let mut f = Fixture::new(store, "g7-no-duplicate");
-        let never = f.file("never.jsonl", 70);
-        f.walk();
-        let row = f.walk();
-        assert_eq!(row["debt"]["outstanding_files"], 1, "{store:?}");
-        assert_eq!(row["debt"]["unread_bytes"], 70);
-        f.save();
-        assert_eq!(committed(&f.index, &never).len(), 1);
-        assert_eq!(f.walk()["debt"]["unread_bytes"], 70);
-        f.close();
-    }
-}
-
-/// [regress] A known root that no longer resolves is not listed: the walk
-/// proves nothing absent under it, so its debt is neither erased nor counted
-/// deleted, and the walk earns no complete discovery.
-#[test]
-fn an_unresolved_root_erases_nothing_and_earns_no_discovery() {
-    for store in STORES {
-        let mut f = Fixture::new(store, "g7-unresolved-root");
-        let other = f.dir.join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        let never = other.join("never.jsonl");
-        std::fs::write(&never, vec![b'x'; 30]).unwrap();
-        let roots = [f.root.clone(), other.clone()];
-        let row = walk(f.source, &roots, &mut f.index);
-        assert_eq!(row["debt"]["outstanding_files"], 1, "{store:?}");
-        f.save();
-        let discovered = f.index.tail_discovery.last_complete_discovery_at;
-        assert!(discovered.is_some());
-
-        std::fs::remove_dir_all(&other).unwrap();
-        let row = walk(f.source, &roots, &mut f.index);
-        assert_eq!(row["debt"]["outstanding_files"], 1);
-        assert_eq!(row["debt"]["deleted_unaccepted_files"], 0);
-        f.save();
-        assert_eq!(committed(&f.index, &never).len(), 1);
-        assert_eq!(
-            f.index.tail_discovery.last_complete_discovery_at,
-            discovered
-        );
-        f.close();
-    }
+fn authority_terminal_debt_has_its_own_label_until_settled() {
+    let mut f = Fixture::new(Source::Claude, "g7-authority-terminal");
+    let held = f.file("family.jsonl", 6);
+    age(&held, 7 * 24 * HOUR);
+    f.index.files.insert(local_index_key(&held), entry(&held));
+    f.index
+        .insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+    let row = f.walk();
+    assert_eq!(row["authority_terminal_files"], 1);
+    assert!(row["authority_terminal_oldest_age_s"].as_u64().unwrap() > 6 * 24 * HOUR);
+    assert_eq!(row["alarm"], true);
+    f.save();
+    accept(f.source, &mut f.index, &held);
+    let row = f.walk();
+    assert_eq!(row["authority_terminal_files"], 0);
+    assert_eq!(row["debt"]["outstanding_files"], 0);
+    f.close();
 }

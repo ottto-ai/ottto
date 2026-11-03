@@ -47161,8 +47161,7 @@ fn advance_bounded_directory_traversal_with_budget(
         .iter()
         .any(|directory| !directory.watcher_hint);
     let mut freshness = money_freshness::WalkFold::resume(source);
-    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk);
-    let listed_at = sampled_scan::now_seconds();
+    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk, &mut freshness);
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -47321,23 +47320,7 @@ fn advance_bounded_directory_traversal_with_budget(
             if source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(&path)
             {
-                // Excluded by design, yet owed until per-file evidence exists.
-                if let Ok(metadata) = entry.metadata() {
-                    let modified = metadata.modified().ok().and_then(unix_seconds);
-                    let listing = g7_debt::Listing {
-                        path: &path,
-                        metadata: &metadata,
-                        in_window: census_unix_seconds.map_or(true, |now| {
-                            is_recent_enough_at(
-                                modified.unwrap_or_default(),
-                                now,
-                                backfill_window_days,
-                            )
-                        }),
-                        excluded: true,
-                    };
-                    debt.listed(index, &traversal, listing);
-                }
+                debt.excluded(&path);
                 continue;
             }
             if source == SnapshotSource::Codex {
@@ -47392,16 +47375,6 @@ fn advance_bounded_directory_traversal_with_budget(
                 modified_unix_seconds,
                 codex_fragment::Stamp::metadata(&metadata),
             );
-            if index
-                .files
-                .get(&local_index_key(&path))
-                .is_some_and(|entry| !entry.same_listing_stamp_as(&metadata))
-            {
-                freshness.changed_file(
-                    index.authority_terminal_member(&path),
-                    listed_at.saturating_sub(modified_unix_seconds),
-                );
-            }
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
@@ -47409,9 +47382,8 @@ fn advance_bounded_directory_traversal_with_budget(
                 path: &path,
                 metadata: &metadata,
                 in_window: !aged,
-                excluded: false,
             };
-            debt.listed(index, &traversal, listing);
+            debt.listed(index, listing);
             let owes_stamped = aged
                 && retention.owes_stamped(
                     source,
@@ -47534,7 +47506,7 @@ fn advance_bounded_directory_traversal_with_budget(
     let walk_ended = traversal.pending_directories.is_empty();
     let debt = debt.end(index, walk_ended);
     if root_walk {
-        freshness.page_end(source, walk_ended, debt.as_ref());
+        freshness.page_end(source, walk_ended, debt);
     }
     index.traversal = Some(traversal);
 }

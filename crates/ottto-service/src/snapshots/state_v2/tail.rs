@@ -229,20 +229,6 @@ pub(in crate::snapshots) struct Observation {
     pub(in crate::snapshots) inventory: Option<InventoryFacts>,
 }
 impl Observation {
-    fn absorb(&mut self, later: Self) {
-        self.representation = later.representation;
-        self.summary = later.summary;
-        self.added.extend(later.added);
-        self.inventory = later.inventory.or(self.inventory.take());
-        for id in later.resolved {
-            self.replaced.remove(&id);
-            self.resolved.insert(id);
-        }
-        for (id, value) in later.replaced {
-            self.resolved.remove(&id);
-            self.replaced.insert(id, value);
-        }
-    }
     fn bytes(&self) -> u64 {
         self.added
             .iter()
@@ -294,33 +280,23 @@ impl TailStage {
             && self.erase.is_empty()
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
-        self.merge(key, observation);
+        self.replace_observation(key, observation);
         self.report();
     }
-    /// Many files' debt-only changes, merged as one by one, with one report.
+    /// Many files' debt-only changes, staged one by one, with one report.
     pub(super) fn observe_all(&mut self, observations: Vec<(String, Observation)>) {
         for (key, observation) in observations {
-            self.merge(&key, observation);
+            self.replace_observation(&key, observation);
         }
         self.report();
     }
-    /// Keys with a debt-only observation staged and not yet committed.
-    pub(super) fn observed_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+    /// A later observation of the key replaces the staged one: each is its
+    /// owner's whole delta from the committed rows.
+    fn replace_observation(&mut self, key: &str, observation: Observation) {
         self.debt
-            .iter()
-            .filter(|(_, debt)| debt.observation.is_some())
-            .map(|(key, _)| key.as_slice())
-    }
-    fn merge(&mut self, key: &str, observation: Observation) {
-        let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
-        let merged = match debt.observation.take() {
-            Some(mut prior) => {
-                prior.absorb(observation);
-                prior
-            }
-            None => observation,
-        };
-        debt.observation = Some(merged);
+            .entry(key.as_bytes().to_vec())
+            .or_default()
+            .observation = Some(observation);
     }
     /// Staged observations of the key are superseded; later ones apply after.
     pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {
