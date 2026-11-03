@@ -393,7 +393,7 @@ fn changed_member_revision_updates_diagnostics_without_rearm() {
     index.files.get_mut(&child).unwrap().source_file_fingerprint = "rev-child-2".to_string();
     let changed = rearm.terminal(&mut index, &rearm.items);
     assert!(!changed.counts.full_rearm, "{changed:?}");
-    assert!(changed.suppression.full_rearm_suppressed);
+    assert!(!changed.suppression.full_rearm_suppressed);
     assert_eq!(changed.rearmed_files, 0);
     assert_ne!(
         index.claude_full_rearm_progress.structural_record, recorded,

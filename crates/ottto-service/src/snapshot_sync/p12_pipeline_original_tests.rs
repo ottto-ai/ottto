@@ -1402,10 +1402,10 @@ fn native_comparison_novel_import_base_parity() {
             offered_body(&candidate_import),
             "exact C bytes/head, including collector/evidence/tags/posture/authority"
         );
-        assert_eq!(rearm_reads(&base_import), 4);
+        assert_eq!(rearm_reads(&base_import), 1);
         assert_eq!(rearm_reads(&candidate_import), 1);
         for (pages, expected_debt, selected) in [
-            (&base_import, 3, &base_selected),
+            (&base_import, 0, &base_selected),
             (&candidate_import, 0, &candidate_selected),
         ] {
             let terminal = pages.last().unwrap();
@@ -1438,7 +1438,7 @@ fn native_comparison_novel_import_base_parity() {
                 .unwrap()
                 .duplicate_census
                 .pending_occurrence_count,
-            5
+            1
         );
         assert_eq!(
             candidate_import
@@ -1756,6 +1756,13 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
         drop(native);
         let mut baseline_copy_body = None;
         let baseline_outcome = baseline.as_ref().map(|base| {
+            // C3's N+1 recovery reads the native owner family before the copy.
+            // O1 no longer gives the control that observation automatically.
+            // Explicit replay keeps this exact-body oracle on the same native
+            // evidence, without adding a production reread cause.
+            let mut replay = ScanIndex::load(&base.index_path).unwrap();
+            assert!(replay.prepare_historical_replay("explicit-copy-owner-oracle".into()));
+            replay.save(&base.index_path).unwrap();
             let imported = base.generation(11);
             let fp = imported
                 .iter()
@@ -1810,11 +1817,17 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
                     if &copy.snapshot_fingerprint != base_copy {
                         let current = serde_json::to_value(copy).unwrap();
                         let reference = baseline_copy_body.as_ref().unwrap();
-                        for (field, value) in current.as_object().unwrap() {
-                            if reference[field] != *value {
+                        let fields = current
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .chain(reference.as_object().unwrap().keys())
+                            .collect::<BTreeSet<_>>();
+                        for field in fields {
+                            if reference[field] != current[field] {
                                 eprintln!(
-                                    "CENSUS_EXIT_COPY field={field} main={} forward={value}",
-                                    reference[field]
+                                    "CENSUS_EXIT_COPY field={field} main={} forward={}",
+                                    reference[field], current[field]
                                 );
                             }
                         }

@@ -677,13 +677,17 @@ fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
             "{arm}: no listed family body is request-owned"
         );
     }
-    // BASE: the healthy terminal page re-proves the family. Its terminal-retry
-    // re-arm owes, so only the changed member is read; the rest re-stamp.
-    assert!(base_retry.census_complete && !base_retry.red);
+    // Both arms read only the changed member. The retained proof stays,
+    // while the incomplete new family remains on the ordinary retry path.
+    assert!(!base_retry.census_complete && !base_retry.red);
     assert_eq!(base_retry.family_reads, 1);
-    assert!(base_retry.proven && !base_retry.retry_pending);
+    assert!(base_retry.proven && base_retry.retry_pending);
     let start = retry.start.as_ref().expect("a retry start");
-    assert_eq!(start.carried_pending_families, Some(1), "carried at start");
+    assert_eq!(
+        start.carried_pending_families,
+        Some(0),
+        "no completed-row carry"
+    );
     assert_eq!(retry.family_reads, 1, "only the changed member is read");
     assert!(retry.retry_pending, "the ordinary path holds the family");
 }
