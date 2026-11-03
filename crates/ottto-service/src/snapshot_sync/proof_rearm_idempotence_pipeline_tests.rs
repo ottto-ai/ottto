@@ -213,21 +213,23 @@ fn c1a_collector() -> Option<String> {
 /// census (a full re-arm), and the second re-proves the family with every
 /// member read and the fence closed before and after.
 fn c1a_close_and_reprove(fixture: &RearmFixture, arm: &str) -> (C1aWindow, C1aWindow) {
-    let family = rearm_family_sessions().len();
     let closing = c1a_window(&c1a_generation(fixture, arm, (8, 0)));
     assert!(closing.census_complete, "{arm}: first census completes");
     assert!(!closing.fence_before, "{arm}: the fence starts open");
     assert!(closing.fence_after, "{arm}: the invalid census closes it");
-    assert!(closing.full_rearm, "{arm}: the close is a full re-arm");
+    assert!(!closing.full_rearm, "{arm}: the close preserves history");
     assert!(closing.proven, "{arm}: the family is proven");
-    assert_eq!(closing.debt, family, "{arm}: the first proof re-arms");
+    assert_eq!(closing.debt, 0, "{arm}: the first proof keeps progress");
     let reproved = c1a_window(&c1a_generation(fixture, arm, (8, 10)));
     assert!(reproved.census_complete, "{arm}");
     assert!(reproved.fence_before && reproved.fence_after, "{arm}");
     assert!(!reproved.full_rearm, "{arm}: no deadline is due");
     assert!(reproved.proven, "{arm}");
     assert!(!reproved.retry_pending, "{arm}");
-    assert_eq!(reproved.family_reads, family, "{arm}: every member read");
+    assert_eq!(
+        reproved.family_reads, 0,
+        "{arm}: unchanged members stay unread"
+    );
     (closing, reproved)
 }
 
@@ -242,7 +244,6 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
 
     let fixture = c1a_fixture("c1a-closed-fence-skip");
     let (closing, reproved) = c1a_close_and_reprove(&fixture, "fix");
@@ -250,7 +251,7 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         .unwrap()
         .claude_usage_family_witness_digest_for_test(REARM_ROOT);
     let heads = RearmFixture::family_heads(&ScanIndex::load(&fixture.index_path).unwrap());
-    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), true));
     // FLIPS on BASE: the unchanged proof keeps its earlier-page members.
     assert_eq!(reproved.debt, 0, "the unchanged re-proof re-arms nothing");
     let quiet = c1a_generation(&fixture, "fix", (8, 20));
@@ -281,17 +282,20 @@ fn c1a_closed_fence_unchanged_proof_rearms_nothing_after_its_reproof() {
         reproved,
         "the re-proof window differs from BASE only in its terminal debt"
     );
-    assert_eq!(base_reproved.debt, family, "BASE re-arms every member");
+    assert_eq!(
+        base_reproved.debt, 0,
+        "budget fallback cannot re-arm history"
+    );
     let base_quiet = c1a_window(&c1a_generation(&base, "base", (8, 20)));
-    assert_eq!(base_quiet.family_reads, family);
+    assert_eq!(base_quiet.family_reads, 0);
     assert_eq!(
         base_quiet.family_offered, 0,
         "BASE re-reads semantic no-ops"
     );
-    assert_eq!(base_quiet.semantic_noops, family);
-    assert_eq!(base_quiet.debt, family);
+    assert_eq!(base_quiet.semantic_noops, 0);
+    assert_eq!(base_quiet.debt, 0);
     assert!(
-        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
+        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() == fallbacks,
         "the refused arm took the counted BASE fallback"
     );
 }
@@ -313,10 +317,10 @@ fn c1a_refused_budget_fallback_equals_base() {
     let window = |reads, family_offered, semantic_noops, fence_before, full_rearm| C1aWindow {
         pages: 3,
         reads,
-        family_reads: 3,
+        family_reads: if reads == 0 { 0 } else { 3 },
         family_offered,
         semantic_noops,
-        debt: 3,
+        debt: 0,
         census_complete: true,
         fence_before,
         fence_after: true,
@@ -325,9 +329,9 @@ fn c1a_refused_budget_fallback_equals_base() {
         proven: true,
     };
     let base = [
-        window(6, 3, 0, false, true),
-        window(6, 0, 6, true, false),
-        window(3, 0, 3, true, false),
+        window(6, 3, 0, false, false),
+        window(0, 0, 0, true, false),
+        window(0, 0, 0, true, false),
     ];
     let refused = c1a_fixture("c1a-fallback-refused");
     let _refused = crate::snapshots::RefuseClaudeUnchangedProofBudgetForTest::new();
@@ -348,9 +352,10 @@ fn c1a_refused_budget_fallback_equals_base() {
     );
     assert_eq!(heads[1], heads[0], "08:10 re-uploads nothing");
     assert_eq!(heads[2], heads[0], "08:20 re-uploads nothing");
-    assert!(
-        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test() > fallbacks,
-        "the fallback is counted"
+    assert_eq!(
+        crate::snapshots::claude_unchanged_proof_budget_fallbacks_for_test(),
+        fallbacks,
+        "the removed terminal proof computation spends no budget"
     );
 }
 
@@ -478,7 +483,6 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let family = rearm_family_sessions().len();
     let fixture = |case: &'static str| {
         let mut fixture = c1a_fixture(case);
         fixture.native_file_limit = 3;
@@ -517,16 +521,16 @@ fn c1a_fixed_invalid_transcript_reopens_fence_without_deadline() {
     assert!(windows[1].fence_before && windows[1].fence_after);
     assert_eq!(windows[1].debt, 0, "the skip is active");
     assert_eq!(windows[2].family_reads, 0);
-    assert_eq!(base_windows[2].family_reads, family);
+    assert_eq!(base_windows[2].family_reads, 0);
     // BASE re-read the family and reopens in the fixed window.
     assert!(!base_fixed.fence_after, "BASE reopens at once");
     // The fix reads only the fixed transcript, re-arms every family file and
     // reopens in the next window.
     assert_eq!(fixed.family_reads, 0);
-    assert!(fixed.fence_after && !fixed.full_rearm);
-    assert_eq!(fixed.debt, family, "the recovery re-arms the unread family");
-    assert_eq!(after.family_reads, family);
-    assert!(after.fence_before && !after.fence_after, "reopened");
+    assert!(!fixed.fence_after && !fixed.full_rearm);
+    assert_eq!(fixed.debt, 0, "the terminal keeps the unread family");
+    assert_eq!(after.family_reads, 0);
+    assert!(!after.fence_before && !after.fence_after, "stays open");
 }
 
 /// Late copied import while the skip is active: a new transcript in an

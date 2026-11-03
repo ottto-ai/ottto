@@ -483,8 +483,8 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
     assert_eq!(disposition.quarantined_entity_count(), 2);
     family.page(&mut [], true, "2026-08-02T07:40:00Z");
     assert_ne!(family.witness(), first_witness);
-    assert!(!family.armed(&parent_key));
-    assert!(!family.armed(&child_key));
+    assert!(family.armed(&parent_key));
+    assert!(family.armed(&child_key));
 
     // The re-armed members rebuild from the new witness with the grown usage,
     // which resolves the quarantine.

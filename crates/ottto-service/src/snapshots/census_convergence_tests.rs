@@ -3203,7 +3203,8 @@ fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
             .claude_usage_family_pending
             .insert("kept-root".into(), pending);
         if already_completed {
-            index.claude_full_rearm_progress.completed_window = rfc3339_unix_seconds(OLDER_WINDOW);
+            index.claude_full_rearm_progress.completed_window =
+                claude_census_window_stamp(OLDER_WINDOW);
         } else {
             let first = apply_claude_reported_usage_with_index(
                 &mut [],
@@ -3217,7 +3218,7 @@ fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
             assert_eq!(first.duplicate_census.fence_after, initially_closed);
             assert_eq!(
                 index.claude_full_rearm_progress.completed_window,
-                rfc3339_unix_seconds(OLDER_WINDOW)
+                claude_census_window_stamp(OLDER_WINDOW)
             );
         }
         for window in [WINDOW, "2026-08-03T07:10:00Z"] {
@@ -3248,10 +3249,19 @@ fn vanished_root_discard_counts_shared_rows_and_keeps_indexed_members() {
     let hash = format!("{:x}", Sha256::digest(b"shared"));
     let mut index = ScanIndex::default();
     index.files.insert(key, committed_entry("revision", "body"));
+    let present_member = format!("{present}_agent-child");
     for root in [present, vanished] {
-        index
-            .claude_usage_family_pending
-            .insert(root.into(), current_pending(root, &hash));
+        index.claude_usage_family_pending.insert(
+            root.into(),
+            current_pending(
+                if root == present {
+                    &present_member
+                } else {
+                    vanished
+                },
+                &hash,
+            ),
+        );
     }
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
         evidence: BTreeMap::from([(

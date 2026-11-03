@@ -2090,7 +2090,7 @@ fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
         Some(&evidence),
     );
     assert!(index.claude_usage_family_witnesses.contains_key(&parent));
-    assert_eq!(armed(&index), [true, true], "both members re-armed");
+    assert_eq!(armed(&index), [false, false], "proof keeps both revisions");
 
     // The next pass re-parses them under an incomplete (unsettled) census.
     let mut reparsed = items;
@@ -2535,7 +2535,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         record_claude_request_census(
             &mut index,
             ClaudeRequestCensusParse {
-                    held_index_keys: &BTreeSet::new(),
+                held_index_keys: &BTreeSet::new(),
                 path: &quiet_path,
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,

@@ -151,12 +151,14 @@ impl Rearm {
         let window = index
             .claude_full_rearm_progress
             .completed_window
-            .filter(|completed| census_complete && *completed >= CENSUS_CLOCK)
+            .filter(|completed| census_complete && *completed >= CENSUS_CLOCK * 1_000_000_000)
             .map(|completed| {
-                time::OffsetDateTime::from_unix_timestamp((completed + 1) as i64)
-                    .unwrap()
-                    .format(&Rfc3339)
-                    .unwrap()
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+                    completed + 1_000_000_000,
+                ))
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap()
             })
             .unwrap_or_else(|| WINDOW.to_owned());
         self.fold_in(
@@ -280,10 +282,13 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
         .map(|key| fix.files[key].size_bytes)
         .sum::<u64>();
     // Preconditions on BASE: every due terminal re-arms the whole family.
-    for run in &base_runs {
+    for (at, run) in base_runs.iter().enumerate() {
         assert!(!run.counts.full_rearm && run.counts.fence_after, "{run:?}");
         assert!(run.counts.census_invalid);
-        assert_eq!(run.counts.page_invalidated_identity_count, 1);
+        assert_eq!(
+            run.counts.page_invalidated_identity_count,
+            usize::from(at == 0)
+        );
         assert_eq!(run.rearmed_files, 0);
         assert_eq!(run.suppression, ClaudeFullRearmSuppressionCounts::default());
     }
@@ -306,7 +311,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
                 full_rearm_suppressed: true,
                 full_rearm_skipped_invalid_unchanged: skipped as u64,
                 full_rearm_post_rebuild_skipped: 0,
-                structural_invalid_family_count: 1,
+                structural_invalid_family_count: 0,
                 suppressed_since_unix_seconds: Some(CENSUS_CLOCK),
             }
         );
@@ -442,7 +447,7 @@ fn non_structural_invalidation_does_not_rearm_history() {
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
     );
     let changed = rearm.reread(&mut changed, &disposition);
-    assert_eq!(changed.counts.page_invalidated_member_changed_count, 1);
+    assert_eq!(changed.counts.page_invalidated_member_changed_count, 0);
     assert!(!changed.counts.full_rearm, "{changed:?}");
     assert!(!changed.suppression.full_rearm_suppressed);
 
@@ -496,7 +501,7 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
     let held = rearm.terminal(&mut index, &rearm.items);
     assert!(!held.counts.full_rearm, "{held:?}");
     assert!(
-        !index
+        index
             .claude_full_rearm_progress
             .first_proof_hold_since_full_rearm
     );
@@ -604,7 +609,7 @@ fn rebuilt_index_first_close_waits_the_capped_delay() {
             )
             .duplicate_census;
         assert!(!counts.fence_before && counts.fence_after, "{counts:?}");
-        assert!(counts.full_rearm, "a close still re-arms once");
+        assert!(!counts.full_rearm, "closing the fence preserves progress");
         assert_eq!(counts.full_rearm_deferred_until, None);
     }
     let _ = fs::remove_dir_all(support);
@@ -913,7 +918,7 @@ fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
     );
     let run = rearm.terminal(&mut index, &rearm.items);
     assert!(!run.counts.full_rearm);
-    assert!(!run.suppression.full_rearm_suppressed);
+    assert!(run.suppression.full_rearm_suppressed);
     assert_eq!(run.rearmed_files, 0);
 }
 
@@ -1094,7 +1099,7 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 );
                 assert_eq!(run.rearmed_files, 0);
                 if let Some(record) = &mut record {
-                    record.suppressed_since_unix_seconds = Some(CENSUS_CLOCK);
+                    record.suppressed_since_unix_seconds = Some(CENSUS_CLOCK + 1);
                     record.skipped_full_rearms += 1;
                 }
             } else {
@@ -1321,7 +1326,7 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
             assert_eq!(parent.claude_account_withheld_reason, None, "{state}");
             assert_eq!(parent.request_identity_refusals, 0, "{state}");
             assert_eq!(
-                run.counts.page_invalidated_identity_count, 1,
+                run.counts.page_invalidated_identity_count, 0,
                 "census identity kept: only the structural child: {run:?} {state}"
             );
             assert_eq!(

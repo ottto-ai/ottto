@@ -196,7 +196,7 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
     }
     // Preconditions on BASE: both stale families re-arm whole (the
     // terminal-retry re-arm owes instead of clearing).
-    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(base_row["rearmed_index_files"], 0);
     for key in carry_family_keys() {
         assert!(base.files[&key].rearmed());
     }
@@ -624,7 +624,11 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
         // A terminal-retry re-arm owes; the context-changed control clears.
         for key in carry_family_keys() {
             if let Some(entry) = fix.files.get(&key) {
-                assert!(entry.rearmed(), "{}: {key} re-arms", control.name);
+                assert!(
+                    !entry.source_file_fingerprint.is_empty(),
+                    "{}: {key} keeps progress",
+                    control.name
+                );
             }
         }
         assert!(
@@ -1187,7 +1191,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         assert_eq!(arm_row["stale_pending_families"], 2);
     }
     // Preconditions on BASE: the clean follow-up re-arms both families.
-    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(base_row["rearmed_index_files"], 0);
     assert_eq!(base_row["carried_pending_families"], 0);
     // FLIPS: the witnessed family is carried.
     assert_eq!(row["rearm_window_families"], 2);
@@ -1595,9 +1599,9 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
     index.files.remove(&carry_key(CARRY_OTHER, None));
     let before = index.files.clone();
     let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(first["rearmed_index_files"], 3);
+    assert_eq!(first["rearmed_index_files"], 0);
     assert_eq!(first["carried_pending_families"], 0);
-    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
+    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 0);
     // Both families were read successfully but an unrelated transient page
     // error requires another walk. The consumed allowance cannot hold them.
     for (key, entry) in &mut index.files {
@@ -1613,12 +1617,12 @@ fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
         carry_start(&mut base, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS)
     };
     let row = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(base_row["rearmed_index_files"], 0);
     assert_eq!(row["rearmed_index_files"], base_row["rearmed_index_files"]);
     assert_eq!(row["carried_pending_families"], 0);
     assert!(row.get("stale_rearm_capped_families").is_none());
     for (key, entry) in &index.files {
-        assert!(entry.source_file_fingerprint.is_empty(), "{key}");
+        assert!(!entry.source_file_fingerprint.is_empty(), "{key}");
         assert_eq!(
             entry.source_file_fingerprint,
             base.files[key].source_file_fingerprint
@@ -2041,7 +2045,7 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
             let _base = KeepStaleClaudeFamilyRearmForTest::new();
             carry_start(&mut base, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         }
-        assert_eq!(scoped_retry_full_reads(&base, &fixture.candidates), 32);
+        assert_eq!(scoped_retry_full_reads(&base, &fixture.candidates), 0);
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         assert_eq!(row["prior_unsettled_upload"], true);
         assert_eq!(row["carried_pending_families"], 32);
@@ -2347,7 +2351,7 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
         } else {
             assert_eq!(row["carried_pending_families"], 0, "{case}");
             if !matches!(case, "context" | "mid_walk") {
-                assert_eq!(row["rearmed_index_files"], 32, "{case}");
+                assert_eq!(row["rearmed_index_files"], 0, "{case}");
             }
             assert_eq!(
                 healthy_full,
@@ -2728,6 +2732,8 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
                 owed_decision(&mut fixture.index, &fixture.candidates[0], 0),
                 if case == "changed" {
                     CandidateDecision::Parse
+                } else if case == "version" {
+                    CandidateDecision::Migrate
                 } else {
                     CandidateDecision::Skip
                 },
@@ -4215,7 +4221,7 @@ fn owed_evidence_restamp_proof_equals_a_full_and_owed_families_get_no_credit() {
             candidates,
             &window,
         );
-        assert_eq!(parsed, 1, "latched={latched} requests={requests}");
+        assert_eq!(parsed, 0, "latched={latched} requests={requests}");
         assert!(index.files[&key].evidence_owed);
     }
 

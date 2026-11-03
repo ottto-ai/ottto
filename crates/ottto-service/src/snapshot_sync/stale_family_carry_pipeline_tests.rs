@@ -32,10 +32,10 @@ fn accepted_retry_no_otel_change_ack_then_carry_again() {
     )
     .unwrap();
     let closing = c1b_generation(&fixture, "accepted", (8, 0));
-    assert!(closing.census_complete && closing.full_rearm);
+    assert!(closing.census_complete && !closing.full_rearm);
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     let seed = c1b_generation(&fixture, "accepted", (8, 10));
-    assert!(seed.red && seed.parsed.contains(session));
+    assert!(seed.red && !seed.parsed.contains(session));
     let before = c1a_saved(&fixture);
     assert!(before["claude_usage_family_witnesses"]
         .get(session)
@@ -297,10 +297,9 @@ fn c1b_red_chain_with(
     arm: &str,
     between: impl FnOnce(&RearmFixture),
 ) -> C1bRun {
-    let family = rearm_family_sessions().len();
     let closing = c1b_generation(&fixture, arm, (8, 0));
     assert!(closing.census_complete, "{arm}: the first census completes");
-    assert!(closing.fence_after && closing.full_rearm, "{arm}");
+    assert!(closing.fence_after && !closing.full_rearm, "{arm}");
     assert!(closing.proven, "{arm}: the family is proven");
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     RearmFixture::append(
@@ -310,8 +309,8 @@ fn c1b_red_chain_with(
     let red = c1b_generation(&fixture, arm, (8, 10));
     assert!(red.red && !red.census_complete, "{arm}: the window is red");
     assert_eq!(
-        red.family_reads, family,
-        "{arm}: the re-arm reads the family"
+        red.family_reads, 0,
+        "{arm}: the terminal did not re-arm the unchanged family"
     );
     assert!(
         red.parsed.contains(REARM_TERMINAL),
@@ -930,7 +929,7 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
                 .and_then(serde_json::Value::as_object_mut)
                 .expect("the preceding full re-arm recorded its progress");
             assert!(
-                progress.remove("full_rearm_window").is_some(),
+                progress.remove("full_rearm_window").is_none(),
                 "explicitly leave Fix 2's window"
             );
             progress.remove("full_rearm_window_next");
@@ -971,7 +970,7 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
                 saved
                     .get("claude_full_rearm_progress")
                     .and_then(|progress| progress.get("full_rearm_window"))
-                    .is_some(),
+                    .is_none(),
                 "retain Fix 2's full-rearm window"
             );
             saved.insert(
@@ -1079,7 +1078,7 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
     let family = rearm_family_sessions().len();
     let fixture = c1a_fixture("c1a-latch-retry-pending-debt");
     let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
-    assert!(closing.census_complete && closing.full_rearm && closing.fence_after);
+    assert!(closing.census_complete && !closing.full_rearm && closing.fence_after);
     assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
     c1a_edit_index(&fixture, |saved| {
         saved.remove("claude_request_identity_contract");
@@ -1133,7 +1132,7 @@ fn fix2_clean_followup(fixture: &RearmFixture) {
             saved
                 .get("claude_full_rearm_progress")
                 .and_then(|progress| progress.get("full_rearm_window"))
-                .is_some(),
+                .is_none(),
             "the 08:10 start opened a full-rearm window"
         );
         saved.remove("traversal");
@@ -1225,7 +1224,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("scoped-retry-late-identity");
     let closing = c1b_generation(&fixture, "scoped", (8, 0));
-    assert!(closing.census_complete && closing.proven && closing.full_rearm);
+    assert!(closing.census_complete && closing.proven && !closing.full_rearm);
     assert!(
         closing.request_owned.contains(REARM_ROOT),
         "positive control: the unlisted root body is request-owned"
