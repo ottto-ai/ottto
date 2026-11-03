@@ -1977,7 +1977,7 @@ fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
 
 /// A resumed source: its next enabled pass re-sends the inventory the server
 /// erased at source-off. Only the upload time goes; the destination identity
-/// and the version seed stay. Durable, unlike the best-effort cache write.
+/// and the version seed stay. Synced, unlike the best-effort cache write.
 pub(crate) fn invalidate_upload_witness(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let path = cache_path(support_dir, source);
     let Some(mut entry) = read_cache(&path) else {
@@ -1986,7 +1986,7 @@ pub(crate) fn invalidate_upload_witness(support_dir: &Path, source: SnapshotSour
     entry.posted_at.clear();
     let bytes = serde_json::to_vec(&entry).map_err(|error| anyhow!("encode cache: {error}"))?;
     ottto_core::write_owner_only_file_atomic(&path, &bytes)?;
-    std::fs::File::open(path.parent().unwrap_or(&path))?.sync_all()?;
+    crate::context_composition::sync_dir(path.parent().unwrap_or(&path))?;
     Ok(())
 }
 

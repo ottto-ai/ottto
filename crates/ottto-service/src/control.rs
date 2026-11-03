@@ -21977,7 +21977,10 @@ for line in sys.stdin:
             assert!(path.exists(), "{path:?}: collected state stays");
         }
         assert_eq!(
-            crate::snapshot_sync::claude_prior_history_for_new_destination(&support_root, "new"),
+            crate::snapshot_sync::withheld_support::claude_prior_history_for_new_destination(
+                &support_root,
+                "new"
+            ),
             crate::snapshots::PriorHistory::Moved,
             "a re-pair after forget reads this Mac's Claude history as moved"
         );

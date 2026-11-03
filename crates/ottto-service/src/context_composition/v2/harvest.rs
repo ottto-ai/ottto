@@ -80,17 +80,17 @@ pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
 pub(crate) fn drop_upload_acks(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let dir = state_dir(support_dir);
     let scopes = dir.join("scopes");
+    let Some((_, source)) = source_order(0).into_iter().find(|(id, _)| *id == source) else {
+        return Ok(());
+    };
     if !scopes.exists() {
         return Ok(());
     }
     let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
-    let prefix = format!("{}-", agent_source_label(source));
-    for entry in fs::read_dir(&scopes)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".upload.json") {
-            fs::remove_file(entry.path())?;
+    for scope_id in disk_scopes(&dir, source) {
+        match fs::remove_file(super::upload::ack_path(&dir, source, &scope_id)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            removed => removed?,
         }
     }
     super::checkpoint::sync_dir(&scopes)?;

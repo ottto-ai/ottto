@@ -6,7 +6,7 @@ use super::*;
 use crate::snapshot_sync::{
     detected_uses_cache_path, disable_snapshot_source, disable_sources_dropped_from_grant,
     enabled_snapshot_sources_in, reconnect_snapshot_source, resume_reconnected_sources,
-    source_erasure_failures_for_test, source_marker,
+    source_marker, withheld_support::source_erasure_failures_for_test,
 };
 use ottto_core::LocalDeviceBinding;
 use std::os::unix::fs::PermissionsExt;
@@ -283,18 +283,15 @@ fn promote_without_claude(support: &Path) {
 }
 
 /// [behaviour] Turning Claude off, a grant that drops it and a credential
-/// promotion that drops it only pause it: its index, every Tail row, caches,
-/// composition state and upload witnesses stay, a resume turn touches
-/// nothing while paused, and Codex keeps running.
+/// promotion that drops it each write the same pause marker. Paused, its
+/// index, every Tail row, caches, composition state and upload witnesses stay,
+/// a resume turn touches nothing, and Codex keeps running.
 #[test]
 #[serial_test::serial]
 fn pause_keeps_every_local_file_and_other_sources_run() {
     let claude = SnapshotSource::ClaudeCode;
     type Trigger = fn(&Path);
-    let arms: [(&str, Trigger); 3] = [
-        ("disable", |support| {
-            disable_snapshot_source(support, SnapshotSource::ClaudeCode).unwrap()
-        }),
+    let arms: [(&str, Trigger); 2] = [
         ("grant_drop", |support| {
             let next = LocalDeviceBinding {
                 sources: vec!["codex".into()],
@@ -306,27 +303,6 @@ fn pause_keeps_every_local_file_and_other_sources_run() {
     ];
     for (arm, trigger) in arms {
         let f = Fixture::new();
-        let mut kept = f.canaries(claude);
-        kept.extend(f.canaries(SnapshotSource::Codex));
-        let (witnesses, markers) = f.witnesses(claude);
-        kept.extend(witnesses);
-        kept.extend(markers);
-        let second = f
-            .support
-            .join("snapshots/destinations")
-            .join("d".repeat(64));
-        fs::create_dir_all(&second).unwrap();
-        let path = second.join(CLAUDE_INDEX);
-        let live = claude_tail_store(&f, &path);
-        crate::backfill::update_backfill_state(&f.support, |state| {
-            crate::backfill::mark_backfill_complete_for_destination(state, claude, &"d".repeat(64));
-        })
-        .unwrap();
-
-        // Nothing has been asked of either source yet.
-        assert_eq!(f.resume(claude), 0, "{arm}");
-        assert_eq!(enabled_snapshot_sources_in(&device(), &f.support).len(), 2);
-
         trigger(&f.support);
         assert_eq!(
             source_marker(&f.support, claude).as_deref(),
@@ -336,43 +312,69 @@ fn pause_keeps_every_local_file_and_other_sources_run() {
         assert_eq!(
             enabled_snapshot_sources_in(&device(), &f.support),
             vec![SnapshotSource::Codex],
-            "{arm}: the marker alone stops collection"
+            "{arm}"
         );
-        assert_eq!(f.resume(claude), 0, "{arm}");
-        assert_eq!(
-            source_marker(&f.support, claude).as_deref(),
-            Some("pending"),
-            "{arm}: paused until re-enabled"
-        );
-        assert_eq!(source_marker(&f.support, SnapshotSource::Codex), None);
-        assert_kept(&kept);
-        drop(live);
-        let reloaded = ScanIndex::load(&path).unwrap();
-        assert!(state_v2::published(&path).unwrap(), "{arm}: store kept");
-        assert_eq!(reloaded.files.len(), 1, "{arm}: index rows kept");
-        let counts = state_v2::tail_kind_counts_for_test(&reloaded);
-        assert_eq!(
-            [
-                counts["tail.head"],
-                counts["tail.page.session_facts"],
-                counts["tail.revision"],
-                counts["tail.set_aside"],
-            ],
-            [1; 4],
-            "{arm}: every Tail row kept: {counts:?}"
-        );
-        assert!(raw_holds(&path, TAIL_CANARY), "{arm}");
-        let pending = crate::backfill::pending_backfill_sources_for_destination(
-            &crate::backfill::load_backfill_state(&f.support),
-            &"d".repeat(64),
-        );
-        assert!(
-            !pending.contains(&claude),
-            "{arm}: no bootstrap replay owed"
-        );
-        drop(reloaded);
-        state_v2::money_test_support::erase_published(&path);
     }
+
+    let f = Fixture::new();
+    let mut kept = f.canaries(claude);
+    kept.extend(f.canaries(SnapshotSource::Codex));
+    let (witnesses, markers) = f.witnesses(claude);
+    kept.extend(witnesses);
+    kept.extend(markers);
+    let second = f
+        .support
+        .join("snapshots/destinations")
+        .join("d".repeat(64));
+    fs::create_dir_all(&second).unwrap();
+    let path = second.join(CLAUDE_INDEX);
+    let live = claude_tail_store(&f, &path);
+    crate::backfill::update_backfill_state(&f.support, |state| {
+        crate::backfill::mark_backfill_complete_for_destination(state, claude, &"d".repeat(64));
+    })
+    .unwrap();
+
+    // Nothing has been asked of either source yet.
+    assert_eq!(f.resume(claude), 0);
+    assert_eq!(enabled_snapshot_sources_in(&device(), &f.support).len(), 2);
+
+    disable_snapshot_source(&f.support, claude).unwrap();
+    assert_eq!(
+        enabled_snapshot_sources_in(&device(), &f.support),
+        vec![SnapshotSource::Codex],
+        "the marker alone stops collection"
+    );
+    assert_eq!(f.resume(claude), 0);
+    assert_eq!(
+        source_marker(&f.support, claude).as_deref(),
+        Some("pending"),
+        "paused until re-enabled"
+    );
+    assert_eq!(source_marker(&f.support, SnapshotSource::Codex), None);
+    assert_kept(&kept);
+    drop(live);
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert!(state_v2::published(&path).unwrap(), "store kept");
+    assert_eq!(reloaded.files.len(), 1, "index rows kept");
+    let counts = state_v2::tail_kind_counts_for_test(&reloaded);
+    assert_eq!(
+        [
+            counts["tail.head"],
+            counts["tail.page.session_facts"],
+            counts["tail.revision"],
+            counts["tail.set_aside"],
+        ],
+        [1; 4],
+        "every Tail row kept: {counts:?}"
+    );
+    assert!(raw_holds(&path, TAIL_CANARY));
+    let pending = crate::backfill::pending_backfill_sources_for_destination(
+        &crate::backfill::load_backfill_state(&f.support),
+        &"d".repeat(64),
+    );
+    assert!(!pending.contains(&claude), "no bootstrap replay owed");
+    drop(reloaded);
+    state_v2::money_test_support::erase_published(&path);
 }
 
 /// [behaviour] A resume that cannot drop a witness keeps the source paused

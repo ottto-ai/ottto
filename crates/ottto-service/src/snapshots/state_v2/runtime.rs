@@ -1262,13 +1262,6 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         Ok(())
     })
 }
-/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
-/// handles first; its established cleanup owner performs all file deletion.
-#[cfg(target_os = "macos")]
-pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
-    close_tree(support)
-}
-
 /// The retired restart-record directory beside a scan index.
 pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
     index_path.with_extension("durable-tail")
@@ -1277,46 +1270,21 @@ pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
 /// Removes that directory, never following a link, and syncs its parent.
 /// `Ok(false)`: nothing was there.
 pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
-    match fs::symlink_metadata(records) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
-        Ok(_) => fs::remove_file(records)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let removed = fence::remove_artifact(records)?;
+    if removed {
+        super::super::sync_checkpoint_parent(records)?;
     }
-    super::super::sync_checkpoint_parent(records)?;
-    Ok(true)
-}
-
-/// Fixture cleanup only. Close the shared session before unlinking all
-/// artifacts, and invalidate clones before releasing CheckpointLock.
-#[cfg(test)]
-pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
-    invalidate_locked(path)?;
-    if let Some(runtime) = index.and_then(|i| i.v2().persistence_v2.as_ref()) {
-        runtime
-            .session
-            .lock()
-            .map_err(|_| Hold::DbUnavailable)?
-            .take();
-    }
-    for (suffix, _, _) in fence::ARTIFACTS {
-        fence::remove_artifact(&fence::sibling(path, suffix))?;
-    }
-    super::ack::erase_failed_imports(path)?;
-    super::super::sync_checkpoint_parent(path)?;
-    remove_retired_record_dir(&retired_record_dir(path))?;
-    super::super::sync_checkpoint_parent(path)?;
-    // Retain the invalidated route's custody latch: erased artifacts must not
-    // let this process resume v1 or re-create v2 without an explicit new lineage.
-    Ok(())
+    Ok(removed)
 }
 
 pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
     telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
+/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
+/// handles first; its established cleanup owner performs all file deletion.
 #[cfg(any(test, target_os = "macos"))]
-fn close_tree(support: &Path) -> Result<()> {
+pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
     let routes: Vec<_> = states()
         .lock()

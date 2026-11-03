@@ -8,8 +8,24 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     // Cleanup also owns deliberately malformed fences; it must not decode them.
     let _owner =
         super::super::super::CheckpointLock::acquire_with_custody(path, false, Some(true)).unwrap();
-    erase_locked(path, None).unwrap();
+    erase_locked(path).unwrap();
     states().lock().unwrap().remove(path);
+}
+
+/// Close the shared session before unlinking all artifacts, and invalidate
+/// clones before releasing CheckpointLock.
+fn erase_locked(path: &Path) -> Result<()> {
+    invalidate_locked(path)?;
+    for (suffix, _, _) in fence::ARTIFACTS {
+        fence::remove_artifact(&fence::sibling(path, suffix))?;
+    }
+    super::super::ack::erase_failed_imports(path)?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    remove_retired_record_dir(&retired_record_dir(path))?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    // Retain the invalidated route's custody latch: erased artifacts must not
+    // let this process resume v1 or re-create v2 without an explicit new lineage.
+    Ok(())
 }
 
 pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
@@ -217,10 +233,10 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let before = fs::read(&f.path).unwrap();
     // An ordinary v1 owner must not prevent uninstall from reaching its
     // established cleanup, and an absent checkpoint lock must stay absent.
-    close_tree(&f.support).unwrap();
+    invalidate_tree(&f.support).unwrap();
     assert!(!f.path.with_extension("lock").exists());
     let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
-    close_tree(&f.support).unwrap();
+    invalidate_tree(&f.support).unwrap();
     drop(lock);
     with_state(&f.path, |state| {
         assert!(!state.latched);
@@ -234,7 +250,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
-    close_tree(&live.support).unwrap();
+    invalidate_tree(&live.support).unwrap();
     assert!(runtime.session.lock().unwrap().is_none());
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);

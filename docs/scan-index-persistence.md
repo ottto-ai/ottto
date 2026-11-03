@@ -536,9 +536,9 @@ progress lock through database fsync and fence publication. Original inventory
 commitments and the copied `v1-readonly` baseline are verified before publication.
 There is one retained pre-import baseline, including its referenced immutable
 shards; saves and hydration create no additional backup copies. The baseline
-retains its explicit erasure exception and 14-day hard-age escalation. Source
-erasure, forget and uninstall delete it and its shards immediately alongside the
-DB/WAL/SHM, import remnants, exact ACK companion and restart records.
+retains its explicit erasure exception and 14-day hard-age escalation. Uninstall
+deletes it and its shards immediately alongside the DB/WAL/SHM, import remnants,
+exact ACK companion and restart records; turning a source off and forget keep them.
 
 Schema revision one uses the forward-only `user_version` runner and checks
 `minimum_writer_capability` before writes. Nonempty revision-zero layouts are
@@ -546,7 +546,7 @@ refused rather than adopted. There are no destructive migration steps or automat
 backup restoration; newer schema/writer capabilities hold the source. Exact ACK
 receipt reconciliation remains required before collection or settlement.
 
-Explicit source erasure also removes the exact ACK companion. Maintenance reports
+Uninstall also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
 or GC authority. Baseline age/escalation gauges refresh after import preservation,
 on authenticated saves and at maintenance/load boundaries.

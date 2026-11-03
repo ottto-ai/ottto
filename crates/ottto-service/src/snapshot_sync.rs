@@ -555,27 +555,6 @@ fn claude_prior_history(
     }
 }
 
-/// A re-paired destination's Claude prior history, read as its first cycle
-/// reads it: before any upload ledger record.
-#[cfg(test)]
-pub(crate) fn claude_prior_history_for_new_destination(
-    support_dir: &Path,
-    destination_namespace: &str,
-) -> crate::snapshots::PriorHistory {
-    let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
-    let scoped = snapshot_destination_scoped_index_path(&stable, destination_namespace);
-    claude_prior_history(
-        &load_backfill_state(support_dir),
-        destination_namespace,
-        &SnapshotUploadProgress::new(
-            destination_namespace.to_string(),
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        ),
-        &snapshot_v3_index_path(&scoped),
-        support_dir,
-    )
-}
-
 /// True when `directory` holds an entry named `{prefix}*`. An unreadable
 /// directory or entry fails closed; a missing directory is empty.
 fn dir_holds_prefixed(directory: &Path, prefix: &str) -> bool {
@@ -810,6 +789,34 @@ struct UploadIndexSettlement {
 #[cfg(test)]
 pub(crate) mod withheld_support {
     use super::*;
+    /// A re-paired destination's Claude prior history, read as its first cycle
+    /// reads it: before any upload ledger record.
+    pub(crate) fn claude_prior_history_for_new_destination(
+        support_dir: &Path,
+        destination_namespace: &str,
+    ) -> crate::snapshots::PriorHistory {
+        let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
+        let scoped = snapshot_destination_scoped_index_path(&stable, destination_namespace);
+        claude_prior_history(
+            &load_backfill_state(support_dir),
+            destination_namespace,
+            &SnapshotUploadProgress::new(
+                destination_namespace.to_string(),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            ),
+            &snapshot_v3_index_path(&scoped),
+            support_dir,
+        )
+    }
+
+    pub(crate) fn source_erasure_failures_for_test(
+        support_dir: &Path,
+        source: SnapshotSource,
+    ) -> u32 {
+        let marker = source_marker_path(support_dir, source);
+        source_erasure_turn().get(&marker).copied().unwrap_or(0)
+    }
+
     pub(crate) fn settle_withheld(
         previous: &ScanIndex,
         mut index: ScanIndex,
@@ -12922,11 +12929,6 @@ pub(crate) fn disable_sources_dropped_from_grant(
 /// keeps the source paused for the next cycle. Errors can name paths, so only
 /// counts are logged.
 pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
-    // Owed by older builds at logout; nothing reads it any more.
-    let _ = std::fs::remove_file(
-        snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
-            .with_file_name("claude-login-addresses.erase-owed"),
-    );
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
         if source_marker(support_dir, source).as_deref() != Some("reconnect") {
@@ -12943,12 +12945,6 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
-    let marker = source_marker_path(support_dir, source);
-    source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
 /// Every per-destination upload witness of `source`, each folder synced: its
@@ -12975,7 +12971,7 @@ fn drop_upload_witnesses(support_dir: &Path, source: SnapshotSource) -> Result<(
                 std::fs::remove_file(&path)?;
             }
         }
-        sync_progress_parent(&dir.join("witness"))?;
+        crate::context_composition::sync_dir(&dir)?;
     }
     Ok(())
 }

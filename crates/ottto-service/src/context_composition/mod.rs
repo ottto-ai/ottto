@@ -28,7 +28,7 @@ mod measure;
 #[cfg(test)]
 mod report;
 mod v2;
-pub(crate) use v2::{drop_upload_acks, recent_scopes};
+pub(crate) use v2::{drop_upload_acks, recent_scopes, sync_dir};
 
 pub use harvest::spawn_context_composition_sync;
 pub use v2::run_context_composition_worker;
