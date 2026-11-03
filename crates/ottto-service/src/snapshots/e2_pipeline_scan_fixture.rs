@@ -212,44 +212,51 @@ impl Continuation {
     }
 }
 
-/// `key`'s continuation: for Claude its head on `index`'s route (this pass's
-/// staged head, else the committed one), as the RAM-era fixture read its
-/// retained checkpoint; any other source's retained copy.
+/// `key`'s continuation: for a source with a Tail codec its head on
+/// `index`'s route (this pass's staged head, else the committed one), as the
+/// RAM-era fixture read its retained checkpoint; any other source's retained
+/// copy.
 pub(crate) fn continuation_for_test(
     source: SnapshotSource,
     cache: &sampled_scan::SharedCache,
     index: &ScanIndex,
     key: &str,
 ) -> Option<Continuation> {
-    use tail_source::TailSource;
-    if source != SnapshotSource::ClaudeCode {
-        return cache
-            .retained_checkpoint(key)
-            .map(|checkpoint| Continuation {
-                audit_debt: checkpoint.audit_debt(),
-                last_full_verified: checkpoint.last_full_verified(),
-            });
-    }
-    let route = route_of(index)?;
-    let (revision, body) = match state_v2::staged_head_for_test(&route, key) {
-        Some(staged) => staged,
-        None => {
-            let head =
-                state_v2::load_head(index, key, tail_source::claude::Claude::REDUCTION_REVISION)
-                    .ok()??;
-            (head.revision, head.body)
+    let certificate = match source {
+        SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
+        SnapshotSource::Pi => head_certificate::<tail_source::pi::Pi>(index, key)?,
+        SnapshotSource::Codex => {
+            return cache
+                .retained_checkpoint(key)
+                .map(|checkpoint| Continuation {
+                    audit_debt: checkpoint.audit_debt(),
+                    last_full_verified: checkpoint.last_full_verified(),
+                })
         }
     };
-    let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    let certificate = tail_source::claude::Claude::decode_head(revision, &body, &mut acc)
-        .ok()?
-        .certificate;
     Some(Continuation {
         audit_debt: certificate
             .audit_debt_unix_seconds
             .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
         last_full_verified: certificate.verified_unix_seconds,
     })
+}
+
+/// `key`'s head certificate on `index`'s route, through `S`'s codec.
+fn head_certificate<S: tail_source::TailSource>(
+    index: &ScanIndex,
+    key: &str,
+) -> Option<crate::transcript_acquisition::DurableCertificate> {
+    let route = route_of(index)?;
+    let (revision, body) = match state_v2::staged_head_for_test(&route, key) {
+        Some(staged) => staged,
+        None => {
+            let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
+            (head.revision, head.body)
+        }
+    };
+    let mut acc = SnapshotAccumulator::new(S::SOURCE);
+    Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
 }
 
 /// A routed graph read back resident, for byte comparisons; an unrouted one
@@ -262,14 +269,15 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     }
 }
 
-/// A scan fixture's Claude page continues from its owner's route; with no
-/// cache it reads a fixture route unrouted. Other sources are left alone.
+/// A scan fixture's page of a source with a Tail codec (Claude, Pi)
+/// continues from its owner's route; with no cache it reads a fixture route
+/// unrouted. Other sources are left alone.
 pub(crate) fn route_claude_for_test(
     source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    if source != SnapshotSource::ClaudeCode {
+    if !super::tail_source::has_codec(source) {
         return index;
     }
     let Some(cache) = cache else {

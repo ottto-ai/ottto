@@ -780,6 +780,12 @@ fn other_page_observing_raw(
     prior: ScanIndex,
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    // A codec source's page continues from its owner's route, as Claude's do.
+    let prior = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        source,
+        Some(scanner.cache.as_ref()),
+        prior,
+    );
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
