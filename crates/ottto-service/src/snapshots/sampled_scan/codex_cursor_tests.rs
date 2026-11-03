@@ -3587,10 +3587,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     let new = write_dated_rollout(&fixture, "2026/11/01", NEW);
     refresh_retained_codex_roster(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
-        (&index.files).into(),
+        None,
     );
     assert!(!index
         .traversal
@@ -8495,49 +8494,52 @@ fn admitted_parent_loses_its_witness_and_its_child_resolves() {
     assert_eq!(warm, oracle.unwrap());
 }
 
-/// P-T25: a parent last modified outside the backfill window is
-/// witnessed `OutOfWindow`: its fork is held under that cause and never
-/// `DeferredRestart` at two consecutive generations. Touching the parent
-/// changes its identity: the witness drops, the parent is read and the
-/// fork settles as a cold scan.
+/// P-T25: a parent last modified outside the backfill window, or never read
+/// and past the first-read bound inside it, is witnessed `OutOfWindow`: its
+/// fork is held under that cause and never `DeferredRestart` at two
+/// consecutive generations. Touching the parent changes its identity: the
+/// witness drops, the parent is read and the fork settles as a cold scan.
 #[test]
 fn out_of_window_parent_holds_its_fork_until_touched() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let set_modified = |at: std::time::SystemTime| {
-        OpenOptions::new()
-            .write(true)
-            .open(home.fixture.file(PARENT))
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-    };
-    set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000));
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut previous_deferred = false;
-    let mut held_at = None;
-    for n in 0..4 {
-        let (next, scan) = home.generation(index, &cache, n);
-        let causes = parent_causes(&scan);
-        let deferred = causes[CodexParentUnresolvable::DeferredRestart.index()] > 0;
-        assert!(!(deferred && previous_deferred), "generation {n}");
-        previous_deferred = deferred;
-        assert!(session_usage(&scan, CHILD).is_empty());
-        if causes == only(CodexParentUnresolvable::OutOfWindow, 1) {
-            held_at.get_or_insert(n);
+    let first_read_bound = crate::snapshots::rfc3339_unix_seconds("2026-08-06T00:00:00Z").unwrap();
+    for parent_modified in [1_600_000_000, first_read_bound] {
+        let home = ForkHome::new(&ForkHome::diverging_child(3));
+        let set_modified = |at: std::time::SystemTime| {
+            OpenOptions::new()
+                .write(true)
+                .open(home.fixture.file(PARENT))
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(parent_modified));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut previous_deferred = false;
+        let mut held_at = None;
+        for n in 0..4 {
+            let (next, scan) = home.generation(index, &cache, n);
+            let causes = parent_causes(&scan);
+            let deferred = causes[CodexParentUnresolvable::DeferredRestart.index()] > 0;
+            assert!(!(deferred && previous_deferred), "generation {n}");
+            previous_deferred = deferred;
+            assert!(session_usage(&scan, CHILD).is_empty());
+            if causes == only(CodexParentUnresolvable::OutOfWindow, 1) {
+                held_at.get_or_insert(n);
+            }
+            index = next;
         }
-        index = next;
+        assert!(
+            held_at.is_some_and(|n| n <= 2),
+            "{parent_modified}: {held_at:?}: {}",
+            counters(&cache)
+        );
+        set_modified(std::time::SystemTime::now());
+        let (index, settled, n) = home.settle(index, &cache, 4);
+        assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
+        let (oracle_index, oracle) = home.oracle(n);
+        assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
     }
-    assert!(
-        held_at.is_some_and(|n| n <= 2),
-        "{held_at:?}: {}",
-        counters(&cache)
-    );
-    set_modified(std::time::SystemTime::now());
-    let (index, settled, n) = home.settle(index, &cache, 4);
-    assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
 /// P-T28: C forks P and P forks C. With the budget spent, both wait

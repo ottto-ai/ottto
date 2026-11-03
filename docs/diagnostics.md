@@ -613,8 +613,11 @@ or identities and never gate reads.
 
 `counts.line_delivery_unselected.age` counts a discovery decision outside the
 window without an owed-growth, verification or unresolved-account exemption.
-It is drained by that source's completed page, whether or not an observer is
-registered, and counts decisions rather than distinct files or bytes.
+`counts.line_delivery_unselected.first_read_age` counts a file not admitted for
+its first read: no read evidence, committed debt or queued read, and modified
+more than 60 days before the census. Files already read keep the window above.
+Both are drained by that source's completed page, whether or not an observer is
+registered, and count decisions rather than distinct files or bytes.
 
 `DiscoveryRetention::owes_with_len` also retains a file whose current length
 exceeds its committed indexed `size_bytes`, using metadata already available at
