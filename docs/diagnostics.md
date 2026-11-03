@@ -357,7 +357,8 @@ Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
 final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
-step) and no footprint fields.
+step) and no footprint fields. `evidence_cross_root` counts carry
+`demanded_requests`: the page's demanded request ids each root is joined against.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
 around folding stored usage families into heads.
 
