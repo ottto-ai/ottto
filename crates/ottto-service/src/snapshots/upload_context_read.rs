@@ -81,7 +81,6 @@ impl Budget {
         // Oversized Codex singletons keep their resumable cursor: each page's
         // chunk is bounded by the cursor's own page allowance, never by this
         // room, on its start and resume pages alike (`PageBudget`, B_s = B).
-        // Claude legal files fit 1GiB.
         let size = candidates.iter().fold(0u64, |sum, candidate| {
             sum.saturating_add(candidate.size_bytes)
         });
@@ -92,7 +91,9 @@ impl Budget {
                 .native_limit
                 .saturating_sub(self.native_read)
                 .saturating_sub(self.native_reserved);
-            if size == 0 || size > available {
+            if size == 0
+                || (size > available && (self.native_read != 0 || self.native_reserved != 0))
+            {
                 return false;
             }
             self.native_reserved = self.native_reserved.saturating_add(size);
@@ -270,6 +271,23 @@ crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_rese
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// [regress] A first context-only read above the page budget cannot stay owed forever.
+    #[test]
+    fn first_large_context_unit_is_admitted_and_the_next_unit_waits() {
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+            let mut budget = Budget::new(source);
+            let mut index = ScanIndex::default();
+            let mut candidate =
+                super::super::tests::test_candidate(PathBuf::from("/synthetic/large.jsonl"));
+            candidate.size_bytes = budget.native_limit + 1;
+            assert!(budget.admit(source, &mut index, &candidate, &[]));
+            let mut next = candidate.clone();
+            next.path = PathBuf::from("/synthetic/next.jsonl");
+            next.size_bytes = 1;
+            assert!(!budget.admit(source, &mut index, &next, &[]));
+        }
+    }
+
     #[test]
     fn context_cursor_room_excludes_prior_ordinary_native_bytes() {
         let mut budget = Budget::new(SnapshotSource::Codex);

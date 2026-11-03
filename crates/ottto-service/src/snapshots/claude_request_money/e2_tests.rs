@@ -832,13 +832,19 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             )]),
             ..Default::default()
         };
-        for (queued, held) in [
-            (vec![family.clone()], true),
-            (vec![family.join("subagents")], true),
-            (vec![p.parent().unwrap().join("other-session")], false),
-            (vec![], false),
+        // [regress] A re-listing pass's directory (not a census member) holds
+        // nothing: the walk already observed its members.
+        for (queued, census, held) in [
+            (vec![family.clone()], true, true),
+            (vec![family.join("subagents")], true, true),
+            (vec![family.clone()], false, false),
+            (vec![p.parent().unwrap().join("other-session")], true, false),
+            (vec![], true, false),
         ] {
-            let index = queued_traversal(&queued, &[]);
+            let mut index = queued_traversal(&queued, &[]);
+            for directory in &mut index.traversal.as_mut().unwrap().pending_directories {
+                directory.census_member = census;
+            }
             let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
             attach_page(&mut items, &read);
             let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
@@ -922,6 +928,31 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     let mut again = vec![traversal.pending_candidates.pop_front().unwrap()];
     assert!(defer_roots_of_queued_families(&mut again, &mut traversal).is_empty());
     assert_eq!(paths(&again), vec![waiting]);
+}
+
+/// [regress] A root waits only for a family directory the census walk still
+/// queues. A re-listing pass (not a census member) starts after the walk
+/// listed every directory, so its root is read, not put back at the front.
+#[test]
+fn e2_root_waits_only_for_a_census_walk_family_directory() {
+    let project = PathBuf::from("/projects/p");
+    let root = project.join(format!("{ROOT}.jsonl"));
+    for census in [true, false] {
+        let mut traversal = queued_traversal(&[project.join(ROOT).join("subagents")], &[])
+            .traversal
+            .unwrap();
+        traversal.pending_directories[0].census_member = census;
+        let mut selected =
+            vec![serde_json::from_value(json!({"scan_root": "/", "path": &root})).unwrap()];
+        let deferred = defer_roots_of_queued_families(&mut selected, &mut traversal);
+        assert_eq!(deferred.len(), usize::from(census), "census={census}");
+        assert_eq!(selected.len(), usize::from(!census), "census={census}");
+        assert_eq!(
+            traversal.pending_candidates.len(),
+            usize::from(census),
+            "census={census}"
+        );
+    }
 }
 
 #[test]

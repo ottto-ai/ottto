@@ -3079,11 +3079,19 @@ fn attach_one(
     // Keep the existing wire bucket activity clock. Identity independently
     // folds own-request clocks after attachment; observer time never decides
     // the local current account.
+    let observed = rfc3339_unix_nanos(&row.observed_at);
     let at = (reported.0 .0 != estimated.0 .0)
-        .then(|| rfc3339_unix_nanos(&row.observed_at))
+        .then_some(observed)
         .flatten();
     fold.entity
         .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
+    // The request's activity time is the later of its transcript and row
+    // clocks, so it never moves back when its evidence moves from the side
+    // row to the transcript. Only the entity clock: hours, buckets and owner
+    // clocks keep the transcript's.
+    if let Some(observed) = observed {
+        fold.entity.activity_nanos = fold.entity.activity_nanos.max(observed);
+    }
     // A copied marker's lent account follows its request to the reported slot.
     if let Some(lent) = fold
         .accounts
@@ -3760,10 +3768,16 @@ pub(crate) fn side_calls_page(
     unresolved
 }
 
-/// Every path component of the directories the traversal queued but has not
+/// Every path component of the directories the census walk queued but has not
 /// listed. A family's member transcripts live under `<root>/subagents/`; the
 /// root file being on a page means its own directory was listed, so the
 /// family's directory is still to be listed exactly when `<root>` is here.
+/// A re-listing pass's directories (not census members) are left out, so
+/// their roots do not wait. That pass starts only once the walk's directory
+/// queue is empty, so the two never share it. Its members are NOT guaranteed
+/// observed: a directory or member created after the walk is unknown until
+/// listed. Once a member is listed, the observed-index (`unread_members`)
+/// and family-census guards still apply.
 fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
@@ -3775,6 +3789,7 @@ fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
 fn directory_names(queued: &VecDeque<ScanTraversalPath>) -> BTreeSet<String> {
     queued
         .iter()
+        .filter(|directory| directory.census_member)
         .flat_map(|directory| directory.path.components())
         .filter_map(|component| match component {
             std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
@@ -3806,6 +3821,11 @@ pub(in crate::snapshots) fn defer_roots_of_queued_families(
         });
     *selected = kept;
     diag("deferred_root_queued_family", deferred.len() as u64);
+    crate::local_resource_diagnostics::page_selection(
+        "claude_code",
+        crate::local_resource_diagnostics::PageSelection::DeferredRoots,
+        deferred.len() as u64,
+    );
     let locations = deferred
         .iter()
         .map(|candidate| location_key(&local_index_key(&candidate.path)))
@@ -4550,6 +4570,10 @@ mod holder_redrift_tests;
 #[cfg(test)]
 #[path = "e2_family_duplicate_tests.rs"]
 mod family_duplicate_tests;
+
+#[cfg(test)]
+#[path = "e2_activity_clock_tests.rs"]
+mod activity_clock_tests;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.

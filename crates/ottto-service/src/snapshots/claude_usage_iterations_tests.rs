@@ -124,6 +124,46 @@ fn claude_iteration_on_another_model_is_counted() {
     }
 }
 
+/// A numeric usage key the parser does not read, at the top level or in an
+/// iteration, is counted by `usage_unknown_numeric_key`; known or non-numeric
+/// keys are not, and the emitted items are byte-identical either way.
+#[test]
+fn claude_unknown_numeric_usage_keys_are_counted_without_changing_items() {
+    let at = "2026-11-02T10:00:00Z";
+    let parse = |line: &Value| {
+        let (items, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            apply_claude_code_line(line, &mut accumulator);
+            accumulator.finalize_claude_responses();
+            let path = std::path::Path::new("/synthetic/session.jsonl");
+            accumulator.into_items(path, at, "fp".into(), None)
+        });
+        assert_eq!(items.len(), 1);
+        (
+            serde_json::to_string(&items).unwrap(),
+            counts.usage_unknown_numeric_key,
+        )
+    };
+    let mut top = billed(3, 50, 1_000, 200, 0);
+    top["output_tokens_details"] = json!({"thinking_tokens": 20});
+    let mut calls = [billed(3, 50, 1_000, 200, 0)];
+    calls[0]["model"] = json!("claude-opus-4-8");
+    let (known, count) = parse(&response(SESSION_PARTIAL, 0, &top, &calls, at));
+    assert_eq!(count, 0);
+    let (mut numeric_top, mut numeric_calls) = (top.clone(), calls.clone());
+    numeric_top["new_tokens"] = json!(7);
+    numeric_calls[0]["new_tokens"] = json!(9.5);
+    let line = response(SESSION_PARTIAL, 0, &numeric_top, &numeric_calls, at);
+    assert_eq!(parse(&line), (known.clone(), 2));
+    let mut other = top.clone();
+    other["new_label"] = json!("x");
+    other["new_flag"] = json!(true);
+    other["new_null"] = Value::Null;
+    other["new_object"] = json!({"new_tokens": 1});
+    let line = response(SESSION_PARTIAL, 0, &other, &calls, at);
+    assert_eq!(parse(&line), (known, 0));
+}
+
 /// [money] Emitted money and placement equal a transcript whose top level
 /// already states every call, so the fold adds exactly the iterations-only
 /// usage.

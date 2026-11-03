@@ -252,7 +252,9 @@ pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
 pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation {
     let fixture = ContinuationFixture::quiescent("continuation-mint-realistic");
     for n in 0..120 {
-        let schedule = fixture.home.join(format!(".codex/automations/schedule-{n}"));
+        let schedule = fixture
+            .home
+            .join(format!(".codex/automations/schedule-{n}"));
         std::fs::create_dir_all(&schedule).unwrap();
         std::fs::write(
             schedule.join("automation.toml"),
@@ -656,6 +658,8 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     progress.permanent_rejections.insert(
         fingerprint,
         PermanentSnapshotRejection {
+            exposure: None,
+            revisions: BTreeMap::new(),
             body_witness: body,
             reason: crate::upload_receipts::RejectedUsageReason::Other,
             reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {

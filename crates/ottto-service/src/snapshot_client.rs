@@ -729,6 +729,9 @@ pub struct ActivityHintResponse {
     /// Exact additive composition detail contract; missing/null/unknown stays legacy.
     #[serde(default)]
     pub context_composition_details_contract: Option<String>,
+    /// Exact additive contract for withheld totals; missing/null/unknown sends none.
+    #[serde(default)]
+    pub names_withheld_contract: Option<String>,
     #[serde(default)]
     pub session_attribution_enabled: bool,
     /// Additive server capability for bounded private labels on opaque
@@ -793,13 +796,6 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
     Ok(hint)
-}
-
-/// Whether the context harvesters may upload workspace and repository labels.
-/// `None` is a failed hint fetch: the policy is unknown, so labels are
-/// withheld. A fetched hint keeps its `workspace_labels_enabled` as sent.
-pub(crate) fn workspace_labels_allowed(hint: Option<&ActivityHintResponse>) -> bool {
-    hint.is_some_and(|hint| hint.workspace_labels_enabled)
 }
 
 fn default_true() -> bool {
@@ -878,11 +874,18 @@ pub struct SnapshotEntityRejection {
 
 impl SnapshotEntityRejection {
     /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
-    /// this body for review. Only these reasons may be non-permanent.
+    /// this body for review. These known holds require their declared contract.
     pub(crate) fn usage_decrease_hold(&self) -> bool {
         matches!(
             self.safe_reason(),
             USAGE_DECREASE_HELD_FOR_REVIEW | USAGE_DECREASE_REFUSED_AFTER_REVIEW
+        )
+    }
+
+    pub(crate) fn ordinary_retryable(&self) -> bool {
+        matches!(
+            self.safe_reason(),
+            "accepted_log_stale_older_mixed" | "other"
         )
     }
 
@@ -894,6 +897,7 @@ impl SnapshotEntityRejection {
             "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
             "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
             "accepted_log_stale_older_upload" => "accepted_log_stale_older_upload",
+            "accepted_log_stale_older_mixed" => "accepted_log_stale_older_mixed",
             "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
             "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
             "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
@@ -1067,7 +1071,11 @@ impl SnapshotBatchResponse {
     /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
     fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
-        for rejection in self.rejected_entities.iter().filter(|r| !r.permanent) {
+        for rejection in self
+            .rejected_entities
+            .iter()
+            .filter(|r| !r.permanent && r.usage_decrease_hold())
+        {
             let held_literal = declared
                 && request.snapshots.iter().any(|item| {
                     item.source_session_id == rejection.source_session_id
@@ -1227,7 +1235,10 @@ impl SnapshotBatchResponse {
                 retained_proof_missing: Vec::new(),
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent && !rejection.usage_decrease_hold() {
+            if !rejection.permanent
+                && !rejection.usage_decrease_hold()
+                && !rejection.ordinary_retryable()
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(
@@ -3782,12 +3793,13 @@ mod tests {
         ));
         let omitted =
             hint(activity_hint_json("").replace("\"workspace_labels_enabled\":true,", ""));
-        assert!(workspace_labels_allowed(Some(&on)));
-        assert!(!workspace_labels_allowed(Some(&off)));
+        use crate::snapshots::SnapshotUploadPolicy as Policy;
+        assert!(Policy::from_hint(&on).workspace());
+        assert!(!Policy::from_hint(&off).workspace());
         // A fetched hint from an older backend keeps the legacy default.
-        assert!(workspace_labels_allowed(Some(&omitted)));
+        assert!(Policy::from_hint(&omitted).workspace());
         // A failed fetch leaves the policy unknown: labels stay on the machine.
-        assert!(!workspace_labels_allowed(None));
+        assert!(!Policy::MOST_PRIVATE.workspace());
     }
 
     #[test]
@@ -5181,7 +5193,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

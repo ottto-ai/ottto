@@ -1,5 +1,7 @@
 # Oversized Claude transcript discovery retries
 
+Superseded by [streaming file admission](2026-11-02-streaming-file-admission.md).
+
 A Claude JSONL transcript larger than the 256 MiB admission limit keeps its
 source census incomplete. The existing oversized-file disclosure remains
 visible. No session or family is proven absent or complete from that partial

@@ -27,6 +27,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
   accepted, and parts the server did accept stay recorded.
 
+Stale-older refusals from current servers mean the server already holds the
+newer usage. Earlier refusals stay counted as owed, with their dispositions
+unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
+use retained bodies; transcripts are read again only for changed input. Unknown
+non-permanent reasons hold their entity without invalidating sibling ACKs. See
+[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
@@ -124,6 +131,9 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 Transcripts never leave the machine. Logs, diagnostics and status carry counts, never transcript
 text, paths or raw identifiers; types holding local-only text don't derive `Debug`. Identity is
 never inferred across sessions, folders, machines, parent and child sessions, profiles or copies.
+What a privacy setting removes from an upload is decided in `upload_policy.rs`, or by the builders
+that read its settings; it never refuses a body, and hashes are computed afterwards from what is
+sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, source removal, forget installation, uninstall) reaches every
 store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
