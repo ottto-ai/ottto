@@ -3196,10 +3196,30 @@ fn published_scan(
 }
 
 /// Step `scan` to completion and apply the collector's upload policy.
-fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
-    loop {
+fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    let (index, scan, _) = finish_saving_reservations(scan);
+    (index, scan)
+}
+
+/// A page needs far fewer steps; past this it is not progressing.
+const PAGE_STEP_CAP: u64 = 100_000;
+
+/// `finish_published`, with the number of archive reservation batches saved.
+/// Like the collector (`SourcePreparation::step`), every pending step saves
+/// its batch: an archive page yields until its reservation is saved.
+fn finish_saving_reservations(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
+    let mut committed = scan.index.clone();
+    let checkpoint = Temp::new("reservation", b"");
+    fs::remove_file(&checkpoint.0).unwrap();
+    let mut saved = 0;
+    for _ in 0..PAGE_STEP_CAP {
         match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Pending(mut next) => {
+                saved += usize::from(next.index.archive_pass.dirty);
+                next.persist_archive_reservation(&mut committed, &checkpoint.0)
+                    .unwrap();
+                scan = next;
+            }
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
@@ -3217,10 +3237,79 @@ fn finish_published(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) 
                     .map(|item| item.snapshot_fingerprint.clone())
                     .collect();
                 index.record_accepted_snapshot_fingerprints(&accepted);
-                return (index, scan);
+                return (index, scan, saved);
             }
         }
     }
+    panic!("a Codex page did not complete within {PAGE_STEP_CAP} steps");
+}
+
+/// Archive power as on a Mac on AC power; Linux reports it unknown.
+struct PoweredArchiveGates;
+impl crate::snapshot_sync::continuation::PlatformGates for PoweredArchiveGates {
+    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Allowed
+    }
+    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
+        crate::snapshot_sync::continuation::PlatformState::Allowed
+    }
+    fn restore_qos(&mut self) {}
+}
+
+/// [regress] 0.1.215 queue: with archive power allowed (macOS), a page whose
+/// roster holds a `.jsonl.zst` archive queues its header reservation and
+/// yields until it is saved. The collector saves it after every pending step;
+/// the test helper did not, so the page returned Pending forever. Linux never
+/// reached it: its unknown power state refuses archive work.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn powered_archive_page_completes_once_its_reservation_is_saved() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const ARCHIVE: &str = "019fa333-2222-7333-8444-888888888889";
+    let fixture = ScanRoot::new(4);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, _) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+        None,
+    );
+    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(PoweredArchiveGates));
+    fixture.append(SESSION, &token_line(5));
+    let page = selected_page(
+        &fixture,
+        &cache,
+        index,
+        &collected_at(1),
+        &[fixture.file(SESSION)],
+    );
+    let (index, _, saved) = finish_saving_reservations(page);
+    assert!(saved > 0, "the archive queued no reservation");
+    assert!(index.archives.contains_key(&local_index_key(&archive)));
 }
 
 /// Write a one-turn rollout in a day directory below the fixture root.
