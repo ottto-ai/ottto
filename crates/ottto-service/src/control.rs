@@ -13757,8 +13757,8 @@ fn open_pi_session_root_direct_io(root: &Path) -> std::io::Result<OpenPiSessionR
 
 /// The components of `sessions` below `home`, walked one by one from the
 /// trusted home directory. A sessions directory outside `home`, relative, or
-/// with `.`/`..` is refused, and never as NotFound, so neither open path
-/// reports it as "no root".
+/// with `..` is refused, and never as NotFound, so neither open path reports
+/// it as "no root". (`Path` drops interior `.` components.)
 #[cfg(unix)]
 fn pi_session_components<'a>(
     home: &Path,
@@ -15733,7 +15733,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -15758,7 +15758,7 @@ fn pi_route_post_smoke_census_failure(
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -16220,7 +16220,7 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Failed if all_census_failed => (
             PI_SESSION_CENSUS_FAILED_CODE,
-            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify."
                 .to_string(),
         ),
         SourceVerificationStatus::NoFreshTelemetry if all_telemetry_disabled => (
