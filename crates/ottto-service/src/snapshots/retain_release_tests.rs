@@ -411,6 +411,8 @@ fn run(world: &mut World, opts: Opts) -> Run {
 /// singleton is granted an exact completion measure.
 #[test]
 fn r0_tail_with_room_is_granted_and_releases_nothing() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -558,6 +560,8 @@ fn r0_blocking_measure_waits_for_the_retained_lock() {
 /// from the cursor reservation, and the next take carries it.
 #[test]
 fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -723,6 +727,8 @@ fn packet_refusal_buckets_and_budget_variants() {
 /// for both sources (Codex by under 1 KiB). It is recorded, not pinned.
 #[test]
 fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -752,6 +758,8 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
 /// `codex_cursor_tests` and `group_job_tests`.
 #[test]
 fn r0_non_f_shapes_keep_clear_other_active() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -868,6 +876,8 @@ fn contended<T>(
 /// is free, never `ClearOtherActive`.
 #[test]
 fn r0_branches_a_and_d_release_as_base_under_contention() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -959,6 +969,8 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
 /// without it, and a supported CI build always has it.
 #[test]
 fn r0_unknown_resident_evicts_nothing() {
+    // Codex's RAM retention path: a Codex index off its V2 route.
+    let _unrouted = crate::snapshots::e2_pipeline_scan_fixture::CodexUnrouted::hold();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
