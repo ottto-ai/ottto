@@ -413,6 +413,11 @@ cat > "$APP_LAUNCH_AGENTS/net.ottto.service.plist" <<PLIST
 <dict>
   <key>Label</key>
   <string>net.ottto.service</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MallocLargeCache</key>
+    <string>0</string>
+  </dict>
   <key>BundleProgram</key>
   <string>Contents/Helpers/ottto-service</string>
   <key>ProgramArguments</key>

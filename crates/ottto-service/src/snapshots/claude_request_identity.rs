@@ -38,7 +38,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod accepted;
 mod budget;
+pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::digest_hex;
+#[cfg(test)]
+pub(crate) use accepted::session_context_digest;
 pub(crate) use accepted::AcceptedBuckets;
 pub(crate) use budget::Measurement as CapMeasurement;
 
@@ -2860,8 +2863,8 @@ pub(crate) struct OrgMarker {
 }
 
 /// Owned, line-ordered marker state for one file. Only the organization hash
-/// and a local change detector for `session_context` are kept; no email or raw
-/// text is retained or sent.
+/// and a keyed local change detector for `session_context` are kept; no email
+/// or raw text is retained or sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
@@ -2870,7 +2873,9 @@ pub(crate) struct OrgMarkers {
     context_digest: Option<String>,
     context_changed: bool,
     /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one.
+    /// of the first later `session_context` naming a different one. Without a
+    /// key, the second is the first later sentence or the first after a marker:
+    /// it could not be compared, so it counts as different.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
     /// Status-coverage key of the folder holding this file, bound when the
@@ -2898,21 +2903,31 @@ pub(crate) fn note_marker_line(
                 .and_then(Value::as_str)
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            // Domain-separated SHA-256 (an H value in the durable store).
-            let digest = format!(
-                "{:x}",
-                sha2::Sha256::new()
-                    .chain_update(b"ottto-claude-org-marker-context:v1\0")
-                    .chain_update(text.as_bytes())
-                    .finalize()
-            );
             let state = markers.get_or_insert_with(Box::default);
-            if state.context_digest.as_deref() != Some(digest.as_str()) {
-                if state.context_digest.is_some() && state.context_flip_position.is_none() {
-                    state.context_flip_position = Some(response_position);
+            match accepted::session_context_digest(&text) {
+                // No key, no field: a sentence that cannot be compared explains
+                // no organization change and ends any earlier email.
+                None => {
+                    state.context_digest = None;
+                    if state.context_position.is_some() || !state.entries.is_empty() {
+                        state.context_flip_position.get_or_insert(response_position);
+                    }
                 }
-                state.context_changed = state.context_digest.is_some() || !state.entries.is_empty();
-                state.context_digest = Some(digest);
+                // An earlier email with no digest (no key then, or scrubbed on a
+                // key change) cannot be compared: this sentence is a fresh
+                // baseline. It explains no organization change and ends that email.
+                Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
+                    let compared = state.context_digest.is_some();
+                    if (compared || state.context_position.is_some())
+                        && state.context_flip_position.is_none()
+                    {
+                        state.context_flip_position = Some(response_position);
+                    }
+                    state.context_changed =
+                        compared || (state.context_position.is_none() && !state.entries.is_empty());
+                    state.context_digest = Some(digest);
+                }
+                Some(_) => {}
             }
             if !text.is_empty() && state.context_position.is_none() {
                 state.context_position = Some(response_position);
@@ -2956,6 +2971,32 @@ pub(crate) fn note_marker_line(
     }
 }
 
+#[cfg(not(test))]
+static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_context_digest_scrubs<T>(
+    use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CONTEXT_DIGEST_SCRUBS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&CONTEXT_DIGEST_SCRUBS)
+    }
+}
+
+/// This thread's count only, so a test takes no other test's identity counts.
+#[cfg(test)]
+pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
+    with_context_digest_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerVerdict<'m> {
     None,
@@ -2966,6 +3007,22 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Ends comparison across a key change, keeping the markers and their
+    /// earlier verdicts. This state exists only once a sentence or marker was
+    /// read, so position 0 stands in when none was recorded: the next sentence
+    /// is a fresh baseline, never a first sentence, and any email stays refused.
+    pub(crate) fn scrub_context_digest(&mut self) {
+        self.context_digest = None;
+        self.context_changed = false;
+        if self.context_position.is_none() {
+            self.context_position = Some(0);
+            self.context_flip_position = Some(0);
+        }
+        with_context_digest_scrubs(|counter| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     /// Binds the registered-folder key once the item's path is known.
     pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
         if self.context_position.is_some() {
@@ -2984,6 +3041,19 @@ impl OrgMarkers {
         (precedes && !self.overflowed)
             .then_some(self.home.as_ref())
             .flatten()
+    }
+
+    /// Without a key: a sentence that could not be compared came at or before
+    /// the marker governing `sequence`, so its flip might have been explained.
+    fn flip_unexplained_for_no_key(&self, sequence: u64) -> bool {
+        !accepted::session_context_key_bound()
+            && self.context_flip_position.is_some_and(|sentence| {
+                self.entries
+                    .iter()
+                    .rev()
+                    .find(|marker| marker.position <= sequence)
+                    .is_some_and(|marker| sentence <= marker.position)
+            })
     }
 
     /// The marker governing the response with `sequence`, by line order only.
@@ -4314,6 +4384,25 @@ pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
     IDENTITY_COUNTS[3].store(families, std::sync::atomic::Ordering::Relaxed);
     IDENTITY_COUNTS[4].store(files, std::sync::atomic::Ordering::Relaxed);
 }
+// Thread-local under test: another test's take must not race this count.
+#[cfg(not(test))]
+static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 =
+        const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_no_key_flip_refusals<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        NO_KEY_FLIP_REFUSALS.with(use_counter)
+    }
+    #[cfg(not(test))]
+    {
+        use_counter(&NO_KEY_FLIP_REFUSALS)
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "budget::Counts::is_empty")]
@@ -4340,6 +4429,13 @@ pub(crate) struct IdentityCounts {
     claude_carry_blocked_no_account_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_carry_skipped_incomplete_transcripts: u64,
+    /// Requests refused as an organization flip with no attribution key to
+    /// compare the sentence before it. At most what a key would have explained.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_no_key_flip_refusals: u64,
+    /// Retained Claude parses scrubbed on an attribution key change.
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_context_digest_scrubs: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -4362,6 +4458,12 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_carry_no_seed_requests: no_seed,
         claude_carry_blocked_no_account_requests: blocked,
         claude_carry_skipped_incomplete_transcripts: incomplete,
+        claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
+        claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }),
     }
 }
 
@@ -5345,6 +5447,17 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
+        if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
+            && item
+                .claude_org_markers
+                .as_deref()
+                .zip(sequence)
+                .is_some_and(|(markers, at)| markers.flip_unexplained_for_no_key(at))
+        {
+            with_no_key_flip_refusals(|counter| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
@@ -6045,6 +6158,9 @@ crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_second
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
 crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);
+
+#[cfg(test)]
+mod context_digest_tests;
 
 #[cfg(test)]
 mod request_owned_contract_tests {

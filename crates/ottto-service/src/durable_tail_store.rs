@@ -701,6 +701,13 @@ pub(crate) struct BatchReceipt {
     pub(crate) completed: Vec<WireReceiptProof>,
 }
 
+/// One `clear_retired_bodies` page. Counts only.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredBodyClear {
+    pub(crate) cleared: u64,
+    pub(crate) failed: u64,
+}
+
 /// One store directory. The in-RAM map of last durable content digests
 /// decides dirtiness, so a clean record is never rewritten.
 pub(crate) struct DurableTailStore {
@@ -718,6 +725,9 @@ pub(crate) struct DurableTailStore {
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
     off_v1_sync_due: bool,
+    /// One sweep per process over retired v1 bodies; see `clear_retired_bodies`.
+    retired_clear_after: Option<Digest32>,
+    retired_clear_done: bool,
     gc_after: Option<Digest32>,
     private_purge_entries: Option<fs::ReadDir>,
     private_purge_page: Option<PrivateLabelPage>,
@@ -796,6 +806,8 @@ impl DurableTailStore {
             rebuilt: BTreeMap::new(),
             startup_synced: false,
             off_v1_sync_due: false,
+            retired_clear_after: None,
+            retired_clear_done: false,
             gc_after: None,
             private_purge_entries: None,
             private_purge_page: None,
@@ -2646,6 +2658,78 @@ impl DurableTailStore {
             self.counters.off_v1_invalidate_failed += 1;
         }
         result
+    }
+
+    /// Empty the opaque body of retired v1 records, at most one inventory page
+    /// per call and one sweep per process. The retired pin in the unchanged
+    /// header is the discriminator: no current decoder can reach these bodies or
+    /// locate a field inside them, and Claude's hold the old unkeyed session
+    /// context digest. The record stays a repin (Missing to readers), so a quiet
+    /// file is still not re-read, as deleting it would cause. No body is read.
+    pub(crate) fn clear_retired_bodies<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+    ) -> io::Result<RetiredBodyClear> {
+        let mut report = RetiredBodyClear::default();
+        if self.retired_clear_done {
+            return Ok(report);
+        }
+        self.check_writer(writer)?;
+        let page = self.inventory_after(self.retired_clear_after)?;
+        self.retired_clear_after = page.last().copied();
+        self.retired_clear_done = page.len() < GC_RECORDS_PER_PASS;
+        for key in &page {
+            if self.pending.contains_key(key) {
+                continue;
+            }
+            let header = match self.classify(key, "off_invalidate", Some(writer)) {
+                Ok(Some(header)) => header,
+                Ok(None) => continue,
+                Err(_) => {
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            if header.body_len == 0 {
+                continue;
+            }
+            match self.clear_retired_body(writer, key, header.stamp) {
+                Ok(()) => report.cleared += 1,
+                Err(_) => report.failed += 1,
+            }
+        }
+        if report.cleared > 0 {
+            self.sync_store()?;
+        }
+        Ok(report)
+    }
+
+    fn clear_retired_body<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        key: &Digest32,
+        prior: Option<Stamp>,
+    ) -> io::Result<()> {
+        let path = self.record_path(key);
+        let mut bytes = vec![0; HEADER_BYTES];
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?
+            .read_exact(&mut bytes)?;
+        bytes[HEADER_BYTES - 4..].fill(0);
+        let trailer = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&trailer);
+        write_atomic(
+            writer,
+            &self.dir,
+            &path,
+            &bytes,
+            prior,
+            self.cleanup.clone(),
+        )?;
+        self.durable.remove(key);
+        Ok(())
     }
 
     /// Physical absence after any outstanding OFF unlink barrier. A missing

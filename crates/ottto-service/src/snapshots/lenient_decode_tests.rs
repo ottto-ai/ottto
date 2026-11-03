@@ -1228,7 +1228,7 @@ fn si_unknown_contract_latches_through_observation_save_and_restart() {
 }
 
 #[test]
-fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
+fn hold_budget_floor_and_daily_rebuild_loop_guard() {
     // Small damage below the floor is contained, not a whole-source rebuild.
     let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-floor");
     let path = scratch.as_ref().join("index.json");
@@ -1314,12 +1314,12 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     let damage = whole_index_damage("budget");
     fs::write(&path, &damage).unwrap();
     refused(&damage);
-    // The pause names its automatic retry: seven days after the witness.
-    let week = 7 * 24 * 60 * 60;
+    // The pause names its automatic retry: 24 hours after the witness.
+    let day = 24 * 60 * 60;
     let retry = scan_index_rebuild_auto_retry_unix_seconds(source).unwrap();
     let now = unix_seconds_at(SystemTime::now());
     assert!(
-        retry > now + week - 60 && retry <= now + week + 1,
+        retry > now + day - 60 && retry <= now + day + 1,
         "{retry} vs {now}"
     );
     assert!(scan_index_rebuild_auto_retry_at(source).is_some());
@@ -1375,7 +1375,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     assert_eq!(corrupt_count(scratch.as_ref()), 2);
     assert!(scan_index_rebuilt_recently(&path, SystemTime::now()).unwrap());
 
-    // A fresh failure inside seven days of the override refuses again; the
+    // A fresh failure inside 24 hours of the override refuses again; the
     // spent press does not carry over.
     fs::write(&path, b"{  ").unwrap();
     refused(b"{  ");
@@ -1568,6 +1568,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "accepted_rebuild_last_alarm_unix_seconds"
             | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
+            "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
+            "tail_discovery" => serde_json::json!({"deleted_unaccepted_files": 1}),
             "upload_context_fingerprint"
             | "codex_parent_proof_cursor"
             | "codex_parent_side_cursor"
@@ -1636,6 +1638,9 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     assert_eq!(
@@ -1763,6 +1768,9 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     // Exercise the historical schema, before the appended archive slots.
     let fields = &lenient_decode::FIELDS[..89];
     let tombstone_slot = fields.len() - 3;
@@ -1809,7 +1817,9 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[89], "archives");
     assert_eq!(fields[90], "archive_deferred_alarm_count");
     assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
-    assert_eq!(fields.len(), 92);
+    assert_eq!(fields[92], "claude_folder_login_ledger");
+    assert_eq!(fields[93], "tail_discovery");
+    assert_eq!(fields.len(), 94);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1838,6 +1848,9 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
+        current.as_object_mut().unwrap().remove(appended);
+    }
     let mut legacy = current.clone();
     legacy
         .as_object_mut()
@@ -2257,7 +2270,7 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
 }
 
 #[test]
-fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
+fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
     for previous in ["budget", "syntax", "collision"] {
         for current in ["budget", "syntax", "collision"] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
@@ -2317,7 +2330,7 @@ fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
 }
 
 #[test]
-fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
+fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
     let now = SystemTime::now();
     let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
     for current in ["budget", "syntax", "collision"] {
@@ -2333,7 +2346,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
         assert!(error.downcast_ref::<ScanIndexRebuildLoop>().is_some());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(corrupt_count(scratch.as_ref()), 1);
-        // The exact 7-day boundary is still protected.
+        // The exact 24-hour boundary is still protected.
         let boundary = UNIX_EPOCH
             + std::time::Duration::from_nanos(
                 u64::try_from(stamp + SCAN_INDEX_REBUILD_COOLDOWN_NANOS).unwrap(),
@@ -2359,7 +2372,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
 }
 
 // The user Repair override keeps the session-identity state the
-// seven-day guard was protecting, and its cooldown is source-wide.
+// 24-hour guard was protecting, and its cooldown is source-wide.
 const OVERRIDE_OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OVERRIDE_OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -4061,6 +4074,7 @@ fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
     }
 }
 
+/// [format] Legacy count slots survive load/save while retired refusal counts become zero.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
@@ -4106,6 +4120,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
+        // Load retires only this decoded legacy value; neighboring positional counts survive.
+        expected["oversized_file_count"] = serde_json::json!(0);
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
@@ -4228,6 +4244,8 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "archives",
             "archive_deferred_alarm_count",
             "copy_prefix_last_accepted_nonce",
+            "claude_folder_login_ledger",
+            "tail_discovery",
         ]
     );
 }

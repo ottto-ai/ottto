@@ -577,7 +577,7 @@ fn claude_compact_records_decode_exactly() {
                         cache_slot,
                     ));
                 }
-                Some(observation) => assert!(observation.push(
+                Some(observation) => observation.push(
                     usage,
                     model,
                     interned,
@@ -587,7 +587,7 @@ fn claude_compact_records_decode_exactly() {
                     computed_effective_input_context,
                     tool_uses,
                     cache_slot,
-                )),
+                ),
             }
         }
         let observation = observation.expect("at least one record");

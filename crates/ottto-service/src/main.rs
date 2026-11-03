@@ -704,6 +704,7 @@ fn run_startup_step(step: StartupStep) {
 /// Everything `serve` and `serve-xpc` do before their first relay or
 /// listener. `serve --once` skips the local state sweep.
 fn prepare_to_serve(sweep_local_state: bool) {
+    ottto_service::log_startup_resources();
     for step in startup_steps(sweep_local_state) {
         run_startup_step(step);
     }

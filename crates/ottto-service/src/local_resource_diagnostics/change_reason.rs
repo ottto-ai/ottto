@@ -3,7 +3,7 @@
 //! emission, ACK or placement. Tags are process-local and bounded to one
 //! page: file tags live from selection to that page's upload, entity tags
 //! for that upload only. A lost tag counts as `unattributed`, never guessed.
-use super::{source_count, source_slot, UNACKED_LOST_START};
+use super::{source_count, source_slot, CHANGE_REASON_START};
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{FullReason, ReadMode};
 use serde::Serialize;
@@ -77,7 +77,7 @@ const SUB_COUNTS: [&str; 2] = [
 /// daemon, and late external evidence stays in admin_other's
 /// sidecar_or_fingerprint sub-count until a per-entry sidecar digest exists.
 const UNKNOWN: [&str; 2] = ["money_only_reveal", "late_external_evidence"];
-const UPLOAD_START: usize = UNACKED_LOST_START + 4;
+const UPLOAD_START: usize = CHANGE_REASON_START;
 const READ_START: usize = UPLOAD_START + TOKENS.len() * FIELDS.len();
 const SUB_START: usize = READ_START + TOKENS.len() * MODES.len() * READ_FIELDS.len();
 pub(super) const END: usize = SUB_START + SUB_COUNTS.len();

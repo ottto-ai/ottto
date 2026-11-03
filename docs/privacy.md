@@ -20,6 +20,11 @@ diagnostics flow sends a redacted payload.
 Agents, the CLI, the macOS app, and the web app are clients. They should not
 duplicate local setup or repair logic.
 
+`ottto uninstall --backup-state <directory>` copies the local sync state,
+which contains local session titles, prompts and workspace paths. Keep the
+backup private; the CLI writes its files as 0600 and its folders as 0700. The
+local state folder is not excluded from Time Machine or iCloud backups.
+
 The loopback `/local-health` endpoint may return the current pseudonymous
 relay-device id to an allowlisted Ottto browser origin so the web app can
 distinguish two macOS users on one physical Mac. Origin-less callers do not
@@ -232,7 +237,10 @@ invoking the provider.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
-definitions in memory to derive tenant-scoped HMAC identifiers. When the
+definitions to derive tenant-scoped HMAC identifiers. Bounded native skill labels
+are kept in owner-only local records independently of upload settings; retirement,
+source removal, forget and uninstall still erase those records. The Companion
+session list also keeps local titles and workspace labels when uploads omit them. When the
 existing **session titles and minimal descriptions** setting is enabled and the
 backend advertises support, a template or skill fact may additionally include
 one display label: either a sanitized prompt prefix of at most 96 bytes or an
@@ -310,6 +318,53 @@ the user, the system or a plugin. Paths are repository-relative. Instruction
 and skill text never leave the Mac. The context-footprint opt-outs (including
 `<support>/context_footprint/disabled`) apply, and
 `OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
+
+## Readable Labels
+
+The **Readable labels** setting applies only to what is uploaded. Local data stays
+on the Mac either way, and the Mac app keeps showing it.
+
+With Readable labels off:
+
+- Session titles and workspace and repository names are not uploaded.
+- Per-item names are not uploaded: skills, custom agents, memory and instruction
+  files, MCP servers and tools, and the files that entered a session's context.
+  Token totals per category still upload, so "MCP tools use 12k tokens" stays
+  visible without naming a tool. Once the server accepts them, unnamed counts and
+  token totals per kind upload too: sizes and counts, not names, and not anonymity.
+- Per-skill attribution identifiers are not uploaded. Prompt and template grouping
+  identifiers still are, so repeated workflows keep grouping.
+- Tool activity keeps its call counts, with every MCP tool counted under one
+  hidden name. Agent roles outside the providers' built-in set are sent as
+  `custom`.
+- The MCP inventory is not collected, so no MCP server is started for it.
+
+Workspace and repository path hashes still upload: they are the identity keys that
+group a user's sessions, and an unchanged path always gives the same hash.
+
+Turning the setting off applies going forward; names uploaded earlier are not
+recalled by the daemon.
+
+The filter **always sends**: it never refuses, drops or delays a body because a
+toggle is off. Transport errors, authentication, money and proof validation, source
+authorization and the server's stale-policy check can still reject a request; that
+is not the filter. A retry inside one upload pass can carry the earlier policy's
+bytes once after a setting changes, and the server rejects those bytes.
+
+## Local Erasure
+
+**Removing a source** erases, for that source only: its scan indexes and durable
+state in `snapshots`, and its active-session, detected-use, MCP inventory and
+context composition state.
+
+**Forget installation** erases, for every source: the whole `snapshots` folder,
+backfill state and upload receipts, the same active-session, detected-use and MCP
+inventory caches, and all context composition state. It also clears the installation
+identity and credentials.
+
+Neither erases your agents' own transcripts or source data, opt-out markers, or
+label-free bookkeeping: counts-only composition run records, footprint upload hashes
+and the remembered privacy settings.
 
 ## Live Telemetry
 

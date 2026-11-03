@@ -115,9 +115,7 @@ fn in_window(member: &Member, now: u64, days: u64) -> bool {
         .is_some_and(|modified| is_recent_enough_at(modified, now, days))
 }
 fn runnable(member: &Member, now: u64, days: u64) -> bool {
-    member.bytes <= max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
-        && member.bytes <= body_witness_adoption_byte_budget()
-        && in_window(member, now, days)
+    in_window(member, now, days)
 }
 // Native path twins reserve together, including when their combined bytes
 // exceed a page even though every physical member fits by itself.
@@ -136,7 +134,6 @@ fn read_groups(request: &Request) -> Vec<Vec<&Member>> {
 }
 fn group_runnable(group: &[&Member], now: u64, days: u64) -> bool {
     group.iter().all(|m| runnable(m, now, days))
-        && group.iter().map(|m| m.bytes).sum::<u64>() <= body_witness_adoption_byte_budget()
 }
 fn estimate(
     request: &Request,

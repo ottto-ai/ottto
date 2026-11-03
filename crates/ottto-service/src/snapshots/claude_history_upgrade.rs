@@ -46,8 +46,8 @@ use std::path::{Path, PathBuf};
 
 /// Most history files one page may upgrade, for every revision (MONEY P2).
 pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
-/// Bytes of history one page may upgrade (1 GiB), for every revision. No
-/// file is admitted past it, including a page's first file.
+/// Bytes of history one page may upgrade (1 GiB), for every revision. Every
+/// page admits its first file or native twin group even when it exceeds this budget.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
 /// Highest active Claude revision the gate is open for. Activating `e2` raised
 /// it to the revision-3 row together with the Claude revision constant and the
@@ -591,29 +591,27 @@ impl HistoryPage {
     /// Reserve this page's budget for one file. A file reserved earlier on
     /// this page keeps its reservation and is not charged twice.
     pub(super) fn reserve(&mut self, index_key: &str, size_bytes: u64) -> bool {
-        self.reserve_within(index_key, size_bytes, false)
+        self.reserve_within(index_key, size_bytes)
     }
 
-    /// Codex and Pi adoption-only pacing: the same budget, except that a
-    /// page's first file is admitted whatever its size. A Codex transcript
-    /// may exceed the byte budget, and without the exception it could never
-    /// adopt. The Claude history gate never uses this.
+    /// Compatibility entry for adoption-only callers; all sources admit the
+    /// first file or native twin group so large histories always make progress.
     pub(super) fn reserve_admitting_first_file(
         &mut self,
         index_key: &str,
         size_bytes: u64,
     ) -> bool {
-        self.reserve_within(index_key, size_bytes, true)
+        self.reserve(index_key, size_bytes)
     }
 
-    fn reserve_within(&mut self, index_key: &str, size_bytes: u64, first_file: bool) -> bool {
+    fn reserve_within(&mut self, index_key: &str, size_bytes: u64) -> bool {
         if self.reserved.contains(index_key) {
             return true;
         }
         // `e2` path twins settle as one entity, so they are reserved as one
         // group: a twin held only by this budget would hold its sibling's
         // body too, page after page. A page's first group passes the file
-        // count (never the bytes), so a pair always fits within two pages.
+        // count and bytes, so even a large pair can make progress.
         let twins = match self.staged_twins.take() {
             Some((key, twins)) if key == index_key => twins,
             _ => Vec::new(),
@@ -630,7 +628,7 @@ impl HistoryPage {
         if (self.files.saturating_add(files) > super::body_witness_adoption_page_budget()
             && !(files > 1 && page_empty))
             || (self.bytes.saturating_add(bytes) > super::body_witness_adoption_byte_budget()
-                && !(first_file && page_empty))
+                && !page_empty)
         {
             return false;
         }
@@ -1684,8 +1682,9 @@ mod tests {
             .contains("no_list_birth:not_installed=1"));
     }
 
+    /// [regress] History over one page makes progress as the first unit.
     #[test]
-    fn the_byte_budget_has_no_first_file_exception() {
+    fn the_byte_budget_admits_the_first_large_history_file() {
         let list = installed("");
         let mut page = HistoryPage::default();
         assert_eq!(
@@ -1696,7 +1695,7 @@ mod tests {
                 "huge",
                 HISTORY_UPGRADE_BYTES_PER_PAGE + 1
             ),
-            HistoryDecision::Held(HistoryHold::Budget)
+            HistoryDecision::Owed
         );
         // Codex and Pi adoption-only pacing keeps progress for a transcript
         // above the byte budget: only a page's first file passes over it.
@@ -1779,14 +1778,11 @@ mod tests {
                 assert_eq!(page.permitted, 2);
             });
         }
-        // Bytes stay strict even for a page's first group.
+        // The first native twin group also passes the byte budget.
         super::super::with_body_witness_adoption_byte_budget(21, || {
             let mut page = HistoryPage::default();
-            assert_eq!(
-                owed(&mut page, TWIN_B, 12),
-                HistoryDecision::Held(HistoryHold::Budget)
-            );
-            assert!(page.reserved.is_empty());
+            assert_eq!(owed(&mut page, TWIN_B, 12), HistoryDecision::Owed);
+            assert_eq!(page.reserved.len(), 2);
         });
         // A single file keeps the previous rule exactly (no group exception).
         super::super::with_body_witness_adoption_page_budget(1, || {

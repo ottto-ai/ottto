@@ -2245,13 +2245,14 @@ mod tests {
             vec![
                 json!({"type": "user", "message": {"role": "user", "content": "hi"}}),
                 json!({"type": "assistant", "requestId": "r1", "message": {"id": "m1", "role": "assistant", "model": "claude-fable-5-1",
-                    "usage": {"input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1,
+                    "usage": {"input_tokens": 150, "cache_read_input_tokens": 0, "output_tokens": 1,
                         "iterations": [{"input_tokens": 100, "cache_read_input_tokens": 200}]},
                     "content": [{"type": "text", "text": "ok"}]}}),
             ],
         );
         let items = parse_claude(&path, None);
-        // The item's first turn is the iteration's context; billing usage says 0.
+        // The item's first turn is the iteration's context (300); billing takes
+        // each kind's larger figure (150 + 200), so the parts don't reconcile.
         assert_eq!(items[0].first_turn_context_tokens, Some(300));
         let start = items[0].session_start.clone().expect("session_start");
         assert_eq!(start.opening_request_count, Some(1));

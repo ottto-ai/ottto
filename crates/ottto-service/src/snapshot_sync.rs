@@ -6688,15 +6688,14 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
-    let upload_policy = SnapshotUploadPolicy {
-        session_titles_enabled: activity_hint.session_titles_enabled,
-        workspace_labels_enabled: activity_hint.workspace_labels_enabled,
-        session_artifacts_enabled: activity_hint.session_artifacts_enabled,
-        session_attribution_enabled: activity_hint.session_attribution_enabled,
-        session_attribution_labels_enabled: activity_hint.session_attribution_enabled
-            && activity_hint.session_titles_enabled
-            && activity_hint.session_attribution_labels_enabled,
-    };
+    if source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_identity::bind_session_context_key(
+            attribution_context.as_ref(),
+        )
+    {
+        daemon.transcript_cache.scrub_retained_context_digests();
+    }
+    let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     let receipt_client = client
         .clone()
@@ -7881,6 +7880,31 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
+    // The Companion uses machine-local labels before upload policy clears them.
+    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
+        scan_agent_status,
+        &current_codex_bindings,
+        cached_codex_login_changed,
+    );
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
+    if crate::active_sessions::reconcile_active_sessions(
+        support_dir,
+        source,
+        &scan_result.snapshots,
+        Some(&reconciliation_status),
+        upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
+        &current_rfc3339(),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "local active-session cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
@@ -7916,7 +7940,8 @@ fn finish_sync_source(
         machine_id,
         |index, snapshots| {
             index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            crate::snapshots::apply_upload_policy(source, snapshots, upload_policy);
+            // Checks a fingerprint an older release persisted, under that release's rules.
+            crate::upload_policy::apply_upload_policy_v1(source, snapshots, upload_policy);
             apply_backfill_cutoff(snapshots, &backfill_state);
         },
     );
@@ -8016,29 +8041,6 @@ fn finish_sync_source(
         scan_result.local_codex_diagnostics.as_mut(),
     ) {
         upload_progress.save(&upload_progress_path)?;
-    }
-    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
-        scan_agent_status,
-        &current_codex_bindings,
-        cached_codex_login_changed,
-    );
-    // Claude activity remains recent relative to the scan's observation
-    // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
-        support_dir,
-        source,
-        &scan_result.snapshots,
-        Some(&reconciliation_status),
-        upload_policy,
-        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
-    )
-    .is_err()
-    {
-        eprintln!(
-            "local active-session cache update skipped for {}",
-            source.api_slug()
-        );
     }
     if !scan_result.census_complete {
         // A stale prior manifest must not survive a lossy census. The healthy
@@ -10085,17 +10087,26 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
+    // Summed CPU/wall sub-windows of evidence_read: strict per-root decode and
+    // the cross-root summary build. One record each per pass.
+    let mut decode_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
+    let mut cross_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
     for root_session_id in usage_roots {
-        let generation =
-            crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
-        let mut api = api_read.take_strict_report(support_dir, &root_session_id);
-        let mut trace = match prepared.as_mut() {
-            Some(read) => read.take_trace(support_dir, &root_session_id),
-            None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                support_dir,
-                [root_session_id.clone()],
-            ),
-        };
+        let (generation, mut api, mut trace) = decode_window.time(|| {
+            let generation =
+                crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
+            let api = api_read.take_strict_report(support_dir, &root_session_id);
+            let trace = match prepared.as_mut() {
+                Some(read) => read.take_trace(support_dir, &root_session_id),
+                None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                    support_dir,
+                    [root_session_id.clone()],
+                ),
+            };
+            (generation, api, trace)
+        });
         if !api.health.is_complete() {
             stats.api_incomplete_root_count += 1;
         }
@@ -10169,7 +10180,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
-        cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref());
+        cross_window
+            .time(|| cross.add_root(&root_session_id, api_rows.as_ref(), trace_rows.as_ref()));
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
@@ -10187,7 +10199,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
-    cross.finish();
+    cross_window.time(|| cross.finish());
+    drop(decode_window);
+    drop(cross_window);
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
@@ -12096,7 +12110,7 @@ fn collector_status_request(
         last_census_complete: Some(status.counts.census_complete),
         last_symlink_rejected_count: status.counts.symlink_rejected_count,
         last_unreadable_path_count: status.counts.unreadable_path_count,
-        last_oversized_file_count: status.counts.oversized_file_count,
+        last_oversized_file_count: 0,
         last_disappeared_file_count: status.counts.disappeared_file_count,
         last_malformed_json_line_count: status.counts.malformed_json_line_count,
         last_invalid_utf8_line_count: status.counts.invalid_utf8_line_count,
@@ -12766,19 +12780,39 @@ pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: Snaps
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
-fn erase_source_files(
-    support_dir: &Path,
-    source: SnapshotSource,
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let others: Vec<PathBuf> = [
+/// A source's caches outside `snapshots`, with their temp copies.
+fn source_cache_files(support_dir: &Path, source: SnapshotSource) -> Vec<PathBuf> {
+    [
         crate::active_sessions::active_session_cache_path(support_dir, source),
         detected_uses_cache_path(support_dir, source),
         crate::mcp_inventory::cache_path(support_dir, source),
     ]
     .into_iter()
     .flat_map(|path| [path.with_extension("json.tmp"), path])
-    .collect();
+    .collect()
+}
+
+/// Forget: every source's caches. The opt-out markers beside them stay.
+pub(crate) fn erase_all_source_caches(support_dir: &Path) -> std::io::Result<()> {
+    for path in SNAPSHOT_SOURCES
+        .into_iter()
+        .flat_map(|source| source_cache_files(support_dir, source))
+    {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn erase_source_files(
+    support_dir: &Path,
+    source: SnapshotSource,
+    complete: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::context_composition::erase_source_state(support_dir, source)?;
+    let others = source_cache_files(support_dir, source);
     let stable = snapshot_index_path(support_dir, source);
     let destinations = support_dir.join("snapshots/destinations");
     // Every parent exists, so an fsync of it fails only on a real I/O error.
@@ -22887,9 +22921,6 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-                mod oversized_discovery_pipeline_tests {
-                    include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
-                }
             }
         }
     }
