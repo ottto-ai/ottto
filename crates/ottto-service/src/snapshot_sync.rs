@@ -25064,6 +25064,10 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 mod h357_ack_tests;
 
 #[cfg(test)]
+#[path = "snapshot_sync/tail_ack_ledger.rs"]
+pub(crate) mod tail_ack_ledger;
+
+#[cfg(test)]
 #[path = "snapshot_sync/usage_decrease_hold_tests.rs"]
 mod usage_decrease_hold_tests;
 

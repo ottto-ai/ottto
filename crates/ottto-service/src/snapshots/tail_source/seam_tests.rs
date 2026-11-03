@@ -28,6 +28,11 @@ pub(in crate::snapshots::tail_source) struct Route {
 }
 
 pub(in crate::snapshots::tail_source) fn route() -> Route {
+    route_for(Source::Claude)
+}
+
+/// A state database route for `source` in a fresh directory.
+pub(in crate::snapshots::tail_source) fn route_for(source: Source) -> Route {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ottto-tail-seam-{}-{}",
@@ -36,7 +41,7 @@ pub(in crate::snapshots::tail_source) fn route() -> Route {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
-    let (session, index) = ColdSession::publish(Source::Claude, &ScanIndex::default(), &dir);
+    let (session, index) = ColdSession::publish(source, &ScanIndex::default(), &dir);
     Route {
         path: session.path().to_owned(),
         _session: session,
