@@ -182,36 +182,31 @@ pub(super) fn hydrate_checkpoint(
     save_digests: usize,
     cx: Option<&kinds::KindCx>,
 ) {
-    start_hydrate();
-    let current = crate::local_resource_diagnostics::state_v2_memory();
-    let process_cpu_us = crate::local_resource_diagnostics::state_v2_cpu_us();
-    if let Ok(mut stats) = stats().lock() {
-        stats.stage_memory.insert(
-            name,
-            MemoryWindow {
-                current,
-                process_cpu_us,
-                save_digests: Some(save_digests),
-                // Hydrate-owned maps; no key/value walks or serialized size estimates.
-                kind_cx_entries: cx.map(|cx| {
-                    cx.presence.len()
-                        + cx.account_ids.len()
-                        + cx.digests.len()
-                        + cx.cold_rolled.len()
-                        + cx.compaction.done.len()
-                }),
-                ..Default::default()
-            },
-        );
-        #[cfg(test)]
-        THREAD_CHECKPOINTS.with(|checkpoints| {
-            checkpoints.borrow_mut().push((
-                name,
-                serde_json::to_value(stats.stage_memory.get(name).unwrap()).unwrap(),
-            ));
-        });
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    if !PASS.with(|pass| pass.borrow().active) {
+        return;
     }
+    initialize_pass();
+    let window = MemoryWindow {
+        current: crate::local_resource_diagnostics::state_v2_memory(),
+        process_cpu_us: crate::local_resource_diagnostics::state_v2_cpu_us(),
+        save_digests: Some(save_digests),
+        // Hydrate-owned maps; no key/value walks or serialized size estimates.
+        kind_cx_entries: cx.map(|cx| {
+            cx.presence.len()
+                + cx.account_ids.len()
+                + cx.digests.len()
+                + cx.cold_rolled.len()
+                + cx.compaction.done.len()
+        }),
+        ..Default::default()
+    };
+    #[cfg(test)]
+    THREAD_CHECKPOINTS.with(|checkpoints| {
+        checkpoints
+            .borrow_mut()
+            .push((name, serde_json::to_value(&window).unwrap()));
+    });
+    record_memory(name, window);
 }
 
 pub(super) fn baseline(path: &Path) {
@@ -298,21 +293,21 @@ pub(in super::super) fn phase(name: &'static str) {
         return;
     }
     initialize_pass();
-    let memory = crate::local_resource_diagnostics::state_v2_memory();
+    record_memory(
+        name,
+        MemoryWindow {
+            current: crate::local_resource_diagnostics::state_v2_memory(),
+            ..Default::default()
+        },
+    );
+}
+fn record_memory(name: &'static str, window: MemoryWindow) {
     if let Ok(mut stats) = stats().lock() {
-        stats.stage_memory.insert(
-            name,
-            MemoryWindow {
-                current: memory,
-                peak: Default::default(),
-                cpu_us: None,
-                wall_us: None,
-                ..Default::default()
-            },
-        );
+        stats.stage_memory.insert(name, window);
         crate::local_resource_diagnostics::claude_state_v2(&*stats);
     }
 }
+
 pub(in super::super) fn acquired(index: &ScanIndex) {
     if !super::state_v2_growth_retention_active(index) {
         return;
@@ -567,6 +562,13 @@ mod ops_tests {
             "destination_namespace_hash": "a".repeat(64),
         }))
         .unwrap();
+        abort_pass();
+        THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
+        ScanIndex::load(&path).unwrap();
+        // Cold loads/checkpoints must not open or initialize a pass window.
+        hydrate_checkpoint("hydrate_route_entry", 0, None);
+        assert_eq!(PASS.with(|pass| pass.borrow().clone()), Pass::default());
+        THREAD_CHECKPOINTS.with(|checkpoints| assert!(checkpoints.borrow().is_empty()));
         for cold in [true, false] {
             pass_start();
             THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
@@ -585,7 +587,6 @@ mod ops_tests {
                 [
                     "hydrate_route_entry",
                     "hydrate_after_ack",
-                    "hydrate_entry",
                     "hydrate_after_decode",
                     "hydrate_after_baseline",
                     "hydrate_exit",

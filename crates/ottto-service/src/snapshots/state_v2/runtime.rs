@@ -371,7 +371,6 @@ fn load_with_custody(
                         telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        telemetry::hydrate_checkpoint("hydrate_entry", 0, None);
                         let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
                         telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
                         #[cfg(test)]
@@ -426,7 +425,6 @@ fn load_with_custody(
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
                 .context("state_v2_open_recover")?;
             telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
-            telemetry::hydrate_checkpoint("hydrate_entry", 0, None);
             let (mut index, mut cx) =
                 import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
             telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
