@@ -2986,17 +2986,26 @@ fn insert_transcript_record(
         if window > 0 {
             revalidate_retirement_growth(index, census, cutoff);
             let active = super::sampled_audit::growth_active(index);
+            let cohort = super::claude_pending_family_session_ids(index)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             let held = |key: &str| {
-                super::restart_restore::enabled()
-                    && (page_held.contains(key)
-                        || index
-                            .traversal
-                            .as_ref()
-                            .is_some_and(|walk| walk.residue.index_keys.contains(key))
-                        || index
-                            .scan_residue_witness
-                            .as_ref()
-                            .is_some_and(|witness| witness.index_keys.contains(key)))
+                index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| entry.evidence_owed)
+                    || claude_index_path_member_ref(Path::new(key))
+                        .is_some_and(|member| cohort.contains(member.root))
+                    || (super::restart_restore::enabled()
+                        && (page_held.contains(key)
+                            || index
+                                .traversal
+                                .as_ref()
+                                .is_some_and(|walk| walk.residue.index_keys.contains(key))
+                            || index
+                                .scan_residue_witness
+                                .as_ref()
+                                .is_some_and(|witness| witness.index_keys.contains(key))))
             };
             let excluded = |key: &str| {
                 active

@@ -9203,9 +9203,8 @@ pub fn apply_claude_effort_evidence_with_index(
         return;
     }
 
-    // A fingerprint version mismatch is missing proof, never an observed
-    // account change. Preserve owners/ACKs and select the affected files even
-    // on a nonterminal page, before the old witness can be forgotten.
+    // Legacy fingerprint versions are missing proof. Drop only the witness;
+    // historical files keep their progress until an independently selected read.
     let reprove_roots = index
         .claude_account_family_witnesses
         .iter()
@@ -9218,19 +9217,6 @@ pub fn apply_claude_effort_evidence_with_index(
         .map(|(root, _)| root.clone())
         .collect::<BTreeSet<_>>();
     if !reprove_roots.is_empty() {
-        for (key, entry) in index.files.slots_mut() {
-            if claude_index_path_family_member(Path::new(key))
-                .is_some_and(|(root, _)| reprove_roots.contains(&root))
-            {
-                crate::local_resource_diagnostics::claude_reread::clear(
-                    crate::local_resource_diagnostics::claude_reread::ClearSite::AccountReproof,
-                    !entry.source_file_fingerprint.is_empty(),
-                );
-                if !entry.source_file_fingerprint.is_empty() {
-                    entry.make_mut().source_file_fingerprint.clear();
-                }
-            }
-        }
         index
             .claude_account_family_witnesses
             .retain(|root, _| !reprove_roots.contains(root));
@@ -9241,13 +9227,8 @@ pub fn apply_claude_effort_evidence_with_index(
         BTreeMap::new()
     };
     if census_complete {
-        // v29 witnesses predate per-member request-set fingerprints. Removing
-        // one without revisiting its unchanged transcript files would strand
-        // later child-only reparses: scan identity stays at v24, so no ordinary
-        // parser upgrade selects those files. Schedule only the affected
-        // complete families for a bounded local reparse before the legacy
-        // witness is discarded. The old count-only witness is never used to
-        // stamp a v30 parse; the reparse must rebuild exact request coverage.
+        // Legacy count-only witnesses cannot prove current request coverage.
+        // Prune them without scheduling a historical reparse.
         let _legacy_witness_roots = index
             .claude_account_family_witnesses
             .iter()
@@ -9360,7 +9341,7 @@ pub fn apply_claude_effort_evidence_with_index(
                 pending.census_complete = true;
             }
         }
-        let current_source_session_ids = snapshots
+        let _current_source_session_ids = snapshots
             .iter()
             .map(|snapshot| snapshot.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
@@ -10648,7 +10629,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             &duplicate_witnesses_after,
             max_duplicate_owners,
         );
-        let closed_only_by_witnessed_families = overflowed_before
+        let _closed_only_by_witnessed_families = overflowed_before
             && coverage_missing_member_count > 0
             && owners_within_bound
             && claude_fence_held_only_by_witnessed_families(index, census_window_end);

@@ -55,7 +55,10 @@ pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexE
 }
 
 /// Per page: the paced owed-read allowance.
-#[allow(dead_code)] // Later dead-code cut: the owed resolver no longer spends a read allowance.
+#[expect(
+    dead_code,
+    reason = "later dead-code cut: owed resolution never spends a read allowance"
+)]
 pub(super) struct Page {
     /// Owed Fulls this page already admitted, and the one
     /// per-page cap. It reuses the existing paced re-read page allowance
