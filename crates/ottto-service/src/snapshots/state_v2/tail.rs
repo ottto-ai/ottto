@@ -179,13 +179,10 @@ pub(in crate::snapshots) enum NoUploadRequired {
     ZeroUsageLines = 1,
     ZeroTokens = 2,
 }
-/// G7 reason_bits registry. Bits 0..7 belong to the G7 producers (growth claim,
-/// unread, held revision, retry pending, quarantine, set aside, authority terminal,
-/// census held); bit 8 is the delivery owner. Keep one definition here.
+/// G7 `reason_bits` (CX1 registry): bits 0-7 are the G7 producers'; bit 8 is D177.
 pub(in crate::snapshots) mod reason_bits {
     pub(in crate::snapshots) const DELIVERY_DEBT: u32 = 1 << 8;
 }
-
 /// The file's debt summary, derived by its owner from the revisions; it is never
 /// acceptance. Unix milliseconds; `reason_bits` are stored opaque.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -275,7 +272,6 @@ pub(in crate::snapshots) enum Disposition {
 }
 #[derive(Default)]
 struct Debt {
-    delivery: Option<bool>,
     disposal: Option<Disposition>,
     observation: Option<Observation>,
 }
@@ -308,12 +304,6 @@ impl TailStage {
             && self.retire.is_empty()
             && self.erase.is_empty()
     }
-    pub(super) fn delivery(&mut self, key: &str, owed: bool) {
-        self.debt
-            .entry(key.as_bytes().to_vec())
-            .or_default()
-            .delivery = Some(owed);
-    }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         let debt = self.debt.entry(key.as_bytes().to_vec()).or_default();
         let merged = match debt.observation.take() {
@@ -331,7 +321,6 @@ impl TailStage {
         self.debt.insert(
             key.as_bytes().to_vec(),
             Debt {
-                delivery: None,
                 disposal: Some(disposition),
                 observation: None,
             },
@@ -370,10 +359,6 @@ impl TailStage {
         // delete the fresh head.
         if file.change == Change::Reset {
             self.retire.remove(&key);
-        }
-        // A later publication cannot borrow an earlier revision's ACK.
-        if let Some(debt) = self.debt.get_mut(&key) {
-            debt.delivery = None;
         }
         if let Some(Entry::File(prior)) = self.files.remove(&key) {
             file.absorb(prior);
@@ -955,11 +940,11 @@ fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
 pub(super) fn erasure_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(bool, Option<u64>)> {
     let kind = RecordKind::parse(REVISION)?;
     let owed = !tx.scan_record_key(&kind, file, None, 1)?.is_empty();
-    let summary = read_head(tx, file)?.map(|head| head.common.debt);
-    Ok((
-        owed || summary.is_some_and(|debt| debt.reason_bits & reason_bits::DELIVERY_DEBT != 0),
-        summary.and_then(|debt| debt.earliest_unacked_change_at),
-    ))
+    let oldest = read_head(tx, file)
+        .ok()
+        .flatten()
+        .and_then(|head| head.common.debt.earliest_unacked_change_at);
+    Ok((owed, oldest))
 }
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 struct Applied {
@@ -1152,11 +1137,7 @@ fn write_file(
             delete_fragments(tx, file, Collection::Revisions.owner(), id, 0)?;
         }
         table.remove(&Collection::Revisions);
-        // G7 dispositions settle its revisions, never delivery custody.
-        common.debt.reason_bits &= reason_bits::DELIVERY_DEBT;
-        if common.debt.reason_bits == 0 {
-            common.debt = DebtSummary::default();
-        }
+        common.debt = DebtSummary::default();
         match disposition {
             // The file is gone, so its header facts are too.
             Disposition::Absence => {
@@ -1168,24 +1149,6 @@ fn write_file(
     }
     if let Some(observation) = debt.and_then(|debt| debt.observation.as_ref()) {
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
-    }
-    // Inside the file's cursor closure: a publishing save whose bodies lack an
-    // exact ACK owes delivery in the same transaction, including a Tail-only
-    // cycle-exit save after a failed POST. Only a file with a cursor owes it.
-    if debt.and_then(|debt| debt.delivery) == Some(true)
-        && (staged.is_some() || reduction.is_some())
-    {
-        common.debt.reason_bits |= reason_bits::DELIVERY_DEBT;
-        common
-            .debt
-            .earliest_unacked_change_at
-            .get_or_insert_with(|| super::super::sampled_scan::now_seconds().saturating_mul(1000));
-    }
-    if debt.and_then(|debt| debt.delivery) == Some(false) {
-        common.debt.reason_bits &= !reason_bits::DELIVERY_DEBT;
-        if common.debt.reason_bits == 0 && !table.contains_key(&Collection::Revisions) {
-            common.debt.earliest_unacked_change_at = None;
-        }
     }
     // No longer a Tail file: the reduction and its pages go, the debt stays.
     if common.representation != Representation::Tail && reduction.is_some() {
@@ -1205,7 +1168,6 @@ fn write_file(
     if reduction.is_none()
         && !table.contains_key(&Collection::Revisions)
         && common.inventory.is_none()
-        && common.debt.reason_bits & reason_bits::DELIVERY_DEBT == 0
     {
         delete_rows(tx, file, false)?;
         return Ok(applied);

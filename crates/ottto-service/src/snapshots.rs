@@ -8718,17 +8718,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // no hold. A correction-owed member is not carried: its own no-op rule
         // drains it, so its unchanged bodies are not re-sent either, and a
         // later read carries or sends once the correction settled.
-        #[cfg(unix)]
-        let delivery_owed = tail_source::delivery::owed(index, &pending.index_key);
-        #[cfg(not(unix))]
-        let delivery_owed = false;
-        let same_body = final_group_fingerprint.is_some()
+        let semantic_noop = final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
             && final_upload_body_witness == pending.previous_upload_body_witness
             && !pending.codex_pending_recovery
-            && !quarantine_retry_required;
+            && !quarantine_retry_required
+            && pending.stored_reuse != Some(CandidateParseReason::DeliveryDebt);
         let correction_named = source == SnapshotSource::ClaudeCode
             && index.claude_authority_correction_owed(Path::new(&pending.index_key));
+        let correction_owed = semantic_noop && correction_named;
         // The A1-A3 exclusions shared by the carry and a rebuilt receipt.
         let receipt_eligible = !correction_named
             && !pending.codex_pending_recovery
@@ -8741,7 +8739,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .iter()
                 .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp));
         let carried_incidence = index.accepted_rebuild_incidence.remove(&pending.index_key);
-        let entity_bodies = if ((same_body || delivery_owed) && receipt_eligible)
+        let entity_bodies = if (semantic_noop && receipt_eligible)
             || carried_incidence.is_some()
             || index.accepted_rebuild_incidence.contains_key("")
         {
@@ -8765,15 +8763,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .filter(|(fp, body)| index.file_entity_stamp_proves(&pending.index_key, fp, body))
             .map(|(fp, _)| fp.clone())
             .collect::<BTreeSet<_>>();
-        let exact_rebuilt_ack = receipt_eligible
-            && !entity_bodies.is_empty()
-            && stamp_proven.len() == entity_bodies.len();
-        let semantic_noop = same_body && (!delivery_owed || exact_rebuilt_ack);
-        let correction_owed = semantic_noop && correction_named;
-        #[cfg(unix)]
-        if exact_rebuilt_ack {
-            let _ = state_v2::tail_delivery(index, &pending.index_key, false);
-        }
         if semantic_noop
             && receipt_eligible
             && !entity_bodies.is_empty()
@@ -46948,18 +46937,8 @@ pub(crate) enum CandidateParseReason {
     DeliveryDebt,
 }
 
-/// D177 delivery custody for one pass's bodies, before its save.
 #[cfg(unix)]
-pub(crate) fn settle_tail_delivery(
-    source: SnapshotSource,
-    index: &ScanIndex,
-    snapshots: &[SnapshotItem],
-    accepted: &BTreeMap<String, String>,
-    failed: bool,
-) {
-    tail_source::delivery::settle(source, index, snapshots, accepted, failed);
-}
-
+pub(crate) use tail_source::delivery::settle as settle_tail_delivery;
 pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 16;
 pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",
@@ -53431,16 +53410,6 @@ impl ScanIndex {
         // Completed restores the old revision while account-held. Its memo is
         // scoped to the active revision/context, so repeating that adoption
         // cannot settle it; a new activation still selects a counted parse.
-        #[cfg(unix)]
-        if tail_source::delivery::owed(self, &key)
-            && entry.size_bytes == candidate.size_bytes
-            && entry.modified_unix_seconds == candidate.modified_unix_seconds
-            && entry
-                .modified_unix_nanos
-                .map_or(true, |at| at == candidate.modified_unix_nanos)
-        {
-            return (CandidateDecision::Skip, None);
-        }
         if body_witness_adoption
             && !withheld_unchanged
             && self.effective_upload_body_witness_revision_requires_adoption(&key)

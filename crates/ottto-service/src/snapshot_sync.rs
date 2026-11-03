@@ -3961,18 +3961,6 @@ fn note_shed_and_backoff(source: SnapshotSource, retry_after: Option<Duration>) 
     }
 }
 
-fn defer_failed_source_upload(source: SnapshotSource, error: &anyhow::Error) {
-    if error
-        .downcast_ref::<UploadFailureDiagnostics>()
-        .is_some_and(|failure| {
-            failure.status_family().starts_with("transport_")
-                || failure.status_family() == "http_5xx"
-        })
-    {
-        defer_source_uploads(source, note_shed_and_backoff(source, None));
-    }
-}
-
 fn clear_shed_streak(source: SnapshotSource) {
     if let Ok(mut streaks) = source_shed_streaks().lock() {
         streaks.remove(source.api_slug());
@@ -8756,7 +8744,6 @@ fn finish_sync_source(
             return Ok(());
         }
         Err(error) => {
-            defer_failed_source_upload(source, &error);
             // Earlier pages may have durable exact ACKs even though this pass
             // failed. Save their wholly settled files and release adopted ACK
             // capacity. Local-state failures leave durability

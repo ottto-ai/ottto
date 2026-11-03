@@ -12,17 +12,6 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
-/// Delivery state joins the same file transaction as its cursor and Tail.
-/// Only an exact file/body ACK may pass `owed=false`.
-pub(in crate::snapshots) fn tail_delivery(index: &ScanIndex, key: &str, owed: bool) -> Result<()> {
-    if let Some(path) = runtime_path(index)? {
-        with_state(&path, |state| {
-            state.tail.delivery(key, owed);
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
 /// This file's completion could not encode: its predecessor stays.
 pub(in crate::snapshots) fn set_aside_tail(
     path: &Path,
@@ -54,10 +43,6 @@ pub(in crate::snapshots) fn staged_head_for_test(path: &Path, key: &str) -> Opti
 }
 /// A debt-only change of one file, committed with the next save or at exit. It
 /// never publishes the file's graph progress and never clears its marker.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-)]
 pub(in crate::snapshots) fn observe_tail(
     path: &Path,
     key: &str,

@@ -746,5 +746,5 @@ pub(crate) fn pause_adoption(support: &Path) {
 }
 
 pub(crate) fn delivery_owed_for_test(index: &ScanIndex, path: &Path) -> bool {
-    super::tail_source::delivery::owed(index, &super::local_index_key(path))
+    super::tail_source::delivery::tests::owed(index, &super::local_index_key(path))
 }
