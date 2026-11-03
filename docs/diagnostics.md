@@ -372,11 +372,10 @@ they reset at process start and never decide anything.
 | Counter | Unit / meaning |
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, or a live input not available now; the file waits and census stays red), `error`. The traversal point of a hit also carries `head_bytes` and `page_bytes` read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `not_rederivable`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: its point says `explicit_action`, and it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible`, `incomplete`, `revision`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: its point says `explicit_action`, and it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
 | `tail_bootstrap_full{no_head}` | A file's first read, apart from reconstruction. |
-| `tail_rederive_bytes{ok,mismatch}` | Actual bytes re-read to check stored content digests, including failures. |
 | `tail_replay_bytes{full,tail}` | Native reduction bytes. |
 | `tail_validation_bytes{sample}` | Sample and guard bytes, apart from native. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
@@ -407,7 +406,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
 | `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
 | `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
-| `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | `tail_rederive_bytes` |
+| `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
 | `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `tail_validation_bytes` |
 | Sampled native bytes | `tail_replay_bytes`, `tail_bootstrap_full` |
 | `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage`, `tail_stage_dropped`, `tail_publish{dropped}` |
@@ -418,7 +417,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
 
 Not built, and so absent from the counters: `tail_candidate_owed`,
-`tail_set_aside_probe` and `tail_rederive_lines`.
+`tail_set_aside_probe`.
 
 ### Claude Census Retirement Overlap
 

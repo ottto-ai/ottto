@@ -9,6 +9,10 @@ const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
     (1, "original state v2 writer"),
     (2, "kind-introduction layouts"),
     (3, "tail store"),
+    (
+        4,
+        "tail revision and head envelope: older writers would drop debt",
+    ),
 ];
 pub(super) const WRITER_CAPABILITY: u64 =
     WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;

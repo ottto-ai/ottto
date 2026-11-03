@@ -39,6 +39,11 @@ pub(in crate::snapshots) fn has_codec(source: SnapshotSource) -> bool {
     with_codec!(source, S => S::SOURCE == source, _ => false)
 }
 
+/// The reduction revision `source`'s codec writes, when it has one.
+pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> Option<u32> {
+    with_codec!(source, S => Some(S::REDUCTION_REVISION), _ => None)
+}
+
 /// The state database route `source`'s Tail lives on, when it has a codec.
 pub(in crate::snapshots) fn tail_route(
     source: SnapshotSource,
@@ -110,6 +115,9 @@ pub(in crate::snapshots) struct CollectionSpec {
     /// Staged with its table entry even when empty, so a load can tell an
     /// empty collection from a missing one.
     pub(in crate::snapshots) required: bool,
+    /// Its pages hold private strings: a rewrite or removal of a committed
+    /// page stages `Change::DropsPrivate`, so the old value is purged (F3).
+    pub(in crate::snapshots) private: bool,
 }
 
 /// Why stored state cannot be reused. Each is a counted reconstruction,
@@ -126,8 +134,6 @@ pub(in crate::snapshots) enum ReconstructCause {
     Revision,
     /// The head was written for another route, scan root or path.
     Identity,
-    /// A re-derived content field no longer matches its stored digest.
-    NotRederivable,
     /// The head's keyed fields were made under another attribution key: an
     /// explicit action (a key rotation), not a failure. Attribution toggled
     /// on or off is no rotation (`HeadIdentity::check`).
@@ -141,7 +147,6 @@ impl ReconstructCause {
             Self::Incomplete => "incomplete",
             Self::Revision => "revision",
             Self::Identity => "identity",
-            Self::NotRederivable => "not_rederivable",
             Self::KeyEpoch => "key_epoch",
         }
     }
@@ -240,8 +245,6 @@ pub(in crate::snapshots) struct DecodedHead {
     pub(in crate::snapshots) certificate: DurableCertificate,
     pub(in crate::snapshots) report: JsonlReadReport,
     pub(in crate::snapshots) scalars: (usize, usize, bool),
-    /// Digests of the re-derived (`X`) fields, checked after re-derivation.
-    pub(in crate::snapshots) rederive: sampled_jsonl::durable::Rederive,
 }
 
 // The checkpoint as the head stores it: samples as offset and SHA-256 only.
@@ -515,7 +518,8 @@ macro_rules! head_fields {
 // The head-field core every codec writes: each accumulator field by its Tail
 // home. Stored fields keep their record class, except that skill labels are
 // plain data and the fork parent and artifacts are stored. `X` fields are
-// re-derived. `I` marks a field this walk does not store: a codec keeps its
+// content a codec keeps as session facts (Claude: `tail.page.session_facts`),
+// except the Codex agent label, which a Claude parse never sets. `I` marks a field this walk does not store: a codec keeps its
 // own `I` fields in its pages or in a trailer after this walk, or never
 // stores them (finish-only and live fields). Claude's: pages (responses, tool
 // uses, changed files, capability buckets, compactions), finish-only fields
@@ -672,5 +676,4 @@ head_fields! {
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
-    D durable_marks: crate::durable_tail_codec::DurableMarks,
 }
