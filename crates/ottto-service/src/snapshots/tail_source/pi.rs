@@ -47,7 +47,6 @@ impl TailSource for Pi {
     const SOURCE: SnapshotSource = SnapshotSource::Pi;
     const REDUCTION_REVISION: u32 = 1;
     const USAGE_BEFORE_FINISH: bool = true;
-    const USAGE_BEFORE_FINISH: bool = true;
 
     fn collections() -> &'static [CollectionSpec] {
         &COLLECTIONS
