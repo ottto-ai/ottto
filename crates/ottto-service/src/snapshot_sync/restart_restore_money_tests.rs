@@ -766,7 +766,7 @@ fn other_page_with_slots(
     scanner: &E2ScanFixture,
     source: SnapshotSource,
     prior: ScanIndex,
-    slots: &[crate::snapshots::codex_slot_naming::RegisteredSlotLogin],
+    slots: &[(String, String, usize)],
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let (mut index, mut scan, modes) = scanner.scan_other(
@@ -776,12 +776,12 @@ fn other_page_with_slots(
         prior,
         true,
     );
-    index.bind_session_accounts_with_slots(
+    index.bind_session_accounts_with_mixed(
         source,
         "e2-synthetic-machine",
         &mut scan.snapshots,
         &[],
-        &mut crate::snapshots::codex_slot_naming::CreatorSlotNaming::new(slots.to_vec()),
+        (slots, &mut [0; 6]),
         &Default::default(),
     );
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());

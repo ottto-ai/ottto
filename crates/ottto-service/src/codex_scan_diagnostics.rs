@@ -964,13 +964,17 @@ pub(crate) struct CodexScanDiagnostics {
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
-    /// Sessions named from their creator record this scan, and those refused
-    /// by cause. Omitted when all are zero.
-    #[serde(
-        skip_serializing_if = "crate::snapshots::codex_slot_naming::CreatorSlotNamingCounts::is_empty"
-    )]
-    pub creator_slot_naming: crate::snapshots::codex_slot_naming::CreatorSlotNamingCounts,
+    /// Codex sessions named by a creator record's slot, then refused, by cause.
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    pub creator_slot_naming: [u64; 6],
 }
+
+pub(crate) const CREATOR_NAMED: usize = 0;
+pub(crate) const CREATOR_NO_MATCH: usize = 1;
+pub(crate) const CREATOR_MULTI_MATCH: usize = 2;
+pub(crate) const CREATOR_MODE_UNREADABLE: usize = 3;
+pub(crate) const CREATOR_NOT_FORCED_CHATGPT: usize = 4;
+pub(crate) const CREATOR_API_KEY: usize = 5;
 
 /// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
 /// finished parses (a singleton, or a joined group's single replay parse,

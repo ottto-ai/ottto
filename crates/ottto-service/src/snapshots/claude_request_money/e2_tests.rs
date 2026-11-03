@@ -1776,6 +1776,7 @@ fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identical
                     "synthetic-machine",
                     &mut upload_items,
                     &[],
+                    (&[], &mut [0; 6]),
                     &admissions,
                 )
                 .is_empty(),

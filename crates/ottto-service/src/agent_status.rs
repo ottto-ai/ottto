@@ -17709,75 +17709,48 @@ pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTr
     .any(|key| value.get(key).is_some_and(|value| !value.is_null()))
 }
 
-/// Every accepted registered Ottto Codex slot binding, each with whether its
-/// saved login is a subscription login now ([`codex_slot_login`]). Only the
-/// slot registry is read: a home seen only through a running process, or not
-/// mapped to a slot, is never listed. A registry read failure lists none.
-pub(crate) fn registered_codex_slot_logins(
-) -> Vec<crate::snapshots::codex_slot_naming::RegisteredSlotLogin> {
-    let store = FileCodexAccountSlotSettingsStore::default();
+/// Accepted registered Codex slots (never a process-only home), login cause.
+pub(crate) fn registered_codex_creator_slots() -> Vec<(String, String, usize)> {
+    let Ok(status) = FileCodexAccountSlotSettingsStore::default().load() else {
+        return Vec::new();
+    };
     let env_api_key = ["OPENAI_API_KEY", "CODEX_API_KEY"]
         .iter()
         .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-    store
-        .registered_bindings()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|binding| binding.accepted)
-        .map(
-            |binding| crate::snapshots::codex_slot_naming::RegisteredSlotLogin {
-                login: store.slot_home(&binding.slot_id).map_or(
-                    Err(crate::snapshots::codex_slot_naming::SlotLoginRefusal::ModeUnreadable),
-                    |home| codex_slot_login(&home, env_api_key),
-                ),
-                account_identifier_hash: binding.account_identifier_hash,
-                workspace_identifier_hash: binding.workspace_identifier_hash,
-            },
-        )
+    let slots = codex_home_slots(&status).into_iter();
+    slots
+        .filter_map(|slot| {
+            let (account, workspace) = slot.registered_binding?;
+            let cause = codex_slot_login_cause(&slot.home, env_api_key);
+            Some((account, workspace, cause))
+        })
         .collect()
 }
 
-/// Whether a registered slot's saved login proves a subscription login: its
-/// config keeps Ottto's forced ChatGPT login, its `auth.json` mode is
-/// `chatgpt`, and no API key is set there (`OPENAI_API_KEY` null or absent)
-/// or in the service's environment (`env_api_key`). Anything missing or
-/// unreadable refuses. Only these fields are decoded; a token or key value is
-/// never kept.
-fn codex_slot_login(
-    home: &Path,
-    env_api_key: bool,
-) -> Result<(), crate::snapshots::codex_slot_naming::SlotLoginRefusal> {
-    use crate::snapshots::codex_slot_naming::SlotLoginRefusal;
+/// Named only with forced ChatGPT config, `chatgpt` auth mode and no API key
+/// there or in the env; unreadable refuses. Only these fields are decoded.
+pub(crate) fn codex_slot_login_cause(home: &Path, env_api_key: bool) -> usize {
+    use crate::codex_scan_diagnostics::*;
     #[derive(Deserialize)]
     struct SavedLogin {
         auth_mode: Option<String>,
         #[serde(rename = "OPENAI_API_KEY", default)]
         api_key: Option<serde::de::IgnoredAny>,
     }
-    let forced = ottto_core::read_codex_config_file_secure(home, CodexHomeTrust::Managed)
-        .ok()
-        .flatten()
-        .and_then(|body| String::from_utf8(body).ok())
-        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
-        .is_some_and(|config| {
-            config
-                .get("forced_login_method")
-                .and_then(toml_edit::Item::as_str)
-                == Some("chatgpt")
-        });
-    if !forced {
-        return Err(SlotLoginRefusal::NotForcedChatgpt);
+    let config = ottto_core::read_codex_config_file_secure(home, CodexHomeTrust::Managed);
+    let forced = config.ok().flatten().and_then(|body| {
+        let config: toml_edit::DocumentMut = String::from_utf8(body).ok()?.parse().ok()?;
+        Some(config.get("forced_login_method")?.as_str()? == "chatgpt")
+    });
+    let auth = ottto_core::read_codex_auth_file_secure(home, CodexHomeTrust::Managed);
+    let saved = auth.ok().flatten();
+    let saved = saved.and_then(|auth| serde_json::from_slice::<SavedLogin>(&auth).ok());
+    match saved.filter(|saved| saved.auth_mode.as_deref() == Some("chatgpt")) {
+        _ if forced != Some(true) => CREATOR_NOT_FORCED_CHATGPT,
+        None => CREATOR_MODE_UNREADABLE,
+        Some(saved) if saved.api_key.is_some() || env_api_key => CREATOR_API_KEY,
+        Some(_) => CREATOR_NAMED,
     }
-    let saved = ottto_core::read_codex_auth_file_secure(home, CodexHomeTrust::Managed)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<SavedLogin>(&bytes).ok())
-        .filter(|saved| saved.auth_mode.as_deref() == Some("chatgpt"))
-        .ok_or(SlotLoginRefusal::ModeUnreadable)?;
-    if saved.api_key.is_some() || env_api_key {
-        return Err(SlotLoginRefusal::ApiKey);
-    }
-    Ok(())
 }
 
 pub(crate) fn session_launch_codex_identity(
@@ -24303,113 +24276,6 @@ for line in sys.stdin:
              lapsed default home (control)"
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A registered slot's saved login proves a subscription login only with
-    /// Ottto's forced ChatGPT config, a `chatgpt` auth mode and no API key in
-    /// its auth store or the service's environment. Missing or unreadable
-    /// fields refuse; a null key is no key, any other value is a key.
-    #[test]
-    fn codex_slot_login_requires_forced_chatgpt_mode_and_no_api_key() {
-        use crate::snapshots::codex_slot_naming::SlotLoginRefusal::{
-            ApiKey, ModeUnreadable, NotForcedChatgpt,
-        };
-        let forced = "cli_auth_credentials_store = \"file\"\nforced_login_method = \"chatgpt\"\n";
-        let chatgpt = serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null,
-            "tokens": {"access_token": "synthetic-token"}});
-        let cases = [
-            (
-                "compliant",
-                Some(forced),
-                Some(chatgpt.clone()),
-                false,
-                Ok(()),
-            ),
-            (
-                "env-key",
-                Some(forced),
-                Some(chatgpt.clone()),
-                true,
-                Err(ApiKey),
-            ),
-            (
-                "absent-key",
-                Some(forced),
-                Some(serde_json::json!({"auth_mode": "chatgpt"})),
-                false,
-                Ok(()),
-            ),
-            (
-                "stored-key",
-                Some(forced),
-                Some(serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": "synthetic"})),
-                false,
-                Err(ApiKey),
-            ),
-            (
-                "empty-key",
-                Some(forced),
-                Some(serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": ""})),
-                false,
-                Err(ApiKey),
-            ),
-            (
-                "api-mode",
-                Some(forced),
-                Some(serde_json::json!({"auth_mode": "apikey", "OPENAI_API_KEY": null})),
-                false,
-                Err(ModeUnreadable),
-            ),
-            (
-                "no-mode",
-                Some(forced),
-                Some(serde_json::json!({"OPENAI_API_KEY": null})),
-                false,
-                Err(ModeUnreadable),
-            ),
-            ("no-auth", Some(forced), None, false, Err(ModeUnreadable)),
-            (
-                "not-forced",
-                Some("cli_auth_credentials_store = \"file\"\n"),
-                Some(chatgpt.clone()),
-                false,
-                Err(NotForcedChatgpt),
-            ),
-            (
-                "forced-api",
-                Some("forced_login_method = \"api\"\n"),
-                Some(chatgpt.clone()),
-                false,
-                Err(NotForcedChatgpt),
-            ),
-            (
-                "no-config",
-                None,
-                Some(chatgpt),
-                false,
-                Err(NotForcedChatgpt),
-            ),
-        ];
-        for (label, config, auth, env_api_key, expected) in cases {
-            let home = crate::test_scratch::ScratchDir::canonical(&format!("codex-slot-{label}"));
-            if let Some(config) = config {
-                std::fs::write(home.join("config.toml"), config).expect("config fixture");
-                std::fs::set_permissions(
-                    home.join("config.toml"),
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .expect("config mode");
-            }
-            if let Some(auth) = auth {
-                std::fs::write(home.join("auth.json"), auth.to_string()).expect("auth fixture");
-                std::fs::set_permissions(
-                    home.join("auth.json"),
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .expect("auth mode");
-            }
-            assert_eq!(codex_slot_login(&home, env_api_key), expected, "{label}");
-        }
     }
 
     #[test]

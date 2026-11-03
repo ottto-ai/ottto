@@ -1329,6 +1329,7 @@ fn e2_bound_trace_case(
         "e2-identity-machine",
         &mut bound,
         &[],
+        (&[], &mut [0; 6]),
         &disposition.mixed_uploads,
     );
     if discarded {

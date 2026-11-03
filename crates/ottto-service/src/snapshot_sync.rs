@@ -7980,27 +7980,22 @@ fn finish_sync_source(
         crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
     let cached_codex_login_changed = source == SnapshotSource::Codex
         && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
-    // Read once per Codex scan: registered slots never come from a process-only
-    // or unmapped home, and their login is checked now, at naming time.
-    let mut creator_slot_naming = crate::snapshots::codex_slot_naming::CreatorSlotNaming::new(
-        if source == SnapshotSource::Codex {
-            crate::agent_status::registered_codex_slot_logins()
-        } else {
-            Vec::new()
-        },
-    );
-    let deferred_accounts = index.bind_session_accounts_with_slots(
+    let creator_slots = (source == SnapshotSource::Codex)
+        .then(crate::agent_status::registered_codex_creator_slots)
+        .unwrap_or_default();
+    let codex_diagnostics = scan_result.local_codex_diagnostics.as_mut();
+    let deferred_accounts = index.bind_session_accounts_with_mixed(
         source,
         machine_id,
         &mut scan_result.snapshots,
         &current_codex_bindings,
-        &mut creator_slot_naming,
+        (
+            &creator_slots,
+            codex_diagnostics.map_or(&mut [0; 6], |d| &mut d.creator_slot_naming),
+        ),
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
-    if let Some(diagnostics) = scan_result.local_codex_diagnostics.as_mut() {
-        diagnostics.creator_slot_naming = creator_slot_naming.counts;
-    }
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -25002,6 +24997,7 @@ mod tests {
                         "machine",
                         std::slice::from_mut(item),
                         &[],
+                        (&[], &mut [0; 6]),
                         &proof.mixed_uploads
                     )
                     .is_empty());
@@ -25050,6 +25046,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut candidate),
                 &[],
+                (&[], &mut [0; 6]),
                 &proof.mixed
             )
             .is_empty());
@@ -25128,6 +25125,7 @@ mod tests {
                 "machine",
                 std::slice::from_mut(&mut retry),
                 &[],
+                (&[], &mut [0; 6]),
                 &proof.mixed
             )
             .is_empty());
