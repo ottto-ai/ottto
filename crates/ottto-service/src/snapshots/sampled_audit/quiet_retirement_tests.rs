@@ -2081,7 +2081,10 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
 
 /// [regress] Due audits must not count as content changes or re-stage retired debt.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
     let _clock = Clock::at(START);
     let source = SnapshotSource::Pi;
