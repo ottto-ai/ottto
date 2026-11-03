@@ -1598,17 +1598,32 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
         let fixture = ScanFixture::new(source);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let (index, _, _) = production_scan(
+        let (mut index, _, _) = production_scan(
             &fixture,
             source,
             ScanIndex::default(),
             Some(cache.clone()),
             "account-a",
         );
+        if source == SnapshotSource::Codex {
+            // Under an unchanged scope the Codex head continues: no Full.
+            fixture.file.append(&usage(source, 120, 2, "fixture-model"));
+            let (next, _, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+            assert_eq!(modes, (0, 1, 0), "an unchanged scope continues from Tail");
+            index = next;
+        }
+        #[cfg(unix)]
+        let scope_reconstructions =
+            || crate::snapshots::tail_source::counters::total("tail_reconstruct", "codex_scope");
+        #[cfg(unix)]
+        let before = scope_reconstructions();
         fixture.file.append(&usage(source, 140, 1, "fixture-model"));
         let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "account-b");
         // Claude's head is bound by its destination route, not the account
-        // scope (D131/D134): it continues, with the same body.
+        // scope (D131/D134): it continues, with the same body. A Codex head
+        // keeps main's RAM binding to its scope (TEMPORARY, until the Codex
+        // D134 re-placement rows): a counted `codex_scope` reconstruction.
         assert_eq!(
             modes,
             if source == SnapshotSource::ClaudeCode {
@@ -1616,6 +1631,12 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
             } else {
                 (1, 0, 0)
             }
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            scope_reconstructions() - before,
+            u64::from(source == SnapshotSource::Codex),
+            "{source:?}"
         );
         let (_, full, _) =
             production_scan(&fixture, source, ScanIndex::default(), None, "account-b");
