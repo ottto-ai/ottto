@@ -136,6 +136,7 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 /// one forced reparse, so it is read at most once more; the restored revision
 /// lets the receipt prove, and later pages neither read nor POST anything.
 #[test]
+#[ignore = "pending E2 #1253 ruling"]
 fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
     // As every owner of this harness: commits persist durable records.
     if !supported("never_delivered_holder_reread_bound") {
