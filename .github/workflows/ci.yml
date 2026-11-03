@@ -155,9 +155,10 @@ jobs:
         # --require-pass is the layout coverage receipt: with
         # OTTTO_REQUIRE_LAYOUT=1 that test passes only on a validated layout,
         # and the step fails unless it printed "... ok" (not ignored, not absent).
-        # Queue and dispatch runs re-run up to 3 failed tests alone once; one
-        # that passes then is reported FLAKY and uploaded below. Money suites
-        # and the layout receipt are never retried (scripts/ci_runtime_tests.py).
+        # Queue and dispatch runs re-run up to 3 failed tests alone once (8 min
+        # budget in all); one that passes then is reported FLAKY and uploaded
+        # below. Money suites and the layout receipt are never retried
+        # (scripts/ci_runtime_tests.py).
         run: >-
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1
           --require-pass heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt
@@ -221,8 +222,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -o pipefail
           status=0
           python3 scripts/flaky_tests.py --repo "$GITHUB_REPOSITORY" --annotate | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          # 3 only means a test reached the threshold (warnings above); a gh error fails.
           test "$status" -eq 0 || test "$status" -eq 3
 
   public-surface:

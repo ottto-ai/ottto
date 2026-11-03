@@ -40,7 +40,8 @@ def recent_artifacts(repo: str, since: datetime.datetime) -> list[dict]:
             if artifact["name"].startswith(PREFIX) and not artifact.get("expired"):
                 found.append(artifact)
         if len(artifacts) < 100:
-            break
+            return found
+    print("flaky_tests: stopped after 5000 artifacts; counts may be low", file=sys.stderr)
     return found
 
 

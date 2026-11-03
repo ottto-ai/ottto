@@ -67,9 +67,11 @@
   tells from the diff alone whether a PR needs macOS evidence (exit 10).
 - Merge-queue and dispatch test runs retry flakes; pull-request runs never do.
   `scripts/ci_runtime_tests.py --retry-failed 1` re-runs up to 3 failed tests
-  alone, once each, after the suite. A test that passes then prints `FLAKY`,
+  per job (each Linux shard is a job) alone, once each, after the suite, within
+  an 8 min budget. A test that passes then prints `FLAKY`,
   appears in the step summary and a `flaky-tests-*` artifact, and no longer
-  fails the run. Money suites, the layout receipt and clippy are never retried.
+  fails the run. Money suites (and any module that uses the money oracle), the
+  layout receipt and clippy are never retried, nor is a crashed test binary.
   `mac_batch.py report` lists FLAKY tests without blaming a PR, and a FLAKY
   macOS-only test is not evidence for its PR. The daily `Flaky test report` job
   (`scripts/flaky_tests.py`) warns about any test that was flaky 3 or more times

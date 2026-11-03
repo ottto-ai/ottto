@@ -32,10 +32,12 @@ each failed test alone, one at a time, in a fresh process, after both groups
 have finished (so a #[serial] test still overlaps nothing). A test that passes
 on retry is reported as FLAKY (log line, step summary, --flaky-json) and no
 longer fails the step. Nothing is retried when more than --retry-limit tests
-failed, when a failure cannot be tied to a test name (doc-test, crash, missing
-summary), when a group hung, or when any failed test is never-retry: a money
-suite (NEVER_RETRY_MODULES, or any path segment naming money) or a
---require-pass receipt.
+failed in this job, when a failure cannot be tied to a test name (doc-test,
+crash or signal, missing summary), when a group hung, or when any failed test
+is never-retry: a money suite (NEVER_RETRY_MODULES, any module whose file uses
+the money oracle, any path segment naming money) or a --require-pass receipt.
+Each retry is killed after --retry-timeout, and all of them share
+--retry-budget seconds.
 """
 
 from __future__ import annotations
@@ -66,8 +68,12 @@ SKIPPABLE = re.compile(r"^\s*(?:#\[.*\]|//.*)?\s*$")
 # Cargo's start line for one test binary, and for a crate's doc-tests.
 RUNNING = re.compile(r"^\s*Running (?:unittests )?\S+ \((\S+)\)")
 DOC_TESTS = re.compile(r"^\s*Doc-tests (\S+)")
+# Cargo's line for each test binary that exited non-zero (--no-fail-fast keeps going).
+PROCESS_FAILED = re.compile(r"process didn't exit successfully: `(\S+)[^`]*` \(([^)]*)\)")
+DOCTEST_FAILED = re.compile(r"error: doctest failed")
 SERVICE_LIB = ["-p", "ottto-service", "--lib"]
-# Money suites must fail on the first red; a retry never hides one.
+# Money suites must fail on the first red; a retry never hides one. Every
+# module whose file calls the money oracle is added at startup (oracle_modules).
 NEVER_RETRY_MODULES = frozenset({
     "authority_proof_correction_pipeline_tests",
     "census_convergence_pipeline_tests",
@@ -184,20 +190,44 @@ def require_passed(names: list[str], lines: list[str]) -> list[str]:
     return [f"{name}: did not pass ({results.get(name, 'not run')})" for name in names if results.get(name) != "ok"]
 
 
-def never_retry(name: str, required: set[str]) -> bool:
+def oracle_modules(root: Path) -> set[str]:
+    """Module names of the .rs files under `root` that use the money oracle."""
+    found = set()
+    for path in root.rglob("*.rs"):
+        if "money_oracle" in path.read_text(encoding="utf-8", errors="replace"):
+            found.add(path.parent.name if path.stem in ("mod", "lib", "main") else path.stem)
+    return found
+
+
+def never_retry(name: str, required: set[str], modules: frozenset[str] | set[str] = NEVER_RETRY_MODULES) -> bool:
     segments = name.split("::")
-    return name in required or any(seg in NEVER_RETRY_MODULES or "money" in seg for seg in segments)
+    return name in required or any(seg in modules or "money" in seg for seg in segments)
 
 
 def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     """Failed test names per test binary file name, plus the binaries whose
-    failures cannot be retried by name: a failed doc-test, no summary (crash or
-    abort), or a summary whose failed count differs from its FAILED lines."""
+    failures cannot be retried by name.
+
+    Retryable means: cargo reported the binary exiting with libtest's failure
+    status 101 (not a signal or another code), it printed FAILED names, and its
+    last summary counts exactly those. Anything else is unretriable: a crash or
+    abort, a failed doc-test, a binary that exited non-zero with no FAILED name
+    (a child probe's summary can look clean), FAILED names in a binary cargo did
+    not report as failing, or a count mismatch.
+    """
     failed: dict[str, set[str]] = {}
     summary_failed: dict[str, int] = {}
+    exits: dict[str, str] = {}
+    doctest_failed = False
     current = None
     for raw in lines:
         line = libtest_log.clean(raw)
+        process = PROCESS_FAILED.search(line)
+        if process:
+            exits[Path(process.group(1)).name] = process.group(2)
+            continue
+        if DOCTEST_FAILED.search(line):
+            doctest_failed = True
         running, doc = RUNNING.match(line), DOC_TESTS.match(line)
         if running or doc:
             current = Path(running.group(1)).name if running else f"doc-tests {doc.group(1)}"
@@ -212,16 +242,21 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
         if summary:
             # Tests that re-run their binary print a summary first; the last one wins.
             summary_failed[current] = int(summary.group(2))
-    unretriable = [
+    unretriable = sorted({
         binary for binary, names in failed.items()
-        if binary not in summary_failed
-        or summary_failed[binary] != len(names)
-        or (binary.startswith("doc-tests ") and summary_failed[binary])
-    ]
+        if (names or binary in exits or summary_failed.get(binary)) and (
+            binary not in summary_failed
+            or summary_failed[binary] != len(names)
+            or not names
+            or exits.get(binary) != "exit status: 101"
+            or binary.startswith("doc-tests ")
+        )
+    } | {binary for binary in exits if binary not in failed} | ({"doc-tests"} if doctest_failed else set()))
     return {binary: sorted(names) for binary, names in failed.items() if names}, unretriable
 
 
-def retry_plan(groups, required: set[str], limit: int) -> tuple[list[tuple[str, list[str]]], str | None]:
+def retry_plan(groups, required: set[str], limit: int,
+               modules: frozenset[str] | set[str] = NEVER_RETRY_MODULES) -> tuple[list[tuple[str, list[str]]], str | None]:
     """(test, cargo scope) to retry for (lines, scope_of_binary) groups, or the
     reason to retry nothing."""
     plan = []
@@ -238,15 +273,16 @@ def retry_plan(groups, required: set[str], limit: int) -> tuple[list[tuple[str, 
         return [], "no failed test names in the output"
     if len(plan) > limit:
         return [], f"{len(plan)} tests failed, over the retry limit of {limit}"
-    blocked = sorted(name for name, _ in plan if never_retry(name, required))
+    blocked = sorted(name for name, _ in plan if never_retry(name, required, modules))
     if blocked:
         return [], f"never retried: {', '.join(blocked)}"
     return plan, None
 
 
 def test_binaries(build_output: str) -> dict[str, list[str]]:
-    """Test binary file name -> cargo arguments that select only its target,
-    from `cargo test --no-run --message-format=json*` output."""
+    """Test binary file name -> cargo arguments that run its target from the
+    same `--workspace` build (same features, so no rebuild), from
+    `cargo test --no-run --message-format=json*` output."""
     found: dict[str, list[str]] = {}
     for line in build_output.splitlines():
         try:
@@ -260,8 +296,7 @@ def test_binaries(build_output: str) -> dict[str, list[str]]:
         target = message["target"]
         kinds = set(target["kind"])
         kind = next((k for k in ("bin", "test", "bench", "example") if k in kinds), None)
-        select = [f"--{kind}", target["name"]] if kind else ["--lib"]
-        found[Path(message["executable"]).name] = ["--manifest-path", message["manifest_path"], *select]
+        found[Path(message["executable"]).name] = ["--workspace", *([f"--{kind}", target["name"]] if kind else ["--lib"])]
     return found
 
 
@@ -312,14 +347,23 @@ def record_flaky(flaky: list[tuple[str, int]], path: str | None, shard: tuple[in
 def retry_failures(cargo: str, groups, args, out_lock: threading.Lock, problems: list[str]) -> list[str]:
     """`problems` (group exits) if any failed test of `groups` still fails or
     cannot be retried, plus why; [] if every one passed alone on retry."""
-    plan, reason = retry_plan(groups, set(args.require_pass), args.retry_limit)
+    modules = NEVER_RETRY_MODULES | oracle_modules(Path("crates"))
+    plan, reason = retry_plan(groups, set(args.require_pass), args.retry_limit, modules)
     if reason:
         print(f"ci_runtime_tests: no retry: {reason}", flush=True)
         return problems + [f"no retry: {reason}"]
     flaky, still = [], []
+    deadline = time.monotonic() + args.retry_budget
     for name, scope in plan:
-        attempt = next((k for k in range(1, args.retry_failed + 1)
-                        if retry_alone(cargo, name, scope, args.retry_timeout, out_lock)), None)
+        attempt = None
+        for k in range(1, args.retry_failed + 1):
+            left = min(args.retry_timeout, deadline - time.monotonic())
+            if left <= 0:
+                print(f"ci_runtime_tests: retry budget of {args.retry_budget:.0f} s used up; {name} not retried", flush=True)
+                break
+            if retry_alone(cargo, name, scope, left, out_lock):
+                attempt = k
+                break
         if attempt is None:
             still.append(f"{name}: failed again on {args.retry_failed} retry(s)")
         else:
@@ -453,9 +497,10 @@ def main() -> int:
         help="re-run each failed test alone up to N times; needs --no-fail-fast",
     )
     parser.add_argument("--retry-limit", type=int, default=3, help="retry nothing when more tests failed")
+    parser.add_argument("--retry-timeout", type=float, default=180, help="seconds per retry before it is killed")
     parser.add_argument(
-        "--retry-timeout", type=float, default=300,
-        help="seconds per retry before it is killed (3 retries must fit the job timeout)",
+        "--retry-budget", type=float, default=480,
+        help="seconds for all retries together, so they fit the job timeout",
     )
     parser.add_argument("--flaky-json", metavar="PATH", help="write tests that passed on retry here (only if any)")
     args = parser.parse_args()
@@ -525,7 +570,7 @@ def main() -> int:
     killed = {label for label in ("main group", "serial group")
               if any(problem.startswith(f"{label}: killed") for problem in problems)}
     if args.retry_failed and problems and not killed:
-        # The serial group, and the main group of shares after 1, run SERVICE_LIB only.
+        # The serial group, and the main group of shares after 1, ran SERVICE_LIB only.
         problems = retry_failures(
             cargo,
             [(main_run[2], binaries.get if first else lambda _binary: SERVICE_LIB),

@@ -150,22 +150,41 @@ class RetryTests(unittest.TestCase):
 
     @staticmethod
     def summary(passed, failed):
-        return f'test result: FAILED. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n'
+        state = 'FAILED' if failed else 'ok'
+        return f'test result: {state}. {passed} passed; {failed} failed; 0 ignored; 0 measured; 0 filtered out\n'
+
+    @staticmethod
+    def exited(binary, status='exit status: 101'):
+        return (f"  process didn't exit successfully: `/w/target/debug/deps/{binary} --nocapture --exact` "
+                f'({status})\n')
 
     def plan(self, lines, required=(), limit=3, scope_of=lambda binary: [binary]):
         return runner.retry_plan([(lines, scope_of)], set(required), limit)
 
     def test_failed_names_map_to_their_binary(self):
         lines = [self.LIB, 'test a::one ... FAILED\n', 'test a::two ... ok\n', self.summary(1, 1),
-                 self.CLI, 'test case ... FAILED\n', self.summary(0, 1),
-                 '   Doc-tests ottto_service\n', 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n']
+                 'error: test failed, to rerun pass `-p ottto-service --lib`\n', 'Caused by:\n',
+                 self.exited('ottto_service-89abcdef'),
+                 self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'),
+                 '   Doc-tests ottto_service\n', self.summary(2, 0)]
         self.assertEqual(self.plan(lines), ([('a::one', ['ottto_service-89abcdef']), ('case', ['cli-0123abcd'])], None))
 
     def test_retries_nothing_it_cannot_tie_to_a_name(self):
+        lib_fail = [self.LIB, 'test a::one ... FAILED\n']
+        flaky_one = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd')]
         cases = {
-            'crash': [self.LIB, 'test a::one ... FAILED\n'],
-            'count mismatch': [self.LIB, 'test a::one ... FAILED\n', self.summary(0, 2)],
-            'doc-test': ['   Doc-tests ottto_core\n', self.summary(1, 1)],
+            'crash': lib_fail + [self.exited('ottto_service-89abcdef')],
+            'count mismatch': lib_fail + [self.summary(0, 2), self.exited('ottto_service-89abcdef')],
+            'signal': lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef', 'signal: 11, SIGSEGV')],
+            'no cargo exit line': lib_fail + [self.summary(0, 1)],
+            # A child probe printed a clean summary, then the binary aborted; a
+            # retried flaky test elsewhere must not turn that green.
+            'crash after child summary': [self.LIB, 'running 1 test\n', self.summary(1, 0),
+                                          self.exited('ottto_service-89abcdef', 'signal: 6, SIGABRT')] + flaky_one,
+            'non-zero exit, clean summary': [self.LIB, self.summary(3, 0),
+                                             self.exited('ottto_service-89abcdef')] + flaky_one,
+            'doc-test': ['   Doc-tests ottto_core\n', self.summary(1, 1),
+                         'error: doctest failed, to rerun pass `-p ottto-core --doc`\n'],
             'no names': ['error: could not compile\n'],
         }
         for label, lines in cases.items():
@@ -173,17 +192,19 @@ class RetryTests(unittest.TestCase):
                 plan, reason = self.plan(lines)
                 self.assertEqual(plan, [])
                 self.assertTrue(reason)
-        plan, reason = self.plan([self.LIB, 'test a::one ... FAILED\n', self.summary(0, 1)], scope_of=lambda _b: None)
+        plan, reason = self.plan(lib_fail + [self.summary(0, 1), self.exited('ottto_service-89abcdef')],
+                                 scope_of=lambda _b: None)
         self.assertIn('unknown test binary', reason)
 
     def test_limit_money_and_receipts_are_never_retried(self):
-        four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4)]
+        four = [self.LIB, *[f'test a::t{i} ... FAILED\n' for i in range(4)], self.summary(0, 4),
+                self.exited('ottto_service-89abcdef')]
         self.assertIn('over the retry limit', self.plan(four)[1])
         self.assertEqual(len(self.plan(four, limit=4)[0]), 4)
         for name in ('snapshot_sync::claude_money_e2_pipeline_tests::x', 'snapshots::state_v2_money_tests::y',
                      'a::money_equivalence_tests::m::z', 'layout::receipt'):
             with self.subTest(name):
-                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1)]
+                lines = [self.LIB, f'test {name} ... FAILED\n', self.summary(0, 1), self.exited('ottto_service-89abcdef')]
                 plan, reason = self.plan(lines, required=['layout::receipt'])
                 self.assertEqual(plan, [])
                 self.assertIn('never retried', reason)
@@ -202,10 +223,24 @@ class RetryTests(unittest.TestCase):
             'not json',
         ])
         self.assertEqual(runner.test_binaries(output), {
-            'c-1': ['--manifest-path', '/w/c/Cargo.toml', '--lib'],
-            'cli-2': ['--manifest-path', '/w/c/Cargo.toml', '--test', 'cli'],
-            'tool-3': ['--manifest-path', '/w/c/Cargo.toml', '--bin', 'tool'],
+            'c-1': ['--workspace', '--lib'],
+            'cli-2': ['--workspace', '--test', 'cli'],
+            'tool-3': ['--workspace', '--bin', 'tool'],
         })
+
+    def test_modules_that_use_the_money_oracle_are_never_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'a').mkdir()
+            (root / 'a' / 'route_tests.rs').write_text('use x::money_oracle::assert_equivalent;\n')
+            (root / 'a' / 'mod.rs').write_text('money_oracle::assert_held();\n')
+            (root / 'a' / 'plain_tests.rs').write_text('fn t() {}\n')
+            modules = runner.oracle_modules(root)
+        self.assertEqual(modules, {'route_tests', 'a'})
+        self.assertTrue(runner.never_retry('s::route_tests::x', set(), modules))
+        self.assertFalse(runner.never_retry('s::plain_tests::x', set(), modules))
+        source = SCRIPT.parent.parent / 'crates'
+        self.assertIn('copy_prefix_route_tests', runner.oracle_modules(source))
 
     def test_retry_passes_kills_on_timeout_and_reports(self):
         lock = threading.Lock()
