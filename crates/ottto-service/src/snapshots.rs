@@ -19676,10 +19676,6 @@ impl SnapshotAccumulator {
         reasoning_effort: Option<String>,
         computed_effective_input_context: Option<u64>,
     ) {
-        self.claude_file_birth.observe_response_writer(
-            value.get("version").and_then(Value::as_str),
-            timestamp.as_deref(),
-        );
         let tool_uses = claude_response_tool_uses(value);
         let cache_slot = claude_cache_request_slot(
             value,
@@ -20500,9 +20496,9 @@ impl SnapshotAccumulator {
                     .map_or(0, String::capacity),
             )?;
         let path_text = path.as_os_str().len();
-        // The twin's index key (lossy text of a path no longer than
-        // PATH_MAX) beside `original_witness`' own key and member; or
-        // the fork parent's key with its path and lossy copies.
+        // The copy's folder key (lossy text of its parent directory, no
+        // longer than PATH_MAX) with its path and lossy copies, beside the
+        // fork parent's key with its path and lossy copies.
         let proof = usize::try_from(libc::PATH_MAX)
             .ok()?
             .checked_mul(3)?

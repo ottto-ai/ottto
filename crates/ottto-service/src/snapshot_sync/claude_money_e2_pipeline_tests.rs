@@ -998,6 +998,8 @@ fn ready(
 }
 
 /// [money] Cumulative acquisition modes and an independent cold read preserve all money fields.
+/// The pre-birth line has no earlier holder of another session in its
+/// folder, so it counts (flagged) on every route: none of them removes it.
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
     with_e2(|| {
@@ -1019,16 +1021,17 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         let mut tail = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(tail.modes, (0, 1, 0));
         literal(&tail);
-        assert_eq!(total(&tail), 1);
-        assert_eq!(tail.scan.snapshots[0].removed_request_count, Some(1));
+        assert_eq!(total(&tail), 2, "the unproven copied line and r2");
+        assert_eq!(tail.scan.snapshots[0].removed_request_count, Some(0));
         assert_eq!(
             tail.scan.snapshots[0]
                 .removed_usage
                 .as_ref()
                 .unwrap()
                 .input_tokens,
-            10
+            0
         );
+        assert_eq!(tail.scan.snapshots[0].input_tokens, 30);
         let full = ready(&c, &E2ScanFixture::default(), prior, 100, true);
         assert_mode(full.modes, (1, 0, 0));
         assert_eq!(
@@ -1099,8 +1102,8 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
             canonical(&unchanged.scan.snapshots),
             canonical(&oracle.scan.snapshots)
         );
-        assert_eq!(total(&unchanged), 1);
-        assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(1));
+        assert_eq!(total(&unchanged), 2);
+        assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(0));
         scanner.evict(&prior);
         let evicted = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(evicted.modes, (1, 0, 0));
@@ -1149,29 +1152,30 @@ fn mutation_case(kind: &str) {
         let actual = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(actual.modes, (1, 0, 0));
         literal(&actual);
-        assert_eq!(actual.scan.snapshots[0].removed_request_count, Some(1));
+        // No earlier holder of another session: the copied line counts.
+        assert_eq!(actual.scan.snapshots[0].removed_request_count, Some(0));
         assert_eq!(
             actual.scan.snapshots[0]
                 .removed_usage
                 .as_ref()
                 .unwrap()
                 .input_tokens,
-            11
+            0
         );
         let oracle = ready(&c, &E2ScanFixture::default(), prior, 100, true);
         assert_eq!(
             canonical(&actual.scan.snapshots),
             canonical(&oracle.scan.snapshots)
         );
-        assert_eq!(total(&actual), if kind == "truncate" { 1 } else { 2 });
+        assert_eq!(total(&actual), if kind == "truncate" { 2 } else { 3 });
         assert_eq!(
             actual.scan.snapshots[0].input_tokens,
             if kind == "truncate" {
-                10
+                21
             } else if kind == "same-size" {
-                40
+                51
             } else {
-                30
+                41
             }
         );
     });
@@ -1226,10 +1230,12 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
     });
 }
 
+/// [money] A move keeps its birth through save and reload: the moved path
+/// inherits the original's cutoff and counts its request once.
 #[test]
-fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
+fn e2_pipeline_birth_store_survives_save_reload_and_move() {
     with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-move-copy");
+        let mut c = Corpus::new("e2-pipeline-move");
         let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
@@ -1238,30 +1244,14 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
         let before = birth_store_bytes(&first.index);
         let prior = c.reload(&mut first.index);
         assert_eq!(before, birth_store_bytes(&prior));
-        let moved = c.write_at(
+        c.write_at(
             &format!("moved/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:01:00Z",
         );
         std::fs::remove_file(&original).unwrap();
-        let mut moved_page = ready(&c, &scanner, prior, 100, false);
+        let moved_page = ready(&c, &scanner, prior, 100, false);
         assert_eq!(total(&moved_page), 1, "a move inherits the original cutoff");
-        moved_page.finish();
-        let prior = c.reload(&mut moved_page.index);
-        c.write_at(
-            &format!("copy/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
-        );
-        assert!(moved.is_file());
-        let copy = ready(&c, &scanner, prior, 100, false);
-        literal(&copy);
-        assert_eq!(
-            total(&copy),
-            2,
-            "restart/move must not make copied r1 count twice"
-        );
-        assert_eq!(copy.scan.snapshots[0].removed_request_count, Some(1));
     });
 }
 
@@ -1282,10 +1272,12 @@ fn twins(reverse: bool) {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
+        // The copy's own turns start after the copy proof cutoff: the
+        // same-session page proof removes r1 when both twins are read.
         c.write_at(
             &format!("{new_dir}/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
@@ -1325,7 +1317,8 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
-/// Today's Claude Code versions are not on `KNOWN_COPY_WRITERS`.
+/// A current Claude Code version. No writer version decides a copy: every
+/// copied prefix takes request-id proof.
 const UNLISTED_WRITER: &str = "2.1.316";
 /// One page's bodies as finished and sent.
 fn sent_money(page: &Page) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
@@ -1606,10 +1599,11 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
+        // Own turns from the copy proof cutoff on: the page proof dedupes r1.
         let twin = c.write_at(
             &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut complete = ready(&c, &scanner, ScanIndex::default(), 100, false);
@@ -1627,7 +1621,7 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
             .append(true)
             .open(&twin)
             .unwrap()
-            .write_all(line(ROOT, "r3", "2026-08-02T07:04:00Z", 30).as_bytes())
+            .write_all(line(ROOT, "r3", "2026-11-04T07:04:00Z", 30).as_bytes())
             .unwrap();
         let mut page = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&twin));
         page.enrich(&c);
@@ -1664,10 +1658,11 @@ fn e2_pipeline_paced_twin_does_not_force_its_family() {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
+        // Own turns from the copy proof cutoff on: the page proof dedupes r1.
         let twin = c.write_at(
             &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut index = ScanIndex::default();
@@ -1693,7 +1688,7 @@ fn e2_pipeline_paced_twin_does_not_force_its_family() {
         }
         assert_eq!(reads.last(), Some(&0), "both twins settled: {reads:?}");
         let indexed = indexed_size(&index, &twin);
-        append(&twin, &line(ROOT, "r3", "2026-08-02T07:04:00Z", 30));
+        append(&twin, &line(ROOT, "r3", "2026-11-04T07:04:00Z", 30));
         for paced in [true, false] {
             let owed = owe_claimed_growth(&index, &c.base, &twin, paced);
             let mut page = c.raw(&scanner, owed, 100, false, std::slice::from_ref(&twin));
@@ -1724,6 +1719,10 @@ fn e2_pipeline_paced_twin_does_not_force_its_family() {
     });
 }
 
+/// [money] An all-pre-birth path twin has no own turn, so nothing proves
+/// its copy: both paths count r1 (flagged) on the first page. After the
+/// original is deleted, the survivor keeps its stored body and, once it
+/// changes, still counts r1 once and its own new turn.
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
     with_e2(|| {
@@ -1739,8 +1738,17 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
             "2026-08-02T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
+        e2::take_diag();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(total(&first), 1);
+        assert_eq!(
+            total(&first),
+            2,
+            "an unproven twin copy counts on both paths"
+        );
+        assert!(
+            copy_diag(&["copy_prefix_unproven"])[0] > 0,
+            "the unproven twin copy is flagged"
+        );
         first.finish();
         let prior = c.reload(&mut first.index);
         std::fs::remove_file(original).unwrap();
@@ -1770,45 +1778,15 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
     });
 }
 
+/// [money] A resumed branch whose original (another session in its folder)
+/// was delivered on an earlier page removes exactly its copied request, by
+/// request id, and keeps its own turn.
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch");
         c.root(ROOT, &line(ROOT, "r1", AT, 10));
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:03:10Z", 0)),
-            "2026-08-02T07:03:00Z",
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        assert_eq!(
-            p.scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
-            10,
-            "original tokens only (own branch response has zero input/output)"
-        );
-        let removed = p
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| s.removed_request_count.unwrap_or(0))
-            .sum::<u64>();
-        assert!(
-            removed > 0,
-            "copy_skipped must be positive for deliberate branch"
-        );
-        let copied = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == COPY)
-            .unwrap();
+        let scanner = E2ScanFixture::default();
         let tuple = |s: &SnapshotItem| {
             (
                 s.request_count,
@@ -1819,16 +1797,35 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
                 s.cache_creation_1h_tokens,
             )
         };
-        let root = p
-            .scan
-            .snapshots
-            .iter()
-            .find(|s| s.source_session_id == ROOT)
-            .unwrap();
+        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        literal(&original);
+        let root = body(&original, ROOT).expect("the original publishes");
         assert_eq!(tuple(root), (1, 10, 10, 3, 5, 2));
-        assert_eq!(tuple(copied), (1, 0, 0, 3, 5, 2));
-        assert_eq!(copied.removed_request_count, Some(1));
         assert_eq!(root.removed_request_count, Some(0));
+        original.finish();
+        let prior = c.reload(&mut original.index);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:03:10Z", 0)),
+            "2026-08-02T07:03:00Z",
+        );
+        let p = ready(&c, &scanner, prior, 100, false);
+        literal(&p);
+        let copied = body(&p, COPY).expect("the branch publishes");
+        assert_eq!(
+            tuple(copied),
+            (1, 0, 0, 3, 5, 2),
+            "own branch response only (zero input/output)"
+        );
+        assert_eq!(
+            copied.removed_request_count,
+            Some(1),
+            "copy_skipped must be positive for deliberate branch"
+        );
+        if let Some(root) = body(&p, ROOT) {
+            assert_eq!(tuple(root), (1, 10, 10, 3, 5, 2));
+            assert_eq!(root.removed_request_count, Some(0));
+        }
         let removed = copied.removed_usage.as_ref().unwrap();
         assert_eq!(
             (
@@ -2043,6 +2040,19 @@ fn retry_case(conflict: bool) {
         } else {
             "e2-pipeline-retry-clean"
         });
+        // An earlier session in the same folder holds the copied request; its
+        // page is delivered first, so the root's copied prefix is removed by
+        // request id on its first read and after the restart alike.
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "copied", "2026-08-02T06:58:00Z", 11),
+            "2026-08-02T06:57:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut holder = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        assert_eq!(total(&holder), 1);
+        holder.finish();
+        let committed = c.reload(&mut holder.index);
         let prefix = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11);
         let a = line(ROOT, "conflict", AT, 2);
         let b = a.replace("claude-haiku-4-5", "claude-sonnet-4-5");
@@ -2052,8 +2062,6 @@ fn retry_case(conflict: bool) {
             &(prefix + &conflict_lines + &line(ROOT, "own", AT, 20)),
         );
         c.agent(0, &line(ROOT, "agent", AT, 5));
-        let scanner = E2ScanFixture::default();
-        let committed = ScanIndex::default();
         let mut p = ready(&c, &scanner, committed.clone(), 100, false);
         literal(&p);
         let root = p
@@ -2314,6 +2322,11 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
     });
 }
 
+/// [money] Restored same-session path twins, every line pre-birth: no own
+/// turn, so no request-id proof (another session's holder or the page
+/// proof). Both paths count r1 and disclose it, in either discovery order
+/// and for equal births; an unchanged repeated page emits nothing, and a
+/// later turn counts once.
 fn restored_twins(reverse: bool, equal: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
@@ -2347,8 +2360,13 @@ fn restored_twins(reverse: bool, equal: bool) {
         literal(&first);
         assert_eq!(
             total(&first),
-            1,
-            "all-prebirth restored twins must count once on their first page"
+            2,
+            "unproven all-prebirth restored twins count on both paths"
+        );
+        assert!(
+            e2::pipeline_test_observer::disclosed(&first.scan.snapshots) + first.released.disclosed
+                > 0,
+            "the unproven twin copy is disclosed"
         );
         first.finish();
         let stored = stored_bodies(&first.index);
@@ -2372,7 +2390,7 @@ fn restored_twins(reverse: bool, equal: bool) {
         literal(&changed);
         assert_eq!(
             total(&changed),
-            2,
+            3,
             "restart and repeated page cannot change the total; the new response counts once"
         );
     });
@@ -2433,10 +2451,11 @@ fn e2_pipeline_first_twin_group_above_byte_budget_preserves_complete_history() {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
+        // Own turns from the copy proof cutoff on: the page proof dedupes r1.
         c.write_at(
             &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
@@ -2631,10 +2650,12 @@ fn rewritten_original(reverse: bool) {
             &line(ROOT, "h1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
+        // Own turns from the copy proof cutoff on: the page proof removes h1
+        // only while the original still holds it.
         c.write_at(
             &format!("{new_dir}/{ROOT}.jsonl"),
-            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
@@ -2692,7 +2713,9 @@ fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() 
 
 /// Restored same-session histories H1
 /// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
-/// the first page in either discovery order and through settlement.
+/// the first page in either discovery order and through settlement. H2, the
+/// later history's first response its twin lacks, is after the copy proof
+/// cutoff, so the same-session page proof removes H1 from it.
 fn overlapping_restored(reverse: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-overlap-restored-{reverse}"));
@@ -2708,8 +2731,8 @@ fn overlapping_restored(reverse: bool) {
         );
         c.write_at(
             &format!("{b}/{ROOT}.jsonl"),
-            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "h2", "2026-08-02T07:00:20Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "h2", "2026-11-04T07:00:20Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
@@ -3053,8 +3076,10 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
 /// The legacy fork-prefix exclusion and the `e2` copy
 /// skip never both remove a copied request. A legacy fork child whose
 /// leading request telemetry assigns to its parent, with a divergent parent
-/// prefix (the exclusion's exact shape, derived on this page), publishes
-/// that request removed exactly once and counts every other request once.
+/// prefix (the exclusion's exact shape, derived on this page), counts every
+/// request once. Read with its parent on a fresh page, the shared request
+/// waits for the parent's acceptance (counted by the parent alone); once the
+/// parent's page is delivered, the child publishes it removed exactly once.
 #[test]
 fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
     with_e2(|| {
@@ -3097,14 +3122,26 @@ fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
         let copy = body(&p, COPY).expect("the child publishes");
         assert_eq!(
             (copy.request_count, copy.removed_request_count),
-            (1, Some(1)),
-            "the shared request is removed once, by the E2 copy rule only"
+            (1, Some(0)),
+            "the shared request waits for its unaccepted parent, never removed twice"
         );
         assert_eq!(
             body(&p, ROOT).expect("the parent publishes").request_count,
             2
         );
         assert_eq!(total(&p), 3, "every request counts exactly once");
+        let prior = settle(&c, &ScanIndex::default(), p, &mut e2_progress());
+        let decided = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&decided);
+        let copy = body(&decided, COPY).expect("the held prefix is decided again");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (1, Some(1)),
+            "the shared request is removed once, by the E2 copy rule only"
+        );
+        if let Some(parent) = body(&decided, ROOT) {
+            assert_eq!(parent.request_count, 2);
+        }
     });
 }
 
@@ -3433,6 +3470,9 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
     }
+    mod copy_route_oracle_tests {
+        include!("copy_route_oracle_tests.rs");
+    }
     #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
@@ -3650,8 +3690,8 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
 }
 
 // Copy-family fix: resumed
-// files written by Claude Code versions outside the writer allowlist, with
-// turns of their own after the copied prefix (the demo 2026-08-12 shape).
+// files of any Claude Code version, with turns of their own after the
+// copied prefix (the demo 2026-08-12 shape).
 const THIRD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const OLD_WRITER: &str = "2.1.222";
 const RESUME_WRITER: &str = "2.1.229";
@@ -4027,42 +4067,9 @@ fn e2_pipeline_resumed_copy_without_proof_or_stored_removal_counts_flagged() {
     }
 }
 
-#[test]
-fn e2_pipeline_certified_resume_keeps_its_timestamp_skip() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-copy-family-certified");
-        let mut progress = e2_progress();
-        let certified =
-            |(request, at, _): (&'static str, &'static str, &'static str)| (request, at, "2.1.309");
-        c.root(ROOT, &resumed(ROOT, &[certified(A), certified(B)]));
-        let old = ScanIndex::default();
-        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
-        let prior = settle(&c, &old, original, &mut progress);
-        c.write_at(
-            &file(COPY),
-            &resumed(COPY, &[certified(A), certified(B), certified(C)]),
-            "2026-08-02T07:03:00Z",
-        );
-        e2::take_diag();
-        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&page);
-        let copy = body(&page, COPY).expect("the resume publishes");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (1, Some(2))
-        );
-        assert_eq!(
-            copy_diag(&PREFIX_KEYS),
-            [0; 5],
-            "no request-id walk, no store, no flag"
-        );
-        assert!(page.index.claude_copy_removals.is_empty());
-    });
-}
-
 /// [money] #964 proof target (audited resumed main files counted their
 /// copied requests twice).
-/// The shape: a resumed main file with an uncertified writer, own turns in
+/// The shape: a resumed main file of any writer version, own turns in
 /// later hours and its holder in an earlier accepted member. Its re-read of
 /// the same bytes removes exactly the copied requests; every token counter is
 /// conserved (kept + removed = the released body), the own turns
@@ -4254,8 +4261,13 @@ fn e2_pipeline_lossy_absence_never_invalidates_a_stored_removal() {
     });
 }
 
+/// [money] Forward-only: an accepted copy settled with its prefix removed
+/// before the copy proof cutoff keeps that removal when its saved removal
+/// metadata is lost (absent or damaged), even when no census proves it any
+/// more; re-counting would re-emit a larger body than the one accepted. Own
+/// turns publish without delay.
 #[test]
-fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying_own_turns() {
+fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
     for missing in [false, true] {
         for retired in [false, true] {
             with_e2(|| {
@@ -4283,18 +4295,16 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
                 e2::take_diag();
                 let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
                 let third = body(&page, THIRD).expect("own turns always publish");
+                let case = format!("missing {missing} retired {retired}");
                 assert_eq!(
                     (third.request_count, third.removed_request_count),
-                    if retired { (5, Some(0)) } else { (2, Some(3)) }
+                    (2, Some(3)),
+                    "{case}"
                 );
-                // An absent field reads as an empty store, never lost.
                 assert_eq!(
                     copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
-                    if retired {
-                        [3, if missing { 0 } else { 3 }]
-                    } else {
-                        [0, 0]
-                    }
+                    [0, 0],
+                    "{case}: nothing flagged"
                 );
             });
         }
@@ -5079,7 +5089,9 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
 /// sum into the first item's body, so a copied-marker loan recorded only by a
 /// later twin (its own later turn) must reach the copy-derived selection too.
 /// Copy-prefix dedupe tombstones every released row X lent, whichever twin
-/// lent it.
+/// lent it. Each twin's folder holds its own accepted origin of request a,
+/// another session delivered before the twins are read (a copied prefix is
+/// proven only by such a holder in the copy's folder).
 #[test]
 fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
     for retained in [false, true] {
@@ -5089,7 +5101,13 @@ fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
             };
             let mut c = Corpus::new("e2-pipeline-copy-derived-twins");
             let scanner = E2ScanFixture::capturing_identity();
-            c.root(ROOT, &resumed(ROOT, &[A]));
+            for (folder, origin) in [("a-first", ROOT), ("z-twin", THIRD)] {
+                c.write_at(
+                    &format!("{folder}/{origin}.jsonl"),
+                    &resumed(origin, &[A]),
+                    "2026-08-02T07:00:00Z",
+                );
+            }
             let old = ScanIndex::default();
             let page = ready(&c, &scanner, old.clone(), 100, false);
             let prior = settle(&c, &old, page, &mut e2_progress());
