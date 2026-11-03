@@ -73,7 +73,7 @@ impl ColdReplay {
         let scope = Scope("integrated-file".into());
         let namespace = Scope("integrated-store".into());
         let (reduction, checkpoint) = counted_codex_record_of(&path, &scope);
-        let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+        let body = codec::encode(&reduction, store::BODY_BYTES).unwrap();
         assert_eq!(
             codec::decode(&body, SnapshotSource::Codex)
                 .unwrap()

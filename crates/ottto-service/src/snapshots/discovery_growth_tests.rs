@@ -545,10 +545,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         let start = plan.start_offset();
         assert_eq!(start, entry.size_bytes);
         let len = candidate.size_bytes - start;
-        let mut reader = BoundedJsonlReader::new(BufReader::new(file), 1024 * 1024, false);
+        let mut reader = BoundedJsonlReader::new(BufReader::new(file));
         reader.set_extent_limit(len);
         reader.acquisition = Some(plan);
-        while let JsonlReaderStep::Line | JsonlReaderStep::Partial = reader
+        while let JsonlReaderStep::Line = reader
             .step(|_| panic!("unterminated fragment must remain withheld"))
             .unwrap()
         {}

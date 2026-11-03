@@ -459,10 +459,11 @@ fn never_counted_records_are_recognised_at_the_top_level_only() {
 }
 
 #[test]
-fn line_reader_reads_to_length_at_open_and_guards_long_lines() {
+/// [behaviour] Whole lines are retained; a frozen partial line resumes from its start.
+fn line_reader_reads_whole_lines_to_length_at_open() {
     let dir = scratch("composition-v2-reader");
     let path = dir.join("lines.jsonl");
-    let long = "x".repeat(40);
+    let long = "x".repeat(16 * 1024 * 1024 + 1);
     fs::write(&path, format!("a\n{long}\nb\npartial")).unwrap();
     let len = fs::metadata(&path).unwrap().len();
     let collect = |reader: &mut LineReader| {
@@ -470,24 +471,22 @@ fn line_reader_reads_to_length_at_open_and_guards_long_lines() {
         while let Some(event) = reader.next_event().unwrap() {
             out.push(match event {
                 LineEvent::Line(line) => String::from_utf8(line.to_vec()).unwrap(),
-                LineEvent::TooLong => "<too long>".to_string(),
             });
         }
         out
     };
-    let mut reader = LineReader::with_guard(File::open(&path).unwrap(), 0, len, false, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["a", "<too long>", "b"]);
+    let mut reader = LineReader::open(File::open(&path).unwrap(), 0, len, false).unwrap();
+    assert_eq!(collect(&mut reader), ["a", long.as_str(), "b"]);
     // The partial last line stays unread.
     assert_eq!(reader.position(), len - "partial".len() as u64);
 
-    // A long line cut by the length at open keeps skipping in the next read.
-    let mut reader = LineReader::with_guard(File::open(&path).unwrap(), 0, 20, false, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["a", "<too long>"]);
-    assert!(reader.skipping());
+    // A long line cut by the length at open remains unread for the next read.
+    let mut reader = LineReader::open(File::open(&path).unwrap(), 0, 20, false).unwrap();
+    assert_eq!(collect(&mut reader), ["a"]);
+    assert!(!reader.skipping());
     let resume = reader.position();
-    let mut reader =
-        LineReader::with_guard(File::open(&path).unwrap(), resume, len, true, 16).unwrap();
-    assert_eq!(collect(&mut reader), ["b"]);
+    let mut reader = LineReader::open(File::open(&path).unwrap(), resume, len, false).unwrap();
+    assert_eq!(collect(&mut reader), [long.as_str(), "b"]);
     fs::remove_dir_all(dir).unwrap();
 }
 
