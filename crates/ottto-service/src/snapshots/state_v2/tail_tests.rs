@@ -1213,3 +1213,42 @@ pub(crate) fn stage_tail_for_test(path: &Path) {
 pub(crate) fn tail_published_for_test(index: &ScanIndex) -> bool {
     read(index, FILE).is_ok_and(|(head, _)| head.is_some())
 }
+
+/// Every Tail kind a Claude file can hold, through the real route on the live
+/// session at `path`: a head of `canary`, a session-facts page past one
+/// fragment that starts with it, one revision of it and a sibling's set-aside
+/// marker. One full save commits them.
+pub(crate) fn seed_tail_kinds_for_test(path: &Path, index: &mut ScanIndex, canary: &str) {
+    let mut facts = canary.as_bytes().to_vec();
+    facts.extend(long_value());
+    stage_tail(
+        path,
+        FILE,
+        staged(canary.as_bytes(), &[(Collection::SessionFacts, 0, &facts)]),
+    )
+    .unwrap();
+    observe_tail(path, FILE, observation(&[canary.as_bytes()])).unwrap();
+    set_aside_tail(path, SIBLING, SetAsideCause::Encode).unwrap();
+    save_locked(path, index, false, None, true).unwrap();
+}
+/// Rows of each Tail kind in the store behind `index`, every file.
+pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for name in catalogue::TAIL_KINDS {
+            let kind = RecordKind::parse(name).unwrap();
+            let (mut count, mut after) = (0, None);
+            loop {
+                let rows = tx.scan_kind(&kind, after.as_ref(), 128).unwrap();
+                let Some(last) = rows.last() else {
+                    break;
+                };
+                after = Some(last.key.clone());
+                count += rows.len();
+            }
+            counts.insert(*name, count);
+        }
+    });
+    counts
+}

@@ -1363,6 +1363,51 @@ pub(crate) fn erase_source(
     Ok(())
 }
 
+/// Account removal: every Tail row of the route at `path`, of any file and
+/// kind, debt included, in one Tail-only commit; then a TRUNCATE checkpoint,
+/// so no removed value stays in the WAL (`secure_delete` zeroes freed pages).
+/// Graph, index and census rows stay. Live sessions close first, as erasure's
+/// do; the next load reopens the store. `Ok(false)`: no store at `path`.
+pub(crate) fn erase_tail_rows(path: &Path) -> Result<bool> {
+    let Some(binding) = binding(path) else {
+        return Ok(false);
+    };
+    if !fence::exists(&fence::sibling(path, ".v2.sqlite"))? {
+        return Ok(false);
+    }
+    let _owner = super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        with_state(path, |state| {
+            let Some((identity, db_path)) = fence::reconcile(path, &binding, state.latched)? else {
+                return Ok(false);
+            };
+            state.latched = true;
+            state.save_digests = None;
+            state.tail = Default::default();
+            let current = state.current.take();
+            let live = state.runtimes.drain(..).filter_map(|r| r.upgrade());
+            for runtime in live.chain(current) {
+                runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .take();
+            }
+            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
+            let expected = db.stamp()?.0;
+            super::ack::ProgressRecovery::recover_route_locked(&identity, expected, path, owner)?;
+            let every = tail::TailStage::erase_every();
+            tail::commit_exit(&mut db, &identity, expected, &every)?;
+            let checkpoint = db.checkpoint(CheckpointMode::IdleReclaim);
+            ensure!(
+                checkpoint.state == CheckpointState::Complete,
+                Hold::DbUnavailable
+            );
+            Ok(true)
+        })
+    })
+}
+
 pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
     telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
@@ -1691,5 +1736,6 @@ pub(super) mod tail_route;
 mod tail_tests;
 #[cfg(test)]
 pub(crate) use tail_tests::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
+    seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
+    tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };

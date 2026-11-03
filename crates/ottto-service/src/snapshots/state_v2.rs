@@ -18,7 +18,8 @@ mod fence;
 mod import;
 mod runtime;
 pub(crate) use runtime::{
-    erase_source, remove_retired_record_dir, retired_record_dir, source_erasure_alarm,
+    erase_source, erase_tail_rows, remove_retired_record_dir, retired_record_dir,
+    source_erasure_alarm,
 };
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
@@ -590,7 +591,8 @@ mod money_fault_tests;
 pub(super) mod money_test_support;
 #[cfg(test)]
 pub(crate) use runtime::{
-    seed_tail_literals_for_test, stage_tail_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
+    seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
+    tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
 // Growth receipts attest confirmed DB custody, independently of the root fence.
 pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};

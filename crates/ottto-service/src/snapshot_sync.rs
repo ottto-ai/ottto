@@ -12928,6 +12928,15 @@ pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: Snaps
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
 }
 
+/// `Some(consecutive failures)` while a login-address erase is owed.
+#[cfg(test)]
+pub(crate) fn login_address_erase_owed_for_test(support_dir: &Path) -> Option<u32> {
+    let marker = login_address_erase_marker(support_dir);
+    marker
+        .exists()
+        .then(|| source_erasure_turn().get(&marker).copied().unwrap_or(0))
+}
+
 fn login_address_erase_marker(support_dir: &Path) -> PathBuf {
     snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
         .with_file_name("claude-login-addresses.erase-owed")
@@ -12944,9 +12953,10 @@ pub(crate) fn owe_login_address_erase(support_dir: &Path) -> Result<()> {
     write_source_marker(&marker, "pending")
 }
 
-/// One attempt per owed erase. Only retained parses and durable-tail records
-/// hold an address digest: the folder ledger holds none, and the rest of the
-/// index stays so the account's history is not replayed.
+/// One attempt per owed erase. Only retained parses and Claude's Tail rows (a
+/// head's org markers) hold an address digest: the folder ledger holds none,
+/// and the rest of the index stays so the account's history is not replayed.
+/// The marker clears only once every route's erase succeeded.
 fn erase_owed_login_addresses(
     support_dir: &Path,
     cache: &crate::snapshots::sampled_scan::SharedCache,
@@ -12959,7 +12969,7 @@ fn erase_owed_login_addresses(
     }
     crate::claude_status_coverage::forget_addresses();
     cache.forget_retained_transcripts();
-    let erased = erase_claude_durable_tails(support_dir).and_then(|()| {
+    let erased = erase_claude_tail_rows(support_dir).and_then(|()| {
         std::fs::remove_file(&marker)?;
         sync_progress_parent(&marker)
     });
@@ -12970,7 +12980,10 @@ fn erase_owed_login_addresses(
     }
 }
 
-fn erase_claude_durable_tails(support_dir: &Path) -> Result<()> {
+/// Every Claude store's Tail rows, stable and in each destination namespace,
+/// and any retired restart-record directory beside them. Every route is tried;
+/// the first error is returned.
+fn erase_claude_tail_rows(support_dir: &Path) -> Result<()> {
     let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
     let family = stable.file_stem().and_then(|stem| stem.to_str());
     let family = family.context("source_erasure_family")?;
@@ -12987,27 +13000,35 @@ fn erase_claude_durable_tails(support_dir: &Path) -> Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    let mut failed = None;
     for parent in parents {
         let entries = match std::fs::read_dir(&parent) {
             Ok(entries) => entries,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
+        let mut stores = Vec::new();
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(family) && name.ends_with(".durable-tail") {
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                } else {
-                    std::fs::remove_file(entry.path())?;
-                }
+            if !name.starts_with(family) {
+                continue;
+            }
+            if let Some(index) = name.strip_suffix(".v2.sqlite") {
+                stores.push(parent.join(index));
+            } else if name.ends_with(".durable-tail") {
+                crate::snapshots::state_v2::remove_retired_record_dir(&entry.path())?;
+            }
+        }
+        for index in stores {
+            if let Err(error) = crate::snapshots::state_v2::erase_tail_rows(&index) {
+                failed.get_or_insert(error);
             }
         }
         sync_progress_parent(&parent.join("erased"))?;
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// A source's caches outside `snapshots`, with their temp copies.

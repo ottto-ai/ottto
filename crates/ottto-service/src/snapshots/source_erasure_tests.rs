@@ -1,9 +1,9 @@
 //! Per-source local erasure: synthetic transcripts and canary files only.
 use super::*;
 use crate::snapshot_sync::{
-    detected_uses_cache_path, disable_snapshot_source, enabled_snapshot_sources_in,
-    erase_disabled_sources, reconnect_snapshot_source, source_erasure_failures_for_test,
-    source_marker,
+    detected_uses_cache_path, disable_snapshot_source, disable_sources_dropped_from_grant,
+    enabled_snapshot_sources_in, erase_disabled_sources, login_address_erase_owed_for_test,
+    reconnect_snapshot_source, source_erasure_failures_for_test, source_marker,
 };
 use ottto_core::LocalDeviceBinding;
 use std::os::unix::fs::PermissionsExt;
@@ -157,9 +157,13 @@ pub(super) fn cold_full(
 }
 
 fn progress_bytes() -> Vec<u8> {
+    progress_for(&NAMESPACE.repeat(64))
+}
+
+fn progress_for(namespace: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "schema_version": 3,
-        "destination_namespace_hash": NAMESPACE.repeat(64),
+        "destination_namespace_hash": namespace,
     }))
     .unwrap()
 }
@@ -485,6 +489,14 @@ fn account_removal_erase_clears_the_login_address_only() {
         .into_iter()
         .partition(|path| path.to_string_lossy().ends_with(".durable-tail"));
     assert_eq!(tails.len(), 1);
+    // A canary named as a store is no store: the erase cannot open it and keeps
+    // its marker. Real stores: `login_address_erase_removes_claude_tail_rows`.
+    let (stores, kept): (Vec<_>, Vec<_>) = kept
+        .into_iter()
+        .partition(|path| path.to_string_lossy().ends_with(".v2.sqlite"));
+    for store in &stores {
+        fs::remove_file(store).unwrap();
+    }
     tails.push(stable);
     let other = f.canaries(SnapshotSource::Codex);
 
@@ -498,4 +510,226 @@ fn account_removal_erase_clears_the_login_address_only() {
     hold_login_address_state(&f);
     assert_eq!(f.erase(SnapshotSource::ClaudeCode), 0);
     assert!(crate::claude_status_coverage::address_digest(LOGIN_ADDRESS).is_some());
+}
+
+const TAIL_CANARY: &str = "LOGIN-ADDRESS-TAIL-CANARY-20261103";
+const CLAUDE_INDEX: &str = "claude_code-scan-index-v3.json";
+
+/// The store's database, WAL and shared-memory files.
+fn store_files(path: &Path) -> [PathBuf; 3] {
+    let db = path.with_file_name(format!(
+        "{}.v2.sqlite",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let sidecar = |suffix: &str| {
+        let mut name = db.clone().into_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    [sidecar("-wal"), sidecar("-shm"), db]
+}
+
+/// Whether any of the store's files holds `needle` in the clear.
+fn raw_holds(path: &Path, needle: &str) -> bool {
+    store_files(path)
+        .iter()
+        .filter_map(|file| fs::read(file).ok())
+        .any(|bytes| bytes.windows(needle.len()).any(|b| b == needle.as_bytes()))
+}
+
+/// A published Claude store at `path` (one graph file row) holding every
+/// Tail kind: head, a fragmented session-facts page, a revision and a
+/// sibling's set-aside marker, each carrying `TAIL_CANARY`. The live graph.
+fn claude_tail_store(f: &Fixture, path: &Path) -> ScanIndex {
+    let (root, now) = f.transcript();
+    let (index, _) = cold_full(&root, &now, ScanIndex::default());
+    let namespace = path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    let mut live = state_v2::money_test_support::publish(&index, path, &progress_for(&namespace));
+    state_v2::seed_tail_kinds_for_test(path, &mut live, TAIL_CANARY);
+    let counts = state_v2::tail_kind_counts_for_test(&live);
+    assert_eq!(
+        [
+            counts["tail.head"],
+            counts["tail.page.session_facts"],
+            counts["tail.revision"],
+            counts["tail.set_aside"],
+        ],
+        [1; 4],
+        "{counts:?}"
+    );
+    assert!(counts["tail.frag"] > 0, "{counts:?}");
+    assert!(
+        raw_holds(path, TAIL_CANARY),
+        "positive control: stored in the clear"
+    );
+    assert_eq!(live.files.len(), 1);
+    live
+}
+
+/// [privacy] Source-off, by local removal or by a credential that drops the
+/// grant, erases every stored Claude Tail row with the store, and only it. A
+/// failed unlink keeps the marker unconfirmed; the next turn finishes.
+#[test]
+fn claude_source_off_erases_tail_rows() {
+    let claude = SnapshotSource::ClaudeCode;
+    type Trigger = fn(&Path);
+    let arms: [(&str, Trigger, bool); 3] = [
+        (
+            "disable",
+            |support| disable_snapshot_source(support, SnapshotSource::ClaudeCode).unwrap(),
+            false,
+        ),
+        (
+            "grant_drop",
+            |support| {
+                let next = LocalDeviceBinding {
+                    sources: vec!["codex".into()],
+                    ..device()
+                };
+                disable_sources_dropped_from_grant(support, &device(), &next).unwrap()
+            },
+            false,
+        ),
+        (
+            "disable_unlink_fails",
+            |support| disable_snapshot_source(support, SnapshotSource::ClaudeCode).unwrap(),
+            true,
+        ),
+    ];
+    let confirmed = || state_v2::telemetry::take_thread_event_for_test("source_erasure_confirmed");
+    for (arm, trigger, fail) in arms {
+        let f = Fixture::new();
+        let path = f.destination.join(CLAUDE_INDEX);
+        let live = claude_tail_store(&f, &path);
+        let codex_path = f.destination.join("codex-scan-index-v3.json");
+        let codex = state_v2::money_test_support::publish(
+            &ScanIndex::default(),
+            &codex_path,
+            &progress_bytes(),
+        );
+        let codex_db = fs::read(&store_files(&codex_path)[2]).unwrap();
+        confirmed();
+
+        trigger(&f.support);
+        assert_eq!(
+            source_marker(&f.support, claude).as_deref(),
+            Some("pending"),
+            "{arm}"
+        );
+        if fail {
+            fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(f.erase(claude), 1, "{arm}: the failure is counted");
+            assert_eq!(
+                source_marker(&f.support, claude).as_deref(),
+                Some("pending"),
+                "{arm}"
+            );
+            assert_eq!(confirmed(), None, "{arm}: never confirmed after an Err");
+            fs::set_permissions(&f.destination, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(raw_holds(&path, TAIL_CANARY), "{arm}: kept for the retry");
+        }
+        assert_eq!(f.erase(claude), 0, "{arm}");
+        assert_eq!(
+            source_marker(&f.support, claude).as_deref(),
+            Some("done"),
+            "{arm}"
+        );
+        assert!(confirmed().is_some(), "{arm}: confirmed on success");
+        for file in store_files(&path).iter().chain([&path]) {
+            assert!(
+                !file.exists(),
+                "{arm}: {file:?}: every Tail kind went with it"
+            );
+        }
+        assert_eq!(
+            fs::read(&store_files(&codex_path)[2]).unwrap(),
+            codex_db,
+            "{arm}"
+        );
+        assert!(
+            state_v2::published(&codex_path).unwrap(),
+            "{arm}: Codex intact"
+        );
+        assert_eq!(
+            source_marker(&f.support, SnapshotSource::Codex),
+            None,
+            "{arm}"
+        );
+        drop((live, codex));
+        state_v2::money_test_support::erase_published(&codex_path);
+    }
+}
+
+/// [privacy] Account removal erases every Claude Tail row (a head's login
+/// address digests among them) in every destination namespace, down to the
+/// raw database, WAL and shared-memory bytes, and keeps the graph and index
+/// rows so history is not replayed. A route that cannot be opened keeps the
+/// marker and counts the failure; the next turn finishes.
+#[test]
+fn login_address_erase_removes_claude_tail_rows() {
+    let claude = SnapshotSource::ClaudeCode;
+    let f = Fixture::new();
+    let second = f
+        .support
+        .join("snapshots/destinations")
+        .join("d".repeat(64));
+    fs::create_dir_all(&second).unwrap();
+    let paths = [f.destination.join(CLAUDE_INDEX), second.join(CLAUDE_INDEX)];
+    let lives: Vec<ScanIndex> = paths
+        .iter()
+        .map(|path| claude_tail_store(&f, path))
+        .collect();
+    let records = f.destination.join("claude_code-scan-index-v3.durable-tail");
+    fs::create_dir_all(&records).unwrap();
+    fs::write(records.join("record.rec"), CANARY).unwrap();
+
+    crate::snapshot_sync::owe_login_address_erase(&f.support).unwrap();
+    let db = store_files(&paths[1])[2].clone();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
+    f.erase(claude);
+    assert_eq!(
+        login_address_erase_owed_for_test(&f.support),
+        Some(1),
+        "an unopenable route keeps the marker and counts the failure"
+    );
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(raw_holds(&paths[1], TAIL_CANARY), "kept for the retry");
+    assert!(!records.exists(), "the retired records went regardless");
+
+    f.erase(claude);
+    assert_eq!(
+        login_address_erase_owed_for_test(&f.support),
+        None,
+        "done once"
+    );
+    assert_eq!(source_marker(&f.support, claude), None, "no source erase");
+    drop(lives);
+    for path in &paths {
+        assert!(
+            !raw_holds(path, TAIL_CANARY),
+            "{path:?}: no stored byte of it in the database, WAL or shared memory"
+        );
+        let reloaded = ScanIndex::load(path).unwrap();
+        assert!(
+            state_v2::published(path).unwrap(),
+            "{path:?}: the store stays"
+        );
+        assert_eq!(
+            reloaded.files.len(),
+            1,
+            "{path:?}: graph and index rows kept"
+        );
+        let counts = state_v2::tail_kind_counts_for_test(&reloaded);
+        assert!(
+            counts.values().all(|rows| *rows == 0),
+            "{path:?}: {counts:?}"
+        );
+        drop(reloaded);
+        state_v2::money_test_support::erase_published(path);
+    }
 }
