@@ -4056,6 +4056,52 @@ fn e2_equal_birth_subagent_twins_count_both_paths_in_both_orders() {
     }
 }
 
+/// [money] The observed shape of a same-session copy: a later path in another
+/// folder copies the prefix of a settled earlier path, its first own turn
+/// before the copy proof cutoff, written by an unlisted version. No holder
+/// can prove that prefix, so it counts, flagged. Off the page the earlier
+/// path is a redundant twin and the copy is sent alone, each request once;
+/// read on one page the two paths sum, as before this change.
+#[test]
+fn e2_settled_twin_in_another_folder_keeps_its_earlier_outcome() {
+    let earlier = root_file("settled-twin-earlier");
+    let copy = root_file("settled-twin-copy");
+    let unlisted = |value: Value| versioned(value, "2.1.222");
+    let history = vec![unlisted(line("a", &at(1), 10))];
+    let mut resumed = history.clone();
+    resumed.push(unlisted(line("b", &at(101), 20)));
+    for (path, lines) in [(&earlier, &history), (&copy, &resumed)] {
+        let text = lines.iter().map(|line| line.to_string() + "\n");
+        fs::write(path, text.collect::<String>()).unwrap();
+    }
+    let mut index = ScanIndex::default();
+    index.files.insert(local_index_key(&earlier), entry());
+    index.files.insert(local_index_key(&copy), entry());
+    let birth = t0() + 100_000_000_000;
+    stage_twins(&mut index, &[(&earlier, t0()), (&copy, birth)]);
+    // (earlier path on the page, published requests, sent as redundant)
+    for (co_paged, requests, redundant) in [(false, 2, 1), (true, 3, 0)] {
+        let case = format!("co-paged {co_paged}");
+        let item = parse(&copy, Some(birth), &index, &resumed);
+        assert_eq!(fold(&item).entity.removed_requests, 0, "{case}");
+        assert_eq!(fold(&item).entity.totals().1, 2, "{case}");
+        assert!(fold(&item).disclosed > 0, "{case}: flagged");
+        let mut page = vec![item];
+        if co_paged {
+            page.insert(0, parse(&earlier, Some(t0()), &index, &history));
+        }
+        take_diag();
+        let got = publish(page, None, TelemetryRead::Loaded, &index);
+        let diag = take_diag();
+        assert_eq!(got.len(), 1, "{case}: one body");
+        assert_eq!(got[0].request_count, requests, "{case}");
+        let count = |key: &str| diag.get(key).copied().unwrap_or(0);
+        assert_eq!(count("held_absent_twin"), 0, "{case}: never held");
+        assert_eq!(count("twin_redundant"), redundant, "{case}");
+    }
+    cleanup(&[&earlier, &copy]);
+}
+
 /// [money] A redundant all-copy path twin off the page leaves the original's
 /// body and placement; diverged absent twins retain their hold and co-read
 /// release.

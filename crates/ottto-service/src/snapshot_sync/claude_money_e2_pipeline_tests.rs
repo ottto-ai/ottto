@@ -1230,13 +1230,12 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
     });
 }
 
-/// [money] A move keeps its birth through save and reload; a later path
-/// twin of the session (own turns from the copy proof cutoff on, read on
-/// one page with the moved path) counts its copied request once.
+/// [money] A move keeps its birth through save and reload: the moved path
+/// inherits the original's cutoff and counts its request once.
 #[test]
-fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
+fn e2_pipeline_birth_store_survives_save_reload_and_move() {
     with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-move-copy");
+        let mut c = Corpus::new("e2-pipeline-move");
         let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
@@ -1245,40 +1244,14 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
         let before = birth_store_bytes(&first.index);
         let prior = c.reload(&mut first.index);
         assert_eq!(before, birth_store_bytes(&prior));
-        let moved = c.write_at(
+        c.write_at(
             &format!("moved/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:01:00Z",
         );
         std::fs::remove_file(&original).unwrap();
-        let mut moved_page = ready(&c, &scanner, prior, 100, false);
+        let moved_page = ready(&c, &scanner, prior, 100, false);
         assert_eq!(total(&moved_page), 1, "a move inherits the original cutoff");
-        moved_page.finish();
-        let prior = c.reload(&mut moved_page.index);
-        c.write_at(
-            &format!("copy/{ROOT}.jsonl"),
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
-            "2026-11-04T07:03:00Z",
-        );
-        assert!(moved.is_file());
-        e2::take_diag();
-        let before = scanner.paths().len();
-        let copy = ready(&c, &scanner, prior, 100, false);
-        literal(&copy);
-        let paths = scanner.paths().split_off(before);
-        let decided = copy_diag(&[
-            "copy_prefix_twin_page_removed",
-            "held_absent_twin",
-            "twin_redundant",
-            "copy_prefix_unproven",
-        ]);
-        assert_eq!(
-            total(&copy),
-            2,
-            "restart/move must not make copied r1 count twice: read {paths:?}, \
-             (page proof, absent twin, redundant twin, unproven) {decided:?}"
-        );
-        assert_eq!(copy.scan.snapshots[0].removed_request_count, Some(1));
     });
 }
 
