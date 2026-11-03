@@ -2342,6 +2342,15 @@ fn growth_claim_recent(state: &GrowthRetention, now: u64) -> bool {
         .is_some_and(|last| now < last.saturating_add(GROWTH_FULL_INTERVAL))
 }
 
+/// Owed growth whose Full `claim_growth_full` would refuse now: selecting it
+/// only defers it again (`defer_growth_read`), so it must not pull a family.
+pub(super) fn growth_full_paced(index: &ScanIndex, key: &str, now: u64) -> bool {
+    growth_active(index)
+        && index.v2().growth_retention.get(key).is_some_and(|state| {
+            state.predecessor_size.is_some() && growth_claim_recent(state, now)
+        })
+}
+
 /// Debt whose claim has expired. Its deferral did not re-queue it, so its
 /// queued path would wait behind the census FIFO; selection wakes it instead.
 pub(super) fn expired_growth_claims(
