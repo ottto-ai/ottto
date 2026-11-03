@@ -26,7 +26,7 @@ use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
+    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -64,7 +64,6 @@ pub fn reconcile_active_sessions(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
-    _upload_policy: SnapshotUploadPolicy,
     scan_started_at: Option<&str>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
@@ -1035,6 +1034,7 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshots::SnapshotUploadPolicy;
     use ottto_protocol::{
         AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation,
         AgentStatusState,
@@ -1102,7 +1102,6 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1422,7 +1421,6 @@ mod tests {
                 test_snapshot("future", "2026-07-19T10:46:00Z"),
             ],
             None,
-            test_policy(),
             Some("2026-07-19T10:00:00Z"),
             "2026-07-19T10:40:00Z",
         )
@@ -1466,7 +1464,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1502,7 +1499,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1514,7 +1510,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:10:00Z",
         )
@@ -1533,7 +1528,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&busy),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1546,7 +1540,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:15:00Z",
         )
@@ -1561,7 +1554,6 @@ mod tests {
             SnapshotSource::Codex,
             &[busy.clone(), other],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:17:00Z",
         )
@@ -1580,7 +1572,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:20:00Z",
         )
@@ -1604,7 +1595,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1614,16 +1604,11 @@ mod tests {
         // The workspace disabled titles; the re-read snapshot carries none.
         let mut stripped = snapshot.clone();
         stripped.session_display_name = None;
-        let policy = SnapshotUploadPolicy {
-            session_titles_enabled: false,
-            ..test_policy()
-        };
         let rebuilt = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             &[stripped],
             None,
-            policy,
             None,
             "2026-07-19T10:08:00Z",
         )
@@ -1645,10 +1630,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                ..test_policy()
-            },
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1667,16 +1648,11 @@ mod tests {
             },
         );
         assert!(uploaded[0].session_display_name.is_none());
-        let policy = SnapshotUploadPolicy {
-            workspace_labels_enabled: false,
-            ..test_policy()
-        };
         let changed = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             &[],
             None,
-            policy,
             None,
             "2026-07-19T10:08:00Z",
         )
@@ -1724,17 +1700,9 @@ mod tests {
     fn current_account_and_history_come_only_from_this_reads_own_requests() {
         let dir = temp_dir("session-accounts");
         let reconcile = |snapshot: &SnapshotItem, source, at: &str| {
-            reconcile_active_sessions(
-                &dir,
-                source,
-                std::slice::from_ref(snapshot),
-                None,
-                test_policy(),
-                None,
-                at,
-            )
-            .expect("reconciliation")
-            .sessions
+            reconcile_active_sessions(&dir, source, std::slice::from_ref(snapshot), None, None, at)
+                .expect("reconciliation")
+                .sessions
         };
         let mut tagged = test_snapshot("s-claude", "2026-07-19T10:04:00Z");
         tagged.claude_account_display = Some(Box::new(account_display("account-a")));
@@ -1751,7 +1719,6 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1806,7 +1773,6 @@ mod tests {
             SnapshotSource::Codex,
             &[codex],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1846,7 +1812,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             Some(&status),
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1861,7 +1826,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             Some(&status),
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1882,7 +1846,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             Some(&conflicting),
-            test_policy(),
             None,
             "2026-07-19T10:07:00Z",
         )
@@ -1933,7 +1896,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1947,7 +1909,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:07:00Z",
         )
