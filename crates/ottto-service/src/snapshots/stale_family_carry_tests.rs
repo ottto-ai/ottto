@@ -2735,6 +2735,8 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
     ] {
         let mut fixture = scoped_retry_fixture(1, 2, false);
         match case {
+            // The latch with an unknown upload scope now carries exact ACKs in
+            // the same context; a context change still keeps BASE.
             "identity_latch" => fixture.index.claude_request_identity_contract_changed = true,
             "daily_replay" => {
                 fixture
@@ -2754,7 +2756,8 @@ fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
             }
             _ => (),
         }
-        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let window = BACKFILL_WINDOW_DAYS + u64::from(case == "identity_latch");
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, window);
         let candidate = fixture
             .candidates
             .iter_mut()
@@ -3719,6 +3722,157 @@ fn contract_debt_scoped_hold_carries_only_settled_siblings() {
     assert!(fixture.roots[1..]
         .iter()
         .all(|root| fixture.index.claude_stale_family_carry.contains(root)));
+    assert!(fixture.index.claude_request_identity_contract_changed);
+}
+
+/// [regress] A same-context retry under the latch whose prior upload left an
+/// unknown scope carries exact-ACKed families: no re-arm, no read, and its
+/// committed entries and ACK ledger are byte-identical. A changed context
+/// still refuses and re-arms every member.
+#[test]
+fn contract_debt_unknown_scope_carries_exact_acks_only_in_the_same_context() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for changed_context in [false, true] {
+        let mut fixture = contract_debt_fixture(2);
+        fixture
+            .index
+            .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        assert!(claude_contract_debt_scope(&fixture.index).is_none());
+        let files = serde_json::to_value(&fixture.index.files).unwrap();
+        let accepted = fixture.index.accepted_snapshot_fingerprints.clone();
+        let window = BACKFILL_WINDOW_DAYS + u64::from(changed_context);
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, window);
+        assert_eq!(row["prior_unsettled_upload"], true);
+        assert!(fixture.index.claude_request_identity_contract_changed);
+        assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, accepted);
+        if changed_context {
+            assert_eq!(row["carried_pending_families"], 0);
+            assert!(fixture.index.files.values().all(|entry| entry.rearmed()));
+            continue;
+        }
+        assert_eq!(row["carried_pending_families"], 2);
+        assert_eq!(row["rearmed_index_files"], 0);
+        assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), files);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+    }
+}
+
+/// [regress] Latch and unknown scope: a carried family whose member then grows
+/// or changes fingerprint is parsed; the parse cancels the carry and re-arms
+/// and replays the sibling, exactly as with a settled sweep.
+#[test]
+fn contract_debt_unknown_scope_changed_member_cancels_and_rearms_siblings() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in ["content", "sidecar"] {
+        let mut index = carry_index();
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+        index.claude_request_identity_contract_changed = true;
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+            rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+        let [root_key, agent_key] = carry_family_keys();
+        let mut candidate = scoped_retry_accept_member(&mut index, &root_key);
+        scoped_retry_accept_member(&mut index, &agent_key);
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        assert!(claude_contract_debt_scope(&index).is_none(), "{case}");
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["prior_unsettled_upload"], true, "{case}");
+        assert!(
+            index.claude_stale_family_carry.contains(CARRY_ROOT),
+            "{case}: the family is carried before its member changes"
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+        traversal.observed_index_keys.extend(carry_family_keys());
+        carry_fill_queue(&mut index);
+        match case {
+            "content" => candidate.size_bytes += 1,
+            _ => candidate.source_file_fingerprint = "e".repeat(64),
+        }
+        assert_eq!(
+            owed_decision(&mut index, &candidate, 1),
+            CandidateDecision::Parse,
+            "{case}"
+        );
+        cancel_claude_family_carry_for_member_parse(
+            &mut index,
+            CARRY_RETRY,
+            &candidate.path,
+            &[],
+            &VecDeque::new(),
+        );
+        assert!(
+            !index.claude_stale_family_carry.contains(CARRY_ROOT),
+            "{case}"
+        );
+        assert!(
+            index.files[&agent_key].source_file_fingerprint.is_empty(),
+            "{case}: the sibling is re-armed"
+        );
+        assert_eq!(
+            index.claude_stale_family_carry.replay,
+            vec![carry_replayed(&agent_key)],
+            "{case}: the sibling is replayed"
+        );
+        assert!(index.claude_request_identity_contract_changed);
+        assert!(index.claude_duplicate_request_witness_overflowed);
+    }
+}
+
+/// [money] The same start with one member's body not exact-ACKed (a failed
+/// upload): that family is still re-armed and read once; the ACKed family
+/// is carried unchanged with no read.
+#[test]
+fn contract_debt_unknown_scope_still_rearms_an_unacked_family() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = contract_debt_fixture(2);
+    let failed = fixture.roots[0].clone();
+    let failed_key = fixture
+        .index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_member_ref(Path::new(key)).is_some_and(|member| member.root == failed)
+        })
+        .unwrap()
+        .clone();
+    for body in fixture.index.file_snapshot_fingerprints[&failed_key].clone() {
+        fixture.index.accepted_snapshot_fingerprints.remove(&body);
+    }
+    fixture
+        .index
+        .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::UploadError);
+    let before = fixture.index.files.clone();
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["rearmed_index_files"], 1);
+    assert!(!fixture.index.claude_stale_family_carry.contains(&failed));
+    assert!(fixture
+        .index
+        .claude_stale_family_carry
+        .contains(&fixture.roots[1]));
+    assert!(fixture.index.files[&failed_key].rearmed());
+    for (key, entry) in &fixture.index.files {
+        if *key != failed_key {
+            assert_eq!(
+                serde_json::to_value(entry).unwrap(),
+                serde_json::to_value(&before[key]).unwrap()
+            );
+        }
+    }
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        1
+    );
     assert!(fixture.index.claude_request_identity_contract_changed);
 }
 

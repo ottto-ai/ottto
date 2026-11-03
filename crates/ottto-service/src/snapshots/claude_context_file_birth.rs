@@ -47,9 +47,11 @@ const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 /// or mixed writer counts and discloses them.
 ///
 /// Frozen. Never append (an append re-enables a copy route for new resumes).
-/// Append-only is only a decode guarantee for stored heads: `ClaudeWriterRun`
-/// stores a position and `ClaudeOwnWriters` one slot per entry, so an insert,
-/// reorder or removal would silently remap stored writers.
+/// An unlisted version takes request-id proof instead (`Holders`, and the
+/// same-session page proof for a path twin). Append-only is only a decode
+/// guarantee for stored heads: `ClaudeWriterRun` stores a position and
+/// `ClaudeOwnWriters` one slot per entry, so an insert, reorder or removal
+/// would silently remap stored writers.
 pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
 
 /// Sticky response writer certificate. Zero = no responses, 255 = invalid.
