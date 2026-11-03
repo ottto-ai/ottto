@@ -31795,9 +31795,7 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
-                    if let Some(line) =
-                        census.codex_parse_reasons_line(index.upload_context_owed_file_count())
-                    {
+                    if let Some(line) = census.codex_parse_reasons_line() {
                         eprintln!("{line}");
                     }
                 }
@@ -31817,8 +31815,7 @@ impl OwnedSourceScan {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_owed_files={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={} held_audit_open_backoff_evicted_keys={}",
-                        index.upload_context_owed_file_count(),
+                        "local snapshot census claude parse reasons: {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={} held_audit_open_backoff_evicted_keys={}",
                         census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &census.parse_reasons),
                         census.claude_compaction_unlinked_parent_count,
                         history_upgrade.denied_for(&[
@@ -40584,15 +40581,14 @@ impl ScanCensus {
 
     /// The local census line attributing this page's Codex selections, or
     /// `None` when nothing was decided. Counts only: no path or identifier.
-    fn codex_parse_reasons_line(&self, upload_context_owed_files: usize) -> Option<String> {
+    fn codex_parse_reasons_line(&self) -> Option<String> {
         if self.parse_reasons.iter().all(|count| *count == 0)
             && self.codex_selections.iter().all(|count| *count == 0)
         {
             return None;
         }
         Some(format!(
-            "local snapshot census codex parse reasons: upload_context_owed_files={} {} {}",
-            upload_context_owed_files,
+            "local snapshot census codex parse reasons: {} {}",
             census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &self.parse_reasons),
             census_count_fields(&CODEX_SELECTION_NAMES, &self.codex_selections),
         ))
@@ -60156,7 +60152,9 @@ mod tests {
             Some(&activity)
         );
         assert_eq!(
-            index.upload_context_owed_counts().no_proof_entities,
+            index
+                .upload_context_owed_counts(SnapshotSource::Codex)
+                .no_proof_entities,
             1,
             "an incomplete state census grants no upload-context proof"
         );
