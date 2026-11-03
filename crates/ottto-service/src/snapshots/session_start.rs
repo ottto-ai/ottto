@@ -3440,9 +3440,18 @@ mod tests {
                 "{name}"
             );
             if name == "codex" {
-                // The prelude has no fact encoding yet: refused, never dropped.
-                assert!(state.put_opening_fact(&mut Enc::bytes(1 << 20)).is_err());
-                continue;
+                // The prelude is its own session fact: it round-trips in full.
+                assert!(state.has_codex_prelude(), "{name}");
+                assert!(decoded.codex_prelude.is_none(), "{name}: the body drops it");
+                let mut e = Enc::bytes(1 << 20);
+                state.put_codex_prelude_fact(&mut e).unwrap();
+                let prelude = e.into_bytes();
+                let mut d = Dec::new(&prelude);
+                decoded.take_codex_prelude_fact(&mut d).unwrap();
+                d.finish().unwrap();
+                let mut again = Enc::bytes(1 << 20);
+                decoded.put_codex_prelude_fact(&mut again).unwrap();
+                assert_eq!(again.into_bytes(), prelude, "{name}");
             }
             assert!(state.has_opening_fact(), "{name}");
             let mut e = Enc::bytes(1 << 20);
