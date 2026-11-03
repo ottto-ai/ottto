@@ -854,3 +854,76 @@ fn copy_unproven_twin_rows_freeze_and_prove_separately() {
         assert_eq!(own_only.request_identity_refusals, 0);
     }
 }
+
+fn recorded_login_proof(proof: &[Contribution]) -> Vec<Contribution> {
+    proof
+        .iter()
+        .map(|share| Contribution {
+            bucket_start: share.bucket_start.clone(),
+            row_key: share.row_key.clone(),
+            usage: share.usage.clone(),
+            identity: RequestIdentity::Tagged(AuthorityKey {
+                login: Some("a".repeat(64)),
+                org: Some("d".repeat(64)),
+                basis: identity::TRANSCRIPT_RECORDED_LOGIN,
+                account_source: None,
+            }),
+        })
+        .collect()
+}
+
+#[test]
+fn recorded_login_rows_stay_unfrozen_so_real_evidence_replaces_them() {
+    let (original, proof) = retained_session(2);
+    let recorded = recorded_login_proof(&proof);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &recorded, &state).unwrap();
+    assert!(first
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis == identity::TRANSCRIPT_RECORDED_LOGIN));
+    assert!(!first.request_evidence.is_empty());
+    retained_ack(&mut state, &first, &[]);
+
+    // The same names again never become a retained marker: they prove nothing.
+    let mut again = original.clone();
+    sticky_apply(&mut again, &recorded, &state).unwrap();
+    assert_eq!(retained_marked(&again), vec![false; 2]);
+
+    // A later own row names the session through the normal path.
+    let mut real = original.clone();
+    sticky_apply(&mut real, &proof, &state).unwrap();
+    assert_eq!(retained_marked(&real), vec![false; 2]);
+    assert!(real
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis == identity::TELEMETRY));
+}
+
+#[test]
+fn recorded_login_later_bodies_after_a_second_login_carry_no_tag_and_no_marker() {
+    let (original, proof) = retained_session(2);
+    let recorded = recorded_login_proof(&proof);
+    let mut state = retained_state();
+    let mut first = original.clone();
+    sticky_apply(&mut first, &recorded, &state).unwrap();
+    retained_ack(&mut state, &first, &[]);
+
+    let untagged: Vec<Contribution> = recorded
+        .iter()
+        .map(|share| Contribution {
+            bucket_start: share.bucket_start.clone(),
+            row_key: share.row_key.clone(),
+            usage: share.usage.clone(),
+            identity: RequestIdentity::Missing,
+        })
+        .collect();
+    let mut later = original.clone();
+    let _ = sticky_apply(&mut later, &untagged, &state);
+    assert_eq!(retained_marked(&later), vec![false; 2]);
+    assert!(later
+        .request_evidence
+        .iter()
+        .all(|entry| entry.identity_basis != identity::TRANSCRIPT_RECORDED_LOGIN));
+}

@@ -71,7 +71,6 @@ impl Fixture {
             "2026-10-20T12:00:00Z",
             365,
             100,
-            false,
             Some(&self.root),
             &[],
             false,

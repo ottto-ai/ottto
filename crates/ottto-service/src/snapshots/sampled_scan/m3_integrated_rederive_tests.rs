@@ -196,7 +196,6 @@ impl ColdReplay {
             "2026-10-20T12:00:00Z",
             365,
             100,
-            false,
             None,
             &[],
             false,

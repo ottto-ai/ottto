@@ -61,7 +61,6 @@ fn walk(
         "2026-08-23T18:40:00Z",
         BACKFILL_WINDOW_DAYS,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        true,
         None,
         &[],
         false,

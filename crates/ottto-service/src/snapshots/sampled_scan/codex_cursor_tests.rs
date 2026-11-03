@@ -842,7 +842,6 @@ fn codex_scan(fixture: &ScanRoot, index: ScanIndex, collected_at: &str) -> Owned
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -1603,7 +1602,6 @@ fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             Some(&support),
             &[],
             false,
@@ -1687,7 +1685,6 @@ fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
             NOW,
             BACKFILL_WINDOW_DAYS,
             10,
-            false,
             Some(&support),
             &[],
             false,
@@ -2742,7 +2739,6 @@ fn hinted_page_limited(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         limit,
-        false,
         None,
         hints,
         false,
@@ -2953,7 +2949,6 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[fixture.file(SESSION_B)],
         false,
@@ -3181,7 +3176,6 @@ fn selected_page(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10000,
-        false,
         None,
         hints,
         false,
@@ -6417,7 +6411,7 @@ fn touched_replaced_or_shrunk_held_file_misses() {
 /// unscoped-incomplete census flag and the owner member count each change
 /// the memo digest; the same inputs give the same digest.
 #[test]
-fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
+fn memo_digest_fences_receipt_contents_census_flags_and_members() {
     use crate::snapshots::codex_file_join::AppliedTierReceipt;
     let temp = Temp::new("memo-fence-digest", b"{\"n\":1}\n");
     let file = File::open(&temp.0).unwrap();
@@ -6482,9 +6476,23 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         digest(&with_receipt(receipt("flex")), &codex, 1),
         "T19: receipt contents"
     );
+    let other_scope: AppliedTierReceipt =
+        serde_json::from_value(json!({"version": 1, "derivation": "fixture",
+            "scope": "another-upload-context", "records": 3, "prefix_digest": "prefix",
+            "tiers": {"turn-1": "priority"}}))
+        .unwrap();
+    assert_eq!(
+        reference,
+        digest(&with_receipt(other_scope), &codex, 1),
+        "the context a receipt was written under wakes nothing"
+    );
     let mut context = with_receipt(receipt("priority"));
     context.active_upload_context_fingerprint = Some("another-upload-context".into());
-    assert_ne!(reference, digest(&context, &codex, 1), "upload context");
+    assert_eq!(
+        reference,
+        digest(&context, &codex, 1),
+        "a delivery context wakes nothing"
+    );
     let flags: [fn(&mut CodexTitleMetadata); 3] = [
         |codex| {
             codex
@@ -6936,7 +6944,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
             NOW,
             365,
             10,
-            false,
             None,
             &[],
             false,
@@ -8445,7 +8452,7 @@ fn fork_cycle_is_witnessed_and_then_quiet() {
     write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
     let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope(&ScanIndex::default());
+    let scope = group_scope();
     for _ in 0..PARENT_RESTART_BUDGET {
         cache.note_parent_restart(&namespace, &scope);
     }
@@ -8966,7 +8973,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
     }
     let cache = Arc::new(SharedCache::default());
     let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope(&ScanIndex::default());
+    let scope = group_scope();
     for _ in 0..PARENT_RESTART_BUDGET {
         cache.note_parent_restart(&namespace, &scope);
     }
@@ -10234,7 +10241,6 @@ fn continuation_page_in(
         collected_at,
         days,
         10,
-        false,
         ordinary,
         carried(root),
     );
@@ -10404,7 +10410,6 @@ fn continuation_prepares_no_group_attempt() {
                 AT,
                 7,
                 10,
-                false,
                 None,
                 &[],
                 false,
@@ -10901,7 +10906,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -11028,7 +11032,6 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 NOW,
                 BACKFILL_WINDOW_DAYS,
                 10,
-                false,
                 Some(secs(600)),
                 carried(&fixture.root),
             )

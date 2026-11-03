@@ -942,7 +942,8 @@ fn instruction_text_and_its_config_digest_never_reach_the_body() {
 }
 
 /// F4: an email context is stored only as its keyed digest (32 bytes, once),
-/// never as the address, its plain SHA-256 or the earlier unkeyed digest.
+/// never as the address, its plain SHA-256 or the earlier unkeyed digest. The
+/// address digest is keyed too, so with no key there is no address field at all.
 #[test]
 fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
     use sha2::Digest as _;
@@ -1503,16 +1504,16 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
-        "95c373175449b72f29d65ad493f5506f6980a338b57e59560a345b0ca0a02cd2",
+        "cf70e0f79a51e32fcf63c592302c5fa66289c66eafb1bf426597d3b873378bc3",
     ),
     (
         SnapshotSource::Codex,
-        "458f4632159f42471342573ed64a7071c7e3376a7ebcdbdec5eb603e8bb0b3d0",
+        "3b7390ea33f805055983bd87d94cbcd59dbf528f1ad066c1f52316a7133bb189",
     ),
     (
         SnapshotSource::Pi,
         // The Pi allowlist pin, including the fork fields of PiSection.
-        "c4f301b3ec5afe28933bfb8af315fe3061fd6d93184589f559206b38d7f81ce8",
+        "10a14138dc3d8c6c41f499fb728e96b9755ab21b87b7e850386a2c39a513f527",
     ),
 ];
 
@@ -1614,6 +1615,10 @@ const H_AUDIT: &[(&str, &str)] = &[
     (
         "Envelope.allowlist",
         "Shape::digest: SHA-256(\"ottto-durable-tail-shape:v1\" || shape text)",
+    ),
+    (
+        "OrgMarkers.address",
+        "HMAC-SHA-256(attribution key, \"ottto:session-attribution:\" || JSON [\"claude_folder_login_address:v1\", key version, lowercased address])",
     ),
     (
         "OrgMarkers.context_digest",
@@ -2342,7 +2347,7 @@ fn skill_label_bounds_and_upload_only_consent_preserve_the_whole_native_state() 
             native.accumulator.source_session_id.as_deref(),
             &path,
         );
-        while !context.prepare_launch_step(&workers).unwrap() {}
+        while !context.launch_events().prepare_step(&workers).unwrap() {}
         let identity =
             opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(&path).unwrap())
                 .unwrap();
@@ -2473,7 +2478,6 @@ fn pl_scope_is_closed_and_every_other_e_field_stays_refusing() {
         [
             "CodexPrelude.skills_body",
             "OpeningCall.files",
-            "OrgMarkers.home",
             "SelectorCapture.context.attribution",
             "SnapshotAccumulator.codex_tier_replay",
             "SnapshotAccumulator.claude_desktop_identity",
@@ -3309,4 +3313,40 @@ fn native_finish_loss_keeps_predecessor_and_discloses_without_receipt_hold() {
         // the reduction bytes happen to equal the predecessor's body.
         index.generation += 1;
     }
+}
+
+/// [privacy] With the key, the address is stored once, as its keyed digest only.
+#[test]
+fn org_marker_address_is_stored_only_as_its_keyed_digest() {
+    use sha2::Digest as _;
+    crate::claude_status_coverage::bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
+    let scratch = Scratch::new("org-keyed");
+    let path = scratch.write("t.jsonl", &claude_org_lines());
+    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let digest = crate::claude_status_coverage::address_digest(CANARY_EMAIL).unwrap();
+    let keyed: Vec<u8> = (0..digest.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&digest[at..at + 2], 16).unwrap())
+        .collect();
+    let separated: [u8; 32] = sha2::Sha256::new()
+        .chain_update(b"ottto-claude-org-marker-context:v1\0")
+        .chain_update(CANARY_EMAIL.as_bytes())
+        .finalize()
+        .into();
+    let context =
+        crate::snapshots::claude_request_identity::session_context_digest(CANARY_EMAIL).unwrap();
+    let context: Vec<u8> = (0..context.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&context[at..at + 2], 16).unwrap())
+        .collect();
+    assert_eq!(occurrences(&body, &keyed).len(), 1);
+    assert_eq!(occurrences(&body, &context).len(), 1, "the sentence only");
+    assert!(occurrences(&body, &separated).is_empty());
+    assert!(occurrences(&body, CANARY_EMAIL.as_bytes()).is_empty());
 }

@@ -94,7 +94,6 @@ fn native_parser_with(
         Some(metadata),
         None,
         None,
-        false,
     )
     .unwrap();
     (parser, expected, scope)
@@ -214,13 +213,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
         SnapshotSource::Codex => {
             parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
         }
-        SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_artifacts(
-            &fixture.0,
-            NOW,
-            "native-fixture".into(),
-            false,
-        )
-        .unwrap(),
+        SnapshotSource::ClaudeCode => {
+            parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
         SnapshotSource::Pi => {
             parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
         }
@@ -445,13 +440,7 @@ fn sampled_native_claude_compaction_sizes_across_tail_passes() {
         acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
     assert_eq!(mode, ReadMode::Tail);
     let tail = rebuilt(items);
-    let mut full = parse_claude_code_jsonl_file_with_artifacts(
-        &fixture.0,
-        NOW,
-        "native-fixture".into(),
-        false,
-    )
-    .unwrap();
+    let mut full = parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
     apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
     let full = rebuilt(full);
     assert_eq!(
@@ -1223,7 +1212,6 @@ fn production_scan_page_at_with_setup(
         collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,
@@ -3033,7 +3021,6 @@ fn cached_scan(
         NOW,
         BACKFILL_WINDOW_DAYS,
         10,
-        false,
         None,
         &[],
         false,

@@ -21,7 +21,6 @@ fn empty_scan() -> SourceScanResult {
         "2026-10-24T00:00:00Z",
         30,
         10,
-        false,
     )
     .unwrap()
 }
@@ -1157,7 +1156,6 @@ fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanR
         "2026-10-24T12:00:00Z",
         30,
         10,
-        false,
         None,
         &[],
         false,

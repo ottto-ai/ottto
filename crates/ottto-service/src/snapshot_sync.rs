@@ -6728,12 +6728,28 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
-    if source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_request_identity::bind_session_context_key(
+    if source == SnapshotSource::ClaudeCode {
+        // No capability or no key: no address digest, so no verdict.
+        let sole_login = activity_hint
+            .session_request_sole_login_witness_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+        let key = attribution_context
+            .as_ref()
+            .filter(|_| sole_login)
+            .map(SessionAttributionContext::accepted_fingerprint_key);
+        // A key or capability change only scrubs what retained parses compare
+        // under the old key: every parse, cursor and count stays, so a server
+        // hint never causes a re-read.
+        let address = crate::claude_status_coverage::bind_address_key(key);
+        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        )
-    {
-        daemon.transcript_cache.scrub_retained_context_digests();
+        );
+        if context || address {
+            daemon
+                .transcript_cache
+                .scrub_retained_identity(context, address);
+        }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
@@ -7057,7 +7073,6 @@ fn prepare_sync_source_inner(
         &scan_started_at,
         scan_window_days,
         MAX_BACKFILL_FILES_PER_SOURCE,
-        upload_policy.session_artifacts_enabled,
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
         &watcher_hints.paths,
         watcher_hints.overflowed,
@@ -7066,6 +7081,7 @@ fn prepare_sync_source_inner(
         &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
+    .with_launch_events(home)
     .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
@@ -7467,12 +7483,12 @@ fn prepare_continuation_source(
         &scan_started_at,
         scan_request_window_days(inputs.receipt_window_days, false),
         MAX_BACKFILL_FILES_PER_SOURCE,
-        inputs.upload_policy.session_artifacts_enabled,
         ordinary_equivalent,
         inputs.evidence.take(),
     )
     .with_continuation_deadline(deadline)
     .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
+    .with_launch_events(home)
     .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
@@ -7694,6 +7710,21 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
+    if source == SnapshotSource::ClaudeCode {
+        let sole_login = activity_hint
+            .session_request_sole_login_witness_contract
+            .as_deref()
+            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
+        upload_progress
+            .accepted_identity_buckets
+            .set_sole_login_enabled(sole_login);
+        crate::snapshots::claude_folder_login::begin_page(
+            &mut index,
+            &committed_index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            sole_login,
+        );
+    }
     let _state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10286,6 +10317,25 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
+    if let Some(accepted) =
+        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
+    {
+        let census_clean = scan_result.census_complete
+            && scan_result.census_residue_index_key_count == 0
+            && scan_result.census_residue_blocked_session_count == 0;
+        crate::snapshots::claude_folder_login::note_page(
+            index,
+            &scan_result.snapshots,
+            &api_report,
+            census_clean,
+        );
+        crate::snapshots::claude_folder_login::stamp_page(
+            &mut scan_result.snapshots,
+            index,
+            &api_report,
+            accepted,
+        );
+    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -10293,7 +10343,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &api_report,
             &trace_report,
             identity_unhealthy_roots,
-            crate::snapshots::claude_request_identity::desktop_census(index),
         );
         let evidence = match &whole_corpus {
             Some(_) => evidence,
@@ -10301,7 +10350,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         };
         evidence
             .with_unhealthy_reasons(unhealthy_reasons)
-            .with_status_coverage(crate::claude_status_coverage::snapshot())
             .with_native_originals(&originals)
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
@@ -12762,6 +12810,7 @@ pub(crate) fn erase_disabled_sources(
     support_dir: &Path,
     cache: &crate::snapshots::sampled_scan::SharedCache,
 ) {
+    erase_owed_login_addresses(support_dir, cache);
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
         let state = source_marker(support_dir, source);
@@ -12771,6 +12820,10 @@ pub(crate) fn erase_disabled_sources(
         // Transcript readers close before the first unlink.
         if source == SnapshotSource::Codex {
             cache.forget_codex_jobs();
+        }
+        if source == SnapshotSource::ClaudeCode {
+            crate::claude_status_coverage::forget_addresses();
+            cache.forget_retained_transcripts();
         }
         let marker = source_marker_path(support_dir, source);
         let erased = erase_source_files(support_dir, source, || {
@@ -12801,6 +12854,89 @@ pub(crate) fn erase_disabled_sources(
 pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
     let marker = source_marker_path(support_dir, source);
     source_erasure_turn().get(&marker).copied().unwrap_or(0)
+}
+
+fn login_address_erase_marker(support_dir: &Path) -> PathBuf {
+    snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
+        .with_file_name("claude-login-addresses.erase-owed")
+}
+
+/// Account removal: the next sync cycle erases what is kept of recorded login
+/// addresses, under the cycle lock and even with no live device.
+pub(crate) fn owe_login_address_erase(support_dir: &Path) -> Result<()> {
+    let marker = login_address_erase_marker(support_dir);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _turn = source_erasure_turn();
+    write_source_marker(&marker, "pending")
+}
+
+/// One attempt per owed erase. Only retained parses and durable-tail records
+/// hold an address digest: the folder ledger holds none, and the rest of the
+/// index stays so the account's history is not replayed.
+fn erase_owed_login_addresses(
+    support_dir: &Path,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+) {
+    let marker = login_address_erase_marker(support_dir);
+    let mut turn = source_erasure_turn();
+    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == ErrorKind::NotFound)
+    {
+        return;
+    }
+    crate::claude_status_coverage::forget_addresses();
+    cache.forget_retained_transcripts();
+    cache.durable_forget_source(SnapshotSource::ClaudeCode);
+    let erased = erase_claude_durable_tails(support_dir).and_then(|()| {
+        std::fs::remove_file(&marker)?;
+        sync_progress_parent(&marker)
+    });
+    let failures = turn.entry(marker).or_default();
+    *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+    if *failures > 3 {
+        crate::snapshots::state_v2::source_erasure_alarm(*failures);
+    }
+}
+
+fn erase_claude_durable_tails(support_dir: &Path) -> Result<()> {
+    let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
+    let family = stable.file_stem().and_then(|stem| stem.to_str());
+    let family = family.context("source_erasure_family")?;
+    let mut parents: Vec<PathBuf> = stable.parent().map(Path::to_path_buf).into_iter().collect();
+    match std::fs::read_dir(support_dir.join("snapshots/destinations")) {
+        Ok(namespaces) => {
+            for namespace in namespaces {
+                let namespace = namespace?.file_name();
+                let scoped =
+                    snapshot_destination_scoped_index_path(&stable, &namespace.to_string_lossy());
+                parents.extend(scoped.parent().map(Path::to_path_buf));
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for parent in parents {
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(family) && name.ends_with(".durable-tail") {
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        sync_progress_parent(&parent.join("erased"))?;
+    }
+    Ok(())
 }
 
 /// A source's caches outside `snapshots`, with their temp copies.
@@ -12909,10 +13045,10 @@ fn snapshot_upload_context_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-/// One destination-scoped index is shared by every privacy policy. The durable
-/// upload-context witness inside the index forces a complete correction pass
-/// whenever policy changes, including A→B→A. Keeping one file per policy made
-/// the second transition reuse an old settled checkpoint and skip correction.
+/// One destination-scoped index is shared by every privacy policy. A policy
+/// change reads nothing: it applies to bodies acquired from then on, and the
+/// per-entity proofs inside the index keep each delivery bound to the context
+/// it was sent under.
 fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("snapshots")
@@ -14093,7 +14229,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14214,7 +14349,6 @@ mod tests {
             "2026-09-30T10:05:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
         )
         .unwrap();
         assert_eq!(raw.snapshots.len(), 1);
@@ -14394,7 +14528,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14666,7 +14799,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_effective_wire_unchanged_capability_enable_survives_finalization() {
+    fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         let root = cache_effective_wire_fixture_root();
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(
@@ -14681,7 +14814,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap()
         };
@@ -14894,38 +15026,10 @@ mod tests {
             scan(&mut index).snapshots.is_empty(),
             "next unchanged source is settled"
         );
+        // A capability flip reads nothing on an unchanged file: it applies
+        // from the next body on.
         index.activate_upload_context("cache-on-same-effective-projection".into());
-        let mut repeated = scan(&mut index);
-        assert_eq!(repeated.snapshots.len(), 1);
-        apply_upload_policy(
-            SnapshotSource::Codex,
-            &mut repeated.snapshots,
-            SnapshotUploadPolicy::default(),
-        );
-        finalize_scan_after_policy_with_body_witness(
-            SnapshotSource::Codex,
-            &mut repeated,
-            &mut index,
-            |item| {
-                effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
-            },
-        );
-        // A new context owes even an equal effective body once: finalization
-        // keeps it; its exact ACK earns the receipt and the file is quiet.
-        assert_eq!(
-            repeated.snapshots.len(),
-            1,
-            "owed once under the new context"
-        );
-        for item in &mut repeated.snapshots {
-            prepare_snapshot_cache_for_upload(item, &progress, true, false, &legacy);
-        }
-        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
-            &mut index,
-            &repeated.snapshots,
-            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&repeated.snapshots),
-        );
-        assert!(scan(&mut index).snapshots.is_empty(), "then quiet");
+        assert!(scan(&mut index).snapshots.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -15383,7 +15487,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap();
             assert_eq!(scan.snapshots.len(), 1);
@@ -15846,7 +15949,6 @@ mod tests {
             "2026-08-29T12:30:00Z",
             183,
             10,
-            true,
         )
         .expect("scan collision upload fixture");
         assert_eq!(scan.discovered_file_count, 1);
@@ -15916,7 +16018,6 @@ mod tests {
             "2026-08-30T12:05:00Z",
             183,
             10,
-            true,
         )
         .expect("scan snapshot fixture");
         assert_eq!(scan.snapshots.len(), 1);
@@ -17133,7 +17234,6 @@ mod tests {
             "2026-07-31T00:00:00Z",
             183,
             2,
-            true,
         )
         .expect("scan first bounded page");
         assert!(!first.census_complete);
@@ -17274,7 +17374,6 @@ mod tests {
             "2026-07-31T00:05:00Z",
             183,
             2,
-            true,
         )
         .expect("scan later bounded page");
         assert!(second.census_complete);
@@ -18399,7 +18498,6 @@ mod tests {
                     collected_at,
                     crate::snapshots::BACKFILL_WINDOW_DAYS,
                     0,
-                    true,
                     &hints,
                 )
                 .unwrap()
@@ -18425,7 +18523,6 @@ mod tests {
                     collected_at,
                     crate::snapshots::BACKFILL_WINDOW_DAYS,
                     1,
-                    true,
                     &hints,
                 )
                 .unwrap()
@@ -18531,7 +18628,6 @@ mod tests {
                 collected_at,
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 1,
-                true,
                 &hints,
             )
             .unwrap()
@@ -19191,6 +19287,40 @@ mod tests {
         assert_ne!(
             stable,
             snapshot_upload_context_fingerprint(SnapshotUploadPolicy::default(), None)
+        );
+    }
+
+    /// [money] The delivery context stays byte-identical while receipts,
+    /// stamps and ACK contexts still bind it: a changed formula would owe every
+    /// proven file again. Values computed independently of this code.
+    #[test]
+    fn upload_context_formula_is_pinned() {
+        let off = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            workspace_labels_enabled: false,
+            session_artifacts_enabled: false,
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        };
+        let on = SnapshotUploadPolicy {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            session_artifacts_enabled: true,
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+        };
+        assert_eq!(
+            cycle_upload_context(off, None, false),
+            "e69b3670ac30103faba7f9dadcff9acc5138dad509fb7ed49b52dff1668cbd4e"
+        );
+        let cached = cycle_upload_context(on, Some("stable-key-epoch"), true);
+        assert_eq!(
+            cached,
+            "ee323545020e97a574089c2e4e03176ad17917d6d78658abb9f39494487581df"
+        );
+        assert_eq!(
+            copy_unproven_upload_context(resumed_prefix_upload_context(cached, true), true),
+            "ca93839676f7beb9078f01550cb3f0b77fca81c318f222f39ffabda0095302d7"
         );
     }
 
@@ -22953,6 +23083,10 @@ mod tests {
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        #[cfg(unix)]
+        mod privacy_flip_money_tests {
+            include!("snapshot_sync/privacy_flip_money_tests.rs");
+        }
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
@@ -23205,7 +23339,6 @@ mod tests {
             "2026-10-06T23:00:00Z",
             7,
             3,
-            false,
         )
         .unwrap();
         index.bind_session_accounts(SnapshotSource::Codex, "machine", &mut scan.snapshots, &[]);
@@ -23801,7 +23934,6 @@ mod tests {
                 "2026-09-30T10:05:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
                 MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
             )
             .unwrap();
             for item in &mut scan.snapshots {
@@ -24650,7 +24782,6 @@ mod tests {
             "2026-08-02T07:10:00Z",
             7,
             100,
-            false,
         )
         .unwrap();
         scan.snapshots = vec![raw.clone()];

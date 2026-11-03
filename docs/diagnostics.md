@@ -1314,6 +1314,9 @@ records can include two sparse, counts-only objects for `source: claude_code`:
 mean zero events in that observation. Counters saturate at `u64::MAX`. They
 add no wire fields, collected data kinds, persisted state or transcript reads.
 No paths, identifiers, fingerprints, bodies or content are emitted.
+Two sparse scalars ride the same counts: `link_scrape_bytes`, the text the
+always-on link scrape tokenized, and `links_over_limit`, links left off an
+upload because their value exceeds the receiver's 512-character limit.
 
 Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Comparison

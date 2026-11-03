@@ -216,7 +216,6 @@ pub fn run_snapshot_audit<W: Write>(
         &mut index,
         &options.collected_at,
         options.backfill_window_days,
-        true,
         Some(&attribution_context),
         options.claude_support_dir.as_deref(),
         &[],
@@ -698,7 +697,7 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::{scan_source_roots_with_artifacts, scan_source_roots_with_attribution};
+    use crate::snapshots::{scan_source_roots_before_policy, scan_source_roots_with_attribution};
     use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -945,7 +944,6 @@ mod tests {
             &mut expected_index,
             "2026-05-29T00:05:00Z",
             BACKFILL_WINDOW_DAYS,
-            true,
             Some(&attribution_context),
         )
         .expect("production-equivalent scan");
@@ -1053,13 +1051,12 @@ mod tests {
         )
         .expect("write transcript");
         let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_artifacts(
+        let scan = scan_source_roots_before_policy(
             SnapshotSource::Pi,
             &[sessions],
             &mut index,
             "2026-07-22T08:02:00Z",
             BACKFILL_WINDOW_DAYS,
-            false,
         )
         .expect("scan");
         let mut original = scan.snapshots.into_iter().next().expect("snapshot");

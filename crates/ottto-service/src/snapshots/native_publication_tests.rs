@@ -134,7 +134,6 @@ fn held_decision_survives_later_publishing_siblings_and_empty_page_transport() {
             "2026-10-20T12:00:00Z",
             365,
             100,
-            false,
             None,
             &[],
             false,

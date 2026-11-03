@@ -46,6 +46,7 @@ pub(crate) struct AcceptedBuckets(
     bool,
     usize,
     bool,
+    bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -227,6 +228,21 @@ fn digest(key: &FingerprintKey, value: Value) -> [u8; 32] {
     mac.update(&serde_json::to_vec(&value).expect("JSON fingerprint"));
     mac.finalize().into_bytes().into()
 }
+/// HMAC-SHA-256 of local text under the attribution key, in the caller's own
+/// domain. A SHA-256 of the same text is a different value, by design: without
+/// the key nothing can be tested against this one.
+pub(crate) fn keyed_text_digest(key: &[u8; 32], domain: &str, text: &str) -> String {
+    let key = FingerprintKey(Zeroizing::new(*key));
+    let bytes = digest(
+        &key,
+        json!([
+            domain,
+            crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
+            text
+        ]),
+    );
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn key_epoch(key: &FingerprintKey) -> [u8; 32] {
     digest(
         key,
@@ -289,10 +305,16 @@ fn basis_token(basis: &str) -> Option<&'static str> {
     match basis {
         TELEMETRY => Some(TELEMETRY),
         TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_SOLE_LOGIN => Some(TRANSCRIPT_SOLE_LOGIN),
+        TRANSCRIPT_RECORDED_LOGIN => Some(TRANSCRIPT_RECORDED_LOGIN),
+        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
         TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
         _ => None,
     }
+}
+/// A carried or recorded-login share: placement, never proof of its row.
+fn placement_only_entry(entry: &Value) -> bool {
+    entry.get("account_source").is_some()
+        || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
     hex(&digest(
@@ -407,7 +429,7 @@ fn row_proof(key: &FingerprintKey, row: &Value, evidence: &Value) -> Option<[u8;
             Some(reference) => {
                 let entry = evidence.get(usize::try_from(reference.as_u64()?).ok()?)?;
                 // A row holding a carried share is never proof.
-                if entry.get("account_source").is_some() {
+                if placement_only_entry(entry) {
                     return None;
                 }
                 Some(authority_hash(
@@ -486,7 +508,7 @@ impl AcceptedSession {
                                 continue;
                             };
                             // A carried share is placement, never a proven authority.
-                            evidence.get("account_source").is_none().then(|| {
+                            (!placement_only_entry(evidence)).then(|| {
                                 authority_hash(
                                     fingerprint_key,
                                     &AuthorityKey {
@@ -690,7 +712,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     state.missing = state.missing.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None, false, false, 0, false))
+                Ok(AcceptedBuckets(states, None, false, false, 0, false, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -721,7 +743,15 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
+        Self(
+            BTreeMap::new(),
+            Some(fixture_key()),
+            false,
+            false,
+            0,
+            false,
+            false,
+        )
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -769,6 +799,7 @@ impl AcceptedBuckets {
             false,
             false,
             0,
+            false,
             false,
         )
     }
@@ -832,6 +863,23 @@ impl AcceptedBuckets {
     }
     pub(crate) fn account_source_enabled(&self) -> bool {
         self.5
+    }
+    /// Recorded-login tagging for this cycle: only the server's exact capability
+    /// token turns it on; absent keeps every byte and writes no ledger.
+    pub(crate) fn set_sole_login_enabled(&mut self, enabled: bool) {
+        self.6 = enabled;
+    }
+    pub(crate) fn sole_login_enabled(&self) -> bool {
+        self.6
+    }
+    /// The opaque per-folder count key: 8 hex of the attribution-key HMAC. No
+    /// key, no token, so the folder cannot qualify.
+    pub(crate) fn folder_token(&self, folder: &str) -> Option<String> {
+        let mac = digest(
+            self.1.as_ref()?,
+            json!(["claude_sole_login_folder:v1", folder]),
+        );
+        Some(mac[..4].iter().map(|byte| format!("{byte:02x}")).collect())
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -1301,6 +1349,7 @@ mod heap_tests {
             false,
             false,
             0,
+            false,
             false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
@@ -1789,6 +1838,7 @@ mod retained_heap_tests {
             false,
             false,
             0,
+            false,
             false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);

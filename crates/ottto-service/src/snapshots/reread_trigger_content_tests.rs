@@ -73,7 +73,6 @@ impl Fixture {
             &collected_at,
             BACKFILL_WINDOW_DAYS,
             MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
         )
         .expect("scan");
         finalize_scan_after_policy(self.source, &mut result, &mut self.index);
@@ -726,14 +725,9 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         // Control: the same birth adopts the stored ctime.
         let mut bound = candidate.clone();
         assert!(
-            adopt_stored_changed_time(
-                &mut bound,
-                &fixture.index.files,
-                Some(live),
-                &mut file
-            )
-            .expect("adopt")
-            .is_some(),
+            adopt_stored_changed_time(&mut bound, &fixture.index.files, Some(live), &mut file)
+                .expect("adopt")
+                .is_some(),
             "{name}: an equal known birth adopts"
         );
         assert_eq!(bound.fingerprint_changed_nanos, stored_changed);
