@@ -571,7 +571,10 @@ impl SharedCache {
         })
     }
     // Refusal returns the original inline graph; boxing adds an unfunded allocation.
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "refusal returns the original inline graph; boxing would allocate"
+    )]
     fn insert_with_custody(
         &self,
         key: String,

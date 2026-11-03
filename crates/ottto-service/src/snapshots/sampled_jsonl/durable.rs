@@ -8,7 +8,13 @@
 //! where in the file each was last assigned. Growth-only restart restore prepays a
 //! bounded native content replay and fences every X field before adoption.
 //! Empty obligations move the paid decoded graph.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "durable body helpers may be reached only from tests"
+    )
+)]
 
 use std::fs::File;
 

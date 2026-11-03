@@ -1080,7 +1080,7 @@ impl ReadPlan {
     /// `commit_sealed_prefix`, plus the typed identity exactly when it
     /// refused as `Lossy`: that refusal is reached only after every other
     /// identity, sample, scope and audit check passed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(crate) fn commit_sealed_prefix_or_lossy_identity(
         self,
         file: &mut File,
@@ -1133,7 +1133,7 @@ impl ReadPlan {
     /// re-read from the held FD only. This is append-only sampled-prefix
     /// semantics, not an immutable snapshot: an interior edit that preserves
     /// both samples is not detected until a later full read.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(crate) fn commit_sealed_prefix(
         self,
         file: &mut File,
@@ -1232,8 +1232,6 @@ impl ReadPlan {
 
 /// One `Samples` in content-free form: its sealed offset and both windows'
 /// lengths and SHA-256 digests.
-// U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedSamples {
     sealed_offset: u64,
@@ -1243,8 +1241,6 @@ pub(crate) struct ParkedSamples {
     boundary_sha256: String,
 }
 
-// U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
 impl ParkedSamples {
     fn of(samples: &Samples) -> Self {
         Self {
@@ -1294,8 +1290,6 @@ impl ParkedSamples {
 /// A `ReadPlan` in content-free persistable form: every field the plan's
 /// later decisions read, plus the job's `started`, with sample bytes kept
 /// only as SHA-256. `unpark` restores the plan exactly or refuses.
-// U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedPlan {
     mode: ReadMode,
@@ -1315,7 +1309,10 @@ pub(crate) struct ParkedPlan {
 }
 
 // U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "first prod caller is U1a-2 (RAM suspension)")
+)]
 impl ParkedPlan {
     /// The stamp the parked read opened with, at its frozen length (not
     /// normalized to the sealed offset).
@@ -1338,7 +1335,10 @@ impl ParkedPlan {
 
 /// A plan rebuilt by `ReadPlan::unpark`.
 // U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "first prod caller is U1a-2 (RAM suspension)")
+)]
 pub(crate) struct Unparked {
     pub(crate) plan: ReadPlan,
     /// The parked `started`, restored exactly: a resumed read, full or
@@ -1353,7 +1353,10 @@ pub(crate) struct Unparked {
 }
 
 // U1a: first production caller is U1a-2 (RAM suspension); persisted from U1a-3.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "first prod caller is U1a-2 (RAM suspension)")
+)]
 impl ReadPlan {
     /// This plan in persistable form, with `started`, the job's read-open
     /// time that its `commit_sealed_prefix` receives. Reads nothing and
@@ -1489,7 +1492,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 /// audit clock and staged debt are carried here unchanged and decided again
 /// by `select_mode` on the checkpoint a restore rebuilds from this one.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableCertificate {
     pub(crate) device: u64,
@@ -1510,7 +1512,6 @@ pub(crate) struct DurableCertificate {
 
 /// What `DurableCertificate::admits` found on the held FD.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DurableAdmission {
     /// The object still has exactly the certified length and mtime.
@@ -1526,7 +1527,6 @@ pub(crate) struct DurableAdmission {
 pub(crate) const DURABLE_SAMPLE_DOMAIN: &[u8] = b"ottto-dt-sample:v1\0";
 
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::new()
         .chain_update(DURABLE_SAMPLE_DOMAIN)
@@ -1538,7 +1538,6 @@ pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
 /// The opened object's birth in unix nanos, or 0 when the file system cannot
 /// report it. Never a default such as mtime or now.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
     metadata
         .created()
@@ -1549,7 +1548,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
@@ -1735,7 +1733,6 @@ impl DurableCertificate {
         Ok(stamp)
     }
 
-    #[allow(clippy::type_complexity)]
     fn admit_samples(
         &self,
         file: &mut File,

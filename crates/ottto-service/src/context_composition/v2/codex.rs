@@ -407,7 +407,6 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     let _ = owned;
 }
 
-#[allow(clippy::too_many_arguments)]
 fn message(
     out: &mut LineSink,
     state: &mut ParseState,

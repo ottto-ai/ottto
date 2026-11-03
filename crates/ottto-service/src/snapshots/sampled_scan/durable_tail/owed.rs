@@ -149,7 +149,10 @@ pub(crate) enum OwedAdmission {
     Admitted,
     Refused(Box<Taken<CachedJsonlReduction>>),
 }
-#[allow(clippy::large_enum_variant)] // Returns the already-funded frame; refusal may not allocate a new box.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "returns the funded frame; refusal may not allocate a new box"
+)]
 pub(in crate::snapshots) enum OwedCompletionAdmission {
     Admitted,
     Refused(sampled_jsonl::CompletedNativeAcquisition),
@@ -517,7 +520,10 @@ impl SharedCache {
     }
 
     /// Refusal returns the original non-Clone debt unchanged.
-    #[allow(clippy::result_large_err)] // The debt itself is the refusal value.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the debt itself is the refusal value"
+    )]
     pub(crate) fn discharge_owed(
         &self,
         owed: ReceiptOwed,

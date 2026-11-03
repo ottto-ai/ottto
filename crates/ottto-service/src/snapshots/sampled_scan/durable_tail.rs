@@ -995,7 +995,6 @@ impl<'a> Interpretation<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn expected(
     source: DurableSource,
     snapshot_source: SnapshotSource,
@@ -1406,7 +1405,10 @@ impl DurableCustody {
         }
         state.active.as_mut().ok_or(LeaseBusy)
     }
-    #[allow(clippy::result_large_err)] // Refusal returns the caller's lease.
+    #[allow(
+        clippy::result_large_err,
+        reason = "refusal returns the caller's lease"
+    )]
     pub(crate) fn attach_active(
         &mut self,
         lease: store::ActiveLease,
@@ -1438,7 +1440,7 @@ impl DurableCustody {
     pub(crate) fn take_owed(&mut self) -> Option<ReceiptOwed> {
         self.state.as_mut()?.owed.take().map(|owed| *owed)
     }
-    #[allow(clippy::result_large_err)] // Refusal returns the original debt.
+    #[allow(clippy::result_large_err, reason = "refusal returns the original debt")]
     pub(crate) fn put_owed(&mut self, owed: ReceiptOwed) -> Result<(), ReceiptOwed> {
         let state = self.state_mut();
         if state.owed.is_some() || state.chain.is_some() {
@@ -1447,7 +1449,10 @@ impl DurableCustody {
         state.owed = Some(Box::new(owed));
         Ok(())
     }
-    #[allow(clippy::result_large_err)] // Refusal returns the original chain.
+    #[allow(
+        clippy::result_large_err,
+        reason = "refusal returns the original chain"
+    )]
     pub(crate) fn put_chain(&mut self, chain: AcquiredChain) -> Result<(), AcquiredChain> {
         let state = self.state_mut();
         if state.owed.is_some() || state.chain.is_some() {
@@ -1545,7 +1550,6 @@ impl RetailAttempt {
 
 impl SharedCache {
     /// Caller already proved strict eligibility/certificate and absence of compatible RAM.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_retail(
         &self,
         source: SnapshotSource,
@@ -2818,7 +2822,7 @@ impl SharedCache {
     /// or a typed pending/integrity/missing outcome. `held` is
     /// the parser's opened FD for `path`, not yet read; bounded positional
     /// content reads preserve its offset, and the read plan repositions it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     #[inline(never)]
     pub(crate) fn durable_restore(
         &self,
@@ -3512,7 +3516,7 @@ impl SharedCache {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     #[inline(never)]
     fn restore_known(
         &self,
@@ -3912,7 +3916,7 @@ impl SharedCache {
 
     /// Restored chains inherit the verified v3 acquisition fields. O is
     /// computed on the held FD, whose position is restored.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     #[inline(never)]
     fn restored_chain(
         &self,
@@ -3968,7 +3972,7 @@ impl SharedCache {
     }
 
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "8 args; test helper")]
     fn durable_restore_record(
         &self,
         source: SnapshotSource,
@@ -3982,7 +3986,7 @@ impl SharedCache {
         self.restore_record_content(source, record, expected, path, scope, held, lease, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     #[inline(never)]
     fn restore_record_content(
         &self,

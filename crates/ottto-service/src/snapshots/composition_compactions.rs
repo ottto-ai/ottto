@@ -64,7 +64,6 @@ impl CompositionCompactions {
     /// the snapshot helper, including its parent-link precedence and greedy
     /// timestamp fallback. The normal provider order is boundary then summary;
     /// a parentless summary arriving first also consumes just one boundary.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn observe(
         &mut self,
         kind: &str,

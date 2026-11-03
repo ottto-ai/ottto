@@ -100,7 +100,7 @@ pub(super) struct PreparedRetry {
 impl PreparedRetry {
     /// Admission precedes every deep copy. All native ledger/index/context
     /// storage shares the cap; no unaccounted 128KiB context is implied.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
     pub(super) fn capture(
         source: SnapshotSource,
         machine_id: &str,

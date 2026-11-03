@@ -32,7 +32,10 @@
 //! record's allowlist digest, so any change to a class, field or type refuses
 //! old records.
 
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the bytes sink is reached only from tests")
+)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
@@ -1604,7 +1607,7 @@ macro_rules! durable_struct {
     };
     ($t:ident { $($c:ident $f:ident : $ty:ty $(as $label:ty)?),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "no fields leaves the encoder unused")]
             fn put(
                 &self,
                 e: &mut $crate::durable_tail_codec::Enc,
@@ -1615,13 +1618,13 @@ macro_rules! durable_struct {
                 );)*
                 Ok(())
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "unused when no field reads the decoder")]
             fn take(
                 d: &mut $crate::durable_tail_codec::Dec<'_>,
             ) -> Result<Self, $crate::durable_tail_codec::Corrupt> {
                 Ok(Self { $($f: $crate::durable_tail_codec::durable_field!(take $c, d, $ty)),* })
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "unused when no field reads the decoder")]
             fn verify(d: &mut $crate::durable_tail_codec::Dec<'_>) -> Result<(), $crate::durable_tail_codec::Corrupt> {
                 $($crate::durable_tail_codec::durable_field!(verify $c, d, $ty);)*
                 Ok(())
@@ -1639,7 +1642,7 @@ macro_rules! durable_struct {
     };
     ($t:ident ( $($c:ident $f:ident : $ty:ty),* $(,)? )) => {
         impl $crate::durable_tail_codec::Durable for $t {
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "no fields leaves the encoder unused")]
             fn put(
                 &self,
                 e: &mut $crate::durable_tail_codec::Enc,
@@ -1650,13 +1653,13 @@ macro_rules! durable_struct {
                 );)*
                 Ok(())
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "unused when no field reads the decoder")]
             fn take(
                 d: &mut $crate::durable_tail_codec::Dec<'_>,
             ) -> Result<Self, $crate::durable_tail_codec::Corrupt> {
                 Ok(Self($($crate::durable_tail_codec::durable_field!(take $c, d, $ty)),*))
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "unused when no field reads the decoder")]
             fn verify(d: &mut $crate::durable_tail_codec::Dec<'_>) -> Result<(), $crate::durable_tail_codec::Corrupt> {
                 $($crate::durable_tail_codec::durable_field!(verify $c, d, $ty);)*
                 Ok(())
@@ -1680,7 +1683,6 @@ macro_rules! durable_enum {
         $({ $($sc:ident $sf:ident : $sty:ty),* $(,)? })?
     ),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
-            #[allow(unused_variables)]
             fn put(
                 &self,
                 e: &mut $crate::durable_tail_codec::Enc,
@@ -1700,7 +1702,6 @@ macro_rules! durable_enum {
                 }
                 Ok(())
             }
-            #[allow(unused_variables)]
             fn take(
                 d: &mut $crate::durable_tail_codec::Dec<'_>,
             ) -> Result<Self, $crate::durable_tail_codec::Corrupt> {

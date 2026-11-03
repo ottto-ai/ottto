@@ -64,7 +64,7 @@ pub(crate) fn guard_unit_test_egress(builder: ureq::AgentBuilder) -> ureq::Agent
 /// after an environment fixture has dropped. Redirects are disabled above in
 /// tests too: ureq invokes middleware only for the initial request.
 #[cfg(test)]
-#[allow(clippy::result_large_err)] // ureq middleware requires this unboxed Error type
+#[expect(clippy::result_large_err, reason = "ureq middleware needs this Error")]
 fn unit_test_loopback_only(
     request: ureq::Request,
     next: ureq::MiddlewareNext<'_>,
@@ -167,7 +167,7 @@ impl TlsConnector for DeadlineTls {
 // ureq's `ErrorKind::msg` and `Error::src` are crate-private, so each failure
 // is an `io::Error` that keeps the underlying I/O kind and carries a typed
 // `TlsSetupError` naming the step.
-#[allow(clippy::result_large_err)] // ureq's own `TlsConnector::connect` result
+#[expect(clippy::result_large_err, reason = "ureq's TlsConnector::connect type")]
 fn rustls_connect(
     config: &Arc<rustls::ClientConfig>,
     dns_name: &str,
@@ -196,7 +196,7 @@ fn rustls_connect(
     Ok(Box::new(RustlsStream(rustls::StreamOwned::new(sess, io))))
 }
 
-#[allow(deprecated)]
+#[expect(deprecated, reason = "CloseNotify is visible only in the error text")]
 fn is_close_notify(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::ConnectionAborted
         && e.get_ref()
@@ -775,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err, reason = "middleware returns ureq::Error")]
     fn deadline_agent_shares_the_connector_and_bounds_a_stalled_handshake() {
         let certificates = Certificates::new("deadline");
         let (certificate, key) = certificates.mint("localhost", "DNS:localhost,IP:127.0.0.1");

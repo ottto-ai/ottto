@@ -116,7 +116,7 @@ impl Registry {
             .retain(|_, entry| now.duration_since(entry.created) < TTL * 2);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(crate) fn prepare(
         &mut self,
         provider: Provider,
@@ -143,7 +143,7 @@ impl Registry {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     fn prepare_inner(
         &mut self,
         provider: Provider,
@@ -167,7 +167,7 @@ impl Registry {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     fn prepare_for_user(
         &mut self,
         provider: Provider,
