@@ -76,6 +76,8 @@ pub(crate) struct Counts {
     pub(crate) evidence_owed: EvidenceOwed,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root_count: Option<u64>,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) vanished_roots_with_shared_rows: u64,
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
@@ -92,6 +94,9 @@ impl Counts {
             .saturating_add(other.deferred_by_contract_debt);
         self.evidence_owed.merge(other.evidence_owed);
         self.root_count = other.root_count.or(self.root_count);
+        self.vanished_roots_with_shared_rows = self
+            .vanished_roots_with_shared_rows
+            .saturating_add(other.vanished_roots_with_shared_rows);
     }
 }
 pub(crate) fn note(f: impl FnOnce(&mut Counts)) {
@@ -106,7 +111,14 @@ fn roots_digest(roots: &[PathBuf]) -> [u8; 32] {
     }
     hash.finalize().into()
 }
-type Parts = [Option<[u8; 32]>; 7];
+type Parts = [Option<[u8; 32]>; 8];
+#[derive(Clone, Copy)]
+pub(crate) struct ContextParts {
+    parts: Parts,
+    /// A known start's replay and scanner derivations still match. Unknown
+    /// process history is never treated as an observed context-only change.
+    pub(crate) restamp_only: bool,
+}
 #[derive(Default)]
 struct ContextState {
     prepared: [Option<[u8; 32]>; 3],
@@ -146,8 +158,9 @@ pub(crate) struct TraversalContext<'a> {
     pub(crate) active: Option<&'a str>,
     pub(crate) replay: Option<&'a str>,
     pub(crate) roots: &'a [PathBuf],
+    pub(crate) identity: &'a str,
 }
-pub(crate) fn compare_context(observed: TraversalContext<'_>) -> Parts {
+pub(crate) fn compare_context(observed: TraversalContext<'_>) -> ContextParts {
     context(|state| {
         let hash = |v: &str| Some(Sha256::digest(v.as_bytes()).into());
         let [policy, epoch, cache] = state.prepared;
@@ -159,6 +172,7 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> Parts {
             epoch,
             cache,
             hash(observed.replay.unwrap_or("none")),
+            hash(observed.identity),
         ];
         note(|counts| {
             counts.root_count = Some(observed.roots.len() as u64);
@@ -180,11 +194,19 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> Parts {
                 }
             }
         });
-        parts
+        let restamp_only = state.retained.as_ref().is_some_and(|(key, prior, _)| {
+            observed.retained.is_none_or(|retained| retained == key)
+                && prior[6] == parts[6]
+                && prior[7] == parts[7]
+        });
+        ContextParts {
+            parts,
+            restamp_only,
+        }
     })
 }
-pub(crate) fn started_context(key: &str, parts: Parts, roots: &[PathBuf]) {
-    context(|state| state.retained = Some((key.to_owned(), parts, roots_digest(roots))));
+pub(crate) fn started_context(key: &str, parts: ContextParts, roots: &[PathBuf]) {
+    context(|state| state.retained = Some((key.to_owned(), parts.parts, roots_digest(roots))));
 }
 
 #[cfg(test)]
@@ -197,6 +219,7 @@ mod tests {
         let other = [PathBuf::from("/synthetic/b")];
         let compare = |retained, backfill, active, replay, roots: &[PathBuf]| {
             compare_context(TraversalContext {
+                identity: "scanner-v1",
                 retained,
                 backfill,
                 active,

@@ -1,22 +1,22 @@
-//! Evidence owed: the Claude terminal-retry re-arm
-//! (`TerminalUnhealthyRetry`) keeps the file's fingerprint and marks its
-//! request evidence owed (`ScanIndexEntry::evidence_owed`) instead of
-//! clearing the fingerprint. Every other re-arm cause clears it.
+//! Evidence owed keeps a known revision across census restarts. Context-only
+//! changes may owe evidence; replay and scan-identity changes still clear it.
 //!
 //! The traversal resolves an owed, unchanged member at selection:
 //! - (a) its stored occurrences are bound to this revision: re-stamp them into
 //!   the current census window, no read; a confirmed-empty member whose
 //!   current census record holds no requests re-stamps from that record;
-//! - otherwise one counted `Rearmed` parse, paced per page; with the
-//!   fingerprint kept the existing RAM/durable restore may serve it (b), else
-//!   it reads Full (d).
+//! - otherwise keep the member owed, without selecting a read.
 use super::usage_pending::UsageView;
 use super::*;
 
-/// Only the terminal-retry re-arm owes evidence instead of clearing the
-/// fingerprint.
+/// Census restart causes may owe evidence; the start further restricts context changes.
 pub(crate) fn owes(cause: rearm_cause::Cause) -> bool {
-    cause == rearm_cause::Cause::TerminalUnhealthyRetry
+    matches!(
+        cause,
+        rearm_cause::Cause::TerminalUnhealthyRetry
+            | rearm_cause::Cause::ContextChanged
+            | rearm_cause::Cause::NoRetainedTraversal
+    )
 }
 
 /// The one keep-or-clear rule: `owe` keeps a known revision and owes it;
@@ -55,6 +55,7 @@ pub(super) fn carry_debt_changes(retained: &ScanIndexEntry, working: &ScanIndexE
 }
 
 /// Per page: the paced owed-read allowance.
+#[allow(dead_code)] // Later dead-code cut: the owed resolver no longer spends a read allowance.
 pub(super) struct Page {
     /// Owed Fulls this page already admitted, and the one
     /// per-page cap. It reuses the existing paced re-read page allowance
@@ -195,7 +196,7 @@ fn family<'a>(
 /// decided by `candidate_decision_in_window`). Only an owed entry changes.
 pub(super) fn resolve(
     index: &mut ScanIndex,
-    page: &mut Page,
+    _page: &mut Page,
     candidate: &CandidateFile,
     census_window_end: &str,
     decision: &mut CandidateDecision,
@@ -289,33 +290,8 @@ pub(super) fn resolve(
             }),
         }
     }
-    if !index.files.contains_key(&key) {
-        return;
-    }
-    // Every owed member left here is read, paced per page; capacity never
-    // keeps one owed.
-    if page.reads >= page.read_cap {
-        // Paced: back into the walk's own queue as a re-read (not a
-        // census member, like a history-upgrade budget hold), still owed.
-        claude_contract::note(|c| c.evidence_owed.deferred_page_cap += 1);
-        if let Some(traversal) = index.traversal.as_mut() {
-            traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root: candidate.scan_root.clone(),
-                path: candidate.path.clone(),
-                census_member: false,
-                watcher_hint: false,
-            });
-        }
-        return;
-    }
-    page.reads += 1;
-    let latched = index.claude_request_identity_contract_changed;
-    claude_contract::note(|c| {
-        c.evidence_owed.read += 1;
-        c.evidence_owed.identity_owed_read_under_latch += u64::from(latched);
-    });
-    *decision = CandidateDecision::Parse;
-    *reason = Some(CandidateParseReason::Rearmed);
+    // Refused evidence stays owed and unobserved. Only an independently
+    // selected read or a later valid re-stamp can resolve it.
 }
 
 /// A traversal started under the recorded identity contract: its census
@@ -393,7 +369,7 @@ fn restamp(
     // stamp is the recorded, real contract this cycle runs under. A pending
     // left `contract_unproven` by a latch clear proves its contract only
     // through that stamp. Under the latch the member must also have been read
-    // under that contract (`current_contract_read`); otherwise one paced read.
+    // under that contract (`current_contract_read`); otherwise it stays owed.
     let latched = index.claude_request_identity_contract_changed;
     let stamped = pending
         .identity_contract
@@ -549,31 +525,30 @@ mod tests {
         .unwrap()
     }
 
-    /// [behaviour] Only the terminal-retry re-arm keeps the revision owed;
-    /// every other re-arm cause clears the fingerprint.
+    /// [regress] All census restart causes may owe unchanged evidence. Context
+    /// classification at Starting still clears replay and identity changes.
     #[test]
-    fn only_the_terminal_retry_rearm_owes() {
-        let mut owed = entry();
-        rearm_cause::clear(
-            "/k.jsonl",
-            &mut owed,
-            rearm_cause::Cause::TerminalUnhealthyRetry,
-        );
-        assert_eq!(
-            (owed.source_file_fingerprint.as_str(), owed.evidence_owed),
-            ("revision", true)
-        );
-        assert!(owed.rearmed());
-        assert_eq!(owed.observed_fingerprint(), "");
+    fn census_restart_causes_may_owe() {
         for cause in [
-            rearm_cause::Cause::NoRetainedTraversal,
-            rearm_cause::Cause::CarryInvalidation,
+            rearm_cause::Cause::TerminalUnhealthyRetry,
             rearm_cause::Cause::ContextChanged,
+            rearm_cause::Cause::NoRetainedTraversal,
+        ] {
+            let mut owed = entry();
+            rearm_cause::clear("/k.jsonl", &mut owed, cause);
+            assert_eq!(
+                (owed.source_file_fingerprint.as_str(), owed.evidence_owed),
+                ("revision", true)
+            );
+            assert_eq!(owed.observed_fingerprint(), "");
+        }
+        for cause in [
+            rearm_cause::Cause::CarryInvalidation,
             rearm_cause::Cause::AuditCapDelay,
         ] {
             let mut cleared = entry();
             rearm_cause::clear("/k.jsonl", &mut cleared, cause);
-            assert!(cleared.source_file_fingerprint.is_empty() && !cleared.evidence_owed);
+            assert!(cleared.source_file_fingerprint.is_empty());
         }
     }
 

@@ -4445,7 +4445,10 @@ fn owed_reads(index: &mut ScanIndex, candidates: &[CandidateFile], window: &str)
             reads.push(candidate.path.clone());
         }
     }
-    for candidate in candidates.iter().filter(|candidate| reads.contains(&candidate.path)) {
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| reads.contains(&candidate.path))
+    {
         index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
     }
     reads
@@ -5125,4 +5128,68 @@ fn cold_stale_carry_streams_the_join_like_a_whole_kind_load() {
     assert!(v2::usage_head_only(&gone, CARRY_ROOT), "nothing compacted");
     drop(custody);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// [regress] Context-only starts owe valid members; invalid rows stay in
+/// the cohort without permanent debt. Replay keeps its explicit clear.
+#[test]
+fn context_restart_never_owes_invalid_rows_and_replay_still_clears() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for replay in [false, true] {
+        let (mut fixture, _) = owed_rearmed(2);
+        let window = fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .census_window_end
+            .clone();
+        for entry in fixture.index.files.values_mut() {
+            entry.evidence_owed = false;
+        }
+        let roots = fixture
+            .index
+            .claude_usage_family_pending
+            .roots()
+            .cloned()
+            .collect::<Vec<_>>();
+        let invalid = roots[0].clone();
+        fixture
+            .index
+            .claude_usage_family_pending
+            .get_mut(&invalid)
+            .unwrap()
+            .invalid = true;
+        if replay {
+            fixture.index.historical_replay_generation = Some("explicit-replay".into());
+        }
+        // The prior fixture's traversal was captured in this process. Changing
+        // backfill is an observed context part; replay is never restamp-only.
+        let candidates = fixture.candidates.clone();
+        let scan_roots = candidates
+            .first()
+            .map(|c| c.scan_root.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &scan_roots,
+            &mut fixture.index,
+            &window,
+            BACKFILL_WINDOW_DAYS + 1,
+        );
+        for candidate in &candidates {
+            let key = local_index_key(&candidate.path);
+            let entry = &fixture.index.files[&key];
+            let member = claude_index_path_member_ref(&candidate.path).unwrap();
+            if replay {
+                assert!(entry.source_file_fingerprint.is_empty());
+            }
+            if member.root == invalid {
+                assert!(!entry.evidence_owed);
+            }
+        }
+    }
 }

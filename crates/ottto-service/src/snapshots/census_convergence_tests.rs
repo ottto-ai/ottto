@@ -3175,3 +3175,40 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
     assert!(index.files.contains_key(&key));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// [regress] Kept old invalid rows are cohort inputs, not fresh census
+/// invalidations. An open fence stays open over two completed empty pages;
+/// an already closed fence still needs positive coverage to open.
+#[test]
+fn kept_rows_do_not_close_an_open_fence_on_later_walks() {
+    for initially_closed in [false, true] {
+        let mut index = ScanIndex::default();
+        index.claude_duplicate_request_witness_overflowed = initially_closed;
+        let key = "/synthetic/kept-root.jsonl";
+        index
+            .files
+            .insert(key.into(), committed_entry("source", "body"));
+        let mut pending = current_pending("kept-root", &hex64('a'));
+        pending.census_window_end = OLDER_WINDOW.into();
+        pending.invalid = true;
+        index
+            .claude_usage_family_pending
+            .insert("kept-root".into(), pending);
+        index.claude_full_rearm_progress.completed_window = rfc3339_unix_seconds(OLDER_WINDOW);
+        for window in [WINDOW, "2026-08-03T07:10:00Z"] {
+            let disposition = apply_claude_reported_usage_with_index(
+                &mut [],
+                &Default::default(),
+                &Default::default(),
+                &mut index,
+                true,
+                window,
+            );
+            assert!(!disposition.duplicate_census.census_invalid);
+            assert_eq!(disposition.duplicate_census.fence_after, initially_closed);
+            assert!(!disposition.duplicate_census.full_rearm);
+            assert_eq!(index.files[key].source_file_fingerprint, "source");
+            assert!(index.claude_usage_family_pending.contains_key("kept-root"));
+        }
+    }
+}

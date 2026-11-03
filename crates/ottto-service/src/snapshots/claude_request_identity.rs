@@ -4589,8 +4589,6 @@ pub(crate) struct ScanEvidence<'a> {
 pub(crate) struct RequestRootIndex(Vec<([u8; 32], u32)>);
 
 impl RequestRootIndex {
-    const SEVERAL: u32 = u32::MAX;
-
     /// Adds one root's API and trace request ids, in any order. Call once per root.
     pub(crate) fn add_root<'r>(&mut self, root: u32, request_ids: impl Iterator<Item = &'r str>) {
         let mut ids = request_ids
@@ -4604,22 +4602,21 @@ impl RequestRootIndex {
     /// Once every root is in: sort, then collapse ids held by several roots.
     pub(crate) fn finish(&mut self) {
         self.0.sort_unstable();
-        self.0.dedup_by(|later, kept| {
-            if later.0 != kept.0 {
-                return false;
-            }
-            kept.1 = Self::SEVERAL;
-            true
-        });
+        // Keep each root ordinal so terminal discard can count shared rows.
+        self.0.dedup();
         self.0.shrink_to_fit();
     }
 
     /// `Some(Some(root))`: one root's rows name `request_id`; `Some(None)`: several.
     pub(crate) fn get(&self, request_id: &str) -> Option<Option<u32>> {
         let id = <[u8; 32]>::from(sha2::Sha256::digest(request_id.as_bytes()));
-        let at = self.0.binary_search_by(|(known, _)| known.cmp(&id)).ok()?;
-        let root = self.0[at].1;
-        Some((root != Self::SEVERAL).then_some(root))
+        let at = self.0.partition_point(|(known, _)| *known < id);
+        let (_, root) = self.0.get(at).filter(|(known, _)| *known == id)?;
+        Some((self.0.get(at + 1).is_none_or(|(next, _)| *next != id)).then_some(*root))
+    }
+
+    pub(super) fn root_holds_hash(&self, root: u32, hash: &[u8; 32]) -> bool {
+        self.0.binary_search(&(*hash, root)).is_ok()
     }
 }
 

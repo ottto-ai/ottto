@@ -2523,6 +2523,10 @@ impl ClaudeStaleFamilyCarry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct ClaudeFullRearmProgress {
+    /// Kept usage rows through this completed window no longer invalidate later
+    /// walks. They still participate in the evidence cohort and duplicate joins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_window: Option<u64>,
     // Process-local proof: every decode drops it. A restart between read and
     // close therefore fails closed, even if persisted scheduling survives.
     #[serde(skip)]
@@ -9244,7 +9248,7 @@ pub fn apply_claude_effort_evidence_with_index(
         // complete families for a bounded local reparse before the legacy
         // witness is discarded. The old count-only witness is never used to
         // stamp a v30 parse; the reparse must rebuild exact request coverage.
-        let legacy_witness_roots = index
+        let _legacy_witness_roots = index
             .claude_account_family_witnesses
             .iter()
             .filter_map(|(root_session_id, witness)| {
@@ -9263,21 +9267,6 @@ pub fn apply_claude_effort_evidence_with_index(
                 .then_some(root_session_id.clone())
             })
             .collect::<BTreeSet<_>>();
-        for (index_key, entry) in index.files.slots_mut() {
-            let Some((root_session_id, source_session_id)) =
-                claude_index_path_family_member(Path::new(index_key))
-            else {
-                continue;
-            };
-            if legacy_witness_roots.contains(&root_session_id)
-                && complete_family_members
-                    .get(&root_session_id)
-                    .is_some_and(|members| members.contains(&source_session_id))
-                && !entry.source_file_fingerprint.is_empty()
-            {
-                entry.make_mut().source_file_fingerprint.clear();
-            }
-        }
         index
             .claude_account_family_witnesses
             .retain(|root_session_id, witness| {
@@ -9375,7 +9364,7 @@ pub fn apply_claude_effort_evidence_with_index(
             .iter()
             .map(|snapshot| snapshot.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
-        let newly_proven_roots = proven_families
+        let _newly_proven_roots = proven_families
             .keys()
             .filter(|root_session_id| {
                 !witness_roots_before.contains(*root_session_id)
@@ -9384,22 +9373,7 @@ pub fn apply_claude_effort_evidence_with_index(
                         .contains_key(*root_session_id)
             })
             .collect::<BTreeSet<_>>();
-        for (index_key, entry) in index.files.slots_mut() {
-            let Some((root_session_id, source_session_id)) =
-                claude_index_path_family_member(Path::new(index_key))
-            else {
-                continue;
-            };
-            if newly_proven_roots.contains(&root_session_id)
-                && !current_source_session_ids.contains(source_session_id.as_str())
-                && !entry.source_file_fingerprint.is_empty()
-            {
-                // Earlier pages uploaded an honest NULL before the terminal
-                // census could prove the family. Reparse them once so the new
-                // durable witness emits the correction on the next pass.
-                entry.make_mut().source_file_fingerprint.clear();
-            }
-        }
+        // Earlier bodies remain unchanged; later dead-code cut removes reproof scheduling.
     }
 }
 
@@ -9609,6 +9583,33 @@ type ClaudeProofRows<'r> = (
 );
 
 impl ClaudeEvidenceRows<'_> {
+    fn root_has_shared_rows(
+        self,
+        root: &str,
+        api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+        join: &terminal_join::TerminalJoin,
+    ) -> bool {
+        match self {
+            Self::Streamed(cross) => cross.root_has_shared_rows(root, join),
+            Self::Whole(_) => api
+                .evidence
+                .get(root)
+                .into_iter()
+                .flatten()
+                .map(|row| row.request_id.as_str())
+                .chain(
+                    trace
+                        .evidence
+                        .get(root)
+                        .into_iter()
+                        .flatten()
+                        .map(|row| row.request_id.as_str()),
+                )
+                .any(|id| join.other_root_holds(root, &Sha256::digest(id.as_bytes()).into())),
+        }
+    }
+
     /// One root's rows for the terminal proof: the reports' rows, else a
     /// strict reread of a pair this pass read healthy but did not keep.
     /// `Err`: that pair changed since, so its family stays unproven.
@@ -10161,6 +10162,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .claude_usage_family_pending
             .views()
             .any(|(root_session_id, pending)| {
+                if claude_pending_completed(index, pending) {
+                    return false;
+                }
                 if pending.window() == census_window_end {
                     return pending.invalid();
                 }
@@ -10359,7 +10363,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && !index
                 .claude_usage_family_pending
                 .view(&root_session_id)
-                .is_some_and(|pending| pending.invalid() || pending.window() != census_window_end)
+                .is_some_and(|pending| {
+                    !claude_pending_completed(index, pending)
+                        && (pending.invalid() || pending.window() != census_window_end)
+                })
         {
             let owned = item
                 .cache_requests
@@ -10407,7 +10414,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
     note_claude_reemission_stop(&context_file_birth, file_birth_tripwire.over_bound_roots());
 
-    let owned_start_reparse_ids = index
+    let _owned_start_reparse_ids = index
         .claude_owned_start_census
         .iter()
         .filter_map(|(source_session_id, witness)| {
@@ -10420,21 +10427,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .map(|_| source_session_id.clone())
         })
         .collect::<BTreeSet<_>>();
-    if !owned_start_reparse_ids.is_empty() {
-        for (index_key, entry) in index.files.slots_mut() {
-            if claude_index_path_family_member(Path::new(index_key)).is_some_and(
-                |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
-            ) {
-                crate::local_resource_diagnostics::claude_reread::clear(
-                    crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
-                    !entry.source_file_fingerprint.is_empty(),
-                );
-                if !entry.source_file_fingerprint.is_empty() {
-                    entry.make_mut().source_file_fingerprint.clear();
-                }
-            }
-        }
-    }
+    // Owned-start observations do not schedule historical body corrections.
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
         request_groupings,
@@ -10742,8 +10735,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && index.claude_request_identity_contract.as_deref()
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
-        let would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
-        let full_rearm = would_full_rearm;
+        let _would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
+        let full_rearm = false; // A complete census never schedules transcript reads.
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -10868,11 +10861,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && entry.effective_upload_body_witness_revision < 3
                     && !index.claude_family_listed(key)
             });
-        let identity_contract_rearm = latch_rearms
-            && !e2_identity_upgrade
-            && fence_stays_closed
-            && census_complete
-            && identity_contract_recorded;
+        let identity_contract_rearm = false;
         // Partial settlement keeps the latch below, but cannot suppress its
         // independent corrective re-arm while the liveness deadline waits.
         // Fence recovery: members an earlier skip left unread stay unobserved,
@@ -10880,7 +10869,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // this window did not read, which the BASE re-arm would have re-read,
         // are all that keeps the fence closed, re-arm every family file once,
         // so the next census can observe all of them in one window.
-        let fence_recovery_rearm = closed_only_by_witnessed_families && fence_stays_closed;
+        let fence_recovery_rearm = false;
         // An unchanged settled proof owes no replay only while the fence was
         // closed before and stays closed after this census, nothing re-arms
         // every file, the identity contract is unchanged, the sweep settled,
@@ -10998,7 +10987,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
-            let settled_unchanged_proof = proof_candidate
+            let _settled_unchanged_proof = proof_candidate
                 && unchanged_proof_roots
                     .as_ref()
                     .is_some_and(|roots| roots.get(root_session_id.as_str()) == Some(&true));
@@ -11014,13 +11003,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             rearm.other_rearm_matches = rearm
                 .other_rearm_matches
                 .saturating_add(usize::from(other_rearm));
-            let rearmed = full_rearm
-                || identity_contract_rearm
-                || fence_recovery_rearm
-                || (proof_candidate && !negative && !settled_unchanged_proof)
-                || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owner
-                || current_member_owns_changed_request;
+            let rearmed = false; // No proof, witness or owner change re-arms history.
             if rearmed {
                 // Reparse earlier-page members of every proven family unless
                 // its proof is unchanged and settled behind a fence that was
@@ -11068,20 +11051,29 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
-        // Completion retires every family pending outside authority
-        // quarantine.
-        let retired = index
+        // Only this completion's absent set may discard usage rows. Any future
+        // retire_tail caller must use this same absence proof, never the 35-day
+        // census-record retirement (which proves age, not filesystem absence).
+        let vanished = index
             .claude_usage_family_pending
             .views()
-            .filter(|(root_session_id, _)| {
-                !index
-                    .claude_usage_authority_quarantine
-                    .contains_key(*root_session_id)
+            .filter(|(root, pending)| {
+                !index.claude_usage_authority_quarantine.contains_key(*root)
+                    && claude_pending_root_vanished(root, *pending, &indexed_claude_family_ids)
             })
-            .map(|(root_session_id, _)| root_session_id.clone())
+            .map(|(root, _)| root.clone())
             .collect::<Vec<_>>();
-        for root_session_id in &retired {
-            index.claude_usage_family_pending.discard(root_session_id);
+        let shared = vanished
+            .iter()
+            .filter(|root| evidence_rows.root_has_shared_rows(root, api_report, trace_report, join))
+            .count();
+        claude_contract::note(|c| c.vanished_roots_with_shared_rows += shared as u64);
+        for root in vanished {
+            index.claude_usage_family_pending.discard(&root);
+        }
+        if let Some(window) = rfc3339_unix_seconds(census_window_end) {
+            let completed = &mut index.claude_full_rearm_progress.completed_window;
+            *completed = Some(completed.unwrap_or_default().max(window));
         }
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
@@ -11211,6 +11203,26 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     disposition
 }
 
+fn claude_pending_completed(index: &ScanIndex, pending: usage_pending::UsageView<'_>) -> bool {
+    index
+        .claude_full_rearm_progress
+        .completed_window
+        .zip(rfc3339_unix_seconds(pending.window()))
+        .is_some_and(|(completed, window)| window <= completed)
+}
+
+fn claude_pending_root_vanished(
+    root: &str,
+    pending: usage_pending::UsageView<'_>,
+    indexed: &BTreeSet<String>,
+) -> bool {
+    !indexed.contains(root)
+        && pending
+            .hash_members()
+            .chain(pending.occurrence_members())
+            .all(|member| !indexed.contains(member))
+}
+
 /// Whether pending from an older census window keeps this census invalid.
 fn claude_stale_pending_keeps_census_invalid(
     index: &ScanIndex,
@@ -11219,15 +11231,14 @@ fn claude_stale_pending_keeps_census_invalid(
     census_complete: bool,
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
+    if claude_pending_completed(index, pending) {
+        return false;
+    }
     // Only a complete census proves that a family vanished. Old pending whose
     // root and members have no indexed file left cannot hide a current
     // request; any remaining file keeps it fail closed below.
     if census_complete
-        && !indexed_claude_family_ids.contains(root_session_id)
-        && pending
-            .hash_members()
-            .chain(pending.occurrence_members())
-            .all(|member| !indexed_claude_family_ids.contains(member))
+        && claude_pending_root_vanished(root_session_id, pending, indexed_claude_family_ids)
     {
         return false;
     }
@@ -45550,6 +45561,7 @@ fn ensure_bounded_traversal(
             active: index.active_upload_context_fingerprint.as_deref(),
             replay: index.historical_replay_generation.as_deref(),
             roots,
+            identity: &scan_traversal_context_fingerprint_with(source, &[], None, None, 0),
         })
     });
     let prior_admission = index
@@ -45758,7 +45770,14 @@ fn ensure_bounded_traversal(
         source,
         index,
         collected_at,
-        prior_traversal_context_matches,
+        prior_traversal_context_matches
+            || (index.traversal.is_none()
+                && index
+                    .claude_full_rearm_progress
+                    .traversal_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.context_fingerprint == context_fingerprint)),
+        context_observation,
         retry_attempt,
     );
 
@@ -45802,7 +45821,10 @@ fn ensure_bounded_traversal(
         let stale_pending_roots = index
             .claude_usage_family_pending
             .views()
-            .filter(|(_, pending)| pending.window() != collected_at)
+            .filter(|(_, pending)| {
+                pending.window() != collected_at
+                    && (!transition.owes() || !claude_pending_completed(index, *pending))
+            })
             .filter(|(root, _)| {
                 !index
                     .claude_usage_authority_quarantine
@@ -46060,6 +46082,12 @@ fn ensure_bounded_traversal(
         let mut carried_file_count = 0_usize;
         let mut capped_file_count = 0_usize;
         let mut window_rearmed_file_count = 0_usize;
+        let invalid_roots = index
+            .claude_usage_family_pending
+            .views()
+            .filter(|(_, pending)| pending.invalid())
+            .map(|(root, _)| root.clone())
+            .collect::<BTreeSet<_>>();
         for (index_key, entry) in index.files.slots_mut() {
             let Some((root, _)) = claude_index_path_family_member(Path::new(index_key))
                 .filter(|(root, _)| stale_pending_roots.contains(root))
@@ -46078,6 +46106,9 @@ fn ensure_bounded_traversal(
             } else if capped_roots.contains(&root) {
                 capped_file_count += 1;
             } else {
+                if transition.owes() && invalid_roots.contains(&root) {
+                    continue;
+                }
                 rearm_cause::clear_owed(
                     index_key,
                     entry.make_mut(),
@@ -85746,7 +85777,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover, identity_contract_window, fence_closed_since);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; completed_window, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover, identity_contract_window, fence_closed_since);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);

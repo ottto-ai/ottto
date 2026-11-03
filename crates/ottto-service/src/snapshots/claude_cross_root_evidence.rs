@@ -141,6 +141,18 @@ impl CrossRootEvidence {
             }));
     }
 
+    pub(super) fn root_has_shared_rows(
+        &self,
+        root: &str,
+        join: &super::terminal_join::TerminalJoin,
+    ) -> bool {
+        let Some(ordinal) = self.roots.iter().position(|known| known == root) else {
+            return false;
+        };
+        join.other_root_hashes(root)
+            .any(|hash| self.request_roots.root_holds_hash(ordinal as u32, hash))
+    }
+
     pub(super) fn tripwire(
         &self,
         items: &[SnapshotItem],

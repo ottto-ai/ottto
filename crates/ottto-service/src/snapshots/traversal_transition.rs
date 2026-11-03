@@ -41,6 +41,8 @@ pub(super) struct Starting {
     index_generation: u64,
     window_unix_seconds: Option<u64>,
     context_matches: bool,
+    #[serde(skip)]
+    context_parts: Option<super::claude_contract::ContextParts>,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
     prior_held_family_roots: usize,
@@ -78,6 +80,7 @@ impl Starting {
     /// terminal-unhealthy retry.
     pub(super) fn owes(&self) -> bool {
         super::evidence_owed::owes(self.rearm_cause())
+            && (self.context_matches || self.context_parts.is_some_and(|p| p.restamp_only))
     }
     pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
         use crate::local_resource_diagnostics::rearm_cause::Cause;
@@ -94,6 +97,7 @@ impl Starting {
         index: &ScanIndex,
         now: &str,
         matches: bool,
+        parts: Option<super::claude_contract::ContextParts>,
         attempt: u8,
     ) -> Self {
         let previous = index.traversal.as_ref().map(|t| Previous {
@@ -125,6 +129,7 @@ impl Starting {
             index_generation: index.generation,
             window_unix_seconds: rfc3339_unix_seconds(now),
             context_matches: matches,
+            context_parts: parts,
             retry_due: matches.then_some(true),
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
             prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
@@ -304,12 +309,13 @@ mod tests {
             &index,
             T1,
             true,
+            None,
             1,
         ))
         .unwrap();
         assert_eq!(row["prior_held_family_roots"], 2);
         assert_eq!(row["prior_held_family_set_digest"], observed.1.unwrap());
-        let other = Starting::capture(SnapshotSource::Pi, &index, T1, true, 1);
+        let other = Starting::capture(SnapshotSource::Pi, &index, T1, true, None, 1);
         assert_eq!(other.prior_held_family_roots, 0);
         assert!(other.prior_held_family_set_digest.is_none());
     }
@@ -843,7 +849,7 @@ mod tests {
                 .unwrap();
         let ((starting, rows), events) = disappearance_diagnostics::observe(|| {
             capture(|| {
-                let starting = Starting::capture(SnapshotSource::Pi, &restored, T1, true, 1);
+                let starting = Starting::capture(SnapshotSource::Pi, &restored, T1, true, None, 1);
                 starting.emit(SnapshotSource::Pi);
                 starting
             })
@@ -972,7 +978,7 @@ mod tests {
             index.generation = u64::MAX;
             let traversal = index.traversal.as_mut().unwrap();
             traversal.counts = max_traversal_counts();
-            let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+            let mut starting = Starting::capture(source, &index, T1, true, None, u8::MAX);
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
@@ -1120,14 +1126,15 @@ mod tests {
         let source = SnapshotSource::ClaudeCode;
         let mut index = ScanIndex::default();
         ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
-        let (_, rows) = capture(|| Starting::capture(source, &index, T1, true, 1).emit(source));
+        let (_, rows) =
+            capture(|| Starting::capture(source, &index, T1, true, None, 1).emit(source));
         for field in FIELDS {
             assert!(rows[0]["counts"].get(field).is_none(), "{field}");
         }
 
         index.generation = u64::MAX;
         index.traversal.as_mut().unwrap().counts = max_traversal_counts();
-        let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+        let mut starting = Starting::capture(source, &index, T1, true, None, u8::MAX);
         starting.context_matches = false;
         starting.prior_unsettled_upload = false;
         starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);

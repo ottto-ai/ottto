@@ -295,3 +295,34 @@ fn a_patched_head_is_read_and_saved_with_its_flag() {
     let _ = fs::remove_dir_all(scratch);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// [regress] A completed terminal retains the same cohort cold and resident,
+/// including after saving/reloading its completed-window marker.
+#[test]
+fn completed_terminal_keeps_cold_and_resident_cohort() {
+    let (dir, child, api, trace, index) = accumulated();
+    let before = claude_pending_family_session_ids(&index);
+    let scratch = crate::test_scratch::canonical_private_dir("terminal-cohort");
+    let (custody, mut cold) =
+        v2::ColdSession::publish(scan_index_persistence::Source::Claude, &index, &scratch);
+    let mut resident = v2::resident(&cold);
+    for view in [&mut cold, &mut resident] {
+        let (_, disposition) = terminal(view, &child, &api, &trace, ONE_FAMILY);
+        assert_eq!(disposition.terminal, ClaudeTerminalOutcome::Complete);
+        assert_eq!(claude_pending_family_session_ids(view), before);
+        assert_eq!(
+            view.claude_usage_family_pending.len(),
+            index.claude_usage_family_pending.len()
+        );
+        assert!(!disposition.duplicate_census.full_rearm);
+    }
+    let (_, reloaded) = custody.save_reload(&mut cold);
+    assert_eq!(claude_pending_family_session_ids(&reloaded), before);
+    assert_eq!(
+        reloaded.claude_full_rearm_progress.completed_window,
+        resident.claude_full_rearm_progress.completed_window
+    );
+    drop(custody);
+    fs::remove_dir_all(scratch).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}

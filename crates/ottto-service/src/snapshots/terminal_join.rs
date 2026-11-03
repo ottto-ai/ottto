@@ -442,6 +442,22 @@ impl TerminalJoin {
         })
     }
 
+    pub(super) fn other_root_holds(&self, root: &str, key: &RequestKey) -> bool {
+        self.other_root_hashes(root).any(|hash| hash == key)
+    }
+
+    pub(super) fn other_root_hashes<'a>(
+        &'a self,
+        root: &'a str,
+    ) -> impl Iterator<Item = &'a RequestKey> {
+        self.entries
+            .iter()
+            .filter(move |(_, owner, flags)| {
+                flags & HASH != 0 && self.owners[*owner as usize].0 != root
+            })
+            .map(|(key, _, _)| key)
+    }
+
     /// Whether `member` of `root` holds any of `keys` among its request
     /// hashes, in any window.
     pub(super) fn member_hashes_meet(

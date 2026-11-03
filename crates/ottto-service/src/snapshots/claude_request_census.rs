@@ -3314,8 +3314,21 @@ fn retire_claude_transcript_records_excluding(
         .unwrap_or(&super::state_v2::EMPTY_INDEX)
         .growth_retention;
     let walk = index.traversal.as_ref();
+    let cohort = super::claude_pending_family_session_ids(index)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let held = |key: &str| {
-        super::restart_restore::enabled() && terminal_residue.is_some_and(|held| held.contains(key))
+        // Age is not an absence proof. Keep own-family off-page holders while
+        // their root is in the cohort, and keep owed members available for a
+        // read-free re-stamp. Neither path retires Tail state.
+        index
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.evidence_owed)
+            || claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| cohort.contains(member.root))
+            || (super::restart_restore::enabled()
+                && terminal_residue.is_some_and(|held| held.contains(key)))
     };
     let growth_excluded = |key: &str| {
         active && super::sampled_audit::growth_excluded_parts(key, growth, walk, terminal_residue)
