@@ -58635,7 +58635,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_context_without_receipt_reparses_under_every_context() {
+    fn upload_context_without_receipt_stays_owed_and_reads_nothing_under_any_context() {
         let root = temp_dir("upload-context-aba");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -58665,9 +58665,12 @@ mod tests {
 
         // No ACK, no receipt: a complete census alone proves nothing, so the
         // file stays owed under every context until its own receipt exists.
+        // Owed proof selects no read: neither the same context again nor a
+        // new one reads the closed file (forward-only).
         assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
-        assert_eq!(scan_with_context("context-b").scanned_file_count, 1);
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 0);
+        assert_eq!(scan_with_context("context-b").scanned_file_count, 0);
+        assert!(index.file_upload_context_requires_adoption(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);
     }
 

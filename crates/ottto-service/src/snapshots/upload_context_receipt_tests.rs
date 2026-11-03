@@ -2182,21 +2182,36 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             .all(|pending| !pending.watcher_hint));
         assert_eq!(traversal.pending_candidates[0].path, a);
         assert_eq!(traversal.pending_candidates[1].path, singleton);
-        f.cache = Arc::default();
-        let previous = f.index.clone();
-        let (((scan, native), reads), group_native) =
-            terminal_contract_retry::group_body_bytes(|| {
-                terminal_contract_retry::source_acquisitions(|| {
-                    f.walk_with_file_limit(true, 2, false)
-                })
-            });
-        assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
+        // The owed group is no context-only work any more: like any unchanged
+        // selected group it may take this page's file allowance and reads
+        // nothing (Codex group admission), so the singleton can wait a page.
+        // Across pages the singleton is read exactly once; the group never.
+        let mut total = BTreeMap::new();
+        let mut sent = 0;
+        let first = f.uploader.posts.len();
+        for _ in 0..3 {
+            f.cache = Arc::default();
+            let previous = f.index.clone();
+            let (((scan, native), reads), group_native) =
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| {
+                        f.walk_with_file_limit(true, 2, false)
+                    })
+                });
+            assert!(
+                native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton()
+            );
+            assert_eq!(group_native, 0, "the context group stays unparsed");
+            for (path, count) in reads {
+                *total.entry(path).or_insert(0) += count;
+            }
+            sent += f.send_ordering_page(&previous, &scan).0;
+        }
         assert_eq!(
-            reads,
+            total,
             BTreeMap::from([(singleton.clone(), 1)]),
-            "ordinary singleton owns its slot; context group stays unparsed"
+            "the ordinary singleton is read once; the context group never"
         );
-        assert_eq!(group_native, 0);
         for name in &names {
             let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
             assert!(
@@ -2204,8 +2219,7 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
                 "group remains owed"
             );
         }
-        let first = f.uploader.posts.len();
-        assert_eq!(f.send_ordering_page(&previous, &scan).0, 1);
+        assert_eq!(sent, 1);
         assert!(f.uploader.posts[first..]
             .iter()
             .flatten()

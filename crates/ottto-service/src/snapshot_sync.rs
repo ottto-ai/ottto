@@ -14698,6 +14698,16 @@ mod tests {
         )
         .unwrap();
         index.activate_upload_context("cache-on-mandatory".into());
+        // Forward-only: the capability change alone reads nothing, although
+        // the accepted file holds no receipt under the new context.
+        assert!(
+            scan(&mut index.clone()).snapshots.is_empty(),
+            "a capability change reads nothing"
+        );
+        // Its next ordinary read carries the capability; a re-arm stands in.
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
         let mut on = scan(&mut index);
         apply_upload_policy(
             SnapshotSource::Codex,
@@ -14970,11 +14980,21 @@ mod tests {
         assert_eq!(accepted, 1);
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         index.activate_upload_context("cache-on".into());
+        // Forward-only: the capability change alone reads nothing, although
+        // the accepted file holds no receipt under the new context.
+        assert!(
+            scan(&mut index.clone()).snapshots.is_empty(),
+            "a capability change reads nothing"
+        );
+        // Its next ordinary read carries the capability; a re-arm stands in.
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
         let mut on = scan(&mut index);
         assert_eq!(
             on.snapshots.len(),
             1,
-            "context transition actually reparses unchanged file"
+            "the next ordinary read reparses the unchanged file"
         );
         apply_upload_policy(
             SnapshotSource::Codex,
