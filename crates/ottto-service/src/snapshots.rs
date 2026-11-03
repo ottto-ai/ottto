@@ -29681,7 +29681,7 @@ impl OwnedSourceScan {
                     sampling: file_sampling,
                     candidate,
                     decision,
-                    parse_reason,
+                    parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
