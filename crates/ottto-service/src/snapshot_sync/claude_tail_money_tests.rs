@@ -1248,15 +1248,6 @@ impl PiLedgerCheck<'_> {
             other_page_observing_raw(c, scanner, SnapshotSource::Pi, prior, |items| {
                 candidates = items.to_vec();
             });
-        // Printed only when the test fails: the page each assertion judges.
-        eprintln!(
-            "pi ledger page: {:?} modes={modes:?} emitted={} candidates={} noop={} dropped={}",
-            self.step,
-            scan.snapshots.len(),
-            candidates.len(),
-            scan.semantic_noop_count,
-            scan.dropped_usage_record_count,
-        );
         match self.step {
             PiLedgerStep::Emit(..) => {
                 assert_eq!(pi_ledger_totals(&scan.snapshots), self.step.totals());
@@ -1458,20 +1449,19 @@ fn pi_ledger_splits(
     final_totals: (u64, u64),
 ) {
     let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
-    eprintln!("pi ledger case: {name}");
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
-    // The shared initial prefix is accepted by all three arms. Check cold and
-    // recordless restart against the retained arm's actual captured body too.
-    for initial_scanner in [E2ScanFixture::default(), disk.owner(SnapshotSource::Pi)] {
-        let (_, scan, _) = PiLedgerCheck {
-            step: initial,
-            accepted: &[],
-        }
-        .page(&c, &initial_scanner, ScanIndex::default());
-        assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
+    // The shared initial prefix is accepted by all three arms. Check a cold
+    // Full against the retained arm's actual captured body too. A restarted
+    // owner continues from the committed graph, never a default one: with no
+    // head it is this cold Full, and pi_pages restarts it on every step.
+    let (_, scan, _) = PiLedgerCheck {
+        step: initial,
+        accepted: &[],
     }
+    .page(&c, &E2ScanFixture::default(), ScanIndex::default());
+    assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
     let mut priors = [prior.clone(), prior.clone(), prior];
     // pi_pages compares the replayed suffix's emitted wire to cold Full. A
     // dropped conflict keeps its predecessor head: the next read Tails from it.
