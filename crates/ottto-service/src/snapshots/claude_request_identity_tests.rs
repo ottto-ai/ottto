@@ -2403,7 +2403,7 @@ fn unchanged_census_keeps_off_page_family_proof_and_legacy_money_after_reload() 
         let key = local_index_key(&quiet_path);
         let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
         let run = |index: ScanIndex| {
-            let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
                 SnapshotSource::ClaudeCode,
                 Some(cache.as_ref()),
                 index,

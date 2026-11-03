@@ -167,7 +167,7 @@ fn claude_page(
     observer: Option<&Recorder>,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> (ScanIndex, SourceScanResult, usize, Vec<Value>) {
-    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
         SnapshotSource::ClaudeCode,
         cache.map(|cache| cache.as_ref()),
         index,
@@ -1690,7 +1690,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
             days_from_now(days)
         };
         let recorder = Recorder::default();
-        let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             SnapshotSource::ClaudeCode,
             Some(cache.as_ref()),
             index,
@@ -2021,7 +2021,7 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let page = |index: ScanIndex, collected_at: &str| {
         let recorder = Recorder::default();
-        let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             SnapshotSource::ClaudeCode,
             Some(cache.as_ref()),
             index,
@@ -2493,7 +2493,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let clamp_events = std::cell::Cell::new(0_u64);
     let last_page = RefCell::new(Value::Null);
     let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
-        let mut index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        let mut index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             SnapshotSource::ClaudeCode,
             Some(cache.as_ref()),
             index,
@@ -3370,7 +3370,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let page = |index: ScanIndex, hints: &[PathBuf], at: &str| {
             let recorder = Recorder::default();
-            let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+            let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
                 SnapshotSource::ClaudeCode,
                 Some(cache.as_ref()),
                 index,

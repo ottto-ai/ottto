@@ -129,7 +129,7 @@ impl Fixture {
         now: &str,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
-        index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             source,
             Some(self.cache.as_ref()),
             index,

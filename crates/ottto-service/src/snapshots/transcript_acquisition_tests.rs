@@ -1220,11 +1220,8 @@ fn production_scan_page_hinted(
     hinted_paths: &[PathBuf],
     setup: impl FnOnce(&mut OwnedSourceScan),
 ) -> ProductionScanPage {
-    index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
-        source,
-        cache.as_deref(),
-        index,
-    );
+    index =
+        crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, cache.as_deref(), index);
     if source == SnapshotSource::ClaudeCode {
         if let Some(cache) = &cache {
             cache.bind_withheld(&mut index);
@@ -1522,6 +1519,50 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
             production_body(source, corrected),
             production_body(source, full)
         );
+    }
+}
+
+/// [regress] A source with a Tail codec on an index with no state database
+/// route keeps its reduction in RAM, as its retention keys on the route, and
+/// takes it back: each growth is a Tail, never a Full on every read. The take
+/// keyed on the codec instead (CX1 S2b run 41569018173: 27 Codex rows Full).
+#[test]
+fn an_unrouted_codec_source_continues_from_its_ram_copy() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = ScanFixture::new(source);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let page = |mut index: ScanIndex| {
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        cache.bind_withheld(&mut index);
+        let scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&fixture.root),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+        )
+        .with_sampled_acquisition(cache.clone(), Scope("account-a".into()));
+        let (index, _, _, modes, _) = finish_production_scan_page(scan, source);
+        (index, modes)
+    };
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let (mut index, modes) = page(ScanIndex::default());
+    assert_eq!(modes, (1, 0, 0), "first read");
+    for id in 1..3 {
+        fixture
+            .file
+            .append(&usage(source, 100 + id as u64 * 30, id, "fixture-model"));
+        let (next, modes) = page(index);
+        assert_eq!(modes, (0, 1, 0), "append {id} continues from RAM");
+        index = next;
     }
 }
 #[test]
@@ -2073,7 +2114,7 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         tail.file.append(&usage(source, 140, 1, "fixture-model"));
-        let tail_index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+        let tail_index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             source,
             Some(tail_cache.as_ref()),
             tail_index,

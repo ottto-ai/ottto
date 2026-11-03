@@ -33,8 +33,8 @@ macro_rules! with_codec {
     };
 }
 
-/// Whether `source` has a Tail codec: its reduction is never kept in RAM and
-/// its Tail counters exist.
+/// Whether `source` has a Tail codec: its Tail counters exist, and on a Tail
+/// route its reduction is never kept in RAM.
 pub(in crate::snapshots) fn has_codec(source: SnapshotSource) -> bool {
     with_codec!(source, S => S::SOURCE == source, _ => false)
 }
@@ -54,21 +54,46 @@ pub(in crate::snapshots) fn tail_route(
         .flatten()
 }
 
-/// `source`'s load of `candidate` on `route`, through its codec.
+/// `source`'s load of `candidate` on `route`, through its codec. `live` is the
+/// read's fresh accumulator, configured with this cycle's inputs.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::snapshots) fn load_candidate(
     source: SnapshotSource,
     index: &ScanIndex,
     route: &Path,
     candidate: &CandidateFile,
+    live: &SnapshotAccumulator,
     capture: bool,
     held: &mut File,
     scope: &crate::transcript_acquisition::Scope,
 ) -> load::Load {
     with_codec!(
         source,
-        S => load::entry::<S>(index, route, candidate, capture, held, scope),
+        S => load::entry::<S>(index, route, candidate, live, capture, held, scope),
         _ => load::Load::Cold(None)
     )
+}
+
+/// `key`'s accepted usage on its committed head, as (requests, tokens), for
+/// a codec that stores usage before finish. `None`: no readable head, or a
+/// codec whose usage folds only at finish (its totals are unknown, not zero).
+pub(in crate::snapshots) fn stored_usage(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<(u64, u64)> {
+    with_codec!(source, S => stored_usage_of::<S>(index, key), _ => None)
+}
+
+fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, u64)> {
+    if !S::USAGE_BEFORE_FINISH {
+        return None;
+    }
+    let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
+    let mut acc = SnapshotAccumulator::new(S::SOURCE);
+    S::decode_head(head.revision, &head.body, &mut acc).ok()?;
+    let totals = &acc.accepted_usage_totals;
+    Some((totals.request_count, totals.total_tokens()))
 }
 
 /// `source`'s pending Tail write for one completion, through its codec.
@@ -138,6 +163,15 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// explicit action (a key rotation), not a failure. Attribution toggled
     /// on or off is no rotation (`HeadIdentity::check`).
     KeyEpoch,
+    /// A Codex group read from its first member (D168): a counted replay,
+    /// never a load outcome or a failure after a head.
+    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
+    GroupReplay,
+    /// A file with a protected Codex receipt read from its start, so the
+    /// receipt's prefix is reproduced (D168): a counted replay, never a load
+    /// outcome or a failure after a head.
+    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
+    TierPrefixReplay,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -148,6 +182,8 @@ impl ReconstructCause {
             Self::Revision => "revision",
             Self::Identity => "identity",
             Self::KeyEpoch => "key_epoch",
+            Self::GroupReplay => "group_replay",
+            Self::TierPrefixReplay => "tier_prefix_replay",
         }
     }
 }
@@ -268,6 +304,9 @@ pub(in crate::snapshots) trait TailSource {
     const SOURCE: SnapshotSource;
     /// Bumped only when the meaning of the parse-time reduction changes.
     const REDUCTION_REVISION: u32;
+    /// The head stores the accepted usage totals: usage is accepted while the
+    /// file is read, not folded at finish.
+    const USAGE_BEFORE_FINISH: bool = false;
     fn collections() -> &'static [CollectionSpec];
     /// How many elements of `collection` the accumulator holds.
     fn elements(acc: &SnapshotAccumulator, collection: Collection) -> u64;
@@ -309,10 +348,13 @@ pub(in crate::snapshots) trait TailSource {
     /// under; `None` without a key. A head from another key is never reused.
     fn key_epoch() -> Option<[u8; 32]>;
     /// Installs the live inputs of this read into a validated stored state,
-    /// before the load publishes it as reused.
+    /// before the load publishes it as reused. `live` is the read's fresh
+    /// accumulator, configured before any line (traces, parent ledgers and
+    /// proof, sidecar projection, counting rule); a load never parses with it.
     fn install_live(
         stored: &mut SnapshotAccumulator,
         fresh: &CandidateFile,
+        live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError>;
 
     /// After every page: each declared collection's stored geometry and
@@ -519,19 +561,21 @@ macro_rules! head_fields {
 // home. Stored fields keep their record class, except that skill labels are
 // plain data and the fork parent and artifacts are stored. `X` fields are
 // content a codec keeps as session facts (Claude: `tail.page.session_facts`),
-// except the Codex agent label, which a Claude parse never sets. `I` marks a field this walk does not store: a codec keeps its
-// own `I` fields in its pages or in a trailer after this walk, or never
-// stores them (finish-only and live fields). Claude's: pages (responses, tool
-// uses, changed files, capability buckets, compactions), finish-only fields
-// (usage ids and occurrences, money, cache observations and requests, usage
-// buckets and totals), live fields (Desktop identity and spawn lineage,
-// account hash) and the Pi ledger.
+// except the Codex agent label, which a Claude parse never sets. `I` marks a
+// field this walk does not store: a codec keeps its own `I` fields in its
+// pages or in a trailer after this walk, or never stores them (finish-only
+// and live fields), and lists every `I` field it never stores in
+// `finish_field_nonempty`. Claude's: pages (responses, tool uses, changed
+// files, capability buckets, compactions), finish-only fields (usage ids and
+// occurrences, money, cache observations and requests, usage buckets and
+// totals), live fields (Desktop identity and spawn lineage, account hash),
+// the Pi ledger, and Codex's paged, trailer and live fields, empty on Claude.
 head_fields! {
     N source: SnapshotSource,
     H cache_configuration_witness: Option<String>,
     N cache_task_complete_at: Option<String>,
     N cache_pending_idle: Option<u64>,
-    L cache_active_turns: BTreeSet<String>,
+    I cache_active_turns: BTreeSet<String>,
     N context_curve_enabled: bool,
     U source_session_id: Option<String>,
     I account_identifier_hash: Option<String>,
@@ -549,9 +593,9 @@ head_fields! {
     U latest_reasoning_effort: Option<String>,
     L latest_turn_id: Option<String>,
     I codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
-    L codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
+    I codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
     N codex_priority_witnesses_uncapped: bool,
-    E codex_tier_replay: Option<codex_file_join::TierReplay>,
+    I codex_tier_replay: Option<codex_file_join::TierReplay>,
     D codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
     D current_selector: SelectorCapture,
     I session_cumulative_usage: Option<UsageTotals>,
@@ -577,13 +621,13 @@ head_fields! {
     N codex_bind_seed_len: Option<u64>,
     I codex_sidecar_projected_next_ordinal: Option<u64>,
     U codex_parent_session_ref: Option<String>,
-    E codex_parent_signatures: Option<CodexParentPrefix>,
+    I codex_parent_signatures: Option<CodexParentPrefix>,
     H codex_parent_prefix_digest: PrefixDigest,
     D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
-    E codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
-    E codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
+    I codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
+    I codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     N codex_parent_proof_mismatch: bool,
-    E codex_parent_proof_refusal: Option<ProofRefusal>,
+    I codex_parent_proof_refusal: Option<ProofRefusal>,
     N codex_proof_decision_only: bool,
     N codex_boundary_buffer_count: u8,
     H codex_proof_ledger_row: Option<String>,
@@ -597,7 +641,7 @@ head_fields! {
     N codex_native_created_thread_last_nanos: Option<i128>,
     L codex_native_created_thread_task_turn_id: Option<String>,
     N codex_native_created_thread_first_turn_bound: bool,
-    H codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
+    I codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
     N codex_physical_signatures_complete: bool,
     N codex_ordinal_expected: Option<u64>,
     N codex_ordinal_sequence_valid: bool,
@@ -617,11 +661,11 @@ head_fields! {
     U codex_root_session_ref: Option<String>,
     N codex_spawn_depth: Option<u64>,
     X codex_agent_label: Option<String>,
-    U activity_tool_counts: BTreeMap<String, u64>,
-    D activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
-    U activity_mcp_tool_counts: BTreeMap<String, u64>,
-    U activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
-    L activity_mcp_call_ids: BTreeMap<String, bool>,
+    I activity_tool_counts: BTreeMap<String, u64>,
+    I activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
+    I activity_mcp_tool_counts: BTreeMap<String, u64>,
+    I activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    I activity_mcp_call_ids: BTreeMap<String, bool>,
     I activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     I seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
     N activity_skills: BTreeSet<String>,
@@ -670,7 +714,7 @@ head_fields! {
     N peak_context_fill_window_tokens: Option<u64>,
     N last_turn_context_window_tokens: Option<u64>,
     N compaction_count: u64,
-    N compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    I compaction_timestamps: crate::owned_heap::OwnedVec<String>,
     D codex_compaction_sizes: CodexCompactionSizes,
     D local_context_points: LocalContextPoints,
     I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,

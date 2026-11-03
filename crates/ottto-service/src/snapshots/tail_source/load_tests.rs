@@ -67,6 +67,7 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, V
             &mut held,
             &scope(),
             &fresh,
+            &SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
         )
     })
 }

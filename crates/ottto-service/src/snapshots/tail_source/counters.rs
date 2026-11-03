@@ -43,6 +43,31 @@ pub(in crate::snapshots) fn add(
     });
 }
 
+/// One executed D168 replay on the reconstruction record: the
+/// `tail_reconstruct` point and its counters, with the bytes the replay read.
+/// A replay is no failure after a head: it raises no alarm and opens no
+/// window. Its bytes are also in `tail_replay_bytes{full}`, as every Full's.
+#[expect(dead_code, reason = "Codex's codec (S2b) counts its replays")]
+pub(in crate::snapshots) fn replay(
+    source: SnapshotSource,
+    cause: super::ReconstructCause,
+    bytes: u64,
+) {
+    let label = cause.label();
+    crate::local_resource_diagnostics::traversal_point(
+        "tail_reconstruct",
+        source.api_slug(),
+        &serde_json::json!({
+            "cause": label,
+            "after_head": false,
+            "explicit_action": false,
+            "bytes": bytes,
+        }),
+    );
+    bump(source, "tail_reconstruct", label);
+    add(source, "tail_reconstruct_bytes", label, bytes);
+}
+
 /// Per source, at most once per 24 h while reconstructions after a head
 /// persist. RAM only: a restart alarms again.
 pub(in crate::snapshots) fn restart_full_alarm_due(source: SnapshotSource) -> bool {

@@ -101,7 +101,7 @@ fn page(
     cache: &Arc<sampled_scan::SharedCache>,
     mut before_step: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Seen) {
-    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
+    let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
         source,
         Some(cache.as_ref()),
         index,

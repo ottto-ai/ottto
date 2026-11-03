@@ -33920,14 +33920,16 @@ impl OwnedSourceScan {
                 .filter(|_| !parser.reader.reader.is_compressed())
             {
                 let key = local_index_key(&candidate.path);
-                // A codec source's continuation is its committed Tail, never
-                // a RAM copy.
+                // On a Tail route the continuation is the committed Tail,
+                // never a RAM copy. Off one, a codec source keeps and takes
+                // its RAM copy, as its retention does.
                 #[cfg(unix)]
                 let tail_route = tail_source::tail_route(source, index);
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
                 #[cfg(unix)]
-                let taken = (!tail_source::has_codec(source))
+                let taken = tail_route
+                    .is_none()
                     .then(|| context.cache.take(&key).map(Box::new))
                     .flatten();
                 #[cfg(not(unix))]
@@ -34111,6 +34113,7 @@ impl OwnedSourceScan {
                                     index,
                                     route,
                                     &candidate,
+                                    &parser.accumulator,
                                     claude_request_identity_capture,
                                     parser.reader.reader.get_mut(),
                                     &scope,
@@ -52913,9 +52916,14 @@ impl ScanIndex {
             .into_iter()
             .filter(|key| !self.files.contains_key(*key))
         {
+            // A codec source keeps no resident copy: its committed head
+            // carries the totals when the codec stores them.
+            let usage = cache.and_then(|cache| cache.resident_usage(source, key));
+            #[cfg(unix)]
+            let usage = usage.or_else(|| tail_source::stored_usage(source, self, key));
             crate::local_resource_diagnostics::unacked_usage_lost_to_deletion(
                 source.api_slug(),
-                cache.and_then(|cache| cache.resident_usage(source, key)),
+                usage,
             );
         }
     }

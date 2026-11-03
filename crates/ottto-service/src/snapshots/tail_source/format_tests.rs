@@ -163,6 +163,7 @@ fn legacy_erasure_is_counted_before_the_first_load() {
             &mut held,
             &scope(),
             &fresh,
+            &SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
         )
     });
     assert!(matches!(load, Load::Reused(_, Some(_))));
@@ -208,20 +209,32 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
         .all(|epoch| *epoch == claude_request_money::e2::RULE_EPOCH));
 }
 
-/// [behaviour] L01: only Claude has a codec, whatever the registry's
-/// `state_v2` flag says, and each source's counters stay on its own line.
+/// [behaviour] L01: the codec list alone gives a source its codec and Tail
+/// route, whatever the registry's `state_v2` flag says (on this branch Claude
+/// only), and each source's counters stay on its own line.
 #[test]
-fn only_claude_has_a_codec_and_counters_stay_per_source() {
+fn codec_list_gives_routes_and_counters_stay_per_source() {
+    const CODECS: [SnapshotSource; 1] = [SnapshotSource::ClaudeCode];
     let route = route();
-    assert!(has_codec(SnapshotSource::ClaudeCode));
-    assert!(tail_route(SnapshotSource::ClaudeCode, &route.index).is_some());
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        assert!(!has_codec(source));
-        assert!(tail_route(source, &route.index).is_none());
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let codec = CODECS.contains(&source);
+        assert_eq!(has_codec(source), codec, "{}", source.api_slug());
+        assert_eq!(
+            tail_route(source, &route.index).is_some(),
+            codec,
+            "{}",
+            source.api_slug()
+        );
     }
     counters::bump(SnapshotSource::ClaudeCode, "tail_db_loads", "hit");
-    let ((), codex) = capture(|| counters::emit(SnapshotSource::Codex));
-    assert!(codex.is_empty());
+    for other in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let ((), lines) = capture(|| counters::emit(other));
+        assert!(lines.is_empty());
+    }
     let ((), claude) = capture(|| counters::emit(SnapshotSource::ClaudeCode));
     assert_eq!(claude.len(), 1);
 }

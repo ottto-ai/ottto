@@ -180,11 +180,13 @@ pub(in crate::snapshots) fn retire_absent(
     let _ = state_v2::retire_tail(&route, retire);
 }
 
-/// `S`'s load of `candidate` on `route`; `held` is the read's opened file.
+/// `S`'s load of `candidate` on `route`; `held` is the read's opened file and
+/// `live` its fresh accumulator.
 pub(in crate::snapshots) fn entry<S: TailSource>(
     index: &ScanIndex,
     route: &Path,
     candidate: &CandidateFile,
+    live: &SnapshotAccumulator,
     capture: bool,
     held: &mut File,
     scope: &Scope,
@@ -204,6 +206,7 @@ pub(in crate::snapshots) fn entry<S: TailSource>(
         held,
         scope,
         candidate,
+        live,
     )
 }
 
@@ -232,6 +235,7 @@ struct Hit {
     page_bytes: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load<S: TailSource>(
     index: &ScanIndex,
     route: &Path,
@@ -240,6 +244,7 @@ pub(super) fn load<S: TailSource>(
     held: &mut File,
     scope: &Scope,
     fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
 ) -> Load {
     let source = S::SOURCE;
     let slug = source.api_slug();
@@ -247,8 +252,8 @@ pub(super) fn load<S: TailSource>(
         crate::local_resource_diagnostics::traversal_point(stage, slug, &counts)
     };
     // (outcome, cause, counted reconstruction, load)
-    let (outcome, cause, reconstruct, load) = match stored::<S>(index, key, id, held, scope, fresh)
-    {
+    let loaded = stored::<S>(index, key, id, held, scope, fresh, live);
+    let (outcome, cause, reconstruct, load) = match loaded {
         Ok(hit) => {
             let base = (!set_aside(index, key)).then_some(hit.base);
             point(
@@ -359,6 +364,7 @@ fn stored<S: TailSource>(
     held: &mut File,
     scope: &Scope,
     fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
 ) -> Result<Hit, Miss> {
     let head = match state_v2::load_head(index, key, S::REDUCTION_REVISION) {
         Ok(Some(head)) => head,
@@ -404,7 +410,7 @@ fn stored<S: TailSource>(
     }
     let table = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
-    S::install_live(&mut acc, fresh).map_err(|error| match error {
+    S::install_live(&mut acc, fresh, live).map_err(|error| match error {
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),
     })?;

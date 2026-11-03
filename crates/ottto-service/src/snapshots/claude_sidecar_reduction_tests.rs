@@ -160,11 +160,8 @@ fn raw_scan_at(
     collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
-    let index = crate::snapshots::e2_pipeline_scan_fixture::route_claude_for_test(
-        SOURCE,
-        cache.as_deref(),
-        index,
-    );
+    let index =
+        crate::snapshots::e2_pipeline_scan_fixture::route_for_test(SOURCE, cache.as_deref(), index);
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),

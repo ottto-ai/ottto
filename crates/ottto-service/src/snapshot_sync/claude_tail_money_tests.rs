@@ -215,26 +215,35 @@ pub(super) fn receipt_with_output(
     );
 }
 
-/// One restart owner's committed state: Claude's state database, or the
-/// other sources' saved index, under a test-held single-writer lock. Claude's
+/// One restart owner's committed state: the state database of the source
+/// under test with a Tail codec (Claude by default), or the other sources'
+/// saved index, under a test-held single-writer lock. The codec source's
 /// retained and restart arms read the same committed heads; the cold arm owns
 /// an empty route. Only the restart arm's page commits.
 struct Disk {
     dir: PathBuf,
     index: PathBuf,
     route: PathBuf,
+    source: SnapshotSource,
 }
 impl Disk {
     fn new(c: &Corpus) -> Self {
+        Self::with_route(c, SnapshotSource::ClaudeCode)
+    }
+    /// `source`'s state database route; every other source saves its index.
+    fn with_route(c: &Corpus, source: SnapshotSource) -> Self {
+        use crate::snapshots::scan_index_persistence::Source;
         let base = c.base.canonicalize().unwrap();
         let dir = base.join("durable-state");
         std::fs::create_dir_all(&dir).unwrap();
         crate::locked_state_dir::test_locks::hold(&dir);
-        let (session, _) = crate::snapshots::StateV2ColdSession::publish(
-            crate::snapshots::scan_index_persistence::Source::Claude,
-            &ScanIndex::default(),
-            &dir,
-        );
+        let persisted = match source {
+            SnapshotSource::ClaudeCode => Source::Claude,
+            SnapshotSource::Codex => Source::Codex,
+            SnapshotSource::Pi => Source::Pi,
+        };
+        let (session, _) =
+            crate::snapshots::StateV2ColdSession::publish(persisted, &ScanIndex::default(), &dir);
         let route = session.path().to_owned();
         // The database outlives the session handle; the corpus owns the dir.
         std::mem::forget(session);
@@ -243,10 +252,11 @@ impl Disk {
             index: dir.join("scan-index.json"),
             dir,
             route,
+            source,
         }
     }
     fn path(&self, source: SnapshotSource) -> &Path {
-        if source == SnapshotSource::ClaudeCode {
+        if source == self.source {
             &self.route
         } else {
             &self.index
@@ -254,7 +264,7 @@ impl Disk {
     }
     fn begin(&self, owner: &E2ScanFixture, source: SnapshotSource) {
         owner.begin_pass(source, &self.dir, self.path(source));
-        if source == SnapshotSource::ClaudeCode {
+        if source == self.source {
             owner.on_committed_route(&self.route);
         }
     }
