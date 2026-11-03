@@ -9395,6 +9395,188 @@ fn off_publication_invalidates_outgrown_v1() {
     });
 }
 
+/// [money] the OFF clear rewrites disk only: no body, no parse drop, no re-read.
+#[test]
+fn off_retired_body_clear_keeps_retained_parses_and_reads_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+        let _off = RestartRestoreForTest::disabled();
+        let root = crate::test_scratch::ScratchDir::new("off-retired-clear");
+        let lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        fs::write(&path, a1a_row("accepted", 100)).unwrap();
+        let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+        let owner = crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::default();
+        let index_path = root.join("index.json");
+        owner.begin_durable(SnapshotSource::ClaudeCode, &root, &index_path);
+        let key = store::key_digest(DurableSource::ClaudeCode, &local_index_key(&path));
+        let mut binding = store::tests::binding("account", "old", ("accepted", None));
+        binding.key = key;
+        let mut record =
+            store::tests::pending(binding, certificate(&path, &Scope("old".into())), 1);
+        record.allowlist = store::parse_hex_digest(
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        )
+        .unwrap();
+        let dir = store::store_dir_for_index(&index_path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        fs::write(&record_path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        store::test_hooks::set_before_access(Some(Box::new(|_, phase| {
+            assert_ne!(phase, "body", "OFF never acquires a restart body");
+            Ok(())
+        })));
+        let scan = |index| {
+            owner.scan(
+                std::slice::from_ref(&projects),
+                &root,
+                index,
+                100,
+                true,
+                &births,
+                &[],
+            )
+        };
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            crate::snapshot_sync::effective_upload_body_witness_revision(
+                SnapshotSource::ClaudeCode,
+            ),
+        );
+        let (mut index, mut first, _) = scan(index);
+        a1a_wire(&root, &mut index, &mut first);
+        let retained = || owner.cache.retained().unwrap().keys().count();
+        let parses = retained();
+        assert!(parses > 0);
+        owner
+            .cache
+            .durable_write_after_save(lock, SnapshotSource::ClaudeCode, &index);
+        assert_eq!(
+            fs::metadata(&record_path).unwrap().len(),
+            (store::HEADER_BYTES + 32) as u64
+        );
+        assert_eq!(retained(), parses);
+        let (_, bytes) = observe_consumed(|| scan(index));
+        assert_eq!(bytes, 0);
+        assert_eq!(retained(), parses);
+        store::test_hooks::set_before_access(None);
+    });
+}
+
+/// [money] A key change keeps every retained parse, reads no transcript byte on
+/// the next scan, and the retained markers trust no org flip after it. The new
+/// sentence differs, so a Full under the new key would trust that flip instead.
+#[test]
+fn key_change_scrubs_retained_digests_without_a_read_or_a_trusted_flip() {
+    use crate::snapshots::claude_request_identity::{
+        bind_session_context_key, take_context_digest_scrubs_for_test, MarkerVerdict,
+    };
+    use base64::Engine as _;
+    let attribution = |byte: u8| {
+        crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::ClaudeCode,
+            Path::new("/nonexistent/context-digest"),
+            true,
+            Some(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap()
+    };
+    let attachment = |body: serde_json::Value| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"attachment",
+                "sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","attachment":body})
+        )
+    };
+    let sentence = |email: &str| {
+        attachment(serde_json::json!({"type":"session_context","context":{"userEmail":email}}))
+    };
+    let org = |uuid: &str| {
+        attachment(serde_json::json!({"type":"credential_org","organizationUuid":uuid}))
+    };
+    for (from, to) in [(Some(1), Some(2)), (Some(1), None), (None, Some(2))] {
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            let _off = RestartRestoreForTest::disabled();
+            let root = crate::test_scratch::ScratchDir::new("key-change-scrub");
+            let _lock = test_locks::hold(&root);
+            let projects = root.join("projects");
+            fs::create_dir(&projects).unwrap();
+            let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+            fs::write(
+                &path,
+                sentence("one@example.invalid")
+                    + &org("11111111-1111-4111-8111-111111111111")
+                    + &a1a_row("accepted", 100),
+            )
+            .unwrap();
+            let births = BTreeMap::from([(path.clone(), 1_785_542_400_000_000_000)]);
+            let owner =
+                crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture::capturing_identity();
+            let scan = |index| {
+                owner.scan(
+                    std::slice::from_ref(&projects),
+                    &root,
+                    index,
+                    100,
+                    true,
+                    &births,
+                    &[],
+                )
+            };
+            bind_session_context_key(from.map(attribution).as_ref());
+            let mut index = ScanIndex::default();
+            index.activate_effective_upload_body_witness_revision(
+                crate::snapshot_sync::effective_upload_body_witness_revision(
+                    SnapshotSource::ClaudeCode,
+                ),
+            );
+            let (mut index, mut first, _) = scan(index);
+            a1a_wire(&root, &mut index, &mut first);
+            let retained = || owner.cache.retained().unwrap().keys().count();
+            let parses = retained();
+            assert!(parses > 0);
+
+            assert!(bind_session_context_key(to.map(attribution).as_ref()));
+            take_context_digest_scrubs_for_test();
+            owner.cache.scrub_retained_context_digests();
+            assert_eq!(take_context_digest_scrubs_for_test(), parses as u64);
+            assert_eq!(retained(), parses);
+            let ((index, _, _), bytes) = observe_consumed(|| scan(index));
+            assert_eq!(bytes, 0);
+            assert_eq!(retained(), parses);
+
+            std::io::Write::write_all(
+                &mut fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                (sentence("two@example.invalid")
+                    + &org("22222222-2222-4222-8222-222222222222")
+                    + &a1a_row("growth", 200))
+                    .as_bytes(),
+            )
+            .unwrap();
+            let _ = scan(index);
+            let cache = owner.cache.retained().unwrap();
+            assert_eq!(
+                cache
+                    .peek(&local_index_key(&path))
+                    .unwrap()
+                    .state
+                    .org_markers_for_test()
+                    .unwrap()
+                    .verdict(u64::MAX, false),
+                MarkerVerdict::UntrustedFlip
+            );
+        });
+    }
+}
+
 // P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
 // acknowledged successor -> second process loss, through production
 // scanner and wire calls.

@@ -103,7 +103,11 @@ impl Fixture {
     }
 }
 
-fn cold_full(root: &PathBuf, now: &str, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+pub(super) fn cold_full(
+    root: &PathBuf,
+    now: &str,
+    index: ScanIndex,
+) -> (ScanIndex, SourceScanResult) {
     let source = SnapshotSource::ClaudeCode;
     let mut scan = OwnedSourceScan::new(
         source,

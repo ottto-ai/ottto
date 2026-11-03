@@ -159,6 +159,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
+| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Each completed `native_collection_page` records existing scanned-file and
@@ -1691,6 +1692,14 @@ counts each `thread_settings_applied` line whose `service_tier` is `fast`,
 count again. It is a cumulative saturating process total with no labelled log
 line and no path or session id, and it never affects money.
 
+## Claude usage iteration on another model
+
+`usage_iteration_model_differs` in `process_retained_cache_lifecycle_totals`
+counts each Claude usage line with a `usage.iterations[]` entry whose `model`
+differs from the line's model (a refusal fallback's declined first attempt, which
+is billed at the line's model); rereads count again. It is a cumulative
+saturating process total with no path or session id, and it never affects money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
@@ -2117,10 +2126,11 @@ on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
 `save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records the
-charged bytes of a save refused as save pressure, with `save_ceiling_cause`:
-`charged_work` above 256 MiB or `value_admission` for one row over its cap; at page size one,
-`save_oversize_alarm` and `state_v2_save_oversize` hold the source. `sqlite_full` counts disk-full failures;
+(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
+charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
+the complete valid save commits; `value_admission` for one row over its cap still
+refuses the save. At page size one, a value-admission failure raises
+`save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires

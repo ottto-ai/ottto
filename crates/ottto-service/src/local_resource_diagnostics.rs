@@ -369,6 +369,13 @@ pub(crate) fn codex_non_default_thread_tier() {
     cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
 }
 
+/// Counts per observed Claude usage line with an `iterations[]` entry naming
+/// another model than the line; rereads count again. Only the lifecycle
+/// registry atomics are updated.
+pub(crate) fn claude_usage_iteration_model_differs() {
+    cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
+}
+
 /// Per-pass observations, not distinct entries/files or a lifetime counter.
 pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
     if observations > 0 {
@@ -403,6 +410,43 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
         "codex",
         &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
     );
+}
+
+/// Sidecar read attempts and actual input bytes since the last Claude page.
+/// Repeated reads count again; missing/refused files add nothing. No identities.
+#[derive(Default, Serialize)]
+struct ClaudeSidecarReparse {
+    claude_sidecar_reparse_files: u64,
+    claude_sidecar_reparse_bytes: u64,
+}
+#[cfg(not(test))]
+static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_SIDECAR_REPARSE.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_SIDECAR_REPARSE)
+    }
+}
+pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    with_claude_sidecar_reparse(|counts| {
+        for (counter, delta) in counts.iter().zip([files, bytes]) {
+            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+        }
+    });
+}
+fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
+    with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
+        claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
+        claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+    })
 }
 
 /// Nonzero-only counters on the existing native_collection_page line. They
@@ -981,6 +1025,8 @@ impl Probe {
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
             #[serde(flatten)]
+            sidecar_reparse: Option<ClaudeSidecarReparse>,
+            #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
             reread: claude_reread::Counts,
@@ -1054,6 +1100,7 @@ impl Probe {
             } else {
                 Default::default()
             },
+            sidecar_reparse: claude.then(take_claude_sidecar_reparse),
             caps: if claude {
                 take_claude_record_caps()
             } else {
@@ -1589,6 +1636,20 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Content-free allocator launch configuration, called once before serving.
+pub fn log_startup_resources() {
+    let value = std::env::var_os("MallocLargeCache");
+    traversal_point(
+        "startup",
+        "unknown",
+        &serde_json::json!({
+            "malloc_large_cache_set": value.is_some(),
+            "malloc_large_cache": value.as_deref().and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok()),
+        }),
+    );
+}
+
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
@@ -2101,6 +2162,23 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    /// [behaviour] Startup settings use the versioned content-free diagnostic carrier.
+    #[test]
+    fn startup_resources_use_the_shared_carrier() {
+        let (_, rows) = super::capture(super::log_startup_resources);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], std::process::id());
+        assert_eq!(row["stage"], "startup");
+        assert_eq!(row["source"], "unknown");
+        let counts = row["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert!(counts["malloc_large_cache_set"].is_boolean());
+        let value = &counts["malloc_large_cache"];
+        assert!(value.is_null() || value.is_u64());
+    }
+
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
@@ -2938,8 +3016,9 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields and the Codex tier field stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2421);
+        // The four Pi fields, the Codex tier field and the Claude iteration
+        // model field stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2474);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

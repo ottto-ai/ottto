@@ -148,7 +148,9 @@ fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
     });
 }
 
+/// [regress] Rebinding a retired listener must not race parallel ephemeral-port users.
 #[test]
+#[serial_test::serial]
 fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes() {
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
