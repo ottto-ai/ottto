@@ -722,7 +722,6 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
         let (root, sub) = (fold(&items[0]), fold(&items[1]));
         assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
         assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
-        assert_eq!((root.side_requests, sub.side_requests), (1, 1));
         assert_eq!(root.side.input, 50);
         assert_eq!(sub.side.input, 40);
         let got = publish(items, None, TelemetryRead::Loaded, &index);
@@ -796,11 +795,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
         // Without the holder the held row is an untraced root fallback too.
         let side = if holder { 1 } else { 2 };
         let root = fold(&items[0]);
-        assert_eq!(
-            (root.side_requests, root.root_fallbacks),
-            (side, side),
-            "holder={holder}"
-        );
+        assert_eq!(root.root_fallbacks, side, "holder={holder}");
         assert_eq!(requests(&items[0], REPORTED), side, "holder={holder}");
         let total = root.entity.totals().1;
         assert_eq!(total, 1 + side, "holder={holder}");
@@ -852,11 +847,7 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             assert_eq!(unresolved.contains(ROOT), held, "{queued:?}");
             assert_eq!(root.entity.held, held, "{queued:?}");
             assert_eq!(root.telemetry.side_calls_done, !held, "{queued:?}");
-            assert_eq!(
-                (root.side_requests, root.root_fallbacks),
-                if held { (0, 0) } else { (1, 1) },
-                "{queued:?}"
-            );
+            assert_eq!(root.root_fallbacks, if held { 0 } else { 1 }, "{queued:?}");
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
     };
@@ -3825,13 +3816,8 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
         )
     });
     assert_eq!(unresolved, BTreeSet::from([ROOT.to_owned()]));
-    assert_eq!(
-        fold(&items[0]).side_requests,
-        0,
-        "never counted on a deadline"
-    );
     assert!(!fold(&items[0]).telemetry.side_calls_done);
-    // The next page's walk completes and counts the side call once.
+    // The next page's walk completes and resolves the side call.
     let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
     attach_page(&mut items, &read);
     let unresolved = side_calls_page(
@@ -3841,7 +3827,6 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
         &index,
     );
     assert!(unresolved.is_empty());
-    assert_eq!(fold(&items[0]).side_requests, 1);
     cleanup(&[&p]);
 }
 

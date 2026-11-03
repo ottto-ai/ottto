@@ -405,7 +405,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         responses: _,
         root_fallbacks: _,
         side: _,
-        side_requests: _,
         telemetry,
         accounts,
         prefix: _,
@@ -921,7 +920,6 @@ pub(crate) struct FileFold {
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
-    pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
@@ -929,7 +927,7 @@ pub(crate) struct FileFold {
     /// Which file this fold read, for the folder ledger; set as it becomes an item.
     pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1153,7 +1151,6 @@ impl FileFold {
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
-            side_requests: 0,
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
@@ -3838,7 +3835,6 @@ pub(crate) fn side_calls_page(
                 )
             });
             fold.side.add(&tokens);
-            fold.side_requests += 1;
             if fallback {
                 fold.root_fallbacks += 1;
             }
