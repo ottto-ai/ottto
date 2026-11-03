@@ -175,12 +175,10 @@ pub(in crate::snapshots) enum ReconstructCause {
     KeyEpoch,
     /// A Codex group read from its first member (D168): a counted replay,
     /// never a load outcome or a failure after a head.
-    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
     GroupReplay,
     /// A file with a protected Codex receipt read from its start, so the
     /// receipt's prefix is reproduced (D168): a counted replay, never a load
     /// outcome or a failure after a head.
-    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
     TierPrefixReplay,
 }
 impl ReconstructCause {

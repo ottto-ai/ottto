@@ -1277,6 +1277,18 @@ pub(in crate::snapshots) fn end_group(
     let Some(group) = active.group.as_deref() else {
         return;
     };
+    // An ended group's replay counts with the bytes it read, as a completed
+    // one's does at its completion.
+    #[cfg(unix)]
+    if sampling.is_some() && crate::snapshots::tail_source::has_codec(SnapshotSource::Codex) {
+        crate::snapshots::tail_source::counters::replay(
+            SnapshotSource::Codex,
+            crate::snapshots::tail_source::ReconstructCause::GroupReplay,
+            group
+                .consumed_before
+                .saturating_add(active.parser.reader.consumed_bytes()),
+        );
+    }
     match end {
         // The chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
