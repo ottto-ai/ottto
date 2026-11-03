@@ -6212,7 +6212,6 @@ fn claude_stale_member_independently_accepted(
             .as_ref()
             .is_some_and(|witness| !witness.is_empty())
         && claude_index_file_body_accepted(index, key, entry)
-        && !index.file_context_read_owed(key)
         && entry
             .last_snapshot_fingerprint
             .as_ref()
@@ -6586,8 +6585,7 @@ fn claude_fence_closed_retry_carry_observed(
             || index
                 .claude_account_deferred_holds
                 .contains_key(index_key.as_str())
-            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry))
-            || index.file_context_read_owed(index_key);
+            || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry));
         let status = blocked.entry(root_session_id).or_default();
         status.0 |= refused;
         // The accepted refusal is the streaming/storage-only member predicate.
@@ -12846,7 +12844,6 @@ fn claude_unchanged_proof_roots<'p>(
         let (root_session_id, source_session_id) = member_ref.into_owned();
         *unchanged = claude_index_file_body_accepted(index, index_key, entry)
             && !entry.rearmed()
-            && !index.file_context_read_owed(index_key)
             && !current_ids.contains(source_session_id.as_str())
             && !index
                 .claude_account_deferred_holds
@@ -33706,19 +33703,12 @@ impl OwnedSourceScan {
             // again as a re-read for the next page of the walk. Codex and Pi
             // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
-                // A Claude history hold defers upload-context debt with the
-                // revision: the gate vetoes every body of a held file, so its
-                // read could never earn a receipt. The file stays owed and
-                // pays both when the hold releases and it is exact-ACKed.
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                    && (index.candidate_requires_only_body_witness_adoption(
-                        &candidate,
-                        audit_now,
-                        source != SnapshotSource::ClaudeCode,
-                    ) || (source == SnapshotSource::ClaudeCode
-                        && claude_copy_prefix_reread::unchanged_requested(
-                            index, &candidate, audit_now,
-                        )));
+                    && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
+                        || (source == SnapshotSource::ClaudeCode
+                            && claude_copy_prefix_reread::unchanged_requested(
+                                index, &candidate, audit_now,
+                            )));
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
@@ -54884,14 +54874,7 @@ impl ScanIndex {
                 .files
                 .get(&local_index_key(&candidate.path))
                 .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
-        self.candidate_decision_refined(
-            candidate,
-            audit_now,
-            true,
-            true,
-            growth_only,
-            source_change,
-        )
+        self.candidate_decision_refined(candidate, audit_now, true, growth_only, source_change)
     }
 
     #[cfg(test)]
@@ -54904,7 +54887,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true, true, false)
+        self.candidate_decision_with_reason_gated(candidate, now, true, false)
     }
 
     /// True when the local list names this Claude file's family root or the
@@ -54918,25 +54901,16 @@ impl ScanIndex {
     }
 
     /// True when only the body-witness revision selects this candidate: the
-    /// same decision without that gate skips the file. With
-    /// `upload_context_adoption: false`, upload-context debt does not count
-    /// as another reason to read.
+    /// same decision without that gate skips the file.
     fn candidate_requires_only_body_witness_adoption(
         &self,
         candidate: &CandidateFile,
         now: u64,
-        upload_context_adoption: bool,
     ) -> bool {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(
-                candidate,
-                now,
-                false,
-                upload_context_adoption,
-                false,
-            )
+            .candidate_decision_with_reason_gated(candidate, now, false, false)
             .0
             == CandidateDecision::Skip
     }
@@ -54986,14 +54960,12 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
-        upload_context_adoption: bool,
         growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_refined(
             candidate,
             now,
             body_witness_adoption,
-            upload_context_adoption,
             growth_only,
             &mut None,
         )
@@ -55006,7 +54978,6 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
-        upload_context_adoption: bool,
         growth_only: bool,
         source_change: &mut Option<change_reason::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
@@ -55107,19 +55078,8 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        // An unsettled page may preserve the previous global context too.
-        // CONTENT is scoped to the active context, so only its already-read
-        // local repair is deferred; a new activation still invalidates it.
-        if upload_context_adoption
-            && !withheld_unchanged
-            && self.file_context_read_owed(&key)
-            && !self.file_upload_context_backoff_holds(candidate)
-        {
-            return (
-                CandidateDecision::Parse,
-                Some(CandidateParseReason::UploadContext),
-            );
-        }
+        // A settings or capability change never selects a read: it applies
+        // from the file's next ordinary read on, for every source.
         if self
             .file_snapshot_fingerprints
             .get(&key)

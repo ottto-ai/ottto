@@ -378,10 +378,6 @@ fn carry_controls() -> Vec<CarryControl> {
         carry_control("accepted_ledger_rebuilding", |index| {
             index.legacy_settlement_reconcile_after_fingerprint = Some("rebuild".to_string());
         }),
-        carry_control("upload_context_not_proven", |index| {
-            // No member holds a receipt under the newly active context.
-            index.activate_upload_context("newer-context".to_string());
-        }),
         carry_control("full_retry_could_reopen", |index| {
             index.files.remove(&carry_key(CARRY_OTHER, None));
         }),

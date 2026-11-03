@@ -125,13 +125,13 @@ fn resumed_copy_prefix_dedupe_is_route_equivalent() {
 }
 
 /// [regress] A holder whose page was never delivered owes its upload-context
-/// proof, as a production file without a receipt does. Re-read beside a new
-/// copy of its prefix, its identical body is offered and exact-ACKed and it
-/// earns its receipt. A family re-arm on that page may clear its revision for
-/// one forced reparse, so it is read at most once more; the restored revision
-/// lets the receipt prove, and later pages neither read nor POST anything.
+/// proof, as a production file without a receipt does. That proof alone
+/// selects no read. A family re-arm beside a new copy of its prefix may clear
+/// its revision for one forced reparse, so it is read at most once; once read
+/// and exact-ACKed it earns its receipt, and later pages neither read nor POST
+/// anything.
 #[test]
-fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
+fn never_delivered_holder_is_read_at_most_once_beside_a_new_copy() {
     // As every owner of this harness: commits persist durable records.
     let _restart_restore = crate::snapshots::RestartRestoreForTest::enabled();
     if !supported("never_delivered_holder_reread_bound") {
@@ -160,22 +160,21 @@ fn never_delivered_holder_is_read_at_most_once_more_beside_a_new_copy() {
             reads.push(opened(&scanner, &holder));
             let sent = deliver_counting(&mut p);
             posts.push(sent);
-            if page == 1 {
-                assert!(reads[0], "the owed holder is re-read beside the new copy");
+            if reads[page - 1] {
                 assert!(
                     upload_context_receipt_earned_for_test(&p.index, &holder),
-                    "page 1 earns the holder's receipt"
+                    "page {page}: the read holder earns its receipt"
                 );
             }
             let owed = upload_context_owed_for_test(&p.index, &holder);
             prior = disk.commit(&p.cache, SnapshotSource::ClaudeCode, &mut p.index);
-            if page >= 2 {
+            if reads.iter().any(|read| *read) {
                 assert!(!owed, "page {page}: the holder owes its proof again");
             }
         }
         assert!(
-            reads[1..].iter().filter(|read| **read).count() <= 1,
-            "the holder is read at most once more after it earns its receipt: {reads:?}"
+            reads.iter().filter(|read| **read).count() <= 1,
+            "the holder is read at most once, never for its proof alone: {reads:?}"
         );
         assert_eq!(
             (&reads[2..], &posts[2..]),

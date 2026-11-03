@@ -3939,7 +3939,6 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
 /// real classify/Completed/save/load, then recovers its missing advisory state.
 fn withheld_equal_fingerprint_recovers_after(failure: &str) {
     for reason in [
-        CandidateParseReason::UploadContext,
         CandidateParseReason::BodyWitnessAdoption,
         CandidateParseReason::ActivityOrQuarantineRetry,
     ] {
@@ -3965,13 +3964,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let revision =
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     let activate = |index: &mut ScanIndex, revision| {
-        if reason == CandidateParseReason::UploadContext {
-            // Production activation: the context, then its quarantine witness.
-            // The file holds no receipt under this context: its own debt.
-            index.activate_file_upload_context(SnapshotSource::ClaudeCode, "retry-context".into());
-        } else {
-            index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
-        }
+        index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
         index.activate_effective_upload_body_witness_revision(revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
     };
@@ -4000,11 +3993,6 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         old_revision
     );
     match reason {
-        CandidateParseReason::UploadContext => {
-            // The prior checkpoint enters with unresolved context debt.
-            // The reader may drain its census before account settlement.
-            previous.bounded_sweep_had_unsettled_upload = true;
-        }
         CandidateParseReason::BodyWitnessAdoption => {}
         CandidateParseReason::ActivityOrQuarantineRetry => {
             // A legacy checkpoint lacks the activity map. Its repair selects
@@ -4035,16 +4023,6 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let mut held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
-    if reason == CandidateParseReason::UploadContext {
-        // A read grants no receipt; only an exact ACK does. The real
-        // checkpoint subset keeps the file's own context debt, independently
-        // of the Completed per-file account restoration.
-        held = held.committable_subset(&previous, &accepted, &BTreeMap::new());
-        assert!(
-            held.file_upload_context_requires_adoption(&key),
-            "real checkpoint preserves the file's context debt"
-        );
-    }
     let checkpoint = root.0.join("equal-held.json");
     let reload = |index: &mut ScanIndex| {
         index.save(&checkpoint).unwrap();

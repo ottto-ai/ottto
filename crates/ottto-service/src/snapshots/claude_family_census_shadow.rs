@@ -567,8 +567,7 @@ pub(super) fn generation_tag(traversal: &ScanTraversalCheckpoint) -> u64 {
 /// every selection gate passed and the opened identity equals the stored
 /// revision. Re-evaluated against a perturbed revision, that branch alone
 /// turns into `SourceChanged`; a hold, quarantine, decode or terminal
-/// disposition Skip does not. Witness-less context debt held by its backoff
-/// is presence, not attestation. State only; no read. `decision_calls` counts
+/// disposition Skip does not. State only; no read. `decision_calls` counts
 /// the candidate decisions this runs.
 #[inline(never)]
 pub(super) fn equality_skip(
@@ -578,7 +577,7 @@ pub(super) fn equality_skip(
     decision_calls: &mut u64,
 ) -> bool {
     let key = local_index_key(&candidate.path);
-    if candidate.source_file_fingerprint.is_empty() || index.file_context_read_owed(&key) {
+    if candidate.source_file_fingerprint.is_empty() {
         return false;
     }
     *decision_calls += 1;
