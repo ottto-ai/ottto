@@ -8718,14 +8718,17 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // no hold. A correction-owed member is not carried: its own no-op rule
         // drains it, so its unchanged bodies are not re-sent either, and a
         // later read carries or sends once the correction settled.
-        let semantic_noop = final_group_fingerprint.is_some()
+        #[cfg(unix)]
+        let delivery_owed = tail_source::delivery::owed(index, &pending.index_key);
+        #[cfg(not(unix))]
+        let delivery_owed = false;
+        let same_body = final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
             && final_upload_body_witness == pending.previous_upload_body_witness
             && !pending.codex_pending_recovery
             && !quarantine_retry_required;
         let correction_named = source == SnapshotSource::ClaudeCode
             && index.claude_authority_correction_owed(Path::new(&pending.index_key));
-        let correction_owed = semantic_noop && correction_named;
         // The A1-A3 exclusions shared by the carry and a rebuilt receipt.
         let receipt_eligible = !correction_named
             && !pending.codex_pending_recovery
@@ -8738,7 +8741,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .iter()
                 .any(|fp| index.quarantined_snapshot_fingerprints.contains_key(fp));
         let carried_incidence = index.accepted_rebuild_incidence.remove(&pending.index_key);
-        let entity_bodies = if (semantic_noop && receipt_eligible)
+        let entity_bodies = if ((same_body || delivery_owed) && receipt_eligible)
             || carried_incidence.is_some()
             || index.accepted_rebuild_incidence.contains_key("")
         {
@@ -8762,6 +8765,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .filter(|(fp, body)| index.file_entity_stamp_proves(&pending.index_key, fp, body))
             .map(|(fp, _)| fp.clone())
             .collect::<BTreeSet<_>>();
+        let exact_rebuilt_ack = receipt_eligible
+            && !entity_bodies.is_empty()
+            && stamp_proven.len() == entity_bodies.len();
+        let semantic_noop = same_body && (!delivery_owed || exact_rebuilt_ack);
+        let correction_owed = semantic_noop && correction_named;
+        #[cfg(unix)]
+        if exact_rebuilt_ack {
+            let _ = state_v2::tail_delivery(index, &pending.index_key, false);
+        }
         if semantic_noop
             && receipt_eligible
             && !entity_bodies.is_empty()
@@ -27029,6 +27041,8 @@ impl OwnedSourceScan {
             sampled_audit::prune_growth_retention(index, sampled_scan::now_seconds());
         }
         let hinted_paths = changed_watcher_hints(index, hinted_paths);
+        #[cfg(unix)]
+        tail_source::delivery::wake(source, index);
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
@@ -46931,9 +46945,10 @@ pub(crate) enum CandidateParseReason {
     Rearmed,
     SourceChanged,
     ForcedFamily,
+    DeliveryDebt,
 }
 
-pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
+pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 16;
 pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",
     "new_file",
@@ -46950,6 +46965,7 @@ pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COU
     "rearmed",
     "source_changed",
     "forced_family",
+    "delivery_debt",
 ];
 
 /// Count-only diagnostic: a Codex selection outcome that carries no
@@ -53329,6 +53345,13 @@ impl ScanIndex {
                 Some(CandidateParseReason::TerminalDisposition),
             );
         }
+        #[cfg(unix)]
+        if tail_source::delivery::retry_pending(self, &key) {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::DeliveryDebt),
+            );
+        }
         let Some(entry) = self.files.get(&key) else {
             // Path-(a) tombstone: a returning member of a retired
             // family is never a new file. It re-enters its family's authority
@@ -53396,6 +53419,16 @@ impl ScanIndex {
         // Completed restores the old revision while account-held. Its memo is
         // scoped to the active revision/context, so repeating that adoption
         // cannot settle it; a new activation still selects a counted parse.
+        #[cfg(unix)]
+        if tail_source::delivery::owed(self, &key)
+            && entry.size_bytes == candidate.size_bytes
+            && entry.modified_unix_seconds == candidate.modified_unix_seconds
+            && entry
+                .modified_unix_nanos
+                .map_or(true, |at| at == candidate.modified_unix_nanos)
+        {
+            return (CandidateDecision::Skip, None);
+        }
         if body_witness_adoption
             && !withheld_unchanged
             && self.effective_upload_body_witness_revision_requires_adoption(&key)

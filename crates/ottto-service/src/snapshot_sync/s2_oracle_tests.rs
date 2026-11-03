@@ -676,3 +676,57 @@ fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hol
         );
     });
 }
+
+/// [behaviour] Failed delivery publishes custody, never acceptance. A quiet
+/// retry rebuilds the two-account switch, side call and evidence gap from S2;
+/// exact ACKs retire all incident debt and the next scan sends nothing.
+#[test]
+fn delivery_debt_failure_rebuild_exact_ack_matches_cold_and_resident() {
+    use crate::snapshots::e2_pipeline_scan_fixture::delivery_owed_for_test as owed;
+    with_e2(|| {
+        let (c, path) = placement_corpus("s2-delivery-debt");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        assert!(accounts(&cold).len() >= 2);
+        assert!(cold.snapshots.len() >= 2);
+        let mut first = page(&c, index, 100, true);
+        money_oracle::assert_equivalent(&cold, &result(&first, Mode::Ram));
+        first.finish();
+        let mut progress = e2_progress();
+        let (failed, sent, _) = upload(&first.scan.snapshots, &mut progress, |_| {
+            Err(anyhow!("synthetic transport outage before acceptance"))
+        });
+        assert!(failed.is_err());
+        assert!(!sent.is_empty(), "the publish actually failed");
+        assert!(progress.accepted_fingerprints.is_empty());
+        let saved = session.save_reload(&mut first.index).0;
+        assert!(owed(&saved, &path));
+        let mut retry = page(&c, saved, 100, true); // no watcher or file change
+        assert_eq!(retry.modes.0, 0, "retry must not Full a valid S2 head");
+        money_oracle::assert_equivalent(&cold, &result(&retry, Mode::Restart));
+        retry.finish();
+        let (accepted, batches, _) = upload(&retry.scan.snapshots, &mut progress, ack);
+        assert_eq!(accepted.unwrap(), ResumableUploadResult::Completed);
+        assert!(!batches.is_empty());
+        retry
+            .index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut retry.index,
+            &retry.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let saved = session.save_reload(&mut retry.index).0;
+        assert!(!owed(&saved, &path));
+        let mut quiet = page(&c, saved, 100, true);
+        quiet.finish();
+        assert!(
+            quiet.scan.snapshots.is_empty(),
+            "exact ACK prevents a double send"
+        );
+    });
+}

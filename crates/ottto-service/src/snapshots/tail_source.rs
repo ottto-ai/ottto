@@ -14,6 +14,7 @@ use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
 pub(in crate::snapshots) mod counters;
+pub(in crate::snapshots) mod delivery;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod seam;
 

@@ -51,14 +51,15 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
 #[allow(unused_imports)]
 pub(in crate::snapshots) use runtime::tail_route::{
     dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
-    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    set_aside_tail, stage_tail, tail_delivery, tail_head_keys, tail_set_aside,
+    with_delivery_on_route,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(unused_imports)]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
-    NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile,
-    TailHead,
+    reason_bits, Change, Collection, CollectionMeta, Common, DebtSummary, Disposition,
+    InventoryFacts, NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape,
+    StagedFile, TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's

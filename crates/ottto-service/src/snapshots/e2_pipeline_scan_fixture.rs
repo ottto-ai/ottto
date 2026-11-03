@@ -744,3 +744,7 @@ pub(crate) fn pause_adoption(support: &Path) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }
+
+pub(crate) fn delivery_owed_for_test(index: &ScanIndex, path: &Path) -> bool {
+    super::tail_source::delivery::owed(index, &super::local_index_key(path))
+}

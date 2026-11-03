@@ -114,7 +114,7 @@ impl PendingTail {
                 false
             }
             Ok(Some(staged)) => state_v2::stage_tail(&self.route, &self.key, staged).is_ok(),
-            Ok(None) => true,
+            Ok(None) => state_v2::with_delivery_on_route(&self.route, &self.key).is_ok(),
         }
     }
 }

@@ -12,6 +12,23 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
+/// Delivery state joins the same file transaction as its cursor and Tail.
+/// Only the exact file/body ACK seam may pass `owed=false`.
+pub(in crate::snapshots) fn tail_delivery(index: &ScanIndex, key: &str, owed: bool) -> Result<()> {
+    if let Some(path) = runtime_path(index)? {
+        with_state(&path, |state| {
+            state.tail.delivery(key, owed);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+pub(in crate::snapshots) fn with_delivery_on_route(path: &Path, key: &str) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.delivery(key, true);
+        Ok(())
+    })
+}
 /// This file's completion could not encode: its predecessor stays.
 pub(in crate::snapshots) fn set_aside_tail(
     path: &Path,

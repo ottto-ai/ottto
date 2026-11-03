@@ -611,6 +611,8 @@ impl ScanIndex {
                         || receipt.body_witness.is_empty()
                 });
             entry.upload_context_receipt = Some(candidate.receipt.clone());
+            #[cfg(unix)]
+            let _ = state_v2::tail_delivery(self, &candidate.key, false);
             if rearmed {
                 counts.files += 1;
                 for (entity, bytes) in &candidate.wire_bytes {

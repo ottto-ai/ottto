@@ -87,6 +87,9 @@ pub(in crate::snapshots) fn reuses_stored(
             | CandidateParseReason::Audit
             | CandidateParseReason::UnknownOutcome,
         ) => true,
+        Some(CandidateParseReason::DeliveryDebt) => {
+            super::delivery::retry_pending(index, key) && !retry_held(index, key)
+        }
         Some(CandidateParseReason::UploadContext) => grew,
         Some(CandidateParseReason::NewFile) => held_new,
         Some(reason) => late_evidence(reason) && !set_aside(index, key) && !retry_held(index, key),
@@ -150,8 +153,9 @@ pub(in crate::snapshots) fn retire_absent(
     for key in absent {
         match state_v2::load_head(index, &key, revision) {
             Ok(Some(head))
-                if head.metadata_only
-                    && head.table.contains_key(&state_v2::Collection::Revisions) =>
+                if head.common.debt.reason_bits & state_v2::reason_bits::DELIVERY_DEBT != 0
+                    || (head.metadata_only
+                        && head.table.contains_key(&state_v2::Collection::Revisions)) =>
             {
                 kept_debt += 1;
             }
@@ -266,6 +270,14 @@ pub(super) fn load<S: TailSource>(
         // Valid stored state for a file that changed: an ordinary Full. A
         // shorter file is main's counted Full; no floor holds it (D158).
         Err(Miss::Changed(reason)) => {
+            if super::delivery::owed(index, key) {
+                counters::bump(source, "delivery_revision_unavailable", "changed");
+                crate::local_resource_diagnostics::traversal_point(
+                    "freshness_alarm",
+                    source.api_slug(),
+                    &serde_json::json!({"basis": "delivery_revision_unavailable", "files": 1, "alarm": true}),
+                );
+            }
             if reason == FullReason::Shrunk {
                 counters::bump(source, "tail_shorter_file_full", "files");
             }
@@ -413,7 +425,7 @@ mod held_original_tests;
 mod refold_tests;
 #[cfg(test)]
 #[path = "settlement_tests.rs"]
-mod settlement_tests;
+pub(in crate::snapshots::tail_source) mod settlement_tests;
 #[cfg(test)]
 #[path = "load_tests.rs"]
-mod tests;
+pub(in crate::snapshots::tail_source) mod tests;
