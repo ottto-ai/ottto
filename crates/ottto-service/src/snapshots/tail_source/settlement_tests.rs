@@ -293,7 +293,8 @@ fn a_proven_change_names_its_full() {
 #[test]
 fn the_shipped_selections_reuse_stored_state() {
     let index = ScanIndex::default();
-    let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew);
+    let held_new = |reason| reuses_stored(&index, "a.jsonl", Some(reason), false, true);
+    let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew, false);
     for reason in [
         CandidateParseReason::TranscriptChanged,
         CandidateParseReason::Audit,
@@ -325,6 +326,10 @@ fn the_shipped_selections_reuse_stored_state() {
         Some(CandidateParseReason::BodyWitnessAdoption),
         true
     ));
+    // A NEW file `e2` withheld continues its committed head; the
+    // certificate admits no other native selection.
+    assert!(held_new(CandidateParseReason::NewFile));
+    assert!(!held_new(CandidateParseReason::BodyWitnessAdoption));
 }
 
 /// [money] §6: a forced member reads natively only for evidence stored state
