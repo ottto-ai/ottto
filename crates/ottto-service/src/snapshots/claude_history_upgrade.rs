@@ -827,18 +827,14 @@ impl super::ScanIndex {
             super::claude_index_path_family_member(std::path::Path::new(index_key))
         {
             if let Some(keys) = path_twins(groups, &member) {
-                for (key, size) in keys {
+                for (key, _) in keys {
                     if self.claude_money_birth_store.staged(key) {
                         continue;
                     }
                     // Exactly one metadata read per indexed twin per page. No content read.
                     let opened = probe_opened_birth(key);
-                    self.claude_money_birth_store.stage_opened(
-                        &member,
-                        key,
-                        opened,
-                        size.unwrap_or(0),
-                    );
+                    self.claude_money_birth_store
+                        .stage_opened(&member, key, opened);
                 }
             }
         }

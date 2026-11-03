@@ -1395,10 +1395,9 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
             opened.birth = u64::try_from(*birth).unwrap();
             opened
         });
-        let size = index.files.get(&key).map_or(0, |e| e.size_bytes);
         index
             .claude_money_birth_store
-            .stage_opened(&member, &key, opened, size);
+            .stage_opened(&member, &key, opened);
     }
 }
 

@@ -41,77 +41,66 @@ const MAX_TELEMETRY_PARTITION_DOUBLINGS: usize = 4;
 const MAX_CONTEXT_BASIS_VERSION_KEYS: usize = 16;
 const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 
-/// Retired: the writer certificate (the latest line's time, then one slot
-/// per listed writer version) earlier builds stored in the Tail head. The
-/// head layout keeps it, so a stored head still loads: decoded and
-/// discarded, written as an empty certificate. Nothing reads it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudeOwnWriters;
-/// The stored slots: one per listed version, length-prefixed.
-type RetiredWriterSlots = [i64; 2];
-impl crate::durable_tail_codec::Durable for ClaudeOwnWriters {
+/// A retired stored scalar: decoded and dropped, written as `NEUTRAL` (the
+/// value the last writer started from), so a stored head keeps its layout
+/// and still loads. Nothing reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Retired<T>(std::marker::PhantomData<T>);
+trait Neutral {
+    const NEUTRAL: Self;
+}
+impl Neutral for i64 {
+    const NEUTRAL: Self = i64::MIN;
+}
+impl Neutral for u8 {
+    const NEUTRAL: Self = 0;
+}
+impl<T> Default for Retired<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<T: crate::durable_tail_codec::Durable + Neutral> crate::durable_tail_codec::Durable
+    for Retired<T>
+{
     fn put(
         &self,
         e: &mut crate::durable_tail_codec::Enc,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        <i64 as crate::durable_tail_codec::Durable>::put(&i64::MIN, e)?;
-        crate::durable_tail_codec::GrownArray::put_grown(&[i64::MIN; 2], e)
+        <T as crate::durable_tail_codec::Durable>::put(&T::NEUTRAL, e)
     }
     fn take(
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
-        <i64 as crate::durable_tail_codec::Durable>::take(d)?;
-        <RetiredWriterSlots as crate::durable_tail_codec::GrownArray>::take_grown(d, || 0)?;
-        Ok(Self)
+        T::take(d).map(|_| Self::default())
     }
     fn verify(
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
-        <i64 as crate::durable_tail_codec::Durable>::verify(d)?;
-        <RetiredWriterSlots as crate::durable_tail_codec::GrownArray>::verify_grown(d)
+        T::verify(d)
     }
     fn shape(s: &mut crate::durable_tail_codec::Shape) {
-        if s.enter("ClaudeOwnWriters") {
-            s.push("N latest");
-            <i64 as crate::durable_tail_codec::Durable>::shape(s);
-            s.push("G others");
-            <RetiredWriterSlots as crate::durable_tail_codec::GrownArray>::shape_grown(s);
-            s.leave();
-        }
+        T::shape(s);
     }
 }
-crate::heap_layout_bound::no_heap!(true; ClaudeOwnWriters);
 
-/// Retired: one stored writer byte, decoded and discarded like
-/// `ClaudeOwnWriters`, written as zero.
+/// Retired: the writer certificate (the latest line's time, then one slot
+/// per formerly listed writer version) earlier builds stored in the Tail head.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudeWriterRun;
-impl crate::durable_tail_codec::Durable for ClaudeWriterRun {
-    fn put(
-        &self,
-        e: &mut crate::durable_tail_codec::Enc,
-    ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        <u8 as crate::durable_tail_codec::Durable>::put(&0, e)
-    }
-    fn take(
-        d: &mut crate::durable_tail_codec::Dec<'_>,
-    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
-        <u8 as crate::durable_tail_codec::Durable>::take(d)?;
-        Ok(Self)
-    }
-    fn verify(
-        d: &mut crate::durable_tail_codec::Dec<'_>,
-    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
-        <u8 as crate::durable_tail_codec::Durable>::verify(d)
-    }
-    fn shape(s: &mut crate::durable_tail_codec::Shape) {
-        if s.enter("ClaudeWriterRun") {
-            s.push("N x0");
-            <u8 as crate::durable_tail_codec::Durable>::shape(s);
-            s.leave();
-        }
-    }
+struct ClaudeOwnWriters {
+    latest: Retired<i64>,
+    others: [Retired<i64>; 2],
 }
+crate::durable_tail_codec::durable_struct!(ClaudeOwnWriters {
+    N latest: Retired<i64>,
+    G others: [Retired<i64>; 2],
+});
+crate::heap_layout_bound::no_heap!(true; ClaudeOwnWriters { latest, others });
+
+/// Retired: one stored writer byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeWriterRun(Retired<u8>);
+crate::durable_tail_codec::durable_struct!(ClaudeWriterRun(N x0: Retired<u8>));
 crate::heap_layout_bound::no_heap!(true; ClaudeWriterRun);
 
 /// Open-descriptor metadata, also used by the page's one metadata probe per twin.

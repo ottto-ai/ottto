@@ -81,7 +81,7 @@ struct Session(
 // Sessions are a sorted Vec: inserts within a page grow amortized, and the
 // save-time prune shrinks it back to its length.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BirthStore(Vec<Session>, Vec<(LocationKey, u8)>, MoneyMarks);
+pub(crate) struct BirthStore(Vec<Session>, Vec<LocationKey>, MoneyMarks);
 /// Money-rule marks (design item 8): the rule version applied and, per
 /// indexed path with a settled request-owned body, which rules shaped its
 /// money. A later money fix re-owes only the paths its mask names.
@@ -375,30 +375,20 @@ impl BirthStore {
         self.staged_location(location_key(path))
     }
     pub(in crate::snapshots) fn staged_location(&self, path: LocationKey) -> bool {
-        self.1.binary_search_by_key(&path, |o| o.0).is_ok()
+        self.1.binary_search(&path).is_ok()
     }
     pub(in crate::snapshots) fn stage_opened(
         &mut self,
         session: &str,
         path: &str,
         opened: Option<ClaudeOpenedBirth>,
-        indexed_size: u64,
     ) {
         let pk = location_key(path);
         if let Some(opened) = opened.filter(|o| o.birth != 0) {
             self.record_opened(session, path, i128::from(opened.birth), opened);
         }
-        let valid = opened.is_some_and(|current| {
-            current.size >= indexed_size
-                && self
-                    .get(session)
-                    .and_then(|s| s.4.binary_search_by_key(&pk, |o| o.0).ok().map(|i| &s.4[i]))
-                    .is_some_and(|o| o.3.covers(current))
-        });
-        let status = u8::from(opened.is_some()) | (u8::from(valid) << 1);
-        match self.1.binary_search_by_key(&pk, |o| o.0) {
-            Ok(i) => self.1[i].1 = status,
-            Err(i) => self.1.insert(i, (pk, status)),
+        if let Err(i) = self.1.binary_search(&pk) {
+            self.1.insert(i, pk);
         }
     }
     /// Remember the identity at birth, never rebind an old minimum to a replacement.
@@ -618,7 +608,7 @@ impl BirthStore {
     fn memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.0.capacity() * std::mem::size_of::<Session>()
-            + self.1.capacity() * std::mem::size_of::<(LocationKey, u8)>()
+            + self.1.capacity() * std::mem::size_of::<LocationKey>()
             + self.2.paths.capacity() * std::mem::size_of::<(LocationKey, u8)>()
             + self
                 .0
@@ -687,7 +677,7 @@ mod tests {
             size: 10,
         };
         store.record_opened("s", "A", 100, opened);
-        store.stage_opened("s", "A", Some(opened), 10);
+        store.stage_opened("s", "A", Some(opened));
         assert!(store.staged_location(location_key("A")));
         assert!(witnessed(&store, opened));
         let mut restored: BirthStore =
@@ -698,12 +688,12 @@ mod tests {
         );
         assert!(witnessed(&restored, opened), "the witness is persisted");
         let grown = ClaudeOpenedBirth { size: 20, ..opened };
-        restored.stage_opened("s", "A", Some(grown), 10);
+        restored.stage_opened("s", "A", Some(grown));
         assert!(witnessed(&restored, grown), "append preserves the witness");
         restored.preserve_missing_from(&store);
         restored.begin_page();
         assert!(!restored.staged_location(location_key("A")));
-        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 19, ..opened }), 10);
+        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 19, ..opened }));
         assert!(
             !witnessed(&restored, ClaudeOpenedBirth { size: 19, ..opened }),
             "remember the highest observed extent"
@@ -715,7 +705,7 @@ mod tests {
             size: 30,
             ..opened
         };
-        restored.stage_opened("s", "A", Some(replacement), 10);
+        restored.stage_opened("s", "A", Some(replacement));
         let at_old_birth = ClaudeOpenedBirth {
             birth: 100,
             ..replacement
@@ -822,16 +812,16 @@ mod tests {
             inode: 2,
             size: 10,
         };
-        restored.stage_opened("s", "A", Some(opened), 10);
+        restored.stage_opened("s", "A", Some(opened));
         assert!(witnessed(&restored, opened));
         restored.begin_page();
         let other = ClaudeOpenedBirth { inode: 3, ..opened };
-        restored.stage_opened("s", "A", Some(other), 10);
+        restored.stage_opened("s", "A", Some(other));
         assert!(!witnessed(&restored, other), "another object");
         // Written back as CMB4 and read again, the witness is unchanged.
         let mut again: BirthStore =
             serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
-        again.stage_opened("s", "A", Some(opened), 10);
+        again.stage_opened("s", "A", Some(opened));
         assert!(witnessed(&again, opened));
         assert!(!witnessed(&again, other));
     }
@@ -853,7 +843,7 @@ mod tests {
             };
             assert!(!witnessed(&restored, opened));
             let mut restored = restored;
-            restored.stage_opened("s", "A", Some(opened), 10);
+            restored.stage_opened("s", "A", Some(opened));
             assert!(
                 !witnessed(&restored, opened),
                 "legacy minima have no recorded generation to compare"

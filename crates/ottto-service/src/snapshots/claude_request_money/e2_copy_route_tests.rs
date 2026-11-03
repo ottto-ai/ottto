@@ -1,7 +1,6 @@
 //! One copy route: a copied prefix goes only on request-id proof from an
 //! earlier accepted main file of another session in the copy's own folder
-//! (whatever Claude Code version wrote it), a saved removal is reversed only
-//! by a holder census that lacks the request, and an accepted copy decided
+//! (whatever Claude Code version wrote it), and an accepted copy decided
 //! before `COPY_PROOF_FROM` keeps its decision.
 
 use super::*;
@@ -61,41 +60,41 @@ fn listed_writer_copy_needs_a_holder() {
         if accepted {
             accepted_receipt(&mut index, &dir);
         }
-        take_diag();
         let items = pass(&mut index, &path, &lines);
         assert_eq!(
             outcome(&items),
             expected,
             "holds {holds} accepted {accepted}"
         );
-        let absent = take_diag().get("copy_unproven_origin_absent").copied();
-        assert_eq!(absent, (!holds).then_some(2), "holds {holds}");
         let _ = fs::remove_dir_all(dir);
     }
 }
 
-/// [behaviour] Only a holder directly in the copy's folder proves its
-/// prefix: a holder in a folder whose name extends the copy's, or in a
-/// folder below it, proves nothing.
+/// [behaviour] Only a holder in the copy's folder proves its prefix: a
+/// holder in a folder whose name extends the copy's proves nothing.
 #[test]
 fn holder_outside_the_copys_folder_proves_nothing() {
-    for (place, removed) in [("same", 2), ("neighbour", 0), ("nested", 0)] {
+    for (neighbour, removed) in [(false, 2), (true, 0)] {
         let dir = scratch();
         let path = copy_at(&dir);
-        let holder_dir = match place {
-            "same" => dir.clone(),
-            "neighbour" => PathBuf::from(format!("{}-y", dir.display())),
-            _ => dir.join("nested"),
+        let holder_dir = if neighbour {
+            PathBuf::from(format!("{}-y", dir.display()))
+        } else {
+            dir.clone()
         };
         fs::create_dir_all(&holder_dir).unwrap();
         let mut index = index_holding(&holder_dir, &["copy-a", "copy-b"]);
         accepted_receipt(&mut index, &holder_dir);
         let items = decide_pass(&mut index, &path);
-        assert_eq!(fold(&items).entity.removed_requests, removed, "{place}");
+        assert_eq!(
+            fold(&items).entity.removed_requests,
+            removed,
+            "neighbour {neighbour}"
+        );
         assert_eq!(
             fold(&items).prefix.unproven_requests,
             2 - removed,
-            "{place}"
+            "neighbour {neighbour}"
         );
         let _ = fs::remove_dir_all(&holder_dir);
         let _ = fs::remove_dir_all(dir);
@@ -142,53 +141,12 @@ fn only_an_unscanned_file_in_the_copys_folder_waits() {
     }
 }
 
-/// [money] A saved removal is reversed only by its holder's census lacking
-/// the request, never by the holder's family being listed for re-emission:
-/// listing pauses new removals only. Control: a census that lacks a
-/// request reverses its saved removal, listed or not.
-#[test]
-fn listed_holder_keeps_saved_removal() {
-    // (holder listed, ids the holder's census holds, removed, counted)
-    for (listed_holder, ids, removed, counted) in [
-        (false, &["copy-a", "copy-b"][..], 2, 1),
-        (true, &["copy-a", "copy-b"][..], 2, 1),
-        (false, &["copy-b"][..], 1, 2),
-        (true, &["copy-b"][..], 1, 2),
-    ] {
-        let dir = scratch();
-        let path = copy_at(&dir);
-        let mut index = index_holding(&dir, ids);
-        accepted_receipt(&mut index, &dir);
-        let file = location_key(&local_index_key(&path));
-        let hashes = ["copy-a", "copy-b"].map(claude_request_hash);
-        index.claude_copy_removals.store(
-            file,
-            BTreeMap::from([(
-                location_key(&holder_key(&dir)),
-                hashes.into_iter().collect(),
-            )]),
-        );
-        let support = scratch();
-        let sessions: &[&str] = if listed_holder { &[HOLDER] } else { &[] };
-        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&support, sessions);
-        index.load_claude_reemission_exclusions(&support);
-        let items = decide_pass(&mut index, &path);
-        let case = format!("listed {listed_holder} ids {ids:?}");
-        assert_eq!(fold(&items).entity.removed_requests, removed, "{case}");
-        assert_eq!(fold(&items).entity.totals().1, counted, "{case}");
-        assert_eq!(fold(&items).prefix.held_requests, 0, "{case}");
-        assert!(!index.claude_copy_removals.get(file).is_empty(), "{case}");
-        let _ = fs::remove_dir_all(dir);
-        let _ = fs::remove_dir_all(support);
-    }
-}
-
-/// [money] Forward-only: a resume whose first own response (provider time)
-/// is before `COPY_PROOF_FROM`, settled with its copies removed and
-/// accepted, with no saved removal, keeps that decision with no holder to
-/// prove it. Any missing condition, an all-copy file or a first own turn
-/// after the cutoff takes the request-id proof (here: none, so it counts).
-/// The gate reads the first own response's time, not a later one's.
+/// [money] The grandfather's gates: a resume whose first own response
+/// (provider time) is before `COPY_PROOF_FROM`, settled with its copies
+/// removed and accepted, with no saved removal, keeps that decision with no
+/// holder to prove it, whatever later own turns follow. Any missing
+/// condition or an all-copy file takes the request-id proof (here: none, so
+/// it counts). The cutoff itself is in the pipeline oracle.
 #[test]
 fn accepted_pre_cutoff_copy_keeps_its_decision() {
     let [copy_a, copy_b] = copies();
@@ -197,10 +155,9 @@ fn accepted_pre_cutoff_copy_keeps_its_decision() {
     let resumed = [copy_a.clone(), copy_b.clone(), own.clone()];
     // (case, lines, COPY mark, accepted body, saved removal, removed)
     let cases = [
-        ("accepted", resumed.to_vec(), true, true, false, 2),
         (
             "later own after cutoff",
-            vec![copy_a.clone(), copy_b.clone(), own, late.clone()],
+            vec![copy_a.clone(), copy_b.clone(), own, late],
             true,
             true,
             false,
@@ -209,14 +166,6 @@ fn accepted_pre_cutoff_copy_keeps_its_decision() {
         ("no copy mark", resumed.to_vec(), false, true, false, 0),
         ("no accepted body", resumed.to_vec(), true, false, false, 0),
         ("saved removal", resumed.to_vec(), true, true, true, 1),
-        (
-            "first own after cutoff",
-            vec![copy_a.clone(), copy_b.clone(), late],
-            true,
-            true,
-            false,
-            0,
-        ),
         ("all copy", vec![copy_a, copy_b], true, true, false, 0),
     ];
     for (case, lines, mark, accepted, saved, removed) in cases {

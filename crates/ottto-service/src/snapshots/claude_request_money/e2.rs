@@ -2864,7 +2864,6 @@ fn decide_holders(
             .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
             .cloned()
             .collect::<Vec<_>>();
-        diag("copy_unproven_origin_absent", ids.len() as u64);
         restore_uncovered(&mut items[wanted.at], &ids);
     }
     updates

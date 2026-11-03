@@ -58,18 +58,15 @@ fn grown_copy(arm: Earlier) -> ((u64, u64), Vec<u64>) {
         &at("07:03:00"),
     );
     input_clock(&path);
+    // Loaded telemetry, so a corrected family counts; each row only once its
+    // transcript line exists.
+    let mut rows = vec![
+        api_for(COPY, "a", 10, 100),
+        api_for(COPY, "b", 10, 200),
+        api_for(COPY, "c", 10, 300),
+    ];
     if arm != Earlier::AfterCutoff {
-        // Loaded telemetry, so a corrected family counts.
-        c.evidence_for(
-            COPY,
-            &[
-                api_for(COPY, "a", 10, 100),
-                api_for(COPY, "b", 10, 200),
-                api_for(COPY, "c", 10, 300),
-                api_for(COPY, "d", 10, 400),
-            ],
-            &[],
-        );
+        c.evidence_for(COPY, &rows, &[]);
     }
     let first = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
     let copy = body(&first, COPY).expect("the resume publishes");
@@ -87,6 +84,10 @@ fn grown_copy(arm: Earlier) -> ((u64, u64), Vec<u64>) {
     }
     append(&path, &line_by(COPY, "d", &d_at, 10, RESUME_WRITER));
     input_clock(&path);
+    if arm != Earlier::AfterCutoff {
+        rows.push(api_for(COPY, "d", 10, 400));
+        c.evidence_for(COPY, &rows, &[]);
+    }
     e2::take_diag();
     let grown = ready(&c, &E2ScanFixture::default(), prior, 100, false);
     let copy = body(&grown, COPY).expect("the grown resume publishes");

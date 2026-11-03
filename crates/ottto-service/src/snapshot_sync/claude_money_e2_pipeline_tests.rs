@@ -1261,12 +1261,22 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
             "2026-11-04T07:03:00Z",
         );
         assert!(moved.is_file());
+        e2::take_diag();
+        let before = scanner.paths().len();
         let copy = ready(&c, &scanner, prior, 100, false);
         literal(&copy);
+        let paths = scanner.paths().split_off(before);
+        let decided = copy_diag(&[
+            "copy_prefix_twin_page_removed",
+            "held_absent_twin",
+            "twin_redundant",
+            "copy_prefix_unproven",
+        ]);
         assert_eq!(
             total(&copy),
             2,
-            "restart/move must not make copied r1 count twice"
+            "restart/move must not make copied r1 count twice: read {paths:?}, \
+             (page proof, absent twin, redundant twin, unproven) {decided:?}"
         );
         assert_eq!(copy.scan.snapshots[0].removed_request_count, Some(1));
     });
@@ -1737,7 +1747,7 @@ fn e2_pipeline_paced_twin_does_not_force_its_family() {
 }
 
 /// [money] An all-pre-birth path twin has no own turn, so nothing proves
-/// its copy: both paths count r1 (disclosed) on the first page. After the
+/// its copy: both paths count r1 (flagged) on the first page. After the
 /// original is deleted, the survivor keeps its stored body and, once it
 /// changes, still counts r1 once and its own new turn.
 #[test]
@@ -1755,6 +1765,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
             "2026-08-02T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
+        e2::take_diag();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(
             total(&first),
@@ -1762,9 +1773,8 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
             "an unproven twin copy counts on both paths"
         );
         assert!(
-            e2::pipeline_test_observer::disclosed(&first.scan.snapshots) + first.released.disclosed
-                > 0,
-            "the unproven twin copy is disclosed"
+            copy_diag(&["copy_prefix_unproven"])[0] > 0,
+            "the unproven twin copy is flagged"
         );
         first.finish();
         let prior = c.reload(&mut first.index);
@@ -4084,70 +4094,6 @@ fn e2_pipeline_resumed_copy_without_proof_or_stored_removal_counts_flagged() {
     }
 }
 
-/// [money] A resume written by a Claude Code version the retired writer
-/// list named (2.1.309) gets no timestamp skip: like any other writer's, its
-/// copied prefix is removed only by the request ids an earlier, accepted main
-/// file of another session in its folder holds, and that removal is stored.
-/// Without such a holder the prefix counts, flagged.
-#[test]
-fn listed_writer_resume_takes_holder_proof() {
-    for holder in [true, false] {
-        with_e2(|| {
-            let mut c = Corpus::new(&format!("e2-pipeline-listed-writer-resume-{holder}"));
-            let listed = |(request, at, _): (&'static str, &'static str, &'static str)| {
-                (request, at, "2.1.309")
-            };
-            let mut prior = ScanIndex::default();
-            if holder {
-                c.root(ROOT, &resumed(ROOT, &[listed(A), listed(B)]));
-                let original = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-                prior = settle(&c, &prior, original, &mut e2_progress());
-            }
-            c.write_at(
-                &file(COPY),
-                &resumed(COPY, &[listed(A), listed(B), listed(C)]),
-                "2026-08-02T07:03:00Z",
-            );
-            e2::take_diag();
-            let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-            literal(&page);
-            let copy = body(&page, COPY).expect("the resume publishes");
-            if holder {
-                assert_eq!(
-                    (copy.request_count, copy.removed_request_count),
-                    (1, Some(2)),
-                    "the copied prefix is removed by request ids"
-                );
-                assert_eq!(
-                    copy_diag(&PREFIX_KEYS),
-                    [0, 0, 0, 0, 2],
-                    "proven, so stored and never flagged"
-                );
-                assert!(
-                    !page.index.claude_copy_removals.is_empty(),
-                    "the removal is stored"
-                );
-            } else {
-                assert_eq!(
-                    (copy.request_count, copy.removed_request_count),
-                    (3, Some(0)),
-                    "no holder: the copied prefix counts"
-                );
-                assert_eq!(
-                    e2::pipeline_test_observer::disclosed(&page.scan.snapshots),
-                    2
-                );
-                assert_eq!(
-                    copy_diag(&PREFIX_KEYS),
-                    [2, 1, 0, 0, 0],
-                    "flagged, nothing stored"
-                );
-                assert!(page.index.claude_copy_removals.is_empty());
-            }
-        });
-    }
-}
-
 /// [money] #964 proof target (audited resumed main files counted their
 /// copied requests twice).
 /// The shape: a resumed main file of any writer version, own turns in
@@ -4342,8 +4288,13 @@ fn e2_pipeline_lossy_absence_never_invalidates_a_stored_removal() {
     });
 }
 
+/// [money] Forward-only: an accepted copy settled with its prefix removed
+/// before the copy proof cutoff keeps that removal when its saved removal
+/// metadata is lost (absent or damaged), even when no census proves it any
+/// more; re-counting would re-emit a larger body than the one accepted. Own
+/// turns publish without delay.
 #[test]
-fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying_own_turns() {
+fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
     for missing in [false, true] {
         for retired in [false, true] {
             with_e2(|| {
@@ -4371,18 +4322,16 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
                 e2::take_diag();
                 let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
                 let third = body(&page, THIRD).expect("own turns always publish");
+                let case = format!("missing {missing} retired {retired}");
                 assert_eq!(
                     (third.request_count, third.removed_request_count),
-                    if retired { (5, Some(0)) } else { (2, Some(3)) }
+                    (2, Some(3)),
+                    "{case}"
                 );
-                // An absent field reads as an empty store, never lost.
                 assert_eq!(
                     copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
-                    if retired {
-                        [3, if missing { 0 } else { 3 }]
-                    } else {
-                        [0, 0]
-                    }
+                    [0, 0],
+                    "{case}: nothing flagged"
                 );
             });
         }
@@ -5167,9 +5116,9 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
 /// sum into the first item's body, so a copied-marker loan recorded only by a
 /// later twin (its own later turn) must reach the copy-derived selection too.
 /// Copy-prefix dedupe tombstones every released row X lent, whichever twin
-/// lent it. Each twin's folder holds the original (a copied prefix is proven
-/// only by an earlier accepted main file of another session in its own
-/// folder), delivered before the twins are read.
+/// lent it. Each twin's folder holds its own accepted origin of request a,
+/// another session delivered before the twins are read (a copied prefix is
+/// proven only by such a holder in the copy's folder).
 #[test]
 fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
     for retained in [false, true] {
@@ -5179,10 +5128,10 @@ fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
             };
             let mut c = Corpus::new("e2-pipeline-copy-derived-twins");
             let scanner = E2ScanFixture::capturing_identity();
-            for folder in ["a-first", "z-twin"] {
+            for (folder, origin) in [("a-first", ROOT), ("z-twin", THIRD)] {
                 c.write_at(
-                    &format!("{folder}/{ROOT}.jsonl"),
-                    &resumed(ROOT, &[A]),
+                    &format!("{folder}/{origin}.jsonl"),
+                    &resumed(origin, &[A]),
                     "2026-08-02T07:00:00Z",
                 );
             }
