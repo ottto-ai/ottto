@@ -669,7 +669,28 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
         );
         let emitted = result(&current, Mode::Restart);
         money_oracle::assert_no_smaller_reemit(ROOT, &previous, &emitted, &cold, false);
+        // The changed sibling is offered before its exact ACK; suppression
+        // must never substitute for receiving that body's witness.
+        let sibling_item = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == COPY)
+            .unwrap();
+        assert_eq!(sibling_item.input_tokens, 12);
+        let sibling_fingerprint = sibling_item.snapshot_fingerprint.clone();
+        let sibling_witness = snapshot_upload_body_witness(sibling_item);
+        assert!(!current
+            .committed
+            .accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
         let prior = commit(&session, current);
+        assert!(prior.accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        assert_eq!(
+            prior.files[sibling.to_str().unwrap()]
+                .last_upload_body_witness
+                .as_deref(),
+            Some(sibling_witness.as_str())
+        );
         let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
             SOURCE,
             &scanner.cache,
@@ -682,9 +703,22 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
             std::fs::metadata(&path).unwrap().len()
         );
         append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
-        // A hint selects both files so complete envelopes can be compared.
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = read(prior, &[path, sibling]);
+        // Apply the same root selection before serialization on both routes.
+        let select_root = |page: &mut Page| {
+            page.scan.snapshots.retain(|s| s.source_session_id == ROOT);
+        };
+        let mut cold_page = page(&c, ScanIndex::default(), 100, false);
+        select_root(&mut cold_page);
+        let cold = result(&cold_page, Mode::ColdFull);
+        let mut replay = read(prior, &[path, sibling]);
+        assert!(
+            !replay
+                .scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == COPY),
+            "only the exact ACK above suppresses the unchanged sibling"
+        );
         // The saved loss selects TerminalDisposition, which main's existing
         // reuse gate sends to Full. The durable seal above still survived.
         assert_eq!(replay.modes, (1, 0, 0));
@@ -698,16 +732,9 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
                 .input_tokens,
             60
         );
-        // The unchanged sibling is suppressed after its exact ACK. Compare
-        // the changed root using the same source bytes on each route.
-        let mut cold = cold;
-        cold.snapshots.remove(COPY);
-        for envelope in cold.normalized.as_array_mut().unwrap() {
-            envelope["snapshots"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|s| s["source_session_id"] != COPY);
-        }
+        // Select before serialization so the real uploader derives the
+        // envelope contracts from exactly the bodies being compared.
+        select_root(&mut replay);
         money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
     });
 }
