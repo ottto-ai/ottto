@@ -11,12 +11,13 @@ fn scratch() -> (ScratchDir, Supervisor) {
     (dir, supervisor)
 }
 
-fn spare_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+// Keep a non-listening SO_REUSEADDR reservation through every relay bind and
+// close/rebind assertion. The native bind helper can share this reservation,
+// but another ephemeral-port allocation cannot claim the port between steps.
+fn reserve_port() -> (TcpListener, u16) {
+    let reservation = TcpListener::from(socket::bind_ipv6_wildcard(0).unwrap());
+    let port = reservation.local_addr().unwrap().port();
+    (reservation, port)
 }
 
 fn ports(record: &Record) -> Vec<u16> {
@@ -153,7 +154,7 @@ fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
 #[serial_test::serial]
 fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes() {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
@@ -197,7 +198,7 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
     assert!(restarted.record.ports.is_empty());
     assert_eq!(restarted.counters.closed.load(Ordering::Relaxed), 2);
     assert_eq!(restarted.counters.open.load(Ordering::Relaxed), 0);
-    let _released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let _released = socket::bind(port).unwrap();
     restarted
         .reconcile_current(
             500 + IDLE_SECONDS + 60,
@@ -213,7 +214,7 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
 #[test]
 fn becoming_approved_closes_socket_and_drops_record_before_primary_bind() {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
@@ -223,14 +224,14 @@ fn becoming_approved_closes_socket_and_drops_record_before_primary_bind() {
     assert_eq!(ports(&supervisor.record), vec![APPROVED]);
     assert!(!ports(&supervisor.record).contains(&port));
     assert!(supervisor.open.is_empty());
-    let _primary = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let _primary = socket::bind(port).unwrap();
     assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_response() {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
@@ -455,8 +456,8 @@ fn optional_record_decoder_accepts_absent_empty_unknown_and_older_fields() {
 #[test]
 fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession() {
     let (_dir, mut supervisor) = scratch();
-    let b = spare_port();
-    let c = spare_port();
+    let (_reservation_b, b) = reserve_port();
+    let (_reservation_c, c) = reserve_port();
     assert_ne!(b, c);
     let candidates = [APPROVED, b, c];
     supervisor
@@ -473,8 +474,8 @@ fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession(
     assert_eq!(supervisor.record.last_approved, None);
     assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 2);
     assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 0);
-    let released = TcpListener::bind((Ipv4Addr::LOCALHOST, b)).unwrap();
-    let released_other = TcpListener::bind((Ipv4Addr::LOCALHOST, c)).unwrap();
+    let released = socket::bind(b).unwrap();
+    let released_other = socket::bind(c).unwrap();
     drop((released, released_other));
     let mut restarted =
         Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 200).unwrap();
@@ -549,7 +550,7 @@ fn hook_supervisor(mut supervisor: Supervisor) -> (Endpoint, thread::JoinHandle<
 #[test]
 fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     let candidates = [APPROVED, port];
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
@@ -563,7 +564,7 @@ fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
     assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 0);
     let disk: Record = load_private_record(&supervisor.path).unwrap();
     assert!(disk.retired.contains(&port));
-    let released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let released = socket::bind(port).unwrap();
     drop(released);
     // Consent returns to exactly the same approval before a periodic tick.
     supervisor
@@ -604,7 +605,7 @@ fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
 fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_activity() {
     for approval in [Approval::Revoked, Approval::Unknown] {
         let (_dir, mut supervisor) = scratch();
-        let port = spare_port();
+        let (_reservation, port) = reserve_port();
         supervisor
             .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
             .unwrap();
@@ -681,7 +682,7 @@ fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_a
 #[test]
 fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     let candidates = [APPROVED, port];
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
@@ -707,14 +708,14 @@ fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
         .unwrap();
     assert!(restarted.open.is_empty());
     assert!(restarted.record.retired.contains(&port));
-    let _not_bound_by_legacy = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let _not_bound_by_legacy = socket::bind(port).unwrap();
 }
 
 #[test]
 fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() {
     use crate::control::ManagedClaudeRelaySettings;
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     let candidates = [APPROVED, port];
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
@@ -815,7 +816,7 @@ fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
 #[test]
 fn rebind_abandons_a_descriptor_replaced_by_an_unrelated_file() {
     let (dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
@@ -850,7 +851,7 @@ fn rebind_abandons_a_descriptor_replaced_by_an_unrelated_file() {
 
 pub(crate) fn with_running_listener_for_test(run: impl FnOnce()) -> (usize, usize) {
     let (_dir, mut supervisor) = scratch();
-    let port = spare_port();
+    let (_reservation, port) = reserve_port();
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
@@ -873,8 +874,8 @@ pub(crate) fn with_running_listener_for_test(run: impl FnOnce()) -> (usize, usiz
 
 #[test]
 fn legacy_listener_rebinds_immediately_after_a_server_first_close() {
-    let listener = socket::bind(0).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (_reservation, port) = reserve_port();
+    let listener = socket::bind(port).unwrap();
     let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     apply_relay_io_timeouts(&client);
     let (mut server, _) = retry_would_block(|| listener.accept()).unwrap();
