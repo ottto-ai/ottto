@@ -825,33 +825,79 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
     let (mut index, posts) = working.checkpoint_with_captured_posts(&read, &prior, "accept");
     let read_route = route(&index, &read, posts);
     money_oracle::assert_equivalent(&expected, &read_route);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let read_head = state_v2::load_head(&index, &key, u32::MAX).unwrap();
+    let mut facts = format!(
+        "after the read: head metadata_only={:?} representation={:?} debt={:?}; \
+         receipt={} adoption={}",
+        read_head.as_ref().map(|head| head.metadata_only),
+        read_head.as_ref().map(|head| head.common.representation),
+        read_head.as_ref().map(|head| head.common.debt),
+        index.files[&key].upload_context_receipt.is_some(),
+        index.file_upload_context_requires_adoption(&key),
+    );
+
+    // The next pass reads nothing: no identity sample, decoder, delivery,
+    // consumed byte, snapshot or POST.
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let activity = codex_zst_refusal_tests::activity();
+    let previous = index.clone();
+    let (working, quiet, delivery, consumed, logs) =
+        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+    let sampled = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get) != samples;
+    let decoded = codex_zst_refusal_tests::activity() != activity || full_decodes(&logs) > 0;
+    let delivered = delivery.0.lock().unwrap().clone();
+    let (mut index, posts) = working.checkpoint_with_captured_posts(&quiet, &previous, "accept");
+    facts += &format!(
+        "\nnext pass: sampled={sampled} decoded={decoded} consumed={consumed} \
+         delivered={delivered:?} snapshots={} posts={}",
+        quiet.snapshots.len(),
+        posts.len(),
+    );
 
     index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    let (mut index, _) = assert_quiet(&c, index, &read_route);
-    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
     let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
-    assert_eq!(settled["outstanding_files"], 0);
-    assert_eq!(settled["unread_bytes"], 0);
-    assert_eq!(settled["over_6h_files"], 0);
     index.save(session.path()).unwrap();
     let mut index = ScanIndex::load(session.path()).unwrap();
-    if let Some(head) = state_v2::load_head(&index, &key, u32::MAX).unwrap() {
-        assert!(!head.metadata_only, "a remaining head bears the reduction");
-        assert_eq!(head.common.representation, state_v2::Representation::Tail);
-        assert_eq!(head.common.debt, Default::default());
-        let mut revisions = 0;
-        state_v2::load_revisions(&index, &key, &head, |_, _| {
+    let head = state_v2::load_head(&index, &key, u32::MAX).unwrap();
+    let mut revisions = 0;
+    if let Some(head) = &head {
+        state_v2::load_revisions(&index, &key, head, |_, _| {
             revisions += 1;
             Ok(())
         })
         .unwrap();
-        assert_eq!(revisions, 0);
     }
     index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index);
-    assert_eq!(after["debt"]["outstanding_files"], 0);
-    assert_eq!(after["debt"]["over_6h_files"], 0);
+    let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+    facts += &format!(
+        "\nsettled: {settled}\nhead: metadata_only={:?} representation={:?} debt={:?} \
+         revisions={revisions}\nafter: {after}",
+        head.as_ref().map(|head| head.metadata_only),
+        head.as_ref().map(|head| head.common.representation),
+        head.as_ref().map(|head| head.common.debt),
+    );
+    assert!(
+        read_head.is_some_and(|head| !head.metadata_only),
+        "the counted read leaves a reduction-bearing head\n{facts}"
+    );
+    assert!(
+        !sampled && !decoded && consumed == 0 && delivered.is_empty(),
+        "no new read\n{facts}"
+    );
+    assert!(quiet.snapshots.is_empty() && posts.is_empty(), "{facts}");
+    assert_eq!(settled["outstanding_files"], 0, "{facts}");
+    assert_eq!(settled["unread_bytes"], 0, "{facts}");
+    assert_eq!(settled["over_6h_files"], 0, "{facts}");
+    if let Some(head) = &head {
+        assert!(!head.metadata_only, "{facts}");
+        assert_eq!(head.common.representation, state_v2::Representation::Tail);
+        assert_eq!(head.common.debt, Default::default(), "{facts}");
+        assert_eq!(revisions, 0, "{facts}");
+    }
+    assert_eq!(after["outstanding_files"], 0, "{facts}");
+    assert_eq!(after["over_6h_files"], 0, "{facts}");
     drop(session);
 }
 
