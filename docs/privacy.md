@@ -364,11 +364,9 @@ bytes once after a setting changes, and the server rejects those bytes.
 **Turning a source off**, a device grant that no longer names it, **logging out**
 and **switching accounts** stop collection and keep local data: scan indexes and
 durable state in `snapshots`, caches, context composition state, backfill state and
-upload receipts all stay. Turning a source back on resumes from that kept state; it
-drops only that source's upload records (composition upload acknowledgments, the MCP
-inventory upload time and its context-footprint upload hashes), so data the server
-removed when the source was turned off is sent again at each collector's normal
-cadence.
+upload receipts all stay. Turning a source back on resumes from that kept state and
+continues forward: data uploaded before the source was turned off stays on the
+server, so nothing already sent is sent again.
 
 **Forget installation** clears the installation identity and credentials only; all
 collected local data stays.

@@ -188,8 +188,8 @@ sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, uninstall) reaches every store and is counted when it fails.
 Source removal, grant loss, logout, account switch and forget installation only stop
-collection and keep local state; re-enabling a source resumes from it and drops only
-that source's upload witnesses. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+collection and keep local state; re-enabling a source resumes from it and drops
+nothing, so nothing already sent is re-sent. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
 
 Local collection never depends on an upload setting. No read-side identity (file scope, Codex
 group scope, traversal, memos, tier receipts) includes a setting, the attribution key, a

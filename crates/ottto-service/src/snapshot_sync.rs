@@ -12534,11 +12534,9 @@ pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource
 /// per device and source; each newer one applies once, recorded in
 /// `snapshots/<slug>.source-control` after its marker (a crash between them
 /// re-applies the same revision). A missing or another device's record reads
-/// as enabled revision 0. OFF pauses like a local disable; ON resumes a paused
-/// source, and one that does not directly follow an applied ON (an OFF was
-/// missed) forces a resume, so the next cycle re-sends what the OFF erased.
-/// A block for another device, an unknown source or a malformed entry is
-/// ignored.
+/// as revision 0. OFF pauses like a local disable; ON resumes a paused source
+/// and changes nothing for a running one. A block for another device, an
+/// unknown source or a malformed entry is ignored.
 pub(crate) fn apply_source_control(support_dir: &Path, reply: &serde_json::Value) {
     let block = &reply["source_control"];
     let (Some("source_control:v1"), Some(device_id), Some(entries)) = (
@@ -12567,28 +12565,22 @@ pub(crate) fn apply_source_control(support_dir: &Path, reply: &serde_json::Value
         ) else {
             continue;
         };
-        let marker = source_marker_path(support_dir, source);
-        let record = marker.with_file_name(format!("{}.source-control", source.api_slug()));
-        let (was_enabled, last) = std::fs::read(&record)
+        let record = source_marker_path(support_dir, source)
+            .with_file_name(format!("{}.source-control", source.api_slug()));
+        let last = std::fs::read(&record)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .filter(|record| record["device_id"] == device_id)
-            .and_then(|r| Some((r["desired_state"] == "enabled", r["revision"].as_u64()?)))
-            .unwrap_or((true, 0));
+            .and_then(|record| record["revision"].as_u64())
+            .unwrap_or(0);
         if revision <= last {
             continue;
         }
         let applied = match state {
             "disabled" => disable_snapshot_source(support_dir, source),
-            _ if was_enabled && revision - 1 == last => {
-                reconnect_snapshot_source(support_dir, source)
-            }
-            _ => {
-                let _turn = source_erasure_turn();
-                write_source_marker(&marker, "reconnect")
-            }
+            _ => reconnect_snapshot_source(support_dir, source),
         };
-        let body = serde_json::json!({"device_id": device_id, "revision": revision, "desired_state": state});
+        let body = serde_json::json!({"device_id": device_id, "revision": revision});
         let _ = applied.and_then(|()| write_source_marker(&record, &body.to_string()));
     }
 }
@@ -12614,12 +12606,12 @@ pub(crate) fn disable_sources_dropped_from_grant(
         .try_for_each(|source| disable_snapshot_source(support_dir, source))
 }
 
-/// One attempt per re-enabled source, under the cycle lock. The kept index,
-/// Tail rows and backfill progress make its next pass a warm Tail. Its upload
-/// witnesses go first and are synced, so what the server erased at source-off
-/// is sent again at each loop's own cadence; then the marker goes. A failure
-/// keeps the source paused for the next cycle. Errors can name paths, so only
-/// counts are logged.
+/// One attempt per re-enabled source, under the cycle lock. Only the marker
+/// goes: the kept index, Tail rows, backfill progress and upload witnesses
+/// make its next pass a warm Tail that re-sends nothing already sent (the
+/// server keeps data while a source is off). A failure keeps the source
+/// paused for the next cycle. Errors can name paths, so only counts are
+/// logged.
 pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
@@ -12627,45 +12619,15 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
             continue;
         }
         let marker = source_marker_path(support_dir, source);
-        let resumed = drop_upload_witnesses(support_dir, source).and_then(|()| {
-            std::fs::remove_file(&marker)?;
-            sync_progress_parent(&marker)
-        });
+        let resumed = std::fs::remove_file(&marker)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| sync_progress_parent(&marker));
         let failures = turn.entry(marker).or_default();
         *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
-}
-
-/// Every per-destination upload witness of `source`, each folder synced: its
-/// composition scope ACKs, its MCP inventory upload time (identity and version
-/// seed stay) and its footprint witnesses. No collected state is touched.
-fn drop_upload_witnesses(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    crate::context_composition::drop_upload_acks(support_dir, source)?;
-    crate::mcp_inventory::invalidate_upload_witness(support_dir, source)?;
-    let footprint = crate::snapshots::durable_sources::DurableSource::from_snapshot(source)
-        .map_or(&[][..], |row| row.properties().footprint_witnesses);
-    for dir in footprint {
-        let dir = support_dir.join(dir);
-        let entries = match std::fs::read_dir(&dir) {
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            entries => entries?,
-        };
-        // Opt-out markers beside them have no extension.
-        for entry in entries {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                std::fs::remove_file(&path)?;
-            }
-        }
-        crate::context_composition::sync_dir(&dir)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {

@@ -1975,21 +1975,6 @@ fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
     write_json_atomic(path, &entry);
 }
 
-/// A resumed source: its next enabled pass re-sends the inventory the server
-/// erased at source-off. Only the upload time goes; the destination identity
-/// and the version seed stay. Synced, unlike the best-effort cache write.
-pub(crate) fn invalidate_upload_witness(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    let path = cache_path(support_dir, source);
-    let Some(mut entry) = read_cache(&path) else {
-        return Ok(());
-    };
-    entry.posted_at.clear();
-    let bytes = serde_json::to_vec(&entry).map_err(|error| anyhow!("encode cache: {error}"))?;
-    ottto_core::write_owner_only_file_atomic(&path, &bytes)?;
-    crate::context_composition::sync_dir(path.parent().unwrap_or(&path))?;
-    Ok(())
-}
-
 /// SHA-256 over the inventory's meaningful content. `machine_id` and
 /// `context_window_tokens` are constant per machine, so only `agent_source`,
 /// the harvested servers (with their loading decisions), the auto tool-search
@@ -3909,45 +3894,6 @@ done
         let (_, deferred) = harvest_server(&server, &env);
         assert!(!deferred);
         assert_eq!(fake.spawns(), vec!["|mcp serve".to_string()]);
-    }
-
-    /// [behaviour] A resume invalidates only the upload time: the next pass
-    /// re-sends, and the destination identity and version seed stay.
-    #[test]
-    fn resume_invalidates_the_posted_time_and_keeps_the_seed() {
-        let support = crate::test_scratch::canonical_private_dir("mcp-resume-witness");
-        let source = SnapshotSource::Codex;
-        let path = cache_path(&support, source);
-        invalidate_upload_witness(&support, source).expect("no cache: nothing to drop");
-        assert!(!path.exists());
-        let now = OffsetDateTime::now_utc();
-        write_cache(
-            &path,
-            &InventoryCacheEntry {
-                seed: Some(VersionSeed {
-                    cli_version: Some("0.128.0".to_string()),
-                    started_at: "2026-11-01T00:00:00Z".to_string(),
-                }),
-                identity: "dest".to_string(),
-                inventory_sha256: "hash".to_string(),
-                posted_at: now.format(&Rfc3339).expect("format"),
-            },
-        );
-        let before = read_cache(&path).expect("cache");
-        assert!(before.seed.is_some(), "positive control: a valid seed");
-        assert!(!cache_is_stale(&before, now));
-        invalidate_upload_witness(&support, source).expect("invalidate");
-        let after = read_cache(&path).expect("cache stays");
-        assert!(cache_is_stale(&after, now), "the next pass re-sends");
-        assert!(!keep_last_inventory(1, Some(&after), "dest", now));
-        assert_eq!(after.identity, "dest");
-        assert_eq!(after.inventory_sha256, "hash");
-        let seed = after
-            .seed
-            .and_then(|seed| seed.sample())
-            .expect("seed kept");
-        assert_eq!(seed.version(), Some("0.128.0"));
-        let _ = std::fs::remove_dir_all(support);
     }
 
     #[test]
