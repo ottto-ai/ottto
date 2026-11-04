@@ -1585,9 +1585,187 @@ pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bo
         trace_evidence_path(support_dir, session_id),
     ]
     .iter()
-    .all(|path| {
-        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    .all(|path| matches!(telemetry_member(path), Ok(None)))
+}
+
+/// One telemetry pair (API + trace member) as read for retention. Each member
+/// is optional: `None` is a confirmed NotFound.
+pub(crate) struct TelemetryPair {
+    /// Every API and trace request id.
+    pub(crate) request_ids: BTreeSet<String>,
+    /// Earliest `observed_at` (unix seconds); `u64::MAX` for no rows.
+    pub(crate) first_observed: u64,
+    /// Latest mtime or ctime of a present member (unix seconds).
+    pub(crate) last_write: i64,
+    pub(crate) bytes: u64,
+    generations: [Option<ApiFileGeneration>; 2],
+}
+
+/// Every stem (`sha256(session id)`) in either telemetry directory. A missing
+/// directory has none.
+pub(crate) fn telemetry_stems(support_dir: &Path) -> std::io::Result<BTreeSet<String>> {
+    let mut stems = BTreeSet::new();
+    for dir in [STORE_DIR, TRACE_STORE_DIR] {
+        let entries = match fs::read_dir(support_dir.join(dir)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            entries => entries?,
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".jsonl")) {
+                stems.insert(stem.to_owned());
+            }
+        }
+    }
+    Ok(stems)
+}
+
+/// The one digest naming a session's telemetry members.
+pub(crate) fn telemetry_stem(session_id: &str) -> String {
+    format!("{:x}", Sha256::digest(session_id.as_bytes()))
+}
+
+/// The one layout of a stem's (API, trace) members.
+fn telemetry_member_paths(support_dir: &Path, stem: &str) -> [PathBuf; 2] {
+    let name = format!("{stem}.jsonl");
+    [
+        support_dir.join(STORE_DIR).join(&name),
+        support_dir.join(TRACE_STORE_DIR).join(name),
+    ]
+}
+
+/// `Ok(None)`: confirmed NotFound. A symlink, non-file or any other error is
+/// a read fault.
+fn telemetry_member(path: &Path) -> std::result::Result<Option<ApiFileGeneration>, ()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            api_file_generation(&metadata).map(Some).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// Read one pair with the existing decoders. `Err`: a read fault (symlink,
+/// unreadable, malformed row, session mismatch, or a member that changed while
+/// read); only this pair is held.
+pub(crate) fn read_telemetry_pair(
+    support_dir: &Path,
+    stem: &str,
+) -> std::result::Result<TelemetryPair, ()> {
+    let paths = telemetry_member_paths(support_dir, stem);
+    let generations = [telemetry_member(&paths[0])?, telemetry_member(&paths[1])?];
+    // The session id from the first row of a present member; it must hash to
+    // the stem.
+    let present = paths
+        .iter()
+        .zip(&generations)
+        .find_map(|(path, generation)| generation.as_ref().map(|_| path))
+        .ok_or(())?;
+    let mut first = String::new();
+    BufReader::new(open_strict(present).map_err(|_| ())?)
+        .read_line(&mut first)
+        .map_err(|_| ())?;
+    let session_id = serde_json::from_str::<Value>(&first)
+        .ok()
+        .and_then(|row| row.get("session_id")?.as_str().map(str::to_owned))
+        .filter(|id| telemetry_stem(id) == stem)
+        .ok_or(())?;
+    let mut request_ids = BTreeSet::new();
+    let mut observed = Vec::new();
+    if generations[0].is_some() {
+        let (rows, witness) = decode_api_sidecar(support_dir, &session_id).map_err(|_| ())?;
+        if !witness.health.is_complete() {
+            return Err(());
+        }
+        for row in rows {
+            request_ids.insert(row.request_id);
+            observed.push(row.observed_at);
+        }
+    }
+    if generations[1].is_some() {
+        let mut report = load_claude_trace_ownership_evidence(support_dir, [session_id.clone()]);
+        if !report.is_complete() {
+            return Err(());
+        }
+        for row in report.evidence.remove(&session_id).unwrap_or_default() {
+            request_ids.insert(row.request_id);
+            observed.push(row.observed_at);
+        }
+    }
+    request_ids.remove("");
+    let mut first_observed = u64::MAX;
+    for at in observed {
+        let at = OffsetDateTime::parse(&at, &Rfc3339).map_err(|_| ())?;
+        first_observed = first_observed.min(u64::try_from(at.unix_timestamp()).map_err(|_| ())?);
+    }
+    let present = generations.iter().flatten();
+    Ok(TelemetryPair {
+        request_ids,
+        first_observed,
+        last_write: present
+            .clone()
+            .map(|generation| generation.modified.0.max(generation.changed.0))
+            .max()
+            .unwrap_or(i64::MAX),
+        bytes: present.map(|generation| generation.bytes).sum(),
+        generations,
     })
+}
+
+/// Unlink a pair's present members under the relay's append lock, only while
+/// each member is still the one that was read (same generation, or still
+/// NotFound). `Ok(false)`: it changed and is kept. A pair left half-unlinked
+/// by a crash is a candidate again with one optional member.
+pub(crate) fn unlink_telemetry_pair(
+    support_dir: &Path,
+    stem: &str,
+    pair: &TelemetryPair,
+) -> std::io::Result<bool> {
+    let _guard = append_lock()
+        .lock()
+        .map_err(|_| std::io::Error::other("Claude local OTEL store lock poisoned"))?;
+    let paths = telemetry_member_paths(support_dir, stem);
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if telemetry_member(path).map_err(|_| std::io::Error::other("member unreadable"))?
+            != *generation
+        {
+            return Ok(false);
+        }
+    }
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if generation.is_some() {
+            #[cfg(test)]
+            if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+                return Err(std::io::Error::other("injected unlink failure"));
+            }
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Make a run's unlinks durable: one sync per telemetry directory.
+pub(crate) fn sync_telemetry_dirs(support_dir: &Path) -> std::io::Result<()> {
+    for dir in [STORE_DIR, TRACE_STORE_DIR] {
+        match crate::context_composition::sync_dir(&support_dir.join(dir)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            synced => synced?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_TELEMETRY_UNLINK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: the `n`th member unlink from now on this thread fails, as a
+/// crash between the two unlinks of a pair would leave it.
+#[cfg(test)]
+pub(crate) fn fail_telemetry_unlink_for_test(n: u32) {
+    FAIL_TELEMETRY_UNLINK.with(|slot| slot.set(n));
 }
 
 /// Counter label for a root whose sidecars do not pair: how many members are
@@ -1977,17 +2155,13 @@ fn append_evidence_bytes(writer: &mut impl Write, encoded: &[u8]) -> Result<()> 
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [api, _] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    api
 }
 
 fn trace_evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(TRACE_STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [_, trace] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    trace
 }
 
 fn append_lock() -> &'static Mutex<()> {

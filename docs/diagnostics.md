@@ -177,6 +177,14 @@ Claude page counters `claude_sidecar_reparse_files` and
 `claude_sidecar_reparse_bytes` report side-file read attempts and actual input
 bytes since the previous Claude page. Repeated reads count again; absent keys
 mean zero. Nonzero values remain exact, with no separate diagnostic record.
+On the same line, `claude_telemetry_retired_roots` and
+`claude_telemetry_retired_bytes` count Claude telemetry pairs deleted because
+every transcript of their session is gone, `claude_telemetry_held_roots` the
+candidate pairs kept (a live reader, a copy of their requests, a listed
+transcript with no loss-free census read, a write after the walk began, or a
+change while deleting),
+and `claude_telemetry_read_fault` the pairs kept because a member could not be
+read cleanly or unlinked.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its

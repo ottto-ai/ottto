@@ -487,7 +487,7 @@ pub(crate) struct ClaudeFamilyHolders {
 }
 
 /// The sorted unique `candidates` a transcript record holds.
-fn held_candidates<'a>(
+pub(super) fn held_candidates<'a>(
     record: &'a ClaudeRequestCensusRecord,
     candidates: &'a [u64],
 ) -> impl Iterator<Item = u64> + 'a {
@@ -598,7 +598,7 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(FAMILY_WALK) {
             return None;
         }
-        Self::walk_transcript_holders(self.records(), deadline, |_, member, record| {
+        Self::walk_transcript_holders(self.records(), Some(deadline), |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
                 return;
             };
@@ -647,7 +647,7 @@ impl ClaudeRequestCensus {
                 !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR) && !record.is_birth_stub()
             });
         let mut hits = Vec::new();
-        Self::walk_transcript_holders(children, deadline, |key, member, record| {
+        Self::walk_transcript_holders(children, Some(deadline), |key, member, record| {
             if member.subagent_stem.is_some() {
                 return;
             }
@@ -660,10 +660,10 @@ impl ClaudeRequestCensus {
     }
 
     /// One walk of `records` (a borrowed path parse per key).
-    /// None when `deadline` passes (checked every 256 records).
-    fn walk_transcript_holders<'a>(
+    /// None when a `deadline` passes (checked every 256 records).
+    pub(super) fn walk_transcript_holders<'a>(
         records: impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)>,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut visit: impl FnMut(
             &'a str,
             super::ClaudeIndexPathMemberRef<'a>,
@@ -671,7 +671,7 @@ impl ClaudeRequestCensus {
         ),
     ) -> Option<()> {
         for (position, (key, record)) in records.enumerate() {
-            if position % 256 == 255 && std::time::Instant::now() >= deadline {
+            if position % 256 == 255 && deadline.is_some_and(|at| std::time::Instant::now() >= at) {
                 return None;
             }
             if let Some(member) = super::claude_index_path_member_ref(Path::new(key)) {

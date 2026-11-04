@@ -474,17 +474,48 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
 /// Sidecar read attempts and actual input bytes since the last Claude page.
 /// Repeated reads count again; missing/refused files add nothing. No identities.
 /// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
+/// Retention: pairs deleted (and their bytes), pairs kept by a protection,
+/// copy or write fence, and pairs kept by a read or unlink fault.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
     #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_files: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_read_fault: u64,
 }
-process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]);
+process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]);
 pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0]);
+}
+/// One Claude telemetry retention run.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct ClaudeTelemetryRetention {
+    pub(crate) retired_roots: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) held_roots: u64,
+    pub(crate) read_fault: u64,
+}
+pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
+    add_claude_sidecar_counts([
+        0,
+        0,
+        run.retired_roots,
+        run.retired_bytes,
+        run.held_roots,
+        run.read_fault,
+    ]);
+}
+fn add_claude_sidecar_counts(deltas: [u64; 6]) {
     with_claude_sidecar_reparse(|counts| {
-        for (counter, delta) in counts.iter().zip([files, bytes]) {
+        for (counter, delta) in counts.iter().zip(deltas) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
         }
     });
@@ -493,6 +524,10 @@ fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
     with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
         claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
         claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+        claude_telemetry_retired_roots: counts[2].swap(0, Relaxed),
+        claude_telemetry_retired_bytes: counts[3].swap(0, Relaxed),
+        claude_telemetry_held_roots: counts[4].swap(0, Relaxed),
+        claude_telemetry_read_fault: counts[5].swap(0, Relaxed),
     })
 }
 
@@ -2463,6 +2498,7 @@ mod tests {
         let maximum = serde_json::to_value(ClaudeSidecarReparse {
             claude_sidecar_reparse_files: u64::MAX,
             claude_sidecar_reparse_bytes: u64::MAX,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
