@@ -477,12 +477,18 @@ def require_base_harness(base):
         raise RuntimeError("base compat: base predates the in-tree money_equivalence_tests harness")
 
 
-def native_coverage(arm, stdout):
-    """The arm's expected native fixtures; fail closed on any missing or extra line."""
-    verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", stdout, re.M)
+def require_disjoint_head_only():
+    """A head-only name is never an existing fixture: a renamed or moved one stays red."""
     head_only = set(HEAD_ONLY_FIXTURES)
     if head_only & NATIVE_FIXTURES or len(head_only) != len(HEAD_ONLY_FIXTURES):
         raise RuntimeError(f"head-only fixtures repeat or overlap native ones: {HEAD_ONLY_FIXTURES}")
+    return head_only
+
+
+def native_coverage(arm, stdout):
+    """The arm's expected native fixtures; fail closed on any missing or extra line."""
+    verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", stdout, re.M)
+    head_only = require_disjoint_head_only()
     # The head must emit every head-only fixture; the base may omit them.
     expected = NATIVE_FIXTURES | (head_only & set(verified) if arm == "base" else head_only)
     if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in stdout:
@@ -501,16 +507,15 @@ def native_coverage(arm, stdout):
 
 
 def receipt_names(left, right, expected):
-    """(compared, uncompared) receipt names. Only a head-only fixture the base
-    does not emit is uncompared; any other missing or extra receipt fails."""
+    """(compared, uncompared) receipt names: base must be a subset of head, and
+    only a head-only fixture the base does not emit is uncompared."""
     def listed(directory):
-        return sorted(p.name for p in directory.glob("*.json") if not p.name.endswith(".cross-build.json"))
-    names, head = listed(left), listed(right)
-    uncompared = sorted(set(head) - set(names))
-    if (len(head) != len(expected) or not set(names) <= set(head)
-            or not set(uncompared) <= {f"{name}.json" for name in HEAD_ONLY_FIXTURES}):
+        return {p.name for p in directory.glob("*.json") if not p.name.endswith(".cross-build.json")}
+    base, head = listed(left), listed(right)
+    if (len(head) != len(expected) or not base <= head
+            or not head - base <= {f"{name}.json" for name in HEAD_ONLY_FIXTURES}):
         raise RuntimeError("missing or extra fixture receipts")
-    return names, uncompared
+    return sorted(base & head), sorted(head - base)
 
 
 def require_saved_digests(directory, name):
@@ -522,9 +527,31 @@ def require_saved_digests(directory, name):
             raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
 
 
+def uncompared_receipts(right, uncompared, signed_lists):
+    """({name: head receipt digests}, failures) for head-only fixtures absent on
+    base. Nothing is compared, so a non-empty signed diff can never match."""
+    records, failures = {}, []
+    for name in uncompared:
+        require_saved_digests(right, name)
+        cross_name = Path(name).with_suffix(".cross-build.json")
+        records[name] = {"head_sha256": (right / Path(name).with_suffix(".sha256")).read_text(),
+                         "head_cross_build_sha256": (right / cross_name.with_suffix(".sha256")).read_text()}
+        print(f"MONEY_EQUIVALENCE_UNCOMPARED {name} absent on base; head VERIFIED "
+              f"sha256={records[name]['head_sha256']} "
+              f"cross_build_sha256={records[name]['head_cross_build_sha256']}", flush=True)
+        signed = None if signed_lists is None else signed_lists[name]
+        if signed:
+            missing, extra = signed_mismatch([], signed)
+            print(f"MONEY_EQUIVALENCE_SIGNED {name} MISMATCH missing={json.dumps(missing)} "
+                  f"extra={json.dumps(extra)}", flush=True)
+            failures.append(name)
+    return records, failures
+
+
 def verified_summary(names, uncompared, base_sha, head_sha, seconds):
-    head_only = (f"UNCOMPARED head-only (absent on base): {', '.join(uncompared)}. "
-                 if uncompared else "")
+    # PR line: money_eq <id> empty on <n> compared | <k> new fixtures uncompared.
+    head_only = (f"{len(names)} compared | {len(uncompared)} new fixtures uncompared "
+                 f"(absent on base): {', '.join(uncompared)}. " if uncompared else "")
     return (f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
             f"base `{base_sha}`, head `{head_sha}`. {head_only}"
             f"{seconds:.1f}s. Family vector/Pi remain ignored.\n")
@@ -563,6 +590,7 @@ def main():
         # base changes are not this branch's.
         base_sha = output(["git", "merge-base", base_sha, "HEAD"])
     head_sha = output(["git", "rev-parse", "HEAD"])
+    require_disjoint_head_only()
     # Declarations come from the public PR body, so the receipt records them.
     pr_number, declarations = pr_declarations(prs, explicit)
     declared_text, declared_sha = canonical_declarations(declarations)
@@ -623,18 +651,8 @@ def main():
             expected[arm] = native_coverage(arm, result.stdout)
         left, right = receipts / "base", receipts / "head"
         names, uncompared = receipt_names(left, right, expected["head"])
-        failures = []
         signed_lists = signed_money_lists(declarations, names + uncompared)
-        for name in uncompared:
-            require_saved_digests(right, name)
-            print(f"MONEY_EQUIVALENCE_UNCOMPARED {name} head-only: the base does not emit it", flush=True)
-            signed = None if signed_lists is None else signed_lists[name]
-            if signed:
-                # Nothing is compared, so no signed path can be observed.
-                missing, extra = signed_mismatch([], signed)
-                print(f"MONEY_EQUIVALENCE_SIGNED {name} MISMATCH missing={json.dumps(missing)} "
-                      f"extra={json.dumps(extra)}", flush=True)
-                failures.append(name)
+        uncompared_records, failures = uncompared_receipts(right, uncompared, signed_lists)
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
             if (left / inputs).read_bytes() != (right / inputs).read_bytes():
@@ -664,7 +682,8 @@ def main():
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
-            manifest["uncompared_head_only"] = uncompared
+            manifest["uncompared_head_only"] = uncompared_records
+        print(f"MONEY_EQUIVALENCE_COUNTS compared={len(names)} uncompared={len(uncompared)}", flush=True)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
