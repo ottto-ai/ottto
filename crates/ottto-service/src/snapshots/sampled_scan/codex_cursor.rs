@@ -2555,13 +2555,7 @@ pub(in crate::snapshots) fn finish_job(
     // (`apply_eof_record`). Such a job gets no S12 grant below.
     let eof_applied = meta.eof_applied;
     let parser = &mut job.parser;
-    let lossy = parser.reader.lossy_prefix()
-        || parser.reader.failure.is_some()
-        || !sampled_jsonl::loss_free_source_report(
-            &parser.reader.report,
-            parser.recognized_usage_drop_count,
-            parser.accumulator.dropped_usage_record_count,
-        );
+    let lossy = parser.reader.failure.is_some();
     let consumed = parser.reader.consumed_bytes();
     let now = super::now_seconds();
     // A group's receipts and replay are bound to its start scope.
@@ -2804,27 +2798,15 @@ fn eof_record_due(job: &OwnedActiveFile) -> bool {
             == Some(&meta.stamp_open)
 }
 
-/// The EOF apply for a group job's live member: `eof_record_due`, the member
-/// still exactly its `boot` object (so strict finish identity holds against
-/// its boot identity), and a record main's trailing-line rule applies
-/// without loss (`apply_physical_line`: within the line cap, UTF-8, blank
-/// or one JSON value). A group refuses any line loss, so a
-/// malformed final record stays withheld, as before.
+/// The EOF apply for a group job's live member: unchanged EOF and exactly
+/// its boot object. The common reader's `apply_sealed_fragment` admits only
+/// valid JSON or a blank suffix; invalid bytes remain withheld and uncounted.
 pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &OpenStamp) -> bool {
-    let reader = &job.parser.reader;
-    let mut bytes = reader.buf.as_slice();
-    if bytes.last() == Some(&b'\r') {
-        bytes = &bytes[..bytes.len() - 1];
-    }
     eof_record_due(job)
         && job
             .cursor
             .as_ref()
             .is_some_and(|meta| &meta.stamp_open == boot)
-        && reader.sealed_fragment.is_some()
-        && std::str::from_utf8(bytes).is_ok_and(|line| {
-            line.trim().is_empty() || serde_json::from_str::<serde_json::Value>(line).is_ok()
-        })
 }
 
 /// The withheld record was applied: the job gets no S12 grant.
@@ -4923,16 +4905,11 @@ crate::heap_layout_bound::fields!(Disclosure; reason, cause, ownership_incomplet
 
 /// PR-1: the line and drop totals a fresh held parse adds to the census,
 /// replayed on a hit. All inline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct HeldCounts {
-    pub(in crate::snapshots) over_line_cap: usize,
-    pub(in crate::snapshots) recognized_usage_drop: usize,
-    pub(in crate::snapshots) dropped_usage_record: u64,
-    /// `ParsedJsonlFile::terminal_line_loss_count`.
-    pub(in crate::snapshots) terminal_line_loss: usize,
+    pub(in crate::snapshots) loss: Option<TerminalJsonlLoss>,
 }
-crate::heap_layout_bound::fields!(HeldCounts; over_line_cap, recognized_usage_drop,
-    dropped_usage_record, terminal_line_loss);
+crate::heap_layout_bound::fields!(HeldCounts; loss);
 
 /// Strict debt of a job that ended without a publishable result
 /// (`JoinStateBound`, `MemberChanged`, `ProbeBudgetOrder`): the prior body is
@@ -5295,28 +5272,8 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
             .add(disclosure.cause, disclosure.ownership_incomplete_file_count);
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
-        // PR-1: the fresh finish's line and drop totals.
-        let held = &disclosure.held;
-        targets.census.over_line_cap_count += held.over_line_cap;
-        targets.census.recognized_usage_drop_count += held.recognized_usage_drop;
-        targets.census.dropped_usage_record_count = targets
-            .census
-            .dropped_usage_record_count
-            .saturating_add(held.dropped_usage_record);
-        if held.terminal_line_loss > 0 {
-            let loss = held.terminal_line_loss;
-            targets.census.terminal_over_line_cap_count = targets
-                .census
-                .terminal_over_line_cap_count
-                .saturating_add(loss);
-            targets.census.terminal_recognized_usage_drop_count = targets
-                .census
-                .terminal_recognized_usage_drop_count
-                .saturating_add(loss);
-            targets.census.terminal_dropped_usage_record_count = targets
-                .census
-                .terminal_dropped_usage_record_count
-                .saturating_add(loss as u64);
+        if let Some(loss) = &disclosure.held.loss {
+            targets.census.add_terminal_jsonl_loss(loss);
         }
     } else {
         targets

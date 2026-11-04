@@ -1767,7 +1767,8 @@ fn pi_time_and_invalid_evidence() {
         u64::MAX - 9,
         "2026-10-27T06:01:00Z",
     );
-    let scan = pi_splits("pi_usage_overflow", &pi_seed(), vec![huge], 0);
+    let scan = pi_splits("pi_usage_overflow", &pi_seed(), vec![huge], 1);
+    assert_eq!(scan.snapshots[0].input_tokens, 10);
     assert_eq!(scan.dropped_usage_record_count, 1);
 }
 
@@ -2173,9 +2174,8 @@ fn codex_admission_branches_preserve_emitted_totals() {
             .collect::<String>();
         let path = c.root.join("rollout.jsonl");
         if name == "dropped-staging" {
-            // The existing policy quarantines the whole entity, including its valid
-            // sibling usage. Exercise that policy after a genuine disk restore
-            // and Tail, as well as from RAM and a cold byte-zero read.
+            // Invalid records are isolated after a genuine disk restore and
+            // Tail, as well as from RAM and a cold byte-zero read.
             let source = SnapshotSource::Codex;
             let _cutover = crate::snapshots::TestCutover::set(0);
             let mut disk = Disk::with_route(&c, source);
@@ -2206,28 +2206,15 @@ fn codex_admission_branches_preserve_emitted_totals() {
             assert_eq!(arms[1].2, (1, 0, 0));
             // The restarted owner continues from the same committed Codex head.
             assert_eq!(arms[2].2, (0, 1, 0));
-            for (index, scan, _) in &arms {
+            for (_, scan, _) in &arms {
                 assert_eq!(scan.dropped_usage_record_count, 1);
                 assert_eq!(scan.recognized_usage_drop_count, 1);
-                assert!(
-                    scan.snapshots.is_empty(),
-                    "quarantine emits neither money nor a $0 body"
+                assert_eq!(scan.snapshots.len(), 1);
+                assert_eq!(
+                    scan.snapshots[0].input_tokens, 2,
+                    "seed plus the valid staging sibling, never the invalid record"
                 );
-                let key = prior.files.keys().next().unwrap();
-                assert!(
-                    index
-                        .files
-                        .get(key)
-                        .map_or(true, |entry| entry.source_file_fingerprint.is_empty()
-                            || entry.size_bytes < std::fs::metadata(&path).unwrap().len()),
-                    "the lossy extent never settles"
-                );
-                // An ordinary next generation still discovers the held file
-                // and counts its dropped usage; no manual re-arm is needed.
-                let (_, retry, _) =
-                    other_page(&c, &E2ScanFixture::default(), source, index.clone());
-                assert!(retry.snapshots.is_empty());
-                assert_eq!(retry.dropped_usage_record_count, 1);
+                assert!(!other_wire(source, scan).is_empty());
             }
             let emitted = |scan: &SourceScanResult| serde_json::to_vec(&scan.snapshots).unwrap();
             assert_eq!(emitted(&arms[0].1), emitted(&arms[1].1));
@@ -2301,11 +2288,14 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         );
         progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
+        // Reuse these outcomes with a B2 loss-bearing successor.
+        append(&path, "{broken\n");
         grow(&path, "next", 20);
         let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
         successor.enrich(&c);
         successor.finish();
         let fulls = successor.modes.0;
+        assert_eq!(successor.scan.malformed_json_line_count, 1);
         if let Some(disposition) = disposition {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
                 let mut response = ack(batch)?;
@@ -2353,6 +2343,11 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         cold.finish();
         assert!(fulls + actual.modes.0 <= 1);
         assert!(!actual.scan.snapshots.is_empty());
+        assert_eq!(actual.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&actual.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold.index).unwrap()["terminal_jsonl_dispositions"]
+        );
         let (a, actual_wire, _) = upload(&actual.scan.snapshots, &mut e2_progress(), ack);
         let (b, cold_wire, _) = upload(&cold.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(a.unwrap(), ResumableUploadResult::Completed);

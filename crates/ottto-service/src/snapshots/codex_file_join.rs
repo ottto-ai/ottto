@@ -2213,7 +2213,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert!(parsed.complete());
+        assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].input_tokens, 300);
         assert_eq!(parsed.report.parsed_json_line_count, 6);
@@ -2584,7 +2584,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert!(parsed.complete());
+        assert!(parsed.progress_complete());
         let item = &parsed.snapshots[0];
         assert_eq!(item.input_tokens, 500);
         let priority = item
@@ -2640,7 +2640,7 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn incomplete_native_replay_cannot_publish_a_partial_joined_replacement() {
+    fn bad_native_record_preserves_the_complete_joined_replacement() {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
@@ -2657,15 +2657,56 @@ pub(super) mod tests {
         let path = root.join("sessions/b.jsonl");
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str(&(serde_json::to_string(&bad).unwrap() + "\n"));
+        // A valid new occurrence makes this a new body, rather than an
+        // unchanged accepted300 body that policy correctly suppresses.
+        for row in member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-c", 100, 400)
+            .into_iter()
+            .skip(1)
+        {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
         fs::write(&path, text).unwrap();
-        let (after, held) = scan(&root, previous.clone(), 2);
-        assert!(held.snapshots.is_empty());
-        assert!(!held.census_complete);
-        assert_eq!(held.ownership_incomplete_file_count, 2);
+        let (mut after, mut current) = scan(&root, previous.clone(), 2);
+        let (mut cold_index, mut cold) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(current.snapshots.len(), 2, "one alias per physical member");
+        assert!(current.snapshots.iter().all(|s| s.input_tokens == 400));
+        assert_eq!(current.recognized_usage_drop_count, 1);
+        assert_eq!(current.ownership_incomplete_file_count, 0);
+        current
+            .codex_joining_validator()
+            .unwrap()
+            .validate(&current.snapshots)
+            .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut current, &mut after);
+        current.finish_codex_capture_boundary(&mut after);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut cold, &mut cold_index);
+        cold.finish_codex_capture_boundary(&mut cold_index);
         assert_eq!(
-            serde_json::to_value(&after.files).unwrap(),
-            serde_json::to_value(&previous.files).unwrap()
+            serde_json::to_value(&current.snapshots).unwrap(),
+            serde_json::to_value(&cold.snapshots).unwrap()
         );
+        let accepted = current
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(accepted.len(), 1, "one body identity across both aliases");
+        assert_eq!(
+            serde_json::to_value(
+                &after
+                    .committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new())
+                    .files
+            )
+            .unwrap(),
+            serde_json::to_value(&previous.files).unwrap(),
+            "no ACK cannot settle either alias"
+        );
+        let mut settled = after.committable_subset(&previous, &accepted, &BTreeMap::new());
+        let state = root.join("index.json");
+        settled.save(&state).unwrap();
+        let (_, quiet) = scan(&root, ScanIndex::load(&state).unwrap(), 2);
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!(quiet.semantic_noop_count, 2);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -3918,7 +3959,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-            assert!(parsed.complete());
+            assert!(parsed.progress_complete());
             let fingerprints = parsed
                 .snapshots
                 .iter()

@@ -90,6 +90,8 @@
   "file.terminal": [
     "loss",
     "loss.dropped_usage_record_count",
+    "loss.invalid_utf8_line_count",
+    "loss.malformed_json_line_count",
     "loss.over_line_cap_count",
     "loss.recognized_usage_drop_count",
     "parser_generation",

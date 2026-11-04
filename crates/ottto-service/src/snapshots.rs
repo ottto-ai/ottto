@@ -633,10 +633,8 @@ pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v30";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
-// A terminal oversized-line disposition is reusable only under the exact
-// bounded reader semantics that created it. Advancing the bound or teaching
-// the reader to salvage a new shape changes this witness, starts one fresh
-// traversal immediately, and re-opens each affected unchanged file once.
+// Legacy compatibility identity, retained byte-for-byte. The reader has no
+// active line limit; consumed record loss must never advance this generation.
 const JSONL_TERMINAL_DISPOSITION_GENERATION: &str =
     "bounded_jsonl_terminal:v1:max_line_bytes=16777216";
 const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
@@ -1535,14 +1533,9 @@ impl ScanTraversalCounts {
         true
     }
 
-    /// The residue this generation settled, if any. Over-line-cap loss carries
-    /// its own per-file terminal disposition and is excluded here; its dropped
-    /// record share equals `terminal_over_line_cap_count` by construction
-    /// (`ParsedJsonlFile::terminal_loss`, `ScanCensus::add_terminal_jsonl_loss`).
+    /// The residue this generation settled, including all terminal drops.
     fn settled_residue(&self) -> Option<SettledScanResidue> {
-        let dropped_usage_record_count = self
-            .terminal_dropped_usage_record_count
-            .saturating_sub(self.terminal_over_line_cap_count as u64);
+        let dropped_usage_record_count = self.terminal_dropped_usage_record_count;
         (self.terminal_ownership_incomplete_file_count > 0
             || self.terminal_zero_snapshot_usage_evidence_count > 0
             || dropped_usage_record_count > 0)
@@ -1558,7 +1551,10 @@ impl ScanTraversalCounts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct TerminalJsonlLoss {
-    over_line_cap_count: usize,
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    malformed_json_line_count: usize,
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    invalid_utf8_line_count: usize,
     recognized_usage_drop_count: usize,
     dropped_usage_record_count: u64,
 }
@@ -17425,7 +17421,7 @@ impl OwnedSourceScan {
                         completed.reduction = None;
                     }
                 }
-                let parse_complete = parsed_file.complete();
+                let parse_complete = parsed_file.progress_complete();
                 // Claude response conflicts may be discovered only by native
                 // finalization. A prefix cannot publish that late loss: it
                 // would have neither a committed audit marker nor necessarily
@@ -17458,9 +17454,7 @@ impl OwnedSourceScan {
                     FileReason::Complete
                 } else if parsed_file.ownership_incomplete_file_count > 0 {
                     FileReason::OwnershipIncomplete
-                } else if parsed_file.recognized_usage_drop_count
-                    > parsed_file.terminal_line_loss_count
-                {
+                } else if parsed_file.recognized_usage_drop_count > 0 {
                     FileReason::RecognizedUsageDropped
                 } else {
                     FileReason::ReadOrLineLoss
@@ -17484,11 +17478,8 @@ impl OwnedSourceScan {
                     .as_ref()
                     .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
                 {
-                    // PR-1: every settleable held singleton (usage-bearing and
-                    // terminal over-line-cap included; `non_progressing_residue`
-                    // already requires `complete_except_over_line_cap`).
-                    // Anything else, completion included, clears
-                    // a stale entry.
+                    // Memoize a non-progressing ownership-held singleton.
+                    // Anything else, completion included, clears a stale entry.
                     let held = !parse_complete
                         && non_progressing_residue
                         && ownership_incomplete_file_count > 0;
@@ -17513,11 +17504,7 @@ impl OwnedSourceScan {
                                         diagnostic_reason,
                                         parsed_snapshot_count: parsed_file.snapshots.len(),
                                         held: sampled_scan::codex_cursor::HeldCounts {
-                                            over_line_cap: report.over_line_cap_count,
-                                            recognized_usage_drop: recognized_usage_drop_count,
-                                            dropped_usage_record: dropped_usage_record_count,
-                                            terminal_line_loss: parsed_file
-                                                .terminal_line_loss_count,
+                                            loss: parsed_file.terminal_loss(),
                                         },
                                     },
                                 )
@@ -17564,7 +17551,11 @@ impl OwnedSourceScan {
                 }
                 // Debt-free after quiet retirement is scheduling state, not
                 // Full authority, including a later forced Unchanged read.
-                let source_verified = cursor_fragment.is_none()
+                let source_verified = sampled_jsonl::loss_free_source_report(
+                    &report,
+                    recognized_usage_drop_count,
+                    dropped_usage_record_count,
+                ) && (cursor_fragment.is_none()
                     && file_sampling.as_ref().is_some_and(|active| {
                         matches!(
                             active.mode,
@@ -17576,12 +17567,7 @@ impl OwnedSourceScan {
                         .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
                     || (file_sampling.is_none()
                         && state_census_complete
-                        && sidecar_census_complete
-                        && sampled_jsonl::loss_free_source_report(
-                            &report,
-                            recognized_usage_drop_count,
-                            dropped_usage_record_count,
-                        ));
+                        && sidecar_census_complete));
                 let mut parsed = parsed_file.snapshots;
                 if source == SnapshotSource::ClaudeCode {
                     // Record only; no decision reads it. A #588
@@ -17600,9 +17586,7 @@ impl OwnedSourceScan {
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
                                 complete: parse_complete,
-                                lossy: dropped_usage_record_count > 0
-                                    || recognized_usage_drop_count > 0
-                                    || report.over_line_cap_count > 0,
+                                lossy: terminal_loss.is_some(),
                                 source_verified,
                                 // Unchanged already checked physical identity and
                                 // acquisition scope against the prior checkpoint.
@@ -17898,11 +17882,7 @@ impl OwnedSourceScan {
                             })
                             && state_census_complete
                             && sidecar_census_complete
-                            && sampled_jsonl::loss_free_source_report(
-                                &report,
-                                recognized_usage_drop_count,
-                                dropped_usage_record_count,
-                            )
+                            && parse_complete
                         {
                             index.complete_native_recomposition(
                                 &index_key,
@@ -17944,11 +17924,7 @@ impl OwnedSourceScan {
                                 && cursor_fragment.is_none()
                                 && state_census_complete
                                 && sidecar_census_complete
-                                && sampled_jsonl::loss_free_source_report(
-                                    &report,
-                                    recognized_usage_drop_count,
-                                    dropped_usage_record_count,
-                                );
+                                && parse_complete;
                             // All source/census/Full-credit decisions above saw
                             // the owed debt. This clears only scheduling state.
                             if quiet_retired {
@@ -18049,36 +18025,19 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                census.malformed_json_line_count += report.malformed_json_line_count;
-                census.invalid_utf8_line_count += report.invalid_utf8_line_count;
-                census.over_line_cap_count += report.over_line_cap_count;
-                census.recognized_usage_drop_count += recognized_usage_drop_count;
+                if let Some(loss) = terminal_loss.as_ref() {
+                    census.add_terminal_jsonl_loss(loss);
+                }
                 census.ownership_incomplete_file_count += ownership_incomplete_file_count;
                 census
                     .causes
                     .add(parsed_file.cause, ownership_incomplete_file_count);
                 census.zero_snapshot_usage_evidence_count +=
                     usize::from(zero_snapshot_usage_evidence);
-                census.dropped_usage_record_count = census
-                    .dropped_usage_record_count
-                    .saturating_add(dropped_usage_record_count);
                 census.claude_compaction_unlinked_parent_count = census
                     .claude_compaction_unlinked_parent_count
                     .saturating_add(claude_compaction_unlinked_parent_count);
-                if let Some(loss) = terminal_loss {
-                    census.terminal_over_line_cap_count = census
-                        .terminal_over_line_cap_count
-                        .saturating_add(loss.over_line_cap_count);
-                    census.terminal_recognized_usage_drop_count = census
-                        .terminal_recognized_usage_drop_count
-                        .saturating_add(loss.recognized_usage_drop_count);
-                    census.terminal_dropped_usage_record_count = census
-                        .terminal_dropped_usage_record_count
-                        .saturating_add(loss.dropped_usage_record_count);
-                }
-                // Retryable parse loss still quarantines the whole derived entity.
-                // A bounded oversized line is different: its loss is terminal and
-                // disclosed, so independently parsed sibling records remain usable.
+                // Only classified holds suppress independently valid siblings.
                 if parse_complete {
                     snapshots.extend(parsed);
                 }
@@ -20644,39 +20603,32 @@ struct ParsedJsonlFile {
     /// `parentUuid` whose chain never reached a boundary (each counts as its
     /// own event). Counted before ownership filtering.
     claude_compaction_unlinked_parent_count: usize,
-    terminal_line_loss_count: usize,
     codex_parent_session_ref: Option<String>,
     /// Whether the parser observed a provider session id. Unstored.
     source_session_id_seen: bool,
 }
 
 impl ParsedJsonlFile {
-    fn complete(&self) -> bool {
-        self.report.complete_except_over_line_cap()
-            && self.report.over_line_cap_count == self.terminal_line_loss_count
-            && self.recognized_usage_drop_count == self.terminal_line_loss_count
-            && self.ownership_incomplete_file_count == 0
+    /// Complete physical records may be discarded. Only classified native
+    /// ownership/conflict holds prevent publication and committed progress.
+    fn progress_complete(&self) -> bool {
+        self.ownership_incomplete_file_count == 0
+            && !(self.snapshots.is_empty()
+                && (self.zero_snapshot_usage_evidence || self.terminal_loss().is_some()))
     }
 
-    /// Every line parsed, yet the file
-    /// cannot be checkpointed: its ownership boundary is unresolved with
-    /// nothing left to wait for, or it carries usage the parser could not turn
-    /// into an entity. Re-reading the same bytes under the same sidecar and
-    /// evidence reproduces this outcome exactly, so the loss is
-    /// disclosed by the census as terminal residue rather than retried. The
-    /// file itself stays retryable in the ordinary sense: it is never recorded
-    /// in the index, so the next generation parses it again and any change to
-    /// its bytes or sidecar evidence is picked up.
     fn non_progressing_residue(&self) -> bool {
-        !self.complete() && self.report.complete_except_over_line_cap()
+        !self.progress_complete()
     }
 
     fn terminal_loss(&self) -> Option<TerminalJsonlLoss> {
-        (self.terminal_line_loss_count > 0).then_some(TerminalJsonlLoss {
-            over_line_cap_count: self.terminal_line_loss_count,
-            recognized_usage_drop_count: self.terminal_line_loss_count,
-            dropped_usage_record_count: self.terminal_line_loss_count as u64,
-        })
+        let loss = TerminalJsonlLoss {
+            malformed_json_line_count: self.report.malformed_json_line_count,
+            invalid_utf8_line_count: self.report.invalid_utf8_line_count,
+            recognized_usage_drop_count: self.recognized_usage_drop_count,
+            dropped_usage_record_count: self.dropped_usage_record_count,
+        };
+        (loss != TerminalJsonlLoss::default()).then_some(loss)
     }
 }
 
@@ -20859,12 +20811,6 @@ impl OwnedJsonlParser {
             // sealed newline, so later growth must keep strict identity.
             || (!self.reader.sealed_fragment()
                 && self.reader.consumed_bytes() != self.reader.last_complete_line_end())
-            || self.reader.lossy_prefix()
-            || !sampled_jsonl::loss_free_source_report(
-                &self.reader.report,
-                self.recognized_usage_drop_count,
-                self.accumulator.dropped_usage_record_count,
-            )
         {
             return None;
         }
@@ -21141,12 +21087,14 @@ impl OwnedJsonlParser {
         }
         if source == SnapshotSource::Pi {
             accumulator.apply_first_prompt_fallback();
-            recognized_usage_drop_count += accumulator
+            let conflicts = accumulator
                 .seen_pi_usage_keys
                 .usage_keys()
                 .values()
                 .filter(|state| state.has_cross_shape_conflict())
                 .count();
+            ownership_incomplete_file_count = usize::from(conflicts > 0);
+            recognized_usage_drop_count += conflicts;
         }
         let accumulator_dropped_usage_record_count =
             accumulator.dropped_usage_record_count as usize;
@@ -21253,7 +21201,6 @@ impl OwnedJsonlParser {
             zero_snapshot_usage_evidence,
             dropped_usage_record_count: recognized_usage_drop_count as u64,
             claude_compaction_unlinked_parent_count,
-            terminal_line_loss_count: report.over_line_cap_count,
             codex_parent_session_ref,
             source_session_id_seen,
         })
@@ -21299,21 +21246,6 @@ impl<'a> PreFinalization<'a> {
     }
 }
 
-/// The native finish's own recount, after finalization: complete, no positive
-/// usage that yielded no entity, and loss-free. Only a completion that passes
-/// it may persist its PRE reduction.
-#[cfg(unix)]
-fn finish_loss_free(native: &Result<ParsedJsonlFile>) -> bool {
-    native.as_ref().is_ok_and(|parsed| {
-        parsed.complete()
-            && !parsed.zero_snapshot_usage_evidence
-            && sampled_jsonl::loss_free_source_report(
-                &parsed.report,
-                parsed.recognized_usage_drop_count,
-                parsed.dropped_usage_record_count,
-            )
-    })
-}
 /// `created()` of an opened file with its device and inode, or None when the
 /// file system cannot report it. Never a default (0, mtime or now).
 fn claude_opened_file_birth(
@@ -21673,12 +21605,6 @@ struct JsonlReadReport {
 
 impl JsonlReadReport {
     fn complete(self) -> bool {
-        self.malformed_json_line_count == 0
-            && self.invalid_utf8_line_count == 0
-            && self.over_line_cap_count == 0
-    }
-
-    fn complete_except_over_line_cap(self) -> bool {
         self.malformed_json_line_count == 0 && self.invalid_utf8_line_count == 0
     }
 }
@@ -21769,11 +21695,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         self.last_line_end
     }
 
-    /// Historical loss, or malformed or invalid input observed in this read.
-    fn lossy_prefix(&self) -> bool {
-        self.report.over_line_cap_count > 0 || !self.report.complete_except_over_line_cap()
-    }
-
     fn sealed_fragment(&self) -> bool {
         self.sealed_fragment.is_some()
     }
@@ -21782,10 +21703,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     /// withheld final record from the bytes already buffered, exactly as a
     /// read without an extent applies its trailing line. No byte is read.
     fn apply_sealed_fragment(&mut self, mut on_value: impl FnMut(&Value)) -> bool {
-        let Some(()) = self.sealed_fragment.take() else {
+        if self.sealed_fragment.is_none()
+            || !apply_physical_line(&self.buf, &mut self.report, None, &mut on_value, false)
+        {
             return false;
-        };
-        apply_physical_line(&self.buf, &mut self.report, None, &mut on_value);
+        }
+        self.sealed_fragment = None;
         release_line_buffer(&mut self.buf);
         true
     }
@@ -21905,7 +21828,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             return Ok(JsonlReaderStep::Complete(*report));
         }
 
-        apply_physical_line(
+        if !apply_physical_line(
             buf,
             report,
             // An unterminated trailing line reaches money only, never LD.
@@ -21920,7 +21843,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 )
             }),
             &mut on_value,
-        );
+            line_complete,
+        ) {
+            // A paused compatibility writer has the same pending suffix as
+            // an extent-bound read. Valid JSON/blank EOF keeps its semantics.
+            self.sealed_fragment = Some(());
+        }
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
     }
@@ -21933,25 +21861,30 @@ fn apply_physical_line(
     report: &mut JsonlReadReport,
     deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
-) {
+    terminal: bool,
+) -> bool {
     #[cfg(test)]
     codex_zst_refusal_tests::jsonl_parse_attempted();
+    let decoded = match jsonl_line_text(buf) {
+        JsonlLineText::Blank => Ok(None),
+        JsonlLineText::Text(line) => serde_json::from_str(line).map(Some).map_err(|_| false),
+        JsonlLineText::InvalidUtf8 => Err(true),
+    };
+    // Unchanged EOF proves no growth, not that a paused writer finished JSON.
+    if !terminal && decoded.is_err() {
+        return false;
+    }
     report.physical_line_count += 1;
     crate::local_resource_diagnostics::jsonl::line(buf.len());
-    let value = match jsonl_line_text(buf) {
-        JsonlLineText::Blank => None,
-        JsonlLineText::Text(line) => match serde_json::from_str::<Value>(line) {
-            Ok(value) => {
-                report.parsed_json_line_count += 1;
-                Some(value)
-            }
-            Err(_) => {
-                report.malformed_json_line_count += 1;
-                None
-            }
-        },
-        JsonlLineText::InvalidUtf8 => {
-            report.invalid_utf8_line_count += 1;
+    let value = match decoded {
+        Ok(Some(value)) => {
+            report.parsed_json_line_count += 1;
+            Some(value)
+        }
+        Ok(None) => None,
+        Err(utf8) => {
+            report.invalid_utf8_line_count += usize::from(utf8);
+            report.malformed_json_line_count += usize::from(!utf8);
             None
         }
     };
@@ -21962,6 +21895,7 @@ fn apply_physical_line(
     if let Some(value) = value {
         on_value(&value);
     }
+    true
 }
 
 fn read_bounded_jsonl_lines_impl(
@@ -25910,18 +25844,18 @@ impl ScanCensus {
     }
 
     fn add_terminal_jsonl_loss(&mut self, loss: &TerminalJsonlLoss) {
-        self.over_line_cap_count = self
-            .over_line_cap_count
-            .saturating_add(loss.over_line_cap_count);
+        self.malformed_json_line_count = self
+            .malformed_json_line_count
+            .saturating_add(loss.malformed_json_line_count);
+        self.invalid_utf8_line_count = self
+            .invalid_utf8_line_count
+            .saturating_add(loss.invalid_utf8_line_count);
         self.recognized_usage_drop_count = self
             .recognized_usage_drop_count
             .saturating_add(loss.recognized_usage_drop_count);
         self.dropped_usage_record_count = self
             .dropped_usage_record_count
             .saturating_add(loss.dropped_usage_record_count);
-        self.terminal_over_line_cap_count = self
-            .terminal_over_line_cap_count
-            .saturating_add(loss.over_line_cap_count);
         self.terminal_recognized_usage_drop_count = self
             .terminal_recognized_usage_drop_count
             .saturating_add(loss.recognized_usage_drop_count);
@@ -40510,14 +40444,7 @@ mod tests {
     fn unhealthy_generation_retries_with_backoff_while_hints_still_progress() {
         let root = temp_dir("bounded-unhealthy-retry");
         let malformed = root.join("a-malformed.jsonl");
-        fs::write(
-            &malformed,
-            concat!(
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
-                "not-json\n"
-            ),
-        )
-        .expect("write malformed fixture");
+        fs::write(&malformed, "not-json\n").expect("write malformed fixture");
         let mut index = ScanIndex::default();
         let first = scan_source_roots(
             SnapshotSource::Pi,
@@ -40734,8 +40661,7 @@ mod tests {
             "settling is idempotent within a generation"
         );
 
-        // Over-line-cap loss keeps its own per-file terminal disposition and
-        // is not re-counted as residue.
+        // Legacy cap fields no longer subtract from the terminal drop residue.
         let mut with_cap_loss = ScanTraversalCounts {
             over_line_cap_count: 11,
             terminal_over_line_cap_count: 11,
@@ -40754,7 +40680,7 @@ mod tests {
             Some(SettledScanResidue {
                 ownership_incomplete_file_count: 2,
                 zero_snapshot_usage_evidence_count: 1,
-                dropped_usage_record_count: 577,
+                dropped_usage_record_count: 588,
             })
         );
 
@@ -41500,17 +41426,29 @@ mod tests {
                 match case {
                     "invalid-utf8" => {
                         assert!(!scan.census_complete, "{case}");
-                        assert!(scan.snapshots.is_empty(), "{case}");
-                        assert!(index.files.is_empty(), "{case}");
+                        assert_eq!(scan.snapshots.len(), 1, "{case}");
+                        assert_eq!(
+                            (
+                                scan.snapshots[0].input_tokens,
+                                scan.snapshots[0].output_tokens
+                            ),
+                            (12, 4)
+                        );
+                        assert_eq!(index.files.len(), 1, "{case}");
                         assert_eq!(scan.invalid_utf8_line_count, 1);
                     }
                     "recognized-drop" => {
-                        // Non-progressing residue: the census completes with the
-                        // loss named while the file itself stays un-indexed and
-                        // retryable (`settle_non_progressing_residue`).
+                        // Discarded records do not withhold healthy siblings.
                         assert!(scan.census_complete, "{case}");
-                        assert!(scan.snapshots.is_empty(), "{case}");
-                        assert!(index.files.is_empty(), "{case}");
+                        assert_eq!(scan.snapshots.len(), 1, "{case}");
+                        assert_eq!(
+                            (
+                                scan.snapshots[0].input_tokens,
+                                scan.snapshots[0].output_tokens
+                            ),
+                            (12, 4)
+                        );
+                        assert_eq!(index.files.len(), 1, "{case}");
                         assert_eq!(scan.recognized_usage_drop_count, 1);
                     }
                     _ => unreachable!(),
@@ -41641,19 +41579,19 @@ mod tests {
         )
         .expect("lossy sibling is isolated");
         assert!(!scan.census_complete);
-        assert_eq!(scan.snapshots.len(), 1);
-        assert_eq!(index.files.len(), 1);
+        assert_eq!(scan.snapshots.len(), 2);
+        assert_eq!(index.files.len(), 2);
         assert_eq!(index.file_snapshot_fingerprints.len(), 0);
 
         finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
-        assert_eq!(scan.snapshots.len(), 1);
-        assert_eq!(index.files.len(), 1);
-        assert_eq!(index.file_snapshot_fingerprints.len(), 1);
-        assert_eq!(index.snapshot_activity_at.len(), 1);
-        assert!(index
-            .files
-            .keys()
-            .all(|path| path.ends_with("a-healthy.jsonl")));
+        assert_eq!(scan.snapshots.len(), 2);
+        assert_eq!(index.files.len(), 2);
+        assert_eq!(index.file_snapshot_fingerprints.len(), 2);
+        assert_eq!(index.snapshot_activity_at.len(), 2);
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| (item.input_tokens, item.output_tokens) == (12, 4)));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -42961,9 +42899,15 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("scan");
-        assert!(scan.snapshots.is_empty());
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].output_tokens
+            ),
+            (12, 4)
+        );
+        // The healthy sibling progresses; rejected records remain uncounted.
         assert!(scan.census_complete);
         assert_eq!(scan.dropped_usage_record_count, 3);
         assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
@@ -42977,9 +42921,8 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("settled mixed scan");
-        // The lossy file is never checkpointed, so a completed generation
-        // re-reads it and re-derives the same disclosed loss.
-        assert_eq!(mixed_settled.scanned_file_count, 1);
+        // Committed siblings stay quiet; the stored disposition discloses loss.
+        assert_eq!(mixed_settled.scanned_file_count, 0);
         assert_eq!(mixed_settled.dropped_usage_record_count, 3);
 
         fs::write(
@@ -43005,8 +42948,8 @@ mod tests {
             index
                 .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
                 .entity_count,
-            0,
-            "the incomplete file never advances the durable manifest"
+            1,
+            "the all-bad rewrite keeps the previously admitted sibling manifest"
         );
 
         let settled = scan_source_roots(
@@ -46818,6 +46761,10 @@ mod tests {
             ),
         )
         .expect("write fixture");
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
+            json!({"timestamp":"2026-08-02T10:00:03Z","sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "type":"assistant","requestId":"req_healthy","message":{"id":"msg_healthy",
+                "model":"claude-opus-4-8","usage":{"input_tokens":7,"output_tokens":3}}})).unwrap();
         let mut index =
             crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let scan = scan_source_roots_with_test_limit(
@@ -46829,9 +46776,17 @@ mod tests {
             10,
         )
         .expect("scan");
-        assert!(scan.snapshots.is_empty());
-        assert_eq!(scan.recognized_usage_drop_count, 2);
-        assert_eq!(scan.dropped_usage_record_count, 2);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].output_tokens
+            ),
+            (7, 3)
+        );
+        // One conflicting response is dropped, comprising two physical rows.
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
         assert!(!index
             .confirmed_empty_files
             .contains(&local_index_key(&path)));
@@ -46849,6 +46804,10 @@ mod tests {
             ),
         )
         .expect("write fixture");
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
+            json!({"timestamp":"2026-08-02T10:00:03Z","sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "type":"assistant","requestId":"req_healthy","message":{"id":"msg_healthy",
+                "model":"claude-opus-4-8","usage":{"input_tokens":7,"output_tokens":3}}})).unwrap();
         let mut index =
             crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let scan = scan_source_roots_with_test_limit(
@@ -46860,7 +46819,14 @@ mod tests {
             10,
         )
         .expect("scan");
-        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].output_tokens
+            ),
+            (7, 3)
+        );
         assert!(scan.recognized_usage_drop_count > 0);
         assert!(!index
             .confirmed_empty_files
@@ -48206,7 +48172,7 @@ mod tests {
         }
         fs::write(&path, format!("{prefix}{lost_request}\n{suffix}")).unwrap();
         let clean = parse_codex_test(&path);
-        assert!(clean.complete());
+        assert!(clean.progress_complete());
         let mut prior_item = clean.snapshots[0].clone();
         prepare_cache_observations(&mut prior_item, None);
         let prior = prior_item.cache_observations_state.unwrap();
@@ -48223,8 +48189,8 @@ mod tests {
             let parsed = parse_codex_test(&path);
             assert!(!parsed.report.complete());
             assert!(
-                !parsed.complete(),
-                "malformed input cannot certify complete source history"
+                parsed.progress_complete(),
+                "valid siblings progress without certifying complete source history"
             );
             let mut item = parsed.snapshots[0].clone();
             assert_eq!((item.input_tokens, item.output_tokens), (300_000, 3));
@@ -48597,8 +48563,21 @@ mod tests {
     fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
         let partial_key = index.files.keys().next().unwrap().clone();
-        let body = String::from_utf8(fs::read(&partial_key).unwrap()).unwrap();
-        fs::write(&partial_key, format!("{body}not valid json\n")).unwrap();
+        // Keep the native owner while replacing all usage with one invalid record.
+        let body = fs::read_to_string(&partial_key).unwrap();
+        let header = body.lines().next().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(header).unwrap()["type"],
+            "session_meta"
+        );
+        let invalid = json!({"type":"event_msg","ordinal":1,"timestamp":"2026-07-22T08:00:00Z",
+            "fixture_padding":"x".repeat(body.len()),"payload":{"type":"token_count","info":{"total_token_usage":{
+                "input_tokens":"invalid","output_tokens":"invalid"}}}});
+        fs::write(
+            &partial_key,
+            format!("{header}\n{invalid}\nnot valid json\n"),
+        )
+        .unwrap();
         index.activate_effective_upload_body_witness_revision(1);
         let previous = index.clone();
         let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
@@ -51927,15 +51906,18 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("overflow remains a bounded scanner outcome");
-        assert!(
-            scan.snapshots.is_empty(),
-            "an exact prefix from a lossy file cannot reach upload"
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].output_tokens
+            ),
+            (u64::MAX, 1)
         );
         assert_eq!(scan.dropped_usage_record_count, 1);
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
+        // The exact admitted prefix progresses; the overflowing record is uncounted.
         assert!(scan.census_complete);
-        assert!(!index.files.contains_key(&local_index_key(&path)));
+        assert!(index.files.contains_key(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53317,7 +53299,7 @@ mod tests {
                 parent_id,
                 &child,
             );
-            assert!(parsed.complete(), "{child_id}: {parsed:#?}");
+            assert!(parsed.progress_complete(), "{child_id}: {parsed:#?}");
             assert_eq!(parsed.snapshots.len(), 1, "{child_id}");
             assert_eq!(parsed.snapshots[0].input_tokens, record_count * 10);
             assert!(parsed.snapshots[0].context_curve.is_none());
@@ -53417,7 +53399,7 @@ mod tests {
                 parse_trusted_created_thread_test(name, child_id, parent_id, &child);
             assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
             assert!(parsed.report.complete(), "{name}");
-            assert!(!parsed.complete(), "{name}");
+            assert!(!parsed.progress_complete(), "{name}");
             assert!(parsed.zero_snapshot_usage_evidence, "{name}");
             assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
             assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
@@ -53427,7 +53409,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_created_thread_malformed_crash_tail_is_uncommittable_with_or_without_curve() {
+    fn codex_created_thread_malformed_crash_tail_keeps_valid_sibling_usage() {
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let turn_id = "01a03e99-5000-7000-8000-000000000001";
@@ -53467,9 +53449,20 @@ mod tests {
             },
         );
         let parsed = parse_codex_test_with_metadata(&path, &metadata);
-        assert!(!parsed.report.complete());
-        assert!(!parsed.complete());
-        assert_eq!(parsed.report.malformed_json_line_count, 1);
+        assert!(parsed.report.complete());
+        assert!(parsed.progress_complete());
+        assert_eq!(parsed.snapshots.len(), 1);
+        assert_eq!(
+            (
+                parsed.snapshots[0].input_tokens,
+                parsed.snapshots[0].output_tokens,
+                parsed.snapshots[0].cache_read_tokens,
+                parsed.snapshots[0].request_count
+            ),
+            (12, 2, 8, 1)
+        );
+        assert_eq!(parsed.report.malformed_json_line_count, 0);
+        assert!(parsed.terminal_loss().is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53602,7 +53595,7 @@ mod tests {
             let parsed = parse_codex_test_with_metadata(&path, &metadata);
             assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
             assert!(parsed.report.complete(), "{name}");
-            assert!(!parsed.complete(), "{name}");
+            assert!(!parsed.progress_complete(), "{name}");
             assert!(parsed.zero_snapshot_usage_evidence, "{name}");
             assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
             assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
@@ -54744,7 +54737,7 @@ mod tests {
     }
 
     fn assert_parentless_admitted(parsed: &ParsedJsonlFile, tokens: (u64, u64, u64, u64, u64)) {
-        assert!(parsed.complete(), "{parsed:#?}");
+        assert!(parsed.progress_complete(), "{parsed:#?}");
         assert_eq!(parsed.ownership_incomplete_file_count, 0);
         let item = parsed.snapshots.first().expect("parentless snapshot");
         assert_eq!(
@@ -55442,7 +55435,7 @@ mod tests {
         assert!(!metadata.state_created_threads.contains(ordinary_id));
 
         let parsed = parse_codex_test_with_metadata(&path, &metadata);
-        assert!(parsed.complete(), "{parsed:#?}");
+        assert!(parsed.progress_complete(), "{parsed:#?}");
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].source_session_id, ordinary_id);
         assert_eq!(parsed.snapshots[0].input_tokens, 12);
@@ -60059,7 +60052,7 @@ crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles,
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
-    terminal_line_loss_count, codex_parent_session_ref,
+    codex_parent_session_ref,
     source_session_id_seen);
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
@@ -60220,7 +60213,7 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
-crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);
+crate::heap_layout_bound::fields!(TerminalJsonlLoss; malformed_json_line_count, invalid_utf8_line_count, recognized_usage_drop_count, dropped_usage_record_count);
 crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, last_activity_at);
 crate::durable_tail_codec::durable_struct!(UsageBucketState {
     D rows: BTreeMap<RowKey, BucketRowAccumulator>,
