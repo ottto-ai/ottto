@@ -1148,7 +1148,7 @@ fn sessions(wire: &Value) -> Vec<String> {
 /// current one. An exact repeat is unchanged; a conflict stores nothing.
 #[derive(Clone, Default)]
 struct HeadStore {
-    /// session -> (head etag, stored body witness)
+    /// session -> (head etag, stored body content identity)
     heads: BTreeMap<String, (String, String)>,
     challenges: BTreeMap<String, String>,
     minted: u64,
@@ -1187,7 +1187,7 @@ impl HeadStore {
             };
             let session = item.source_session_id.clone();
             if let Some((head, held)) = self.heads.get(&session).cloned() {
-                if held == witness {
+                if held == item.snapshot_fingerprint {
                     ack.accepted += 1;
                     ack.unchanged_entities.push(SnapshotEntityRef {
                         head_etag: cas.then_some(head),
@@ -1209,7 +1209,10 @@ impl HeadStore {
                 }
             }
             let head = self.mint();
-            self.heads.insert(session.clone(), (head.clone(), witness));
+            self.heads.insert(
+                session.clone(),
+                (head.clone(), item.snapshot_fingerprint.clone()),
+            );
             self.challenges.remove(&session);
             self.stored.push(session);
             ack.accepted += 1;
@@ -1334,7 +1337,7 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
     let head = store.mint();
     store.heads.insert(
         repeat.source_session_id.clone(),
-        (head, snapshot_upload_body_witness(&repeat)),
+        (head, repeat.snapshot_fingerprint.clone()),
     );
     let items = [
         patched.clone(),
