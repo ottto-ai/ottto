@@ -4,8 +4,9 @@
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
 use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction, NOW};
-use super::super::{encode, page_bytes};
+use super::super::page_bytes;
 use super::*;
+use crate::durable_tail_codec::Enc;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::StagedFile;
 use serde_json::json;
@@ -861,7 +862,7 @@ fn codex_content_loads_back_from_its_session_facts() {
 
     let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
     Codex::decode_head(staged.revision, &staged.head, &mut into).unwrap();
-    let unknown = encode(|e| {
+    let unknown = Enc::count_write(usize::MAX, |e| {
         e.varint(6)?;
         e.varint(1)
     })
