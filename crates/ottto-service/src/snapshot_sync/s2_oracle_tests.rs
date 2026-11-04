@@ -69,7 +69,14 @@ fn hinted(c: &Corpus, index: ScanIndex, limit: usize, sampled: bool, hints: &[Pa
 
 /// Commit the native page's exact ACKs and context receipts to the same
 /// live database; the next caller gets the production cold load.
-fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
+fn commit(session: &StateV2ColdSession, page: Page) -> ScanIndex {
+    commit_with_progress(session, page).0
+}
+
+fn commit_with_progress(
+    session: &StateV2ColdSession,
+    mut page: Page,
+) -> (ScanIndex, SnapshotUploadProgress) {
     page.finish();
     let mut progress = e2_progress();
     assert_eq!(
@@ -83,7 +90,7 @@ fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    session.save_reload(&mut page.index).0
+    (session.save_reload(&mut page.index).0, progress)
 }
 
 fn accepted(result: &mut RouteResult, items: &[SnapshotItem]) {
@@ -683,13 +690,13 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
         assert!(!current
             .committed
             .accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
-        let prior = commit(&session, current);
+        let (prior, progress) = commit_with_progress(&session, current);
         assert!(prior.accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        // A file stores a set digest, not an individual entity witness.
+        // Compare the exact-body ACK at its native per-entity boundary.
         assert_eq!(
-            prior.files[sibling.to_str().unwrap()]
-                .last_upload_body_witness
-                .as_deref(),
-            Some(sibling_witness.as_str())
+            progress.accepted_body_witnesses.get(&sibling_fingerprint),
+            Some(&sibling_witness)
         );
         let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
             SOURCE,
