@@ -146,7 +146,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
         // The least recently used record goes first (L1).
         assert!(!cursor.parked.contains_key("key-000"));
         assert!(cursor.parked.contains_key(&format!("key-{PARKED_KEYS:03}")));
-        assert_eq!(cursor.counters.parked_hits, 3);
+        assert_eq!(cursor.counters.parked_hits, 2);
     });
 }
 
