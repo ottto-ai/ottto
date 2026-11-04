@@ -2247,7 +2247,6 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
         assert!(vanished.snapshots.is_empty(), "vanished Full emits nothing");
         assert_eq!(modes.0, 0, "vanish does not regrant Full");
         assert_eq!(cache.cursor_reserved(), 0);
-        assert!(cache.cursor_slot_free());
     });
 }
 

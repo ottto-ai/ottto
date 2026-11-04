@@ -1006,7 +1006,16 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     let (index, posts) = working.checkpoint_with_captured_posts(&funded, &before, "accept");
     assert_eq!(posts.len(), 1);
     assert_eq!(cache.cursor_reserved(), 0);
-    assert_quiet(&c, index, &emitted(&cold_index, &cold_main));
+    // The deliberately raced plain append still needs its ordinary read;
+    // this is not the unchanged carry/restart case exercised above.
+    let before = index.clone();
+    let (working, followup, _, _, _) = page(&c, index, cache);
+    assert!(
+        followup.snapshots.is_empty(),
+        "the non-usage append creates no new money body"
+    );
+    let (_, posts) = working.checkpoint_with_captured_posts(&followup, &before, "accept");
+    assert!(posts.is_empty(), "the raced append has no upload");
     drop(session);
 }
 
@@ -1023,12 +1032,7 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
     c.write(SIDE, Some("b"));
     c.write(GAP, None);
     let compressed = c.path(MAIN).with_extension("jsonl.zst");
-    fs::write(
-        &compressed,
-        zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap(),
-    )
-    .unwrap();
-    fs::remove_file(c.path(MAIN)).unwrap();
+
     let (session, prior) = StateV2ColdSession::publish(
         Source::Codex,
         &ScanIndex::default(),
@@ -1039,8 +1043,23 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
         prior.clone(),
         Arc::new(sampled_scan::SharedCache::default()),
     );
-    let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+    let (index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
     assert_eq!(posts.len(), 1);
+    // The observed provider compression path carries its durable physical
+    // stamp. A generic first read alone does not promise header reuse.
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(&fs::read(c.path(MAIN)).unwrap()[..], 1).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(c.path(MAIN)).unwrap();
+    let (_, carried_scan, carried_delivery, carried_bytes, carried_logs) =
+        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+    assert!(carried_scan.snapshots.is_empty());
+    assert!(carried_delivery.0.lock().unwrap().is_empty());
+    assert_eq!(carried_bytes, 0);
+    assert_eq!(full_decodes(&carried_logs), 0);
+    let mut index = ScanIndex::load(session.path()).unwrap();
     let compressed_key = local_index_key(&compressed);
     let carried = serde_json::to_value(&index.files[&compressed_key]).unwrap();
     let plain = c

@@ -152,12 +152,18 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    // An unfunded encoded header stays incomplete for an ordinary retry;
-    // it is neither decoded nor recorded as unreadable.
+    // An unfunded encoded header holds its filename owner for ordinary
+    // retry; unrelated membership stays complete, with no read or unreadable record.
     let before = ACTIVITY.with(std::cell::Cell::get);
     while !inventory.step(&CodexTitleMetadata::default()) {}
     assert!(inventory.headers.is_empty());
-    assert!(!inventory.complete);
+    assert!(inventory.complete);
+    assert_eq!(
+        inventory.held_owners,
+        codex_session_id_candidates_from_path(&path)
+            .into_iter()
+            .collect()
+    );
     assert!(inventory.refused.is_empty());
     assert_eq!(ACTIVITY.with(std::cell::Cell::get), before);
     fs::remove_dir_all(root).unwrap();
