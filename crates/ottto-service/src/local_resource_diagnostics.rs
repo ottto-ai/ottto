@@ -3001,7 +3001,7 @@ mod tests {
         let record = &records[0];
         assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
         assert_eq!(record["source"], "unknown");
-        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert_eq!(record["counts"]["prefix_excluded_bodies"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
         // The four Pi fields, the Codex tier field and the two Claude usage

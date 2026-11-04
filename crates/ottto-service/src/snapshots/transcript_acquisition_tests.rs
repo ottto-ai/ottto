@@ -170,7 +170,7 @@ fn acquire_items_with(
     // without this cycle's live inputs, through a sealed checkpoint only.
     let state = parser.durable_test_reduction_copy();
     let acquisition = parser.retain_reduction(scope, now).unwrap().unwrap();
-    let retained = (!acquisition.unsealed).then(|| Retained {
+    let retained = (!acquisition.unsealed).then_some(Retained {
         checkpoint: acquisition.checkpoint,
         state,
     });
