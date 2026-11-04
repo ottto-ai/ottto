@@ -228,6 +228,11 @@ fn paused_e2_ack_loss_restart_exact_receipt() {
             let mut refused = response.accepted_entities.pop().unwrap();
             response.accepted -= 1;
             refused.head_etag = None;
+            // Head-CAS covers the request once an item carries cache
+            // observations, so a conflict carries a head challenge.
+            if items.iter().any(|item| item.cache_observations.is_some()) {
+                refused.head_challenge = Some("c".repeat(64));
+            }
             response.conflict_entities.push(refused);
             Ok(response)
         });
