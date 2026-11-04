@@ -915,8 +915,7 @@ pub(crate) const CREATOR_PREVIOUSLY_UPLOADED: usize = 8;
 
 /// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
 /// finished parses (a singleton, or a joined group's single replay parse,
-/// each folded once), summed with saturation. Owned by the scan result and
-/// borrowed into the local terminal journal as `local_codex_counting_v2`;
+/// each folded once), summed with saturation. Owned by the scan result;
 /// also present for active-cutover scans or tombstone bookkeeping. Usage vectors are
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
