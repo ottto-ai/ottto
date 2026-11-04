@@ -627,7 +627,7 @@ fn granted(device_id: &str) -> LocalDeviceBinding {
 
 /// Makes `device_id` the active binding under `support`.
 fn bind(support: &Path, device_id: &str) {
-    ottto_core::FileDeviceStore::new(support.join(ottto_core::DEVICE_FILE_NAME))
+    ottto_core::FileDeviceStore::new(support.join("device.json"))
         .save(&granted(device_id))
         .unwrap();
 }
@@ -1001,7 +1001,7 @@ fn grant_drop_then_enabled_revision_stays_ungranted() {
             ..granted(DEVICE)
         };
         disable_sources_dropped_from_grant(&f.support, &granted(DEVICE), &next).unwrap();
-        ottto_core::FileDeviceStore::new(f.support.join(ottto_core::DEVICE_FILE_NAME))
+        ottto_core::FileDeviceStore::new(f.support.join("device.json"))
             .save(&next)
             .unwrap();
         web(&f.support, &[(source, 1, "enabled")]);

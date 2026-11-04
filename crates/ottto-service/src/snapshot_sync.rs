@@ -19764,7 +19764,7 @@ mod tests {
             source_control_backend(&["codex", "claude_code"], &[("codex", 1, "disabled")]);
         assert_eq!(enabled_snapshot_sources(&backend.device).len(), 2);
         let sources = cycle_heartbeat(
-            &SnapshotApiClient::new(&backend.api_base_url),
+            &SnapshotApiClient::new(backend.api_base_url.as_str()),
             &backend.device,
             "device-secret",
             "otm_test",
