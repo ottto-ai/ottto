@@ -2471,7 +2471,7 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
 }
 
 #[test]
-fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding() {
+fn e2_identity_every_marker_keeps_starting_org_with_or_without_different_binding() {
     {
         for count in [64, 65] {
             for bound in [None, Some("b".repeat(64))] {
@@ -2503,7 +2503,7 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
                     item.request_evidence[0].provider_workspace_hash.as_deref(),
                     Some(org_hash(ORG_A).as_str())
                 );
-                assert_eq!(fold(&item).accounts.as_ref().unwrap().conflict, count == 65);
+                assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
                 assert_evidence_referenced(&item);
                 cleanup(&[&path]);
             }
@@ -3363,10 +3363,10 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
     };
 }
 
-/// [behaviour] Past the marker cap, a removed prefix's marker is no starting
-/// witness: the copy's own request takes no org.
+/// [behaviour] A removed prefix's marker is no starting witness: the copy's
+/// own request takes no org.
 #[test]
-fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
+fn e2_identity_excluded_marker_is_no_starting_witness() {
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-marker-overflow");
@@ -3378,14 +3378,11 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
                 .claude_file_birth
                 .set_birth_for_test(t0() + 100_000_000_000);
             accumulator.account_identifier_hash = bound.clone();
-            let mut lines = vec![
+            let lines = vec![
                 org_marker(ORG_A),
                 line("copied", &at(1), 10),
                 line("own", &at(101), 20),
             ];
-            for _ in 0..64 {
-                lines.push(org_marker(ORG_A));
-            }
             for value in &lines {
                 apply_claude_code_line(value, &mut accumulator);
             }
@@ -3406,7 +3403,7 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
                 ),
                 (1, 20, Some(1))
             );
-            assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+            assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
             assert!(org_amounts(&item).is_empty());
             assert!(rows_of(&item).all(|row| row.account_identifier_hash == bound));
             assert_evidence_referenced(&item);
