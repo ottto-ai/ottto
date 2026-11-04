@@ -994,12 +994,15 @@ pub(crate) mod native_cold {
     ) {
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
-        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
-            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
-                completed.checkpoint
-            }
-            _ => panic!("a clean native fixture is certified"),
-        };
+        let checkpoint = parser
+            .retain_reduction(
+                scope,
+                now,
+                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
+            )
+            .unwrap()
+            .expect("a clean native fixture is certified")
+            .checkpoint;
         (reduction, checkpoint)
     }
 }

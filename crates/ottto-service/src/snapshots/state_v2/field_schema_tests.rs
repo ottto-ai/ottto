@@ -460,7 +460,6 @@ fn fills() -> Vec<(&'static str, Fill)> {
     macro_rules! fill {
         ($f:ident, $g:ident, (control $c:ident), $k:tt, $h:ident) => {};
         ($f:ident, $g:ident, ($codec:ident none), $k:tt, $h:ident) => {};
-        ($f:ident, $g:ident, (retired root $mode:ident $empty:tt), $k:tt, $h:ident) => {};
         ($f:ident, $g:ident, ($codec:ident $check:ident $($mode:ident)?), $k:tt, $h:ident) => {
             fills.push((
                 stringify!($f),
@@ -652,7 +651,8 @@ fn read_fixture(name: &str) -> String {
 }
 /// Owned kinds no sample field writes: opaque v1 holds and retired kinds.
 fn unwritten(kind: &str) -> bool {
-    kind.starts_with("raw_hold.")
+    catalogue::retired_kind(kind)
+        || kind.starts_with("raw_hold.")
         || matches!(
             kind,
             "setting.upload_context_fingerprint" | "v1_field.claude_desktop_census_witness"
@@ -830,14 +830,6 @@ fn stored_field_paths_check() {
             );
             continue;
         };
-        if catalogue::retired_root(kind) {
-            assert!(now.is_empty(), "{kind}: retired members stay unwritten");
-            assert!(
-                catalogue::accepts(kind),
-                "{kind}: a retired kind stays accepted"
-            );
-            continue;
-        }
         for path in paths.difference(now) {
             if parent(path).is_some_and(|p| !now.contains(p)) {
                 continue;

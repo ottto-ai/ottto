@@ -627,33 +627,6 @@ impl HeapLayoutBound for WakeIdentities {
 }
 
 impl SharedCache {
-    /// A cheap content-qualified identity for retained wake decisions only.
-    /// Missing/evicted evidence or any content/object mismatch keeps live ctime.
-    /// Samples use pread so neither a parser nor a boot reader is repositioned.
-    #[cfg(test)]
-    pub(in crate::snapshots) fn retained_open(
-        &self,
-        path: &Path,
-        file: &File,
-    ) -> Option<(OpenStamp, String, String)> {
-        let metadata = file.metadata().ok()?;
-        let width = FILE_CONTENT_SAMPLE_BYTES as u64;
-        let read = |at, len| {
-            let mut bytes = vec![0; len];
-            file.read_exact_at(&mut bytes, at).ok()?;
-            Some(bytes)
-        };
-        let samples = OpenedContentSamples {
-            head: read(0, metadata.len().min(width) as usize)?,
-            tail: if metadata.len() > width {
-                Some(read(metadata.len() - width, FILE_CONTENT_SAMPLE_BYTES)?)
-            } else {
-                None
-            },
-        };
-        self.retained_sampled(path, file, &metadata, &samples)
-    }
-
     /// Reuse the candidate opener's samples. Its live identity and the
     /// cross-scan identity are computed from exactly the same bytes.
     pub(in crate::snapshots) fn retained_sampled(

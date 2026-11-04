@@ -1777,7 +1777,7 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
 }
 
 /// [format] Old -> new -> old -> new: the shipped member layout is accepted,
-/// its generic empty roots remain readable, and each ordinary save retires
+/// an older reader HOLDs after ordinary saves retire
 /// the old contents without changing unrelated money or request custody.
 #[test]
 fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
@@ -1867,21 +1867,24 @@ fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
         super::save_graph(&mut db, &identity, before, &mut upgraded, &mut cx).unwrap();
         expected.generation = upgraded.generation;
         assert_persisted(&mut db, &expected);
-        // A previous writer can still read all eleven required roots. It
-        // sees no retired content, even after another upgrade/save cycle.
+        // D59: a previous reader HOLDs when its required root is absent.
+        // A later old writer can restore its original rows before the next upgrade.
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (field, mode, _, empty) in &rows {
             let kind = format!("v1_field.{field}");
-            let value: serde_json::Value =
-                mapper::field_read(&mut tx, &kind, *mode, None, || empty.clone()).unwrap();
-            assert_eq!(&value, empty, "round {round}: {field}");
+            assert!(
+                mapper::field_read::<serde_json::Value>(&mut tx, &kind, *mode, None, || empty
+                    .clone())
+                .is_err(),
+                "round {round}: old reader must HOLD {field}"
+            );
             let mut count = 0;
             mapper::rows(&mut tx, &kind, |_, _| {
                 count += 1;
                 Ok(())
             })
             .unwrap();
-            assert_eq!(count, 1, "only the empty compatibility root remains");
+            assert_eq!(count, 0, "retired kind is unwritten");
         }
     }
 }

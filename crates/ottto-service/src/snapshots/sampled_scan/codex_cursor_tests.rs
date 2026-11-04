@@ -8544,7 +8544,16 @@ fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
         now,
         "a change after sampling must keep its live stamp"
     );
-    let (qualified, _, _) = cache.retained_open(&home.path, &file).unwrap();
+    let mut file = file;
+    opened_object_identity_and_stat_retained(
+        SnapshotSource::Codex,
+        &mut file,
+        Some((&cache, &home.path)),
+        false,
+        false,
+    )
+    .unwrap();
+    let qualified = cache.retained_stamp(&home.path, OpenStamp::capture(&file).unwrap());
     assert_ne!(
         qualified.changed, now.changed,
         "a fresh equal-content sample pass can qualify the stored ctime"

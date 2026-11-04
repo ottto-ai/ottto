@@ -17567,24 +17567,6 @@ struct SnapshotAccumulator {
     // available. The native stream must end at the same ordinal boundary.
     codex_sidecar_projected_next_ordinal: Option<u64>,
     codex_parent_session_ref: Option<String>,
-    // Retired positional head slots; decoded values are discarded by the head codec.
-    retired_codex_parent_prefix_digest: PrefixDigest,
-    retired_codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
-    retired_codex_parent_proof_mismatch: bool,
-    retired_codex_proof_decision_only: bool,
-    retired_codex_boundary_buffer_count: u8,
-    retired_codex_proof_ledger_row: Option<String>,
-    retired_codex_parent_ledger_identity_used: Option<String>,
-    retired_codex_parent_unresolvable: Option<CodexParentUnresolvable>,
-    retired_codex_parent_ledger_consulted: bool,
-    retired_codex_parent_signature_index: usize,
-    retired_codex_physical_signatures_complete: bool,
-    retired_codex_parent_ownership_ledgers: serde::de::IgnoredAny,
-    retired_codex_parent_signatures: serde::de::IgnoredAny,
-    retired_codex_parent_prefix_proof: serde::de::IgnoredAny,
-    retired_codex_parent_proof_used: serde::de::IgnoredAny,
-    retired_codex_parent_proof_refusal: serde::de::IgnoredAny,
-    retired_codex_physical_signatures: serde::de::IgnoredAny,
     // Fresh provider-created rollouts use a native creation envelope and one
     // gap-free ordinal stream. These fields bind the first task/turn to that
     // envelope and reject retrograde timestamps anywhere in the opened file.
@@ -17848,23 +17830,6 @@ impl SnapshotAccumulator {
             codex_sidecar_projected_next_ordinal: None,
             codex_parent_session_ref: None,
             codex_native_created_thread_valid: true,
-            retired_codex_parent_prefix_digest: [0; 32],
-            retired_codex_parent_prefix_decided: None,
-            retired_codex_parent_proof_mismatch: false,
-            retired_codex_proof_decision_only: false,
-            retired_codex_boundary_buffer_count: 0,
-            retired_codex_proof_ledger_row: None,
-            retired_codex_parent_ledger_identity_used: None,
-            retired_codex_parent_unresolvable: None,
-            retired_codex_parent_ledger_consulted: false,
-            retired_codex_parent_signature_index: 0,
-            retired_codex_physical_signatures_complete: true,
-            retired_codex_parent_ownership_ledgers: serde::de::IgnoredAny,
-            retired_codex_parent_signatures: serde::de::IgnoredAny,
-            retired_codex_parent_prefix_proof: serde::de::IgnoredAny,
-            retired_codex_parent_proof_used: serde::de::IgnoredAny,
-            retired_codex_parent_proof_refusal: serde::de::IgnoredAny,
-            retired_codex_physical_signatures: serde::de::IgnoredAny,
             codex_created_thread_native_only: false,
             codex_native_created_thread_header_nanos: None,
             codex_native_created_thread_last_nanos: None,
@@ -44247,8 +44212,6 @@ impl ScanIndex {
         let (v2_index, try_import) =
             state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
         if let Some(mut index) = v2_index {
-            let file = File::open(path)?;
-            let _opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
             if !index.finish_decoded_load(source) {
                 return Err(anyhow::anyhow!(
                     "scan_index_storage_generation_requires_repair"
@@ -44256,10 +44219,6 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded));
         }
-        let file =
-            File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        let _opened = sampled_scan::codex_cursor::OpenStamp::capture(&file)
-            .with_context(|| format!("stat scan index {}", path.display()))?;
         let decoded =
             read_scan_index_representation(path, "load", scan_index_source_label(source), None)
                 .map_err(|error| match error.downcast::<lenient_decode::Error>() {

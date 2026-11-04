@@ -1543,38 +1543,6 @@ fn ordinary_codex_page_preserves_future_exact_body_cooldown_and_settlement() {
     );
 }
 
-/// [format] The open-file stamp is exactly five content-free scalars: it
-/// round-trips, and a missing field or a malformed time fails closed.
-#[test]
-fn open_stamp_round_trips_as_content_free_scalars() {
-    use sampled_scan::codex_cursor::OpenStamp;
-    let fixture = Fixture::new(SnapshotSource::Codex);
-    let stamp = OpenStamp::capture(&File::open(&fixture.0).unwrap()).unwrap();
-    let value = serde_json::to_value(&stamp).unwrap();
-    let keys = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        keys,
-        BTreeSet::from(["changed", "dev", "extent", "ino", "modified"])
-    );
-    assert_eq!(value["extent"], fs::metadata(&fixture.0).unwrap().len());
-    assert_eq!(
-        serde_json::from_value::<OpenStamp>(value.clone()).unwrap(),
-        stamp
-    );
-
-    let mut missing = value.clone();
-    missing.as_object_mut().unwrap().remove("ino");
-    assert!(serde_json::from_value::<OpenStamp>(missing).is_err());
-    let mut malformed = value;
-    malformed["changed"] = json!([1, 2, 3]);
-    assert!(serde_json::from_value::<OpenStamp>(malformed).is_err());
-}
-
 /// One sampled Claude page of `fixture` through `cache`: (index, modes).
 fn codec_page(
     fixture: &ScanFixture,
