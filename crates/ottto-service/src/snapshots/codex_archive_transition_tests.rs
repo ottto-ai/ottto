@@ -28,8 +28,9 @@ struct Corpus {
 }
 impl Corpus {
     fn new() -> Self {
-        let scratch = crate::test_scratch::ScratchDir::new("codex-encoding-transitions");
+        let scratch = crate::test_scratch::ScratchDir::canonical("codex-encoding-transitions");
         let home = fs::canonicalize(scratch.as_ref()).unwrap();
+        crate::test_scratch::create_private_dir(&home.join("state")).unwrap();
         let sessions = home.join("sessions");
         let archived = home.join("archived_sessions");
         fs::create_dir_all(&sessions).unwrap();

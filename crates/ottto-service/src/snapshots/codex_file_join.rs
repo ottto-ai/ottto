@@ -609,6 +609,7 @@ impl HeaderInventory {
             let stored_head =
                 index
                     .as_deref()
+                    .filter(|index| index.v2().persistence_v2.is_some())
                     .map(|index| {
                         state_v2::load_head(index, &key,
                 <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION)

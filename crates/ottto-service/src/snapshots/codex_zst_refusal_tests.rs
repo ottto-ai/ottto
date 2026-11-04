@@ -80,7 +80,7 @@ fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
             "CompressedHeaderUnfunded": 1,
         })]
     );
-    let (_, rows) = capture(|| crate::local_resource_diagnostics::codex_zst_refused_flush());
+    let (_, rows) = capture(crate::local_resource_diagnostics::codex_zst_refused_flush);
     assert_eq!(flushed(&rows), Vec::<Value>::new(), "unchanged pass");
     let (_, rows) = capture(|| {
         codex_zst_refused(CodexZstCause::AdmissionRefused);
