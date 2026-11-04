@@ -2530,6 +2530,19 @@ fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
 /// no cache patch beside the forked ROOT's patched body.
 const UNPATCHED: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
+/// The production prepare when the account requires head-CAS: a session with
+/// a saved head keeps its patch, one without a head travels unpatched.
+fn under_required_cas(
+    items: &[SnapshotItem],
+    progress: &SnapshotUploadProgress,
+) -> Vec<SnapshotItem> {
+    let mut items = items.to_vec();
+    for item in &mut items {
+        prepare_snapshot_cache_for_upload(item, progress, true, true, &BTreeSet::new());
+    }
+    items
+}
+
 /// One route's upload of its page under the saved cache ledger, with the
 /// observed post-ACK placement ledger.
 fn mixed_route(
@@ -2537,7 +2550,7 @@ fn mixed_route(
     progress: &SnapshotUploadProgress,
     mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
 ) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
-    let sent = under_cas(&page.scan.snapshots, progress);
+    let sent = under_required_cas(&page.scan.snapshots, progress);
     let mut progress = progress.clone();
     progress
         .accepted_identity_buckets
@@ -2600,11 +2613,16 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
         let warm = E2ScanFixture::capturing_identity();
         disk.begin(&warm, SnapshotSource::ClaudeCode);
         let mut progress = e2_progress();
+        // ROOT already holds a server head; UNPATCHED has none yet, so under
+        // a required head-CAS its body travels without cache rows.
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(ROOT), "d".repeat(64));
 
         let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
         first.enrich(&c);
         first.finish();
-        let sent = under_cas(&first.scan.snapshots, &progress);
+        let sent = under_required_cas(&first.scan.snapshots, &progress);
         assert!(sent
             .iter()
             .any(|item| item.source_session_id == ROOT && item.cache_observations.is_some()));

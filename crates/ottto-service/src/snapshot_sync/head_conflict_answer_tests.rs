@@ -1652,24 +1652,32 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     store.seed("r3-owed");
     owe(&mut progress, &owed, challenge(0xc));
 
-    let (lost, _) = page(&mut progress, &[owed.clone()], &none, |request, wire| {
-        store.post(request, wire);
-        Err(anyhow!("synthetic lost reply"))
-    });
+    let (lost, _) = page(
+        &mut progress,
+        std::slice::from_ref(&owed),
+        &none,
+        |request, wire| {
+            store.post(request, wire);
+            Err(anyhow!("synthetic lost reply"))
+        },
+    );
     assert!(lost.is_err());
     assert!(progress.head_conflict_challenges.contains_key(&key));
     assert!(!progress
         .accepted_body_witnesses
         .contains_key(&owed.snapshot_fingerprint));
 
-    let (result, _) = page(&mut progress, &[owed.clone()], &none, |request, wire| {
-        Ok(store.post(request, wire))
-    });
+    let (result, _) = page(
+        &mut progress,
+        std::slice::from_ref(&owed),
+        &none,
+        |request, wire| Ok(store.post(request, wire)),
+    );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(progress.head_conflict_challenges.is_empty());
     assert_eq!(store.stored, ["r3-owed"], "no double credit");
 
-    let (result, wires) = page(&mut progress, &[owed.clone()], &none, |_, _| {
+    let (result, wires) = page(&mut progress, std::slice::from_ref(&owed), &none, |_, _| {
         panic!("a settled body sends no POST")
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1727,35 +1735,43 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
         let owed = body("r4-owed", None);
         let key = cache_session_key("r4-owed");
         owe(&mut progress, &owed, challenge(0xc));
-        let (result, wires) = page(&mut progress, &[owed.clone()], &none, |request, _| {
-            let item = &request.snapshots[0];
-            let mut ack = empty_ack();
-            match permanent {
-                Some(permanent) => {
-                    ack.rejected_entities
-                        .push(crate::snapshot_client::SnapshotEntityRejection {
-                            source_session_id: item.source_session_id.clone(),
-                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                            occurrence_count: 1,
-                            permanent,
-                            reason: outcome.into(),
-                            detail: String::new(),
+        let (result, wires) = page(
+            &mut progress,
+            std::slice::from_ref(&owed),
+            &none,
+            |request, _| {
+                let item = &request.snapshots[0];
+                let mut ack = empty_ack();
+                match permanent {
+                    Some(permanent) => {
+                        ack.rejected_entities.push(
+                            crate::snapshot_client::SnapshotEntityRejection {
+                                source_session_id: item.source_session_id.clone(),
+                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                occurrence_count: 1,
+                                permanent,
+                                reason: outcome.into(),
+                                detail: String::new(),
+                            },
+                        );
+                    }
+                    None => {
+                        let version =
+                            crate::snapshot_client::snapshot_ack_body_witness_version(item)
+                                .unwrap();
+                        ack.accepted = 1;
+                        ack.unchanged_entities.push(SnapshotEntityRef {
+                            body_witness_version: version,
+                            body_witness_digest: version
+                                .map(|_| snapshot_upload_body_witness(item)),
+                            unchanged_basis: Some(outcome.into()),
+                            ..reference(item)
                         });
+                    }
                 }
-                None => {
-                    let version =
-                        crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
-                    ack.accepted = 1;
-                    ack.unchanged_entities.push(SnapshotEntityRef {
-                        body_witness_version: version,
-                        body_witness_digest: version.map(|_| snapshot_upload_body_witness(item)),
-                        unchanged_basis: Some(outcome.into()),
-                        ..reference(item)
-                    });
-                }
-            }
-            Ok(ack)
-        });
+                Ok(ack)
+            },
+        );
         assert!(wires[0].get("head_cas_contract").is_none(), "{outcome}");
         let result = result.unwrap();
         let retryable = permanent == Some(false);

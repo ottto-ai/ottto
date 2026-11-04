@@ -45,7 +45,13 @@ fn previous_batches(items: &[PackingItem], progress: &SnapshotUploadProgress) ->
     let mut batch = Vec::new();
     let mut bytes = 2usize;
     let mut class = None;
-    for (index, body, _) in previous_pending(items, progress).into_values() {
+    // Bodies are grouped by request class (stable within a class) before the
+    // count and byte cuts, so each class travels in its own requests.
+    let mut pending = previous_pending(items, progress)
+        .into_values()
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|(index, _, _)| items[*index].class);
+    for (index, body, _) in pending {
         let item_bytes = body.len().saturating_add(1);
         let item_class = items[index].class;
         if !batch.is_empty()
@@ -140,7 +146,7 @@ fn snapshot_packing_count_matches_json_oracle_and_actual_duplicate_class_uploads
         item(4, json!(null), false),
     ];
     let actual = assert_previous_oracle(&items, test_upload_progress());
-    assert_eq!(actual, vec![vec![0, 1], vec![20, 3], vec![4]]);
+    assert_eq!(actual, vec![vec![0, 1, 4], vec![20, 3]]);
 
     let mut progress = test_upload_progress();
     progress
@@ -151,7 +157,7 @@ fn snapshot_packing_count_matches_json_oracle_and_actual_duplicate_class_uploads
         .insert(items[1].fingerprint.clone(), items[1].fingerprint.clone());
     assert_eq!(
         assert_previous_oracle(&items, progress),
-        vec![vec![1], vec![20, 3], vec![4]]
+        vec![vec![1, 4], vec![20, 3]]
     );
     assert!(assert_previous_oracle(&[], test_upload_progress()).is_empty());
 }
