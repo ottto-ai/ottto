@@ -320,7 +320,12 @@ pub(crate) fn retain_indexed_walk_for_test(
     assert!(walk.pending_directories.is_empty(), "the walk is complete");
     for candidate in &walk.pending_candidates {
         let metadata = std::fs::symlink_metadata(&candidate.path).unwrap();
-        assert!(index.listing_unchanged(&candidate.path, &metadata));
+        let entry = &index.files[&local_index_key(&candidate.path)];
+        assert!(entry.same_listing_stamp_as(&metadata));
+        assert!(!entry.rearmed());
+        // A retained walk keeps a sampled prefix until its audit deadline;
+        // listing_unchanged would reject even that not-yet-due obligation.
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
     }
     index.traversal.as_mut().unwrap().pending_candidates.clear();
 }
