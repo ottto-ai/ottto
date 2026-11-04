@@ -1,10 +1,51 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, Observation, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
+    Collection, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
 };
 use super::*;
 
+/// Prepare-time carry: the original RAM graph stays old until COMMIT. The
+/// ordinary save owns CAS merge, graph encoding, Tail movement and rollback.
+pub(in crate::snapshots) fn carry_tail(
+    index: &mut ScanIndex,
+    to: &str,
+    carry: PathCarry,
+) -> Result<()> {
+    let path = runtime_path(index)?.ok_or(Hold::ReloadRequired)?;
+    let _owner = super::super::super::CheckpointLock::acquire(&path)?;
+    let mut next = index.clone();
+    with_save_session(
+        &path,
+        index.v2().persistence_v2.clone(),
+        index.generation,
+        |state, session, id| {
+            let previous = match state.save_digests.take() {
+                Some(previous) => previous,
+                None => {
+                    let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
+                    let previous = kinds::baseline(&committed, &mut cx)?;
+                    session.cx = cx;
+                    previous
+                }
+            };
+            let moved = state.tail.carry_observation(to, &carry)?;
+            recovered_write(&path, None, &id, session, |session| {
+                session.cx.carry = Some((to.to_owned(), carry));
+                session.cx.tail = Some(moved);
+                let digests =
+                    import::save(&mut session.db, &id, previous, &mut next, &mut session.cx)?;
+                session.stamp = session.db.stamp()?;
+                state.save_digests = Some(digests);
+                Ok(())
+            })
+        },
+    )?
+    .ok_or(Hold::ReloadRequired)?;
+    *index = next;
+    super::super::super::sampled_audit::renew_growth_claims(index, &path);
+    Ok(())
+}
 /// Staged state never declines; a later completion of the file merges into it.
 pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile) -> Result<()> {
     with_state(path, |state| {
@@ -107,6 +148,16 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
+/// Historical first-seen evidence only; no disposition or attempt is applied.
+pub(in crate::snapshots) fn legacy_archive_was_seen(index: &ScanIndex, key: &str) -> Result<bool> {
+    Ok(read_txn(index, |tx| {
+        Ok(tx
+            .get(&super::super::mapper::key("v1_field.archives", key, 1)?)?
+            .is_some())
+    })?
+    .0)
+}
+
 /// `head`'s pages, one short read transaction, streamed to `visit`. See
 /// `tail::load_pages` for its outcomes.
 pub(in crate::snapshots) fn load_tail(

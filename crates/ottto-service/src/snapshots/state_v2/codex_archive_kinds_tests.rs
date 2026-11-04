@@ -1,5 +1,4 @@
 use super::*;
-use crate::snapshots::codex_compressed_input::ArchiveEvidence;
 use crate::snapshots::scan_index_persistence::{Binding, Source};
 
 /// [format] Claude stores keep the pre-archive row set and hydrate without archive roots.
@@ -33,8 +32,10 @@ fn claude_store_omits_archive_rows_and_hydrates_legacy_absence() {
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     db.control("field_presence", &presence).unwrap();
     let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert!(restored.archives.is_empty());
-    assert_eq!(restored.archive_deferred_alarm_count, 0);
+    assert!(serde_json::to_value(&restored)
+        .unwrap()
+        .get("archives")
+        .is_none());
     let actual = baseline(&restored, &mut cx).unwrap().rows;
     assert_eq!(
         actual.keys().collect::<Vec<_>>(),
@@ -82,24 +83,15 @@ fn codex_store() -> (Scratch, sqlite::Sqlite) {
     db.control("generation", &0_u64).unwrap();
     (Scratch(dir), db)
 }
-fn custody(index: &ScanIndex) -> (serde_json::Value, u64) {
-    (
-        serde_json::to_value(&index.archives).unwrap(),
-        index.archive_deferred_alarm_count,
-    )
-}
+const RETIRED_ARCHIVE_KINDS: [&str; 2] =
+    ["v1_field.archives", "v1_field.archive_deferred_alarm_count"];
 fn assert_kinds(db: &mut sqlite::Sqlite, present: bool) {
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    for kind in kinds_misc::ARCHIVE_KINDS {
-        let root = tx.get(&mapper::key(kind, "", 0).unwrap()).unwrap();
+    for kind in RETIRED_ARCHIVE_KINDS {
         let rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 1)
             .unwrap();
-        assert_eq!(
-            (root.is_some(), !rows.is_empty()),
-            (present, present),
-            "{kind}"
-        );
+        assert_eq!(!rows.is_empty(), present, "{kind}");
     }
 }
 /// Save `next` over the committed store, then reopen it.
@@ -116,160 +108,81 @@ fn save_and_reopen(
     hydrate(db, codex_binding()).unwrap()
 }
 
-/// [regress] A Codex-bound store keeps archive custody (held, owed evidence and a
-/// deferred alarm) through populate, a changed delta, a delta to empty and a
-/// store written before the kinds existed. No save refuses, so passes upload.
+/// [format] Retired layout-2 archive rows are accepted but never hydrated,
+/// digested, rewritten or swept. Preserve their bytes through save and reopen.
 #[test]
 fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
-    let (first, second) = (
-        "/synthetic/archived/a.jsonl.zst",
-        "/synthetic/archived/b.jsonl.zst",
-    );
-    let held = ArchiveEvidence::unknown();
-    assert!(held.owed_cause().is_some(), "held evidence is owed");
-    let mut index = ScanIndex::default();
-    index.archives.insert(first.into(), held.clone());
-    index.archive_deferred_alarm_count = 2;
-    // The v1 inventory admits both fields, so the v1 import reaches populate.
-    let v1 = serde_json::json!({
-        "schema_version": 2, "generation": 0, "files": {},
-        "archives": index.archives, "archive_deferred_alarm_count": 2,
-    });
-    assert_eq!(
-        codec::inventory(std::io::Cursor::new(serde_json::to_vec(&v1).unwrap())),
-        Ok(())
-    );
-
-    // Populate (the import's writer) stores both kinds and their presence.
-    let (_scratch, mut db) = codex_store();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let mut cx = KindCx {
-        binding: Some(codex_binding()),
-        ..Default::default()
-    };
-    populate(&index, &mut tx, &mut cx).unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    assert_kinds(&mut db, true);
-    let (mut restored, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
-    assert_eq!(custody(&restored), custody(&index));
-    assert_eq!(cx.presence.get("archives"), Some(&true));
-    assert_eq!(cx.presence.get("archive_deferred_alarm_count"), Some(&true));
-
-    // Delta to a changed archive set.
-    let previous = restored.clone();
-    restored.archives.get_mut(first).unwrap().owner = Some("synthetic-owner".into());
-    restored.archives.insert(second.into(), held);
-    restored.archive_deferred_alarm_count = 3;
-    let (mut reopened, mut cx) = save_and_reopen(&mut db, &previous, &mut restored, &mut cx);
-    assert_eq!(custody(&reopened), custody(&restored));
-    assert_eq!(reopened.archives.len(), 2);
-
-    // Delta to empty drops the rows; the store hydrates empty.
-    let previous = reopened.clone();
-    reopened.archives.clear();
-    reopened.archive_deferred_alarm_count = 0;
-    let (emptied, _) = save_and_reopen(&mut db, &previous, &mut reopened, &mut cx);
-    assert_kinds(&mut db, false);
-    assert!(emptied.archives.is_empty());
-    assert_eq!(emptied.archive_deferred_alarm_count, 0);
-
-    // Upgrade: a store written before these kinds existed (rows and presence
-    // keys deleted) opens empty, then gains both rows on its next save.
-    let (_scratch, mut db) = codex_store();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let mut cx = KindCx {
-        binding: Some(codex_binding()),
-        ..Default::default()
-    };
-    populate(&index, &mut tx, &mut cx).unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    let mut presence: BTreeMap<String, bool> = db.read_control("field_presence").unwrap().unwrap();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    for kind in kinds_misc::ARCHIVE_KINDS {
-        mapper::rows(&mut tx, kind, |tx, h| mapper::remove(tx, &h.key)).unwrap();
-    }
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    for field in ["archives", "archive_deferred_alarm_count"] {
-        assert_eq!(presence.remove(field), Some(true));
-    }
-    db.control("field_presence", &presence).unwrap();
-    assert_kinds(&mut db, false);
-    let (mut opened, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
-    assert!(opened.archives.is_empty());
-    assert_eq!(opened.archive_deferred_alarm_count, 0);
-    let previous = opened.clone();
-    opened.archives = index.archives.clone();
-    opened.archive_deferred_alarm_count = index.archive_deferred_alarm_count;
-    let (upgraded, cx) = save_and_reopen(&mut db, &previous, &mut opened, &mut cx);
-    assert_kinds(&mut db, true);
-    assert_eq!(custody(&upgraded), custody(&index));
-    assert_eq!(cx.presence.get("archives"), Some(&true));
-    assert_eq!(
-        serde_json::to_vec(&upgraded).unwrap(),
-        serde_json::to_vec(&opened).unwrap()
-    );
-}
-
-/// [regress] 0.1.213: every refused archive pass rewrote every archive row (a
-/// header attempt spent at reservation, then refunded), so each save was over
-/// target and halved the scan page limit (`saved_page`). Through the production
-/// refusal path, only the first refusal records each archive's cause; a repeat
-/// refused pass writes the rows an unchanged save writes, so the limit is kept.
-#[test]
-fn a_repeat_refused_archive_pass_dirties_no_row_and_keeps_the_page_limit() {
-    use crate::local_resource_diagnostics::CodexZstCause;
-    use crate::snapshots::codex_compressed_input::{ArchiveReservation, ArchiveTransition};
-    // What a pass does to each archive whose funded header read is refused.
-    let refused_pass = |index: &mut ScanIndex| {
-        for a in index.archives.values_mut() {
-            let w = a.work.get_or_insert_with(Box::default);
-            w.reservation = ArchiveReservation::HeaderReady;
-            w.cancel_unopened_header();
-            a.transition(ArchiveTransition::Transient(
-                CodexZstCause::AdmissionRefused,
-            ));
-        }
-        index.disclose_archive_debt();
-    };
-    let mut index = ScanIndex::default();
-    // One row over the limiter's 5,000-row target.
-    for n in 0..5_001 {
-        index.archives.insert(
-            format!("/synthetic/archived/{n}.jsonl.zst"),
-            ArchiveEvidence::unknown(),
-        );
-    }
     let (scratch, mut db) = codex_store();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut cx = KindCx {
         binding: Some(codex_binding()),
         ..Default::default()
     };
-    populate(&index, &mut tx, &mut cx).unwrap();
+    populate(&ScanIndex::default(), &mut tx, &mut cx).unwrap();
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    // An import store does not count dirty rows: measure a finished one.
-    let identity: Identity = db.read_control("identity").unwrap().unwrap();
+    assert_kinds(&mut db, false);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let mut expected = Vec::new();
+    for kind in RETIRED_ARCHIVE_KINDS {
+        assert!(catalogue::OWNED.iter().any(|(name, _)| *name == kind));
+        assert_eq!(catalogue::introduced(kind).unwrap(), 2);
+        // Deliberately incompatible payload: attempting active decode must fail.
+        let key = mapper::key(kind, "", 0).unwrap();
+        let header =
+            mapper::put(&mut tx, &key, &serde_json::json!({"future": [false, 7]})).unwrap();
+        expected.push((key, header));
+        if kind == "v1_field.archives" {
+            // Real held custody has a member, unlike an empty retired manifest.
+            let key = mapper::key(kind, "/synthetic/archived/held.jsonl.zst", 1).unwrap();
+            let header = mapper::put(
+                &mut tx,
+                &key,
+                &serde_json::json!({"future":[false,7],"header_attempts":4}),
+            )
+            .unwrap();
+            expected.push((key, header));
+        }
+    }
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     db.finish_import().unwrap();
-    let mut db =
-        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
-    db.path_extractor(private_paths);
-    let save = |db: &mut sqlite::Sqlite, pass: &dyn Fn(&mut ScanIndex)| {
-        let (mut next, mut cx) = hydrate(db, codex_binding()).unwrap();
-        let previous = next.clone();
-        pass(&mut next);
-        let before = db.save_row_attempts();
-        save_graph(db, &identity, &previous, &mut next, &mut cx).unwrap();
-        let after = db.save_row_attempts();
-        (after.0 - before.0, after.1 - before.1)
+    let reopen = || {
+        let mut db =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        db.path_extractor(private_paths);
+        db.reference_extractor(references);
+        db
     };
-    // Control: the first refusal changes every row once, over target.
-    save(&mut db, &refused_pass);
-    assert!(
-        db.save_over_target(),
-        "the first refusal records each cause"
+    let mut db = reopen();
+    let (mut index, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
+    let rows = baseline(&index, &mut cx).unwrap().rows;
+    for (key, _) in &expected {
+        assert!(
+            !rows.contains_key(key),
+            "inert rows are not baseline digests"
+        );
+    }
+    assert!(serde_json::to_value(&index)
+        .unwrap()
+        .get("archives")
+        .is_none());
+    let previous = index.clone();
+    let (restored, _) = save_and_reopen(&mut db, &previous, &mut index, &mut cx);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap(),
+        serde_json::to_value(&index).unwrap()
     );
-    let unchanged = save(&mut db, &|_: &mut ScanIndex| {});
-    assert!(!db.save_over_target());
-    assert_eq!(save(&mut db, &refused_pass), unchanged, "no archive row");
-    assert!(!db.save_over_target(), "the page limit is not reduced");
+    drop(db);
+    let mut db = reopen();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for (key, header) in expected {
+        let actual = tx
+            .get(&key)
+            .unwrap()
+            .expect("inert row survives ordinary save");
+        assert_eq!(
+            actual, header,
+            "byte commitment, key and position preserved"
+        );
+    }
 }

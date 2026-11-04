@@ -229,55 +229,6 @@ pub(in crate::snapshots) enum StartRefusal {
     Unstartable,
 }
 
-/// Archive catch-up pacing for one ordinary page and its continuation
-/// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
-/// durable authority. A refusal never resets it; byte pages and continuation
-/// wall-work bound admission of the next archive.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ArchivePass {
-    pub(crate) started: bool,
-    pub(crate) work: u64,
-    pub(crate) power: bool,
-    /// Continuation's platform gates; a pass and its pages share them.
-    pub(crate) gates: crate::snapshot_sync::ArchiveGates,
-    pub(crate) dirty: bool,
-    pub(crate) prepared: bool,
-    pub(crate) headers_prepared: bool,
-    pub(crate) deferred: std::collections::BTreeSet<String>,
-}
-crate::heap_layout_bound::split_fields!(ArchivePass;
-    inline: [started, work, power, dirty, prepared, headers_prepared];
-    heap: [deferred]; shared: [gates]);
-
-impl ArchivePass {
-    /// A new ordinary pass: fresh counters and the prepare-time power gate;
-    /// the cached-archive walk position and the gates carry over.
-    pub(crate) fn prepare(&mut self) {
-        let Self {
-            started,
-            work,
-            power,
-            gates,
-            ..
-        } = self;
-        (*started, *work) = (false, 0);
-        *power = gates.power_ready();
-    }
-
-    /// Archive work may start now: prepare-time and live power, the pass's
-    /// wall work (continuation's contention threshold), and `remaining`
-    /// page bytes.
-    pub(crate) fn ready(&self, remaining: u64) -> bool {
-        self.power && remaining > 0 && crate::snapshot_sync::archive_work_ready(self.work)
-    }
-}
-
-impl PageBudget {
-    pub(in crate::snapshots) fn archive_ready(&self, pass: &ArchivePass) -> bool {
-        pass.ready(self.singleton_remaining(Limits::current()))
-    }
-}
-
 impl PageBudget {
     /// A page whose start enqueued `hints` watcher hints as next-generation
     /// evidence (G1).
@@ -5302,7 +5253,7 @@ mod header_admission_tests {
             Some(&fixture.directories),
         );
         let cache = Arc::new(SharedCache::default());
-        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(&cache)) {}
+        while !inventory.step_encoded(&CodexTitleMetadata::default(), Some(&cache)) {}
         let key = paths.first().unwrap().clone();
         assert!(cache
             .with_cursor(|cursor| cursor.headers.get(&key))
@@ -5318,11 +5269,15 @@ mod header_admission_tests {
             .flatten()
             .unwrap();
         let mut refused = false;
-        for number in 0..codex_file_join::MAX_HEADER_FILES {
-            let key = format!("header-{number}");
-            cache.refresh_header(key.clone(), Some(facts.clone()));
+        for number in 0..8 {
+            let mut key = format!("header-{number}");
+            // Preserve byte-pressure with a small population: the backing
+            // allocation, like the stored key, is charged by capacity.
+            key.reserve_exact(state_bytes() / 8);
+            let lookup = key.clone();
+            cache.refresh_header(key, Some(facts.clone()));
             if cache
-                .with_cursor(|cursor| cursor.headers.get(&key))
+                .with_cursor(|cursor| cursor.headers.get(&lookup))
                 .flatten()
                 .is_none()
             {
@@ -5358,10 +5313,10 @@ mod header_admission_tests {
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
                 // Model a resident graph that became full after caching headers.
-                for number in 0..codex_file_join::MAX_HEADER_FILES {
-                    cursor
-                        .headers
-                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                for number in 0..8 {
+                    let mut key = format!("header-{number}");
+                    key.reserve_exact(state_bytes() / 8);
+                    cursor.headers.refresh(key, Some(facts.clone()));
                 }
                 assert!(state_for_main(cursor).is_none(), "starvation precondition");
             })
@@ -5383,10 +5338,10 @@ mod header_admission_tests {
         cache
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
-                for number in 0..codex_file_join::MAX_HEADER_FILES {
-                    cursor
-                        .headers
-                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                for number in 0..8 {
+                    let mut key = format!("header-{number}");
+                    key.reserve_exact(state_bytes() / 8);
+                    cursor.headers.refresh(key, Some(facts.clone()));
                 }
                 assert!(!free_room(&retained, cursor, 1024));
                 assert!(admit_locked(&mut retained, cursor, 1024));
@@ -5396,4 +5351,22 @@ mod header_admission_tests {
         drop(retained);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Resource refusals retain the ordinary queue's census and watcher custody.
+pub(in crate::snapshots) fn requeue_refused(
+    source: SnapshotSource,
+    error: &anyhow::Error,
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    candidate: &CandidateFile,
+) -> bool {
+    let refused = source == SnapshotSource::Codex
+        && error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+    if refused {
+        requeue(index, flags, candidate);
+    }
+    refused
 }

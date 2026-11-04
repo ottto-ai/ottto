@@ -1374,7 +1374,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "archive_deferred_alarm_count" => serde_json::json!(1),
             "archives" => serde_json::json!({"archive": {
                 "stamp":{"length":1,"device":1,"inode":2,"modified":[3,4],"changed":[0,0]},
-                "disposition":{"Held":{"cause":CodexZstCause::OwnerUnproven,"quiet":true}}
+                "disposition":{"Held":{"cause":"CompressedOwnerUnproven","quiet":true}}
             }}),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
@@ -3630,7 +3630,9 @@ fn scan_index_full_positional_field_order_is_pinned() {
 fn retired_codex_field(field: &str) -> bool {
     matches!(
         field,
-        "codex_parent_ownership_refs"
+        "archives"
+            | "archive_deferred_alarm_count"
+            | "codex_parent_ownership_refs"
             | "codex_parent_ownership_ledgers"
             | "codex_parent_side_requests"
             | "codex_parent_side"

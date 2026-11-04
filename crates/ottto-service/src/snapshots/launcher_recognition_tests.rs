@@ -104,7 +104,7 @@ fn run_with_limit(
                 );
                 finalize_scan_after_policy(source, &mut scan, &mut index);
                 if source == SnapshotSource::Codex && scan.codex_join_validation.is_some() {
-                    let (capture, _, _) =
+                    let (capture, _) =
                         index.stage_codex_recovery_capture(&previous, &scan.snapshots);
                     scan.finish_codex_capture_boundary(&mut index);
                     let accepted = scan
