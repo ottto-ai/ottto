@@ -366,13 +366,15 @@ fn suffix<S: SourceFixture>() {
         route.save(false);
         route.index = ScanIndex::load(&route.path).unwrap();
         assert_eq!(head::<S>(&route, &path).body, predecessor);
-        // Main's compatibility reader may disclose the unfinished row once;
-        // no resulting reduction can overwrite that predecessor.
+        // The compatibility reader also keeps the unfinished row pending;
+        // it neither counts loss nor overwrites the predecessor.
         let (tail, compatibility) = full::<S>(&route, &path);
         assert_eq!(
             compatibility.report.physical_line_count,
-            S::lines().len() + 2
+            S::lines().len() + 1
         );
+        assert_eq!(compatibility.report.malformed_json_line_count, 1);
+        assert_eq!(compatibility.report.invalid_utf8_line_count, 0);
         assert!(!tail.publish(&Ok(compatibility)));
         route.save(false);
         assert_eq!(head::<S>(&route, &path).body, predecessor);
@@ -526,6 +528,96 @@ fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
         money_oracle::assert_no_smaller_reemit(&item.source_session_id, &prior, &held, cold, true);
     }
 }
+/// [regress] D1: a paused compatibility writer keeps its suffix pending;
+/// completing it tails exactly once from the saved head, equal to cold Full.
+#[test]
+fn paused_compatibility_suffix_completes_once_from_saved_head() {
+    let mut route = route_for(Source::Claude);
+    let path = route.dir.join(Claude::name());
+    let mut rows = claude_lines(3);
+    let last = rows.remove(3); // Third assistant response; retain the title.
+    write(&path, &rows);
+    let (tail, seed) = full::<Claude>(&route, &path);
+    assert_eq!(
+        (
+            seed.snapshots[0].input_tokens,
+            seed.snapshots[0].request_count
+        ),
+        (21, 2)
+    );
+    let previous = emitted::<Claude>(Mode::ColdFull, &route, &seed.snapshots);
+    commit::<Claude>(&mut route, &path, tail, seed);
+    let before = head::<Claude>(&route, &path);
+    let sealed = fs::metadata(&path).unwrap().len();
+    let split = last.len() / 2;
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&last.as_bytes()[..split]).unwrap();
+    drop(file);
+    let (mut p, base, mode) = stored::<Claude>(&route, &path);
+    assert_eq!(mode, ReadMode::Tail);
+    assert!(p.reader.extent_limit.is_none());
+    while !p.step().unwrap() {}
+    assert!(p.reader.sealed_fragment());
+    assert!(!p.apply_sealed_fragment());
+    let (tail, paused) = finish::<Claude>(&route, &path, p, Some(base));
+    assert!(paused.terminal_loss().is_none());
+    let (_, cold_paused) = full::<Claude>(&route, &path);
+    assert!(cold_paused.terminal_loss().is_none());
+    let partial_cold = emitted::<Claude>(Mode::ColdFull, &route, &cold_paused.snapshots);
+    let partial_tail = emitted::<Claude>(Mode::Restart, &route, &paused.snapshots);
+    money_oracle::assert_no_smaller_reemit(
+        &paused.snapshots[0].source_session_id,
+        &previous,
+        &partial_tail,
+        &partial_cold,
+        false,
+    );
+    assert!(!tail.publish(&Ok(paused)));
+    route.save(false);
+    route.index = ScanIndex::load(&route.path).unwrap();
+    assert_eq!(head::<Claude>(&route, &path).body, before.body);
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&last.as_bytes()[split..]).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let (p, base, mode) = stored::<Claude>(&route, &path);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(
+        p.reader.acquisition.as_ref().unwrap().start_offset(),
+        sealed
+    );
+    let (tail, completed) = finish::<Claude>(&route, &path, p, Some(base));
+    assert!(completed.terminal_loss().is_none());
+    assert_eq!(
+        (
+            completed.snapshots[0].input_tokens,
+            completed.snapshots[0].output_tokens,
+            completed.snapshots[0].request_count
+        ),
+        (33, 15, 3)
+    );
+    let (_, cold) = full::<Claude>(&route, &path);
+    let cold = emitted::<Claude>(Mode::ColdFull, &route, &cold.snapshots);
+    let actual = emitted::<Claude>(Mode::Restart, &route, &completed.snapshots);
+    money_oracle::assert_equivalent(&cold, &actual);
+    money_oracle::assert_no_smaller_reemit(
+        &completed.snapshots[0].source_session_id,
+        &previous,
+        &actual,
+        &cold,
+        false,
+    );
+    commit::<Claude>(&mut route, &path, tail, completed);
+    assert_eq!(
+        crate::snapshots::tail_source::committed_sealed_offset(
+            Claude::SOURCE,
+            &route.index,
+            &local_index_key(&path)
+        ),
+        Some(fs::metadata(&path).unwrap().len())
+    );
+}
+
 /// [regress] O1-O4/O6-O9: Claude responses survive discarded siblings.
 #[test]
 fn claude_bad_record_keeps_valid_responses() {

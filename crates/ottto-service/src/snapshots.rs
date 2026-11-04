@@ -2336,14 +2336,9 @@ impl ScanTraversalCounts {
         true
     }
 
-    /// The residue this generation settled, if any. Over-line-cap loss carries
-    /// its own per-file terminal disposition and is excluded here; its dropped
-    /// record share equals `terminal_over_line_cap_count` by construction
-    /// (`ParsedJsonlFile::terminal_loss`, `ScanCensus::add_terminal_jsonl_loss`).
+    /// The residue this generation settled, including all terminal drops.
     fn settled_residue(&self) -> Option<SettledScanResidue> {
-        let dropped_usage_record_count = self
-            .terminal_dropped_usage_record_count
-            .saturating_sub(self.terminal_over_line_cap_count as u64);
+        let dropped_usage_record_count = self.terminal_dropped_usage_record_count;
         (self.terminal_ownership_incomplete_file_count > 0
             || self.terminal_zero_snapshot_usage_evidence_count > 0
             || dropped_usage_record_count > 0)
@@ -19878,11 +19873,8 @@ impl OwnedSourceScan {
                     .as_ref()
                     .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
                 {
-                    // PR-1: every settleable held singleton (usage-bearing and
-                    // terminal over-line-cap included; `non_progressing_residue`
-                    // already requires `complete_except_over_line_cap`).
-                    // Anything else, completion included, clears
-                    // a stale entry.
+                    // Memoize a non-progressing ownership-held singleton.
+                    // Anything else, completion included, clears a stale entry.
                     let held = !parse_complete
                         && non_progressing_residue
                         && ownership_incomplete_file_count > 0;
@@ -20451,7 +20443,6 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                census.over_line_cap_count += report.over_line_cap_count;
                 if let Some(loss) = terminal_loss.as_ref() {
                     census.add_terminal_jsonl_loss(loss);
                 }
@@ -24617,7 +24608,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             return Ok(JsonlReaderStep::Complete(*report));
         }
 
-        apply_physical_line(
+        if !apply_physical_line(
             buf,
             report,
             // An unterminated trailing line reaches money only, never LD.
@@ -24632,8 +24623,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 )
             }),
             &mut on_value,
-            true,
-        );
+            line_complete,
+        ) {
+            // A paused compatibility writer has the same pending suffix as
+            // an extent-bound read. Valid JSON/blank EOF keeps its semantics.
+            self.sealed_fragment = Some(());
+        }
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
     }
@@ -44545,8 +44540,7 @@ mod tests {
             "settling is idempotent within a generation"
         );
 
-        // Over-line-cap loss keeps its own per-file terminal disposition and
-        // is not re-counted as residue.
+        // Legacy cap fields no longer subtract from the terminal drop residue.
         let mut with_cap_loss = ScanTraversalCounts {
             over_line_cap_count: 11,
             terminal_over_line_cap_count: 11,
@@ -44565,7 +44559,7 @@ mod tests {
             Some(SettledScanResidue {
                 ownership_incomplete_file_count: 2,
                 zero_snapshot_usage_evidence_count: 1,
-                dropped_usage_record_count: 577,
+                dropped_usage_record_count: 588,
             })
         );
 
@@ -59082,7 +59076,7 @@ mod tests {
             },
         );
         let parsed = parse_codex_test_with_metadata(&path, &metadata);
-        assert!(!parsed.report.complete());
+        assert!(parsed.report.complete());
         assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(
@@ -59094,7 +59088,8 @@ mod tests {
             ),
             (12, 2, 8, 1)
         );
-        assert_eq!(parsed.report.malformed_json_line_count, 1);
+        assert_eq!(parsed.report.malformed_json_line_count, 0);
+        assert!(parsed.terminal_loss().is_none());
         assert_eq!(
             parsed.state_only_blocked_session_ids,
             BTreeSet::from([child_id.to_string()])

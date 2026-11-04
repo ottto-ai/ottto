@@ -821,7 +821,7 @@ fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
     );
     // Deliver the real watcher's exact hint; listing time alone does not
     // promise a changed member will be selected from an unchanged directory.
-    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(modes, (0, 1, 0));
     assert_eq!(
         content(production_body(CLAUDE, next)),
         content(full_body(&base.fixture, CLAUDE))

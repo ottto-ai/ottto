@@ -726,9 +726,19 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
                 .any(|item| item.source_session_id == COPY),
             "only the exact ACK above suppresses the unchanged sibling"
         );
-        // The saved loss selects TerminalDisposition, which main's existing
-        // reuse gate sends to Full. The durable seal above still survived.
-        assert_eq!(replay.modes, (1, 0, 0));
+        // Same-generation growth continues the saved head despite its loss.
+        assert_eq!(replay.modes, (0, 1, 0));
+        assert_eq!(replay.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            replay.scan.malformed_json_line_count,
+            cold_page.scan.malformed_json_line_count
+        );
+        let dispositions = |page: &Page| {
+            serde_json::to_value(&page.index).unwrap()["terminal_jsonl_dispositions"].clone()
+        };
+        let cold_loss = dispositions(&cold_page);
+        assert!(!cold_loss.as_object().unwrap().is_empty());
+        assert_eq!(dispositions(&replay), cold_loss);
         assert_eq!(
             replay
                 .scan
