@@ -203,8 +203,9 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
     let fork = forked.finish_view().0.seen_pi_usage_keys.fork_parts();
     assert!(fork.0 && fork.1.is_some());
     let mut staged = stage(&forked, &certificate);
-    let stored = super::super::encode(|e| fork.put(e)).unwrap();
-    let orphan = super::super::encode(|e| (false, fork.1).put(e)).unwrap();
+    let stored = crate::durable_tail_codec::Enc::count_write(64, |e| fork.put(e)).unwrap();
+    let orphan =
+        crate::durable_tail_codec::Enc::count_write(64, |e| (false, fork.1).put(e)).unwrap();
     assert!(staged.head.ends_with(&stored));
     staged.head.truncate(staged.head.len() - stored.len());
     staged.head.extend(orphan);
