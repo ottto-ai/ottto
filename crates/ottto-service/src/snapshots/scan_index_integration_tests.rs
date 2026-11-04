@@ -109,6 +109,11 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
     ];
     for (map, field) in fields.into_iter().enumerate() {
         for cause in causes {
+            // The usage map's records are retired: they decode and drop, so
+            // no record in it can withhold the map.
+            if field == Field::UsagePending && cause == UnavailableCause::Decode {
+                continue;
+            }
             let mut fixture = Fixture::new();
             let healthy = fixture.load();
             assert!(healthy.persistence_available());
@@ -161,12 +166,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                     healthy.claude_account_family_pending
                 );
             }
-            if map != 1 {
-                assert_eq!(
-                    loaded.claude_usage_family_pending,
-                    healthy.claude_usage_family_pending
-                );
-            }
             if map != 2 {
                 assert_eq!(
                     serde_json::to_vec(&loaded.claude_request_census).unwrap(),
@@ -193,28 +192,12 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             let pending_before = loaded.claude_account_family_pending.clone();
             loaded.retire_committed_claude_account_pending_windows();
             assert_eq!(loaded.claude_account_family_pending, pending_before);
-            assert_eq!(
-                loaded.retire_absent_retry_pending_claude_families(
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    "fixture"
-                ),
-                0
-            );
             assert!(matches!(
                 loaded.lower_claude_retired_family_tombstone_fence(
                     &BTreeSet::new(),
                     &BTreeSet::new()
                 ),
                 ClaudeTombstoneFenceRepair::Kept { .. }
-            ));
-            assert!(!claude_stale_rearm_can_reopen_fence(
-                &loaded,
-                &BTreeSet::new()
-            ));
-            assert!(!claude_fence_held_only_by_witnessed_families(
-                &loaded,
-                "2026-10-29T00:00:00Z"
             ));
             let old_move_hold = loaded.claude_history_move_released;
             loaded.note_claude_history_cutoff(PriorHistory::Moved, true, false);
@@ -640,10 +623,6 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
                             &BTreeSet::new()
                         ),
                         ClaudeTombstoneFenceRepair::Kept { .. }
-                    ));
-                    assert!(!claude_stale_rearm_can_reopen_fence(
-                        &unknown,
-                        &BTreeSet::new()
                     ));
                     recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })

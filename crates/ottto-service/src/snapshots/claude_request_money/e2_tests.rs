@@ -1714,12 +1714,9 @@ fn tag_owned_with_fallbacks(
     let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
-    let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-    let ownership = claude_request_identity::TranscriptOwnership::after_census(index, &disposition);
     let activity = claude_request_identity::stage_request_owned_activity(
         &items,
         &evidence,
-        &ownership,
         &per_file_originals,
     );
     let withheld = finish_page(
@@ -1733,12 +1730,7 @@ fn tag_owned_with_fallbacks(
         withheld.is_empty(),
         "identity doubt must never withhold money"
     );
-    let outcome = claude_request_identity::apply_scan_with_ownership(
-        &mut items,
-        &evidence,
-        BTreeMap::new(),
-        &ownership,
-    );
+    let outcome = claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
     claude_request_identity::publish_request_owned_activity(&items, activity);
     assert!(expected_fallbacks <= items.len());
     assert_eq!(outcome.sent, items.len() - expected_fallbacks);
@@ -3069,14 +3061,10 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
         let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
-        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-        let ownership =
-            claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
         let originals = claude_request_identity::capture_request_owned_originals(&items);
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
-        let activity = claude_request_identity::stage_request_owned_activity(
-            &items, &evidence, &ownership, &originals,
-        );
+        let activity =
+            claude_request_identity::stage_request_owned_activity(&items, &evidence, &originals);
         assert!(finish_page(
             &mut items,
             &index,
@@ -3086,12 +3074,8 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
         )
         .is_empty());
         let before = serde_json::to_vec(&items).unwrap();
-        let outcome = claude_request_identity::apply_scan_with_ownership(
-            &mut items,
-            &evidence,
-            BTreeMap::new(),
-            &ownership,
-        );
+        let outcome =
+            claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
         assert_eq!((outcome.sent, outcome.ineligible), (0, 1));
         assert_eq!(serde_json::to_vec(&items).unwrap(), before);
         claude_request_identity::publish_request_owned_activity(&items, activity);
@@ -3131,15 +3115,8 @@ fn e2_identity_failed_tag_restores_activity_and_refusals() {
         let api = ClaudeLocalOtelLoadReport::default();
         let trace = ClaudeTraceOwnershipLoadReport::default();
         let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
-        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-        let ownership =
-            claude_request_identity::TranscriptOwnership::after_census(&index, &disposition);
-        let outcome = claude_request_identity::apply_scan_with_ownership(
-            &mut items,
-            &evidence,
-            BTreeMap::new(),
-            &ownership,
-        );
+        let outcome =
+            claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
         assert_eq!((outcome.sent, outcome.ineligible), (0, 1));
         assert_eq!(serde_json::to_vec(&items).unwrap(), before);
         cleanup(&[&path]);

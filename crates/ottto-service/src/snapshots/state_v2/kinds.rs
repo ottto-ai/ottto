@@ -3,7 +3,7 @@
 use super::super::account_pending_retention::Archived;
 use super::*;
 use anyhow::{bail, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct KindCx {
@@ -32,6 +32,9 @@ pub(super) struct KindCx {
     pub(super) tail: Option<tail::TailStage>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
+    /// Rows of retired kinds this hydrate found, by key only: their values are
+    /// never read. The baseline names them, so the next save removes them.
+    pub(super) retired: BTreeSet<RowKey>,
     valid: bool,
 }
 
@@ -64,14 +67,7 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         ..Default::default()
     };
     let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
-    // Members intentionally omitted by normalization remain in the committed
-    // baseline, so the existing delta removes them on the next ordinary save.
-    let retired = std::mem::take(&mut rows.seed)
-        .into_iter()
-        .filter(|(key, _)| matches!(key, RowKey::Record { kind, .. } if catalogue::retired_kind(kind.name())))
-        .collect::<BTreeMap<_, _>>();
     let mut stored = rows.finish()?;
-    stored.extend(retired);
     // Defaults are logical state, not rows the older store actually owns. They
     // must be absent from the baseline so the first save writes them all.
     stored.retain(|key, _| match key {
@@ -85,6 +81,14 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         },
         _ => true,
     });
+    // Nothing enumerates a retired kind, so the next save's `finish` removes
+    // these rows (releasing their shared sets) in its own transaction. Their
+    // digest is never compared. A failed save leaves them for the next hydrate.
+    stored.extend(
+        std::mem::take(&mut cx.retired)
+            .into_iter()
+            .map(|key| (key, [0; 32])),
+    );
     Ok(Baseline {
         generation: index.generation,
         rows: stored,
@@ -155,8 +159,10 @@ pub(super) fn hydrate_txn(
     );
     // An otherwise registered but unimplemented money kind must never vanish
     // because no group happens to scan it. Inventory the closed kind catalogue
-    // in bounded pages before installing any semantic state.
+    // in bounded pages before installing any semantic state. The same walk
+    // names every retired kind's rows, from their headers only.
     let mut after = None;
+    let mut retired = BTreeSet::new();
     loop {
         let page = tx.scan_prefix(
             RowPrefix {
@@ -176,6 +182,9 @@ pub(super) fn hydrate_txn(
                 catalogue::group(kind.name()).is_some(),
                 "state_v2_unmapped_kind"
             );
+            if catalogue::retired(kind.name()) {
+                retired.insert(header.key.clone());
+            }
         }
         after = page.last().map(|h| h.key.clone());
     }
@@ -185,6 +194,7 @@ pub(super) fn hydrate_txn(
         binding: Some(binding),
         layout: mapper::layout(tx)?,
         layout_recorded: tx.get(&RowKey::Meta("catalogue_layout".into()))?.is_some(),
+        retired,
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
@@ -331,14 +341,6 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
-                // Loaded usage families now match the rows this save left.
-                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
-                    let rows = &digests.rows;
-                    cold.saved(|root| {
-                        let key = mapper::key("usage.pending", root, 1).ok()?;
-                        rows.get(&key).copied()
-                    });
-                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;

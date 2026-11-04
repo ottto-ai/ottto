@@ -263,7 +263,7 @@ fn an_identical_stored_body_takes_the_ack_path() {
     let scan = finalize(&mut route, &key, items, true);
     assert!(scan.snapshots.is_empty());
     assert_eq!(scan.semantic_noop_count, count);
-    assert!(!route.index.files[&key].rearmed());
+    assert!(!route.index.files[&key].source_file_fingerprint.is_empty());
 }
 
 /// [behaviour] A file proven changed takes its Full under the proven reason.

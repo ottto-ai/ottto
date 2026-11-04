@@ -3744,7 +3744,7 @@ pub(crate) fn reconcile_request_accounts(
                 .requests
                 .get(&(root, request.as_str()))
                 .and_then(|row| *row);
-            let identity = request_occurrence_facts(item, request, occurrence, false)
+            let identity = request_occurrence_facts(item, request, occurrence)
                 .map(|facts| classify_ref(evidence, &facts));
             let copy = carry.on && fold.unproven_copy(occurrence);
             // A gap has no telemetry row and no other stream's owner.
@@ -4481,9 +4481,6 @@ pub(crate) struct RequestFacts<'a> {
     pub(crate) terminal_unix_seconds: Option<u64>,
     pub(crate) event_clock_complete: bool,
     pub(crate) marker: MarkerVerdict<'a>,
-    /// Another transcript also carries this request (the pass's duplicate
-    /// witness): it is not this transcript's alone.
-    pub(crate) duplicated_elsewhere: bool,
 }
 
 /// A borrowed authority key: classification builds no strings; a `Grouping`
@@ -4593,9 +4590,6 @@ pub(crate) fn classify_ref<'k>(
                 Some(Some(_)) => return Refused(Refusal::ForeignOwner),
                 Some(None) => return Refused(Refusal::ConflictingDuplicate),
                 None => {}
-            }
-            if facts.duplicated_elsewhere {
-                return Refused(Refusal::ConflictingDuplicate);
             }
             return match transcript_identity(facts) {
                 // A carried or missing clock cannot establish attribution.
@@ -4721,9 +4715,6 @@ struct ActivityRequest<'r> {
 /// each straight into a bounded `Grouping`; no request is retained.
 pub(crate) struct RequestSink<'s, 'a> {
     evidence: &'s ScanEvidence<'a>,
-    /// The duplicate witness, on the transcript path only; reported rows
-    /// carry their own telemetry owner.
-    duplicates: Option<&'s Duplicates>,
     /// Request-id hashes the reported rebuild excludes as another root's.
     excluded: Option<&'s BTreeSet<String>>,
     root: String,
@@ -4740,7 +4731,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
     ) -> Option<Self> {
         Some(Self {
             evidence,
-            duplicates: None,
             excluded: None,
             root: owner_root(item)?.to_string(),
             desktop: item
@@ -4750,11 +4740,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 == Some("claude-desktop"),
             grouping: Grouping::new(max_groups),
         })
-    }
-
-    fn with_duplicates(mut self, duplicates: &'s Duplicates) -> Self {
-        self.duplicates = Some(duplicates);
-        self
     }
 
     /// The item's transcript requests (by request-id hash) the reported
@@ -4803,13 +4788,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             return;
         }
         let (sequence, event_clock_complete) = request.occurrence.unzip();
-        let duplicated_elsewhere = self.duplicates.is_some_and(|duplicates| {
-            !duplicates.is_empty()
-                && duplicates.contains_key(&format!(
-                    "{:x}",
-                    sha2::Sha256::digest(request.request_id.as_bytes())
-                ))
-        });
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -4827,7 +4805,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 (Some(markers), Some(sequence)) => markers.verdict(sequence, self.desktop),
                 _ => MarkerVerdict::None,
             },
-            duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
         if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
@@ -4844,7 +4821,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
-        if !self.grouping.unowned_request && !duplicated_elsewhere {
+        if !self.grouping.unowned_request {
             let original = match self.evidence.native_originals {
                 Some(originals) => originals.get(&item.source_session_id),
                 None => item.session_account_evidence.as_ref(),
@@ -5022,32 +4999,6 @@ fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) 
     Some(())
 }
 
-/// Diagnostic-only query; never consumed by a scheduling or attribution gate.
-pub(super) fn full_rearm_requests_refused(
-    item: &SnapshotItem,
-    evidence: &ScanEvidence<'_>,
-    reported: Option<&Grouping>,
-    duplicates: &Duplicates,
-) -> bool {
-    let refused = |grouping: &Grouping| {
-        grouping.failed.is_some()
-            || grouping.unowned_request
-            || grouping.keys_over_cap
-            || grouping.rows().any(|(_, group)| group.refused)
-    };
-    if let Some(grouping) = reported {
-        return refused(grouping);
-    }
-    let Some(sink) = RequestSink::for_item(evidence, item, bucket_row_count(item)) else {
-        return false;
-    };
-    let mut sink = sink.with_duplicates(duplicates);
-    // An unplaceable own-byte structural shape is already handled by the
-    // native census. Preserve any refusals produced before placement stopped.
-    let _ = transcript_requests(item, |request| sink.add(item, request));
-    refused(&sink.finish())
-}
-
 /// The transcript path's request-count guard: the parser counted exactly the
 /// owned occurrences that carry usage, each under its own request id. A
 /// response whose every usage field is zero (an API-error record with a
@@ -5078,37 +5029,16 @@ pub(crate) fn owner_root(item: &SnapshotItem) -> Option<&str> {
     }
 }
 
-type Duplicates = BTreeMap<String, BTreeSet<super::ClaudeDuplicateRequestOwner>>;
-
-/// This pass's duplicate witness. Census settlement never authorizes marker
-/// tags; duplicates still refuse transcript requests without their own telemetry.
-pub(crate) struct TranscriptOwnership<'i> {
-    duplicates: &'i Duplicates,
-}
-
-impl<'i> TranscriptOwnership<'i> {
-    pub(crate) fn after_census(
-        index: &'i ScanIndex,
-        _disposition: &super::ClaudeUsageAuthorityDisposition,
-    ) -> Self {
-        Self {
-            duplicates: &index.claude_duplicate_request_owners,
-        }
-    }
-}
-
-/// No duplicates: what the classification tests assume.
+/// What the classification tests run: stage, tag and publish one page.
 #[cfg(test)]
 pub(crate) fn apply_scan(
     snapshots: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
     reported: BTreeMap<String, Grouping>,
 ) -> ScanOutcome {
-    static NONE: Duplicates = BTreeMap::new();
-    let ownership = TranscriptOwnership { duplicates: &NONE };
     let originals = capture_request_owned_originals(snapshots);
-    let activity = stage_request_owned_activity(snapshots, evidence, &ownership, &originals);
-    let outcome = apply_scan_with_ownership(snapshots, evidence, reported, &ownership);
+    let activity = stage_request_owned_activity(snapshots, evidence, &originals);
+    let outcome = apply_scan_page(snapshots, evidence, reported);
     publish_request_owned_activity(snapshots, activity);
     outcome
 }
@@ -5116,24 +5046,17 @@ pub(crate) fn apply_scan(
 /// Tag every eligible Claude item of this pass. Runs before the legacy account path, which leaves
 /// new-collector items alone; ineligible items stay on today's path untouched.
 /// `reported` holds the groupings the reported rebuild produced this pass.
-pub(crate) fn apply_scan_with_ownership(
+pub(crate) fn apply_scan_page(
     snapshots: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
     mut reported: BTreeMap<String, Grouping>,
-    ownership: &TranscriptOwnership<'_>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     for item in snapshots {
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(
-            item,
-            evidence,
-            &mut reported,
-            ownership,
-            &mut outcome.copy_invalidated,
-        ) {
+        match tag_item(item, evidence, &mut reported, &mut outcome.copy_invalidated) {
             Some(Ok(Tagged::Held)) => {
                 outcome.held.insert(item.source_session_id.clone());
             }
@@ -5189,7 +5112,6 @@ pub(crate) struct RequestOwnedActivity(
 pub(crate) fn stage_request_owned_activity(
     items: &[SnapshotItem],
     evidence: &ScanEvidence<'_>,
-    ownership: &TranscriptOwnership<'_>,
     originals: &RequestOwnedOriginals,
 ) -> RequestOwnedActivity {
     let mut page = RequestOwnedActivity::default();
@@ -5221,7 +5143,6 @@ pub(crate) fn stage_request_owned_activity(
             .push(collect_request_owned_activity(
                 item,
                 evidence,
-                ownership,
                 originals
                     .0
                     .get(&(
@@ -5262,7 +5183,6 @@ fn request_occurrence_facts<'a>(
     item: &'a SnapshotItem,
     request_id: &'a str,
     occurrence: &'a super::ClaudeTranscriptUsageOccurrence,
-    duplicated_elsewhere: bool,
 ) -> Option<RequestFacts<'a>> {
     let root = owner_root(item)?;
     let timestamp = occurrence.timestamp.as_deref()?;
@@ -5283,14 +5203,12 @@ fn request_occurrence_facts<'a>(
             .map_or(MarkerVerdict::None, |markers| {
                 markers.verdict(occurrence.sequence, desktop)
             }),
-        duplicated_elsewhere,
     })
 }
 
 fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
-    ownership: &TranscriptOwnership<'_>,
     original: Option<&super::SessionAccountEvidence>,
 ) -> crate::desktop_recent::RecentActivity {
     let Some(fold) = item.claude_money.as_deref() else {
@@ -5304,18 +5222,10 @@ fn collect_request_owned_activity(
         {
             continue;
         }
-        let duplicated = !ownership.duplicates.is_empty()
-            && ownership.duplicates.contains_key(&format!(
-                "{:x}",
-                sha2::Sha256::digest(request_id.as_bytes())
-            ));
-        if duplicated {
-            continue;
-        }
         let Some(timestamp) = occurrence.timestamp.as_deref() else {
             continue;
         };
-        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false) else {
+        let Some(facts) = request_occurrence_facts(item, request_id, occurrence) else {
             continue;
         };
         let identity = classify_ref(evidence, &facts);
@@ -5355,7 +5265,6 @@ fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
     reported: &mut BTreeMap<String, Grouping>,
-    ownership: &TranscriptOwnership<'_>,
     invalidated_rows: &mut Vec<CopyInvalidation>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let accepted = evidence
@@ -5465,8 +5374,7 @@ fn tag_item(
         }
         grouping
     } else {
-        let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?
-            .with_duplicates(ownership.duplicates);
+        let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
         transcript_requests(item, |request| sink.add(item, request))?;
         sink.finish()
     };

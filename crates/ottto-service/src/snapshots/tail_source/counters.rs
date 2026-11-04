@@ -43,16 +43,25 @@ pub(in crate::snapshots) fn add(
     });
 }
 
+/// A D168 replay: a counted read from a file's start, never a load outcome.
+#[derive(Clone, Copy)]
+pub(in crate::snapshots) enum Replay {
+    /// A Codex group read from its first member.
+    Group,
+    /// A file with a protected Codex receipt read from its start, so the
+    /// receipt's prefix is reproduced.
+    TierPrefix,
+}
+
 /// One executed D168 replay on the reconstruction counters, with the bytes
 /// the replay read. A replay is no failure after a head: it is not in
 /// `tail_reconstruct_after_head`. Its bytes are also in the page's
 /// `completed_full_native_bytes`, as every Full's.
-pub(in crate::snapshots) fn replay(
-    source: SnapshotSource,
-    cause: super::ReconstructCause,
-    bytes: u64,
-) {
-    let label = cause.label();
+pub(in crate::snapshots) fn replay(source: SnapshotSource, replay: Replay, bytes: u64) {
+    let label = match replay {
+        Replay::Group => "group_replay",
+        Replay::TierPrefix => "tier_prefix_replay",
+    };
     bump(source, "tail_reconstruct", label);
     add(source, "tail_reconstruct_bytes", label, bytes);
 }

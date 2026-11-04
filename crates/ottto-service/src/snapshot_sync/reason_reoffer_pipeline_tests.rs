@@ -3,41 +3,18 @@
 // cycle, and a test-thread wall clock for the local re-offer schedule only.
 // Nothing waits 24 hours; no provider, credential or runtime state is read.
 use super::*;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 const DAY: u64 = 86_400;
 const ORIGINAL_PAIR: &str = "original_pair_candidate_unproved";
 
 thread_local! {
     static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
-    static EVIDENCE_STATS: RefCell<Option<ClaudeLocalEvidenceStats>> = const { RefCell::new(None) };
 }
 
 /// The synthetic local scheduling clock of this test thread, if set.
 pub(crate) fn clock() -> Option<u64> {
     CLOCK.with(Cell::get)
-}
-
-/// Observe the same counts serialized on the Claude local-evidence line.
-pub(crate) fn record_evidence_stats(stats: &ClaudeLocalEvidenceStats) {
-    if clock().is_some() {
-        EVIDENCE_STATS.with(|slot| slot.replace(Some(stats.clone())));
-    }
-}
-
-/// The scanner uses a wall-clock second, independently of the scheduling
-/// clock. Wait at most one second for a different census window before
-/// re-reading a member whose request set changed.
-fn wait_for_fresh_census_window(previous: &str) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while current_rfc3339() == previous {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "the wall-clock census second must advance"
-        );
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
 }
 
 struct ClockGuard;
@@ -259,7 +236,6 @@ impl Drop for ReofferServer {
 struct CycleResult {
     result: Result<()>,
     census_window_end: String,
-    evidence_stats: Option<ClaudeLocalEvidenceStats>,
     leased_offers: usize,
     cache_enabled: bool,
     index: ScanIndex,
@@ -345,13 +321,6 @@ impl ReofferPipeline {
         self.cycle_with_census(now, true)
     }
 
-    /// One real due cycle that starts with RetryPending authority debt: its
-    /// scanner terminal withholds the ordinary census (path-(a) bridge), and
-    /// the debt settles in finish.
-    fn cycle_with_authority_debt(&mut self, now: u64) -> CycleResult {
-        self.cycle_with_census(now, false)
-    }
-
     fn collection() -> AgentStatusCollection {
         AgentStatusCollection {
             snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
@@ -395,7 +364,6 @@ impl ReofferPipeline {
             "synthetic census is complete unless authority debt withholds it"
         );
         let census_window_end = preparation.scan_started_at.clone();
-        EVIDENCE_STATS.with(|slot| slot.replace(None));
         let cooldown_deferred = index.reason_reoffer_cooldown_deferred_count();
         let cache_enabled = preparation.cache_observations_enabled;
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
@@ -425,7 +393,6 @@ impl ReofferPipeline {
         CycleResult {
             result,
             census_window_end,
-            evidence_stats: EVIDENCE_STATS.with(|slot| slot.take()),
             leased_offers,
             cache_enabled,
             index: ScanIndex::load(&index_path).unwrap(),
@@ -1411,8 +1378,8 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
 }
 
 /// A protected root, named by the local
-/// re-emission list, whose family a census retired as absent (tombstoned,
-/// witness kept) and whose member then returns, through the real
+/// re-emission list, whose family holds a stored witness and a census retired
+/// as absent (tombstoned, witness kept) and whose member then returns, through the real
 /// prepare/finish pipeline and the recording server. The return re-enters
 /// the authority path, and nothing emitted for the root is a request-owned
 /// literal (`claude_request_counting:v1`, the "new v1"), nor is any file of
@@ -1440,14 +1407,30 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         .expect("the root is indexed");
 
     crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
-    let mut index = ScanIndex::load(&first.index_path).unwrap();
-    index.tombstone_claude_family_for_test(root);
-    index.save(&first.index_path).unwrap();
     let transcript = pipeline
         .fixture
         .home
         .join(".claude/projects/-synthetic-repo")
         .join(format!("{root}.jsonl"));
+    // An upgraded store's state: an older build stored the family's witness
+    // (no build proves a new one), then a census retired the family.
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    let items = crate::snapshots::parse_claude_code_jsonl_file(
+        &transcript,
+        &first.census_window_end,
+        String::new(),
+    )
+    .unwrap();
+    assert!(
+        index.install_stored_claude_family_witness_from_support_for_test(
+            root,
+            &items,
+            &pipeline.support
+        ),
+        "the stored witness installs"
+    );
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
     let bytes = std::fs::read(&transcript).unwrap();
     std::fs::remove_file(&transcript).unwrap();
     let absent = pipeline.cycle(t0 + 600);
@@ -2385,221 +2368,5 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     assert_eq!(
         quiet.index.files[&key].effective_upload_body_witness_revision,
         settled_revision
-    );
-}
-
-/// A returning family that grew needs one cumulative replacement body.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
-    // Tombstone hold until reported proof is ordinary-money policy: the family is listed below.
-
-    if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {
-        return;
-    }
-    let root = IDENTITY_PIPELINE_ROOT;
-    let t0 = current_unix_seconds();
-    let mut pipeline = ReofferPipeline::new("patha-grown-return-fresh-window", Answer::Accept, t0);
-    let first = pipeline.cycle(t0);
-    assert!(first.result.is_ok(), "{:?}", first.result);
-    let root_offers = |offered: &[serde_json::Value]| {
-        offered
-            .iter()
-            .filter(|offer| offer["source_session_id"] == root)
-            .map(fingerprint_of)
-            .collect::<Vec<_>>()
-    };
-    let accepted = root_offers(&pipeline.server.offered());
-    assert_eq!(accepted.len(), 1, "the root is offered once at first");
-    let key = first
-        .index
-        .files
-        .keys()
-        .find(|key| key.ends_with(&format!("{root}.jsonl")))
-        .cloned()
-        .expect("the root is indexed");
-    let witness = first
-        .index
-        .claude_usage_family_witness_digest_for_test(root)
-        .expect("the proven root keeps a witness");
-
-    // Retire the family: its tombstone stands while it is absent.
-    let mut index = ScanIndex::load(&first.index_path).unwrap();
-    index.tombstone_claude_family_for_test(root);
-    index.save(&first.index_path).unwrap();
-    let transcript = pipeline
-        .fixture
-        .home
-        .join(".claude/projects/-synthetic-repo")
-        .join(format!("{root}.jsonl"));
-    let bytes = std::fs::read(&transcript).unwrap();
-    std::fs::remove_file(&transcript).unwrap();
-    let absent = pipeline.cycle(t0 + 600);
-    assert!(absent.result.is_ok(), "{:?}", absent.result);
-    assert!(!absent.index.files.contains_key(&key));
-    assert!(absent.index.claude_family_tombstoned_for_test(root));
-    assert!(!reemission_list_path(&pipeline.support).exists());
-    // The family keeps ordinary money: an installed list names it, and every
-    // later cycle loads that list (`load_claude_reemission_exclusions`).
-    crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
-    assert!(reemission_list_path(&pipeline.support).exists());
-    let offered_before = pipeline.server.offered().len();
-
-    // It returns with the same bytes while its proof is unhealthy: the
-    // tombstone routes it to the authority path, held, nothing offered.
-    let api = pipeline
-        .support
-        .join("local-otel/claude-code-effort")
-        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
-    std::fs::write(&api, b"{ malformed synthetic proof\n").unwrap();
-    std::fs::write(&transcript, &bytes).unwrap();
-    let returned = pipeline.cycle(t0 + 1_200);
-    assert!(returned.result.is_ok(), "{:?}", returned.result);
-    assert!(
-        root_offers(&pipeline.server.offered()[offered_before..]).is_empty(),
-        "nothing is offered before the proof"
-    );
-    let record = returned
-        .index
-        .claude_authority_record_for_test(root)
-        .expect("the returning root re-forms its record, never a new file");
-    assert!(record.bound_to_retained_witness && !record.terminal);
-    assert_eq!(record.proven_witness_fingerprint, witness);
-    assert_eq!(record.failed_reconstruction_count, 1);
-    assert!(returned.index.claude_family_tombstoned_for_test(root));
-
-    assert_eq!(
-        returned
-            .evidence_stats
-            .as_ref()
-            .expect("Claude evidence fold")
-            .first_proof_hold
-            .census_withheld_retry_pending_family_count,
-        1,
-        "the existing census counter exposes the held RetryPending family"
-    );
-
-    assert_eq!(
-        returned
-            .evidence_stats
-            .as_ref()
-            .unwrap()
-            .returning_family_grown_held,
-        1
-    );
-
-    // Growth needs a new witness. Keep exact reconstruction unchanged and
-    // let the native terminal re-prove in a new wall-clock census window.
-    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
-        .replace_nanosecond(0)
-        .unwrap()
-        .format(&Rfc3339)
-        .unwrap();
-    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
-        "sessionId": root, "requestId": "req_3",
-        "message": {"id": "m3", "model": "claude-haiku-4-5",
-        "usage": {"input_tokens": 30, "output_tokens": 3}}});
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript)
-        .unwrap()
-        .write_all(format!("{grown}\n").as_bytes())
-        .unwrap();
-    // Still-unhealthy evidence holds the genuinely grown returning family.
-    // The dedicated census-line value must expose it while other pending
-    // causes remain in the existing aggregate counter.
-    wait_for_fresh_census_window(&returned.census_window_end);
-    let grown_held = pipeline.cycle_with_authority_debt(t0 + 1_500);
-    assert!(grown_held.result.is_ok(), "{:?}", grown_held.result);
-    assert_ne!(grown_held.census_window_end, returned.census_window_end);
-    let held_stats = grown_held
-        .evidence_stats
-        .as_ref()
-        .expect("Claude evidence fold");
-    assert_eq!(held_stats.returning_family_grown_held, 1);
-    assert_eq!(
-        held_stats
-            .duplicate_census
-            .page_invalidated_member_changed_count,
-        0
-    );
-    assert_eq!(
-        held_stats
-            .first_proof_hold
-            .census_withheld_retry_pending_family_count,
-        1
-    );
-    assert!(grown_held
-        .index
-        .claude_authority_record_for_test(root)
-        .is_some());
-    assert!(grown_held.index.claude_family_tombstoned_for_test(root));
-    assert!(root_offers(&pipeline.server.offered()[offered_before..]).is_empty());
-    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
-    // It starts with the RetryPending record, which withholds this scan's
-    // census; the next cycle, with the debt settled, completes it again.
-    wait_for_fresh_census_window(&grown_held.census_window_end);
-    let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
-    assert!(proved.result.is_ok(), "{:?}", proved.result);
-    assert_ne!(proved.census_window_end, returned.census_window_end);
-    assert_ne!(proved.census_window_end, grown_held.census_window_end);
-    assert_eq!(
-        proved
-            .evidence_stats
-            .as_ref()
-            .unwrap()
-            .returning_family_grown_held,
-        0
-    );
-    assert_eq!(
-        proved
-            .evidence_stats
-            .as_ref()
-            .expect("Claude evidence fold")
-            .duplicate_census
-            .page_invalidated_member_changed_count,
-        0
-    );
-    assert_eq!(
-        proved
-            .evidence_stats
-            .as_ref()
-            .expect("Claude evidence fold")
-            .first_proof_hold
-            .census_withheld_retry_pending_family_count,
-        0
-    );
-    let later = pipeline.cycle(t0 + 2_400);
-    assert!(later.result.is_ok(), "{:?}", later.result);
-    let offered = pipeline.server.offered();
-    let reoffered = root_offers(&offered[offered_before..]);
-    assert_eq!(reoffered.len(), 1, "re-offered exactly once: {reoffered:?}");
-    let body = |fingerprint: &str| {
-        offered
-            .iter()
-            .find(|offer| fingerprint_of(offer) == fingerprint)
-            .unwrap()
-    };
-    assert_ne!(reoffered[0], accepted[0], "growth creates a new body B1");
-    let baseline = usage_of(body(&accepted[0]));
-    assert_eq!(
-        usage_of(body(&reoffered[0])),
-        (baseline.0 + 1, baseline.1 + 30, baseline.2 + 3),
-        "B1 is cumulative B0 plus req_3, superseding B0 rather than adding it again"
-    );
-    assert!(later.index.files.contains_key(&key), "never dropped");
-    assert!(later
-        .index
-        .accepted_snapshot_fingerprint_recorded(&reoffered[0]));
-    assert!(later.index.claude_authority_record_for_test(root).is_none());
-    assert!(!later.index.claude_family_tombstoned_for_test(root));
-    let once_more = pipeline.cycle(t0 + 3_000);
-    assert!(once_more.result.is_ok(), "{:?}", once_more.result);
-    assert_eq!(
-        root_offers(&pipeline.server.offered()[offered_before..]),
-        reoffered,
-        "the accepted cumulative head is not offered again"
     );
 }

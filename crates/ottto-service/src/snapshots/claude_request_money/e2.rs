@@ -2285,7 +2285,7 @@ fn scan_evidence(
     let settled = index
         .files
         .get(key)
-        .filter(|entry| record.proves_current(entry.observed_fingerprint()));
+        .filter(|entry| record.proves_current(entry.source_file_fingerprint.as_str()));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
     if let Some(metadata) = &metadata {
         let now = metadata
@@ -4320,7 +4320,7 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         if let Some(record) = index.claude_request_census.get(key).filter(|record| {
             !record.request_hashes().is_empty()
                 && index.files.get(key).is_some_and(|entry| {
-                    record.current_for(entry.observed_fingerprint())
+                    record.current_for(entry.source_file_fingerprint.as_str())
                         && entry.same_listing_stamp_as(&metadata)
                 })
         }) {

@@ -30,11 +30,6 @@
 //! record's allowlist digest, so any change to a class, field or type refuses
 //! old records.
 
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the verify walk and the shape run only in tests")
-)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 
@@ -249,11 +244,13 @@ impl<'a> Dec<'a> {
 /// The shape of every persisted type: names, classes and field types, each
 /// named type once.
 #[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code, reason = "shape walk: tests only"))]
 pub(crate) struct Shape {
     text: String,
     seen: BTreeSet<&'static str>,
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "shape walk: tests only"))]
 impl Shape {
     pub(crate) fn push(&mut self, part: &str) {
         self.text.push_str(part);
@@ -281,7 +278,9 @@ pub(crate) trait Durable: Sized {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse>;
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
     /// Walk the stored fields without constructing the value or allocating.
+    #[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    #[cfg_attr(not(test), allow(dead_code, reason = "shape walk: tests only"))]
     fn shape(s: &mut Shape);
 }
 
@@ -294,7 +293,9 @@ pub(crate) trait Durable: Sized {
 pub(crate) trait HDigest: Sized {
     fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse>;
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
+    #[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    #[cfg_attr(not(test), allow(dead_code, reason = "shape walk: tests only"))]
     fn shape_h(s: &mut Shape);
 }
 
@@ -442,6 +443,7 @@ impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
 pub(crate) fn verify_h_map<K: HDigestKey + Ord, V: Durable>(
     d: &mut Dec<'_>,
     max: usize,
@@ -449,6 +451,7 @@ pub(crate) fn verify_h_map<K: HDigestKey + Ord, V: Durable>(
     verify_entries_bounded(d, max, K::key_h, V::verify)
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
 fn verify_seq(
     d: &mut Dec<'_>,
     mut item: impl FnMut(&mut Dec<'_>) -> Result<(), Corrupt>,
@@ -488,10 +491,12 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
 /// intentionally not keys: their decoded equality need not match wire order.
 pub(crate) trait DurableKey: Durable {
     type View<'a>: Ord;
+    #[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
     fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt>;
 }
 pub(crate) trait HDigestKey: HDigest {
     type View<'a>: Ord;
+    #[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
     fn key_h<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt>;
 }
 macro_rules! scalar_keys {
@@ -570,6 +575,7 @@ impl<T: HDigestKey> HDigestKey for Option<T> {
 /// Canonically sorted entries take one linear walk. Decode also accepts
 /// unsorted unique entries: re-walk earlier borrowed keys in that case to
 /// reject duplicates exactly, using constant space (worst-case quadratic time).
+#[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
 fn verify_entries<'a, K: Ord>(
     d: &mut Dec<'a>,
     key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
@@ -578,6 +584,7 @@ fn verify_entries<'a, K: Ord>(
     verify_entries_bounded(d, usize::MAX, key, value)
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
 fn verify_entries_bounded<'a, K: Ord>(
     d: &mut Dec<'a>,
     max: usize,
@@ -1018,7 +1025,9 @@ pub(crate) trait GrownArray: Sized {
     type Item;
     fn put_grown(&self, e: &mut Enc) -> Result<(), Refuse>;
     fn take_grown(d: &mut Dec<'_>, pad: impl FnMut() -> Self::Item) -> Result<Self, Corrupt>;
+    #[cfg_attr(not(test), allow(dead_code, reason = "verify walk: tests only"))]
     fn verify_grown(d: &mut Dec<'_>) -> Result<(), Corrupt>;
+    #[cfg_attr(not(test), allow(dead_code, reason = "shape walk: tests only"))]
     fn shape_grown(s: &mut Shape);
 }
 

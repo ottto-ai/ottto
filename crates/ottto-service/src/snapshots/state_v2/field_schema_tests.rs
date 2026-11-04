@@ -651,7 +651,7 @@ fn read_fixture(name: &str) -> String {
 }
 /// Owned kinds no sample field writes: opaque v1 holds and retired kinds.
 fn unwritten(kind: &str) -> bool {
-    catalogue::retired_kind(kind)
+    catalogue::retired(kind)
         || kind.starts_with("raw_hold.")
         || matches!(
             kind,
@@ -711,26 +711,8 @@ fn g(given: Given) -> Given {
 fn given() -> Vec<(&'static str, Vec<Given>)> {
     use crate::local_resource_diagnostics::CapCounts;
     use crate::snapshots::codex_file_join::AppliedTierReceipt;
-    use crate::snapshots::evidence_owed::EvidenceContract;
-    use crate::snapshots::ClaudeStaleFamilyCarryOrigin;
     vec![
         ("traversal/counts/caps", vec![g(|s| s.json::<CapCounts>())]),
-        (
-            "claude_stale_family_carry/origin",
-            vec![g(|s| s.json::<ClaudeStaleFamilyCarryOrigin>())],
-        ),
-        (
-            "claude_usage_family_pending/*/identity_contract",
-            vec![g(|s| s.json::<EvidenceContract>())],
-        ),
-        (
-            "claude_usage_family_pending/*/contract_unproven",
-            vec![g(|_| Ok(json!(true)))],
-        ),
-        (
-            "claude_usage_family_pending/*/idless_revision",
-            vec![g(|_| Ok(Json::Array(vec![json!(1); 32])))],
-        ),
         (
             "traversal/counts/unreadable_causes/samples",
             vec![g(|_| {

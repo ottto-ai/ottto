@@ -39,12 +39,12 @@ fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
     .remove(0)
 }
 
-/// [regress] Reader-upgrade recovery: a family proven before the thinking reader hashed reasoning 0 into its
-/// witness. After the upgrade a member re-parses with thinking and the same
-/// request set. The sidecar still reports 0, so the next complete, healthy
-/// census re-proves the family and uploads it; it never ends terminal.
+/// [regress] Reader upgrade: a family witness stored before the thinking
+/// reader hashed reasoning 0. After the upgrade a member re-parses with
+/// thinking and the same request set. It cannot be rebuilt against the stored
+/// witness, so it is held for a bounded retry, never lost or terminal.
 #[test]
-fn family_proven_before_thinking_reader_reproves_after_upgrade() {
+fn family_stored_before_thinking_reader_is_held_after_upgrade() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to native grains.
 
     use super::tests::{complete_api_row, complete_trace_row, manifest_index_entry};
@@ -101,14 +101,15 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         parse_member(&root_path, "root-fp-1"),
         parse_member(&child_path, "child-fp-1"),
     ];
-    apply_claude_reported_usage_with_index(
-        &mut items,
+    // An upgraded store's witness, stored before the thinking reader: no
+    // build proves a new one.
+    assert!(index.install_stored_claude_family_witness_for_test(
+        FAMILY_ROOT,
+        &items,
         &api_report,
         &trace_report,
-        &mut index,
-        true,
-        "2026-08-02T07:10:00Z",
-    );
+    ));
+    apply_claude_reported_usage_with_index(&mut items, &api_report, &trace_report, &mut index);
     assert!(items
         .iter()
         .all(|item| item.usage_accounting_contract.as_deref() == exclusive));
@@ -119,7 +120,7 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         .expect("family proven with reasoning 0");
 
     // After the upgrade: the root re-parses with thinking, same requests.
-    let (root_path, child_path) = write_family(&dir, Some(4));
+    let (root_path, _) = write_family(&dir, Some(4));
     let mut reparsed = vec![parse_member(&root_path, "root-fp-2")];
     assert_eq!(reparsed[0].reasoning_output_tokens, 8);
     assert_eq!(
@@ -133,8 +134,6 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         &api_report,
         &trace_report,
         &mut index,
-        true,
-        "2026-08-02T07:11:00Z",
     );
     never_terminal(&index);
     assert_eq!(reparsed[0].usage_accounting_contract, None);
@@ -150,36 +149,5 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         Some(&proven_before)
     );
 
-    // The next complete, healthy census re-parses the family.
-    let mut census = vec![
-        parse_member(&root_path, "root-fp-2"),
-        parse_member(&child_path, "child-fp-1"),
-    ];
-    let disposition = apply_claude_reported_usage_with_index(
-        &mut census,
-        &api_report,
-        &trace_report,
-        &mut index,
-        true,
-        "2026-08-02T07:12:00Z",
-    );
-    never_terminal(&index);
-    assert_eq!(disposition.quarantined_entity_count(), 0);
-    assert!(census
-        .iter()
-        .all(|item| item.usage_accounting_contract.as_deref() == exclusive));
-    assert_eq!(census[0].reasoning_output_tokens, 8);
-    assert_eq!(census[0].output_tokens, 20);
-    let mut uploadable = census;
-    disposition.retain_uploadable(&mut uploadable);
-    assert_eq!(uploadable.len(), 2, "re-proven revisions reach upload");
-    assert!(!index
-        .claude_usage_authority_quarantine
-        .contains_key(FAMILY_ROOT));
-    assert_ne!(
-        index.claude_usage_family_witnesses.get(FAMILY_ROOT),
-        Some(&proven_before),
-        "the new witness hashes the thinking count"
-    );
     let _ = fs::remove_dir_all(dir);
 }

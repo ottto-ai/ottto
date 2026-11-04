@@ -290,11 +290,6 @@ impl Page {
             &disposition,
             &backfill,
         );
-        // The streamed terminal's local counters depend on the store's
-        // representation (resident or cold) and are logged only; the arms
-        // compare what the fold decided (its stats copy included).
-        disposition.terminal_stream = Default::default();
-        self.stats.terminal_stream = Default::default();
         self.disposition = disposition.clone();
         if let (Some(mut checks), Some((whole, whole_accepted, whole_reads))) = (checks, whole) {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
@@ -373,9 +368,8 @@ type ComparedSide<'p> = (
 struct StreamedChecks {
     non_terminal: usize,
     terminal: usize,
-    /// Enrichments whose streamed read dropped another complete root's rows.
-    dropped: usize,
-    /// Enrichments whose terminal proof reread a pair the page did not keep.
+    /// Enrichments whose terminal pass read more pairs than the whole fold.
+    /// None: the terminal proof reread is gone.
     reread: usize,
     /// Enrichments whose bodies, both ways, carry L2 and its org forward to
     /// root A's own request that has no telemetry row.
@@ -442,8 +436,6 @@ impl StreamedChecks {
             Some("8".repeat(64)),
             1,
         )));
-        let page_roots = claude_evidence_root_session_ids(&streamed.scan.snapshots).len();
-        self.dropped += usize::from(streamed.stats.complete_sidecar_root_count > page_roots);
         self.reread += usize::from(terminal && reads > whole_reads);
     }
 }
@@ -686,11 +678,11 @@ fn five_root_sweep(multi_root: bool) {
 }
 
 /// [money] Streaming the Claude local evidence (only the page's roots keep
-/// rows; every root adds its cross-root answers as it is read; a terminal
-/// proof rereads the pairs it did not keep) emits exactly what a fold over
-/// every root's rows emits. Every enrichment of the fixtures below runs both
-/// ways: bodies, contract-5 tags, persisted index, holds and stats byte-equal,
-/// the money oracle equal, on non-terminal and terminal passes.
+/// rows; every root adds its cross-root answers as it is read) emits
+/// exactly what a fold over every root's rows emits. Every enrichment of the
+/// fixtures below runs both ways: bodies, contract-5 tags, persisted index,
+/// holds and stats byte-equal, the money oracle equal, on non-terminal and
+/// terminal passes.
 #[test]
 fn streamed_evidence_equals_whole_corpus() {
     // A request's API and trace rows under its own root are one owner; only
@@ -721,16 +713,17 @@ fn streamed_evidence_equals_whole_corpus() {
         twins(false);
         // A page copy with no own rows (the foreign-owner branch).
         e2_pipeline_resumed_prefix_counts_removed_partial_dollars_and_own_turns();
-        e2_pipeline_legacy_fork_prefix_is_removed_exactly_once();
     });
     assert!(
-        checks.non_terminal > 0
-            && checks.terminal > 0
-            && checks.dropped > 0
-            && checks.reread > 0
-            && checks.carried > 0,
-        "the arm must compare non-terminal and terminal passes that drop and reread rows \
-         and carry an account forward: {checks:?}"
+        // The evidence pass reads only the page's roots (no pending-family
+        // scope), so no streamed read has another root's rows to drop.
+        checks.non_terminal > 0 && checks.terminal > 0 && checks.carried > 0,
+        "the arm must compare non-terminal and terminal passes that carry an account \
+         forward: {checks:?}"
+    );
+    assert_eq!(
+        checks.reread, 0,
+        "no terminal pass rereads a pair: {checks:?}"
     );
 }
 
@@ -1301,13 +1294,19 @@ fn twins(reverse: bool) {
             "opposite discovery orders count each request once on the first page"
         );
         assert_eq!(first.scan.snapshots.len(), 1);
-        let expected = canonical(&first.scan.snapshots);
         first.finish();
         let prior = c.reload(&mut first.index);
-        let repeated = ready(&c, &scanner, prior, 100, false);
-        assert_eq!(
-            canonical(&repeated.scan.snapshots),
-            expected,
+        // Unchanged settled twins are read again only by a change: the old
+        // terminal family re-arm that re-read them on every complete census
+        // is gone.
+        let (repeated, consumed) =
+            crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
+                ready(&c, &scanner, prior, 100, false)
+            });
+        assert!(scanner.paths().is_empty(), "no twin is opened again");
+        assert_eq!(consumed, 0, "the repeated page reads no transcript byte");
+        assert!(
+            repeated.scan.snapshots.is_empty(),
             "repeated page cannot add money"
         );
     });
@@ -1629,14 +1628,34 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
             .unwrap();
         let mut page = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&twin));
         page.enrich(&c);
-        assert!(
-            !page.scan.snapshots.is_empty(),
-            "both twins must co-schedule at the file-count boundary"
-        );
+        // The completed census dropped its walk, so this page lists both
+        // twins again and gives its one census slot to the listed original
+        // ahead of the hint. Settled and unchanged, the original reads
+        // nothing and pulls no family (the old terminal family re-arm had
+        // cleared its fingerprint, so it read both twins here). The grown
+        // twin stays queued for a later page; nothing may publish before it.
+        let mut deferred = 0;
+        while page.scan.snapshots.is_empty() {
+            assert!(
+                scanner.paths().is_empty()
+                    && page.disposition.request_owned_hold_reasons.is_empty(),
+                "a deferring page opens and holds nothing: page={deferred} opened={} \
+                 scanned={} holds={:?}",
+                scanner.paths().len(),
+                page.scan.scanned_file_count,
+                page.disposition.request_owned_hold_reasons
+            );
+            deferred += 1;
+            assert!(deferred <= 3, "the grown twin is read on a later page");
+            page.finish();
+            let next = c.reload(&mut page.index);
+            page = c.raw(&scanner, next, 1, false, &[]);
+            page.enrich(&c);
+        }
         assert_eq!(
             scanner.paths().len(),
             2,
-            "both twin paths must actually be opened"
+            "both twin paths must actually be opened (after {deferred} deferring pages)"
         );
         assert_eq!(
             total(&page),
@@ -2771,9 +2790,17 @@ fn overlapping_restored(reverse: bool) {
         assert_eq!(first.scan.snapshots[0].input_tokens, 30);
         assert_eq!(first.scan.snapshots[0].removed_request_count, Some(1));
         let prior = settle(&c, &old, first, &mut progress);
-        let again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&again);
-        assert_eq!(total(&again), 2, "settled and re-read: unchanged");
+        // Settled and unchanged: a restart reads and re-sends nothing (the old
+        // terminal family re-arm re-read both histories).
+        let (again, consumed) =
+            crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
+                ready(&c, &E2ScanFixture::default(), prior, 100, false)
+            });
+        assert_eq!(consumed, 0, "settled: the restart reads no transcript byte");
+        assert!(
+            again.scan.snapshots.is_empty(),
+            "settled: nothing is re-sent"
+        );
     });
 }
 #[test]
@@ -3092,78 +3119,6 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
             (copy.request_count, copy.removed_request_count),
             (0, Some(1))
         );
-    });
-}
-
-/// The legacy fork-prefix exclusion and the `e2` copy
-/// skip never both remove a copied request. A legacy fork child whose
-/// leading request telemetry assigns to its parent, with a divergent parent
-/// prefix (the exclusion's exact shape, derived on this page), counts every
-/// request once. Read with its parent on a fresh page, the shared request
-/// waits for the parent's acceptance (counted by the parent alone); once the
-/// parent's page is delivered, the child publishes it removed exactly once.
-#[test]
-fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-legacy-fork-prefix");
-        c.root(
-            ROOT,
-            &(line(ROOT, "shared", AT, 10) + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)),
-        );
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &(line(COPY, "shared", AT, 10) + &line(COPY, "child", "2026-08-02T07:04:00Z", 30)),
-            "2026-08-02T07:03:00Z",
-        );
-        c.evidence_for(
-            ROOT,
-            &[
-                api_for(ROOT, "shared", 10, 100),
-                api_for(ROOT, "parent", 20, 200),
-            ],
-            &[trace_for(ROOT, "shared", ""), trace_for(ROOT, "parent", "")],
-        );
-        c.evidence_for(
-            COPY,
-            &[api_for(COPY, "child", 30, 300)],
-            &[trace_for(COPY, "child", "")],
-        );
-        let p = ready(
-            &c,
-            &E2ScanFixture::default(),
-            ScanIndex::default(),
-            100,
-            false,
-        );
-        literal(&p);
-        assert_eq!(
-            e2::pipeline_test_observer::legacy_excluded(&p.index, COPY),
-            1,
-            "the legacy exclusion would remove the shared prefix from the child"
-        );
-        let copy = body(&p, COPY).expect("the child publishes");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (1, Some(0)),
-            "the shared request waits for its unaccepted parent, never removed twice"
-        );
-        assert_eq!(
-            body(&p, ROOT).expect("the parent publishes").request_count,
-            2
-        );
-        assert_eq!(total(&p), 3, "every request counts exactly once");
-        let prior = settle(&c, &ScanIndex::default(), p, &mut e2_progress());
-        let decided = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&decided);
-        let copy = body(&decided, COPY).expect("the held prefix is decided again");
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (1, Some(1)),
-            "the shared request is removed once, by the E2 copy rule only"
-        );
-        if let Some(parent) = body(&decided, ROOT) {
-            assert_eq!(parent.request_count, 2);
-        }
     });
 }
 
@@ -4639,7 +4594,8 @@ fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removal
 /// Requests of `item` per organization hash its identity names.
 /// The released raised-cap hold's saved index over `prior`: the captured
 /// held-page delta, checked field by field. Only its path-independent fields
-/// replay (the unsettled-upload sweep marks and the held family's root digest).
+/// replay (the unsettled-upload sweep marks). The retired re-arm progress
+/// field the capture also holds is not loaded.
 /// The resumed file's census record and birth-store entry bind its path and
 /// physical identity (device, inode, ctime), so the deduping read re-derives
 /// them from the file.
@@ -4676,8 +4632,6 @@ fn released_held_index(c: &Corpus, prior: &ScanIndex) -> ScanIndex {
     ] {
         index[field] = after[field].clone();
     }
-    index["claude_full_rearm_progress"]["held_family_roots"] =
-        after["claude_full_rearm_progress"]["held_family_roots"].clone();
     let mut index: ScanIndex = serde_json::from_value(index).unwrap();
     c.reload(&mut index)
 }

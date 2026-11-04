@@ -2637,12 +2637,6 @@ fn ledger_accepted_file_counts_settled_only_with_current_ledger() {
         !settled(&grown, SnapshotSource::ClaudeCode),
         "newly committed unaccepted member"
     );
-    let mut evidence = index.clone();
-    evidence.files.get_mut(&key).unwrap().evidence_owed = true;
-    assert!(
-        !settled(&evidence, SnapshotSource::ClaudeCode),
-        "open evidence debt"
-    );
     assert!(
         !settled(&index, SnapshotSource::Codex),
         "Codex acceptance needs a proven owner"

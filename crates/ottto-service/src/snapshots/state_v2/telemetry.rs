@@ -371,9 +371,6 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 #[derive(Default, Serialize)]
 struct RetainedHeap {
     account_pending: Option<u64>,
-    usage_pending: Option<u64>,
-    #[serde(rename = "family.requests")]
-    family_requests: Option<u64>,
     census: Option<u64>,
     side_maps: Option<u64>,
     files: Option<u64>,
@@ -400,23 +397,9 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
-    // Cold: only this pass's loaded families hold request hashes in RAM.
-    use super::super::usage_pending::UsagePending;
-    let evidence = match &index.claude_usage_family_pending {
-        UsagePending::Resident(families) => families,
-        UsagePending::Cold(cold) => cold.loaded(),
-    };
-    let family_requests = evidence.values().try_fold(0_u64, |sum, p| {
-        sum.checked_add(heap(&p.member_request_id_hashes)?)
-    });
-    let usage_pending = heap(&index.claude_usage_family_pending)
-        .zip(family_requests)
-        .and_then(|(all, requests)| all.checked_sub(requests));
     let hashes = index.claude_request_census.hash_total();
     RetainedHeap {
         account_pending: heap(&index.claude_account_family_pending),
-        usage_pending,
-        family_requests,
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
         side_maps: side_maps(index),
@@ -733,42 +716,6 @@ mod ops_tests {
                 .collect::<Vec<_>>(),
             ["source_finish", "source_prepare"]
         );
-    }
-
-    /// [behaviour] family requests heap is separate and diagnostics never contain its text.
-    #[test]
-    fn family_requests_heap_is_separate_and_diagnostics_never_contain_its_text() {
-        let mut index = ScanIndex::default();
-        index.claude_usage_family_pending.insert(
-            "synthetic-private-family".into(),
-            super::super::super::ClaudeUsageFamilyPending {
-                census_window_end: "synthetic-window".into(),
-                member_request_id_hashes: BTreeMap::from([(
-                    "synthetic-private-member".into(),
-                    std::collections::BTreeSet::from(["synthetic-private-request".repeat(256)]),
-                )]),
-                member_occurrences: BTreeMap::new(),
-                invalid: false,
-                idless_revision: None,
-                identity_contract: None,
-                contract_unproven: false,
-            },
-        );
-        let observation = retained_heap(&index);
-        if crate::heap_layout_bound::layout_supported() {
-            assert!(observation.family_requests.unwrap() > 4096);
-            assert!(observation.usage_pending.unwrap() > 0);
-            assert_eq!(
-                observation.usage_pending.unwrap() + observation.family_requests.unwrap(),
-                heap(&index.claude_usage_family_pending).unwrap()
-            );
-        } else {
-            assert!(observation.usage_pending.is_none());
-            assert!(observation.family_requests.is_none());
-        }
-        let json = serde_json::to_string(&observation).unwrap();
-        assert!(!json.contains("synthetic-private"));
-        assert!(json.contains("family.requests"));
     }
 
     /// [behaviour] The existing state_v2 line flags census occupancy at 75%

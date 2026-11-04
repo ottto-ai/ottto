@@ -8854,7 +8854,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                 }
                 let before = serde_json::to_value(&index).unwrap();
                 let context = index.active_upload_context_fingerprint.clone();
-                let contract = index.claude_request_identity_contract_changed;
                 let (next, scan) = continuation_page_in(
                     &fixture.root,
                     index,
@@ -8872,7 +8871,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                     "{schedule} page {turn}: no traversal, census or ACK write"
                 );
                 assert_eq!(index.active_upload_context_fingerprint, context);
-                assert_eq!(index.claude_request_identity_contract_changed, contract);
                 assert!(scan.snapshots.is_empty());
                 assert!(scan.pending_finalization.is_empty());
                 assert_eq!(scan.scanned_file_count, 0);

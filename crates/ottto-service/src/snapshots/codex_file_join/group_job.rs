@@ -425,7 +425,6 @@ impl GroupBoot {
                 retention: discovery_retention!(index),
                 growth: None,
             },
-            false,
             cache,
         ) else {
             return Boot::Strict;
@@ -1266,7 +1265,7 @@ pub(in crate::snapshots) fn end_group(
     if sampling.is_some() && crate::snapshots::tail_source::has_codec(SnapshotSource::Codex) {
         crate::snapshots::tail_source::counters::replay(
             SnapshotSource::Codex,
-            crate::snapshots::tail_source::ReconstructCause::GroupReplay,
+            crate::snapshots::tail_source::counters::Replay::Group,
             group
                 .consumed_before
                 .saturating_add(active.parser.reader.consumed_bytes()),

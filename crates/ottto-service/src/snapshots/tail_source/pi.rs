@@ -9,12 +9,12 @@
 //! header line is inside the certificate's head sample, so a changed header
 //! fails the certificate and reads Full.
 use super::{
-    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages,
-    read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
+    decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour, hour_pages,
+    read_fact_page, read_hour_page, read_page, slot, slot_start, CollectionSpec, DecodedHead,
     HeadIdentity, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, HDigest, Refuse};
-use crate::snapshots::state_v2::{Collection, Shape as PageShape};
+use crate::snapshots::state_v2::Collection;
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
@@ -23,20 +23,8 @@ const USAGE_KEYS_G: u32 = 256;
 const COLLECTIONS: [CollectionSpec; 3] = [
     // A pairing changes an older key's state, so the ledger is a `Slot`, not
     // an append-only `Log`: a changed page restates, an unchanged one never.
-    CollectionSpec {
-        collection: Collection::PiUsageKeys,
-        shape: PageShape::Slot,
-        g: USAGE_KEYS_G,
-        required: true,
-        private: false,
-    },
-    CollectionSpec {
-        collection: Collection::UsageHours,
-        shape: PageShape::Hour,
-        g: 0,
-        required: true,
-        private: false,
-    },
+    slot(Collection::PiUsageKeys, USAGE_KEYS_G),
+    hour(Collection::UsageHours),
     SESSION_FACTS,
 ];
 
