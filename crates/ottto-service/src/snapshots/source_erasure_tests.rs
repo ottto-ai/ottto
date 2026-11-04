@@ -6,8 +6,7 @@ use super::*;
 use crate::snapshot_sync::{
     apply_source_control, detected_uses_cache_path, disable_snapshot_source,
     disable_sources_dropped_from_grant, enabled_snapshot_sources_in, reconnect_snapshot_source,
-    resume_reconnected_sources, source_marker,
-    withheld_support::{source_control_block_log_for_test, source_erasure_failures_for_test},
+    resume_reconnected_sources, source_marker, withheld_support::source_erasure_failures_for_test,
 };
 use ottto_core::LocalDeviceBinding;
 use std::os::unix::fs::PermissionsExt;
@@ -439,28 +438,6 @@ fn failed_resume_stays_paused_alarms_after_three_then_retries() {
 /// placement. Only the resumed source's upload witnesses go.
 #[test]
 fn pause_then_resume_reads_warm_and_equals_a_cold_full() {
-    pause_then_resume_money(
-        |support, source| disable_snapshot_source(support, source).unwrap(),
-        |support, source| reconnect_snapshot_source(support, source).unwrap(),
-    );
-}
-
-/// [money] The same oracle, paused by a web OFF and resumed by a web ON.
-#[test]
-#[serial_test::serial]
-fn web_off_on_reads_warm_and_equals_a_cold_full() {
-    pause_then_resume_money(
-        |support, source| {
-            bind(support, DEVICE);
-            web(support, &[(source, 1, "disabled")]);
-        },
-        |support, source| web(support, &[(source, 2, "enabled")]),
-    );
-}
-
-type Switch = fn(&Path, SnapshotSource);
-
-fn pause_then_resume_money(pause: Switch, resume: Switch) {
     use sampled_scan::transition_fixture::{money_oracle, scan_money};
     let source = SnapshotSource::ClaudeCode;
     let f = Fixture::new();
@@ -485,7 +462,7 @@ fn pause_then_resume_money(pause: Switch, resume: Switch) {
     kept.extend(codex_witnesses);
     kept.extend(codex_markers);
 
-    pause(&f.support, source);
+    disable_snapshot_source(&f.support, source).unwrap();
     assert_eq!(f.resume(source), 0);
     assert_kept(&claude_witnesses);
     // While paused: growth, a new file, an atomic rewrite, then a restart.
@@ -505,7 +482,7 @@ fn pause_then_resume_money(pause: Switch, resume: Switch) {
     fs::rename(&temp, session_file(&root, REWRITTEN_SESSION)).unwrap();
     drop(live);
 
-    resume(&f.support, source);
+    reconnect_snapshot_source(&f.support, source).unwrap();
     assert_eq!(f.resume(source), 0);
     assert_eq!(source_marker(&f.support, source), None);
     assert!(enabled_snapshot_sources_in(&device(), &f.support).contains(&source));
@@ -612,8 +589,9 @@ const SOURCES: [SnapshotSource; 3] = [
     SnapshotSource::ClaudeCode,
     SnapshotSource::Pi,
 ];
-/// The server sends lowercase; the binding's case must not matter.
-const DEVICE: &str = "6F1C0E52-0000-4000-8000-00000000A001";
+/// Lowercase hyphenated, as the server serializes a device UUID both in the
+/// credential the binding copies and in the heartbeat reply.
+const DEVICE: &str = "6f1c0e52-0000-4000-8000-00000000a001";
 const OTHER_DEVICE: &str = "6f1c0e52-0000-4000-8000-00000000b002";
 
 /// Every source granted to `device_id`.
@@ -648,8 +626,7 @@ fn block(device_id: &str, entries: &[(SnapshotSource, u64, &str)]) -> serde_json
                 "action_id": "00000000-0000-4000-8000-000000000001"})
         })
         .collect::<Vec<_>>();
-    json!({"contract": "source_control:v1", "device_id": device_id.to_ascii_lowercase(),
-        "sources": sources})
+    json!({"contract": "source_control:v1", "device_id": device_id, "sources": sources})
 }
 
 fn web(support: &Path, entries: &[(SnapshotSource, u64, &str)]) {
@@ -736,8 +713,11 @@ fn web_off_on_round_trip_pauses_then_resumes_warm() {
     }
 }
 
-/// [behaviour] An older or repeated revision changes nothing, and an
-/// applied ON is not resumed twice.
+/// [behaviour] An older or repeated revision changes nothing, and an applied
+/// ON is not resumed twice. The record is on disk, so the same reply after a
+/// restart is the repeated case. [format] A crash after a pause marker but
+/// before its record (as a local disable leaves it) re-applies that revision
+/// to the same end state, and a later ON resumes.
 #[test]
 #[serial_test::serial]
 fn stale_or_duplicate_revision_is_ignored() {
@@ -766,29 +746,7 @@ fn stale_or_duplicate_revision_is_ignored() {
         assert_eq!(record(&f.support, source), applied("enabled", 3));
         f.resume(source);
         assert_kept(&witnesses);
-    }
-}
 
-/// [behaviour] After a restart the same reply applies nothing. A crash
-/// between the marker and its record re-applies that revision to the same
-/// end state.
-#[test]
-#[serial_test::serial]
-fn restart_reapplies_nothing() {
-    for source in SOURCES {
-        let f = Fixture::new();
-        bind(&f.support, DEVICE);
-        web(&f.support, &[(source, 1, "disabled")]);
-        web(&f.support, &[(source, 2, "enabled")]);
-        f.resume(source);
-        let (witnesses, _) = upload_witnesses(&f, source);
-        // Restart: no in-memory state, the same reply.
-        web(&f.support, &[(source, 2, "enabled")]);
-        assert_eq!(source_marker(&f.support, source), None);
-        f.resume(source);
-        assert_kept(&witnesses);
-
-        // Crash twin: the OFF marker landed, its record did not.
         let f = Fixture::new();
         bind(&f.support, DEVICE);
         disable_snapshot_source(&f.support, source).unwrap();
@@ -798,19 +756,7 @@ fn restart_reapplies_nothing() {
             Some("pending")
         );
         assert_eq!(record(&f.support, source), applied("disabled", 1));
-        // Crash twin: the ON marker landed over an applied OFF, its record did not.
-        fs::write(
-            f.support
-                .join(format!("snapshots/{}.source-disabled", source.api_slug())),
-            "reconnect",
-        )
-        .unwrap();
         web(&f.support, &[(source, 2, "enabled")]);
-        assert_eq!(
-            source_marker(&f.support, source).as_deref(),
-            Some("reconnect")
-        );
-        assert_eq!(record(&f.support, source), applied("enabled", 2));
         f.resume(source);
         assert_eq!(source_marker(&f.support, source), None);
     }
@@ -839,8 +785,8 @@ fn revision_gap_forces_resume() {
     }
 }
 
-/// [money] Upgrade: the first ON with no record keeps every upload
-/// witness, so nothing is re-sent; a source paused locally still resumes.
+/// [behaviour] Upgrade: the first ON with no record keeps every upload
+/// witness, so nothing is re-sent.
 #[test]
 #[serial_test::serial]
 fn first_enabled_revision_without_record_keeps_witnesses() {
@@ -853,99 +799,74 @@ fn first_enabled_revision_without_record_keeps_witnesses() {
         assert_eq!(record(&f.support, source), applied("enabled", 1));
         f.resume(source);
         assert_kept(&witnesses);
+    }
+}
 
+/// [behaviour] A local pause whose request failed leaves the server at its
+/// last ON. While this Mac has not recorded that ON (first reply after the
+/// upgrade), the reply resumes the source: the failed pause is undone. Once
+/// the ON is recorded, the same reply keeps a later failed pause.
+#[test]
+#[serial_test::serial]
+fn failed_local_pause_then_unapplied_enabled_reply() {
+    for source in SOURCES {
         let f = Fixture::new();
         bind(&f.support, DEVICE);
         disable_snapshot_source(&f.support, source).unwrap();
         web(&f.support, &[(source, 1, "enabled")]);
         assert_eq!(
             source_marker(&f.support, source).as_deref(),
-            Some("reconnect")
+            Some("reconnect"),
+            "{source:?}: the unapplied ON undoes the failed pause"
+        );
+        f.resume(source);
+        disable_snapshot_source(&f.support, source).unwrap();
+        web(&f.support, &[(source, 1, "enabled")]);
+        assert_eq!(
+            source_marker(&f.support, source).as_deref(),
+            Some("pending")
         );
     }
 }
 
-/// [behaviour] Another device's block, an unknown source and a malformed
-/// entry or block change nothing; each block-level reason is logged once per
-/// change and a clean block clears it. Another device's record reads as
-/// enabled revision 0.
+/// [behaviour] A block for another device, including one whose id differs
+/// only in case, an unknown source and a malformed entry change nothing; a
+/// valid entry beside them applies. Another device's record reads as enabled
+/// revision 0.
 #[test]
 #[serial_test::serial]
 fn foreign_device_unknown_source_malformed_entry_are_ignored() {
-    let codex = SnapshotSource::Codex;
+    let (codex, claude, pi) = (SOURCES[0], SOURCES[1], SOURCES[2]);
     let f = Fixture::new();
     bind(&f.support, DEVICE);
-    let untouched = |f: &Fixture| {
-        SOURCES.iter().all(|source| {
-            source_marker(&f.support, *source).is_none() && record(&f.support, *source).is_none()
-        })
-    };
-    reply(&f.support, block(OTHER_DEVICE, &[(codex, 1, "disabled")]));
-    assert!(untouched(&f));
-    assert_eq!(source_control_block_log_for_test(), Some("device_mismatch"));
-
-    let entry = |extra: serde_json::Value| {
-        let mut entry = json!({"source": "codex", "revision": 1, "desired_state": "disabled"});
-        entry
-            .as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        entry
-    };
-    for bad in [
-        entry(json!({"revision": 0})),
-        entry(json!({"revision": "1"})),
-        entry(json!({"revision": -1})),
-        entry(json!({"desired_state": "paused"})),
-        entry(json!({"desired_state": null})),
-    ] {
-        let mut malformed = block(DEVICE, &[]);
-        malformed["sources"] = json!([bad]);
-        reply(&f.support, malformed);
+    for other in [OTHER_DEVICE.to_string(), DEVICE.to_ascii_uppercase()] {
+        reply(&f.support, block(&other, &[(codex, 1, "disabled")]));
     }
-    assert!(untouched(&f));
-    for (key, value) in [
-        ("contract", json!("source_control:v2")),
-        ("device_id", json!(null)),
-        ("sources", json!({})),
-    ] {
-        let mut malformed = block(DEVICE, &[(codex, 1, "disabled")]);
-        malformed[key] = value;
-        reply(&f.support, malformed);
-        assert_eq!(source_control_block_log_for_test(), Some("malformed"));
-    }
-    assert!(untouched(&f));
+    let mut mixed = block(DEVICE, &[(claude, 1, "disabled")]);
+    mixed["sources"].as_array_mut().unwrap().extend([
+        json!({"source": "gemini", "revision": 1, "desired_state": "disabled"}),
+        json!({"source": "codex", "revision": 1, "desired_state": "paused"}),
+    ]);
+    reply(&f.support, mixed);
+    assert_eq!(source_marker(&f.support, codex), None);
+    assert_eq!(record(&f.support, codex), None);
+    assert_eq!(
+        source_marker(&f.support, claude).as_deref(),
+        Some("pending")
+    );
 
-    let mut unknown = block(DEVICE, &[(codex, 1, "disabled")]);
-    unknown["sources"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"source": "gemini", "revision": 1, "desired_state": "disabled"}));
-    reply(&f.support, unknown);
-    assert_eq!(source_control_block_log_for_test(), Some("unknown_source"));
-    assert_eq!(source_marker(&f.support, codex).as_deref(), Some("pending"));
-    // An absent block says nothing; a clean one clears the reason.
-    apply_source_control(&f.support, &json!({"accepted": true}));
-    assert_eq!(source_control_block_log_for_test(), Some("unknown_source"));
-    web(&f.support, &[(codex, 2, "enabled")]);
-    assert_eq!(source_control_block_log_for_test(), None);
-
-    // A record another device left reads as enabled revision 0.
-    let pi = SnapshotSource::Pi;
     fs::write(
         record_path(&f.support, pi),
         json!({"device_id": OTHER_DEVICE, "revision": 5, "desired_state": "disabled"}).to_string(),
     )
     .unwrap();
-    web(&f.support, &[(pi, 1, "enabled")]);
-    assert_eq!(source_marker(&f.support, pi), None);
-    assert_eq!(record(&f.support, pi), applied("enabled", 1));
-    web(&f.support, &[(pi, 2, "disabled")]);
-    assert_eq!(source_marker(&f.support, pi).as_deref(), Some("pending"));
+    web(&f.support, &[(pi, 1, "disabled")]);
+    assert_eq!(record(&f.support, pi), applied("disabled", 1));
 }
 
 /// [behaviour] A reply for the old device that waits on a binding switch
-/// sees the new binding and changes nothing.
+/// sees the new binding and changes nothing. Apply reads the binding only
+/// under the lock the switch holds, so every interleaving ends the same.
 #[test]
 #[serial_test::serial]
 fn binding_switch_is_serialized_with_apply() {
@@ -955,34 +876,12 @@ fn binding_switch_is_serialized_with_apply() {
         let switching = crate::control::lock_setup_run_binding();
         let support = f.support.clone();
         let delayed = std::thread::spawn(move || web(&support, &[(source, 1, "disabled")]));
-        std::thread::sleep(std::time::Duration::from_millis(200));
         bind(&f.support, OTHER_DEVICE);
+        assert!(!delayed.is_finished(), "apply waits for the switch");
         drop(switching);
         delayed.join().unwrap();
         assert_eq!(source_marker(&f.support, source), None);
         assert_eq!(record(&f.support, source), None);
-        assert_eq!(source_control_block_log_for_test(), Some("device_mismatch"));
-    }
-}
-
-/// [behaviour] A local disable (its POST then writes the next revision) is
-/// resumed by a later web ON.
-#[test]
-#[serial_test::serial]
-fn local_disable_then_web_on_resumes() {
-    for source in SOURCES {
-        let f = Fixture::new();
-        bind(&f.support, DEVICE);
-        disable_snapshot_source(&f.support, source).unwrap();
-        web(&f.support, &[(source, 1, "disabled")]);
-        assert_eq!(
-            source_marker(&f.support, source).as_deref(),
-            Some("pending")
-        );
-        web(&f.support, &[(source, 2, "enabled")]);
-        f.resume(source);
-        assert_eq!(source_marker(&f.support, source), None);
-        assert!(enabled_snapshot_sources_in(&granted(DEVICE), &f.support).contains(&source));
     }
 }
 

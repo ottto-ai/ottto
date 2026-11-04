@@ -794,11 +794,6 @@ pub(crate) mod withheld_support {
         source_erasure_turn().get(&marker).copied().unwrap_or(0)
     }
 
-    /// The block-level ignore reason last logged, `None` after a clean block.
-    pub(crate) fn source_control_block_log_for_test() -> Option<&'static str> {
-        *SOURCE_CONTROL_BLOCK_LOG.lock().unwrap()
-    }
-
     pub(crate) fn settle_withheld(
         previous: &ScanIndex,
         mut index: ScanIndex,
@@ -12529,131 +12524,73 @@ pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource
         let _turn = source_erasure_turn();
         write_source_marker(&source_marker_path(support_dir, source), "pending")?;
     }
-    revoke_paused_relay(source);
-    Ok(())
-}
-
-fn revoke_paused_relay(source: SnapshotSource) {
     if source == SnapshotSource::ClaudeCode {
         crate::otlp_relay::legacy::revoke_now();
     }
-}
-
-/// Last per-entry outcome per source, logged on change.
-static SOURCE_CONTROL_LOGS: Mutex<[Option<&str>; 3]> = Mutex::new([None, None, None]);
-/// Last block-level ignore reason (`None` after a clean block), logged on change.
-static SOURCE_CONTROL_BLOCK_LOG: Mutex<Option<&str>> = Mutex::new(None);
-
-fn note_source_control_block(reason: Option<&'static str>) {
-    let mut last = SOURCE_CONTROL_BLOCK_LOG
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if *last != reason {
-        if let Some(reason) = reason {
-            eprintln!("source control ignored reason={reason}");
-        }
-        *last = reason;
-    }
+    Ok(())
 }
 
 /// Applies the web's per-source OFF/ON from a heartbeat reply. Revisions are
 /// per device and source; each newer one applies once, recorded in
 /// `snapshots/<slug>.source-control` after its marker (a crash between them
 /// re-applies the same revision). A missing or another device's record reads
-/// as enabled revision 0. OFF writes the pause marker. ON writes `reconnect`
-/// (the next cycle drops upload witnesses, then resumes) unless nothing is
-/// paused and it directly follows an applied ON.
+/// as enabled revision 0. OFF pauses like a local disable; ON resumes a paused
+/// source, and one that does not directly follow an applied ON (an OFF was
+/// missed) forces a resume, so the next cycle re-sends what the OFF erased.
+/// A block for another device, an unknown source or a malformed entry is
+/// ignored.
 pub(crate) fn apply_source_control(support_dir: &Path, reply: &serde_json::Value) {
-    use serde_json::{json, Value};
-    let block = match reply.get("source_control") {
-        None | Some(Value::Null) => return,
-        Some(block) => block,
-    };
+    let block = &reply["source_control"];
     let (Some("source_control:v1"), Some(device_id), Some(entries)) = (
-        block.get("contract").and_then(Value::as_str),
-        block.get("device_id").and_then(Value::as_str),
-        block.get("sources").and_then(Value::as_array),
+        block["contract"].as_str(),
+        block["device_id"].as_str(),
+        block["sources"]
+            .as_array()
+            .filter(|entries| !entries.is_empty()),
     ) else {
-        return note_source_control_block(Some("malformed"));
+        return;
     };
-    if entries.is_empty() {
-        return note_source_control_block(None);
+    // Identity, then source: the marker writers take the erasure turn.
+    let _binding = crate::control::lock_setup_run_binding();
+    let current = ottto_core::FileDeviceStore::default().load().ok().flatten();
+    if !current.is_some_and(|current| current.device_id == device_id) {
+        return;
     }
-    let mut paused = Vec::new();
-    {
-        // Same order as a promotion that drops a grant: identity, then source.
-        let _binding = crate::control::lock_setup_run_binding();
-        let _turn = source_erasure_turn();
-        let current = ottto_core::FileDeviceStore::default().load().ok().flatten();
-        let Some(current) = current.filter(|d| d.device_id.eq_ignore_ascii_case(device_id)) else {
-            return note_source_control_block(Some("device_mismatch"));
+    for entry in entries {
+        let source = SNAPSHOT_SOURCES
+            .into_iter()
+            .find(|source| entry["source"].as_str() == Some(source.api_slug()));
+        let (Some(source), Some(revision @ 1..), Some(state @ ("enabled" | "disabled"))) = (
+            source,
+            entry["revision"].as_u64(),
+            entry["desired_state"].as_str(),
+        ) else {
+            continue;
         };
-        let mut block_reason = None;
-        for entry in entries {
-            let Some(source) = SNAPSHOT_SOURCES.into_iter().find(|source| {
-                entry.get("source").and_then(Value::as_str) == Some(source.api_slug())
-            }) else {
-                block_reason = Some("unknown_source");
-                continue;
-            };
-            let revision = entry
-                .get("revision")
-                .and_then(Value::as_u64)
-                .filter(|n| *n > 0);
-            let state = entry.get("desired_state").and_then(Value::as_str);
-            let (Some(revision), Some(state @ ("enabled" | "disabled"))) = (revision, state) else {
-                if rejection_log::changed(&SOURCE_CONTROL_LOGS, source, "malformed").is_some() {
-                    eprintln!(
-                        "source control ignored source={} reason=malformed",
-                        source.api_slug()
-                    );
-                }
-                continue;
-            };
-            rejection_log::changed(&SOURCE_CONTROL_LOGS, source, "ok");
-            let marker = source_marker_path(support_dir, source);
-            let record = marker.with_file_name(format!("{}.source-control", source.api_slug()));
-            let (was_enabled, last) = std::fs::read(&record)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .filter(|r| {
-                    r["device_id"]
-                        .as_str()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(&current.device_id))
-                })
-                .and_then(|r| Some((r["desired_state"] == "enabled", r["revision"].as_u64()?)))
-                .unwrap_or((true, 0));
-            if revision <= last {
-                continue;
-            }
-            let follows_on = was_enabled && revision - 1 == last;
-            let next = match state {
-                "disabled" => Some("pending"),
-                _ if follows_on && source_marker(support_dir, source).is_none() => None,
-                _ => Some("reconnect"),
-            };
-            let body = json!({"device_id": current.device_id, "revision": revision, "desired_state": state});
-            let applied = next
-                .map_or(Ok(()), |next| write_source_marker(&marker, next))
-                .and_then(|()| {
-                    ottto_core::write_owner_only_file_atomic(&record, body.to_string().as_bytes())?;
-                    sync_progress_parent(&record)
-                });
-            if next == Some("pending") {
-                paused.push(source);
-            }
-            match applied {
-                Ok(()) => eprintln!(
-                    "source control applied source={} state={state} revision={revision}",
-                    source.api_slug()
-                ),
-                Err(_) => eprintln!("source control apply failed source={}", source.api_slug()),
-            }
+        let marker = source_marker_path(support_dir, source);
+        let record = marker.with_file_name(format!("{}.source-control", source.api_slug()));
+        let (was_enabled, last) = std::fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|record| record["device_id"] == device_id)
+            .and_then(|r| Some((r["desired_state"] == "enabled", r["revision"].as_u64()?)))
+            .unwrap_or((true, 0));
+        if revision <= last {
+            continue;
         }
-        note_source_control_block(block_reason);
+        let applied = match state {
+            "disabled" => disable_snapshot_source(support_dir, source),
+            _ if was_enabled && revision - 1 == last => {
+                reconnect_snapshot_source(support_dir, source)
+            }
+            _ => {
+                let _turn = source_erasure_turn();
+                write_source_marker(&marker, "reconnect")
+            }
+        };
+        let body = serde_json::json!({"device_id": device_id, "revision": revision, "desired_state": state});
+        let _ = applied.and_then(|()| write_source_marker(&record, &body.to_string()));
     }
-    // After both guards: the legacy relay's revoke waits on its supervisor.
-    paused.into_iter().for_each(revoke_paused_relay);
 }
 
 /// The explicit way back. A source that was never paused has nothing to resume.
