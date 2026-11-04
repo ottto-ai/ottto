@@ -699,7 +699,9 @@ fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -
     Ok(read_sample(file, offset, expected.len(), count)? == expected)
 }
 
+#[cfg(test)]
 use crate::hex::is_sha256_lower as digest_shaped;
+#[cfg(test)]
 use crate::hex::sha256_lower as sha256_hex;
 
 /// The parts of a prior certificate `prepare`'s decision reads, borrowed from
