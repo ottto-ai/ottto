@@ -19,7 +19,6 @@ pub const OTTTO_SOCKET_ENV: &str = "OTTTO_SERVICE_SOCKET";
 pub const OTTTO_CONTROL_TOKEN_ENV: &str = "OTTTO_SERVICE_CONTROL_TOKEN";
 pub const OTTTO_SECRET_FALLBACK_DIR_ENV: &str = "OTTTO_SERVICE_SECRET_FALLBACK_DIR";
 pub const OTTTO_SERVICE_SOCKET_NAME: &str = "ottto-service.sock";
-pub const OTTTO_LEGACY_SOCKET_NAME: &str = "locald.sock";
 pub const OTTTO_CLIENT_NAME: &str = "ottto-service";
 
 pub fn user_launchctl_domain() -> String {

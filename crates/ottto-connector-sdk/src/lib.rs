@@ -8,7 +8,6 @@ use std::fmt;
 
 pub const SOURCE_MANIFEST_SCHEMA_VERSION: &str = "source_manifest.v1";
 pub const COLLECTOR_MANIFEST_SCHEMA_VERSION: &str = "collector_manifest.v1";
-pub const CONNECTOR_REGISTRY_SCHEMA_VERSION: &str = "connector_registry.v1";
 
 pub const FORBIDDEN_V1_FIELDS: &[&str] = &[
     "supported_platforms",

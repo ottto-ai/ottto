@@ -18,8 +18,7 @@ pub mod token_store;
 pub use credential_file::CredentialFileCapRefused;
 
 pub use account_store::{
-    default_account_path, default_connection_api_base_url, default_connection_path,
-    default_device_path, default_machine_path, default_pending_device_credential_path,
+    default_connection_api_base_url, default_pending_device_credential_path,
     default_prior_device_path, default_sources_dir, default_support_dir,
     is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
     FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore,
@@ -30,56 +29,43 @@ pub use account_store::{
 };
 pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,
-    claude_cli_account_identifier_hash_at, claude_cli_account_identifier_hash_from_config,
-    default_claude_cli_config_path, CLAUDE_CLI_CONFIG_FILE_NAME,
+    claude_cli_account_identifier_hash_at, default_claude_cli_config_path,
 };
 pub use claude_config_slots::{
     prepare_managed_claude_provisional_root, validate_managed_claude_auth_root,
     ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError, ClaudeSlotAccountBinding,
     ClaudeSlotApproval, ClaudeSlotApprovalSource, FileClaudeConfigSlotSettingsStore,
     CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME, CLAUDE_MANAGED_ACCOUNTS_DIR_NAME,
-    CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS, MAX_CLAUDE_CONFIG_DIR_BYTES,
-    MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
+    MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 pub use claude_statusline::{
-    append_claude_statusline_context_history, claude_statusline_cache_path,
-    claude_statusline_context_cache_path, claude_statusline_context_history_path,
-    ingest_claude_statusline_payload, parse_claude_statusline_context_window_payload,
-    parse_claude_statusline_payload, read_claude_statusline_cache,
+    ingest_claude_statusline_payload, read_claude_statusline_cache,
     read_claude_statusline_context_cache, read_claude_statusline_context_history,
-    write_claude_statusline_cache, write_claude_statusline_context_cache,
-    write_claude_statusline_context_history, ClaudeStatusLineAccountResolutionMethod,
-    ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
-    ClaudeStatusLineContextWindowSample, ClaudeStatusLineIngestResult,
+    write_claude_statusline_cache, ClaudeStatusLineContextWindowCache,
+    ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
     ClaudeStatusLineRateLimitCache, ClaudeStatusLineRateLimitWindow,
-    CLAUDE_STATUSLINE_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
-    CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME,
-    CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES,
     CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
 };
 pub use codex_account_slots::{
-    codex_auth_file_mark, read_codex_auth_file_secure, read_codex_config_file_secure,
-    CodexAccountSlotSettingsError, CodexActiveSignIn, CodexAuthFileMark, CodexHomeTrust,
-    CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
-    CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME, CODEX_MANAGED_ACCOUNTS_DIR_NAME,
-    MAX_CODEX_ACCOUNT_SLOTS, MAX_MANAGED_CODEX_ACCOUNT_SLOTS,
+    read_codex_auth_file_secure, read_codex_config_file_secure, CodexAccountSlotSettingsError,
+    CodexHomeTrust, FileCodexAccountSlotSettingsStore, CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME,
+    MAX_CODEX_ACCOUNT_SLOTS,
 };
 pub use lifecycle::{
     execute_local_uninstall, launch_agent_path, launchd_target, local_lifecycle_home_dir,
-    plan_local_uninstall, LifecycleError, UninstallExecutionOptions,
+    plan_local_uninstall, UninstallExecutionOptions,
 };
 pub use local_client::{
-    default_socket_path, request_unix_socket, request_unix_socket_with_timeout, LocalRequestError,
+    default_socket_path, request_unix_socket, request_unix_socket_with_timeout,
     LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
 };
 pub use local_service::{
     install_owner_for_path, kickstart_macos_launch_agent, macos_launch_agent_target,
     user_launchctl_domain, MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL,
-    OTTTO_CLIENT_NAME, OTTTO_CONTROL_TOKEN_ENV, OTTTO_LEGACY_SERVICE_BINARY_NAME,
-    OTTTO_LEGACY_SOCKET_NAME, OTTTO_SECRET_FALLBACK_DIR_ENV, OTTTO_SERVICE_BINARY_NAME,
-    OTTTO_SERVICE_SOCKET_NAME, OTTTO_SOCKET_ENV,
+    OTTTO_CLIENT_NAME, OTTTO_CONTROL_TOKEN_ENV, OTTTO_SECRET_FALLBACK_DIR_ENV,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SERVICE_SOCKET_NAME, OTTTO_SOCKET_ENV,
 };
-pub use redaction::{redact_inline, redact_key_value, RedactionPolicy};
+pub use redaction::{redact_inline, RedactionPolicy};
 pub use status::{
     compiled_build_id, compiled_release_channel, compiled_release_version, empty_status, problem,
     release_channel_from_str,

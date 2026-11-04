@@ -85,9 +85,6 @@ impl ControlTokenStore for MemoryTokenStore {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct KeychainTokenStore;
-
 #[derive(Debug, Clone)]
 pub struct KeychainSecretStore {
     account: &'static str,
@@ -172,21 +169,6 @@ impl KeychainSecretStore {
             account,
             keychain_only: true,
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ControlTokenStore for KeychainTokenStore {
-    fn load(&self) -> Result<String, TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).load()
-    }
-
-    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).save(token)
-    }
-
-    fn delete(&self) -> Result<(), TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).delete()
     }
 }
 
@@ -489,21 +471,6 @@ fn security_cli_delete_reports_missing(exit_code: Option<i32>, stderr: &[u8]) ->
     }
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     stderr.contains("could not be found") || stderr.contains("item not found")
-}
-
-#[cfg(not(target_os = "macos"))]
-impl ControlTokenStore for KeychainTokenStore {
-    fn load(&self) -> Result<String, TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).load()
-    }
-
-    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).save(token)
-    }
-
-    fn delete(&self) -> Result<(), TokenStoreError> {
-        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).delete()
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
