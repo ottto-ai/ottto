@@ -1137,30 +1137,16 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let mut fixture = PipelineFixture::new("census-p2-upgrade-owed");
     fixture.baseline();
     let index = ScanIndex::load(&fixture.index_path).expect("load the baseline index");
-    let mut legacy = serde_json::to_value(&index).expect("encode the baseline index");
-    legacy["claude_usage_family_pending"] = serde_json::Value::Object(
-        PIPELINE_SESSIONS
-            .iter()
-            .map(|session| {
-                (
-                    session.to_string(),
-                    serde_json::json!({
-                        "census_window_end": "2026-08-02T08:00:00Z",
-                        "member_request_id_hashes": {*session: ["0".repeat(64)]},
-                        "member_occurrences": {},
-                        "invalid": false,
-                    }),
-                )
-            })
-            .collect(),
-    );
+    let legacy = crate::snapshots::sampled_scan::transition_fixture::legacy_pending_store(&index);
+    let pending = legacy["claude_usage_family_pending"]
+        .as_object()
+        .expect("the legacy store carries pending evidence");
+    assert_eq!(pending.len(), PIPELINE_SESSIONS.len());
     let files = legacy["files"]
-        .as_object_mut()
+        .as_object()
         .expect("the index encodes its file entries");
     assert_eq!(files.len(), PIPELINE_SESSIONS.len());
-    for entry in files.values_mut() {
-        entry["evidence_owed"] = true.into();
-    }
+    assert!(files.values().all(|entry| entry["evidence_owed"] == true));
     let decoded: ScanIndex =
         serde_json::from_value(legacy.clone()).expect("an older release's index decodes");
     let reencoded = serde_json::to_value(&decoded).expect("re-encode the decoded index");

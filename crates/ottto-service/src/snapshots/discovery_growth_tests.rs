@@ -1038,41 +1038,60 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         }
 
         // Quiet corpus after a restart: saved index, no retained checkpoint.
-        let mut f = Fixture::new();
-        let mut index = kept_generation(&f, source, true);
-        let path = f.root.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
-        let index = ScanIndex::load(&path).unwrap();
-        f.cache = Arc::new(sampled_scan::SharedCache::default());
-        let opens = all_transcript_opens_for_test();
-        let ((quiet_index, scan, reads, rows), consumed) =
-            sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
-        // The reloaded generation ran its due pass; no first walk replaced it.
-        assert!(!rows.iter().any(|row| {
-            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
-        }));
-        if let Some(traversal) = quiet_index.traversal.as_ref() {
-            assert!(traversal.counts.listing_generations >= 1, "{source:?}");
-        }
-        assert!(scan.snapshots.is_empty(), "{source:?}");
-        assert_eq!(scan.scanned_file_count, 0, "{source:?}");
-        // Zero opens measures zero identity, cheap and other reads.
-        let measured = (all_transcript_opens_for_test() == opens).then_some(0);
-        let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
-            sampled_scan::transition_fixture::Mode::Restart,
-            source,
-            Vec::new(),
-            &[],
-        );
-        quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
-        quiet.io = sampled_scan::transition_fixture::IoBytes {
-            consumed,
-            cheap_checks: measured,
-            anchor_reads: measured,
-            other_reads: measured,
-            ..Default::default()
+        // Claude's store is also restarted as an older release left it, with
+        // pending usage evidence and an owed bit on every file: the upgrade
+        // reads nothing either.
+        let legacies: &[bool] = if source == SnapshotSource::ClaudeCode {
+            &[false, true]
+        } else {
+            &[false]
         };
-        sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        for &legacy in legacies {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, true);
+            let path = f.root.join("index.json");
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+            let index = ScanIndex::load(&path).unwrap();
+            let index = if legacy {
+                sampled_scan::transition_fixture::upgrade_from_legacy_store(&index, &path)
+            } else {
+                index
+            };
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let opens = all_transcript_opens_for_test();
+            let ((quiet_index, scan, reads, rows), consumed) =
+                sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+            // The reloaded generation ran its due pass; no first walk replaced it.
+            assert!(!rows.iter().any(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            }));
+            if let Some(traversal) = quiet_index.traversal.as_ref() {
+                assert!(
+                    traversal.counts.listing_generations >= 1,
+                    "{source:?} legacy {legacy}"
+                );
+            }
+            assert!(scan.snapshots.is_empty(), "{source:?} legacy {legacy}");
+            assert_eq!(scan.scanned_file_count, 0, "{source:?} legacy {legacy}");
+            // Zero opens measures zero identity, cheap and other reads.
+            let measured = (all_transcript_opens_for_test() == opens).then_some(0);
+            let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
+                sampled_scan::transition_fixture::Mode::Restart,
+                source,
+                Vec::new(),
+                &[],
+            );
+            quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
+            quiet.io = sampled_scan::transition_fixture::IoBytes {
+                consumed,
+                cheap_checks: measured,
+                anchor_reads: measured,
+                other_reads: measured,
+                ..Default::default()
+            };
+            sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        }
     }
 }
 

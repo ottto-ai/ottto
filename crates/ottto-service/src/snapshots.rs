@@ -7194,35 +7194,6 @@ fn confirmed_empty_claude_family_members(
         .collect()
 }
 
-/// Family roots whose files Claude telemetry retention keeps: account-pending
-/// families that still owe identity, and witnessed families with their
-/// legacy owners.
-fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
-    index
-        .claude_account_family_pending
-        .iter()
-        .filter(|(_, pending)| {
-            pending.invalid
-                || pending.has_history()
-                || pending
-                    .member_requests
-                    .values()
-                    .any(|requests| requests.identity_revision.is_none())
-        })
-        .map(|(root, _)| root)
-        .chain(index.claude_usage_family_witnesses.keys())
-        .chain(
-            index
-                .claude_usage_family_witnesses
-                .values()
-                .flat_map(|witness| witness.legacy_owner_roots.iter()),
-        )
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
     claude_snapshot_family_root_ref(item).to_owned()
 }

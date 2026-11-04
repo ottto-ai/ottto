@@ -61,6 +61,62 @@ pub(crate) fn codex_evidence_of_items(
     })
 }
 
+/// The store an older release left: `index` as a standalone index file in
+/// which every transcript's family still carries the retired per-family
+/// pending usage evidence and every file entry the retired owed bit. A routed
+/// index is written as its resident copy without the route, as a standalone
+/// file holds it.
+pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
+    let copy = if super::super::e2_pipeline_scan_fixture::route_of(index).is_some() {
+        let mut copy = super::super::state_v2::money_test_support::resident(index);
+        copy.v2_mut().persistence_v2 = None;
+        copy.generation = 0;
+        copy
+    } else {
+        index.clone()
+    };
+    let mut legacy = serde_json::to_value(&copy).expect("encode the index");
+    let mut pending = serde_json::Map::new();
+    let files = legacy["files"]
+        .as_object_mut()
+        .expect("the index encodes its file entries");
+    for (key, entry) in files.iter_mut() {
+        entry["evidence_owed"] = true.into();
+        let session = std::path::Path::new(key)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("a transcript key")
+            .to_string();
+        let mut members = serde_json::Map::new();
+        members.insert(session.clone(), json!(["0".repeat(64)]));
+        pending.insert(
+            session,
+            json!({
+                "census_window_end": "2026-08-02T08:00:00Z",
+                "member_request_id_hashes": members,
+                "member_occurrences": {},
+                "invalid": false,
+            }),
+        );
+    }
+    legacy["claude_usage_family_pending"] = Value::Object(pending);
+    legacy
+}
+
+/// Writes [`legacy_pending_store`] at `path` and loads it as this build does.
+pub(crate) fn upgrade_from_legacy_store(
+    index: &super::super::ScanIndex,
+    path: &std::path::Path,
+) -> super::super::ScanIndex {
+    let legacy = legacy_pending_store(index);
+    assert!(!legacy["claude_usage_family_pending"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).expect("write the legacy store");
+    super::super::ScanIndex::load(path).expect("an older release's store loads")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {
     ColdFull,
