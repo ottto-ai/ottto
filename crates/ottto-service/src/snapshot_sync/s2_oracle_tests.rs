@@ -69,7 +69,14 @@ fn hinted(c: &Corpus, index: ScanIndex, limit: usize, sampled: bool, hints: &[Pa
 
 /// Commit the native page's exact ACKs and context receipts to the same
 /// live database; the next caller gets the production cold load.
-fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
+fn commit(session: &StateV2ColdSession, page: Page) -> ScanIndex {
+    commit_with_progress(session, page).0
+}
+
+fn commit_with_progress(
+    session: &StateV2ColdSession,
+    mut page: Page,
+) -> (ScanIndex, SnapshotUploadProgress) {
     page.finish();
     let mut progress = e2_progress();
     assert_eq!(
@@ -83,7 +90,7 @@ fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    session.save_reload(&mut page.index)
+    (session.save_reload(&mut page.index), progress)
 }
 
 fn accepted(result: &mut RouteResult, items: &[SnapshotItem]) {
@@ -508,6 +515,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             &c.base.join("state"),
         );
         let prior = commit(&session, page(&c, index, 100, true));
+        append(&path, "{broken\n");
         append(
             &path,
             &line(ROOT, "partial-later", "2026-08-02T07:04:00Z", 6),
@@ -519,11 +527,32 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         let current = page(&c, prior, 100, true);
         assert_eq!(current.modes.0, 0, "partial ACK uses a stored Tail");
         assert!(current.modes.1 > 0);
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&current.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold_page.index).unwrap()["terminal_jsonl_dispositions"]
+        );
+        let loss_body = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        let loss_fingerprint = loss_body.snapshot_fingerprint.clone();
+        let loss_witness = snapshot_upload_body_witness(loss_body);
         let mut progress = e2_progress();
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
             let mut response = ack(items)?;
-            let mut refused = response.accepted_entities.pop().unwrap();
+            // Preserve the existing partial outcome while exactly ACKing
+            // the loss-bearing root and leaving its other entity owed.
+            let other = response
+                .accepted_entities
+                .iter()
+                .position(|entity| entity.source_session_id != ROOT)
+                .unwrap();
+            let mut refused = response.accepted_entities.remove(other);
             response.accepted -= 1;
             // Cache rows put the request under head-CAS: the refusal then
             // carries the server's challenge instead of a head.
@@ -537,6 +566,11 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);
         assert_eq!(progress.quarantined_fingerprints.len(), 1);
+        assert!(progress.accepted_fingerprints.contains(&loss_fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
+        );
         let mut observed =
             RouteResult::emitted(Mode::Restart, SOURCE, batches, &current.scan.snapshots);
         let mut cold = cold;
@@ -559,6 +593,10 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         assert_eq!(
             restored.quarantined_fingerprints,
             progress.quarantined_fingerprints
+        );
+        assert_eq!(
+            restored.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
         );
         assert!(current.scan.snapshots.iter().any(|item| !progress
             .accepted_fingerprints
@@ -620,46 +658,10 @@ fn scan_behind_accepted_never_reemits_a_smaller_body() {
     });
 }
 
-/// Failure context for the lossy row: scan counters and every index field
-/// that names the lossy file.
-fn lossy_diag(label: &str, page: &Page, key: &str) -> String {
-    let scan = &page.scan;
-    let fields = serde_json::to_value(&page.committed)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, v)| v.to_string().contains(key))
-        .map(|(k, v)| {
-            let text = v.to_string().chars().take(1500).collect::<String>();
-            format!("{k}={text}")
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "\n[{label}] modes={:?} discovered={} scanned={} limit_skipped={} \
-         malformed={} census_complete={} emitted={:?} decode_hold={} \
-         len={:?}\n committed_entry={:?}\n after_entry={:?}\n fields={fields:?}",
-        page.modes,
-        scan.discovered_file_count,
-        scan.scanned_file_count,
-        scan.skipped_file_count_due_to_limit,
-        scan.malformed_json_line_count,
-        scan.census_complete,
-        scan.snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<Vec<_>>(),
-        page.committed.decode_holds_file(key),
-        std::fs::metadata(key).map(|m| m.len()).ok(),
-        page.committed.files.get(key),
-        page.index.files.get(key),
-    )
-}
-
-/// [money] A lossy append gets no new stored authority. Repeated reads from
-/// the last good head retain the cold Full's money and loss disclosures.
+/// [money] A bad physical record preserves valid siblings through durable
+/// Tail and later appends, matching byte-zero Full including placement.
 #[test]
-fn lossy_prefix_retains_the_previous_head_and_matches_full() {
+fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
     with_e2(|| {
         let mut c = corpus("s2-lossy-prefix");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
@@ -669,7 +671,14 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let initial = page(&c, index, 100, true);
+        let scanner = E2ScanFixture::capturing_identity();
+        scanner.on_committed_route(session.path());
+        let read = |index, hints: &[PathBuf]| {
+            let mut page = c.raw(&scanner, index, 100, true, hints);
+            page.enrich(&c);
+            page
+        };
+        let initial = read(index, &[]);
         let mut previous = result(&initial, Mode::ColdFull);
         accepted(&mut previous, &initial.scan.snapshots);
         let prior = commit(&session, initial);
@@ -682,41 +691,99 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             &line(COPY, "sibling-later", "2026-08-02T07:01:00Z", 7),
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let current = page(&c, prior, 100, true);
-        let key = path.to_str().unwrap().to_owned();
-        let mut diag = format!(
-            "cold emitted={:?}",
-            cold.snapshots.keys().collect::<Vec<_>>()
-        );
-        diag += &lossy_diag("lossy", &current, &key);
-        assert_eq!(current.modes.0, 0, "{diag}");
-        assert!(current.modes.1 > 0, "{diag}");
-        let mut held = result(&current, Mode::Restart);
-        held.accepted = previous.accepted.clone();
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
-        let prior = commit(&session, current);
-        // The lossy completion set no marker and kept the pre-append entry,
-        // so unchanged bytes would rightly skip: they reproduce the same hold.
-        // New bytes after the lossy point, seen through the watcher hint,
-        // re-select the file; the Tail continues from the retained head.
-        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
-        diag += &lossy_diag("replay", &replay, &key);
+        let current = read(prior, &[]);
+        assert_eq!(current.modes.0, 0);
+        assert!(current.modes.1 > 0);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
         assert_eq!(
-            replay.modes.0, 0,
-            "lossy completion must leave the old head{diag}"
+            current
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            30
         );
+        let emitted = result(&current, Mode::Restart);
+        money_oracle::assert_no_smaller_reemit(ROOT, &previous, &emitted, &cold, false);
+        // The changed sibling is offered before its exact ACK; suppression
+        // must never substitute for receiving that body's witness.
+        let sibling_item = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == COPY)
+            .unwrap();
+        assert_eq!(sibling_item.input_tokens, 12);
+        let sibling_fingerprint = sibling_item.snapshot_fingerprint.clone();
+        let sibling_witness = snapshot_upload_body_witness(sibling_item);
+        assert!(!current
+            .committed
+            .accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        let (prior, progress) = commit_with_progress(&session, current);
+        assert!(prior.accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        // A file stores a set digest, not an individual entity witness.
+        // Compare the exact-body ACK at its native per-entity boundary.
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&sibling_fingerprint),
+            Some(&sibling_witness)
+        );
+        let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+            SOURCE,
+            &scanner.cache,
+            &prior,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.sealed_offset(),
+            std::fs::metadata(&path).unwrap().len()
+        );
+        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
+        // Apply the same root selection before serialization on both routes.
+        let select_root = |page: &mut Page| {
+            page.scan.snapshots.retain(|s| s.source_session_id == ROOT);
+        };
+        let mut cold_page = page(&c, ScanIndex::default(), 100, false);
+        select_root(&mut cold_page);
+        let cold = result(&cold_page, Mode::ColdFull);
+        let mut replay = read(prior, &[path, sibling]);
         assert!(
-            replay.modes.1 > 0,
-            "the old seal must replay the lossy suffix{diag}"
+            !replay
+                .scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == COPY),
+            "only the exact ACK above suppresses the unchanged sibling"
         );
-        // Nothing new is emitted: the root is held again, as in a cold Full
-        // of the same bytes, and the sibling is unchanged since the lossy
-        // page, so that page's emitted sibling body is the stored path's.
-        assert!(replay.scan.snapshots.is_empty(), "{diag}");
-        assert!(!cold.snapshots.contains_key(ROOT), "{diag}");
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
+        // Same-generation growth continues the saved head despite its loss.
+        assert_eq!(replay.modes, (0, 1, 0));
+        let dispositions = |page: &Page| {
+            serde_json::to_value(&page.index).unwrap()["terminal_jsonl_dispositions"].clone()
+        };
+        let cold_loss = dispositions(&cold_page);
+        let losses = cold_loss.as_object().unwrap();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(
+            losses.values().next().unwrap()["loss"]["malformed_json_line_count"],
+            1
+        );
+        assert_eq!(dispositions(&replay), cold_loss);
+        assert_eq!(
+            replay
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            60
+        );
+        // Select before serialization so the real uploader derives the
+        // envelope contracts from exactly the bodies being compared.
+        select_root(&mut replay);
+        money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
     });
 }
 

@@ -14,7 +14,8 @@ use crate::instruction_inventory::{
 };
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
+    load_snapshot_device_credentials, ActivityHintResponse, RelayTokenAuthorizationRejected,
+    SnapshotApiClient,
 };
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
@@ -305,6 +306,10 @@ fn harvest_source(
 ) -> Result<ContextHarvestOutcome> {
     let relay_token =
         client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode)?;
+    // Each upload mints its own token just before it posts, as the Codex path
+    // does: the probes take tens of seconds, and another minter on this device
+    // can rebind its machine id in that gap.
+    let mint = || client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode);
     let identity = destination_identity(device, machine_id, api_base_url);
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
@@ -316,7 +321,7 @@ fn harvest_source(
             let _ = fs::remove_file(&marker);
             return harvest_recent_workspaces(
                 client,
-                &relay_token,
+                &mint,
                 support_dir,
                 &identity,
                 home,
@@ -334,7 +339,7 @@ fn harvest_source(
 
     harvest_recent_workspaces(
         client,
-        &relay_token,
+        &mint,
         support_dir,
         &identity,
         home,
@@ -363,7 +368,7 @@ fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn harvest_recent_workspaces(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     home: &Path,
@@ -412,7 +417,7 @@ fn harvest_recent_workspaces(
             Ok(mut request) => {
                 match upload_if_changed(
                     client,
-                    relay_token,
+                    mint_relay_token,
                     support_dir,
                     identity,
                     &mut request,
@@ -422,6 +427,15 @@ fn harvest_recent_workspaces(
                     Ok(false) => skipped += 1,
                     Err(error) => {
                         failed += 1;
+                        if let Some(rejected) =
+                            error.downcast_ref::<RelayTokenAuthorizationRejected>()
+                        {
+                            eprintln!(
+                                "context footprint upload unauthorized: HTTP {}",
+                                rejected.status
+                            );
+                            continue;
+                        }
                         eprintln!(
                             "context footprint upload skipped for workspace_hash={}: {}",
                             request.workspace_hash,
@@ -683,7 +697,14 @@ fn capture_claude_context(
 }
 
 fn configure_claude_context_command(command: &mut Command, include_mcp_servers: bool) -> Duration {
-    command.args(["-p", "/context", "--output-format", "json"]);
+    // Like the /usage refresher: a probe must not leave a saved session behind.
+    command.args([
+        "-p",
+        "/context",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+    ]);
     if !include_mcp_servers {
         // Keep strict mode everywhere except the single sampled workspace.
         // Dropping it globally would double-count MCP across the context and
@@ -1534,7 +1555,7 @@ struct FootprintCacheEntry {
 
 pub(crate) fn upload_if_changed(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     request: &mut ContextFootprintIngestRequest,
@@ -1554,7 +1575,8 @@ pub(crate) fn upload_if_changed(
     }
     let payload = serde_json::to_value(request)
         .map_err(|error| anyhow!("encode context footprint: {error}"))?;
-    client.upload_context_footprint(relay_token, &payload)?;
+    let relay_token = mint_relay_token()?;
+    client.upload_context_footprint(&relay_token, &payload)?;
     write_json_atomic(
         &path,
         &FootprintCacheEntry {
@@ -1817,7 +1839,8 @@ mod tests {
                 payload
             );
             let arguments = fs::read_to_string(fixture.fake.root.join("arguments")).unwrap();
-            assert!(arguments.starts_with("\n-p\n/context\n--output-format\njson\n"));
+            assert!(arguments
+                .starts_with("\n-p\n/context\n--no-session-persistence\n--output-format\njson\n"));
             assert_eq!(arguments.contains("--strict-mcp-config"), !sampled);
             assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
         }

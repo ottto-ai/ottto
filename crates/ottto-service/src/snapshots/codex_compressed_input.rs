@@ -667,7 +667,7 @@ pub(in crate::snapshots) mod tests {
             None,
             None,
         )?;
-        anyhow::ensure!(parsed.complete(), "fixture parse incomplete");
+        anyhow::ensure!(parsed.progress_complete(), "fixture parse incomplete");
         Ok(json!({
             "report": format!("{:?}", parsed.report),
             "snapshots": parsed.snapshots,
@@ -1165,7 +1165,7 @@ pub(in crate::snapshots) mod tests {
                     None,
                 )
                 .unwrap();
-            assert!(parsed.complete());
+            assert!(parsed.progress_complete());
             let mut items = parsed.snapshots;
             apply_upload_policy(
                 SnapshotSource::Codex,
@@ -2105,7 +2105,7 @@ pub(in crate::snapshots) mod tests {
                 .unwrap();
             assert!(parsed.snapshots.is_empty());
             assert_eq!(parsed.zero_snapshot_usage_evidence, evidence);
-            assert_eq!(parsed.complete(), !evidence);
+            assert_eq!(parsed.progress_complete(), !evidence);
             let (index, scan, _) = run_archive(
                 &f,
                 ScanIndex::default(),

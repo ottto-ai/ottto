@@ -247,7 +247,6 @@ pub(crate) enum Refusal {
     InvalidEvidence,
     ContradictoryOrg,
     BadClock,
-    MarkerOverflow,
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
@@ -2843,9 +2842,6 @@ fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence])
 
 // --- Transcript organization markers (cached accumulator state) -------------
 
-/// Most markers one file may carry before transcript bases switch off for it.
-pub(crate) const MAX_ORG_MARKERS_PER_FILE: usize = 64;
-
 /// 2026-11-05T00:00:00Z (UTC ms). A request whose own provider time is at or
 /// after it follows the latest valid org line; an earlier request keeps the
 /// terminal trust it had, so a cold read equals a stored one.
@@ -2876,8 +2872,8 @@ pub(crate) struct OrgMarker {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
-    starting_marker: Option<OrgMarker>,
-    overflowed: bool,
+    starting_marker: RetiredStartingMarker,
+    overflowed: RetiredOverflow,
     context_digest: Option<String>,
     context_changed: bool,
     /// Response positions of the first non-blank `session_context` email and
@@ -2886,6 +2882,65 @@ pub(crate) struct OrgMarkers {
     /// it could not be compared, so it counts as different.
     context_position: Option<u64>,
     context_flip_position: Option<u64>,
+}
+
+/// Retired: the starting marker earlier builds stored beside the entries (it
+/// copied the first one). Decoded and dropped, written as `None`, so a stored
+/// head keeps its layout and still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredStartingMarker;
+
+/// Retired: the marker-count flag earlier builds stored. A head that set it had
+/// dropped its markers, so it does not decode and the file reads cold. Written
+/// as `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredOverflow;
+
+impl crate::durable_tail_codec::Durable for RetiredStartingMarker {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<OrgMarker>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
+impl crate::durable_tail_codec::Durable for RetiredOverflow {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&false, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        if <bool as crate::durable_tail_codec::Durable>::take(d)? {
+            return Err(crate::durable_tail_codec::Corrupt);
+        }
+        Ok(Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        Self::take(d).map(|_| ())
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <bool as crate::durable_tail_codec::Durable>::shape(s);
+    }
 }
 
 /// The hashed organization of a `credential_org` attachment; `None` when blank
@@ -2951,14 +3006,6 @@ pub(crate) fn note_marker_line(
         Some("credential_org") => {
             let org = marker_org_hash(attachment);
             let state = markers.get_or_insert_with(Box::default);
-            if state.overflowed {
-                return;
-            }
-            if state.entries.len() == MAX_ORG_MARKERS_PER_FILE {
-                state.overflowed = true;
-                state.entries = Vec::new();
-                return;
-            }
             let terminal_trusted = match state.entries.last() {
                 None => true,
                 Some(previous) => {
@@ -2966,15 +3013,11 @@ pub(crate) fn note_marker_line(
                 }
             };
             state.context_changed = false;
-            let marker = OrgMarker {
+            state.entries.push(OrgMarker {
                 position: response_position,
                 org,
                 terminal_trusted,
-            };
-            if state.starting_marker.is_none() {
-                state.starting_marker = Some(marker.clone());
-            }
-            state.entries.push(marker);
+            });
         }
         _ => {}
     }
@@ -2993,7 +3036,6 @@ pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
 pub(crate) enum MarkerVerdict<'m> {
     None,
     Trusted(&'m str),
-    Overflow,
     UntrustedFlip,
     BadOrg,
 }
@@ -3004,7 +3046,6 @@ impl OrgMarkers {
     pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries
             .iter()
-            .chain(&self.starting_marker)
             .map(|marker| marker.position)
             .chain(self.context_position)
             .chain(self.context_flip_position)
@@ -3029,9 +3070,6 @@ impl OrgMarkers {
     /// `latest` (Desktop, or a request from `ACCOUNT_RULE_FROM`) trusts any
     /// valid org line; otherwise an unexplained flip is refused.
     pub(crate) fn verdict(&self, sequence: u64, latest: bool) -> MarkerVerdict<'_> {
-        if self.overflowed {
-            return MarkerVerdict::Overflow;
-        }
         let Some(marker) = self
             .entries
             .iter()
@@ -3049,7 +3087,7 @@ impl OrgMarkers {
 }
 
 // `e2` consumes this compact, native-sequence-ordered placement before any
-// requests aggregate. Marker state is bounded independently of request count.
+// requests aggregate.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 /// A counted request's grain slot (live key, origin), the account a copied
 /// marker lent it, and whether this pass positively read its own evidence.
@@ -3329,31 +3367,6 @@ pub(crate) fn request_accounts(
     };
     // Only `e2` can exclude a request. Marker timestamps never decide identity.
     let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
-    if markers.overflowed {
-        if let Some(marker) = markers
-            .starting_marker
-            .as_ref()
-            .filter(own_marker)
-            .filter(|marker| marker.position <= first)
-        {
-            if let Some(org) = marker.org.as_deref() {
-                accounts.starting = Some(Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                    account_source: None,
-                }));
-                accounts.runs.push(AccountRun {
-                    position: marker.position,
-                    account: accounts.starting.clone(),
-                    copied: None,
-                    split: false,
-                });
-            }
-        }
-    }
-    accounts.fallback = accounts.starting.clone();
-    accounts.conflict = markers.overflowed;
     // Positions where one request carries two different orgs (R3-N2).
     let mut contradicted = Vec::new();
     // A refused org line still governing at `trust_from` starts a run there
@@ -3408,18 +3421,16 @@ pub(crate) fn request_accounts(
     }
     // Derive the first own request's start from the accepted own stream,
     // preserving the first observation of a conflicting same-position pair.
-    if !markers.overflowed {
-        if let Some(key) = accounts
-            .runs
-            .iter()
-            .rev()
-            .filter(|run| run.position <= first)
-            .find_map(|run| run.account.as_ref())
-        {
-            accounts.starting = Some(key.clone());
-        }
-        accounts.fallback = accounts.starting.clone();
+    if let Some(key) = accounts
+        .runs
+        .iter()
+        .rev()
+        .filter(|run| run.position <= first)
+        .find_map(|run| run.account.as_ref())
+    {
+        accounts.starting = Some(key.clone());
     }
+    accounts.fallback = accounts.starting.clone();
     // R3-N2 (QUOTA): a later request carrying two different orgs is never
     // guessed: it goes to the starting (or bound) account, counted as a
     // conflict above. A pair at the session start is the start itself.
@@ -3545,7 +3556,6 @@ impl RequestAccounts {
             let org = markers
                 .entries
                 .iter()
-                .chain(&markers.starting_marker)
                 .filter_map(|marker| marker.org.as_ref().map(String::capacity))
                 .max()
                 .unwrap_or(0);
@@ -4728,7 +4738,6 @@ pub(super) fn owner_is_foreign(
 fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
         MarkerVerdict::None => return None,
-        MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
         MarkerVerdict::UntrustedFlip => return Some(IdentityRef::Refused(Refusal::UntrustedFlip)),
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
@@ -5475,14 +5484,15 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
     D entries: Vec<OrgMarker>,
-    D starting_marker: Option<OrgMarker>,
-    N overflowed: bool,
+    D starting_marker: RetiredStartingMarker,
+    N overflowed: RetiredOverflow,
     H context_digest: Option<String>,
     N context_changed: bool,
     N context_position: Option<u64>,
     N context_flip_position: Option<u64>,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
+crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
     N position: u64,
     U org: Option<String>,

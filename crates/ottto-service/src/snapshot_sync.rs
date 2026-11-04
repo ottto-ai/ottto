@@ -11,7 +11,7 @@ use crate::backfill::{
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
     update_backfill_state,
 };
-use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
+use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics};
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
 };
@@ -4094,8 +4094,6 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     census_status: crate::snapshots::CensusStatus,
-    cap_counts: crate::local_resource_diagnostics::CapCounts,
-    local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
     backfill_file_limit: u64,
     discovered_file_count: u64,
@@ -4228,8 +4226,6 @@ impl SyncCounts {
             scanned_session_count: scan_result.scanned_session_count as u64,
             semantic_noop_count: scan_result.semantic_noop_count as u64,
             census_complete: scan_result.census_complete,
-            cap_counts: scan_result.cap_counts,
-            local_codex_diagnostics: scan_result.local_codex_diagnostics,
             symlink_rejected_count: scan_result.symlink_rejected_count as u64,
             unreadable_path_count: scan_result.unreadable_path_count as u64,
             oversized_file_count: scan_result.oversized_file_count as u64,
@@ -8619,7 +8615,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8640,7 +8635,6 @@ fn finish_sync_source(
                         message: "backend shed the snapshot upload; honouring backoff",
                     },
                 },
-                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -8649,7 +8643,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8666,7 +8659,6 @@ fn finish_sync_source(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
                     ),
                 },
-                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -8808,7 +8800,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8823,7 +8814,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                     state,
                 },
-                scan_result.codex_counting_v2.as_deref(),
             );
             return Err(error.context(context));
         }
@@ -9123,7 +9113,6 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
-            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9138,7 +9127,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                 state,
             },
-            scan_result.codex_counting_v2.as_deref(),
         );
         if !resolved_permanent_rejections {
             return Err(snapshot_entity_deferred(count));
@@ -9163,7 +9151,6 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
-            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9178,7 +9165,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                 state: CollectorState::Success,
             },
-            scan_result.codex_counting_v2.as_deref(),
         )?;
     }
     if let Some(mut lease) = native_comparison_lease {
@@ -11922,8 +11908,7 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 
 /// Build the terminal collector receipt for a completed cycle.
 ///
-/// Split from the send so the live path can journal the exact typed receipt it
-/// is about to POST, and so tests can assert against that same payload —
+/// Split from the send so tests can assert against the exact typed payload —
 /// including its declared `report_kind` — rather than a hand-rolled lookalike.
 fn collector_status_request(
     destination_namespace: &str,
@@ -12198,105 +12183,13 @@ fn refresh_terminal_manifest(
     Ok(())
 }
 
-fn terminal_status_journal_path(
-    support_dir: &Path,
-    destination_namespace: &str,
-    source: SnapshotSource,
-) -> PathBuf {
-    support_dir
-        .join("snapshots")
-        .join("destinations")
-        .join(destination_namespace)
-        .join(format!("{}-terminal-status-v1.json", source.api_slug()))
-}
-
-#[cfg(test)]
-fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
-    save_terminal_status_journal_with_diagnostics(path, request, None, None, Default::default())
-}
-
-fn save_terminal_status_journal_with_diagnostics(
-    path: &Path,
-    request: &SnapshotStatusRequest,
-    diagnostic: Option<&CodexScanDiagnostics>,
-    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
-    cap_counts: crate::local_resource_diagnostics::CapCounts,
-) -> Result<()> {
-    #[derive(Serialize)]
-    struct LocalJournal<'a> {
-        #[serde(flatten)]
-        receipt: &'a SnapshotStatusRequest,
-        #[serde(skip_serializing_if = "crate::local_resource_diagnostics::CapCounts::is_empty")]
-        local_cap_counts: crate::local_resource_diagnostics::CapCounts,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        local_codex_diagnostics: Option<&'a CodexScanDiagnostics>,
-        /// Borrowed from the scan result; absent when no configured counting
-        /// parse finished, never written as zero.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        local_codex_counting_v2: Option<&'a codex_scan_diagnostics::CountingV2Receipts>,
-    }
-    // One latest receipt already has stricter retention than the four-record
-    // ceiling. Enforce the extension's byte cap before touching its journal.
-    let diagnostic = diagnostic.filter(|diagnostic| {
-        serde_json::to_vec_pretty(diagnostic)
-            .is_ok_and(|bytes| bytes.len() <= MAX_LOCAL_DIAGNOSTIC_BYTES)
-    });
-    let journal = LocalJournal {
-        local_cap_counts: cap_counts,
-        receipt: request,
-        local_codex_diagnostics: diagnostic,
-        local_codex_counting_v2: codex_counting_v2,
-    };
-    if request.last_scan_finished_at.is_none() {
-        return Err(anyhow!("terminal status journal requires a finished scan"));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("create terminal status journal directory")?;
-    }
-    let _lock = SnapshotProgressLock::acquire(path)?;
-    let temp_path = unique_progress_sibling(path, "tmp");
-    let mut file = std::fs::File::create(&temp_path).context("create terminal status journal")?;
-    let result = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut file, &journal)
-            .context("write terminal status journal")?;
-        file.sync_all().context("sync terminal status journal")?;
-        std::fs::rename(&temp_path, path).context("replace terminal status journal")?;
-        sync_progress_parent(path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-#[cfg(test)]
-fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequest>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("read terminal status journal"),
-    };
-    let request: SnapshotStatusRequest =
-        serde_json::from_slice(&bytes).context("parse terminal status journal")?;
-    if request.schema_version != SNAPSHOT_STATUS_SCHEMA_VERSION
-        || request.last_scan_started_at.is_none()
-        || request.last_scan_finished_at.is_none()
-    {
-        return Err(anyhow!("terminal status journal is not a terminal receipt"));
-    }
-    Ok(Some(request))
-}
-
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
-    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
-    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     // This is the single terminal report boundary. Every terminal outcome
@@ -12324,36 +12217,11 @@ fn report_status_with_fresh_relay_token(
     // Keep non-blocking cooldown debt beside the terminal census counters on
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
-    let diagnostic = status.counts.local_codex_diagnostics;
-    let cap_counts = status.counts.cap_counts;
     let request = collector_status_request(
         &destination_namespace,
         status,
         census_residue_status_admitted,
     )?;
-    let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
-    // Commit the exact typed receipt before it can reach the backend. A later
-    // cycle-start or heartbeat therefore repeats one coherent scan result
-    // instead of combining a fresh start/default counters with an old error.
-    //
-    // The ordering holds on the success path, but it is best-effort: the
-    // journal is a local diagnostic artifact with no production reader, so a
-    // full disk or an unwritable support dir must not suppress the terminal
-    // report itself. Remote truth never waits on local disk; the failure is
-    // disclosed on the daemon's error log instead.
-    if let Err(error) = save_terminal_status_journal_with_diagnostics(
-        &journal_path,
-        &request,
-        diagnostic.as_ref(),
-        codex_counting_v2,
-        cap_counts,
-    ) {
-        eprintln!(
-            "local snapshot terminal status journal write failed for {}: {}",
-            source.api_slug(),
-            safe_error(&error)
-        );
-    }
     client.report_status(&relay_token, &request)?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -12395,11 +12263,9 @@ fn withdraw_and_report_policy_stop(
         client,
         device,
         device_secret,
-        support_dir,
         source,
         TerminalManifestSource::Withdraw,
         status,
-        None,
     )
 }
 
@@ -12425,8 +12291,8 @@ fn withdraw_and_report_policy_stop(
 /// That absence is also why this body must stay byte-identical to the shape the
 /// backend classifies as a check-in (`last_scan_finished_at is None && enabled
 /// && last_error_code is None && next_retry_at is None && consecutive_failures
-/// == 0`). Replaying the journaled terminal receipt here — the local journal
-/// `report_status_with_fresh_relay_token` writes — would silently retire
+/// == 0`). Replaying the terminal receipt
+/// `report_status_with_fresh_relay_token` posts here would silently retire
 /// check-in receipts, make the cycle-start in-progress marker dead code, flip
 /// manifest preservation to invalidation on every heartbeat while an error is
 /// retained, and put a `scan_status` payload behind a `checkin` declaration.
@@ -19938,7 +19804,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -19948,7 +19813,6 @@ mod tests {
                 counts: SyncCounts::for_policy(30),
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report status with fresh relay token");
 
@@ -20037,7 +19901,6 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
-            test_terminal_status_support_dir(),
             source,
             manifest_source,
             CollectorStatus {
@@ -20047,7 +19910,6 @@ mod tests {
                 counts,
                 state,
             },
-            None,
         )
         .expect("terminal receipt");
         let requests = captured.lock().expect("captured requests").clone();
@@ -20125,11 +19987,10 @@ mod tests {
     }
 
     /// A liveness beat may only repeat evidence the backend has already
-    /// accepted. A durable terminal journal now exists (ottto#393), but no
-    /// beat reads it — `report_checkin_status` has no path to it — so a beat
-    /// replays nothing at all: every scan-result field is literally absent,
-    /// zero, or false, and the only carried witness is the cached manifest
-    /// from the last completed terminal report.
+    /// accepted. `report_checkin_status` has no path to the last terminal
+    /// receipt, so a beat replays nothing at all: every scan-result field is
+    /// literally absent, zero, or false, and the only carried witness is the
+    /// cached manifest from the last completed terminal report.
     #[test]
     #[serial(source_manifests)]
     fn a_liveness_beat_discloses_nothing_the_backend_has_not_accepted() {
@@ -21267,7 +21128,6 @@ mod tests {
             &client,
             &device,
             "synthetic-secret",
-            support,
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21277,7 +21137,6 @@ mod tests {
                 counts: SyncCounts::from_scan_result(&scan, 0, 30),
                 state: CollectorState::Success,
             },
-            scan.codex_counting_v2.as_deref(),
         )
         .unwrap();
         let requests = captured.lock().unwrap();
@@ -21312,112 +21171,7 @@ mod tests {
 
     #[test]
     #[serial(source_manifests)]
-    fn codex_local_diagnostics_stay_in_latest_journal_and_off_the_wire() {
-        let _guard = SourceManifestTestGuard::new();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
-            captured.clone(),
-            vec![30, 30],
-        ));
-        let device = LocalDeviceBinding {
-            device_id: "device_test".into(),
-            machine_id: Some("otm_test".into()),
-            sources: vec!["codex".into()],
-        };
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        let path = terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            &destination,
-            SnapshotSource::Codex,
-        );
-        // Only the first scan executed configured counting.
-        let receipts = codex_scan_diagnostics::CountingV2Receipts {
-            v2_sessions: 1,
-            tombstone_evictions_v2_only: 2,
-            tombstone_evictions_pre_cutover_legacy: 3,
-            tombstone_evictions_not_provably_pre_cutover_legacy: 4,
-            legacy_to_v2_after_tombstone_eviction: 5,
-            tombstone_count: 1024,
-            tombstone_cap: 1024,
-            ..Default::default()
-        };
-        for generation in [1, 2] {
-            let cap_counts = crate::local_resource_diagnostics::CapCounts {
-                bootstrap_overflow_events: u64::from(generation == 1),
-                ..Default::default()
-            };
-            let counts = SyncCounts {
-                cap_counts,
-                local_codex_diagnostics: Some(CodexScanDiagnostics {
-                    version: 1,
-                    generation,
-                    ..Default::default()
-                }),
-                ..SyncCounts::for_policy(30)
-            };
-            report_status_with_fresh_relay_token(
-                &client,
-                &device,
-                "device-secret",
-                test_terminal_status_support_dir(),
-                SnapshotSource::Codex,
-                TerminalManifestSource::Withdraw,
-                CollectorStatus {
-                    source: SnapshotSource::Codex,
-                    machine_id: "otm_test",
-                    scan_started_at: "2026-09-01T07:44:00Z",
-                    counts,
-                    state: CollectorState::Success,
-                },
-                (generation == 1).then_some(&receipts),
-            )
-            .unwrap();
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
-            assert_eq!(
-                journal.get("local_cap_counts"),
-                (generation == 1)
-                    .then(|| serde_json::to_value(cap_counts).unwrap())
-                    .as_ref()
-            );
-            if generation == 1 {
-                assert_eq!(
-                    journal["local_codex_counting_v2"],
-                    serde_json::to_value(receipts).unwrap()
-                );
-            } else {
-                assert!(
-                    journal.get("local_codex_counting_v2").is_none(),
-                    "a scan without executed counting is absent, not zero"
-                );
-            }
-            let requests = captured.lock().unwrap();
-            let terminal = http_request_json(requests.last().unwrap());
-            assert!(terminal.get("local_codex_diagnostics").is_none());
-            assert!(terminal.get("local_codex_counting_v2").is_none());
-            assert_eq!(
-                serde_json::to_value(load_terminal_status_journal(&path).unwrap().unwrap())
-                    .unwrap(),
-                terminal
-            );
-        }
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with("terminal-status-v1.json"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn terminal_receipt_is_journaled_before_post_and_liveness_stays_liveness() {
+    fn terminal_receipt_is_posted_and_liveness_stays_liveness() {
         let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
@@ -21440,7 +21194,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21450,9 +21203,8 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
-        .expect("persist and emit terminal loss receipt");
+        .expect("emit terminal loss receipt");
         report_checkin_status_with_fresh_relay_token(
             &client,
             &device,
@@ -21472,22 +21224,6 @@ mod tests {
         assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
         assert!(terminal["last_scan_finished_at"].is_string());
 
-        // The durable journal holds exactly the body that was committed before
-        // the POST: one coherent scan result - timestamps, counters, cap state
-        // and error all from the same `SourceScanResult`.
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        let journal = load_terminal_status_journal(&terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            &destination,
-            SnapshotSource::Codex,
-        ))
-        .expect("read journal")
-        .expect("journal exists");
-        assert_eq!(
-            serde_json::to_value(journal).expect("journal JSON"),
-            terminal
-        );
-
         // The liveness beat that follows it is NOT the terminal body. Its wire
         // shape is exactly what the backend classifies as a check-in receipt,
         // so the terminal report stays the single source of scan truth.
@@ -21503,140 +21239,6 @@ mod tests {
         assert_eq!(checkin["last_scan_started_at"], "2026-09-01T08:12:28Z");
         assert_eq!(checkin["last_recognized_usage_drop_count"], 0);
         assert_eq!(checkin["last_dropped_usage_record_count"], 0);
-    }
-
-    /// The journal is a local diagnostic artifact with no production reader, so
-    /// it must never gate remote truth. An unwritable support dir - a full or
-    /// read-only disk in the field - has to log and continue, with the terminal
-    /// receipt reaching the backend carrying exactly the same counters.
-    #[test]
-    #[serial(source_manifests)]
-    fn terminal_receipt_is_posted_when_the_journal_write_fails() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
-            captured.clone(),
-            vec![30],
-        ));
-        let device = LocalDeviceBinding {
-            device_id: "device_test".to_string(),
-            machine_id: Some("otm_test".to_string()),
-            sources: vec!["codex".to_string()],
-        };
-
-        // Inject the write failure without a test-only seam: the journal's
-        // parent chain runs through a regular file, so `create_dir_all` fails
-        // exactly as it would on an unwritable support directory.
-        let support_dir = test_terminal_status_support_dir().join("blocked-support-dir");
-        std::fs::create_dir_all(test_terminal_status_support_dir())
-            .expect("create terminal status test root");
-        std::fs::write(&support_dir, b"not a directory").expect("block the support dir");
-
-        let mut counts = SyncCounts::for_policy(30);
-        counts.scan_cap_hit = false;
-        counts.census_complete = true;
-        counts.local_codex_diagnostics = Some(CodexScanDiagnostics {
-            version: 1,
-            ..Default::default()
-        });
-        counts.recognized_usage_drop_count = 1_105;
-        counts.dropped_usage_record_count = 1_105;
-        counts.ownership_incomplete_file_count = 1;
-
-        report_status_with_fresh_relay_token(
-            &client,
-            &device,
-            "device-secret",
-            &support_dir,
-            SnapshotSource::Codex,
-            TerminalManifestSource::Withdraw,
-            CollectorStatus {
-                source: SnapshotSource::Codex,
-                machine_id: "otm_test",
-                scan_started_at: "2026-09-01T07:44:00Z",
-                counts,
-                state: CollectorState::Success,
-            },
-            None,
-        )
-        .expect("a failed local journal write must not suppress the terminal report");
-
-        let requests = captured.lock().expect("captured requests").clone();
-        let terminal = http_request_json(&requests[1]);
-        assert_eq!(terminal["last_recognized_usage_drop_count"], 1_105);
-        assert_eq!(terminal["last_dropped_usage_record_count"], 1_105);
-        assert_eq!(terminal["last_ownership_incomplete_file_count"], 1);
-        assert_eq!(terminal["last_error_code"], "parse_error");
-        assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
-        assert!(terminal["last_scan_finished_at"].is_string());
-        assert_eq!(terminal["last_scan_cap_hit"], false);
-
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        assert!(
-            !terminal_status_journal_path(&support_dir, &destination, SnapshotSource::Codex)
-                .exists(),
-            "the journal genuinely failed to write; the POST proceeded anyway"
-        );
-    }
-
-    /// The journal persists the exact typed `SnapshotStatusRequest` that is
-    /// about to go on the wire, so the declared `report_kind` has to survive
-    /// the disk round trip like every other field. Without `Deserialize` on
-    /// `SnapshotStatusReportKind` the journal would not compile at all; with a
-    /// `skip`/`default` escape hatch it would silently reload as some other
-    /// kind and a replayed receipt would lie about what it is. This asserts the
-    /// reloaded receipt is byte-for-byte the one that was committed.
-    #[test]
-    #[serial(source_manifests)]
-    fn the_journaled_receipt_reloads_with_its_declared_report_kind() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let mut counts = SyncCounts::for_policy(30);
-        counts.census_complete = true;
-        counts.recognized_usage_drop_count = 7;
-        counts.dropped_usage_record_count = 7;
-        let request = collector_status_request(
-            "destination",
-            CollectorStatus {
-                source: SnapshotSource::Codex,
-                machine_id: "otm_test",
-                scan_started_at: "2026-09-01T07:44:00Z",
-                counts,
-                state: CollectorState::Error {
-                    code: "scan_error",
-                    message: "local snapshot scan failed",
-                },
-            },
-            false,
-        )
-        .expect("terminal receipt");
-        assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
-
-        let path = terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            "destination",
-            SnapshotSource::Codex,
-        );
-        save_terminal_status_journal(&path, &request).expect("journal the terminal receipt");
-        let reloaded = load_terminal_status_journal(&path)
-            .expect("read journal")
-            .expect("journal exists");
-
-        // The declaration itself survives...
-        assert_eq!(reloaded.report_kind, SnapshotStatusReportKind::ScanStatus);
-        // ...as the snake_case wire token, not a re-derived guess...
-        let reloaded_json = serde_json::to_value(&reloaded).expect("reloaded JSON");
-        assert_eq!(reloaded_json["report_kind"], "scan_status");
-        // ...and the whole receipt is unchanged by the round trip, so a replay
-        // could never post a body that differs from the one committed.
-        assert_eq!(
-            reloaded_json,
-            serde_json::to_value(&request).expect("committed JSON")
-        );
-        // A journaled scan result stays a scan result on the egress guard: it
-        // can never re-enter the wire wearing a check-in declaration.
-        reloaded
-            .validate_declared_report_kind()
-            .expect("a journaled scan status is truthfully declared");
     }
 
     #[test]
@@ -21724,7 +21326,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21734,7 +21335,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report terminal status");
         let requests = captured.lock().expect("captured requests").clone();
@@ -21832,7 +21432,6 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
-                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -21842,7 +21441,6 @@ mod tests {
                     counts,
                     state,
                 },
-                None,
             )
             .expect("report terminal manifest withdrawal");
             let request = captured.lock().expect("captured requests")[1].clone();
@@ -22063,7 +21661,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22073,7 +21670,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report terminal with refreshed policy");
 
@@ -22117,7 +21713,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22127,7 +21722,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("zero-width terminal tombstone");
         assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_none());

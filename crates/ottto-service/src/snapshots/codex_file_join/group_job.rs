@@ -1027,7 +1027,7 @@ fn member_eof(
                 inputs.attribution,
             )
             .map_err(|_| GroupEnd::Strict)?;
-        if !parsed.complete() {
+        if !parsed.progress_complete() {
             return Err(GroupEnd::Strict);
         }
         let mut snapshots = parsed.snapshots;
