@@ -33,13 +33,8 @@ pub(in crate::snapshots) fn carry_tail(
             recovered_write(&path, None, &id, session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
                 session.cx.tail = Some(moved);
-                let digests = import::save(
-                    &mut session.db,
-                    &id,
-                    previous,
-                    &mut next,
-                    &mut session.cx,
-                )?;
+                let digests =
+                    import::save(&mut session.db, &id, previous, &mut next, &mut session.cx)?;
                 session.stamp = session.db.stamp()?;
                 state.save_digests = Some(digests);
                 Ok(())
