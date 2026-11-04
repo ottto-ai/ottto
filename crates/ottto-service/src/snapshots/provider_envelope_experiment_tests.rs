@@ -307,7 +307,11 @@ fn replaced_selected_file_keeps_safe_open_failure_visible() {
 fn failed_selected_file_keeps_dependent_source_unresolved() {
     let fixture = SelectionFixture::new();
     let state = fixture.prepare(fixture.previous.clone(), 2);
-    let path = replace_candidate(&state);
+    let path = state.identified_candidates[0].path.clone();
+    // A directory cannot supply transcript bytes, even to a privileged reader.
+    // Ordinary files replaced by other files may legitimately be reparsed.
+    fs::rename(&path, path.with_extension("refused-backup")).unwrap();
+    fs::create_dir(&path).unwrap();
     let key = local_index_key(&path);
     let old = serde_json::to_vec(&state.index.files[&key]).unwrap();
     let (index, scan) = finish(state);
@@ -315,6 +319,7 @@ fn failed_selected_file_keeps_dependent_source_unresolved() {
         scan.scanned_file_count, 1,
         "only the unchanged sibling completed"
     );
+    assert!(scan.unreadable_path_count > 0);
     assert_eq!(serde_json::to_vec(&index.files[&key]).unwrap(), old);
     assert!(scan
         .snapshots
@@ -398,7 +403,7 @@ fn selected_fixture() -> (SelectionFixture, ScanIndex, SourceScanResult, ScanInd
         previous.clone(),
         WINDOW,
         30,
-        2,
+        3,
         None,
         &fixture.paths[2..3],
         false,
@@ -406,13 +411,52 @@ fn selected_fixture() -> (SelectionFixture, ScanIndex, SourceScanResult, ScanInd
     ));
     assert!(!scan.census_complete);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    let new_key = local_index_key(&fixture.paths[2]);
+    let new_revision = &index
+        .files
+        .get(&new_key)
+        .expect("the page read C")
+        .source_file_fingerprint;
+    assert!(
+        scan.snapshots
+            .iter()
+            .any(|item| item.source_file_fingerprint.as_ref() == Some(new_revision)),
+        "the new member must actually be read before testing its settlement"
+    );
     (fixture, index, scan, previous)
+}
+
+fn selected_prior_key(index: &ScanIndex, scan: &SourceScanResult, previous: &ScanIndex) -> String {
+    index
+        .files
+        .iter()
+        .find(|(key, entry)| {
+            previous.files.contains_key(*key)
+                && scan.snapshots.iter().any(|item| {
+                    item.source_file_fingerprint.as_ref() == Some(&entry.source_file_fingerprint)
+                })
+        })
+        .map(|(key, _)| key.clone())
+        .expect("the page parsed a previously committed member")
+}
+
+fn queued_prior_key(index: &ScanIndex, previous: &ScanIndex) -> String {
+    index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .find(|key| previous.files.contains_key(key))
+        .expect("an unselected committed member remains queued")
 }
 
 #[test]
 fn selected_restore_preserves_prior_body_and_queued_debt() {
-    let (fixture, index, _scan, previous) = selected_fixture();
-    let key = local_index_key(&fixture.paths[1]);
+    let (fixture, index, scan, previous) = selected_fixture();
+    let key = selected_prior_key(&index, &scan, &previous);
+    let owed_key = queued_prior_key(&index, &previous);
     let old = serde_json::to_vec(&previous.files[&key]).unwrap();
     let mut selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert_eq!(serde_json::to_vec(&selected.files[&key]).unwrap(), old);
@@ -427,7 +471,9 @@ fn selected_restore_preserves_prior_body_and_queued_debt() {
             .unwrap()
     ));
     let queued = &selected.traversal.as_ref().unwrap().pending_candidates;
-    assert!(queued.iter().any(|entry| entry.path == fixture.paths[0]));
+    assert!(queued
+        .iter()
+        .any(|entry| local_index_key(&entry.path) == owed_key));
     selected.mark_bounded_sweep_unsettled();
     selected.save(&fixture.index_path).unwrap();
     let restored = ScanIndex::load(&fixture.index_path).unwrap();
@@ -717,7 +763,7 @@ fn proof_revision_reparse_and_restart_preserve_body_custody() {
             let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
             index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
         }
-        let path = fixture.dir.join("restart-index.json");
+        let path = fixture.dir.join("correction-selected.json");
         index.save(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
@@ -793,6 +839,7 @@ fn unknown_input_creates_no_false_credit_or_new_debt() {
 fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
     for partial in [false, true] {
         let (fixture, mut index, mut scan, mut previous) = selected_fixture();
+        let copy = queued_prior_key(&index, &previous);
         let key = local_index_key(&fixture.paths[2]);
         let entry = index.files[&key].clone();
         previous.files.insert(key.clone(), entry.clone());
@@ -845,7 +892,6 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
                 .count(),
             crate::transcript_cache::CACHE_ENTRIES
         );
-        let copy = local_index_key(&fixture.paths[0]);
         assert_eq!(
             serde_json::to_value(&selected.files[&copy]).unwrap(),
             serde_json::to_value(&previous.files[&copy]).unwrap()

@@ -1272,15 +1272,6 @@ pub(crate) fn before_next_trace_read_for_test(hook: impl FnOnce(&Path) + 'static
     TRACE_BEFORE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
-pub(crate) fn reset_evidence_read_counts_for_test() {
-    API_READ_RECEIPT.with(|receipt| {
-        let (_, _, force) = receipt.get();
-        receipt.set((0, 0, force));
-    });
-    TRACE_READ_RECEIPT.with(|count| count.set(0));
-}
-
 /// Runs `f`, then puts this thread's read receipts back as they were before
 /// it; a pending trace-read hook is set aside so `f` cannot fire it.
 #[cfg(test)]
