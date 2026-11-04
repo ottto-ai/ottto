@@ -26,7 +26,8 @@ fail (exit 1). Notes never fail.
   stutter       a file or directory name does not start with its parent
                 directory's name.
 
-Exit status: 0, or 1 when an enforced rule has findings, 2 on a usage error.
+Exit status: 0, or 1 when an enforced rule has findings, 2 on a usage error (or a
+setup error while a rule is enforced).
 """
 
 from __future__ import annotations
@@ -287,7 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         tree = rst.crate_tree(source, CRATE)
     except (OSError, rst.SourceError) as error:
         print(f"source-layout: {error}", file=sys.stderr)
-        return 2
+        # A report never blocks a change; an enforced check does.
+        return 2 if enforce else 0
     findings: list[Finding] = []
     check_size(root, files, limits, base_limits, findings)
     check_tree(root, files, dirs, tree, findings)

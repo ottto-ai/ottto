@@ -472,7 +472,8 @@ def main(argv: list[str] | None = None) -> int:
         head_source, head_tree, head_files, head_units = side(repo, head_sha, changed, base_source)
     except rst.SourceError as error:
         print(f"move-ledger: {error}", file=sys.stderr)
-        return 2
+        # A report never blocks a change; an enforced check does.
+        return 0 if args.report else 2
     ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened))
     for path in head_files:
         if path in changed and path not in head_tree.contexts:

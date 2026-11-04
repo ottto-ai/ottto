@@ -219,7 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         base_rules, head_rules = retry_rules(base_source, base_sha), retry_rules(head_source, head_sha)
     except rst.SourceError as error:
         print(f"test-ids: {error}", file=sys.stderr)
-        return 2
+        # A report never blocks a change; an enforced check does.
+        return 0 if args.report else 2
     flips = 0
     for target, pairs in sorted(mapping.items()):
         renamed = sum(1 for old, new in pairs if old != new)
