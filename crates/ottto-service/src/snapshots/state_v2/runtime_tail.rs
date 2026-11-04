@@ -210,7 +210,7 @@ fn exit_commit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
         .stamp
         .0;
     let _save_window = telemetry::Window::begin("save");
-    with_save_session(path, Some(runtime), expected, true, |state, session, id| {
+    with_save_session(path, Some(runtime), expected, |state, session, id| {
         recovered_write(path, None, &id, session, |session| {
             super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail)?;
             session.stamp = session.db.stamp()?;

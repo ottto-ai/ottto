@@ -32654,13 +32654,6 @@ impl OwnedSourceScan {
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
-            if sampled_audit::growth_active(index)
-                && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
-            {
-                sampled_audit::queue_growth_retry(index, &candidate);
-                census.record_unreadable(UnreadableCause::Reduction, 1);
-                pending!();
-            }
             let archive_candidate = codex_archive_path(&candidate.path);
             let mut archive_census = ScanCensus::default();
             let Some((mut candidate, opened_file)) =
