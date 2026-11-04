@@ -44,8 +44,9 @@ fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
     receipt_first_case(Source::Claude, &progress(4, "old"), &progress(5, "new"));
 }
 /// [money] the same receipt-first replay holds past the former 11,182,080 B
-/// bound for every source: real-shaped progress, and progress whose encoded
-/// receipt exceeds 64 MiB.
+/// bound for every source with real-shaped progress, and once with progress
+/// whose encoded receipt exceeds 64 MiB (receipt write and recovery have no
+/// source branch).
 #[test]
 fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
     use crate::snapshots::SnapshotSource;
@@ -56,7 +57,7 @@ fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
         bytes.extend_from_slice(b"\"body\":\"padded\"}");
         bytes
     };
-    let (old_padded, new_padded) = (padded(4), padded(5));
+    assert!(receipt_first_case(Source::Claude, &padded(4), &padded(5)) > 67_108_864);
     let namespace = "a".repeat(64);
     for (source, snapshot) in [
         (Source::Claude, SnapshotSource::ClaudeCode),
@@ -69,9 +70,11 @@ fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
             )
         };
         let old = real(4);
-        assert!(old.len() as u64 > 11_182_080, "{source:?}");
+        assert!(
+            old.len() > crate::snapshot_sync::OLD_PROGRESS_BOUND_FOR_TEST,
+            "{source:?}"
+        );
         receipt_first_case(source, &old, &real(5));
-        assert!(receipt_first_case(source, &old_padded, &new_padded) > 67_108_864);
     }
 }
 /// [money] mismatched identity generation and same generation forks hold without changes.

@@ -274,6 +274,34 @@ pub(crate) mod money_oracle {
             _ => out.push(format!("{path}: expected {a}, got {b}")),
         }
     }
+    /// Per-entity money FIELDS differences, plus missing/extra entities.
+    pub(crate) fn entity_differences(
+        cold: &RouteResult,
+        other: &RouteResult,
+        out: &mut Vec<String>,
+    ) {
+        for entity in cold
+            .snapshots
+            .keys()
+            .chain(other.snapshots.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            let (a, b) = (cold.snapshots.get(entity), other.snapshots.get(entity));
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    for field in FIELDS {
+                        diff(
+                            &format!("entity/{entity}/{field}"),
+                            &a[*field],
+                            &b[*field],
+                            out,
+                        );
+                    }
+                }
+                _ => out.push(format!("entity/{entity}: missing/extra emitted entity")),
+            }
+        }
+    }
     pub(crate) fn assert_equivalent(cold: &RouteResult, other: &RouteResult) {
         assert_placement_equivalent(cold, other);
         assert_eq!(cold.source, other.source);
@@ -293,27 +321,7 @@ pub(crate) mod money_oracle {
                 }
             }
         }
-        for entity in cold
-            .snapshots
-            .keys()
-            .chain(other.snapshots.keys())
-            .collect::<BTreeSet<_>>()
-        {
-            let (a, b) = (cold.snapshots.get(entity), other.snapshots.get(entity));
-            match (a, b) {
-                (Some(a), Some(b)) => {
-                    for field in FIELDS {
-                        diff(
-                            &format!("entity/{entity}/{field}"),
-                            &a[*field],
-                            &b[*field],
-                            &mut differences,
-                        );
-                    }
-                }
-                _ => differences.push(format!("entity/{entity}: missing/extra emitted entity")),
-            }
-        }
+        entity_differences(cold, other, &mut differences);
         diff(
             "codex/TierReplay_receipts_ownership_token_count",
             &cold.codex_evidence,

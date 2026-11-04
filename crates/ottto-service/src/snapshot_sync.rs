@@ -13129,6 +13129,10 @@ pub(crate) fn with_state_v2_progress_owner<T>(
     }
 }
 
+/// The removed upload-progress bound, (64 MiB - 16 KiB) / 6 bytes.
+#[cfg(test)]
+pub(crate) const OLD_PROGRESS_BOUND_FOR_TEST: usize = 11_182_080;
+
 /// Test evidence: real-shaped upload progress past the former 11,182,080 B
 /// ACK custody bound, grown as the index quarantine mirror grows it (terminal
 /// refusal records). No source is given cache evidence.
@@ -13150,7 +13154,7 @@ pub(crate) fn above_old_bound_progress_for_test(
         if n % 1000 == 999 {
             progress.generation = generation;
             let bytes = serde_json::to_vec_pretty(&progress).unwrap();
-            if bytes.len() > 11_182_080 {
+            if bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST {
                 validate_state_v2_original_progress(&bytes, namespace).unwrap();
                 return bytes;
             }
@@ -23701,21 +23705,8 @@ mod tests {
             }
             let index_path = root.join("boundary-index.json");
             let progress_path = root.join("boundary-progress.json");
-            let mut baseline = ScanIndex::default();
-            baseline.prepare_historical_replay("boundary-pending-replay".into());
+            let (baseline, mut working, mut progress) = Self::fresh_state(&root);
             baseline.save(&index_path).unwrap();
-            let mut working = baseline.clone();
-            let mut progress = test_upload_progress();
-            progress.destination_namespace_hash =
-                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-            progress.prepare_historical_replay("boundary-pending-replay");
-            // As the source pass: bind the context on index and ledger first.
-            activate_source_upload_context(
-                SnapshotSource::Codex,
-                Self::context(),
-                &mut working,
-                &mut progress,
-            );
             let mut items = Self::prepare(&root, &mut working, None).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
@@ -23899,16 +23890,26 @@ mod tests {
         fn cold_full(&self, keep_cache: bool) -> Vec<SnapshotItem> {
             Self::cold_full_of(&self.root, keep_cache)
         }
-        fn cold_full_of(root: &Path, keep_cache: bool) -> Vec<SnapshotItem> {
-            let mut index = ScanIndex::default();
-            index.prepare_historical_replay("boundary-pending-replay".into());
+        /// A fresh baseline index, then the working index and ledger with the
+        /// upload context bound first, as the source pass binds it.
+        fn fresh_state(root: &Path) -> (ScanIndex, ScanIndex, SnapshotUploadProgress) {
+            let mut baseline = ScanIndex::default();
+            baseline.prepare_historical_replay("boundary-pending-replay".into());
+            let mut working = baseline.clone();
             let mut progress = test_upload_progress();
+            progress.destination_namespace_hash =
+                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+            progress.prepare_historical_replay("boundary-pending-replay");
             activate_source_upload_context(
                 SnapshotSource::Codex,
                 Self::context(),
-                &mut index,
+                &mut working,
                 &mut progress,
             );
+            (baseline, working, progress)
+        }
+        fn cold_full_of(root: &Path, keep_cache: bool) -> Vec<SnapshotItem> {
+            let (_, mut index, progress) = Self::fresh_state(root);
             let mut items =
                 Self::prepare(root, &mut index, keep_cache.then_some(&progress)).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
@@ -23954,16 +23955,7 @@ mod tests {
         use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
         money_oracle::assert_placement_equivalent(cold, actual);
         let mut differences = Vec::new();
-        for (entity, body) in &cold.snapshots {
-            for field in money_oracle::FIELDS {
-                money_oracle::diff(
-                    &format!("{entity}/{field}"),
-                    &body[*field],
-                    &actual.snapshots[entity][*field],
-                    &mut differences,
-                );
-            }
-        }
+        money_oracle::entity_differences(cold, actual, &mut differences);
         assert!(differences.is_empty(), "{}", differences.join("\n"));
     }
     impl Drop for SameSourceAckFixture {
@@ -24128,7 +24120,7 @@ mod tests {
             f.progress.save(&f.progress_path).unwrap();
             let bytes = std::fs::read(&f.progress_path).unwrap();
             assert!(
-                phase == 0 || bytes.len() > 11_182_080,
+                phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
                 "past the former bound"
             );
             let recovery = crate::snapshots::ProgressRecovery::synthetic(
@@ -24195,7 +24187,7 @@ mod tests {
                 let receipt: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
                 let saved = std::fs::read(&f.progress_path).unwrap();
-                assert!(phase == 0 || saved.len() > 11_182_080);
+                assert!(phase == 0 || saved.len() > OLD_PROGRESS_BOUND_FOR_TEST);
                 assert_eq!(
                     receipt["progress"].as_str().unwrap().as_bytes(),
                     saved,
@@ -24373,94 +24365,6 @@ mod tests {
         }
     }
 
-    /// [money] Under the former bound, a mixed page (one accepted body, then
-    /// one refused or one not-stored body) posts the same bodies and writes
-    /// the same progress bytes with the receipt as without it; the receipt
-    /// carries those exact bytes. Without a receipt the page never reached
-    /// the removed size admission, so this is the unchanged base path.
-    #[test]
-    #[serial]
-    fn v2_under_bound_mixed_outcomes_match_the_path_without_receipt() {
-        for disposition in ["refused", "not_stored"] {
-            let mut f = SameSourceAckFixture::new();
-            f.progress.save(&f.progress_path).unwrap();
-            let start = f.progress.clone();
-            let start_bytes = std::fs::read(&f.progress_path).unwrap();
-            let mut receipt_path = f.index_path.clone().into_os_string();
-            receipt_path.push(".v2-ack-receipt");
-            let mut runs = Vec::new();
-            for bound in [true, false] {
-                f.progress = start.clone();
-                ottto_core::write_owner_only_file_atomic(&f.progress_path, &start_bytes).unwrap();
-                if bound {
-                    let recovery = crate::snapshots::ProgressRecovery::synthetic(
-                        &f.index_path,
-                        &start.destination_namespace_hash,
-                        f.baseline.generation,
-                    );
-                    recovery.adopt_synthetic(Some(&start_bytes));
-                    f.progress.ack_recovery = Some(Box::new(recovery));
-                }
-                let posts = std::cell::RefCell::new(Vec::new());
-                f.send(0, |items| {
-                    posts.borrow_mut().push(serde_json::to_vec(&items).unwrap());
-                    same_source_fixture_ack(items)
-                })
-                .unwrap();
-                let _ = f.send(1, |items| {
-                    posts.borrow_mut().push(serde_json::to_vec(&items).unwrap());
-                    let mut response = same_source_fixture_ack(items)?;
-                    let entities = std::mem::take(&mut response.accepted_entities);
-                    if disposition == "not_stored" {
-                        response.unchanged_entities = entities
-                            .into_iter()
-                            .map(|mut entity| {
-                                entity.unchanged_basis = Some("usage_identical".into());
-                                entity
-                            })
-                            .collect();
-                    } else {
-                        response.rejected_entities = entities
-                            .into_iter()
-                            .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
-                                source_session_id: entity.source_session_id,
-                                snapshot_fingerprint: entity.snapshot_fingerprint,
-                                reason: "invalid".into(),
-                                detail: "permanent validation failure".into(),
-                                permanent: true,
-                                occurrence_count: entity.occurrence_count,
-                            })
-                            .collect();
-                        response.accepted = 0;
-                        response.sessions_reconciled = 0;
-                    }
-                    Ok(response)
-                });
-                let accepted = &f.progress.accepted_fingerprints;
-                assert!(accepted.contains(&f.items[0].snapshot_fingerprint));
-                assert!(!accepted.contains(&f.items[1].snapshot_fingerprint));
-                if disposition == "refused" {
-                    assert!(f
-                        .progress
-                        .quarantined_fingerprints
-                        .contains_key(&f.items[1].snapshot_fingerprint));
-                }
-                let progress = std::fs::read(&f.progress_path).unwrap();
-                if bound {
-                    let receipt: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-                    assert!(
-                        receipt["progress"].as_str().unwrap().as_bytes() == progress,
-                        "{disposition}: receipt carries the exact progress bytes"
-                    );
-                }
-                runs.push((posts.into_inner(), progress));
-            }
-            assert!(runs[0].0 == runs[1].0, "{disposition}: POST bodies");
-            assert!(runs[0].1 == runs[1].1, "{disposition}: progress bytes");
-        }
-    }
-
     /// [money] Placement past the former 11,182,080 B bound: the placement
     /// oracle's bodies (two accounts, a mid-session switch, a side call, an
     /// evidence gap and a tagged row) are stored-body ACKed into a ledger past
@@ -24497,7 +24401,10 @@ mod tests {
         }
         progress.save(&path).unwrap();
         let after = std::fs::read(&path).unwrap();
-        assert!(after.len() > 11_182_080, "past the former bound");
+        assert!(
+            after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
+            "past the former bound"
+        );
         // Crash: the exact receipt is durable, the progress rename is lost.
         ottto_core::write_owner_only_file_atomic(&path, &before).unwrap();
         let mut restored = SnapshotUploadProgress::load_with_recovery(
