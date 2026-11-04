@@ -1,7 +1,7 @@
 //! One source regression each: native Full, RAM and database continuation,
 //! physical suffix custody, native conflict holds and exact-body acceptance.
 use super::super::claude::{tests::lines as claude_lines, Claude};
-use super::super::codex::{tests::lines as codex_lines, Codex};
+use super::super::codex::{tests::candidate, tests::lines as codex_lines, Codex};
 use super::super::load::{reuses_stored, Load};
 use super::super::pi::Pi;
 use super::tests::{route_for, scope, Route, NOW};
