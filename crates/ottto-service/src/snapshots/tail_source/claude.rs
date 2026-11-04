@@ -11,9 +11,9 @@
 //! labels are stored as they are.
 use super::{
     changed_files, decode_envelope, encode_envelope, fixed_pages, full_log_pages, hour, log,
-    page_bytes, read_page, read_shared_page, shared_elements, shared_pages, slot, slot_start,
-    CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource, CHANGED_FILES,
-    SESSION_FACTS,
+    page_bytes, read_page, read_shared_page, read_slot_vec, shared_elements, shared_pages, slot,
+    slot_start, CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource,
+    CHANGED_FILES, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, Refuse};
 use crate::snapshots::state_v2::Collection;
@@ -192,14 +192,12 @@ impl TailSource for Claude {
                     Some(()) => Err(ReconstructCause::Corrupt),
                 }
             }),
-            Collection::Compactions => {
-                let observations = &mut into.claude_compaction_observations;
-                slot_start(page, COMPACTIONS_G, observations.len())?;
-                read_page(bytes, COMPACTIONS_G, |d| {
-                    observations.push(ClaudeCompactionObservation::take(d)?);
-                    Ok(())
-                })
-            }
+            Collection::Compactions => read_slot_vec(
+                page,
+                bytes,
+                COMPACTIONS_G,
+                &mut into.claude_compaction_observations,
+            ),
             _ => read_shared_page(collection, page, bytes, into),
         }
     }

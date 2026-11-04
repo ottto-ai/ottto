@@ -16,8 +16,9 @@
 //! foreign and finish-only fields stay empty at the seam.
 use super::{
     decode_envelope, encode_envelope, fixed_pages, hour, hour_pages, read_hour_page, read_page,
-    read_shared_page, shared_elements, shared_pages, slot, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, CHANGED_FILES, SESSION_FACTS,
+    read_shared_page, read_slot_vec, shared_elements, shared_pages, slot, slot_start,
+    CollectionSpec, DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource,
+    CHANGED_FILES, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{durable_struct, Durable, HDigest, Refuse};
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
@@ -430,20 +431,10 @@ impl TailSource for Codex {
                 })
             }
             Collection::Requests => {
-                let requests = &mut into.cache_requests;
-                slot_start(page, REQUESTS_G, requests.len())?;
-                read_page(bytes, REQUESTS_G, |d| {
-                    requests.push(OwnedRequest::take(d)?);
-                    Ok(())
-                })
+                read_slot_vec(page, bytes, REQUESTS_G, &mut into.cache_requests)
             }
             Collection::Compactions => {
-                let timestamps = &mut into.compaction_timestamps;
-                slot_start(page, COMPACTIONS_G, timestamps.len())?;
-                read_page(bytes, COMPACTIONS_G, |d| {
-                    timestamps.push(String::take(d)?);
-                    Ok(())
-                })
+                read_slot_vec(page, bytes, COMPACTIONS_G, &mut into.compaction_timestamps)
             }
             Collection::UsageHours => {
                 read_hour_page(page, bytes, &mut into.usage_buckets, String::as_str)
