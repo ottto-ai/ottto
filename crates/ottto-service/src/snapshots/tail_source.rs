@@ -945,7 +945,7 @@ mod retired_slot_tests {
             SnapshotSource::Codex,
         ] {
             let mut acc = SnapshotAccumulator::new(source);
-            let empty = encode(|e| put_fields(&acc, e)).unwrap();
+            let empty = Enc::count_write(usize::MAX, |e| put_fields(&acc, e)).unwrap();
             acc.retired_codex_parent_prefix_digest = [1; 32];
             acc.retired_codex_parent_prefix_decided = Some((7, [2; 32], true));
             acc.retired_codex_parent_proof_mismatch = true;
@@ -957,11 +957,17 @@ mod retired_slot_tests {
             acc.retired_codex_parent_ledger_consulted = true;
             acc.retired_codex_parent_signature_index = 7;
             acc.retired_codex_physical_signatures_complete = false;
-            assert_eq!(encode(|e| put_fields(&acc, e)).unwrap(), empty);
+            assert_eq!(
+                Enc::count_write(usize::MAX, |e| put_fields(&acc, e)).unwrap(),
+                empty
+            );
             let mut d = Dec::new(&empty);
             let restored = take_fields(&mut d).unwrap();
             d.finish().unwrap();
-            assert_eq!(encode(|e| put_fields(&restored, e)).unwrap(), empty);
+            assert_eq!(
+                Enc::count_write(usize::MAX, |e| put_fields(&restored, e)).unwrap(),
+                empty
+            );
             assert!(restored.retired_codex_parent_prefix_decided.is_none());
             assert!(restored.retired_codex_parent_unresolvable.is_none());
             assert!(restored.retired_codex_physical_signatures_complete);
@@ -978,9 +984,9 @@ mod retired_slot_tests {
             retired,
             CodexOwnershipBoundary::AwaitingParentPrefix
         ));
-        assert!(encode(|e| retired.put(e)).is_err());
+        assert!(Enc::count_write(usize::MAX, |e| retired.put(e)).is_err());
         assert_eq!(
-            encode(|e| CodexOwnershipBoundary::AllLocal.put(e)).unwrap(),
+            Enc::count_write(usize::MAX, |e| CodexOwnershipBoundary::AllLocal.put(e)).unwrap(),
             [1]
         );
     }
