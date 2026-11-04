@@ -205,7 +205,6 @@ pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
-use disappearance_diagnostics::enabled as vanished_directory_removal;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
@@ -3081,8 +3080,6 @@ fn claude_terminal_predates_e2(record: &ClaudeUsageAuthorityQuarantineRecord) ->
 
 include!("snapshots/authority_proof_correction.rs");
 include!("snapshots/load_containment.rs");
-#[path = "snapshots/local_switch.rs"]
-mod local_switch;
 
 #[cfg(test)]
 mod compact_index_tests;
@@ -14019,8 +14016,8 @@ impl OwnedSourceScan {
         }
         let hinted_paths = changed_watcher_hints(index, hinted_paths);
         let next_generation_hints;
-        let mut unlisted = {
-            let unlisted = refresh_retained_codex_roster(
+        {
+            refresh_retained_codex_roster(
                 source,
                 index,
                 backfill_window_days,
@@ -14036,14 +14033,13 @@ impl OwnedSourceScan {
             );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
-            unlisted
-        };
-        unlisted.extend(advance_bounded_directory_traversal(
+        }
+        let unlisted = advance_bounded_directory_traversal(
             source,
             index,
             backfill_window_days,
             Some(&resource_probe.discovery_growth),
-        ));
+        );
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         let codex_census_valid = source == SnapshotSource::Codex
             && index
@@ -14381,7 +14377,7 @@ impl OwnedSourceScan {
                 )
             })
             .collect::<Vec<_>>();
-        // A key missing from this page's complete directory reads and proven
+        // A key missing from this page's directory reads and proven
         // securely absent is the same removal as a NotFound census member; the
         // page-end owner retires it. A custody move this page (the rekey seam)
         // leaves the old key unindexed, so it is dropped here. The proof is
@@ -28674,17 +28670,10 @@ fn refresh_retained_codex_roster(
     index: &mut ScanIndex,
     backfill_window_days: u64,
     growth: Option<&discovery_growth::Page>,
-) -> BTreeSet<String> {
+) {
     let mut traversal = index.traversal.take().expect("traversal initialized");
-    let unlisted = refresh_retained_codex_directories(
-        source,
-        &mut traversal,
-        backfill_window_days,
-        index,
-        growth,
-    );
+    refresh_retained_codex_directories(source, &mut traversal, backfill_window_days, index, growth);
     index.traversal = Some(traversal);
-    unlisted
 }
 
 fn refresh_retained_codex_directories(
@@ -28693,10 +28682,9 @@ fn refresh_retained_codex_directories(
     backfill_window_days: u64,
     index: &ScanIndex,
     growth: Option<&discovery_growth::Page>,
-) -> BTreeSet<String> {
-    let mut unlisted = BTreeSet::new();
+) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
-        return unlisted;
+        return;
     }
     let recovery = DiscoveryRecovery::from(&index.files);
     let retention = DiscoveryRetention {
@@ -28706,7 +28694,7 @@ fn refresh_retained_codex_directories(
     let moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
-        _ => return unlisted,
+        _ => return,
     };
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
     let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
@@ -28727,7 +28715,6 @@ fn refresh_retained_codex_directories(
                 traversal
                     .codex_rollout_paths
                     .retain(|key| !Path::new(key).starts_with(&directory));
-                unlisted_index_keys(&index.files, &directory, &BTreeSet::new(), &mut unlisted);
                 continue;
             }
             _ => continue,
@@ -28741,28 +28728,17 @@ fn refresh_retained_codex_directories(
         }
         remaining -= entries.len();
         let mut present = BTreeSet::new();
-        let mut names = BTreeSet::new();
         let mut appeared = Vec::new();
         let mut new_directories = Vec::new();
         let mut clean = true;
         for entry in entries {
-            let Some((path, file_type)) = directory_read_fault(&directory, false, entry)
+            let Some((path, file_type)) = entry
                 .ok()
-                .and_then(|entry| {
-                    directory_read_fault(&directory, true, entry.file_type())
-                        .ok()
-                        .map(|kind| (entry.path(), kind))
-                })
+                .and_then(|entry| entry.file_type().ok().map(|kind| (entry.path(), kind)))
             else {
                 clean = false;
                 break;
             };
-            names.insert(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
             if file_type.is_symlink() {
                 clean = false;
                 break;
@@ -28791,7 +28767,6 @@ fn refresh_retained_codex_directories(
         if !clean || !census.refresh(&directory, &before) {
             continue;
         }
-        unlisted_index_keys(&index.files, &directory, &names, &mut unlisted);
         traversal.codex_rollout_paths.retain(|key| {
             Path::new(key).parent() != Some(directory.as_path()) || present.contains(key)
         });
@@ -28867,7 +28842,6 @@ fn refresh_retained_codex_directories(
                 watcher_hint: true,
             }));
     }
-    unlisted
 }
 
 /// F5: queue `keys` again as census members of the generation that observed
@@ -29066,7 +29040,7 @@ impl DiscoveryRecovery<'_> {
     }
 }
 
-/// Returns the indexed keys this tick's complete directory reads did not list.
+/// Returns the indexed keys this tick's directory reads did not list.
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     index: &mut ScanIndex,
@@ -29083,7 +29057,7 @@ fn advance_bounded_directory_traversal(
 }
 
 /// Adds to `unlisted` each indexed key beneath `directory` whose first
-/// component there is not in `names`, a complete listing of `directory`
+/// component there is not in `names`, the names listed in `directory`
 /// (empty for a directory now gone). A listed child's subtree is skipped by
 /// seeking past its prefix; its own read covers it. Nomination only: the
 /// secure absence proof decides.
@@ -29265,29 +29239,14 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A queued directory gone below its live parent, in a strictly
-                // later walk too, is a removal; its files settle one by one
-                // through the missing-parent rule.
-                if vanished_directory_removal()
-                    && matches!(
-                        claude_absence_is_removal(source, &directory.path),
-                        Parent::Live
-                    )
-                    && claude_vanished_confirmed(&index.withheld_memo, &traversal, &directory.path)
-                {
-                    disappearance_diagnostics::not_found_removal(
-                        source,
-                        disappearance_diagnostics::Site::WalkDirectory,
-                    );
-                } else {
-                    debt.unlisted();
-                    disappearance_diagnostics::not_found(
-                        &mut traversal.counts.disappeared_file_count,
-                        source,
-                        disappearance_diagnostics::Site::WalkDirectory,
-                    );
-                }
-                // Its indexed subtree is offered to the same absence proof.
+                // A queued directory gone mid-walk still counts as a lost
+                // listing; its indexed subtree is offered to the absence proof.
+                debt.unlisted();
+                disappearance_diagnostics::not_found(
+                    &mut traversal.counts.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Site::WalkDirectory,
+                );
                 unlisted_index_keys(
                     &index.files,
                     &directory.path,
@@ -29348,13 +29307,13 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .cmp(&right.as_ref().map(|entry| entry.file_name()).ok())
         });
-        // Every name of a complete listing; an entry or type error leaves none.
-        let mut names = Some(BTreeSet::new());
+        // Listed names. A key missing only from a partial listing is just a
+        // nominee: the absence proof refuses any key still present.
+        let mut names = BTreeSet::new();
         for entry in entries {
             let entry = match directory_read_fault(&directory.path, false, entry) {
                 Ok(entry) => entry,
                 Err(_) => {
-                    names = None;
                     traversal
                         .counts
                         .record_unreadable(UnreadableCause::Directory, 1);
@@ -29362,19 +29321,15 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
             };
             let path = entry.path();
-            if let Some(names) = names.as_mut() {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
-            }
+            names.insert(entry.file_name().to_string_lossy().into_owned());
             let file_type = match directory_read_fault(&directory.path, true, entry.file_type()) {
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
-                    names = None;
                     index.archive_io_error(&path, Some(&error));
                     debt.unlisted();
                     continue;
                 }
                 Err(_) => {
-                    names = None;
                     traversal
                         .counts
                         .record_unreadable(UnreadableCause::Metadata, 1);
@@ -29578,9 +29533,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
             }
         }
-        if let Some(names) = names {
-            unlisted_index_keys(&index.files, &directory.path, &names, &mut unlisted);
-        }
+        unlisted_index_keys(&index.files, &directory.path, &names, &mut unlisted);
     }
     debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
@@ -29621,38 +29574,6 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
         Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => Parent::MetadataError,
         _ => Parent::Missing,
     }
-}
-
-/// Default OFF: a member below a deleted directory settles as a removal
-/// once a strictly later walk proves the same absence beneath the same pinned
-/// ancestor of a live configured root with no symlink, on its device, >=600 s
-/// on, even while discovery is still pending (deleted directories are found
-/// then). Every other case, including the first NotFound, stays loss as on main.
-fn claude_missing_parent_is_removal(index: &ScanIndex, parent: Parent, path: &Path) -> bool {
-    if !matches!(parent, Parent::Missing) || !vanished_directory_removal() {
-        return false;
-    }
-    let Some(walk) = index.traversal.as_ref() else {
-        return false;
-    };
-    if !claude_vanished_confirmed(&index.withheld_memo, walk, path) {
-        return false;
-    }
-    disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
-    true
-}
-
-/// Later-walk confirmation for a vanished member or queued directory.
-fn claude_vanished_confirmed(
-    memo: &withheld_account::Memo,
-    walk: &ScanTraversalCheckpoint,
-    path: &Path,
-) -> bool {
-    let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
-        return false;
-    };
-    let ancestor = sampled_audit::absence_parent_on_root_device(path, &walk.scan_roots);
-    memo.vanished_absence_eligible(&local_index_key(path), ancestor, walk_window)
 }
 
 /// Mutable candidate-boundary owner plus the same bounded member view used by
@@ -29730,9 +29651,7 @@ fn candidate_from_traversal_path_at(
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
                 let parent = claude_absence_is_removal(source, &pending.path);
-                if parent.is_removal(&pending.path)
-                    || claude_missing_parent_is_removal(discovery.index, parent, &pending.path)
-                {
+                if parent.is_removal(&pending.path) {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);
@@ -30239,7 +30158,7 @@ impl<'a> DiscoveryRetention<'a> {
         stamp: Option<codex_fragment::Stamp>,
     ) {
         let key = local_index_key(path);
-        if self.account_holds.contains_key(&key) || vanished_directory_removal() {
+        if self.account_holds.contains_key(&key) {
             // This gate already has physical presence; invalidate an earlier
             // absence even if the file disappears again before page completion.
             if let Some(memo) = self.memo {

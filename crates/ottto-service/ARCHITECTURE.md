@@ -134,10 +134,9 @@ only visibility, `use`/`mod` lines, path literals and wrappers change) and
 
 ## One version
 
-- A runtime switch is a support-directory marker (normally `local_switch!`), never an environment
-  variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
-  explicitly documented changes. When retired, the feature is either on by default with the OFF
-  path deleted, or deleted.
+- A runtime switch is a support-directory marker, never an environment variable alone, and it is
+  temporary. Its OFF state preserves existing behaviour except for explicitly documented changes.
+  When retired, the feature is either on by default with the OFF path deleted, or deleted.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.
