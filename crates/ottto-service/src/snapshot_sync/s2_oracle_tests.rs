@@ -674,7 +674,7 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
             SOURCE,
             &scanner.cache,
             &prior,
-            &crate::snapshots::local_index_key(&path),
+            path.to_str().unwrap(),
         )
         .unwrap();
         assert_eq!(
