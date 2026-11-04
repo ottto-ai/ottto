@@ -1462,8 +1462,8 @@ fn usage_line(session: &str, seconds: usize, request: &str) -> String {
     )
 }
 
-/// A corpus of one root with account evidence, then sessions that sort after
-/// it and keep the walk alive one page at a time.
+/// A corpus of one root, then sessions that sort after it and keep the walk
+/// alive one page at a time.
 fn production_corpus(label: &str) -> PathBuf {
     let dir = crate::test_scratch::private_dir(label);
     fs::write(
@@ -1654,8 +1654,27 @@ fn a_real_parse_completes_a_family_on_a_later_production_page() {
     let dir = production_corpus("e7-8a-production-complete");
     let mut index = ScanIndex::default();
     production_page(&dir, &mut index);
-    // The parse's attestation covers the next page's evaluation.
+    // The parse's attestation covers the next page's evaluation. The walk
+    // goes in name order, one file per page: page 1 parsed the root, page 2
+    // the first later session, and both families are complete.
     let second = production_page(&dir, &mut index);
-    assert_eq!(complete_count(&second), 1, "{second}");
+    assert_eq!(complete_count(&second), 2, "{second}");
+    let later = |prefix: &str| format!("{prefix}-5555-4555-8555-555555555555");
+    let parsed = |session: &str| {
+        let name = format!("{session}.jsonl");
+        index
+            .files
+            .iter()
+            .find(|(key, entry)| key.ends_with(&name) && !entry.source_file_fingerprint.is_empty())
+            .map(|(key, _)| key.clone())
+    };
+    for session in [ROOT.to_string(), later("e5555555")] {
+        let key = parsed(&session).expect("parsed");
+        assert_eq!(evaluate(&index, &[family(&key)]).complete, 1, "{session}");
+    }
+    // The other later sessions are not parsed yet, so not complete.
+    for session in [later("e6666666"), later("e7777777")] {
+        assert_eq!(parsed(&session), None, "{session}");
+    }
     let _ = fs::remove_dir_all(dir);
 }
