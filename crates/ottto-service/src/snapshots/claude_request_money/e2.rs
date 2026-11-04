@@ -2003,7 +2003,7 @@ pub(crate) fn decide_page_copies(
             .state
             .get_or_insert_with(|| index.claude_copy_removals.clone());
         for file in resolved_holds {
-            state.clear_hold(file);
+            settle_hold(state, file, false);
         }
     }
 
@@ -2242,7 +2242,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
                 .claude_request_census
                 .get(root_key)
                 .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
-            record_counts(Counts::one(27, u64::from(deferred)));
+            record_counts(Counts::one(26, u64::from(deferred)));
             diag("family_copy_deferred", u64::from(deferred));
             false
         }
@@ -2734,7 +2734,7 @@ fn decide_holders(
             .collect::<Vec<_>>();
         let twin_removed = wanted.twin_held.iter().filter(|&h| !decided(h)).count() as u64;
         diag("copy_prefix_twin_page_removed", twin_removed);
-        record_counts(Counts::one(28, twin_removed));
+        record_counts(Counts::one(27, twin_removed));
         let reused = wanted
             .stored
             .iter()
@@ -2748,16 +2748,6 @@ fn decide_holders(
         if absent_kept > 0 {
             diag("copy_removal_holder_absent_kept", absent_kept);
             record_counts(Counts::one(23, absent_kept));
-        }
-        // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
-        if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
-            let late = wanted
-                .covered
-                .keys()
-                .filter(|hash| !wanted.stored.contains(hash))
-                .count() as u64;
-            diag("copy_prefix_late_origin_removed", late);
-            record_counts(Counts::one(24, late));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
@@ -2797,8 +2787,8 @@ fn decide_holders(
                 .is_some_and(|state| !state.pending(wanted.order.1));
             diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
             diag("copy_prefix_origin_unaccepted_passes", 1);
-            record_counts(Counts::one(25, u64::from(first)));
-            record_counts(Counts::one(26, 1));
+            record_counts(Counts::one(24, u64::from(first)));
+            record_counts(Counts::one(25, 1));
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -2820,7 +2810,7 @@ fn decide_holders(
                 .is_some_and(|parent| parent_proves(index, parent, &wanted.session, wanted.order))
         {
             if let Some(state) = updates.state.as_mut() {
-                state.clear_hold(wanted.order.1);
+                settle_hold(state, wanted.order.1, true);
             }
             diag("copy_parent_ref", uncovered.len() as u64);
             restore_uncovered(&mut items[wanted.at], &[]);
@@ -2848,7 +2838,7 @@ fn decide_holders(
             continue;
         }
         if let Some(state) = updates.state.as_mut() {
-            state.clear_hold(wanted.order.1);
+            settle_hold(state, wanted.order.1, uncovered.is_empty());
         }
         // What no holder proves now (its id list retired, over budget or
         // missing, an origin deleted or in another folder, no stored
@@ -2936,11 +2926,13 @@ fn defer_prefix(
         return;
     };
     if ids.is_empty() {
-        state.clear_hold(file);
+        settle_hold(state, file, uncovered.is_empty());
         restore_uncovered(item, &[]);
         return;
     }
+    let age = state.hold_age(file);
     if !state.advance_hold(file) {
+        record_wait_settled(Settled::Expired, age);
         restore_uncovered(item, &ids);
         if let Some(fold) = item.claude_money.as_deref_mut() {
             fold.prefix.hold_expired = ids
@@ -2950,6 +2942,9 @@ fn defer_prefix(
                 .sum();
         }
         return;
+    }
+    if age == 0 {
+        record_counts(Counts::one(WAIT_AT, 1));
     }
     diag(reason, 1);
     let Some(fold) = item.claude_money.as_deref_mut() else {
@@ -4491,7 +4486,7 @@ fn absent_twins(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; COUNT_LEN] = [
+const COUNT_NAMES: [&str; 28] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4523,8 +4518,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
-    // A prefix removed after its origin's late acceptance; copies and passes waiting for one.
-    "copy_prefix_late_origin_removed",
+    // Copies and passes waiting for an origin's acceptance.
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
     // A forked subagent's first-line copy counted because its root was not
@@ -4533,7 +4527,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
 ];
-const COUNT_LEN: usize = 29;
+// Then `copy_prefix_wait`: proof waits started, and (episodes, decided
+// passes) settled by holder proof, third-pass expiry or counting.
+const WAIT_AT: usize = COUNT_NAMES.len();
+const WAIT_OUTCOMES: [&str; 3] = ["proof", "expired", "counted"];
+const COUNT_LEN: usize = WAIT_AT + 1 + 2 * WAIT_OUTCOMES.len();
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4563,6 +4561,8 @@ impl Drop for PageSpent {
     }
 }
 fn record_counts(counts: Counts) {
+    #[cfg(test)]
+    PAGE_COUNTS.with(|page| page.borrow_mut().add(&counts));
     for (counter, value) in COUNTS.iter().zip(counts.0) {
         if value != 0 {
             counter.fetch_add(value, Ordering::Relaxed);
@@ -4572,8 +4572,51 @@ fn record_counts(counts: Counts) {
 pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
-#[derive(Debug, Default)]
+// This thread's share of the shared counters (test builds).
+#[cfg(test)]
+thread_local! {
+    static PAGE_COUNTS: RefCell<Counts> = const { RefCell::new(Counts([0; COUNT_LEN])) };
+}
+#[cfg(test)]
+fn take_thread_counts() -> Counts {
+    PAGE_COUNTS.take()
+}
+/// How a proof wait ended, in `WAIT_OUTCOMES` order.
+#[derive(Clone, Copy)]
+enum Settled {
+    Proof,
+    Expired,
+    Counted,
+}
+/// A proof wait ended after `age` held passes: one episode and its decided
+/// passes, this one included.
+fn record_wait_settled(outcome: Settled, age: u64) {
+    if age > 0 {
+        let at = WAIT_AT + 1 + 2 * outcome as usize;
+        let mut counts = Counts::default();
+        counts.0[at] = 1;
+        counts.0[at + 1] = age + 1;
+        record_counts(counts);
+    }
+}
+/// Clears `file`'s prefix retry debt, counting the wait it ends: proof when
+/// nothing of the prefix is left uncovered.
+fn settle_hold(state: &mut super::copy_removals::CopyRemovals, file: LocationKey, proven: bool) {
+    let outcome = if proven {
+        Settled::Proof
+    } else {
+        Settled::Counted
+    };
+    record_wait_settled(outcome, state.hold_age(file));
+    state.clear_hold(file);
+}
+#[derive(Debug)]
 pub(crate) struct Counts([u64; COUNT_LEN]);
+impl Default for Counts {
+    fn default() -> Self {
+        Self([0; COUNT_LEN])
+    }
+}
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
@@ -4605,7 +4648,7 @@ impl Counts {
         all[12] = added;
         Self(all)
     }
-    /// One enable-readiness counter (index 22..28) by `n`.
+    /// One counter by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;
@@ -4625,6 +4668,21 @@ impl Serialize for Counts {
             if value != 0 {
                 map.serialize_entry(key, &value)?;
             }
+        }
+        let wait = &self.0[WAIT_AT..];
+        if wait.iter().any(|&n| n != 0) {
+            let mut family = serde_json::Map::new();
+            family.insert("version".into(), super::super::collector_version().into());
+            if wait[0] != 0 {
+                family.insert("started".into(), wait[0].into());
+            }
+            for (outcome, pair) in WAIT_OUTCOMES.into_iter().zip(wait[1..].chunks(2)) {
+                if pair[0] != 0 {
+                    let pair = serde_json::json!({"episodes": pair[0], "decisions": pair[1]});
+                    family.insert(outcome.into(), pair);
+                }
+            }
+            map.serialize_entry("copy_prefix_wait", &family)?;
         }
         map.end()
     }
