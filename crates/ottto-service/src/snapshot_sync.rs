@@ -23897,6 +23897,9 @@ mod tests {
         }
         /// A cold Full of this root: a fresh index, scanned as `new` scans it.
         fn cold_full(&self, keep_cache: bool) -> Vec<SnapshotItem> {
+            Self::cold_full_of(&self.root, keep_cache)
+        }
+        fn cold_full_of(root: &Path, keep_cache: bool) -> Vec<SnapshotItem> {
             let mut index = ScanIndex::default();
             index.prepare_historical_replay("boundary-pending-replay".into());
             let mut progress = test_upload_progress();
@@ -23907,7 +23910,7 @@ mod tests {
                 &mut progress,
             );
             let mut items =
-                Self::prepare(&self.root, &mut index, keep_cache.then_some(&progress)).snapshots;
+                Self::prepare(root, &mut index, keep_cache.then_some(&progress)).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             items
         }
@@ -23994,6 +23997,17 @@ mod tests {
                 .filter_map(|row| row["event_id"].as_str().map(str::to_string))
                 .collect::<BTreeSet<_>>()
         };
+        // C's growth: a cache break (share 0.9 -> 0), which the detector
+        // records as an observation.
+        let grow = |path: &Path| {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            for row in [
+                serde_json::json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:02Z","payload":{"response_id":"resp_reopened","usage":{"input_tokens":120000,"cached_input_tokens":0,"output_tokens":2}}}),
+                serde_json::json!({"type":"event_msg","timestamp":"2026-09-30T10:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":220000,"cached_input_tokens":90000,"output_tokens":3},"last_token_usage":{"input_tokens":120000,"cached_input_tokens":0,"output_tokens":2}}}}),
+            ] {
+                std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes()).unwrap();
+            }
+        };
         let headed =
             |items: Vec<SnapshotItem>| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
                 let mut response = same_source_fixture_ack(items)?;
@@ -24027,9 +24041,25 @@ mod tests {
             }
             // C was accepted before this page: settled history, not on it.
             let c = cache_session_key(&f.items[2].source_session_id);
-            // C's real accepted cache state, with its observations.
+            // C's accepted cache state with real observations: a cold scan of
+            // a copy of C's file grown with the same rows the reopen adds.
+            let c_path = std::fs::read_dir(&f.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.to_string_lossy()
+                        .ends_with(&format!("{}.jsonl", f.items[2].source_session_id))
+                })
+                .unwrap();
             let c_state = {
-                let scanned = f.cold_full(true);
+                let copy = std::env::temp_dir()
+                    .join(format!("ottto-ack-bound-c-copy-{}", unique_poison_scope()));
+                std::fs::create_dir_all(&copy).unwrap();
+                let copied = copy.join(c_path.file_name().unwrap());
+                std::fs::copy(&c_path, &copied).unwrap();
+                grow(&copied);
+                let scanned = SameSourceAckFixture::cold_full_of(&copy, true);
+                std::fs::remove_dir_all(&copy).unwrap();
                 let patch = scanned
                     .iter()
                     .find(|item| item.source_session_id == f.items[2].source_session_id)
@@ -24267,25 +24297,7 @@ mod tests {
             assert!(adopted(&f.working));
             // Settled C reopens: its rollout grows and the ordinary scan
             // re-reads only that file into one definite body.
-            let path = std::fs::read_dir(&f.root)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| {
-                    path.to_string_lossy()
-                        .ends_with(&format!("{}.jsonl", c_item.source_session_id))
-                })
-                .unwrap();
-            let mut grown = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            for row in [
-                serde_json::json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:02Z","payload":{"response_id":"resp_reopened","usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}),
-                serde_json::json!({"type":"event_msg","timestamp":"2026-09-30T10:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":220000,"cached_input_tokens":190000,"output_tokens":3},"last_token_usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}}),
-            ] {
-                std::io::Write::write_all(&mut grown, format!("{row}\n").as_bytes()).unwrap();
-            }
-            drop(grown);
+            grow(&c_path);
             let scan = f.restart(true);
             assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
             f.progress.ack_recovery = recovery;
