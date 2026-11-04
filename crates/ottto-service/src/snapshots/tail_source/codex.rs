@@ -27,6 +27,16 @@ use crate::snapshots::state_v2::Collection;
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
+/// Existing head metadata, decoded once without transcript bytes.
+pub(in crate::snapshots) fn header_facts(
+    revision: u32,
+    body: &[u8],
+) -> Result<(Option<String>, Option<String>), ReconstructCause> {
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Codex::decode_head(revision, body, &mut stored)?;
+    Ok((stored.codex_sidecar_binding, stored.source_session_id))
+}
+
 const DICTIONARY_G: u32 = 64;
 const PRIORITY_G: u32 = 256;
 const SIGNATURES_G: u32 = 256;

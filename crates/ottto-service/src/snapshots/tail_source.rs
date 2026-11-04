@@ -145,6 +145,77 @@ pub(in crate::snapshots) fn committed_sealed_offset(
     Some(DurableCertificate::take(&mut d).ok()?.sealed_offset)
 }
 
+pub(in crate::snapshots) fn certified_certificate(
+    body: &[u8],
+) -> Result<DurableCertificate, Corrupt> {
+    let mut d = Dec::new(body);
+    HeadIdentity::take(&mut d)?;
+    DurableCertificate::take(&mut d)
+}
+
+/// Legacy physical proof keeps the certificate's birth check as well as its
+/// object/extent/mtime witness. It never samples the transcript to seed facts.
+pub(in crate::snapshots) fn certified_physical_matches(
+    body: &[u8],
+    metadata: &fs::Metadata,
+) -> bool {
+    let Ok(certificate) = certified_certificate(body) else {
+        return false;
+    };
+    let Ok(stamp) = crate::transcript_acquisition::FileStamp::capture(metadata.clone()) else {
+        return false;
+    };
+    stamp.same_listing(
+        certificate.device,
+        certificate.inode,
+        certificate.length,
+        certificate.modified,
+    ) && (certificate.birth_nanos == 0
+        || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
+}
+
+/// Rebind only a Codex head's route prefix after the caller proves a path
+/// carry. Capture, key epoch, certificate, reduction and every page stay exact.
+pub(in crate::snapshots) fn carry_codex_head(
+    route: &Path,
+    old_root: &Path,
+    old_path: &Path,
+    new_root: &Path,
+    new_path: &Path,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut d = Dec::new(body);
+    let mut stored =
+        HeadIdentity::take(&mut d).map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    anyhow::ensure!(
+        stored.binding
+            == HeadIdentity::new(
+                route,
+                SnapshotSource::Codex,
+                old_root,
+                old_path,
+                stored.capture
+            )
+            .binding,
+        "tail_carry_identity"
+    );
+    stored.binding = HeadIdentity::new(
+        route,
+        SnapshotSource::Codex,
+        new_root,
+        new_path,
+        stored.capture,
+    )
+    .binding;
+    let suffix = d
+        .raw(d.remaining())
+        .map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    let mut out = Enc::count_write(usize::MAX, |e| stored.put(e))
+        .map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    out.extend_from_slice(suffix);
+    Ok(out)
+}
+
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum LiveLoadError {

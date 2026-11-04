@@ -4234,14 +4234,10 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result
-                .ownership_incomplete_file_count
-                .saturating_add(scan_result.archive_owed_count)
-                as u64,
-            causes: scan_result.causes.summary_with_archive(
-                scan_result.ownership_incomplete_file_count,
-                scan_result.archive_owed_count,
-            ),
+            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -6271,17 +6267,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("read reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -7089,13 +7075,14 @@ fn prepare_sync_source_inner(
         &mut watcher_hints.list_all,
         request_identity_capture,
         &copy_prefix_scope,
+        Some((daemon.transcript_cache.as_ref(), &sampled_scope)),
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
     .with_codex_versions(daemon.codex_versions.clone());
     // A walk already running keeps the request: the first pass after it lists.
     crate::snapshot_watcher::defer_listing(source, watcher_hints.list_all);
-    scan.rehome_withheld_baseline(&mut committed_index);
+    scan.rehome_withheld_baseline(&mut committed_index)?;
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -8488,19 +8475,6 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    if !index.archives.is_empty() {
-        index.settle_archive_outcome(|fp| {
-            upload_progress
-                .accepted_body_witnesses
-                .get(fp)
-                .filter(|_| {
-                    !upload_progress
-                        .context_resend
-                        .requires_resend(fp, &upload_progress.accepted_body_contexts)
-                })
-                .map(String::as_str)
-        });
-    }
     // Shed and upload-error partial checkpoint: save wholly settled files,
     // then release adopted ACK capacity against the full scan's references
     // (#778 R2-2). A failed save is logged and yields `None`; a failed
@@ -13179,6 +13153,7 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{
     archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress,
+    codex_transition_cold_batches,
 };
 
 #[cfg(test)]
@@ -22006,14 +21981,27 @@ mod tests {
         captured: Arc<Mutex<Vec<String>>>,
         hints: Vec<(u64, &'static str)>,
     ) -> String {
+        snapshot_status_server_with_hint_extras_and_batch(captured, hints, None)
+    }
+
+    fn snapshot_status_server_with_hint_extras_and_batch(
+        captured: Arc<Mutex<Vec<String>>>,
+        hints: Vec<(u64, &'static str)>,
+        batch: Option<Vec<SnapshotItem>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
             let receipt_count = hints.len();
             let mut hints = hints.into_iter();
-            for _ in 0..receipt_count * 3 {
+            let mut ordinary_requests = receipt_count * 3;
+            loop {
                 let (mut stream, _) = listener.accept().expect("accept snapshot status request");
                 let request = read_complete_http_request(&mut stream);
+                // A batch fixture exercises ordinary uploads and fresh relay
+                // acquisition too; its terminal status ends the conversation.
+                let terminal = batch.is_some()
+                    && request.starts_with("POST /api/v1/agent-session-snapshots/status ");
                 let body = if request.contains("/telemetry/devices/") {
                     captured
                         .lock()
@@ -22021,6 +22009,21 @@ mod tests {
                         .push(request);
                     r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
                         .to_string()
+                } else if request.contains("/agent-session-snapshots/batches") {
+                    let items = batch.as_ref().expect("expected snapshot upload");
+                    let entities = items.iter().map(|item| {
+                        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                        serde_json::json!({"source_session_id":item.source_session_id,
+                            "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                            "body_witness_version":version,
+                            "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
+                    }).collect::<Vec<_>>();
+                    captured.lock().unwrap().push(request);
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                        "accepted_entities":entities})
+                    .to_string()
                 } else if request.contains("/activity-hints") {
                     let (hint, extra) = hints.next().expect("one hint per receipt");
                     format!(
@@ -22041,6 +22044,15 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write snapshot status response");
+                if terminal {
+                    break;
+                }
+                if batch.is_none() {
+                    ordinary_requests -= 1;
+                    if ordinary_requests == 0 {
+                        break;
+                    }
+                }
             }
         });
         format!("http://{address}")
@@ -24282,47 +24294,3 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
-
-/// Continuation's platform gates for archive work: the native signals unless
-/// a caller injects its own. A pass and its continuation pages share them.
-#[derive(Clone)]
-pub(crate) struct ArchiveGates(
-    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
-);
-impl Default for ArchiveGates {
-    fn default() -> Self {
-        Self::new(None::<continuation::MacPlatformSignals>)
-    }
-}
-impl std::fmt::Debug for ArchiveGates {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ArchiveGates")
-    }
-}
-impl ArchiveGates {
-    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
-        Self(gates.map(|g| {
-            std::sync::Arc::new(Mutex::new(g))
-                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
-        }))
-    }
-    /// Continuation's power policy: only `Allowed` permits archive work;
-    /// `Refused` and `Unknown` deny.
-    pub(crate) fn power_ready(&self) -> bool {
-        let Some(gates) = self.0.as_ref() else {
-            return continuation::PlatformGates::power(
-                &mut continuation::MacPlatformSignals::default(),
-            ) == continuation::PlatformState::Allowed;
-        };
-        gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .power()
-            == continuation::PlatformState::Allowed
-    }
-}
-
-/// Share continuation's work threshold with archive admission.
-pub(crate) fn archive_work_ready(micros: u64) -> bool {
-    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
-}
