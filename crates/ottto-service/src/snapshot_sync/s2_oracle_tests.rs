@@ -515,6 +515,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             &c.base.join("state"),
         );
         let prior = commit(&session, page(&c, index, 100, true));
+        append(&path, "{broken\n");
         append(
             &path,
             &line(ROOT, "partial-later", "2026-08-02T07:04:00Z", 6),
@@ -526,11 +527,32 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         let current = page(&c, prior, 100, true);
         assert_eq!(current.modes.0, 0, "partial ACK uses a stored Tail");
         assert!(current.modes.1 > 0);
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&current.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold_page.index).unwrap()["terminal_jsonl_dispositions"]
+        );
+        let loss_body = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        let loss_fingerprint = loss_body.snapshot_fingerprint.clone();
+        let loss_witness = snapshot_upload_body_witness(loss_body);
         let mut progress = e2_progress();
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
             let mut response = ack(items)?;
-            let mut refused = response.accepted_entities.pop().unwrap();
+            // Preserve the existing partial outcome while exactly ACKing
+            // the loss-bearing root and leaving its other entity owed.
+            let other = response
+                .accepted_entities
+                .iter()
+                .position(|entity| entity.source_session_id != ROOT)
+                .unwrap();
+            let mut refused = response.accepted_entities.remove(other);
             response.accepted -= 1;
             // Cache rows put the request under head-CAS: the refusal then
             // carries the server's challenge instead of a head.
@@ -544,6 +566,11 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);
         assert_eq!(progress.quarantined_fingerprints.len(), 1);
+        assert!(progress.accepted_fingerprints.contains(&loss_fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
+        );
         let mut observed =
             RouteResult::emitted(Mode::Restart, SOURCE, batches, &current.scan.snapshots);
         let mut cold = cold;
@@ -566,6 +593,10 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         assert_eq!(
             restored.quarantined_fingerprints,
             progress.quarantined_fingerprints
+        );
+        assert_eq!(
+            restored.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
         );
         assert!(current.scan.snapshots.iter().any(|item| !progress
             .accepted_fingerprints

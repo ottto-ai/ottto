@@ -375,27 +375,3 @@ fn a_forced_member_reads_natively_only_for_missing_evidence() {
     }
     assert!(forced_member_needs_native(&index, "absent.jsonl"));
 }
-
-/// [regress] Only growth under the stored loss generation may reuse its head.
-#[test]
-fn terminal_disposition_growth_reuses_only_the_same_generation() {
-    let mut index = ScanIndex::default();
-    let key = "a.jsonl";
-    index.terminal_jsonl_dispositions.insert(
-        key.into(),
-        TerminalJsonlDisposition {
-            source_file_fingerprint: "old".into(),
-            parser_generation: JSONL_TERMINAL_DISPOSITION_GENERATION.into(),
-            loss: TerminalJsonlLoss::default(),
-        },
-    );
-    let reason = Some(CandidateParseReason::TerminalDisposition);
-    assert!(reuses_stored(&index, key, reason, true, false));
-    assert!(!reuses_stored(&index, key, reason, false, false));
-    index
-        .terminal_jsonl_dispositions
-        .get_mut(key)
-        .unwrap()
-        .parser_generation = "another-generation".into();
-    assert!(!reuses_stored(&index, key, reason, true, false));
-}

@@ -1,37 +1,28 @@
 //! One source regression each: native Full, RAM and database continuation,
 //! physical suffix custody, native conflict holds and exact-body acceptance.
 use super::super::claude::{tests::lines as claude_lines, Claude};
-use super::super::codex::{tests::candidate, tests::lines as codex_lines, Codex};
-use super::super::load::{load, Load};
+use super::super::codex::{tests::lines as codex_lines, Codex};
+use super::super::load::{reuses_stored, Load};
 use super::super::pi::Pi;
 use super::tests::{route_for, scope, Route, NOW};
+use super::transition_tests::{
+    complete, finish as native_finish, head, load_at, open as parser, FixtureSource,
+};
 use super::*;
 use crate::snapshot_sync::tail_ack_ledger::AckLedger;
 use crate::snapshots::sampled_scan::transition_fixture::{
     self as fixture, money_oracle, Accepted, Mode, RouteResult,
 };
 use crate::snapshots::scan_index_persistence::Source;
-use crate::snapshots::state_v2::TailHead;
 use serde_json::json;
 use std::io::Write;
 
-trait SourceFixture: TailSource {
-    const INDEX: Source;
-    const APPLY: fn(&Value, &mut SnapshotAccumulator);
+trait SourceFixture: FixtureSource {
     const TOTAL: (u64, u64);
-    fn lines() -> Vec<String>;
-    fn name() -> String {
-        "session.jsonl".into()
-    }
     fn bad() -> Vec<String>;
 }
 impl SourceFixture for Claude {
-    const INDEX: Source = Source::Claude;
-    const APPLY: fn(&Value, &mut SnapshotAccumulator) = apply_claude_code_line;
     const TOTAL: (u64, u64) = (21, 10);
-    fn lines() -> Vec<String> {
-        claude_lines(2)
-    }
     fn bad() -> Vec<String> {
         vec![
             json!({"type":"assistant","sessionId":"5f0c2a8e-1111-4222-8333-944445555777",
@@ -42,15 +33,7 @@ impl SourceFixture for Claude {
     }
 }
 impl SourceFixture for Codex {
-    const INDEX: Source = Source::Codex;
-    const APPLY: fn(&Value, &mut SnapshotAccumulator) = apply_codex_line;
     const TOTAL: (u64, u64) = (200, 20);
-    fn lines() -> Vec<String> {
-        codex_lines(2)
-    }
-    fn name() -> String {
-        "rollout-019a0c2a-8e11-7222-8333-944445555777.jsonl".into()
-    }
     fn bad() -> Vec<String> {
         vec![
             json!({"timestamp":"2026-10-18T10:00:30Z","type":"event_msg","payload":{
@@ -59,15 +42,17 @@ impl SourceFixture for Codex {
         ]
     }
 }
-impl SourceFixture for Pi {
+impl FixtureSource for Pi {
     const INDEX: Source = Source::Pi;
     const APPLY: fn(&Value, &mut SnapshotAccumulator) = apply_pi_line;
-    const TOTAL: (u64, u64) = (24, 8);
-    fn lines() -> Vec<String> {
+    fn name() -> String {
+        "session.jsonl".into()
+    }
+    fn lines(size: usize) -> Vec<String> {
         let mut rows = vec![json!({"type":"session","id":"synthetic-pi-bad-record",
             "timestamp":"2026-10-20T10:00:00Z"})
         .to_string()];
-        for i in 0..2 {
+        for i in 0..size {
             rows.push(pi_usage(
                 "message",
                 &format!("good-{i}"),
@@ -76,6 +61,9 @@ impl SourceFixture for Pi {
         }
         rows
     }
+}
+impl SourceFixture for Pi {
+    const TOTAL: (u64, u64) = (24, 8);
     fn bad() -> Vec<String> {
         // Provider clocks on both assistant shapes and an entry-level clock.
         let mut rows = vec![
@@ -99,9 +87,6 @@ fn pi_usage(shape: &str, id: &str, at: Value) -> String {
 fn write(path: &Path, rows: &[String]) {
     fs::write(path, rows.join("\n") + "\n").unwrap();
 }
-fn parser<S: SourceFixture>(path: &Path) -> OwnedJsonlParser {
-    fixture::native_cold::parser(S::SOURCE, path, File::open(path).unwrap(), S::APPLY)
-}
 fn finish<S: SourceFixture>(
     route: &Route,
     path: &Path,
@@ -109,38 +94,24 @@ fn finish<S: SourceFixture>(
     base: Option<TailBase>,
 ) -> (PendingTail, ParsedJsonlFile) {
     while !p.step().unwrap() {}
-    let (tail, native) = route.finish_under::<S>(path, p, base, |_| {}, &scope());
+    let (tail, native) = native_finish::<S>(route, path, p, base, |_| {});
     (tail, native.unwrap())
 }
 fn full<S: SourceFixture>(route: &Route, path: &Path) -> (PendingTail, ParsedJsonlFile) {
-    let mut p = parser::<S>(path);
-    assert!(matches!(
-        p.prepare_acquisition(None, &scope(), None, NOW).unwrap(),
-        ReadMode::Full(_)
-    ));
-    finish::<S>(route, path, p, None)
+    let (tail, native) = complete::<S>(route, path, None, |_| {});
+    (tail, native.unwrap())
 }
 fn stored<S: SourceFixture>(route: &Route, path: &Path) -> (OwnedJsonlParser, TailBase, ReadMode) {
-    let mut held = File::open(path).unwrap();
-    let mut p = parser::<S>(path);
-    let id = HeadIdentity::new(&route.path, S::SOURCE, &route.dir, path, false);
-    let Load::Reused(taken, Some(base)) = load::<S>(
-        &route.index,
-        &route.path,
-        &local_index_key(path),
-        &id,
-        &mut held,
-        &scope(),
-        &candidate(path),
-        &p.accumulator,
-    ) else {
+    let Load::Reused(taken, Some(base)) = load_at::<S>(route, path, &local_index_key(path)) else {
         panic!("committed loss is progress, never reconstruction");
     };
+    let mut p = parser::<S>(path);
     let mode = p
         .prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
         .unwrap();
     (p, base, mode)
 }
+
 fn emitted<S: SourceFixture>(mode: Mode, route: &Route, items: &[SnapshotItem]) -> RouteResult {
     let batch = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -162,11 +133,6 @@ fn emitted<S: SourceFixture>(mode: Mode, route: &Route, items: &[SnapshotItem]) 
     }
     result
 }
-fn head<S: SourceFixture>(route: &Route, path: &Path) -> TailHead {
-    state_v2::load_head(&route.index, &local_index_key(path), S::REDUCTION_REVISION)
-        .unwrap()
-        .unwrap()
-}
 fn commit<S: SourceFixture>(
     route: &mut Route,
     path: &Path,
@@ -176,14 +142,14 @@ fn commit<S: SourceFixture>(
     assert!(parsed.progress_complete());
     assert!(tail.publish(&Ok(parsed)));
     route.save(false);
-    assert!(!head::<S>(route, path).metadata_only);
+    assert!(!head::<S>(route, &local_index_key(path)).metadata_only);
 }
 fn regression<S: SourceFixture>() {
     let mut route = route_for(S::INDEX);
     let path = route.dir.join(S::name());
     // O1/O3/O4: independently enumerate valid siblings, then add physical and
     // recognized usage losses between them. Their native reducers stay unchanged.
-    write(&path, &S::lines());
+    write(&path, &S::lines(2));
     let (_, clean) = full::<S>(&route, &path);
     assert_eq!(
         (
@@ -192,7 +158,7 @@ fn regression<S: SourceFixture>() {
         ),
         S::TOTAL
     );
-    let mut mixed = S::lines();
+    let mut mixed = S::lines(2);
     mixed.splice(2..2, S::bad());
     let mut bytes = mixed[..2].join("\n").into_bytes();
     bytes.extend_from_slice(b"\n{broken\n\xff\n");
@@ -298,8 +264,9 @@ fn regression<S: SourceFixture>() {
     quiet.io.anchor_reads = Some(sample_bytes);
     quiet.io.other_reads = Some(0);
     money_oracle::assert_quiet_restart_zero_bytes(&quiet);
-    // O9: an old serde writer discards additive diagnostics, retaining all
-    // old spellings. Missing diagnostics confer no new source/ACK authority.
+    // O9: the new decoder reads legacy JSON with the retired cap leaf and
+    // defaulted diagnostics. This proves legacy-to-new decoding only; it
+    // does not exercise an older daemon reading newly written rows.
     let old = json!({"source_file_fingerprint":"a".repeat(64),
         "parser_generation":JSONL_TERMINAL_DISPOSITION_GENERATION,
         "loss":{"over_line_cap_count":1,"recognized_usage_drop_count":loss.recognized_usage_drop_count,
@@ -310,14 +277,14 @@ fn regression<S: SourceFixture>() {
         loss.recognized_usage_drop_count
     );
     assert_eq!(legacy.loss.malformed_json_line_count, 0);
-    let before = head::<S>(&route, &path).body;
+    let before = head::<S>(&route, &local_index_key(&path)).body;
     route
         .index
         .terminal_jsonl_dispositions
         .insert(local_index_key(&path), legacy);
     route.save(false);
     route.index = ScanIndex::load(&route.path).unwrap();
-    assert_eq!(head::<S>(&route, &path).body, before);
+    assert_eq!(head::<S>(&route, &local_index_key(&path)).body, before);
     let (p, base, mode) = stored::<S>(&route, &path);
     assert_eq!(mode, ReadMode::Unchanged);
     let (_, native) = finish::<S>(&route, &path, p, Some(base));
@@ -328,17 +295,16 @@ fn regression<S: SourceFixture>() {
     suffix::<S>();
     loss_only::<S>(&cold, &items);
     admission::<S>();
-    ack_transitions::<S>(&route, &items);
 }
 fn suffix<S: SourceFixture>() {
     for suffix in [b"{\"paused\":".as_slice(), b"\xff".as_slice()] {
         let mut route = route_for(S::INDEX);
         let path = route.dir.join(S::name());
-        write(&path, &S::lines());
+        write(&path, &S::lines(2));
         let (tail, parsed) = full::<S>(&route, &path);
         let cold = emitted::<S>(Mode::ColdFull, &route, &parsed.snapshots);
         commit::<S>(&mut route, &path, tail, parsed);
-        let predecessor = head::<S>(&route, &path).body;
+        let predecessor = head::<S>(&route, &local_index_key(&path)).body;
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"{bad\n").unwrap();
         file.write_all(suffix).unwrap();
@@ -365,19 +331,19 @@ fn suffix<S: SourceFixture>() {
         assert!(!tail.publish(&Ok(parsed)));
         route.save(false);
         route.index = ScanIndex::load(&route.path).unwrap();
-        assert_eq!(head::<S>(&route, &path).body, predecessor);
+        assert_eq!(head::<S>(&route, &local_index_key(&path)).body, predecessor);
         // The compatibility reader also keeps the unfinished row pending;
         // it neither counts loss nor overwrites the predecessor.
         let (tail, compatibility) = full::<S>(&route, &path);
         assert_eq!(
             compatibility.report.physical_line_count,
-            S::lines().len() + 1
+            S::lines(2).len() + 1
         );
         assert_eq!(compatibility.report.malformed_json_line_count, 1);
         assert_eq!(compatibility.report.invalid_utf8_line_count, 0);
         assert!(!tail.publish(&Ok(compatibility)));
         route.save(false);
-        assert_eq!(head::<S>(&route, &path).body, predecessor);
+        assert_eq!(head::<S>(&route, &local_index_key(&path)).body, predecessor);
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(if suffix[0] == b'{' { b"true}\n" } else { b"\n" })
             .unwrap();
@@ -409,7 +375,7 @@ fn suffix<S: SourceFixture>() {
     for end in ["", "   "] {
         let mut route = route_for(S::INDEX);
         let path = route.dir.join(S::name());
-        let mut rows = S::lines();
+        let mut rows = S::lines(2);
         if !end.is_empty() {
             rows.push(end.into());
         }
@@ -441,7 +407,7 @@ fn suffix<S: SourceFixture>() {
 fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
     let mut route = route_for(S::INDEX);
     let path = route.dir.join(S::name());
-    let mut rows = S::lines();
+    let mut rows = S::lines(2);
     rows.retain(|line| {
         let v: Value = serde_json::from_str(line).unwrap();
         matches!(
@@ -528,6 +494,30 @@ fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
         money_oracle::assert_no_smaller_reemit(&item.source_session_id, &prior, &held, cold, true);
     }
 }
+/// [regress] Only growth under the stored loss generation may reuse its head.
+#[test]
+fn terminal_disposition_growth_reuses_only_the_same_generation() {
+    let mut index = ScanIndex::default();
+    let key = "a.jsonl";
+    index.terminal_jsonl_dispositions.insert(
+        key.into(),
+        TerminalJsonlDisposition {
+            source_file_fingerprint: "old".into(),
+            parser_generation: JSONL_TERMINAL_DISPOSITION_GENERATION.into(),
+            loss: TerminalJsonlLoss::default(),
+        },
+    );
+    let reason = Some(CandidateParseReason::TerminalDisposition);
+    assert!(reuses_stored(&index, key, reason, true, false));
+    assert!(!reuses_stored(&index, key, reason, false, false));
+    index
+        .terminal_jsonl_dispositions
+        .get_mut(key)
+        .unwrap()
+        .parser_generation = "another-generation".into();
+    assert!(!reuses_stored(&index, key, reason, true, false));
+}
+
 /// [regress] D1: a paused compatibility writer keeps its suffix pending;
 /// completing it tails exactly once from the saved head, equal to cold Full.
 #[test]
@@ -547,7 +537,7 @@ fn paused_compatibility_suffix_completes_once_from_saved_head() {
     );
     let previous = emitted::<Claude>(Mode::ColdFull, &route, &seed.snapshots);
     commit::<Claude>(&mut route, &path, tail, seed);
-    let before = head::<Claude>(&route, &path);
+    let before = head::<Claude>(&route, &local_index_key(&path));
     let sealed = fs::metadata(&path).unwrap().len();
     let split = last.len() / 2;
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -575,7 +565,10 @@ fn paused_compatibility_suffix_completes_once_from_saved_head() {
     assert!(!tail.publish(&Ok(paused)));
     route.save(false);
     route.index = ScanIndex::load(&route.path).unwrap();
-    assert_eq!(head::<Claude>(&route, &path).body, before.body);
+    assert_eq!(
+        head::<Claude>(&route, &local_index_key(&path)).body,
+        before.body
+    );
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     file.write_all(&last.as_bytes()[split..]).unwrap();
     file.write_all(b"\n").unwrap();
@@ -637,7 +630,7 @@ fn pi_bad_record_keeps_valid_occurrences() {
     regression::<Pi>();
     let route = route_for(Source::Pi);
     let path = route.dir.join("conflict.jsonl");
-    let mut rows = Pi::lines();
+    let mut rows = Pi::lines(2);
     rows.push(pi_usage(
         "message_end",
         "good-0",
@@ -671,7 +664,7 @@ fn pi_bad_record_keeps_valid_occurrences() {
     assert!(conflict.non_progressing_residue());
     assert!(!tail.publish(&Ok(conflict)));
     // A checked overflow is one discarded record beside healthy occurrences.
-    let mut rows = Pi::lines();
+    let mut rows = Pi::lines(2);
     let mut overflow: Value = serde_json::from_str(&pi_usage(
         "message_end",
         "overflow",
@@ -699,7 +692,7 @@ fn pi_bad_record_keeps_valid_occurrences() {
 fn admission<S: SourceFixture>() {
     let route = route_for(S::INDEX);
     let path = route.dir.join(S::name());
-    let mut rows = S::lines();
+    let mut rows = S::lines(2);
     rows.extend(S::bad());
     write(&path, &rows);
     let at = "2026-12-20T00:00:00Z";
@@ -980,81 +973,6 @@ fn claude_responses() {
         &cold,
         &emitted::<Claude>(Mode::Restart, &route, &parsed.snapshots),
     );
-}
-
-// O7: transport refusal and not-stored credit nothing; a partial ACK credits
-// its exact entity; crash/reopen retains that credit without replaying it.
-fn ack_transitions<S: SourceFixture>(route: &Route, items: &[SnapshotItem]) {
-    let mut rows = S::lines();
-    let original = &items[0].source_session_id;
-    let sibling = "019a0c2a-8e11-7222-8333-944445555778";
-    for row in &mut rows {
-        *row = row.replace(original, sibling);
-    }
-    let path = route.dir.join(format!("rollout-{sibling}.jsonl"));
-    write(&path, &rows);
-    let (_, parsed) = full::<S>(route, &path);
-    let mut offered = items.to_vec();
-    offered.extend(parsed.snapshots);
-    assert_eq!(offered.len(), 2);
-    let response = |batch: &[SnapshotItem], partial: bool, not_stored: bool| {
-        let refs: Vec<Value> = batch.iter().take(if partial {1} else {batch.len()}).map(|item| json!({
-            "source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
-            "body_witness_digest":snapshot_upload_body_witness(item),"occurrence_count":1,
-            "unchanged_basis":not_stored.then_some("usage_identical")
-        })).collect();
-        serde_json::from_value::<crate::snapshot_client::SnapshotBatchResponse>(json!({
-            "accepted":refs.len(),"sessions_reconciled":refs.len(),"session_ids":[],"disabled":false,
-            "disabled_reason":null,"entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
-            "accepted_entities":if not_stored {vec![]} else {refs.clone()},
-            "unchanged_entities":if not_stored {refs} else {vec![]},
-            "rejected_entities":if partial {batch.iter().skip(1).map(|item| json!({
-                "source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
-                "occurrence_count":1,"reason":"invalid","detail":"synthetic refusal","permanent":true
-            })).collect::<Vec<_>>()} else {vec![]}
-        })).unwrap()
-    };
-    let mut ack = AckLedger::new(S::SOURCE);
-    assert!(ack
-        .attempt(&offered, |_| Err(anyhow::anyhow!(
-            "synthetic transport failure"
-        )))
-        .is_err());
-    assert!(!offered.iter().any(|item| ack.settled(item)));
-    let mut unstored = AckLedger::new(S::SOURCE);
-    let _ = unstored.attempt(&offered, |batch| Ok(response(&batch, false, true)));
-    assert!(!offered.iter().any(|item| unstored.settled(item)));
-    let mut accepted_fingerprint = None;
-    let _ = ack.attempt(&offered, |batch| {
-        accepted_fingerprint = Some(batch[0].snapshot_fingerprint.clone());
-        Ok(response(&batch, true, false))
-    });
-    let accepted_fingerprint = accepted_fingerprint.unwrap();
-    let accepted = offered
-        .iter()
-        .find(|item| item.snapshot_fingerprint == accepted_fingerprint)
-        .unwrap();
-    let rejected = offered
-        .iter()
-        .find(|item| item.snapshot_fingerprint != accepted_fingerprint)
-        .unwrap();
-    assert!(ack.settled(accepted));
-    assert!(!ack.settled(rejected));
-    let progress = route.dir.join("acks.json");
-    ack.save(&progress);
-    let mut restarted = AckLedger::new(S::SOURCE);
-    restarted.reopen(S::SOURCE, &progress);
-    assert!(restarted.settled(accepted));
-    assert!(!restarted.settled(rejected));
-    let retry = rejected.clone();
-    // Permanent refusal stores no body ACK; a fresh delivery context can retry it.
-    let mut retrying = AckLedger::new(S::SOURCE);
-    retrying.deliver(std::slice::from_ref(&retry));
-    assert!(retrying.settled(&retry));
-    restarted.deliver(std::slice::from_ref(accepted));
-    assert_eq!(restarted.posts(), 0);
-    assert!(restarted.settled(accepted));
-    assert!(!restarted.settled(rejected));
 }
 
 // The existing native account corpus supplies two accounts and the switch;

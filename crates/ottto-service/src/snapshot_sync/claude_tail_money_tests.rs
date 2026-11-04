@@ -2288,11 +2288,14 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         );
         progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
+        // Reuse these outcomes with a B2 loss-bearing successor.
+        append(&path, "{broken\n");
         grow(&path, "next", 20);
         let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
         successor.enrich(&c);
         successor.finish();
         let fulls = successor.modes.0;
+        assert_eq!(successor.scan.malformed_json_line_count, 1);
         if let Some(disposition) = disposition {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
                 let mut response = ack(batch)?;
@@ -2340,6 +2343,11 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         cold.finish();
         assert!(fulls + actual.modes.0 <= 1);
         assert!(!actual.scan.snapshots.is_empty());
+        assert_eq!(actual.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&actual.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold.index).unwrap()["terminal_jsonl_dispositions"]
+        );
         let (a, actual_wire, _) = upload(&actual.scan.snapshots, &mut e2_progress(), ack);
         let (b, cold_wire, _) = upload(&cold.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
