@@ -5681,3 +5681,21 @@ mod header_admission_tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Resource refusals retain the ordinary queue's census and watcher custody.
+pub(in crate::snapshots) fn requeue_refused(
+    source: SnapshotSource,
+    error: &anyhow::Error,
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    candidate: &CandidateFile,
+) -> bool {
+    let refused = source == SnapshotSource::Codex
+        && error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+    if refused {
+        requeue(index, flags, candidate);
+    }
+    refused
+}

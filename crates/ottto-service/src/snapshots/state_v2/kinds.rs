@@ -30,6 +30,8 @@ pub(super) struct KindCx {
     /// A full save's staged Tail state; claim-only saves leave this `None` and
     /// publish none. The save's owner takes it back after the attempt.
     pub(super) tail: Option<tail::TailStage>,
+    /// Only the synchronous prepare-time transaction owns this move.
+    pub(super) carry: Option<(String, tail::PathCarry)>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
     /// Rows of retired kinds this hydrate found, by key only: their values are
@@ -232,49 +234,6 @@ pub(super) fn delta(
     tx: &mut dyn Transaction,
     cx: &mut KindCx,
 ) -> Result<Baseline> {
-    let carried = cx
-        .tail
-        .iter()
-        .flat_map(|stage| stage.carries())
-        .next()
-        .is_some();
-    if !carried {
-        return delta_inner(previous, next, tx, cx);
-    }
-    ensure!(
-        cx.tail
-            .iter()
-            .flat_map(|stage| stage.carries())
-            .all(|(to, carry)| !next.files.contains_key(&carry.from)
-                && std::str::from_utf8(to).is_ok_and(|to| next.files.contains_key(to))),
-        "state_v2_tail_carry_graph"
-    );
-    // Enumeration, both graph keys, all aliases, Tail moves and finish share
-    // the existing transaction's one rollback unit. No second custody list.
-    let mut previous = Some(previous);
-    let mut baseline = None;
-    let result = tx.isolated(&mut |tx| {
-        baseline = Some(delta_inner(
-            previous.take().expect("one carry boundary"),
-            next,
-            tx,
-            cx,
-        )?);
-        ensure!(!cx.tail_rolled_back, Hold::ReloadRequired);
-        Ok(())
-    })?;
-    if result.is_err() {
-        cx.valid = false;
-    }
-    result?;
-    baseline.ok_or_else(|| Hold::ReloadRequired.into())
-}
-fn delta_inner(
-    previous: Baseline,
-    next: &ScanIndex,
-    tx: &mut dyn Transaction,
-    cx: &mut KindCx,
-) -> Result<Baseline> {
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
     cx.archived = Archived::default();
@@ -291,7 +250,21 @@ fn delta_inner(
                 .collect(),
             ..Default::default()
         };
+        if let Some((to, carry)) = &cx.carry {
+            rows.closures
+                .entry(carry.from.as_bytes().to_vec())
+                .or_default();
+            rows.closures.entry(to.as_bytes().to_vec()).or_default();
+        }
         let windows = enumerate(next, &mut rows, &previous.windows, cx)?;
+        if let Some((to, carry)) = &cx.carry {
+            // Take BOTH closures before finish: predecessor deletion, destination
+            // graph and all Tail rows share this transaction's COMMIT/rollback.
+            let mut closure = rows.take_closure(carry.from.as_bytes())?;
+            closure.extend(rows.take_closure(to.as_bytes())?);
+            tail::write_closure(rows.tx()?, &closure)?;
+            tail::move_tail(rows.tx()?, to.as_bytes(), carry)?;
+        }
         let retired = tail::removed_files(&rows.old);
         cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
         let digests = rows.finish()?;
@@ -333,13 +306,9 @@ pub(super) fn save_graph(
             Hold::ForeignBinding
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
-        // Reuse the same custody seam for claims restored by the CAS merge.
-        for (to, carry) in pending.tail.iter().flat_map(|stage| stage.carries()) {
-            next.rekey_account_custody(
-                &carry.from,
-                std::str::from_utf8(to)?,
-                Some(&carry.scan_root),
-            );
+        if let Some((to, carry)) = &pending.carry {
+            // CAS-restored custody joins the same map move before encoding.
+            next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
         }
         super::super::lenient_decode::check_held_output(next)?;
         let mut tx = store.begin(TxnMode::Write)?;
@@ -352,6 +321,7 @@ pub(super) fn save_graph(
                 next.generation = generation;
                 // RAM is ahead of a rolled-back file's committed rows: reload
                 // them. The stage is published; the file reselects.
+                pending.carry = None;
                 if pending.tail_rolled_back {
                     pending.tail = None;
                     bail!(Hold::ReloadRequired);

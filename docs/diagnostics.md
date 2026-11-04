@@ -1728,9 +1728,10 @@ read is carried on a later pass. Multi-file compressed sessions remain unsupport
 grouped replay.
 
 A proven representation/path carry preserves old logical fingerprints, ACK/context
-facts and debt in one paired save rollback unit, using the ordinary graph delta and
-Tail save. While a carry is staged, the complete graph delta shares that rollback
-boundary; ordinary saves keep their original per-file boundaries. Rename performs no header, sample,
+facts and debt in one prepare-time transaction, using the ordinary graph delta and
+Tail save. RAM adopts the destination after COMMIT; ordinary saves keep their
+original per-file boundaries. A failed carry holds only its proven owner and counts
+on the existing inventory cause. Rename performs no header, sample,
 decoder or body read and no POST. A compressed rollout rewritten by the provider as
 a new plaintext file is read in full once (counted), as any replaced file is today.
 A restart mid-first-read re-decodes the prefix, counted on

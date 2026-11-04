@@ -16832,7 +16832,10 @@ impl OwnedSourceScan {
     }
 
     pub(crate) fn rehome_withheld_baseline(&self, baseline: &mut ScanIndex) -> Result<()> {
-        baseline.rehome_codex_carry_baseline(&self.index)?;
+        // Prepare may have committed a representation move before selection.
+        if self.source == SnapshotSource::Codex && baseline.generation != self.index.generation {
+            *baseline = self.index.clone();
+        }
         baseline.rehome_withheld_baseline(&self.index);
         Ok(())
     }
@@ -16997,10 +17000,10 @@ impl OwnedSourceScan {
             directory_entries_per_tick(),
             Some(&resource_probe.discovery_growth),
         );
-        let carry_deferred = if source == SnapshotSource::Codex {
+        let (carry_deferred, carry_held_owners) = if source == SnapshotSource::Codex {
             index.prepare_codex_carries(carry_cache.map(|(cache, scope)| (cache, Some(scope))))
         } else {
-            BTreeSet::new()
+            Default::default()
         };
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
@@ -17632,16 +17635,6 @@ impl OwnedSourceScan {
         // Only pure context debt moves behind ordinary work. Preserve relative
         // order of all authority, recovery, new and changed family members.
         identified_candidates.sort_by_cached_key(|candidate| index.context_only_read(candidate));
-        if source == SnapshotSource::Codex {
-            if let Some(walk) = index.traversal.as_ref() {
-                identified_candidates.retain(|candidate| {
-                    !codex_file_join::shadowed_compressed_path(
-                        &candidate.path,
-                        &walk.codex_rollout_paths,
-                    )
-                });
-            }
-        }
         let codex_join_inventory =
             (source == SnapshotSource::Codex && !identified_candidates.is_empty()).then(|| {
                 let traversal = index
@@ -17656,8 +17649,8 @@ impl OwnedSourceScan {
                 inventory
                     .pending
                     .retain(|path| !carry_deferred.contains(&local_index_key(path)));
-                inventory.complete &=
-                    traversal.pending_directories.is_empty() && carry_deferred.is_empty();
+                inventory.held_owners = carry_held_owners;
+                inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());
@@ -19158,16 +19151,13 @@ impl OwnedSourceScan {
                                 &active.candidate.path,
                             );
                         }
-                        if source == SnapshotSource::Codex
-                            && error
-                                .downcast_ref::<std::io::Error>()
-                                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                        {
-                            sampled_scan::codex_cursor::requeue(
-                                index,
-                                &codex_selected_flags,
-                                &active.candidate,
-                            );
+                        if sampled_scan::codex_cursor::requeue_refused(
+                            source,
+                            &error,
+                            index,
+                            &codex_selected_flags,
+                            &active.candidate,
+                        ) {
                             active.parser.reader.reader.close();
                             pending!();
                         }
@@ -22014,28 +22004,6 @@ impl OwnedSourceScan {
                     counters.tombstone_hits = counters.tombstone_hits.saturating_add(1);
                 });
             }
-            if source == SnapshotSource::Codex {
-                match index.codex_unchanged_decision(
-                    &candidate,
-                    &codex_title_metadata,
-                    audit_now,
-                    true,
-                ) {
-                    Ok(Some((CandidateDecision::Skip, _))) => {
-                        page_selection(source.api_slug(), PageSelection::Skipped, 1);
-                        pending!();
-                    }
-                    Err(_) => {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
-                        pending!();
-                    }
-                    _ => {}
-                }
-            }
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(events) = launch_lookup {
@@ -22161,6 +22129,31 @@ impl OwnedSourceScan {
                     index.candidate_decision_in_window(&candidate, audit_now, &mut source_change)
                 }
             };
+            if source == SnapshotSource::Codex {
+                match opened_file
+                    .metadata()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|stat| {
+                        index.codex_unchanged_decision(
+                            &candidate,
+                            &stat,
+                            &codex_title_metadata,
+                            audit_now,
+                            true,
+                        )
+                    }) {
+                    Ok(Some(logical)) => (decision, parse_reason) = logical,
+                    Err(_) => {
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                    _ => {}
+                }
+            }
             let target_match = native_comparison
                 .as_ref()
                 .and_then(|phase| phase.target_revision_matches(&candidate));
@@ -22585,16 +22578,13 @@ impl OwnedSourceScan {
                 Ok(parser) => parser,
 
                 Err(error) => {
-                    if source == SnapshotSource::Codex
-                        && error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                    {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
+                    if sampled_scan::codex_cursor::requeue_refused(
+                        source,
+                        &error,
+                        index,
+                        &codex_selected_flags,
+                        &candidate,
+                    ) {
                         pending!();
                     }
                     if source == SnapshotSource::ClaudeCode {
@@ -31885,6 +31875,7 @@ fn codex_fresh_data_pending(candidate: &ScanTraversalPath, index: &ScanIndex) ->
                 .codex_physical_matches(&key, &metadata)
                 .ok()
                 .flatten()
+                .map(|(matched, _)| matched)
                 .map_or_else(
                     || entry.map_or(true, |entry| entry.size_bytes != metadata.len()),
                     |unchanged| !unchanged,
@@ -37277,7 +37268,7 @@ impl ScanIndex {
         if entry.is_some_and(|entry| {
             entry.codex_counting_owner.is_some() || entry.codex_protected_owner.is_some()
         }) {
-            if let Ok(Some(unchanged)) = self.codex_physical_matches(&key, metadata) {
+            if let Ok(Some((unchanged, _))) = self.codex_physical_matches(&key, metadata) {
                 return unchanged;
             }
         }
@@ -38718,21 +38709,6 @@ impl ScanIndex {
 
     /// Move, never settle, existing custody. No transcript read or release/ACK credit.
     fn rekey_account_custody(&mut self, from: &str, to: &str, scan_root: Option<&Path>) {
-        self.file_custody(from, Some((to, scan_root)));
-    }
-
-    /// One custody list for moves and the existing entry-only drop. Extra
-    /// path aliases move only for the caller supplying a discovered root.
-    fn file_custody(&mut self, from: &str, target: Option<(&str, Option<&Path>)>) {
-        let Some((to, scan_root)) = target else {
-            self.files.remove(from);
-            self.confirmed_empty_files.remove(from);
-            self.claude_request_census.remove(from);
-            self.claude_money_birth_store.set_money_marks(from, 0);
-            self.claude_copy_removals
-                .forget(claude_money_birth_store::location_key(from));
-            return;
-        };
         let from_location = claude_money_birth_store::location_key(from);
         let to_location = claude_money_birth_store::location_key(to);
         self.claude_copy_removals.rekey(from_location, to_location);
@@ -39966,7 +39942,12 @@ impl ScanIndex {
     /// it after its own guards; dispositions, fingerprints, holds and Codex
     /// proof stay with each caller. Nothing else ends a census record.
     fn drop_file_entry(&mut self, key: &str) {
-        self.file_custody(key, None);
+        self.files.remove(key);
+        self.confirmed_empty_files.remove(key);
+        self.claude_request_census.remove(key);
+        self.claude_money_birth_store.set_money_marks(key, 0);
+        self.claude_copy_removals
+            .forget(claude_money_birth_store::location_key(key));
     }
 
     /// Keep move history for 30 days after the last indexed or held member.

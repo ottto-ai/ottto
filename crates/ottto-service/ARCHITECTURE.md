@@ -42,6 +42,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
   singleton sessions and joined groups across registered homes. A header owner that changes
   during a pass holds that pass’s Codex publication until revalidation on the next pass.
+  A proven compression or same-object move commits the old and new graph closures
+  and Tail keys together during preparation; RAM adopts the destination after COMMIT.
+  A refused carry holds only its predecessor's proven owner and counts as inventory debt.
   A rollout moved while a reader owns it waits for a later pass. Multi-file compressed
   sessions remain unsupported for grouped replay.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It

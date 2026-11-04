@@ -5,27 +5,51 @@ use super::super::tail::{
 };
 use super::*;
 
-/// Pair both graph closures and Tail at the next ordinary save.
-pub(in crate::snapshots) fn carry_tail(path: &Path, to: &str, carry: PathCarry) -> Result<()> {
-    with_state(path, |state| state.tail.carry(to, carry))
-}
-pub(in crate::snapshots) fn pending_carries(index: &ScanIndex) -> Result<Vec<(String, PathCarry)>> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(Vec::new());
-    };
-    with_state(&path, |state| {
-        state
-            .tail
-            .carries()
-            .map(|(to, carry)| Ok((std::str::from_utf8(to)?.to_owned(), carry.clone())))
-            .collect()
-    })
-}
-fn pending_carry(index: &ScanIndex, key: &str) -> Result<Option<PathCarry>> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(None);
-    };
-    with_state(&path, |state| Ok(state.tail.carry_for(key).cloned()))
+/// Prepare-time carry: the original RAM graph stays old until COMMIT. The
+/// ordinary save owns CAS merge, graph encoding, Tail movement and rollback.
+pub(in crate::snapshots) fn carry_tail(
+    index: &mut ScanIndex,
+    to: &str,
+    carry: PathCarry,
+) -> Result<()> {
+    let path = runtime_path(index)?.ok_or(Hold::ReloadRequired)?;
+    let _owner = super::super::super::CheckpointLock::acquire(&path)?;
+    let mut next = index.clone();
+    with_save_session(
+        &path,
+        index.v2().persistence_v2.clone(),
+        index.generation,
+        |state, session, id| {
+            let previous = match state.save_digests.take() {
+                Some(previous) => previous,
+                None => {
+                    let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
+                    let previous = kinds::baseline(&committed, &mut cx)?;
+                    session.cx = cx;
+                    previous
+                }
+            };
+            state.tail.carry_observation(to, &carry)?;
+            recovered_write(&path, None, &id, session, |session| {
+                session.cx.carry = Some((to.to_owned(), carry));
+                session.cx.tail = Some(std::mem::take(&mut state.tail));
+                let digests = import::save(
+                    &mut session.db,
+                    &id,
+                    previous,
+                    &mut next,
+                    &mut session.cx,
+                    false,
+                )?;
+                session.stamp = session.db.stamp()?;
+                state.save_digests = Some(digests);
+                Ok(())
+            })
+        },
+    )?
+    .ok_or(Hold::ReloadRequired)?;
+    *index = next;
+    Ok(())
 }
 /// Staged state never declines; a later completion of the file merges into it.
 pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile) -> Result<()> {
@@ -125,17 +149,8 @@ pub(in crate::snapshots) fn load_head(
     key: &str,
     revision: u32,
 ) -> Result<Option<TailHead>> {
-    let carry = pending_carry(index, key)?;
-    let stored_key = carry.as_ref().map_or(key, |carry| carry.from.as_str());
     read_txn_at(index, |tx, stamp| {
-        let mut head = super::super::tail::load_head(tx, stored_key.as_bytes(), revision, stamp.0)?;
-        if let (Some(head), Some(carry)) = (&mut head, &carry) {
-            if !head.metadata_only {
-                head.body.clone_from(&carry.head);
-            }
-            head.common.inventory = Some(carry.inventory.clone());
-        }
-        Ok(head)
+        super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
 /// Historical first-seen evidence only; no disposition or attempt is applied.
@@ -157,10 +172,8 @@ pub(in crate::snapshots) fn load_tail(
     mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
-    let carry = pending_carry(index, key)?;
-    let stored_key = carry.as_ref().map_or(key, |carry| carry.from.as_str());
     read_txn_at(index, |tx, stamp| {
-        super::super::tail::load_pages(tx, stored_key.as_bytes(), head, stamp.0, &mut visit)
+        super::super::tail::load_pages(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })?;
     telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
     Ok(())
@@ -173,10 +186,8 @@ pub(in crate::snapshots) fn load_revisions(
     head: &TailHead,
     mut visit: impl FnMut(u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
-    let carry = pending_carry(index, key)?;
-    let stored_key = carry.as_ref().map_or(key, |carry| carry.from.as_str());
     read_txn_at(index, |tx, stamp| {
-        super::super::tail::load_revisions(tx, stored_key.as_bytes(), head, stamp.0, &mut visit)
+        super::super::tail::load_revisions(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })
 }
 /// The route of `index`'s live session, for a caller holding only the graph:
@@ -190,21 +201,14 @@ pub(in crate::snapshots) fn tail_route_path(
 pub(in crate::snapshots) fn tail_head_keys(
     index: &ScanIndex,
 ) -> Result<std::collections::BTreeSet<String>> {
-    let mut keys = read_txn(index, super::super::tail::head_keys)?.0;
-    for (to, carry) in pending_carries(index)? {
-        keys.remove(&carry.from);
-        keys.insert(to);
-    }
-    Ok(keys)
+    Ok(read_txn(index, super::super::tail::head_keys)?.0)
 }
 pub(in crate::snapshots) fn tail_set_aside(
     index: &ScanIndex,
     key: &str,
 ) -> Result<Option<SetAside>> {
-    let carry = pending_carry(index, key)?;
-    let stored_key = carry.as_ref().map_or(key, |carry| carry.from.as_str());
     Ok(read_txn(index, |tx| {
-        super::super::tail::read_set_aside(tx, stored_key.as_bytes())
+        super::super::tail::read_set_aside(tx, key.as_bytes())
     })?
     .0)
 }

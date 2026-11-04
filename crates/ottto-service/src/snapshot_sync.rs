@@ -3653,11 +3653,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
-    let mut carried_baseline = (index.has_pending_codex_carry()?).then(|| committed_index.clone());
-    if let Some(baseline) = carried_baseline.as_mut() {
-        baseline.rehome_codex_carry_baseline(index)?;
-    }
-    let committed_index = carried_baseline.as_ref().unwrap_or(committed_index);
     let progress_owner =
         SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
     let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
@@ -7645,7 +7640,6 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
-    committed_index.rehome_codex_carry_baseline(&index)?;
     // Telemetry retention keeps the sessions this page names, read before any
     // page filter drops a snapshot.
     let telemetry_named = claude_scan_roots

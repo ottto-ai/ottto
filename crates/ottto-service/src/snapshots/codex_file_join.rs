@@ -175,17 +175,14 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 }
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.
-fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize, FileStamp)> {
-    // Physical probe/scope callers have no decoder credit. Preserve their
-    // existing fail-closed cause; ordinary inventory uses the funded opener.
-    refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
-    read_header_bytes_encoded(candidate, None, &mut 0)
-}
-fn read_header_bytes_encoded(
+fn read_header_bytes(
     candidate: &CandidateFile,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
     read_work: &mut usize,
 ) -> Result<(Vec<u8>, String, usize, FileStamp)> {
+    if cache.is_none() {
+        refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
+    }
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -235,13 +232,12 @@ pub(super) fn read_header_line(input: &mut impl BufRead) -> std::io::Result<Opti
 }
 
 type ReadHeader = (CachedHeader, String);
-fn read_header_encoded(
+fn read_header(
     candidate: &CandidateFile,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
     read_work: &mut usize,
 ) -> Result<ReadHeader> {
-    let (bytes, witness, read_bytes, stamp) =
-        read_header_bytes_encoded(candidate, cache, read_work)?;
+    let (bytes, witness, read_bytes, stamp) = read_header_bytes(candidate, cache, read_work)?;
     #[cfg(test)]
     codex_zst_refusal_tests::jsonl_parse_attempted();
     let value: Value = serde_json::from_slice(&bytes)?;
@@ -265,10 +261,7 @@ fn read_header_encoded(
 /// repeated; every other refusal is final on its first read.
 const HEADER_READ_ATTEMPTS: usize = 3;
 const HEADER_CHANGED_WHILE_READ: &str = "Codex header changed while read";
-fn read_header_settled(candidate: &CandidateFile) -> (Result<ReadHeader>, usize) {
-    read_header_settled_encoded(candidate, None)
-}
-fn read_header_settled_encoded(
+fn read_header_settled(
     candidate: &CandidateFile,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> (Result<ReadHeader>, usize) {
@@ -276,7 +269,7 @@ fn read_header_settled_encoded(
     let mut total_work = 0usize;
     loop {
         let mut read_work = 0;
-        let result = read_header_encoded(candidate, cache, &mut read_work);
+        let result = read_header(candidate, cache, &mut read_work);
         total_work = total_work.saturating_add(read_work);
         match result {
             Err(error)
@@ -300,14 +293,15 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
 /// Tail head continues (D131), read as the inventory reads it.
 #[cfg(unix)]
 pub(super) fn header_owner(candidate: &CandidateFile) -> Result<String> {
-    read_header_settled(candidate)
+    read_header_settled(candidate, None)
         .0
         .map(|(header, _)| header.owner)
 }
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
-    read_header_bytes(candidate).map(|(bytes, _, _, _)| format!("{:x}", Sha256::digest(bytes)))
+    read_header_bytes(candidate, None, &mut 0)
+        .map(|(bytes, _, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// RAM-only validated facts; candidate attribution and metadata witnesses are
@@ -411,6 +405,7 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
+    pub(super) held_owners: BTreeSet<String>,
     pub(super) read_bytes: usize,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
@@ -452,6 +447,7 @@ impl HeaderInventory {
                 .map(PathBuf::from)
                 .collect(),
             headers: Vec::new(),
+            held_owners: BTreeSet::new(),
             directories: directories.cloned().unwrap_or_default(),
             complete: directories.is_some_and(|value| value.stable),
             read_bytes: 0,
@@ -493,7 +489,7 @@ impl HeaderInventory {
 
     #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
-        self.step_cached(metadata, None)
+        self.step_encoded(metadata, None)
     }
     /// Funded ordinary header inventory, independent of the body's encoding.
     #[cfg(test)]
@@ -502,15 +498,7 @@ impl HeaderInventory {
         metadata: &CodexTitleMetadata,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> bool {
-        self.step_with_input(metadata, cache.map(Arc::as_ref), cache, None, None)
-    }
-    #[cfg(test)]
-    pub(super) fn step_cached(
-        &mut self,
-        metadata: &CodexTitleMetadata,
-        cache: Option<&sampled_scan::SharedCache>,
-    ) -> bool {
-        self.step_with_input(metadata, cache, None, None, None)
+        self.step_selected(metadata, &mut ScanIndex::default(), &BTreeMap::new(), cache)
     }
     pub(super) fn step_selected(
         &mut self,
@@ -519,22 +507,8 @@ impl HeaderInventory {
         flags: &BTreeMap<String, (bool, bool)>,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> bool {
-        self.step_with_input(
-            metadata,
-            cache.map(Arc::as_ref),
-            cache,
-            Some(index),
-            Some(flags),
-        )
-    }
-    fn step_with_input(
-        &mut self,
-        metadata: &CodexTitleMetadata,
-        cache: Option<&sampled_scan::SharedCache>,
-        funded_cache: Option<&Arc<sampled_scan::SharedCache>>,
-        index: Option<&mut ScanIndex>,
-        flags: Option<&BTreeMap<String, (bool, bool)>>,
-    ) -> bool {
+        let funded_cache = cache;
+        let cache = cache.map(Arc::as_ref);
         if !self.cache_pruned {
             self.cache_pruned = true;
             if let Some(cache) = cache {
@@ -590,86 +564,49 @@ impl HeaderInventory {
                 None,
             );
             retry_candidate = Some(candidate.clone());
-            let stored_head =
-                index
-                    .as_deref()
-                    .filter(|index| index.v2().persistence_v2.is_some())
-                    .map(|index| {
-                        state_v2::load_head(index, &key,
-                <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION)
-                    })
-                    .transpose()?
-                    .flatten();
-            // Existing ordinary heads have object certificates but no carried
-            // inventory. Both forms reuse proven owning facts without a read.
-            let mut reused = stored_head
-                .filter(|head| !head.metadata_only)
-                .and_then(|head| {
-                    let current = open_candidate_beneath_root(&candidate)
-                        .ok()?
-                        .metadata()
-                        .ok()?;
-                    let stamp = FileStamp::capture(current.clone()).ok()?;
+            let current = open_candidate_beneath_root(&candidate)?.metadata()?;
+            let stamp = FileStamp::capture(current.clone())?;
+            // One securely acquired physical witness for both durable and RAM facts.
+            let durable = index
+                .codex_physical_matches(&key, &current)?
+                .filter(|(matched, _)| *matched)
+                .and_then(|(_, head)| {
                     let facts = head.common.inventory.as_ref();
-                    let owner = if let Some(facts) = facts {
-                        if !facts.stamp.matches_acquisition(&stamp) {
-                            return None;
-                        }
-                        facts.owner.clone()
-                    } else {
-                        if !codex_rollout_carry::physical_matches(&head, &current) {
-                            return None;
-                        }
+                    let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
                         tail_source::codex::header_facts(head.revision, &head.body)
                             .ok()?
-                            .1?
-                    };
-                    Some((
-                        CachedHeader {
-                            stamp,
-                            owner,
-                            created_unix_ms: facts.and_then(|facts| facts.created_unix_ms),
-                            read_bytes: facts.map_or(0, |facts| {
-                                usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
-                            }),
-                        },
-                        metadata_witness(&current),
-                    ))
-                });
-            if let Some((facts, _)) = &reused {
-                self.reuse_hits += 1;
-                self.reuse_misses -= 1;
-                self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
-            }
-            if let Some(cached) = reused
-                .is_none()
-                .then(|| {
-                    cache.and_then(|cache| {
-                        cache
-                            .with_cursor(|cursor| cursor.headers.get(&key))
-                            .flatten()
+                            .1
+                    })?;
+                    Some(CachedHeader {
+                        stamp: stamp.clone(),
+                        owner,
+                        created_unix_ms: facts.and_then(|facts| facts.created_unix_ms),
+                        read_bytes: facts.map_or(0, |facts| {
+                            usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
+                        }),
                     })
+                });
+            let reused = durable
+                .or_else(|| {
+                    let cached = cache?
+                        .with_cursor(|cursor| cursor.headers.get(&key))
+                        .flatten()?;
+                    (cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp))
+                        .then_some(cached)
                 })
-                .flatten()
-            {
-                let current = open_candidate_beneath_root(&candidate)?.metadata()?;
-                let stamp = FileStamp::capture(current.clone())?;
-                // Non-Unix stamps have no object identity; length alone
-                // cannot authorize reuse of owning-header facts.
-                if cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp) {
+                .map(|facts| {
                     self.reuse_hits += 1;
                     self.reuse_misses -= 1;
-                    self.bytes_avoided = self.bytes_avoided.saturating_add(cached.read_bytes);
-                    reused = Some((cached, metadata_witness(&current)));
-                }
-            }
+                    self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
+                    (facts, metadata_witness(&current))
+                });
             let (facts, witness) = match reused {
                 Some(header) => header,
                 None => {
                     if let Some(cache) = cache {
                         cache.refresh_header(key.clone(), None);
                     }
-                    let (header, read_work) = read_header_settled_encoded(&candidate, funded_cache);
+                    let (header, read_work) = read_header_settled(&candidate, funded_cache);
                     self.read_bytes = self.read_bytes.saturating_add(read_work);
                     let (facts, witness) = header?;
                     if let Some(cache) = cache {
@@ -692,19 +629,15 @@ impl HeaderInventory {
                 self.headers.push(header);
             }
             Err(error) => {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                {
-                    // Decoder credit is a temporary refusal. Preserve the
-                    // exact roster member for the next funded ordinary turn.
-                    if let Some((index, candidate)) = index.zip(retry_candidate.as_ref()) {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            flags.expect("selected inventory flags"),
-                            candidate,
-                        );
-                    }
+                if retry_candidate.as_ref().is_some_and(|candidate| {
+                    sampled_scan::codex_cursor::requeue_refused(
+                        SnapshotSource::Codex,
+                        &error,
+                        index,
+                        flags,
+                        candidate,
+                    )
+                }) {
                     // The ordinary queue owns the next attempt. Finish this
                     // inventory as incomplete so paused readers can release credit.
                     self.complete = false;
@@ -750,7 +683,7 @@ impl HeaderInventory {
         if !self.complete || !self.pending.is_empty() {
             return None;
         }
-        let mut affected = BTreeSet::new();
+        let mut affected = self.held_owners.clone();
         let mut homes = BTreeMap::new();
         for header in &self.headers {
             if homes
@@ -783,19 +716,15 @@ impl HeaderInventory {
         if owners.is_empty() {
             return Ok(0);
         }
-        let (affected, checked_headers) = self.current_membership_failures()?;
+        let affected = self
+            .affected_owners()
+            .context("Codex joining header inventory is incomplete")?;
         anyhow::ensure!(
             owners
                 .iter()
                 .all(|owner| self.membership_complete(owner, Some(&affected))),
             "Codex joining header inventory is incomplete"
         );
-        Ok(checked_headers)
-    }
-    fn current_membership_failures(&self) -> Result<(BTreeSet<String>, usize)> {
-        let affected = self
-            .affected_owners()
-            .context("Codex joining header inventory is incomplete")?;
         // Uniqueness spans all registered homes, even a home with no selected
         // owner. An unread or changed directory there may hide a new collision.
         for root in &self.roots {
@@ -819,18 +748,18 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let (current, _) = read_header_settled(&header.candidate).0?;
+            let (current, _) = read_header_settled(&header.candidate, None).0?;
             anyhow::ensure!(
                 current.owner == header.owner,
                 "Codex joining header ownership changed"
             );
         }
-        Ok((affected, checked_headers))
+        Ok(checked_headers)
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, held_owners, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -879,9 +808,21 @@ impl Validation {
         // One fresh roster check per home/boundary, independent of group count.
         // Never cache this result across capture, network or checkpoint boundaries.
         let checked_headers = self.inventory.validate_memberships(&selected)?;
-        for group in &self.groups {
-            if owners.contains(&group.owner) {
-                Self::validate_group(group)?;
+        for group in self
+            .groups
+            .iter()
+            .filter(|group| owners.contains(&group.owner))
+        {
+            for member in &group.members {
+                let mut opened = member.clone();
+                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
+                let granted = group.live.as_ref().is_some_and(|(key, prefix)| {
+                    *key == local_index_key(&member.path) && prefix.holds(&file)
+                });
+                anyhow::ensure!(
+                    granted || opened.opened_object_identity == member.opened_object_identity,
+                    "Codex joined member changed after replay"
+                );
             }
         }
         Ok(checked_headers)
@@ -891,20 +832,6 @@ impl Validation {
     pub(super) fn remove_owners(&mut self, held: &BTreeSet<String>) {
         self.owners.retain(|owner| !held.contains(owner));
         self.groups.retain(|group| !held.contains(&group.owner));
-    }
-    fn validate_group(group: &Group) -> Result<()> {
-        for member in &group.members {
-            let mut opened = member.clone();
-            let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
-            let granted = group.live.as_ref().is_some_and(|(key, prefix)| {
-                *key == local_index_key(&member.path) && prefix.holds(&file)
-            });
-            anyhow::ensure!(
-                granted || opened.opened_object_identity == member.opened_object_identity,
-                "Codex joined member changed after replay"
-            );
-        }
-        Ok(())
     }
 }
 crate::heap_layout_bound::fields!(Group; owner, home, members, live);
@@ -2051,6 +1978,19 @@ pub(super) mod tests {
         while !inventory.step(&CodexTitleMetadata::default()) {}
         (root, inventory)
     }
+    /// [regress] Failed carry proof constrains only its established owner.
+    #[test]
+    fn carry_deferral_holds_only_its_proven_owner() {
+        let mut inventory = HeaderInventory::new(&[], &BTreeSet::new(), None);
+        inventory.complete = true;
+        inventory.held_owners.insert("held".into());
+        let affected = inventory.affected_owners();
+        assert!(!inventory.membership_complete("held", affected.as_ref()));
+        assert!(inventory.membership_complete("independent", affected.as_ref()));
+        inventory.complete = false;
+        assert!(inventory.affected_owners().is_none());
+    }
+
     #[test]
     fn header_inventory_completes_valid_large_headers_without_a_volume_limit() {
         let (root, _) = fixture();
@@ -4373,13 +4313,13 @@ pub(in crate::snapshots) mod header_cache_tests {
     pub(in crate::snapshots) fn page(
         root: &Path,
         paths: &BTreeSet<String>,
-        cache: &sampled_scan::SharedCache,
+        cache: &Arc<sampled_scan::SharedCache>,
     ) -> HeaderInventory {
         let sessions = root.join("sessions");
         let mut census = DirectoryCensus::new();
         census.observe(&sessions, &fs::metadata(&sessions).unwrap());
         let mut inventory = HeaderInventory::new(&[sessions], paths, Some(&census));
-        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(cache)) {}
+        while !inventory.step_encoded(&CodexTitleMetadata::default(), Some(cache)) {}
         inventory
     }
 
@@ -4407,7 +4347,7 @@ pub(in crate::snapshots) mod header_cache_tests {
     fn unchanged_pages_reuse_without_reading_and_restart_is_cold() {
         let (root, fixture) = tests::fixture();
         let paths = paths(&fixture);
-        let cache = sampled_scan::SharedCache::default();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         let first = page(&root, &paths, &cache);
         assert!(first.complete);
         assert_eq!(first.reuse_misses, paths.len());
@@ -4432,7 +4372,7 @@ pub(in crate::snapshots) mod header_cache_tests {
     fn growth_and_replacement_refresh_once_failures_never_become_hits() {
         let (root, fixture) = tests::fixture();
         let paths = paths(&fixture);
-        let cache = sampled_scan::SharedCache::default();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         page(&root, &paths, &cache);
         let path = Path::new(paths.first().unwrap());
         let original = fs::read(path).unwrap();
@@ -4486,7 +4426,7 @@ pub(in crate::snapshots) mod header_cache_tests {
     fn byte_admission_refuses_optional_facts_and_clear_releases_them() {
         let (root, fixture) = tests::fixture();
         let paths = paths(&fixture);
-        let cache = sampled_scan::SharedCache::default();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         let refused =
             sampled_scan::codex_cursor::with_test_state_budget(0, || page(&root, &paths, &cache));
         assert!(
@@ -4517,7 +4457,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let (root, fixture) = tests::fixture();
         let paths = paths(&fixture);
-        let cache = sampled_scan::SharedCache::default();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         page(&root, &paths, &cache);
         let path = Path::new(paths.first().unwrap());
         let stat = fs::metadata(path).unwrap();

@@ -920,17 +920,29 @@ pub(in crate::snapshots) mod tests {
     #[serial_test::serial(source_cadences, source_manifests, client_report)]
     fn compressed_equals_plain_money_oracle() {
         archive_native_placement_preserves_resolved_evidence_and_untagged_remainder();
+        eprintln!("compressed_equals_plain_money_oracle::archive_native_placement_preserves_resolved_evidence_and_untagged_remainder ... ok");
         archive_nonledger_children_resume_through_shared_ownership();
+        eprintln!("compressed_equals_plain_money_oracle::archive_nonledger_children_resume_through_shared_ownership ... ok");
         archive_exact_body_receipt_is_required_for_settlement_and_quiet_restart();
+        eprintln!("compressed_equals_plain_money_oracle::archive_exact_body_receipt_is_required_for_settlement_and_quiet_restart ... ok");
         archive_unstored_body_restarts_from_committable_and_accepts_retry();
+        eprintln!("compressed_equals_plain_money_oracle::archive_unstored_body_restarts_from_committable_and_accepts_retry ... ok");
         archive_debt_preserves_replay_and_plain_reoffers();
+        eprintln!("compressed_equals_plain_money_oracle::archive_debt_preserves_replay_and_plain_reoffers ... ok");
         archive_open_and_receipt_refusals_preserve_plain_work();
+        eprintln!("compressed_equals_plain_money_oracle::archive_open_and_receipt_refusals_preserve_plain_work ... ok");
         archive_marker_compatibility_and_plain_bytes_remain_independent();
+        eprintln!("compressed_equals_plain_money_oracle::archive_marker_compatibility_and_plain_bytes_remain_independent ... ok");
         archive_held_replay_equals_seeded();
+        eprintln!("compressed_equals_plain_money_oracle::archive_held_replay_equals_seeded ... ok");
         archive_nonwitness_custody_survives_partial_and_local_hold();
+        eprintln!("compressed_equals_plain_money_oracle::archive_nonwitness_custody_survives_partial_and_local_hold ... ok");
         archive_context_is_per_marker_before_source_context_promotion();
+        eprintln!("compressed_equals_plain_money_oracle::archive_context_is_per_marker_before_source_context_promotion ... ok");
         archive_over_the_former_file_limit_reaches_opened_identity();
+        eprintln!("compressed_equals_plain_money_oracle::archive_over_the_former_file_limit_reaches_opened_identity ... ok");
         archive_empty_requires_zero_usage_evidence();
+        eprintln!("compressed_equals_plain_money_oracle::archive_empty_requires_zero_usage_evidence ... ok");
     }
 
     fn archive_native_placement_preserves_resolved_evidence_and_untagged_remainder() {

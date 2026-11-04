@@ -17,9 +17,9 @@ fn facts() -> InventoryFacts {
         ),
     }
 }
-fn pair(f: &Fixture, index: &mut ScanIndex) {
+fn pair(index: &mut ScanIndex) -> Result<()> {
     carry_tail(
-        &f.path,
+        index,
         MOVED,
         tail::PathCarry {
             from: FILE.into(),
@@ -28,22 +28,6 @@ fn pair(f: &Fixture, index: &mut ScanIndex) {
             inventory: facts(),
         },
     )
-    .unwrap();
-    let entry = index.files.remove(FILE).unwrap();
-    index.files.insert_shared(MOVED.into(), entry);
-    let entities = index.file_snapshot_fingerprints.remove(FILE).unwrap();
-    index
-        .file_snapshot_fingerprints
-        .insert_shared(MOVED.into(), entities);
-    let incidence = index.accepted_rebuild_incidence.remove(FILE).unwrap();
-    index
-        .accepted_rebuild_incidence
-        .insert(MOVED.into(), incidence);
-    let growth = index.v2_mut().growth_retention.remove(FILE).unwrap();
-    index.v2_mut().growth_retention.insert(MOVED.into(), growth);
-    index.confirmed_empty_files.remove(FILE);
-    index.confirmed_empty_files.insert(MOVED.into());
-    index.scan_residue_witness.as_mut().unwrap().index_keys = BTreeSet::from([MOVED.into()]);
 }
 fn seed(f: &Fixture) -> ScanIndex {
     f.published();
@@ -138,13 +122,14 @@ fn paired_carry_commit_outcomes_are_complete_old_or_complete_new() {
     for published in [false, true] {
         let f = Fixture::new();
         let mut index = seed(&f);
-        pair(&f, &mut index);
         if published {
             kinds::FAIL_DIGEST_PROMOTION.with(|fail| fail.set(true));
         } else {
             with_session_db(&index, |db| sqlite::fence_commit_writing(db, "generation"));
         }
-        assert!(save_with(&f.path, &mut index).is_err());
+        assert!(pair(&mut index).is_err());
+        assert!(index.files.contains_key(FILE));
+        assert!(!index.files.contains_key(MOVED));
         drop(BaselineRelease::new(&f.path, &index));
         let index = load_with(&f.path, false).unwrap().unwrap();
         assert_pair(&index, published);

@@ -30,11 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     traces: Option<Arc<CodexTurnTraceMap>>,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )?;
     let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
@@ -330,7 +325,7 @@ impl GroupBoot {
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member, None, &mut 0) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -714,12 +709,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     match open_candidate_file(SnapshotSource::Codex, member) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
@@ -738,12 +727,6 @@ fn legacy_tee(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
@@ -1183,7 +1166,8 @@ fn open_member(
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.
-        let (bytes, _, read, _) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
+        let (bytes, _, read, _) =
+            read_header_bytes(&member, None, &mut 0).map_err(|_| GroupEnd::Changed)?;
         group.charge = group.charge.saturating_add(read as u64);
         if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
             return Err(GroupEnd::Changed);

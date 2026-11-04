@@ -145,20 +145,9 @@ pub(in crate::snapshots) fn committed_sealed_offset(
     Some(DurableCertificate::take(&mut d).ok()?.sealed_offset)
 }
 
-/// The physical witness already certified by a stored reduction. Old heads
-/// without inventory facts can use it without touching transcript bytes.
-pub(in crate::snapshots) fn certified_content_stamp(
+pub(in crate::snapshots) fn certified_certificate(
     body: &[u8],
-) -> Result<sampled_scan::codex_cursor::ContentStamp, Corrupt> {
-    let certificate = certified_certificate(body)?;
-    Ok(sampled_scan::codex_cursor::ContentStamp::from_parts(
-        certificate.device,
-        certificate.inode,
-        certificate.length,
-        certificate.modified,
-    ))
-}
-fn certified_certificate(body: &[u8]) -> Result<DurableCertificate, Corrupt> {
+) -> Result<DurableCertificate, Corrupt> {
     let mut d = Dec::new(body);
     HeadIdentity::take(&mut d)?;
     DurableCertificate::take(&mut d)

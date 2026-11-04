@@ -256,7 +256,6 @@ enum Entry {
 /// so subset graphs and clones can neither drop nor duplicate it.
 #[derive(Default)]
 pub(super) struct TailStage {
-    carries: BTreeMap<Vec<u8>, PathCarry>,
     files: BTreeMap<Vec<u8>, Entry>,
     debt: BTreeMap<Vec<u8>, Observation>,
     retire: BTreeSet<Vec<u8>>,
@@ -273,45 +272,26 @@ pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) inventory: InventoryFacts,
 }
 impl TailStage {
-    pub(super) fn carry(&mut self, to: &str, carry: PathCarry) -> Result<()> {
+    pub(super) fn carry_observation(&mut self, to: &str, carry: &PathCarry) -> Result<()> {
         let from = carry.from.as_bytes();
         let to = to.as_bytes().to_vec();
         ensure!(
-            !(from == to
-                || self.carries.contains_key(from)
-                || self.carries.contains_key(&to)
-                || self
-                    .carries
-                    .values()
-                    .any(|prior| prior.from.as_bytes() == from)
-                || (self.debt.contains_key(from) && self.debt.contains_key(&to))
-                || self.files.contains_key(from)
-                || self.files.contains_key(&to)
-                || self.retire.contains(from)
-                || self.retire.contains(&to)
-                || self.erase.contains(from)
-                || self.erase.contains(&to)),
+            from != to
+                && [from, to.as_slice()]
+                    .iter()
+                    .all(|key| !self.files.contains_key(*key)
+                        && !self.retire.contains(*key)
+                        && !self.erase.contains(*key)),
             "state_v2_tail_carry_conflict"
         );
-        // Discovery ran before the carry proof and may have staged this name
-        // as a new physical input. Its observation cannot replace the proved
-        // predecessor's logical representation or existing debt/pages.
+        // A provisional discovery observation is superseded by the proven
+        // predecessor, including its logical representation and existing debt.
         self.debt.remove(&to);
-        if let Some(debt) = self.debt.remove(from) {
-            self.debt.insert(to.clone(), debt);
-        }
-        if let Some(debt) = self.debt.get_mut(&to) {
+        if let Some(mut debt) = self.debt.remove(from) {
             debt.inventory = Some(carry.inventory.clone());
+            self.debt.insert(to, debt);
         }
-        self.carries.insert(to, carry);
-        self.report();
         Ok(())
-    }
-    pub(super) fn carries(&self) -> impl Iterator<Item = (&Vec<u8>, &PathCarry)> {
-        self.carries.iter()
-    }
-    pub(super) fn carry_for(&self, key: &str) -> Option<&PathCarry> {
-        self.carries.get(key.as_bytes())
     }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]
@@ -321,14 +301,8 @@ impl TailStage {
             _ => None,
         }
     }
-    /// Graph-free saves cannot publish either half of a staged path carry.
-    pub(super) fn require_graph_free(&self) -> Result<()> {
-        ensure!(self.carries.is_empty(), Hold::ReloadRequired);
-        Ok(())
-    }
     pub(super) fn is_empty(&self) -> bool {
-        self.carries.is_empty()
-            && self.files.is_empty()
+        self.files.is_empty()
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
@@ -350,14 +324,11 @@ impl TailStage {
         let key = key.as_bytes().to_vec();
         // None keeps facts, including facts staged by this pass's ordinary
         // header opener or path carry before its debt observation arrives.
-        observation.inventory = observation
-            .inventory
-            .or_else(|| {
-                self.debt
-                    .get(&key)
-                    .and_then(|prior| prior.inventory.clone())
-            })
-            .or_else(|| self.carries.get(&key).map(|carry| carry.inventory.clone()));
+        observation.inventory = observation.inventory.or_else(|| {
+            self.debt
+                .get(&key)
+                .and_then(|prior| prior.inventory.clone())
+        });
         self.debt.insert(key, observation);
     }
     /// Erasure of the key's whole scope; anything staged for it goes. `true`:
@@ -423,24 +394,14 @@ impl TailStage {
         let debt = self
             .debt
             .values()
-            .fold(0, |sum, observation| sum + observation.bytes())
-            + self
-                .carries
-                .values()
-                .map(|carry| {
-                    carry.head.len() as u64
-                        + carry.from.len() as u64
-                        + carry.inventory.owner.len() as u64
-                        + carry.scan_root.as_os_str().len() as u64
-                })
-                .sum::<u64>();
+            .fold(0, |sum, observation| sum + observation.bytes());
         self.files.values().fold(debt, |sum, entry| match entry {
             Entry::File(file) => sum + file.bytes(),
             Entry::Failed(_) => sum,
         })
     }
     pub(super) fn files(&self) -> usize {
-        self.files.len() + self.debt.len() + self.carries.len()
+        self.files.len() + self.debt.len()
     }
     fn report(&mut self) {
         let bytes = self.bytes();
@@ -1312,7 +1273,7 @@ fn move_row(tx: &mut dyn Transaction, old: &Header, new: RowKey) -> Result<()> {
     tx.delete(&old.key)?;
     Ok(())
 }
-fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<()> {
+pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<()> {
     let from = carry.from.as_bytes();
     let mut head = read_head(tx, from)?.context("state_v2_tail_carry_missing")?;
     ensure!(
@@ -1372,7 +1333,10 @@ fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<(
     tx.delete(&row(HEAD, from, 0)?)?;
     Ok(())
 }
-fn write_closure(tx: &mut dyn Transaction, closure: &[mapper::ClosureRow]) -> Result<()> {
+pub(super) fn write_closure(
+    tx: &mut dyn Transaction,
+    closure: &[mapper::ClosureRow],
+) -> Result<()> {
     for row in closure {
         match &row.value {
             Some(value) => {
@@ -1393,34 +1357,9 @@ pub(super) fn apply(
     removed: &[Vec<u8>],
 ) -> Result<bool> {
     let mut applied = Applied::default();
-    let paired: BTreeSet<Vec<u8>> = stage
-        .into_iter()
-        .flat_map(|stage| stage.carries())
-        .flat_map(|(to, carry)| [to.clone(), carry.from.as_bytes().to_vec()])
-        .collect();
-    if !paired.is_empty() {
-        let stage = stage.expect("paired stage");
-        for (to, carry) in stage.carries() {
-            let mut closure = rows.take_closure(carry.from.as_bytes())?;
-            closure.extend(rows.take_closure(to)?);
-            write_closure(rows.tx()?, &closure)?;
-            move_tail(rows.tx()?, to, carry)?;
-            let staged = match stage.files.get(to) {
-                Some(Entry::File(file)) => Some(file),
-                _ => None,
-            };
-            if staged.is_some() || stage.debt.contains_key(to) {
-                applied.absorb(write_file(rows.tx()?, to, staged, stage.debt.get(to))?);
-            }
-            if let Some(Entry::Failed(cause)) = stage.files.get(to) {
-                mark_set_aside(rows.tx()?, to, *cause)?;
-            }
-        }
-    }
     let keys: BTreeSet<&Vec<u8>> = stage
         .into_iter()
         .flat_map(|stage| stage.files.keys().chain(stage.debt.keys()))
-        .filter(|key| !paired.contains(*key))
         .collect();
     for file in keys {
         let entry = stage.and_then(|stage| stage.files.get(file));
@@ -1468,11 +1407,7 @@ pub(super) fn apply(
     }
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
-    for file in removed
-        .iter()
-        .chain(authorised)
-        .filter(|file| !paired.contains(*file))
-    {
+    for file in removed.iter().chain(authorised) {
         // F4: a head this build cannot read is set aside, never retired.
         let mut kept = false;
         let result = tx.isolated(&mut |tx| {
@@ -1492,11 +1427,7 @@ pub(super) fn apply(
         applied.retired += 1;
     }
     // Scope erasure is not a reset: debt goes too, and nothing vetoes it.
-    for file in stage
-        .into_iter()
-        .flat_map(|stage| &stage.erase)
-        .filter(|file| !paired.contains(*file))
-    {
+    for file in stage.into_iter().flat_map(|stage| &stage.erase) {
         delete_rows(tx, file, false)?;
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
@@ -1515,8 +1446,6 @@ pub(super) fn commit_exit(
     expected: u64,
     stage: &TailStage,
 ) -> Result<()> {
-    // A graph-free exit cannot publish a path move's Tail half.
-    stage.require_graph_free()?;
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
