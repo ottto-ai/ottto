@@ -230,7 +230,7 @@ impl ScanIndex {
             let mut compressed_name = old_path.as_os_str().to_os_string();
             compressed_name.push(".zst");
             let compression = old_path.extension().is_some_and(|ext| ext == "jsonl")
-                && candidate.path == PathBuf::from(compressed_name)
+                && candidate.path.as_os_str() == compressed_name.as_os_str()
                 && old_path.parent() == candidate.path.parent();
             let head = state_v2::load_head(self, &from, revision)?;
             ensure!(!compression || head.is_some(), "codex_carry_certificate");

@@ -277,20 +277,20 @@ impl TailStage {
         let from = carry.from.as_bytes();
         let to = to.as_bytes().to_vec();
         ensure!(
-            from != to
-                && !self.carries.contains_key(from)
-                && !self.carries.contains_key(&to)
-                && !self
+            !(from == to
+                || self.carries.contains_key(from)
+                || self.carries.contains_key(&to)
+                || self
                     .carries
                     .values()
                     .any(|prior| prior.from.as_bytes() == from)
-                && !(self.debt.contains_key(from) && self.debt.contains_key(&to))
-                && !self.files.contains_key(from)
-                && !self.files.contains_key(&to)
-                && !self.retire.contains(from)
-                && !self.retire.contains(&to)
-                && !self.erase.contains(from)
-                && !self.erase.contains(&to),
+                || (self.debt.contains_key(from) && self.debt.contains_key(&to))
+                || self.files.contains_key(from)
+                || self.files.contains_key(&to)
+                || self.retire.contains(from)
+                || self.retire.contains(&to)
+                || self.erase.contains(from)
+                || self.erase.contains(&to)),
             "state_v2_tail_carry_conflict"
         );
         if let Some(debt) = self.debt.remove(from) {
@@ -308,17 +308,6 @@ impl TailStage {
     }
     pub(super) fn carry_for(&self, key: &str) -> Option<&PathCarry> {
         self.carries.get(key.as_bytes())
-    }
-    pub(super) fn inventory(&mut self, key: &str, common: Common, facts: InventoryFacts) {
-        self.debt
-            .entry(key.as_bytes().to_vec())
-            .or_insert_with(|| Observation {
-                representation: common.representation,
-                summary: common.debt,
-                ..Default::default()
-            })
-            .inventory = Some(facts);
-        self.report();
     }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]

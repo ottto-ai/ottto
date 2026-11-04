@@ -122,6 +122,7 @@ impl<R: Read> BoundedDecoder<R> {
         self.input.capacity().saturating_add(self.context.sizeof())
     }
 
+    #[cfg(test)]
     pub(super) fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
     }

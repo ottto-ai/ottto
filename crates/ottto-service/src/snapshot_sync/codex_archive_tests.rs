@@ -43,7 +43,7 @@ impl ScanIndex {
                         "synthetic-machine",
                         items.to_vec(),
                         SnapshotUploadPolicy::default(),
-                        Default::default(),
+                        crate::client_report::ClientReport::empty(),
                     );
                     posts.push(serde_json::to_vec(&request).unwrap());
                     if outcome == "shed" {

@@ -504,6 +504,7 @@ impl HeaderInventory {
     ) -> bool {
         self.step_with_input(metadata, cache.map(Arc::as_ref), cache, None, None)
     }
+    #[cfg(test)]
     pub(super) fn step_cached(
         &mut self,
         metadata: &CodexTitleMetadata,
@@ -706,9 +707,7 @@ impl HeaderInventory {
                 {
                     // Decoder credit is a temporary refusal. Preserve the
                     // exact roster member for the next funded ordinary turn.
-                    if let Some((index, candidate)) =
-                        index.as_deref_mut().zip(retry_candidate.as_ref())
-                    {
+                    if let Some((index, candidate)) = index.zip(retry_candidate.as_ref()) {
                         sampled_scan::codex_cursor::requeue(
                             index,
                             flags.expect("selected inventory flags"),
