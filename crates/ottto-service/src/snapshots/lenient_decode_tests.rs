@@ -2299,31 +2299,14 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
                 serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
             serde_json::to_vec(&value).unwrap()
         }
-        "collision" => {
-            let mut index = fixture();
-            let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-            for (id, signature) in [
-                (key.to_string(), "lower"),
-                (key.to_ascii_uppercase(), "upper"),
-            ] {
-                index.codex_parent_ownership_ledgers.insert(
-                    id,
-                    CodexParentOwnershipLedger {
-                        signatures: vec![signature.to_string()],
-                        ..Default::default()
-                    },
-                );
-            }
-            serde_json::to_vec(&index).unwrap()
-        }
         _ => panic!("unknown synthetic damage"),
     }
 }
 
 #[test]
 fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
-    for previous in ["budget", "syntax", "collision"] {
-        for current in ["budget", "syntax", "collision"] {
+    for previous in ["budget", "syntax"] {
+        for current in ["budget", "syntax"] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
             let path = scratch.join("index.json");
             let previous_bytes = whole_index_damage(previous);
@@ -2384,7 +2367,7 @@ fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
 fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
     let now = SystemTime::now();
     let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    for current in ["budget", "syntax", "collision"] {
+    for current in ["budget", "syntax"] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-load-cooldown-time");
         let path = scratch.join("index.json");
         let bytes = whole_index_damage(current);
@@ -2597,153 +2580,129 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
     let session = item.source_session_id.clone();
     let owner_key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
     let source = SnapshotSource::ClaudeCode;
-    for damage_kind in ["budget", "collision"] {
-        let context = damage_kind.to_string();
-        reset_override_state_for_restart();
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
-        let path = scratch.join("index.json");
-        let support = scratch.join("support");
-        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
-        // The first incident is the pre-existing gated rebuild.
-        fs::write(&path, b"{").unwrap();
-        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    let context = "budget";
+    reset_override_state_for_restart();
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
+    let path = scratch.join("index.json");
+    let support = scratch.join("support");
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+    // The first incident is the pre-existing gated rebuild.
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
 
-        let seed = override_identity_seed(&session);
-        let damage = match damage_kind {
-            "budget" => struct_order_budget_damage(&seed, ""),
-            _ => {
-                let mut seed = seed.clone();
-                let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-                for (id, signature) in [
-                    (key.to_string(), "lower"),
-                    (key.to_ascii_uppercase(), "upper"),
-                ] {
-                    seed.codex_parent_ownership_ledgers.insert(
-                        id,
-                        CodexParentOwnershipLedger {
-                            signatures: vec![signature.to_string()],
-                            ..Default::default()
-                        },
-                    );
-                }
-                serde_json::to_vec(&seed).unwrap()
-            }
-        };
-        fs::write(&path, &damage).unwrap();
-        let error = load().unwrap_err();
-        assert!(
-            error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
-            "{context}: {error:#}"
-        );
-        assert_eq!(fs::read(&path).unwrap(), damage, "{context}");
+    let seed = override_identity_seed(&session);
+    let damage = struct_order_budget_damage(&seed, "");
+    fs::write(&path, &damage).unwrap();
+    let error = load().unwrap_err();
+    assert!(
+        error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+        "{context}: {error:#}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), damage, "{context}");
 
-        assert_eq!(
-            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-            ScanIndexRebuildOverride::Armed
-        );
-        let overrides = scan_index_rebuild_manual_override_count();
-        let before = scan_index_containment_lines_for_test().len();
-        let (rebuilt, origin) = load().unwrap();
-        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{context}");
-        assert!(rebuilt.files.is_empty(), "{context}");
-        assert_eq!(rebuilt.generation, 0, "{context}");
-        assert_identity_carried(&rebuilt, &seed, &context);
-        assert_eq!(scan_index_rebuild_manual_override_count(), overrides + 1);
-        assert!(
-            scan_index_containment_lines_for_test()[before..]
-                .iter()
-                .any(|line| line.contains("override=user_repair")
-                    && line.contains("identity=carried"))
-        );
-        // The damaged bytes are the override witness.
-        let witness = fs::read_dir(scratch.as_ref())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("index.corrupt.override.")
-            })
-            .unwrap();
-        assert_eq!(fs::read(&witness).unwrap(), damage, "{context}");
-        assert!(scan_index_override_stamp_path(&support, source).exists());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    let overrides = scan_index_rebuild_manual_override_count();
+    let before = scan_index_containment_lines_for_test().len();
+    let (rebuilt, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{context}");
+    assert!(rebuilt.files.is_empty(), "{context}");
+    assert_eq!(rebuilt.generation, 0, "{context}");
+    assert_identity_carried(&rebuilt, &seed, context);
+    assert_eq!(scan_index_rebuild_manual_override_count(), overrides + 1);
+    assert!(scan_index_containment_lines_for_test()[before..]
+        .iter()
+        .any(|line| line.contains("override=user_repair") && line.contains("identity=carried")));
+    // The damaged bytes are the override witness.
+    let witness = fs::read_dir(scratch.as_ref())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index.corrupt.override.")
+        })
+        .unwrap();
+    assert_eq!(fs::read(&witness).unwrap(), damage, "{context}");
+    assert!(scan_index_override_stamp_path(&support, source).exists());
 
-        // Post-override failure: the replacement cycle dies before any save.
-        // The next load reads the carried rebuild, still fresh (generation 0,
-        // no files), never an empty identity graph.
-        drop(rebuilt);
-        let (mut reloaded, origin) = load().unwrap();
-        assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{context}");
-        assert_eq!(reloaded.generation, 0, "{context}");
-        assert!(reloaded.files.is_empty(), "{context}");
-        assert!(!scan_index_rebuild_paused(source));
-        assert_identity_carried(&reloaded, &seed, &context);
+    // Post-override failure: the replacement cycle dies before any save.
+    // The next load reads the carried rebuild, still fresh (generation 0,
+    // no files), never an empty identity graph.
+    drop(rebuilt);
+    let (mut reloaded, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{context}");
+    assert_eq!(reloaded.generation, 0, "{context}");
+    assert!(reloaded.files.is_empty(), "{context}");
+    assert!(!scan_index_rebuild_paused(source));
+    assert_identity_carried(&reloaded, &seed, context);
 
-        // Post-override evidence: conflicting exact creator B defers and
-        // never replaces the retained owner A.
-        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
-        let deferred = reloaded.bind_session_accounts(
+    // Post-override evidence: conflicting exact creator B defers and
+    // never replaces the retained owner A.
+    set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
+    let deferred = reloaded.bind_session_accounts(
+        SnapshotSource::ClaudeCode,
+        "machine-a",
+        &mut [item.clone()],
+        &[],
+    );
+    assert!(deferred.contains(&session), "{context}");
+    assert_eq!(
+        reloaded.session_account_bindings[&owner_key].account_identifier_hash,
+        OVERRIDE_OWNER_A
+    );
+
+    // A replacement page records acknowledgements and checkpoints a
+    // partial commit: the carried ones have no file incidence yet and
+    // are kept until a census re-derives it.
+    assert!(reloaded.accepted_incidence_pending_census, "{context}");
+    reloaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    let partial =
+        reloaded.committable_subset(&reloaded.clone(), &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(
+        partial.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+        "{context}"
+    );
+    assert!(partial.accepted_incidence_pending_census, "{context}");
+
+    // A settled upload saves; a stale writer's CAS then fails. A stays.
+    let mut stale = reloaded.clone();
+    reloaded.save(&path).unwrap();
+    assert!(stale.save(&path).is_err(), "{context}");
+    let mut restarted = load().unwrap().0;
+    assert_eq!(restarted.generation, 1, "{context}");
+    assert_identity_carried(&restarted, &seed, context);
+    assert!(restarted
+        .bind_session_accounts(
             SnapshotSource::ClaudeCode,
             "machine-a",
             &mut [item.clone()],
-            &[],
-        );
-        assert!(deferred.contains(&session), "{context}");
-        assert_eq!(
-            reloaded.session_account_bindings[&owner_key].account_identifier_hash,
-            OVERRIDE_OWNER_A
-        );
-
-        // A replacement page records acknowledgements and checkpoints a
-        // partial commit: the carried ones have no file incidence yet and
-        // are kept until a census re-derives it.
-        assert!(reloaded.accepted_incidence_pending_census, "{context}");
-        reloaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-        let partial =
-            reloaded.committable_subset(&reloaded.clone(), &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(
-            partial.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
-            "{context}"
-        );
-        assert!(partial.accepted_incidence_pending_census, "{context}");
-
-        // A settled upload saves; a stale writer's CAS then fails. A stays.
-        let mut stale = reloaded.clone();
-        reloaded.save(&path).unwrap();
-        assert!(stale.save(&path).is_err(), "{context}");
-        let mut restarted = load().unwrap().0;
-        assert_eq!(restarted.generation, 1, "{context}");
-        assert_identity_carried(&restarted, &seed, &context);
-        assert!(restarted
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine-a",
-                &mut [item.clone()],
-                &[]
-            )
-            .contains(&session));
-        assert_eq!(
-            restarted.session_account_bindings[&owner_key].account_identifier_hash,
-            OVERRIDE_OWNER_A
-        );
-        // Only reconstructing each carried file retires its debt; census alone
-        // proves neither reconstruction nor the release of history-held files.
-        assert!(restarted.accepted_incidence_pending_census, "{context}");
-        assert!(
-            !restarted.accepted_rebuild_incidence.is_empty(),
-            "{context}"
-        );
-        assert_eq!(
-            seed.file_snapshot_fingerprints,
-            restarted.accepted_rebuild_incidence
-        );
-        restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-        assert_eq!(
-            restarted.accepted_snapshot_fingerprints,
-            seed.accepted_snapshot_fingerprints
-        );
-    }
+            &[]
+        )
+        .contains(&session));
+    assert_eq!(
+        restarted.session_account_bindings[&owner_key].account_identifier_hash,
+        OVERRIDE_OWNER_A
+    );
+    // Only reconstructing each carried file retires its debt; census alone
+    // proves neither reconstruction nor the release of history-held files.
+    assert!(restarted.accepted_incidence_pending_census, "{context}");
+    assert!(
+        !restarted.accepted_rebuild_incidence.is_empty(),
+        "{context}"
+    );
+    assert_eq!(
+        seed.file_snapshot_fingerprints,
+        restarted.accepted_rebuild_incidence
+    );
+    restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    assert_eq!(
+        restarted.accepted_snapshot_fingerprints,
+        seed.accepted_snapshot_fingerprints
+    );
 }
 
 #[test]
@@ -3745,11 +3704,8 @@ fn repair_identity_carry_keeps_retirement_evidence_with_its_own_decode_policy() 
     }
 }
 
-fn write_repair_collision(path: &Path, value: &mut Value) -> Vec<u8> {
-    let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-    value["codex_parent_ownership_ledgers"] = serde_json::json!({
-        key: {"signatures": ["lower"]}, key.to_ascii_uppercase(): {"signatures": ["upper"]}
-    });
+fn write_repair_budget_damage(path: &Path, value: &mut Value) -> Vec<u8> {
+    value["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
     let bytes = serde_json::to_vec(value).unwrap();
     fs::write(path, &bytes).unwrap();
     bytes
@@ -3831,7 +3787,7 @@ fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fen
             }
             _ => unreachable!(),
         }
-        let bytes = write_repair_collision(&path, &mut value);
+        let bytes = write_repair_budget_damage(&path, &mut value);
         assert!(
             load()
                 .unwrap_err()
