@@ -4,7 +4,7 @@
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
 use super::super::page_bytes;
-use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction, NOW};
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction};
 use super::*;
 use crate::durable_tail_codec::Enc;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;

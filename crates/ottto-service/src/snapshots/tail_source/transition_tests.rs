@@ -827,7 +827,6 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
             apply_codex_line,
             Some(metadata),
             None,
-            None,
         )
         .unwrap()
     };

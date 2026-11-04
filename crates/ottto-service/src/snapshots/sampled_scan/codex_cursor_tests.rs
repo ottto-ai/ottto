@@ -6805,7 +6805,6 @@ struct ProvenanceAdmission {
 
 fn provenance_admission() -> ProvenanceAdmission {
     let fixture = ScanRoot::new(40);
-    let key = local_index_key(&fixture.file(SESSION));
     let cache = Arc::new(SharedCache::default());
     let key = certified_beside_a_retained_copy(&cache);
     let copy = cache
