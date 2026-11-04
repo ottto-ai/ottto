@@ -219,11 +219,8 @@ fn a_conflict_owed_session_reads_native_full() {
         0,
     );
     let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
-    assert_eq!(page["read"]["head_conflict"]["state_missing"]["files"], 1);
-    assert_eq!(
-        page["read"]["head_conflict"]["state_missing"]["native_bytes"],
-        7
-    );
+    assert_eq!(page["read"]["head_conflict"]["files"], 1);
+    assert_eq!(page["read"]["head_conflict"]["native_bytes"], 7);
 }
 
 /// [money] SOURCE (b): stored state incomplete for the file never re-folds.
