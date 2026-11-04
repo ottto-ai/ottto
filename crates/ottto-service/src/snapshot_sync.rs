@@ -794,6 +794,11 @@ pub(crate) mod withheld_support {
         source_erasure_turn().get(&marker).copied().unwrap_or(0)
     }
 
+    /// The block-level ignore reason last logged, `None` after a clean block.
+    pub(crate) fn source_control_block_log_for_test() -> Option<&'static str> {
+        *SOURCE_CONTROL_BLOCK_LOG.lock().unwrap()
+    }
+
     pub(crate) fn settle_withheld(
         previous: &ScanIndex,
         mut index: ScanIndex,
@@ -5059,23 +5064,7 @@ fn sync_once_with_retry(
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
-    let enabled_sources = enabled_snapshot_sources(&device);
-
-    if let Some(source) = enabled_sources.first().copied() {
-        if let Err(error) = upload_local_health_projection_reporting(
-            &client,
-            &device,
-            &device_secret,
-            source,
-            &machine_id,
-            daemon,
-        ) {
-            eprintln!(
-                "local health projection upload skipped: {}",
-                safe_error(&error)
-            );
-        }
-    }
+    let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
 
     // Cycle-start scan receipts: one cheap non-terminal status per enabled
     // source before any scanning. Sources late in the sequential cycle would
@@ -5133,6 +5122,33 @@ fn sync_once_with_retry(
     }
     continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
+}
+
+/// The cycle's heartbeat, then the sources this cycle collects: an OFF its
+/// reply carries stops that source in this same cycle.
+fn cycle_heartbeat(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Vec<SnapshotSource> {
+    if let Some(source) = heartbeat_source(device) {
+        if let Err(error) = upload_local_health_projection_reporting(
+            client,
+            device,
+            device_secret,
+            source,
+            machine_id,
+            daemon,
+        ) {
+            eprintln!(
+                "local health projection upload skipped: {}",
+                safe_error(&error)
+            );
+        }
+    }
+    enabled_snapshot_sources(device)
 }
 
 /// The cycle's API client, with the receipt state and context every cycle uses.
@@ -5520,7 +5536,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
+    let Some(source) = heartbeat_source(&device) else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
     let client = SnapshotApiClient::new(snapshot_api_base_url()?);
@@ -5851,7 +5867,8 @@ fn upload_local_health_projection_with(
         .as_ref()
         .ok_or_else(|| anyhow!("canonical local health projection is missing"))?;
 
-    client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    let reply = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    apply_source_control(&default_support_dir(), &reply);
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
@@ -12461,6 +12478,19 @@ fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
     device.sources.iter().any(|slug| slug == source.api_slug())
 }
 
+/// The heartbeat's relay-token source: the first enabled one, else the first
+/// granted one, so a device with every source paused still hears an ON.
+fn heartbeat_source(device: &LocalDeviceBinding) -> Option<SnapshotSource> {
+    enabled_snapshot_sources(device)
+        .first()
+        .copied()
+        .or_else(|| {
+            SNAPSHOT_SOURCES
+                .into_iter()
+                .find(|source| source_granted(device, *source))
+        })
+}
+
 /// Consecutive resume failures per marker. Held across each resume turn, so a
 /// concurrent control-thread marker change cannot be overwritten by that
 /// turn's completion.
@@ -12492,10 +12522,138 @@ fn write_source_marker(path: &Path, state: &str) -> Result<()> {
     sync_progress_parent(path)
 }
 
-/// Stops collection now and keeps every local file.
+/// Stops collection now and keeps every local file. Claude's legacy relay
+/// closes after the marker is written and the guard is dropped.
 pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    let _turn = source_erasure_turn();
-    write_source_marker(&source_marker_path(support_dir, source), "pending")
+    {
+        let _turn = source_erasure_turn();
+        write_source_marker(&source_marker_path(support_dir, source), "pending")?;
+    }
+    revoke_paused_relay(source);
+    Ok(())
+}
+
+fn revoke_paused_relay(source: SnapshotSource) {
+    if source == SnapshotSource::ClaudeCode {
+        crate::otlp_relay::legacy::revoke_now();
+    }
+}
+
+/// Last per-entry outcome per source, logged on change.
+static SOURCE_CONTROL_LOGS: Mutex<[Option<&str>; 3]> = Mutex::new([None, None, None]);
+/// Last block-level ignore reason (`None` after a clean block), logged on change.
+static SOURCE_CONTROL_BLOCK_LOG: Mutex<Option<&str>> = Mutex::new(None);
+
+fn note_source_control_block(reason: Option<&'static str>) {
+    let mut last = SOURCE_CONTROL_BLOCK_LOG
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if *last != reason {
+        if let Some(reason) = reason {
+            eprintln!("source control ignored reason={reason}");
+        }
+        *last = reason;
+    }
+}
+
+/// Applies the web's per-source OFF/ON from a heartbeat reply. Revisions are
+/// per device and source; each newer one applies once, recorded in
+/// `snapshots/<slug>.source-control` after its marker (a crash between them
+/// re-applies the same revision). A missing or another device's record reads
+/// as enabled revision 0. OFF writes the pause marker. ON writes `reconnect`
+/// (the next cycle drops upload witnesses, then resumes) unless nothing is
+/// paused and it directly follows an applied ON.
+pub(crate) fn apply_source_control(support_dir: &Path, reply: &serde_json::Value) {
+    use serde_json::{json, Value};
+    let block = match reply.get("source_control") {
+        None | Some(Value::Null) => return,
+        Some(block) => block,
+    };
+    let (Some("source_control:v1"), Some(device_id), Some(entries)) = (
+        block.get("contract").and_then(Value::as_str),
+        block.get("device_id").and_then(Value::as_str),
+        block.get("sources").and_then(Value::as_array),
+    ) else {
+        return note_source_control_block(Some("malformed"));
+    };
+    if entries.is_empty() {
+        return note_source_control_block(None);
+    }
+    let mut paused = Vec::new();
+    {
+        // Same order as a promotion that drops a grant: identity, then source.
+        let _binding = crate::control::lock_setup_run_binding();
+        let _turn = source_erasure_turn();
+        let current = ottto_core::FileDeviceStore::default().load().ok().flatten();
+        let Some(current) = current.filter(|d| d.device_id.eq_ignore_ascii_case(device_id)) else {
+            return note_source_control_block(Some("device_mismatch"));
+        };
+        let mut block_reason = None;
+        for entry in entries {
+            let Some(source) = SNAPSHOT_SOURCES.into_iter().find(|source| {
+                entry.get("source").and_then(Value::as_str) == Some(source.api_slug())
+            }) else {
+                block_reason = Some("unknown_source");
+                continue;
+            };
+            let revision = entry
+                .get("revision")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0);
+            let state = entry.get("desired_state").and_then(Value::as_str);
+            let (Some(revision), Some(state @ ("enabled" | "disabled"))) = (revision, state) else {
+                if rejection_log::changed(&SOURCE_CONTROL_LOGS, source, "malformed").is_some() {
+                    eprintln!(
+                        "source control ignored source={} reason=malformed",
+                        source.api_slug()
+                    );
+                }
+                continue;
+            };
+            rejection_log::changed(&SOURCE_CONTROL_LOGS, source, "ok");
+            let marker = source_marker_path(support_dir, source);
+            let record = marker.with_file_name(format!("{}.source-control", source.api_slug()));
+            let (was_enabled, last) = std::fs::read(&record)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|r| {
+                    r["device_id"]
+                        .as_str()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&current.device_id))
+                })
+                .and_then(|r| Some((r["desired_state"] == "enabled", r["revision"].as_u64()?)))
+                .unwrap_or((true, 0));
+            if revision <= last {
+                continue;
+            }
+            let follows_on = was_enabled && revision - 1 == last;
+            let next = match state {
+                "disabled" => Some("pending"),
+                _ if follows_on && source_marker(support_dir, source).is_none() => None,
+                _ => Some("reconnect"),
+            };
+            let body = json!({"device_id": current.device_id, "revision": revision, "desired_state": state});
+            let applied = next
+                .map_or(Ok(()), |next| write_source_marker(&marker, next))
+                .and_then(|()| {
+                    ottto_core::write_owner_only_file_atomic(&record, body.to_string().as_bytes())?;
+                    sync_progress_parent(&record)
+                });
+            if next == Some("pending") {
+                paused.push(source);
+            }
+            match applied {
+                Ok(()) => eprintln!(
+                    "source control applied source={} state={state} revision={revision}",
+                    source.api_slug()
+                ),
+                Err(_) => eprintln!("source control apply failed source={}", source.api_slug()),
+            }
+        }
+        note_source_control_block(block_reason);
+    }
+    // After both guards: the legacy relay's revoke waits on its supervisor.
+    paused.into_iter().for_each(revoke_paused_relay);
 }
 
 /// The explicit way back. A source that was never paused has nothing to resume.
@@ -19492,6 +19650,130 @@ mod tests {
         }
     }
 
+    /// A registered device granted `sources` against a backend whose
+    /// heartbeat replies are `replies`, in order. Holds the env guards.
+    struct SourceControlBackend {
+        root: PathBuf,
+        support_dir: PathBuf,
+        device: LocalDeviceBinding,
+        api_base_url: String,
+        captured: Arc<Mutex<Vec<String>>>,
+        _guards: [EnvVarGuard; 2],
+    }
+
+    fn source_control_backend(
+        sources: &[&str],
+        replies: &[(&str, u64, &str)],
+    ) -> SourceControlBackend {
+        clear_setup_run_refresh_hold();
+        let root = test_dir("source-control-heartbeat");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let guards = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir),
+        ];
+        let replies = replies
+            .iter()
+            .map(|(source, revision, state)| {
+                serde_json::json!({"accepted": true, "source_control": {"contract": "source_control:v1",
+                    "device_id": "device_test", "sources": [{"source": source,
+                    "revision": revision, "desired_state": state}]}})
+            })
+            .collect();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = source_control_heartbeat_server(captured.clone(), replies);
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+        };
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save device");
+        FileConnectionStore::default()
+            .save(&LocalConnectionBinding {
+                setup_run_id: "setup_source_control".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            })
+            .expect("save connection");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+        SourceControlBackend {
+            root,
+            support_dir,
+            device,
+            api_base_url,
+            captured,
+            _guards: guards,
+        }
+    }
+
+    /// [behaviour] The heartbeat lists `source_control:v1` and keeps running
+    /// on a granted source's token while every source is paused, so a web ON
+    /// still arrives: OFF then ON pauses and resumes the source.
+    #[test]
+    #[serial]
+    fn all_sources_paused_heartbeat_still_runs() {
+        let backend = source_control_backend(
+            &["codex"],
+            &[("codex", 1, "disabled"), ("codex", 2, "enabled")],
+        );
+        let codex = SnapshotSource::Codex;
+        let daemon = test_daemon("otm_test");
+        upload_local_health_projection_now(&daemon).expect("heartbeat");
+        assert_eq!(
+            source_marker(&backend.support_dir, codex).as_deref(),
+            Some("pending")
+        );
+        assert!(enabled_snapshot_sources(&backend.device).is_empty());
+        assert_eq!(heartbeat_source(&backend.device), Some(codex));
+        upload_local_health_projection_now(&daemon).expect("heartbeat while all paused");
+        assert_eq!(
+            source_marker(&backend.support_dir, codex).as_deref(),
+            Some("reconnect")
+        );
+        resume_reconnected_sources(&backend.support_dir);
+        assert_eq!(enabled_snapshot_sources(&backend.device), vec![codex]);
+        let requests = backend.captured.lock().expect("captured").clone();
+        let heartbeats = requests
+            .iter()
+            .filter(|request| request.contains("POST /api/v1/apps/health/heartbeat"))
+            .collect::<Vec<_>>();
+        assert_eq!(heartbeats.len(), 2);
+        assert!(heartbeats
+            .iter()
+            .all(|request| request.contains("\"source_control:v1\"")));
+        let _ = std::fs::remove_dir_all(&backend.root);
+    }
+
+    /// [behaviour] An OFF carried by the cycle's own heartbeat stops that
+    /// source in the same cycle; the other one still runs.
+    #[test]
+    #[serial]
+    fn cycle_heartbeat_off_skips_source_same_cycle() {
+        let backend =
+            source_control_backend(&["codex", "claude_code"], &[("codex", 1, "disabled")]);
+        assert_eq!(enabled_snapshot_sources(&backend.device).len(), 2);
+        let sources = cycle_heartbeat(
+            &SnapshotApiClient::new(&backend.api_base_url),
+            &backend.device,
+            "device-secret",
+            "otm_test",
+            &test_daemon("otm_test"),
+        );
+        assert_eq!(sources, vec![SnapshotSource::ClaudeCode]);
+        let _ = std::fs::remove_dir_all(&backend.root);
+    }
+
     #[test]
     #[serial]
     fn local_health_upload_holds_after_rejected_refresh_until_the_binding_changes() {
@@ -21956,6 +22238,38 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write local health response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// Answers relay tokens and projections, and each heartbeat with the
+    /// next of `replies` (then `{}`).
+    fn source_control_heartbeat_server(
+        captured: Arc<Mutex<Vec<String>>>,
+        replies: Vec<serde_json::Value>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind source control backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let request = read_complete_http_request(&mut stream);
+                let body = if request.contains("/relay-token") {
+                    serde_json::json!({"token": "relay-token-codex", "expires_at": "2026-06-01T10:15:00Z"})
+                } else if request.contains("/apps/health/heartbeat") {
+                    replies.next().unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::json!({"ok": true})
+                }
+                .to_string();
+                captured.lock().expect("capture request").push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         format!("http://{address}")
