@@ -52,7 +52,9 @@ fn uploadable(index: &mut ScanIndex, items: &[SnapshotItem]) -> Vec<SnapshotItem
 /// or lost (C4), including after an older store's family proof is dropped
 /// (C5); an unbound session uploads Unknown, the disclosed residual. Families
 /// on two accounts, with a switch or a side call, emit the same bytes as
-/// before, and the candidate roots are unchanged (C7).
+/// before, and the candidate roots are unchanged (C7). A child billed only
+/// outside the subscription keeps its own proved login on the wire; an
+/// unhealthy trace read leaves it Unknown with its money unchanged.
 #[test]
 fn family_stamp_removal_money_table() {
     let (dir, parent, items) = claude_account_family_fixture(false);
@@ -180,6 +182,72 @@ fn family_stamp_removal_money_table() {
         assert_eq!(exact_session_account_hash(&page[0]), None, "{case}");
         assert_eq!(exact_session_account_hash(&page[1]), None, "{case}");
         assert_equivalent(&route(Mode::ColdFull, &items), &route(Mode::Ram, &page));
+    }
+
+    // External billing: the child's own API row (re-signed to B) and its
+    // same-agent trace owner place B; a malformed trace read places nothing.
+    let mut external = owned[1].clone();
+    for row in external.model_usage.iter_mut().chain(
+        external
+            .usage_buckets
+            .iter_mut()
+            .flat_map(|bucket| bucket.model_usage.iter_mut()),
+    ) {
+        row.auth_mode = Some("api_key".into());
+    }
+    external.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &external);
+    let mut own = complete_api_row(&owned_parent, "req_5", 5, 10, 1, 0);
+    own.account_identifier_hash = Some(b.clone());
+    own.fingerprint.clear();
+    own.fingerprint = format!(
+        "sha256:{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&own).unwrap())
+    );
+    let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(owned_parent.clone(), vec![own])]),
+        ..Default::default()
+    };
+    let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(owned_parent.clone(), trace.clone())]),
+        ..Default::default()
+    };
+    let money = |item: &SnapshotItem| {
+        (
+            item.input_tokens,
+            item.output_tokens,
+            item.request_count,
+            item.cost.clone(),
+        )
+    };
+    assert!(external.request_count > 0, "the child has billed requests");
+    for (case, malformed) in [("clean", 0), ("malformed trace", 1)] {
+        trace_report.malformed_lines = malformed;
+        let mut page = vec![external.clone()];
+        let coverage =
+            crate::snapshots::claude_request_accounts::apply(&mut page, &api_report, &trace_report)
+                .coverage;
+        assert_eq!(money(&page[0]), money(&external), "{case}: money kept");
+        assert_eq!(
+            page[0].provenance.collector,
+            crate::snapshots::claude_request_accounts::UNKNOWN,
+            "{case}: never subscription coverage"
+        );
+        let body = route(Mode::ColdFull, &page).snapshots[&page[0].source_session_id].to_string();
+        if malformed == 0 {
+            assert_eq!(
+                coverage,
+                [crate::snapshots::claude_request_accounts::Coverage::UnsupportedDestination]
+            );
+            assert_eq!(exact_session_account_hash(&page[0]), Some(b.clone()));
+            assert!(body.contains(&b), "{case}: own login on the wire");
+        } else {
+            assert_eq!(
+                coverage,
+                [crate::snapshots::claude_request_accounts::Coverage::UnreadableEvidence]
+            );
+            assert_eq!(exact_session_account_hash(&page[0]), None, "{case}");
+            assert!(!body.contains(&b), "{case}: Unknown on the wire");
+        }
     }
     fs::remove_dir_all(dir).unwrap();
     fs::remove_dir_all(owned_dir).unwrap();
