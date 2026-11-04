@@ -234,8 +234,9 @@ fn returning_family_publishes_once_under_its_authority_record() {
     let births = BTreeMap::from([(path.clone(), rfc3339_unix_nanos(at).unwrap())]);
     let source = SnapshotSource::ClaudeCode;
     let roots = [root];
-    let scan = |index, sampled| {
-        E2ScanFixture::default().scan(&roots, &scratch, index, 10, sampled, &births, &[])
+    // One fixture per daemon run: its retained cache is that run's RAM.
+    let scan = |run: &E2ScanFixture, index, sampled| {
+        run.scan(&roots, &scratch, index, 10, sampled, &births, &[])
     };
     let api = Default::default();
     let trace = Default::default();
@@ -258,7 +259,7 @@ fn returning_family_publishes_once_under_its_authority_record() {
     };
     let mut fresh = ScanIndex::default();
     fresh.load_claude_reemission_exclusions(&scratch);
-    let (mut cold_idx, mut cold_scan, _) = scan(fresh, false);
+    let (mut cold_idx, mut cold_scan, _) = scan(&E2ScanFixture::default(), fresh, false);
     let key = local_index_key(&path);
     // The member returns unindexed: the committed index does not keep its
     // held body, and the family's terminal record holds its revision.
@@ -271,7 +272,8 @@ fn returning_family_publishes_once_under_its_authority_record() {
         .clone();
     returned.file_snapshot_fingerprints.remove(&key);
     returned.insert_unproven_terminal_claude_authority_for_test(id, &revision);
-    let (returned, held, modes) = scan(returned, true);
+    let live = E2ScanFixture::default();
+    let (returned, held, modes) = scan(&live, returned, true);
     assert_eq!(modes, (0, 0, 0), "the held member waits for its record");
     assert_eq!(publishes(&held), 0);
     let mut due = returned;
@@ -284,8 +286,9 @@ fn returning_family_publishes_once_under_its_authority_record() {
     let restored = ScanIndex::load(&saved).unwrap();
     let cold = finish(&mut cold_idx, &mut cold_scan);
     let mut routes = Vec::new();
-    for (route, index) in [("RAM", due), ("restore", restored)] {
-        let (mut index, mut read, modes) = scan(index, true);
+    let restarted = E2ScanFixture::default();
+    for (route, run, index) in [("RAM", &live, due), ("restore", &restarted, restored)] {
+        let (mut index, mut read, modes) = scan(run, index, true);
         assert_eq!(modes, (1, 0, 0), "{route}: one read when due");
         let money = finish(&mut index, &mut read);
         assert_eq!(publishes(&read), 1, "{route}: published once");
@@ -293,9 +296,8 @@ fn returning_family_publishes_once_under_its_authority_record() {
             !index.claude_usage_authority_quarantine.contains_key(id),
             "{route}: the record settles"
         );
-        index.save(&saved).unwrap();
-        let (_, quiet, modes) = scan(ScanIndex::load(&saved).unwrap(), true);
-        assert_eq!(modes, (0, 0, 0), "{route}: not read again");
+        let (_, quiet, (full, tail, _)) = scan(run, index, true);
+        assert_eq!((full, tail), (0, 0), "{route}: not read again");
         assert_eq!(publishes(&quiet), 0, "{route}: not published again");
         routes.push(money);
     }
