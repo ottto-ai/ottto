@@ -39280,22 +39280,14 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 /// `usage` entries name their model; summaries run on the session's current
 /// model, which `place_usage` falls back to when `model` is None.
 fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
-        // Copied spend is excluded, but its model remains the context for
-        // owned summary entries that do not repeat a model name.
-        accumulator.set_model(string_at(value, &["model"]));
+    let clock = value.get("timestamp");
+    let timestamp = pi_timestamp_value(clock);
+    if !pi_usage_gate(value, accumulator, &["model"], clock, timestamp.as_deref()) {
         return;
     }
     let Some(usage) = pi_message_usage(value) else {
         return;
     };
-    let timestamp = pi_timestamp_value(value.get("timestamp"));
-    if timestamp.is_none() && value.get("timestamp").is_some() {
-        if !usage.is_zero() {
-            accumulator.note_dropped_usage();
-        }
-        return;
-    }
     let mut selector = accumulator.current_selector.clone();
     selector.merge(pi_selector_from_usage_message(value));
     accumulator.add_usage_with_selector(
@@ -39429,42 +39421,58 @@ fn pi_timestamp_field(value: &Value) -> Option<String> {
         .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
 }
 
-/// One usage record (an assistant `message` or a `message_end`): a fork copy
-/// only sets the model; a valid or absent clock applies the usage; a present
-/// but invalid clock drops positive usage.
+/// The rule every Pi usage line passes first. A fork copy is the parent's
+/// spend: it only leaves its model (at `model_path`) as context. A present but
+/// invalid `clock` drops positive usage. True when the usage applies at
+/// `timestamp` (None when the clock is absent).
+fn pi_usage_gate(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    model_path: &[&str],
+    clock: Option<&Value>,
+    timestamp: Option<&str>,
+) -> bool {
+    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+        accumulator.set_model(string_at(value, model_path));
+        false
+    } else if timestamp.is_none() && clock.is_some() {
+        if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+            accumulator.note_dropped_usage();
+        }
+        false
+    } else {
+        true
+    }
+}
+
+/// One usage record (an assistant `message` or a `message_end`), through the
+/// shared gate, then the dedup ledger.
 fn apply_pi_usage_record(
     value: &Value,
     accumulator: &mut SnapshotAccumulator,
     timestamp: Option<&str>,
     shape: PiUsageRecordShape,
 ) {
-    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
-        accumulator.set_model(string_at(value, &["message", "model"]));
-    } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+    let clock = pi_usage_record_clock(value);
+    if pi_usage_gate(value, accumulator, &["message", "model"], clock, timestamp) {
         apply_pi_usage_line(value, accumulator, timestamp, shape);
-    } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
-        accumulator.note_dropped_usage();
     }
 }
 
 /// A usage record's occurrence clock. Current and transitional Pi records may
 /// carry a later envelope write time at the top level; provider response time
 /// is the usage occurrence clock and is also what historical `message_end`
-/// records use.
-fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
-    let provider_timestamp = value.pointer("/message/timestamp");
-    if provider_timestamp.is_some() {
-        // Present-but-invalid provider evidence is loss. Falling back to the
-        // envelope would silently turn a malformed occurrence clock into a
-        // different, often later, billable hour.
-        pi_timestamp_value(provider_timestamp)
-    } else {
-        pi_timestamp_value(value.get("timestamp"))
-    }
+/// records use. Present-but-invalid provider evidence is loss: falling back
+/// to the envelope would turn a malformed occurrence clock into a different,
+/// often later, billable hour.
+fn pi_usage_record_clock(value: &Value) -> Option<&Value> {
+    value
+        .pointer("/message/timestamp")
+        .or_else(|| value.get("timestamp"))
 }
 
-fn pi_message_timestamp_is_present(value: &Value) -> bool {
-    value.get("timestamp").is_some() || value.pointer("/message/timestamp").is_some()
+fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
+    pi_timestamp_value(pi_usage_record_clock(value))
 }
 
 fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
