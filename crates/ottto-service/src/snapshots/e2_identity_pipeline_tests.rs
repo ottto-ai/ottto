@@ -208,6 +208,8 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] A later-born same-session copy read beside its original counts
+/// the copied history once and tags every row with the one proven login.
 #[test]
 fn e2_pipeline_tags_a_copied_transcript_once() {
     let (dir, root, _) = claude_account_family_fixture(false);
@@ -245,15 +247,17 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let mut index = ScanIndex::default();
     // The first page may meet the twins in either order (disclosed residual).
     e2_page(&dirs, &support, &mut index);
-    // The copy continues on its own (one known writer): the twin family is
-    // re-read together and the copied history is skipped.
+    // The copy continues on its own: the twin family is re-read together,
+    // and its own turn starts on or after the page proof's cutoff
+    // (2026-11-04T00:00:00Z), so the history its original holds is skipped.
     let mut own: serde_json::Value =
         serde_json::from_str(fs::read_to_string(&copy).unwrap().lines().next().unwrap()).unwrap();
     own["requestId"] = json!("req_own");
-    own["version"] = json!("2.1.309");
+    let proof_from = OffsetDateTime::parse("2026-11-04T00:00:00Z", &Rfc3339).unwrap();
     own["timestamp"] = json!(OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .unwrap()
+        .max(proof_from)
         .format(&Rfc3339)
         .unwrap());
     let mut file = fs::OpenOptions::new().append(true).open(&copy).unwrap();

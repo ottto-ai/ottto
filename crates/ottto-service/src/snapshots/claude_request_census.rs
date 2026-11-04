@@ -979,7 +979,7 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(FAMILY_WALK) {
             return None;
         }
-        self.walk_transcript_holders(deadline, |_, member, record| {
+        Self::walk_transcript_holders(self.records(), deadline, |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
                 return;
             };
@@ -995,14 +995,16 @@ impl ClaudeRequestCensus {
         Some(found)
     }
 
-    /// `e2` copy decisions, once per page: every MAIN transcript record (never
-    /// a subagent) holding some of the sorted unique `wanted` hashes, with
-    /// its key, session and the hashes it holds. The caller decides whether
-    /// the record proves anything (current revision, other session, earlier
-    /// birth). The same walk as `family_transcript_holders`, across
-    /// families. None when `deadline` passes: the caller cannot decide.
+    /// `e2` copy decisions, once per folder per page: every MAIN transcript
+    /// record (never a subagent) directly in `folder` (an index key) holding
+    /// some of the sorted unique `wanted` hashes, with its key, session and
+    /// the hashes it holds. The caller decides whether the record proves
+    /// anything (current revision, other session, earlier birth). The same
+    /// walk as `family_transcript_holders`, over the folder's key range only.
+    /// None when `deadline` passes: the caller cannot decide.
     pub(crate) fn main_transcript_holders<'a>(
         &'a self,
+        folder: &str,
         wanted: &[u64],
         deadline: std::time::Instant,
         mut visit: impl FnMut(&'a str, &'a str, &'a ClaudeRequestCensusRecord, &[u64]),
@@ -1014,8 +1016,19 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(MAIN_WALK) {
             return None;
         }
+        let prefix = format!("{folder}{}", std::path::MAIN_SEPARATOR);
+        let children = self
+            .records
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .filter(|(key, record)| {
+                !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR) && !record.is_birth_stub()
+            });
         let mut hits = Vec::new();
-        self.walk_transcript_holders(deadline, |key, member, record| {
+        Self::walk_transcript_holders(children, deadline, |key, member, record| {
             if member.subagent_stem.is_some() {
                 return;
             }
@@ -1027,10 +1040,10 @@ impl ClaudeRequestCensus {
         })
     }
 
-    /// One walk of the transcript records (a borrowed path parse per key).
+    /// One walk of `records` (a borrowed path parse per key).
     /// None when `deadline` passes (checked every 256 records).
     fn walk_transcript_holders<'a>(
-        &'a self,
+        records: impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)>,
         deadline: std::time::Instant,
         mut visit: impl FnMut(
             &'a str,
@@ -1038,7 +1051,7 @@ impl ClaudeRequestCensus {
             &'a ClaudeRequestCensusRecord,
         ),
     ) -> Option<()> {
-        for (position, (key, record)) in self.records().enumerate() {
+        for (position, (key, record)) in records.enumerate() {
             if position % 256 == 255 && std::time::Instant::now() >= deadline {
                 return None;
             }
