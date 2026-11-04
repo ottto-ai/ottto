@@ -194,6 +194,8 @@ pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
+#[cfg(unix)]
+mod shutdown;
 
 process_static!(fn with_claude_identity_over_cap: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]);
 
@@ -1847,6 +1849,13 @@ pub fn log_startup_resources() {
                 .and_then(|value| value.parse::<u64>().ok()),
         }),
     );
+    // The shutdown row is process-wide; a captured unit test only checks startup.
+    #[cfg(test)]
+    if TEST_OUTPUT.with(|output| output.borrow().is_some()) {
+        return;
+    }
+    #[cfg(unix)]
+    shutdown::install();
 }
 
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
@@ -2339,6 +2348,99 @@ mod tests {
         assert!(counts["malloc_large_cache_set"].is_boolean());
         let value = &counts["malloc_large_cache"];
         assert!(value.is_null() || value.is_u64());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "private subprocess shutdown fixture"]
+    fn shutdown_record_fixture() {
+        if std::env::var_os("OTTTO_SHUTDOWN_FIXTURE").is_none() {
+            return;
+        }
+        super::log_startup_resources();
+        println!("shutdown-fixture-ready");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    /// [behaviour] Startup diagnostics install the shutdown row: SIGTERM
+    /// writes exactly one, and the process still dies by SIGTERM.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_writes_one_shutdown_row() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        let now_ms = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_resource_diagnostics::tests::shutdown_record_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OTTTO_SHUTDOWN_FIXTURE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let before = now_ms();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("shutdown-fixture-ready") {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "fixture ended early"
+            );
+        }
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let status = child.wait().unwrap();
+        let after = now_ms();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("local_resources ") && line.contains("\"shutdown\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        // The handler's fixed stack buffer holds the whole row with room for
+        // longer process ids and timestamps.
+        assert!(
+            lines[0].len() < super::shutdown::LINE_BUFFER / 2,
+            "{}",
+            lines[0]
+        );
+        let (_, json) = lines[0]
+            .split_once("ottto-service: local_resources ")
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(row["stage"], "shutdown");
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], child.id());
+        assert_eq!(row["source"], "unknown");
+        assert_eq!(row["counts"], serde_json::json!({}));
+        let observed = row["observation"]["observed_unix_ms"].as_u64().unwrap();
+        assert!(
+            (before..=after).contains(&observed),
+            "{before} {observed} {after}"
+        );
     }
 
     #[test]
