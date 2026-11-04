@@ -201,7 +201,18 @@ def module_name(path: Path) -> str:
     if path.stem in ("mod", "lib", "main"):
         path = path.parent
     # A bare `tests` would match nearly every test; keep its parent.
-    return f"{path.parent.name}::tests" if path.stem == "tests" else path.stem
+    if path.stem == "tests":
+        return f"{path.parent.name}::tests"
+    # A file under a `tests/` module directory of a crate's src tree names a
+    # topic (`snapshots/tests/upload.rs`); keep its owner so a generic topic
+    # stem cannot match other modules' tests.
+    parts = path.parts
+    owners = [i for i, part in enumerate(parts[:-1]) if part == "tests" and "src" in parts[:i]]
+    if owners:
+        cut = owners[-1]
+        owner = [] if parts[cut - 1] == "src" else [parts[cut - 1]]
+        return "::".join([*owner, "tests", *parts[cut + 1:-1], path.stem])
+    return path.stem
 
 
 def oracle_modules(root: Path) -> set[str]:

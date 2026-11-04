@@ -1,0 +1,15 @@
+# path	max_lines
+crates/ottto-service/src/snapshots.rs	67896
+crates/ottto-service/src/snapshots/claude_request_identity.rs	5459
+crates/ottto-service/src/snapshots/claude_request_identity_tests.rs	3928
+crates/ottto-service/src/snapshots/codex_compressed_input.rs	3859
+crates/ottto-service/src/snapshots/codex_file_join.rs	4471
+crates/ottto-service/src/snapshots/lenient_decode.rs	3044
+crates/ottto-service/src/snapshots/lenient_decode_tests.rs	4072
+crates/ottto-service/src/snapshots/line_delivery_tests.rs	4122
+crates/ottto-service/src/snapshots/session_start.rs	3464
+crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs	3168
+crates/ottto-service/src/snapshots/claude_request_money/e2.rs	4658
+crates/ottto-service/src/snapshots/claude_request_money/e2_tests.rs	4580
+crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs	5728
+crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs	9948
