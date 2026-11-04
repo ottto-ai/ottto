@@ -43,7 +43,7 @@ fn revision_value_roundtrips_and_refuses_other_versions() {
     }
 }
 
-fn entry(path: &Path) -> ScanIndexEntry {
+pub(in crate::snapshots) fn entry(path: &Path) -> ScanIndexEntry {
     let live = std::fs::metadata(path).unwrap();
     let mut entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({
         "size_bytes": 1, "modified_unix_seconds": 1,
@@ -62,7 +62,7 @@ fn entry(path: &Path) -> ScanIndexEntry {
 }
 
 /// The file's own matched exact receipt for its stored entry.
-fn accept(source: SnapshotSource, index: &mut ScanIndex, path: &Path) {
+pub(in crate::snapshots) fn accept(source: SnapshotSource, index: &mut ScanIndex, path: &Path) {
     index.activate_file_upload_context(source, CONTEXT.into());
     let entry = index.files.get_mut(&local_index_key(path)).unwrap();
     entry.last_upload_body_witness = Some("body".into());
@@ -132,15 +132,15 @@ fn committed(index: &ScanIndex, path: &Path) -> BTreeMap<u64, Revision> {
 }
 
 /// A published state-v2 store and a transcript root, all three sources alike.
-struct Fixture {
-    index: ScanIndex,
+pub(in crate::snapshots) struct Fixture {
+    pub(in crate::snapshots) index: ScanIndex,
     session: crate::snapshots::StateV2ColdSession,
-    root: PathBuf,
+    pub(in crate::snapshots) root: PathBuf,
     dir: PathBuf,
-    source: SnapshotSource,
+    pub(in crate::snapshots) source: SnapshotSource,
 }
 impl Fixture {
-    fn new(store: Source, name: &str) -> Self {
+    pub(in crate::snapshots) fn new(store: Source, name: &str) -> Self {
         restart();
         let dir = crate::test_scratch::canonical_private_dir(name);
         let root = dir.join("root");
@@ -158,7 +158,7 @@ impl Fixture {
             source: store.snapshot(),
         }
     }
-    fn file(&self, name: &str, bytes: usize) -> PathBuf {
+    pub(in crate::snapshots) fn file(&self, name: &str, bytes: usize) -> PathBuf {
         let path = self.root.join(name);
         std::fs::write(&path, vec![b'x'; bytes]).unwrap();
         path
@@ -171,10 +171,10 @@ impl Fixture {
         )
     }
     /// The walk's observations commit with the next full save; reload them.
-    fn save(&mut self) {
+    pub(in crate::snapshots) fn save(&mut self) {
         self.index = self.session.save_reload(&mut self.index).0;
     }
-    fn close(self) {
+    pub(in crate::snapshots) fn close(self) {
         let Self {
             index,
             session,
@@ -394,4 +394,24 @@ fn authority_terminal_debt_has_its_own_label_until_settled() {
     assert_eq!(row["authority_terminal_files"], 0);
     assert_eq!(row["debt"]["outstanding_files"], 0);
     f.close();
+}
+
+/// [behaviour] The retirement roster exists only for a complete walk begun in this
+/// process with no walk issue (symlink, unreadable, too wide, disappeared, or
+/// no Tail route).
+#[test]
+fn roster_only_for_a_complete_walk_without_issues() {
+    let roster = |started_at: Option<u64>, incomplete: bool, issue: bool| {
+        let mut walk = Walk::EMPTY;
+        walk.started_at = started_at;
+        walk.incomplete = incomplete;
+        walk.issue = issue;
+        walk.listed.insert("k".into(), Some(1));
+        walk.complete_roster()
+            .map(|roster| (roster.started_at_ms, roster.listed.len()))
+    };
+    assert_eq!(roster(Some(5), false, false), Some((5, 1)));
+    assert_eq!(roster(None, false, false), None, "resumed after a restart");
+    assert_eq!(roster(Some(5), true, false), None, "listing error");
+    assert_eq!(roster(Some(5), false, true), None, "walk issue");
 }

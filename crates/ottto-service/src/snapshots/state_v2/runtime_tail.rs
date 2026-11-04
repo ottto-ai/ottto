@@ -1,7 +1,7 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, Disposition, Observation, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
+    Collection, Observation, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
 };
 use super::*;
 
@@ -65,22 +65,6 @@ pub(in crate::snapshots) fn observe_tails(
 ) -> Result<()> {
     with_state(path, |state| {
         state.tail.observe_all(observations);
-        Ok(())
-    })
-}
-/// The caller's authorised final disposition of the file's whole debt: its
-/// revisions go and its marker clears; a head left with no reduction goes too.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Tail debt owner (G7) calls this")
-)]
-pub(in crate::snapshots) fn dispose_tail(
-    path: &Path,
-    key: &str,
-    disposition: Disposition,
-) -> Result<()> {
-    with_state(path, |state| {
-        state.tail.dispose(key, disposition);
         Ok(())
     })
 }
@@ -210,7 +194,7 @@ fn exit_commit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
         .stamp
         .0;
     let _save_window = telemetry::Window::begin("save");
-    with_save_session(path, Some(runtime), expected, true, |state, session, id| {
+    with_save_session(path, Some(runtime), expected, |state, session, id| {
         recovered_write(path, None, &id, session, |session| {
             super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail)?;
             session.stamp = session.db.stamp()?;

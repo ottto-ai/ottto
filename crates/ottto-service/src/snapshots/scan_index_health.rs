@@ -75,8 +75,6 @@ pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
                 | Hold::ReferenceDrift => Reason::ShardUnavailable,
                 Hold::MigrationFailed
                 | Hold::ReloadRequired
-                | Hold::SaveCeiling
-                | Hold::SaveOversize
                 | Hold::SaveFull
                 | Hold::AckCustody => Reason::Retrying,
             });
@@ -183,7 +181,7 @@ pub(crate) fn is_version_refusal(error: &anyhow::Error) -> bool {
 
 pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex, LoadOrigin)>) {
     match loaded {
-        Ok((index, LoadOrigin::Loaded(_))) => {
+        Ok((index, LoadOrigin::Loaded)) => {
             if index.persistence_available() {
                 set(source, Reason::NewerApp, false, 0);
             }

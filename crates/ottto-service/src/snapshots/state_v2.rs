@@ -17,20 +17,15 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
-pub(crate) use runtime::{
-    erase_source, erase_tail_rows, remove_retired_record_dir, retired_record_dir,
-    source_erasure_alarm,
-};
+pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, runtime_path,
-    save_locked, save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
-    visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
+    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
+    idle, load_locked, published, recovery_save_guard, runtime_path, save_locked,
 };
 mod catalogue;
 mod codec;
@@ -54,8 +49,8 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
-    retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
+    erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails, retire_tail,
+    set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
@@ -63,9 +58,8 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
     reason = "the acquisition cutover consumes these staged types"
 )]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
-    NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile,
-    TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, NoUploadRequired,
+    Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
@@ -75,15 +69,11 @@ pub(super) struct IndexState {
     pub(super) persistence_v2: Option<Arc<Runtime>>,
     pub(super) growth_claim_context: Option<Arc<super::sampled_audit::GrowthClaimContext>>,
     pub(super) growth_retention: BTreeMap<String, super::sampled_audit::GrowthRetention>,
-    /// Runtime-only: keys whose growth was revalidated in this graph
-    /// generation. Never persisted, so check-only results write no rows.
-    pub(super) growth_checked: (u64, std::collections::BTreeSet<String>),
 }
 pub(super) static EMPTY_INDEX: IndexState = IndexState {
     persistence_v2: None,
     growth_claim_context: None,
     growth_retention: BTreeMap::new(),
-    growth_checked: (0, std::collections::BTreeSet::new()),
 };
 impl ScanIndex {
     pub(super) fn v2(&self) -> &IndexState {
@@ -93,7 +83,7 @@ impl ScanIndex {
         self.v2.get_or_insert_with(Box::default)
     }
 }
-crate::heap_layout_bound::fields!(IndexState; persistence_v2, growth_claim_context, growth_retention, growth_checked);
+crate::heap_layout_bound::fields!(IndexState; persistence_v2, growth_claim_context, growth_retention);
 
 /// Runtime-only custody carrier. Only the verified v2 load route may install it.
 /// Environment/sentinel state alone must never activate growth retention.
@@ -371,24 +361,23 @@ fn value_target(key: &RowKey) -> u64 {
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
-        // Measured on a copy of a real state store (245,006 values): only these two
-        // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
-        // Bound logical JSON on both admission and decompression, before chunks.
+        // The two whole fields that exceed 1 MiB on real stores share the
+        // value bound, so a large row commits instead of refusing its save.
         RowKey::Record { kind, .. }
             if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
         {
-            16 * 1024 * 1024
+            VALUE_BYTES
         }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
     }
 }
 /// Admission and decode bound, moved together so a row this build commits
-/// also decodes on it: the physical row limit for mutable rows, else the target.
+/// also decodes on it.
 fn value_cap(key: &RowKey) -> u64 {
-    match value_target(key) {
-        MUTABLE_VALUE_BYTES => VALUE_BYTES,
-        target => target,
+    match key {
+        RowKey::Meta(_) => CONTROL_BYTES,
+        _ => VALUE_BYTES,
     }
 }
 fn admit_key(key: &RowKey) -> Result<()> {

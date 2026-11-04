@@ -8,8 +8,24 @@ pub(in crate::snapshots) fn erase_published(path: &Path) {
     // Cleanup also owns deliberately malformed fences; it must not decode them.
     let _owner =
         super::super::super::CheckpointLock::acquire_with_custody(path, false, Some(true)).unwrap();
-    erase_locked(path, None).unwrap();
+    erase_locked(path).unwrap();
     states().lock().unwrap().remove(path);
+}
+
+/// Close the shared session before unlinking all artifacts, and invalidate
+/// clones before releasing CheckpointLock.
+fn erase_locked(path: &Path) -> Result<()> {
+    invalidate_locked(path)?;
+    for (suffix, _, _) in fence::ARTIFACTS {
+        fence::remove_artifact(&fence::sibling(path, suffix))?;
+    }
+    super::super::ack::erase_failed_imports(path)?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    remove_retired_record_dir(&retired_record_dir(path))?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    // Retain the invalidated route's custody latch: erased artifacts must not
+    // let this process resume v1 or re-create v2 without an explicit new lineage.
+    Ok(())
 }
 
 pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
@@ -57,24 +73,12 @@ pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
     view
 }
 
-/// Delete one stored usage-pending row on the session's own connection,
-/// outside a transaction: neither the generation nor the data version moves,
-/// so the session's stamp still matches the graph.
-pub(in crate::snapshots) fn delete_usage_row_in_session(index: &ScanIndex, root: &str) {
-    let key = mapper::key("usage.pending", root, 1).unwrap();
-    with_session_db(index, |db| sqlite::delete_row_for_test(db, &key));
-}
-
-/// Process-lifetime count of refused cold usage-pending loads.
-pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
-    telemetry::latest_for_test("usage_pending_unknown")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0)
-}
-
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
-pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
+pub(in crate::snapshots) fn with_session_db(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut sqlite::Sqlite),
+) {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     let mut guard = runtime.session.lock().unwrap();
     f(&mut guard.as_mut().unwrap().db);
@@ -217,10 +221,10 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let before = fs::read(&f.path).unwrap();
     // An ordinary v1 owner must not prevent uninstall from reaching its
     // established cleanup, and an absent checkpoint lock must stay absent.
-    close_tree(&f.support, false).unwrap();
+    invalidate_tree(&f.support).unwrap();
     assert!(!f.path.with_extension("lock").exists());
     let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
-    close_tree(&f.support, false).unwrap();
+    invalidate_tree(&f.support).unwrap();
     drop(lock);
     with_state(&f.path, |state| {
         assert!(!state.latched);
@@ -234,7 +238,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     assert!(runtime.session.lock().unwrap().is_some());
     let fence = fs::read(&live.path).unwrap();
-    close_tree(&live.support, false).unwrap();
+    invalidate_tree(&live.support).unwrap();
     assert!(runtime.session.lock().unwrap().is_none());
     assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
     assert_eq!(fs::read(&live.path).unwrap(), fence);
@@ -365,6 +369,29 @@ fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindo
         invalid: false,
     }
 }
+/// An `account` window ending on October `day`: one request per member,
+/// tagged with this window's identity revision (64 hex, as decode requires;
+/// accounts are hex letters).
+fn tagged_window(
+    day: u32,
+    account: char,
+    members: &[&str],
+) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    let mut window = account_window(day);
+    window.account_identifier_hash = account.to_string().repeat(64);
+    for (n, member) in members.iter().enumerate() {
+        // Members of one window need distinct 16-hex prefixes.
+        let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
+        let mut requests =
+            crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
+                .unwrap();
+        requests.identity_revision = Some(format!("{account}{day:063x}"));
+        window.members.insert((*member).into(), 1);
+        window.member_requests.insert((*member).into(), requests);
+        window.evidence_request_count += 1;
+    }
+    window
+}
 /// An account window with one member request set. Decode marks a window
 /// without member requests invalid, so a typed fixture stored as valid needs
 /// one to load back canonical.
@@ -391,7 +418,6 @@ fn member_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow
 fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
     use crate::snapshots::{
         ClaudeAccountFamilyPending as Family, ClaudeAccountFamilyPendingWindow as Window,
-        ClaudeAccountRequestSet,
     };
     const A: &str = "/synthetic/family/a.jsonl";
     const B: &str = "/synthetic/family/b.jsonl";
@@ -402,22 +428,8 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             .get_mut("family")
             .unwrap()
     }
-    // One request per member, tagged with this window's identity revision
-    // (64 hex, as decode requires; accounts are hex letters).
     fn window(day: u32, account: char, members: &[&str]) -> Window {
-        let mut window = account_window(day);
-        window.account_identifier_hash = account.to_string().repeat(64);
-        for (n, member) in members.iter().enumerate() {
-            // Members of one window need distinct 16-hex prefixes.
-            let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
-            let mut requests =
-                ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
-            requests.identity_revision = Some(format!("{account}{day:063x}"));
-            window.members.insert((*member).into(), 1);
-            window.member_requests.insert((*member).into(), requests);
-            window.evidence_request_count += 1;
-        }
-        window
+        tagged_window(day, account, members)
     }
     fn roll(index: &mut ScanIndex, day: u32) {
         let family = family(index);
@@ -558,261 +570,6 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             && w.member_requests
                 .values()
                 .all(|r| r.identity_revision.is_some())));
-}
-/// [money] Cold usage pending stores what the resident graph stores: a page
-/// loads only its own families, a sibling subset saves one of them, and the
-/// working graph then loads another, changes its occurrence count, removes a
-/// third and saves itself with no Unknown refusal. Its heads are refreshed by
-/// that save; loading every family and a restart see the explicit rows, and the
-/// running total equals the sum of heads and the fold of the rows (A1).
-#[test]
-fn cold_usage_pending_page_loads_and_sibling_saves_store_the_resident_result() {
-    use crate::snapshots::usage_pending::{tests::family, Families, UsagePending};
-    let total = |families: &Families| UsagePending::from(families.clone()).total_occurrences();
-    let roots =
-        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|r| (*r).into()).collect() };
-    // r1 as the sibling saved it, r2 with one member's occurrences dropped
-    // by the working graph, r3 removed and r4 untouched.
-    let mut expected = Families::from([
-        ("r1".to_owned(), family("w1", 2, false)),
-        ("r2".to_owned(), family("w1", 3, false)),
-        ("r4".to_owned(), family("w1", 2, false)),
-    ]);
-    expected.get_mut("r1").unwrap().invalid = true;
-    expected
-        .get_mut("r2")
-        .unwrap()
-        .member_occurrences
-        .pop_first()
-        .unwrap();
-    let run = |cold: bool| {
-        let f = Fixture::new();
-        let mut pre = ScanIndex::default();
-        for (root, members) in [("r1", 2), ("r2", 3), ("r3", 4), ("r4", 2)] {
-            pre.claude_usage_family_pending
-                .insert(root.into(), family("w1", members, false));
-        }
-        f.import_graph(Some(&pre));
-        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-        let loaded = load_with(&f.path, false).unwrap().unwrap();
-        let stored = materialized(&loaded).claude_usage_family_pending.clone();
-        assert_eq!(*stored, *pre.claude_usage_family_pending);
-        let mut working = if cold { loaded } else { materialized(&loaded) };
-        let usage = &working.claude_usage_family_pending;
-        assert_eq!(usage.cold().is_some(), cold);
-        assert_eq!(usage.total_occurrences(), total(&stored));
-        assert_eq!(
-            usage.roots().collect::<Vec<_>>(),
-            stored.keys().collect::<Vec<_>>()
-        );
-        let committed = working.clone();
-
-        // The page loads r1 alone; r2 stays Unknown, never absent.
-        load_usage(&mut working, &roots(&["r1"])).unwrap();
-        assert_eq!(
-            working.claude_usage_family_pending.family("r2").is_err(),
-            cold
-        );
-        let usage = &mut working.claude_usage_family_pending;
-        usage.family_mut("r1").unwrap().unwrap().invalid = true;
-        let mut subset = working.committable_subset_with_local_holds(
-            &committed,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        assert!(save_with(&f.path, &mut subset).unwrap());
-
-        // The working graph loads r2 after the sibling's save, drops one
-        // member's occurrences from it, removes r3 and saves itself: r1 is
-        // rewritten as the sibling saved it and r4 is kept by its head.
-        working.generation = subset.generation;
-        load_usage(&mut working, &roots(&["r2"])).unwrap();
-        let usage = &mut working.claude_usage_family_pending;
-        let r2 = usage.family_mut("r2").unwrap().unwrap();
-        r2.member_occurrences.pop_first().unwrap();
-        usage.discard("r3");
-        assert!(save_with(&f.path, &mut working).unwrap());
-        assert_eq!(
-            working.claude_usage_family_pending.total_occurrences(),
-            total(&expected)
-        );
-        // The save refreshed the loaded heads: settling returns every loaded
-        // family to its head, and the running total is unchanged.
-        settle_usage(&mut working, &BTreeSet::new());
-        if let Some(cold) = working.claude_usage_family_pending.cold() {
-            assert!(cold.loaded().is_empty());
-        }
-        assert_eq!(
-            working.claude_usage_family_pending.total_occurrences(),
-            total(&expected)
-        );
-
-        // Loading every family sees exactly the saved rows.
-        let every: BTreeSet<String> = working
-            .claude_usage_family_pending
-            .roots()
-            .cloned()
-            .collect();
-        load_usage(&mut working, &every).unwrap();
-        let usage = &working.claude_usage_family_pending;
-        let joined: Families = every
-            .iter()
-            .map(|root| (root.clone(), usage.family(root).unwrap().unwrap().clone()))
-            .collect();
-        assert_eq!(joined, expected);
-        settle_usage(&mut working, &BTreeSet::new());
-        assert_eq!(
-            working.claude_usage_family_pending.family("r4").is_err(),
-            cold
-        );
-
-        // Restart: production reloads this hold-free store cold in both runs.
-        // A1: running total == sum of heads == fold of the stored rows.
-        let reloaded = load_with(&f.path, false).unwrap().unwrap();
-        let usage = &reloaded.claude_usage_family_pending;
-        assert!(usage.cold().is_some());
-        let families = materialized(&reloaded)
-            .claude_usage_family_pending
-            .resident()
-            .unwrap()
-            .clone();
-        let heads: usize = usage.views().map(|(_, view)| view.occurrences()).sum();
-        assert_eq!(usage.total_occurrences(), heads);
-        assert_eq!(heads, total(&families));
-        assert_eq!(families, expected);
-        families
-    };
-    let cold = run(true);
-    assert_eq!(cold, run(false));
-    assert_eq!(cold, expected);
-}
-
-/// [money] A row deleted out of band makes the page's keyed load refuse as a
-/// whole (counted): no family of the page is applied and the deleted family
-/// stays discoverable, Unknown rather than absent.
-#[test]
-fn cold_usage_pending_out_of_band_delete_refuses_the_whole_page() {
-    use crate::snapshots::usage_pending::tests::family;
-    let f = Fixture::new();
-    let mut pre = ScanIndex::default();
-    for root in ["r1", "r2"] {
-        pre.claude_usage_family_pending
-            .insert(root.into(), family("w1", 2, false));
-    }
-    f.import_graph(Some(&pre));
-    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    let mut working = load_with(&f.path, false).unwrap().unwrap();
-    assert!(working.claude_usage_family_pending.cold().is_some());
-    with_session_db(&working, |db| {
-        let key = mapper::key("usage.pending", "r2", 1).unwrap();
-        sqlite::delete_row_elsewhere_for_test(db, &key);
-    });
-    let unknown = || {
-        telemetry::latest_for_test("usage_pending_unknown")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
-    let before = unknown();
-    let page: BTreeSet<String> = ["r1".into(), "r2".into()].into();
-    assert!(load_usage(&mut working, &page).is_err());
-    assert!(unknown() > before);
-    let usage = &working.claude_usage_family_pending;
-    assert!(usage.cold().unwrap().loaded().is_empty());
-    assert!(usage.family("r1").is_err());
-    assert!(usage.contains_key("r2"));
-    assert!(usage.family("r2").is_err());
-}
-/// [format] f6 explicit forget deletes all artifacts, including a retired
-/// record directory, and invalidates stale clones.
-#[test]
-fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
-    use crate::snapshots::scan_index_persistence::Source;
-    for source in [Source::Claude, Source::Codex, Source::Pi] {
-        f6_forget(source);
-    }
-}
-fn f6_forget(source: crate::snapshots::scan_index_persistence::Source) {
-    let mut f = Fixture::new();
-    // This API is binding-scoped (source + namespace dir name), so a shared
-    // literal namespace collides with parallel fixtures: use a unique one.
-    let namespace = {
-        use sha2::Digest;
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(f.support.to_string_lossy().as_bytes())
-        )
-    };
-    let parent = f.path.parent().unwrap().with_file_name(namespace);
-    fs::rename(f.path.parent().unwrap(), &parent).unwrap();
-    f.path = parent.join(super::super::money_test_support::synthetic_file(
-        source, ".json",
-    ));
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    let file = serde_json::from_value(serde_json::json!({
-        "size_bytes": 4, "modified_unix_seconds": 1,
-        "source_file_fingerprint": "a".repeat(64),
-        "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
-    }))
-    .unwrap();
-    index.files.insert("committed".into(), file);
-    save_with(&f.path, &mut index).unwrap();
-    fill_session(&mut index);
-    assert!(save_with(&f.path, &mut index).is_err());
-    let mut retry = load_with(&f.path, false).unwrap().unwrap();
-    save_with(&f.path, &mut retry).unwrap();
-    let mut stale = retry.clone();
-    assert!(fence::sibling(&f.path, ".v2.sqlite.owner").exists());
-    for suffix in [
-        ".v2.sqlite.migration-backup",
-        ".v1-readonly",
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v2-fence.tmp",
-        ".v2-ack-receipt",
-    ] {
-        fs::write(fence::sibling(&f.path, suffix), b"forgotten-path-canary").unwrap();
-    }
-    let shards = fence::sibling(&f.path, ".v1-readonly.shards");
-    fs::create_dir(&shards).unwrap();
-    fs::write(shards.join("payload"), b"forgotten-path-canary").unwrap();
-    let recovery = fence::sibling(&f.path, ".v2-recovery");
-    fs::create_dir(&recovery).unwrap();
-    fs::write(
-        recovery.join("interrupted-member"),
-        b"forgotten-path-canary",
-    )
-    .unwrap();
-    let records = crate::snapshots::state_v2::retired_record_dir(&f.path);
-    fs::create_dir(&records).unwrap();
-    fs::write(records.join("synthetic.rec"), b"restart-record").unwrap();
-    with_session_db(&retry, |db| {
-        db.control("erasure_pending", &retry.generation).unwrap()
-    });
-    crate::snapshots::erase_claude_state_v2_artifacts(&f.support).unwrap();
-    assert!(!records.exists());
-    assert!(!recovery.exists());
-    for suffix in [
-        ".v2.sqlite.migration-backup",
-        "",
-        ".v2.sqlite",
-        ".v2.sqlite-wal",
-        ".v2.sqlite-shm",
-        ".v2.sqlite.owner",
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v1-readonly",
-        ".v1-readonly.shards",
-        ".v2-fence.tmp",
-        ".v2-ack-receipt",
-    ] {
-        assert!(!fence::sibling(&f.path, suffix).exists());
-    }
-    assert!(save_with(&f.path, &mut stale).is_err());
-    assert!(load_with(&f.path, false).is_err());
 }
 /// [format] publication pending pause does not touch v1.
 #[test]
@@ -1085,7 +842,6 @@ mod hydrate_parity {
             s::tests::manifest_index_entry(Some(&"a".repeat(64))),
         );
         index.insert_retry_pending_claude_authority_for_test("family");
-        index.insert_claude_usage_family_pending_for_test("family", "2026-10-30T00:00:00Z");
         index
     }
     fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
@@ -1129,11 +885,12 @@ mod hydrate_parity {
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
-        // A loaded graph's cold usage map does not serialize: compare the
-        // families it stores.
-        let view = match actual.claude_usage_family_pending.cold() {
-            Some(_) => materialized(actual),
-            None => actual.clone(),
+        // A loaded graph's cold account archives do not serialize: compare
+        // the windows it stores.
+        let view = if crate::snapshots::state_v2::money_test_support::has_cold_archive(actual) {
+            materialized(actual)
+        } else {
+            actual.clone()
         };
         assert_eq!(
             serde_json::to_value(&view).unwrap(),
@@ -1160,10 +917,6 @@ mod hydrate_parity {
                 .collect::<Vec<_>>()
         };
         assert_eq!(custody(actual), custody(expected));
-        assert_eq!(
-            actual.codex_parent_proof_parents_live,
-            expected.codex_parent_proof_parents_live
-        );
     }
     fn unix_now() -> u64 {
         SystemTime::now()
@@ -1509,7 +1262,6 @@ mod hydrate_parity {
             ArchivedWindows::Resident(windows) if windows.len() == 2
         ));
         assert!(actual.claude_usage_authority_quarantine.is_empty());
-        assert!(actual.claude_usage_family_pending.is_empty());
     }
     /// [money] original mistyped authority freezes siblings before canonicalization and bound control repairs.
     #[test]
@@ -1578,7 +1330,6 @@ mod hydrate_parity {
             assert_eq!(actual.decode_holds.v2_provenance().1, u64::from(bound));
             if !bound {
                 assert!(actual.claude_usage_family_witnesses.is_empty());
-                assert!(actual.claude_usage_family_pending.is_empty());
                 assert_eq!(
                     actual.files["/synthetic/family.jsonl"].source_file_fingerprint,
                     "source"
@@ -1594,84 +1345,160 @@ pub(super) fn over_row_limit() -> BTreeSet<String> {
     BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
 }
 
-/// [format] value admission reloads the prior generation halves then retries and grows back.
-#[test]
-fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(collection_page_limit(&index, 250), 250);
-    index
-        .file_snapshot_fingerprints
-        .insert("oversize".into(), over_row_limit());
-    let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-    assert_eq!(collection_page_limit(&index, 250), 125);
-    assert!(guard_external(
-        &f.path,
-        index.v2().persistence_v2.as_ref(),
-        index.generation
-    )
-    .is_err());
-    let mut retry = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(retry.generation, G);
-    // Reopen cannot clear a failed-save upload fence.
-    assert!(guard_external(
-        &f.path,
-        retry.v2().persistence_v2.as_ref(),
-        retry.generation
-    )
-    .is_err());
-    // [regress] Local receipt binding must not need the upload fence: the
-    // held pass that retries the save starts here, before collection.
-    assert!(
-        crate::snapshots::ProgressRecovery::for_index(&retry, &f.path)
-            .unwrap()
-            .is_some()
-    );
-    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
-        .unwrap()
-        .unwrap();
-    recovery().unwrap();
-    assert!(save_with(&f.path, &mut retry).unwrap());
-    assert_eq!(retry.generation, G + 1);
-    assert_eq!(collection_page_limit(&retry, 250), 150);
-    guard_external(
-        &f.path,
-        retry.v2().persistence_v2.as_ref(),
-        retry.generation,
-    )
+/// Real-shaped money (usage tokens, accepted proof, file progress) plus one
+/// family whose tagged windows switch account a -> b: a positive money and
+/// placement control for whole-store comparisons.
+fn two_account_graph() -> ScanIndex {
+    const A: &str = "/synthetic/family/a.jsonl";
+    const B: &str = "/synthetic/family/b.jsonl";
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+    ))
     .unwrap();
-    for expected in [175, 200, 225, 250, 250] {
-        save_with(&f.path, &mut retry).unwrap();
-        assert_eq!(collection_page_limit(&retry, 250), expected);
+    let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+    index.generation = 0;
+    for (key, c) in [(A, '1'), (B, '2')] {
+        let fingerprint = c.to_string().repeat(64);
+        let entry = crate::snapshots::tests::manifest_index_entry(Some(&fingerprint));
+        index.files.insert(key.into(), entry);
+        index.accepted_snapshot_fingerprints.insert(fingerprint);
     }
+    index.claude_account_family_pending.insert(
+        "family".into(),
+        crate::snapshots::ClaudeAccountFamilyPending {
+            current: tagged_window(27, 'b', &[A, B]),
+            previous_windows: ArchivedWindows::Resident(vec![
+                tagged_window(25, 'a', &[A]),
+                tagged_window(26, 'a', &[A]),
+            ]),
+            confirmed_absent_members: BTreeSet::new(),
+        },
+    );
+    index
 }
 
-/// [money] page one oversize holds and fences upload ack and publication.
+/// [money] A row over the 64 MiB decode bound refuses only that save, as
+/// DbUnavailable: no page change and no hold, and the failed session reloads
+/// the committed generation before any upload or ACK. With the fault removed
+/// the retried pass commits G+1 with the same money and placement as a run
+/// that never refused. Both runs save a typed traversal past the former
+/// 16 MiB limit and a typed birth store (within its 4 MiB decoder bound) and
+/// reopen them unchanged; an older build's 16 MiB decoder refuses the
+/// widened row rather than reading a narrower value.
 #[test]
-fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(collection_page_limit(&index, 1), 1);
-    index
-        .file_snapshot_fingerprints
-        .insert("oversize".into(), over_row_limit());
-    let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    let current = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(current.generation, G);
-    assert_eq!(collection_page_limit(&current, 1), 1);
-    // This is the production external boundary used before uploads and ACKs.
-    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &current);
+fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
+    let page = |index: &mut ScanIndex| {
+        index.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
+        for n in 0..12_000 {
+            index.claude_money_birth_store.record_observation(
+                &format!("session-{n}"),
+                &format!("/synthetic/birth/{n}.jsonl"),
+                1_000 + i128::from(n),
+            );
+        }
+        index
+            .files
+            .get_mut("/synthetic/family/a.jsonl")
+            .unwrap()
+            .last_snapshot_fingerprint = Some("3".repeat(64));
+    };
+    let run = |fault: bool| {
+        let f = Fixture::new();
+        let progress = br#"{"generation":0}"#;
+        let mut index =
+            super::super::money_test_support::publish(&two_account_graph(), &f.path, progress);
+        assert_eq!(index.generation, G);
+        if fault {
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            page(&mut index);
+            index
+                .file_snapshot_fingerprints
+                .insert("oversize".into(), over_row_limit());
+            telemetry::take_thread_event_for_test("db_unavailable_cause");
+            let error = save_with(&f.path, &mut index).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+            assert_eq!(
+                telemetry::take_thread_event_for_test("db_unavailable_cause").unwrap()["at"],
+                "state_v2_value_admission"
+            );
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            assert_eq!(
+                with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
+                None
+            );
+            // The refused session cannot authorize an upload or ACK.
+            assert!(guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation
+            )
+            .is_err());
+            // Reload through the production route, as publication did.
+            index = ScanIndex::load(&f.path).unwrap();
+            assert_eq!(index.generation, G);
+            assert!(!index.file_snapshot_fingerprints.contains_key("oversize"));
+            guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation,
+            )
+            .unwrap();
+            assert!(
+                crate::snapshots::state_v2_recovery_save_guard(&f.path, &index)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        page(&mut index);
+        assert!(save_with(&f.path, &mut index).unwrap());
+        assert_eq!(index.generation, G + 1);
+        assert_eq!(collection_page_limit(&index, 250), 250);
+        let saved = serde_json::to_vec(&materialized(&index)).unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(reloaded.generation, G + 1);
+        let view = materialized(&reloaded);
+        assert_eq!(serde_json::to_vec(&view).unwrap(), saved);
+        let key = mapper::key("scan_state.traversal", "", 0).unwrap();
+        with_session_db(&reloaded, |db| {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let header = tx.get(&key).unwrap().unwrap();
+            let stored = mapper::bytes(&mut tx, &header).unwrap();
+            let json = codec::expand(&stored, value_cap(&key)).unwrap();
+            assert!(json.len() > 16 * 1024 * 1024);
+            assert_eq!(
+                codec::expand(&stored, 16 * 1024 * 1024)
+                    .unwrap_err()
+                    .to_string(),
+                "state_v2_value_admission"
+            );
+        });
+        view
+    };
+    let clean = run(false);
     assert_eq!(
-        guard().unwrap_err().downcast_ref::<Hold>(),
-        Some(&Hold::SaveOversize)
+        serde_json::to_vec(&run(true)).unwrap(),
+        serde_json::to_vec(&clean).unwrap()
     );
+    // Positive control: two accounts placed and the typed birth store
+    // present. The fixture's usage-pending rows are a retired kind and load
+    // as nothing.
+    let accounts: BTreeSet<_> = clean.claude_account_family_pending["family"]
+        .previous_windows
+        .resident()
+        .iter()
+        .chain([&clean.claude_account_family_pending["family"].current])
+        .map(|w| w.account_identifier_hash.clone())
+        .collect();
+    assert_eq!(accounts.len(), 2);
+    let value = serde_json::to_value(&clean).unwrap();
+    assert!(value.get("claude_usage_family_pending").is_none());
+    let birth = serde_json::to_vec(&clean.claude_money_birth_store).unwrap();
+    assert!((1024 * 1024..4 * 1024 * 1024).contains(&birth.len()));
     assert_eq!(
-        with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
-        Some(Hold::SaveOversize)
+        clean
+            .claude_money_birth_store
+            .observed_birth("session-7", "/synthetic/birth/7.jsonl"),
+        Some(1_007)
     );
 }
 
@@ -1783,7 +1610,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_view = materialized(&committed);
     let committed_generation = current.generation;
     let committed_context = current.historical_replay_generation.clone();
-    current.historical_replay_generation = Some("uncommitted-context".into());
+    assert!(current.prepare_historical_replay("uncommitted-context".into()));
     fill_session(&mut current);
     assert!(save_locked(
         &f.path,
@@ -1821,6 +1648,9 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     );
     assert_eq!(restored.generation, committed_generation);
     assert_eq!(restored.historical_replay_generation, committed_context);
+    let mut replay_again = restored.clone();
+    assert!(replay_again.prepare_historical_replay("uncommitted-context".into()));
+    assert!(!replay_again.prepare_historical_replay("uncommitted-context".into()));
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
 
     let path = seed.files.keys().next().unwrap();

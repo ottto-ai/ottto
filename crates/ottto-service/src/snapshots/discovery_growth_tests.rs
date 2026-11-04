@@ -4,6 +4,7 @@
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::local_resource_diagnostics::capture;
+use crate::snapshot_watcher::ListingTrigger;
 
 const SESSION: &str = "5e551011-0000-4000-8000-00000000d171";
 
@@ -103,7 +104,29 @@ impl Fixture {
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, &[])
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            &[],
+            &mut ListingRequest::default(),
+        )
+    }
+    /// One page over `roots` served with a listing request; returns what
+    /// stays unserved.
+    fn page_requesting(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        index: ScanIndex,
+        mut list_all: ListingRequest,
+    ) -> (ScanIndex, Reads, Vec<Value>, ListingRequest) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let (index, _, reads, rows) =
+            self.page_with(source, roots, index, &now, &[], &mut list_all);
+        (index, reads, rows, list_all)
     }
     fn page_hinted(
         &self,
@@ -112,7 +135,15 @@ impl Fixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, hints)
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            hints,
+            &mut ListingRequest::default(),
+        )
     }
     fn page_at(
         &self,
@@ -120,14 +151,24 @@ impl Fixture {
         index: ScanIndex,
         now: &str,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
-        self.page_with(source, index, now, &[])
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            now,
+            &[],
+            &mut ListingRequest::default(),
+        )
     }
     fn page_with(
         &self,
         source: SnapshotSource,
+        roots: &[PathBuf],
         mut index: ScanIndex,
         now: &str,
         hints: &[PathBuf],
+        list_all: &mut ListingRequest,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             source,
@@ -137,9 +178,9 @@ impl Fixture {
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
-            let mut scan = OwnedSourceScan::new(
+            let mut scan = OwnedSourceScan::new_selecting(
                 source,
-                std::slice::from_ref(&self.root),
+                roots,
                 index,
                 now,
                 7,
@@ -147,6 +188,9 @@ impl Fixture {
                 None,
                 hints,
                 false,
+                list_all,
+                true,
+                &[],
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -354,6 +398,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         token(10)
     );
     fs::write(&f.path, &prefix).unwrap();
+    #[cfg(target_os = "macos")]
+    let original_birth =
+        crate::transcript_acquisition::birth_unix_nanos(&fs::metadata(&f.path).unwrap());
     let (mut index, baseline, _, _) = f.page(source, ScanIndex::default());
     assert_eq!(baseline.snapshots.len(), 1, "real indexed Codex prefix");
     fs::OpenOptions::new()
@@ -362,7 +409,17 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .unwrap()
         .write_all(token(20).as_bytes())
         .unwrap();
-    f.age(91); // age BEFORE binding the completion; no artificial stale witness
+    // Past the 7-day window, inside the 60-day first-read bound used by
+    // the cold Full oracle. Bind after this one backdate for APFS birth clamping.
+    f.age(59);
+    let aged_metadata = fs::metadata(&f.path).unwrap();
+    let aged_modified = aged_metadata.modified().unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(crate::transcript_acquisition::birth_clamped(
+        original_birth,
+        crate::transcript_acquisition::birth_unix_nanos(&aged_metadata),
+        &aged_metadata,
+    ));
     let key = local_index_key(&f.path);
     let mut candidate = candidate_from_traversal_path(
         source,
@@ -440,6 +497,133 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         encoded["files"][&key].get("codex_fragment").is_none(),
         "RAM only"
     );
+    // Main reloads the index every pass (snapshot_sync's per-pass load) and
+    // never serializes the RAM-only fragment custody, so each reloaded pass
+    // re-reads the fragment only: a Tail from the committed prefix, bounded
+    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
+    // The existing repeat counter counts each such pass. These passes run
+    // before the metadata-only change below, as production's re-read sees an
+    // unchanged file: once reloaded, the entry has no fragment record to
+    // adopt a stored ctime against.
+    // Money (main's trailing-line rule): a complete unterminated record is
+    // held back only from the sealed prefix, the head and line delivery, so
+    // the re-read counts it exactly as a cold Full of the same bytes does, and
+    // re-applies it idempotently: the next pass adds no usage.
+    let cold_full = |collected_at: &str| {
+        let mut cold_scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&f.root),
+            ScanIndex::default(),
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            None,
+            &[],
+            false,
+        );
+        loop {
+            match cold_scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => cold_scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut scan,
+                    mut index,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        source,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    finalize_scan_after_policy(source, &mut scan, &mut index);
+                    break (index, scan);
+                }
+            }
+        }
+    };
+    let usage = |items: &[SnapshotItem]| {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    [
+                        item.input_tokens,
+                        item.output_tokens,
+                        item.cache_read_tokens,
+                        item.reasoning_output_tokens,
+                        item.request_count,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let bound = index.clone();
+    let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
+    let mut first_pass = Vec::new();
+    let mut first_scan = None;
+    for pass in 0..2 {
+        let (next, scan, reads, rows) = f.page(source, index);
+        let modes = reads.0.lock().unwrap().0.clone();
+        let repeats = rows
+            .iter()
+            .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
+            .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
+            .collect::<Vec<_>>();
+        let emitted = usage(&scan.snapshots);
+        if pass == 0 {
+            // The first reloaded pass: one ordinary fragment-only Tail. It
+            // counts the complete record and records the full length.
+            assert_eq!(
+                scan.scanned_file_count, 1,
+                "the reloaded pass re-reads the fragment once"
+            );
+            assert_eq!(modes, vec![growth_mode()], "one read, never a Full");
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(
+                    repeats,
+                    vec![(json!(1), Some(fragment_bytes))],
+                    "one fragment-only Tail, byte-bounded to the fragment"
+                );
+            }
+            assert!(
+                !scan.snapshots.is_empty(),
+                "the complete unterminated record counts on the re-read"
+            );
+            assert_eq!(
+                next.files[&key].size_bytes, candidate.size_bytes,
+                "the ordinary re-read records the full length"
+            );
+            first_pass = emitted;
+            first_scan = Some(scan.clone());
+        } else {
+            // Later passes: the file is unchanged since that read, so nothing
+            // is re-read until it changes.
+            assert_eq!(scan.scanned_file_count, 0, "pass {pass}: no re-read");
+            assert!(modes.is_empty(), "pass {pass}: no read: {modes:?}");
+            assert!(repeats.is_empty(), "pass {pass}: no repeat: {repeats:?}");
+            assert!(scan.snapshots.is_empty(), "pass {pass}: no snapshot");
+            for (session, totals) in &emitted {
+                let first = first_pass
+                    .iter()
+                    .find(|(first, _)| first == session)
+                    .map(|(_, first)| first)
+                    .unwrap_or_else(|| panic!("pass {pass}: new usage for {session}"));
+                assert!(
+                    totals.iter().zip(first).all(|(now, first)| now <= first),
+                    "pass {pass}: no snapshot above the first re-read: {totals:?} > {first:?}"
+                );
+            }
+        }
+        if !scan.snapshots.is_empty() {
+            let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
+            sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+                &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
+                &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
+            );
+        }
+        assert!(next.files[&key].has_unverified_source());
+        index = next;
+    }
     // Metadata-only change: the certified prefix still names the observed EOF,
     // so ctime adoption must use that extent, not just the committed prefix.
     use std::os::unix::fs::PermissionsExt;
@@ -451,10 +635,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &mut ScanCensus::default(),
         None,
         7,
-        discovery_retention!(index),
+        discovery_retention!(bound),
     )
     .unwrap();
-    let entry = &index.files[&key];
+    let entry = &bound.files[&key];
     assert_ne!(
         entry.size_bytes, metadata_only.size_bytes,
         "certified prefix"
@@ -477,71 +661,48 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "the adopted trigger keeps known_fragment bound to the sampled fingerprint"
     );
     assert_eq!(
-        index.candidate_decision_with_reason(&metadata_only),
+        bound.candidate_decision_with_reason(&metadata_only),
         (CandidateDecision::Skip, None),
         "metadata alone cannot select TranscriptChanged or another acquisition"
     );
+    // Within one preparation (the index in memory): the bound fragment is
+    // neither growth nor owed growth.
     let metadata = fs::metadata(&f.path).unwrap();
-    for _ in 0..2 {
-        let page = discovery_growth::Page::default();
-        let retention = discovery_retention!(index, &page);
-        retention.observe_stamped_growth(
-            &f.path,
-            metadata.len(),
-            candidate.modified_unix_seconds,
-            codex_fragment::Stamp::metadata(&metadata),
-        );
-        let (_, rows) = capture(|| {
-            assert!(
-                retention.owes_stamped(
-                    source,
-                    &f.path,
-                    metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata)
-                ),
-                "audit still owes it"
-            )
-        });
-        assert!(!rows
-            .iter()
-            .any(|row| row.to_string().contains("\"grown\":1")));
-        assert_eq!(
-            page.counts(&index, now)
-                .discovery_retained_grown_fate
-                .still_retained,
-            0,
-            "known fragment is excluded from growth population"
-        );
-        let (next, scan, reads, rows) = f.page(source, index);
-        assert_eq!(
-            scan.scanned_file_count, 0,
-            "unchanged aged fragment: no acquisition"
-        );
-        assert!(scan.snapshots.is_empty());
-        assert!(reads.0.lock().unwrap().0.is_empty());
+    let page = discovery_growth::Page::default();
+    let retention = discovery_retention!(bound, &page);
+    retention.observe_stamped_growth(
+        &f.path,
+        metadata.len(),
+        candidate.modified_unix_seconds,
+        codex_fragment::Stamp::metadata(&metadata),
+    );
+    let (_, rows) = capture(|| {
         assert!(
-            !rows
-                .iter()
-                .any(|row| row["counts"]["discovery_retained"]["grown"]
-                    .as_u64()
-                    .is_some_and(|n| n != 0)),
-            "no grown events"
-        );
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row["counts"].get("codex_fragment_tail_repeat").is_some()),
-            "retained witness within a preparation: zero repeat counter"
-        );
-        assert!(next.files[&key].has_unverified_source());
-        index = next;
-    }
+            retention.owes_stamped(
+                source,
+                &f.path,
+                metadata.len(),
+                codex_fragment::Stamp::metadata(&metadata)
+            ),
+            "audit still owes it"
+        )
+    });
+    assert!(!rows
+        .iter()
+        .any(|row| row.to_string().contains("\"grown\":1")));
+    assert_eq!(
+        page.counts(&bound, now)
+            .discovery_retained_grown_fate
+            .still_retained,
+        0,
+        "known fragment is excluded from growth population"
+    );
     // Portable completion seam: two ordinary index reloads lose only the RAM
     // witness. A real revalidated Tail plan/native reader consumes the known
     // fragment only. This does not claim a native cache-owner test on Linux.
     for _preparation in 0..2 {
         let reloaded: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            serde_json::from_slice(&serde_json::to_vec(&bound).unwrap()).unwrap();
         let entry = &reloaded.files[&key];
         assert!(entry.codex_fragment.is_none());
         let mut file = File::open(&f.path).unwrap();
@@ -607,7 +768,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         );
     }
     // Missing binding/object changes must not turn a length heuristic into Skip.
-    let mut without = index.clone();
+    let mut without = bound.clone();
     without.files.get_mut(&key).unwrap().codex_fragment = None;
     assert_eq!(
         without.candidate_decision(&candidate),
@@ -619,7 +780,15 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .unwrap()
         .write_all(b"\n")
         .unwrap();
-    f.age(91);
+    // The unterminated read cannot replace the original prefix head. Keep
+    // the backdate that its shared certificate's birth_clamped check admits:
+    // a second age() would move mtime past APFS's already-clamped birth.
+    File::options()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_modified(aged_modified)
+        .unwrap();
     let (caught, scan, reads, rows) = f.page(source, index);
     assert!(
         !rows
@@ -637,45 +806,19 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         "real aged growth has positive grown credit"
     );
     assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
-    assert_eq!(scan.snapshots.len(), 1, "terminated record catches up once");
+    assert!(scan.snapshots.is_empty(), "the newline adds no usage");
     assert_eq!(
         caught.files[&key].size_bytes,
         fs::metadata(&f.path).unwrap().len()
     );
-    // Whole-body equality with a cold ordinary Full, not token-only equality.
-    let mut cold_scan = OwnedSourceScan::new(
-        source,
-        std::slice::from_ref(&f.root),
-        ScanIndex::default(),
-        &scan.snapshots[0].collected_at,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        None,
-        &[],
-        false,
-    );
-    let (cold_index, cold) = loop {
-        match cold_scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => cold_scan = next,
-            OwnedSourceScanStep::Complete {
-                mut scan,
-                mut index,
-                ..
-            } => {
-                apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
-                finalize_scan_after_policy(source, &mut scan, &mut index);
-                break (index, scan);
-            }
-        }
-    };
-    assert_eq!(
-        serde_json::to_value(&scan.snapshots).unwrap(),
-        serde_json::to_value(&cold.snapshots).unwrap(),
-        "catch-up body == cold Full"
-    );
+    // The complete record already counted on the first re-read; its newline
+    // adds no usage. The first re-read's emitted usage equals a cold Full of
+    // the terminated bytes.
+    let emitted = first_scan.expect("the first re-read emitted");
+    let (cold_index, cold) = cold_full(&emitted.snapshots[0].collected_at);
     sampled_scan::transition_fixture::money_oracle::assert_equivalent(
         &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
-        &sampled_scan::transition_fixture::scan_money(source, &caught, &scan),
+        &sampled_scan::transition_fixture::scan_money(source, &caught, &emitted),
     );
     let (_, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");
@@ -817,6 +960,44 @@ fn run_pages(f: &Fixture, source: SnapshotSource, mut index: ScanIndex) -> Run {
     panic!("{source:?}: the re-listing pass must drain within 8 pages");
 }
 
+/// Each indexed file's proven revision; a re-arm clears it.
+fn proven_revisions(index: &ScanIndex) -> BTreeMap<String, String> {
+    index
+        .files
+        .iter()
+        .filter(|(_, entry)| !entry.source_file_fingerprint.is_empty())
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect()
+}
+
+/// Every re-arm a diagnostic row names: a `rearm_cleared{…}` Full cause or a
+/// nonzero `rearmed` count.
+fn rearm_labels(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key.starts_with("rearm_cleared{") {
+                    out.push(key.clone());
+                }
+                let zero = value.is_null()
+                    || value == &json!(false)
+                    || value == &json!(0)
+                    || value["count"] == json!(0);
+                if key == "rearmed" && !zero {
+                    out.push(format!("rearmed {value}"));
+                }
+                rearm_labels(value, out);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rearm_labels(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Census completion and every loss count a page reports.
 fn census(scan: &SourceScanResult) -> Value {
     json!([
@@ -895,41 +1076,154 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         }
 
         // Quiet corpus after a restart: saved index, no retained checkpoint.
-        let mut f = Fixture::new();
-        let mut index = kept_generation(&f, source, true);
-        let path = f.root.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
-        let index = ScanIndex::load(&path).unwrap();
-        f.cache = Arc::new(sampled_scan::SharedCache::default());
-        let opens = all_transcript_opens_for_test();
-        let ((quiet_index, scan, reads, rows), consumed) =
-            sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
-        // The reloaded generation ran its due pass; no first walk replaced it.
-        assert!(!rows.iter().any(|row| {
-            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
-        }));
-        if let Some(traversal) = quiet_index.traversal.as_ref() {
-            assert!(traversal.counts.listing_generations >= 1, "{source:?}");
-        }
-        assert!(scan.snapshots.is_empty(), "{source:?}");
-        assert_eq!(scan.scanned_file_count, 0, "{source:?}");
-        // Zero opens measures zero identity, cheap and other reads.
-        let measured = (all_transcript_opens_for_test() == opens).then_some(0);
-        let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
-            sampled_scan::transition_fixture::Mode::Restart,
-            source,
-            Vec::new(),
-            &[],
-        );
-        quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
-        quiet.io = sampled_scan::transition_fixture::IoBytes {
-            consumed,
-            cheap_checks: measured,
-            anchor_reads: measured,
-            other_reads: measured,
-            ..Default::default()
+        // Claude's store is also restarted as release 0.1.217 left it mid-walk
+        // (pending usage evidence, an owed bit on every file, every family
+        // carried with its files queued for replay, full re-arm progress, the
+        // fence and latch set): the upgrade re-arms and reads nothing either.
+        let legacies: &[bool] = if source == SnapshotSource::ClaudeCode {
+            &[false, true]
+        } else {
+            &[false]
         };
-        sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        for &legacy in legacies {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, true);
+            let path = f.root.join("index.json");
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+            let index = ScanIndex::load(&path).unwrap();
+            let proven = proven_revisions(&index);
+            assert!(!proven.is_empty(), "{source:?}: a proven corpus");
+            let index = if legacy {
+                sampled_scan::transition_fixture::upgrade_from_legacy_store(&index, &path)
+            } else {
+                index
+            };
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let opens = all_transcript_opens_for_test();
+            let ((quiet_index, scan, reads, rows), consumed) =
+                sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+            // The reloaded generation ran its due pass; no first walk replaced it.
+            assert!(!rows.iter().any(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            }));
+            if let Some(traversal) = quiet_index.traversal.as_ref() {
+                assert!(
+                    traversal.counts.listing_generations >= 1,
+                    "{source:?} legacy {legacy}"
+                );
+            }
+            assert!(scan.snapshots.is_empty(), "{source:?} legacy {legacy}");
+            assert_eq!(scan.scanned_file_count, 0, "{source:?} legacy {legacy}");
+            // No file is re-armed: every proven revision survives the load and
+            // the page, no row names a re-arm, and no file reads Full.
+            assert_eq!(
+                proven_revisions(&quiet_index),
+                proven,
+                "{source:?} legacy {legacy}: re-armed a file"
+            );
+            let mut rearms = Vec::new();
+            for row in &rows {
+                rearm_labels(row, &mut rearms);
+            }
+            assert!(rearms.is_empty(), "{source:?} legacy {legacy}: {rearms:?}");
+            assert!(
+                !modes(&reads).iter().any(|mode| mode.starts_with("Full")),
+                "{source:?} legacy {legacy}: a Full read"
+            );
+            // Zero opens measures zero identity, cheap and other reads.
+            let measured = (all_transcript_opens_for_test() == opens).then_some(0);
+            let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
+                sampled_scan::transition_fixture::Mode::Restart,
+                source,
+                Vec::new(),
+                &[],
+            );
+            quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
+            quiet.io = sampled_scan::transition_fixture::IoBytes {
+                consumed,
+                cheap_checks: measured,
+                anchor_reads: measured,
+                other_reads: measured,
+                ..Default::default()
+            };
+            sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        }
+    }
+}
+
+/// [behaviour] A walk that starts in the requesting page serves the request
+/// without a second listing. A listing request lists every root of a kept
+/// generation at once, for every source: the downtime writes are read and no
+/// generation starts. A request while that walk runs neither restarts nor
+/// drops it: it stays unserved for the pass after the walk.
+#[test]
+fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let roots = std::slice::from_ref(&f.root);
+        let mut first = ListingRequest::default();
+        first.record(ListingTrigger::Start);
+        let (index, _, _, unserved) = f.page_requesting(source, roots, ScanIndex::default(), first);
+        assert!(!unserved.requested(), "{source:?}: the new walk serves it");
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .map_or(true, |walk| walk.counts.listing_generations == 0),
+            "{source:?}: no second listing"
+        );
+
+        let index = kept_generation(&f, source, false);
+        append_records(
+            &f.root.join(format!("{GROWN}.jsonl")),
+            &usage_records(source, GROWN, 2, false),
+        );
+        append_records(
+            &f.root.join(format!("{CREATED}.jsonl")),
+            &usage_records(source, CREATED, 1, true),
+        );
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        let mut rescan = ListingRequest::default();
+        rescan.record(ListingTrigger::Rescan);
+        let starting = |row: &&Value| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        };
+        with_test_directory_entries(ROOT_ENTRIES, || {
+            let (index, reads, rows, unserved) = f.page_requesting(source, roots, index, first);
+            assert!(!unserved.requested(), "{source:?}: served at once");
+            let walk = index.traversal.as_ref().unwrap();
+            assert_eq!(walk.counts.listing_generations, 1, "{source:?}");
+            assert!(!walk.pending_directories.is_empty(), "{source:?}");
+            let (mut index, more, more_rows, unserved) =
+                f.page_requesting(source, roots, index, rescan);
+            assert_eq!(unserved, rescan, "{source:?}: kept, the walk not restarted");
+            let mut read = [modes(&reads), modes(&more)].concat();
+            let mut starts = rows.iter().chain(&more_rows).filter(starting).count();
+            // The passes after it drain what the listing queued.
+            for _ in 0..8 {
+                if index.traversal.as_ref().map_or(true, |walk| {
+                    walk.pending_directories.is_empty() && walk.pending_candidates.is_empty()
+                }) {
+                    break;
+                }
+                let (next, _, reads, rows) = f.page(source, index);
+                index = next;
+                read.extend(modes(&reads));
+                starts += rows.iter().filter(starting).count();
+            }
+            read.sort();
+            assert_eq!(read, expected, "{source:?}");
+            assert_eq!(starts, 0, "{source:?}: no new generation");
+        });
     }
 }
 
@@ -970,7 +1264,13 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
             if !hinted {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-                start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
+                start_due_listing_pass(
+                    source,
+                    walked.traversal.as_mut().unwrap(),
+                    &now,
+                    false,
+                    &mut ListingRequest::default(),
+                );
                 advance_bounded_directory_traversal(source, &mut walked, 7, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
@@ -1068,7 +1368,13 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     let traversal = index.traversal.as_mut().unwrap();
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
-    start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
+    start_due_listing_pass(
+        source,
+        traversal,
+        &now.format(&Rfc3339).unwrap(),
+        false,
+        &mut ListingRequest::default(),
+    );
     advance_bounded_directory_traversal(source, index, 7, None);
     assert!(index
         .traversal

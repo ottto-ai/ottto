@@ -2,13 +2,12 @@
 //! No observations or coverage witnesses are added to persistent local state.
 
 use super::{
-    claude_api_evidence_fingerprint_is_valid, claude_snapshot_request_id_hashes,
-    claude_trace_evidence_fingerprint_is_valid, claude_trace_owner_session_id,
-    set_claude_account_hash, snapshot_fingerprint, SnapshotItem, SnapshotSource,
+    claude_snapshot_request_id_hashes, set_claude_account_hash, snapshot_fingerprint, SnapshotItem,
+    SnapshotSource,
 };
 use crate::claude_local_otel::{
-    ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition, ClaudeLocalOtelEvidence,
-    ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence, ClaudeTraceOwnershipLoadReport,
+    ClaudeIdentityDisposition, ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport,
+    ClaudeTraceOwnershipEvidence, ClaudeTraceOwnershipLoadReport,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -369,11 +368,11 @@ fn qualify_mixed(
         || !original
             .account_identifier_hash
             .as_deref()
-            .is_some_and(hash_is_valid)
+            .is_some_and(super::claude_request_identity::hash_is_valid)
         || !original
             .provider_workspace_hash
             .as_deref()
-            .is_some_and(hash_is_valid)
+            .is_some_and(super::claude_request_identity::hash_is_valid)
         || item.model_usage.is_empty()
         || item.usage_buckets.is_empty()
         || item
@@ -415,13 +414,6 @@ fn qualify_mixed(
                         }))
             })
         })
-}
-
-fn hash_is_valid(hash: &str) -> bool {
-    hash.len() == 64
-        && hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub(super) fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
@@ -512,54 +504,14 @@ fn request_accounts<'a>(
             .get(&(root, request.as_str()))
             .and_then(|entry| *entry)
             .ok_or(Coverage::MissingRequests)?;
-        if row.session_id != root
-            || row.capture_revision != "claude_api_request:v2"
-            || row.request_count != 1
-            || !row.account_identity_checked
-            || !claude_api_evidence_fingerprint_is_valid(row)
-        {
-            return Err(Coverage::InvalidAccountEvidence);
-        }
-        let hash = row
-            .account_identifier_hash
-            .as_deref()
+        let hash = super::claude_request_identity::valid_login(row, root)
             .ok_or(Coverage::InvalidAccountEvidence)?;
-        if hash.len() != 64
-            || !hash
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || row.request_identity.as_ref().is_some_and(|identity| {
-                identity.identity_hash_scheme != "provider-sha256:v1"
-                    || identity.account.disposition != ClaudeIdentityDisposition::Complete
-                    || match identity.account.origin {
-                        ClaudeIdentityAttributeOrigin::LogRecord => {
-                            identity.account.log_record_hash.as_deref() != Some(hash)
-                                || identity.account.resource_hash.is_some()
-                        }
-                        ClaudeIdentityAttributeOrigin::Resource => {
-                            identity.account.resource_hash.as_deref() != Some(hash)
-                                || identity.account.log_record_hash.is_some()
-                        }
-                        ClaudeIdentityAttributeOrigin::ResourceAndLogRecord => {
-                            identity.account.resource_hash.as_deref() != Some(hash)
-                                || identity.account.log_record_hash.as_deref() != Some(hash)
-                        }
-                        ClaudeIdentityAttributeOrigin::Missing => true,
-                    }
-            })
-        {
-            return Err(Coverage::InvalidAccountEvidence);
-        }
         accounts.insert(hash);
         let owner = owners
             .get(&(root, request.as_str()))
             .and_then(|entry| *entry)
             .ok_or(Coverage::UnprovedRequestOwner)?;
-        if owner.session_id != root
-            || owner.capture_revision != "claude_llm_request_ownership:v1"
-            || !claude_trace_evidence_fingerprint_is_valid(owner)
-            || claude_trace_owner_session_id(root, &owner.agent_id) != item.source_session_id
-            || owner.client_request_id.is_empty()
+        if super::claude_request_identity::owner_is_foreign(owner, root, &item.source_session_id)
             || owner.client_request_id != row.client_request_id
         {
             return Err(Coverage::UnprovedRequestOwner);

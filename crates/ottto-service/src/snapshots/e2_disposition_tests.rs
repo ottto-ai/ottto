@@ -12,8 +12,8 @@ struct Proven {
     index: ScanIndex,
 }
 
-/// The family proven by today's reported fold (gate off), as on a Mac
-/// before the switch-on.
+/// The family with the witness an older build stored (gate off), as on a Mac
+/// before the switch-on; the fold rebuilds it.
 fn proven_family() -> Proven {
     let (root, parent, mut items) = claude_account_family_fixture(true);
     let mut api_rows = (1..=4)
@@ -46,14 +46,8 @@ fn proven_family() -> Proven {
         ),
         manifest_index_entry(None),
     );
-    apply_claude_reported_usage_with_index(
-        &mut items,
-        &api,
-        &trace,
-        &mut index,
-        true,
-        "2026-08-02T07:10:00Z",
-    );
+    assert!(index.install_stored_claude_family_witness_for_test(&parent, &items, &api, &trace));
+    apply_claude_reported_usage_with_index(&mut items, &api, &trace, &mut index);
     assert!(index.claude_usage_family_witnesses.contains_key(&parent));
     Proven {
         parent,
@@ -74,14 +68,8 @@ fn child_page(
     if !healthy {
         trace.malformed_lines = 1;
     }
-    let disposition = apply_claude_reported_usage_with_index(
-        &mut child,
-        &proven.api,
-        &trace,
-        &mut proven.index,
-        false,
-        "2026-08-02T07:11:00Z",
-    );
+    let disposition =
+        apply_claude_reported_usage_with_index(&mut child, &proven.api, &trace, &mut proven.index);
     (child, disposition)
 }
 

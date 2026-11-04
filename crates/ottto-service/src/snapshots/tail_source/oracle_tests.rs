@@ -62,6 +62,25 @@ fn restart_append_and_skill_labels_match_full() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 300);
     let sealed = len(&path);
+    let mut db_path = route.path.as_os_str().to_owned();
+    db_path.push(".v2.sqlite");
+    let db = rusqlite::Connection::open_with_flags(
+        Path::new(&db_path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let compressed: u64 = db
+        .query_row(
+            "SELECT count(*) FROM records WHERE kind LIKE 'tail.%' AND value_version=3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        compressed > 0,
+        "restart/append fixture must exercise compression"
+    );
+    drop(db);
     route.index = ScanIndex::load(&route.path).unwrap();
     append(&path, 300);
     let cold = full(&route, &path);
@@ -282,9 +301,8 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
 
 /// [money] A late-evidence re-fold whose body is not the ACKed one reads 0
 /// native bytes and is sent as an ordinary update (L02): its body is the
-/// cold Full's whole body, never a rescan claim or a challenge answer,
-/// counted by its reason, and nothing is owed afterwards. An append's body
-/// is not a re-fold.
+/// cold Full's whole body, never a rescan claim or a challenge answer, and
+/// nothing is owed afterwards.
 #[test]
 fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let mut route = route();
@@ -292,10 +310,9 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let (items, bytes) = stored_finish(&route, &path, &key);
     assert_eq!(bytes, 0);
     let count = items.len();
-    let scan = finalize(&mut route, &key, items.clone(), false, Some(REASON));
+    let scan = finalize(&mut route, &key, items, false);
     assert_eq!(scan.snapshots.len(), count, "the re-fold is sent");
     assert_eq!(scan.semantic_noop_count, 0);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
     money_oracle::assert_equivalent(
         &full(&route, &path),
         &emitted(Mode::Restart, &scan.snapshots),
@@ -318,8 +335,4 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
         false,
         false
     ));
-
-    let scan = finalize(&mut route, &key, items, false, None);
-    assert_eq!(scan.snapshots.len(), count);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
 }

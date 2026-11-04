@@ -51,6 +51,8 @@ pub(crate) enum Source {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Field {
     AccountPending,
+    /// A slot whose field is retired: an older file's map is still read and
+    /// validated, and the decoder drops its records.
     UsagePending,
     RequestCensus,
 }

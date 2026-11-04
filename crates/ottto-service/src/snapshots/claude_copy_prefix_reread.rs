@@ -359,7 +359,6 @@ pub(crate) fn prepare(
     collected_at: &str,
     window_days: u64,
 ) -> Result<Vec<PathBuf>> {
-    index.copy_prefix_recovery_scope.clear();
     let path = support.join("snapshots").join(REQUEST);
     if !path.try_exists()? {
         return Ok(Vec::new());
@@ -449,8 +448,6 @@ pub(crate) fn prepare(
         }
         index.copy_prefix_last_accepted_nonce = request.nonce.clone();
     }
-    let accepted =
-        request.nonce.is_some() && request.nonce == index.copy_prefix_last_accepted_nonce;
     let mut pending = Vec::new();
     for m in request.members {
         let key = local_index_key(&m.path);
@@ -465,9 +462,6 @@ pub(crate) fn prepare(
                 .set_money_marks(&key, marks | REOWED);
         }
         if index.effective_upload_body_witness_revision_requires_adoption(&key) {
-            if accepted {
-                index.copy_prefix_recovery_scope.insert(m.path.clone());
-            }
             pending.push(m.path);
         }
     }
@@ -521,7 +515,6 @@ pub(super) fn select(
                 }
                 false
             };
-            index.claude_stale_family_carry.replay.retain(&mut take);
             index
                 .traversal
                 .as_mut()
@@ -567,7 +560,7 @@ pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile, 
         // Re-evaluate every independent reason without revision or mode
         // debt. Sidecar changes, retries and source changes must still parse
         // locally under history holds, as before this scoped mechanism.
-        && index.candidate_decision_with_reason_gated(candidate, now, false, false).0 == CandidateDecision::Skip
+        && index.candidate_decision_with_reason_gated(candidate, now, false).0 == CandidateDecision::Skip
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 // Positive-proof correction of a terminal Claude family authority record:
-// the rebind and its no-grant controls, the all-member fallback, the
-// candidate gate, strict load validation, record-contract compatibility with
+// the persisted all-member grant, the candidate gate, strict load validation, record-contract compatibility with
 // the source-pinned pre-change decoder, partial-checkpoint carriage,
-// complete-healthy absence retirement, no-body completion, the empty map
+// no-body completion, the empty map
 // advance with its restoration seams, the accepted-body no-op, and
 // correction custody. All fixtures are synthetic and
 // content-free. The state-machine section is CONTROLLED: it seeds a granted
@@ -99,28 +98,31 @@ fn apc_terminal_fixture() -> ScanIndex {
             proof_correction: None,
         },
     );
-    index.claude_usage_family_pending.insert(
-        APC_ROOT.to_string(),
-        ClaudeUsageFamilyPending {
-            census_window_end: APC_WINDOW.to_string(),
-            member_request_id_hashes: BTreeMap::new(),
-            member_occurrences: BTreeMap::new(),
-            invalid: false,
-            idless_revision: None,
-            identity_contract: None,
-            contract_unproven: false,
-        },
-    );
     index
         .claude_usage_family_witnesses
         .insert(APC_ROOT.to_string(), witness);
     index
 }
 
-/// What the complete census does with a proven family: the rebind first, then the
-/// retained witness becomes the new proof.
+/// The owed correction an older build persisted for a new proof of the
+/// family: the terminal record declares contract v2, binds to that proof and
+/// owes every recorded member; the retained witness becomes the new proof.
 fn apc_prove(index: &mut ScanIndex, witness: &ClaudeUsageFamilyWitness) {
-    index.rebind_claude_authority_proof(APC_ROOT, witness);
+    let proof = claude_usage_family_witness_fingerprint(witness);
+    let record = index
+        .claude_usage_authority_quarantine
+        .get_mut(APC_ROOT)
+        .unwrap();
+    record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
+    record.proven_witness_fingerprint = proof.clone();
+    record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+        proof_witness_fingerprint: proof,
+        owed_member_ids: record
+            .member_source_file_fingerprints
+            .keys()
+            .cloned()
+            .collect(),
+    });
     index
         .claude_usage_family_witnesses
         .insert(APC_ROOT.to_string(), witness.clone());
@@ -174,14 +176,12 @@ const PARSE_FOR_AUTHORITY: (CandidateDecision, Option<CandidateParseReason>) = (
     Some(CandidateParseReason::AuthorityQuarantine),
 );
 
-/// A genuinely changed complete proof over an exactly bound, bounded
-/// terminal record rebinds it to that proof, declares contract v2, and owes
-/// every recorded member one correction. Count, disposition, deadline and
-/// member revisions are unchanged; owed members bypass the terminal gate.
+/// A persisted grant over a bounded terminal record is a valid v2 record:
+/// every owed member bypasses the terminal gate, and the grant survives a
+/// save and reload.
 #[test]
-fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
+fn a_persisted_grant_owes_every_member_past_the_terminal_gate() {
     let mut index = apc_terminal_fixture();
-    let before = apc_record(&index).clone();
     for slot in 0..2 {
         assert_eq!(
             apc_decision(&index, &apc_candidate(&index, slot)),
@@ -189,35 +189,8 @@ fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
             "the bound terminal record skips an unchanged member"
         );
     }
-    let proof = apc_witness('f');
-    apc_prove(&mut index, &proof);
+    apc_prove(&mut index, &apc_witness('f'));
     let record = apc_record(&index);
-    let digest = claude_usage_family_witness_fingerprint(&proof);
-    assert_eq!(
-        record.contract,
-        CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION
-    );
-    assert_eq!(record.proven_witness_fingerprint, digest);
-    assert_eq!(
-        record.proof_correction,
-        Some(ClaudeAuthorityProofCorrection {
-            proof_witness_fingerprint: digest,
-            owed_member_ids: apc_members().into_iter().collect(),
-        })
-    );
-    assert_eq!(
-        record.failed_reconstruction_count,
-        before.failed_reconstruction_count
-    );
-    assert_eq!(record.disposition, before.disposition);
-    assert_eq!(
-        record.retry_after_unix_seconds,
-        before.retry_after_unix_seconds
-    );
-    assert_eq!(
-        record.member_source_file_fingerprints,
-        before.member_source_file_fingerprints
-    );
     assert!(claude_authority_record_contract_is_valid(record));
     assert!(index.claude_authority_proof_correction_pending());
     for slot in 0..2 {
@@ -230,133 +203,6 @@ fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-grant");
     let loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
     assert_eq!(apc_owed(&loaded), apc_owed(&index));
-}
-
-/// No grant without a genuinely changed proof over an exactly bound terminal
-/// record: the same proof, a RetryPending record, a misbound or malformed
-/// record, a missing record or a missing retained witness change nothing.
-/// (An unhealthy or partial census never reaches the rebind: only a complete healthy
-/// census proves a family. The pipeline tests exercise those censuses.)
-#[test]
-fn rebind_grants_nothing_without_a_changed_proof_over_an_exactly_bound_record() {
-    let changed = apc_witness('f');
-    let unchanged = |mutate: &dyn Fn(&mut ScanIndex), witness: &ClaudeUsageFamilyWitness| {
-        let mut index = apc_terminal_fixture();
-        mutate(&mut index);
-        let before = serde_json::to_vec(&index).unwrap();
-        index.rebind_claude_authority_proof(APC_ROOT, witness);
-        assert_eq!(serde_json::to_vec(&index).unwrap(), before);
-    };
-    unchanged(&|_| {}, &apc_witness('e'));
-    unchanged(
-        &|index| {
-            let record = index
-                .claude_usage_authority_quarantine
-                .get_mut(APC_ROOT)
-                .unwrap();
-            record.failed_reconstruction_count = 1;
-            record.disposition = ClaudeUsageAuthorityQuarantineDisposition::RetryPending;
-        },
-        &changed,
-    );
-    unchanged(
-        &|index| {
-            index
-                .claude_usage_authority_quarantine
-                .get_mut(APC_ROOT)
-                .unwrap()
-                .proven_witness_fingerprint = apc_hex('9');
-        },
-        &changed,
-    );
-    unchanged(
-        &|index| {
-            index
-                .claude_usage_authority_quarantine
-                .get_mut(APC_ROOT)
-                .unwrap()
-                .failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES + 1;
-        },
-        &changed,
-    );
-    unchanged(
-        &|index| {
-            index
-                .claude_usage_authority_quarantine
-                .get_mut(APC_ROOT)
-                .unwrap()
-                .member_source_file_fingerprints
-                .clear();
-        },
-        &changed,
-    );
-    unchanged(
-        &|index| {
-            index.claude_usage_authority_quarantine.remove(APC_ROOT);
-        },
-        &changed,
-    );
-    unchanged(
-        &|index| {
-            index.claude_usage_family_witnesses.remove(APC_ROOT);
-        },
-        &changed,
-    );
-}
-
-/// R5 as implemented: a further changed proof over a pending correction owes
-/// every recorded member again, including one already drained, and resets no
-/// counter or deadline. Repeating that proof grants nothing.
-#[test]
-fn a_new_proof_over_a_pending_correction_owes_every_member_again() {
-    let mut index = apc_terminal_fixture();
-    apc_prove(&mut index, &apc_witness('f'));
-    // The root's exact corrected body settled; only the agent still owes.
-    let [root, agent] = apc_members();
-    index
-        .claude_usage_authority_quarantine
-        .get_mut(APC_ROOT)
-        .unwrap()
-        .proof_correction
-        .as_mut()
-        .unwrap()
-        .owed_member_ids
-        .remove(&root);
-    assert_eq!(apc_owed(&index), Some(BTreeSet::from([agent.clone()])));
-    assert_eq!(
-        apc_decision(&index, &apc_candidate(&index, 0)),
-        (CandidateDecision::Skip, None),
-        "a drained member with its recorded revision keeps the terminal gate"
-    );
-    assert_eq!(
-        apc_decision(&index, &apc_candidate(&index, 1)),
-        PARSE_FOR_AUTHORITY
-    );
-    let before = apc_record(&index).clone();
-    let second = apc_witness('7');
-    apc_prove(&mut index, &second);
-    let record = apc_record(&index);
-    let digest = claude_usage_family_witness_fingerprint(&second);
-    assert_eq!(record.proven_witness_fingerprint, digest);
-    assert_eq!(
-        record.proof_correction,
-        Some(ClaudeAuthorityProofCorrection {
-            proof_witness_fingerprint: digest,
-            owed_member_ids: BTreeSet::from([root, agent]),
-        }),
-        "conservative fallback: every recorded member owes under the new proof"
-    );
-    assert_eq!(
-        record.failed_reconstruction_count,
-        before.failed_reconstruction_count
-    );
-    assert_eq!(
-        record.retry_after_unix_seconds,
-        before.retry_after_unix_seconds
-    );
-    let repeated = serde_json::to_vec(&index).unwrap();
-    apc_prove(&mut index, &second);
-    assert_eq!(serde_json::to_vec(&index).unwrap(), repeated);
 }
 
 /// A changed member revision still parses through the existing path, and a
@@ -406,7 +252,7 @@ fn apc_load_value(scratch: &Path, name: &str, value: &Value) -> (ScanIndex, bool
 /// T5/R7 strict load: the proof, record digest and retained witness are one
 /// binding; owed is non-empty and a subset of the recorded members; contract
 /// v2 exactly when a correction is present, on a terminal record. Every other
-/// shape drops only the authority record and its pending proof state.
+/// shape drops only the authority record.
 #[test]
 fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-load");
@@ -505,10 +351,6 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
         assert_eq!(
             serde_json::to_value(&loaded.files).unwrap(),
             serde_json::to_value(&rearmed).unwrap(),
-            "{name}"
-        );
-        assert!(
-            !loaded.claude_usage_family_pending.contains_key(APC_ROOT),
             "{name}"
         );
         assert!(
@@ -692,64 +534,15 @@ fn partial_checkpoint_subset_keeps_every_unsettled_owed_member() {
     );
 }
 
-/// A complete healthy census retires only grants it disproves: members absent
-/// from the complete family leave the owed set and the recorded members, a
-/// census sharing no recorded member keeps the record, and a family absent
-/// from the census clears its record and pending proof.
-#[test]
-fn complete_census_retires_only_absent_correction_members() {
-    let [root, agent] = apc_members();
-    let mut index = apc_terminal_fixture();
-    apc_prove(&mut index, &apc_witness('f'));
-    index.retire_absent_claude_proof_corrections(&BTreeMap::from([(
-        APC_ROOT.to_string(),
-        BTreeSet::from([root.clone(), agent.clone()]),
-    )]));
-    assert_eq!(
-        apc_owed(&index),
-        Some(BTreeSet::from([root.clone(), agent]))
-    );
-    index.retire_absent_claude_proof_corrections(&BTreeMap::from([(
-        APC_ROOT.to_string(),
-        BTreeSet::from([root.clone()]),
-    )]));
-    assert_eq!(apc_owed(&index), Some(BTreeSet::from([root.clone()])));
-    assert_eq!(
-        apc_record(&index)
-            .member_source_file_fingerprints
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([root])
-    );
-    assert!(claude_authority_record_contract_is_valid(apc_record(
-        &index
-    )));
-    // A present family whose census shares no recorded member is malformed
-    // partial bookkeeping: it stays fail-closed rather than clearing.
-    let kept = serde_json::to_vec(&index).unwrap();
-    index.retire_absent_claude_proof_corrections(&BTreeMap::from([(
-        APC_ROOT.to_string(),
-        BTreeSet::from([format!("{APC_ROOT}_agent-unrecorded")]),
-    )]));
-    assert_eq!(serde_json::to_vec(&index).unwrap(), kept);
-    index.retire_absent_claude_proof_corrections(&BTreeMap::new());
-    assert!(!index
-        .claude_usage_authority_quarantine
-        .contains_key(APC_ROOT));
-    assert!(!index.claude_usage_family_pending.contains_key(APC_ROOT));
-}
-
 // ---------------------------------------------------------------------------
-// Absence retirement, no-body completion, the empty map advance with its
+// No-body completion, the empty map advance with its
 // restoration seams, and the accepted-body no-op as CONTROLLED
 // state-machine tests: the granted record and each page's file facts are
 // seeded, so none of these is a natural pipeline run. Every transition under
 // test is made by production code, in `finish_sync_source` order: a page's
 // parse goes through `ScanIndex::record` and the real finalizer, then the map
-// advance; a terminal page through the real authority apply (its known-empty
-// drain and its absence retirement); a completed page through the current-page
-// no-body drain; a shed through partial-checkpoint selection, which is
+// advance; a completed page, or a later page of a complete census, through
+// the current-page no-body drain; a shed through partial-checkpoint selection, which is
 // `committable_subset` followed by the no-body drain exactly as the locked
 // checkpoint orders them, or through borrowed and consuming held
 // restoration; a restart through a save and a strict reload. The real locked
@@ -854,7 +647,6 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
-        stored_reuse: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -897,157 +689,21 @@ fn apc_empty_page(
     scan
 }
 
-/// The authority apply of a page with no family snapshot, as on the terminal
-/// page of a generation whose family sits on earlier pages.
-fn apc_apply(index: &mut ScanIndex, census_complete: bool, healthy: bool) {
-    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-        evidence: BTreeMap::new(),
-        health: crate::claude_local_otel::ClaudeLocalOtelLoadHealth {
-            malformed_lines: u64::from(!healthy),
-            ..Default::default()
-        },
-    };
-    let mut page: Vec<SnapshotItem> = Vec::new();
-    let _ = apply_claude_reported_usage_with_index_and_limits(
-        &mut page,
-        &api,
-        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-        index,
-        census_complete,
-        APC_WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-    );
+/// A later page that parses no family member: its no-body drain settles the
+/// saved empty pairs only when the census is complete.
+fn apc_later_page(index: &mut ScanIndex, census_complete: bool) {
+    index.settle_empty_claude_proof_corrections(&apc_scan(census_complete, Vec::new()));
 }
 
 fn apc_quarantine_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_usage_authority_quarantine).unwrap()
 }
 
-/// Absence retirement. A member absent from a complete
-/// healthy census leaves the owed set and the member map and nothing else
-/// changes; an incomplete or unhealthy census proves no absence. A shed
-/// terminal page's checkpoint selection carries the retirement, and it
-/// survives restart while the present member still owes.
-#[test]
-fn m1_only_a_complete_healthy_absence_retires_the_absent_members_grant() {
-    let [root, _] = apc_members();
-    let [_, agent_key] = apc_keys();
-    let committed = apc_granted();
-    // The agent transcript vanished: the census no longer indexes it. Its
-    // accepted body, entity and activity remain as debt for existing paths.
-    let mut absent = committed.clone();
-    absent.files.remove(&agent_key);
-    for (complete, healthy) in [(false, true), (true, false), (false, false)] {
-        let mut index = absent.clone();
-        apc_apply(&mut index, complete, healthy);
-        assert_eq!(
-            apc_quarantine_bytes(&index),
-            apc_quarantine_bytes(&absent),
-            "complete={complete} healthy={healthy}: no absence is proved"
-        );
-    }
-    let mut index = absent.clone();
-    apc_apply(&mut index, true, true);
-    assert_eq!(apc_owed(&index), Some(BTreeSet::from([root.clone()])));
-    assert_eq!(
-        apc_map(&index).into_keys().collect::<BTreeSet<_>>(),
-        BTreeSet::from([root.clone()])
-    );
-    assert_eq!(apc_map(&index)[&root], apc_map(&committed)[&root]);
-    assert_eq!(apc_frame(&index), apc_frame(&committed));
-    assert_eq!(apc_debts(&index), apc_debts(&committed));
-    assert!(index.claude_usage_family_pending.contains_key(APC_ROOT));
-
-    // Shed on the terminal page: the checkpoint selects the retired record and
-    // keeps the committed prior entity of the absent member.
-    let scan = apc_scan(true, Vec::new());
-    let mut subset = index.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
-    subset.settle_empty_claude_proof_corrections(&scan);
-    assert_eq!(apc_quarantine_bytes(&subset), apc_quarantine_bytes(&index));
-    assert_eq!(
-        subset.file_snapshot_fingerprints.get(&agent_key),
-        committed.file_snapshot_fingerprints.get(&agent_key)
-    );
-    let scratch = crate::test_scratch::ScratchDir::new("proof-correction-m1");
-    let loaded = apc_save_reload(&mut subset, &scratch.join("index.json"));
-    assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([root])));
-    assert_eq!(
-        apc_decision(&loaded, &apc_candidate(&loaded, 0)),
-        PARSE_FOR_AUTHORITY,
-        "the present member still owes after restart"
-    );
-}
-
-/// Absence-retirement edges. An absent member that reappears
-/// is an ordinary new file and revives no grant. A family the complete census
-/// no longer contains clears its record by the existing vanish rule, exactly
-/// as it clears an old-contract record, whatever the report health, and the
-/// saved index reloads without a rebuild. A family whose root transcript
-/// vanished is not a complete family, so the same existing rule applies.
-#[test]
-fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
-    let [root, agent] = apc_members();
-    let [root_key, agent_key] = apc_keys();
-    let mut index = apc_granted();
-    let entry = index.files.remove(&agent_key).unwrap();
-    apc_apply(&mut index, true, true);
-    assert_eq!(apc_owed(&index), Some(BTreeSet::from([root.clone()])));
-    let mut reappeared = test_candidate(PathBuf::from(&agent_key));
-    reappeared.size_bytes = entry.size_bytes;
-    reappeared.modified_unix_seconds = entry.modified_unix_seconds;
-    reappeared.source_file_fingerprint = entry.source_file_fingerprint.clone();
-    assert_eq!(
-        apc_decision(&index, &reappeared),
-        (
-            CandidateDecision::Parse,
-            Some(CandidateParseReason::NewFile)
-        ),
-        "a reappearing member takes the ordinary new-file path"
-    );
-    assert!(!apc_map(&index).contains_key(&agent));
-    assert_eq!(apc_owed(&index), Some(BTreeSet::from([root])));
-
-    let scratch = crate::test_scratch::ScratchDir::new("proof-correction-vanish");
-    for (case, vanished) in [
-        ("whole-family", vec![root_key.clone(), agent_key.clone()]),
-        ("root-transcript", vec![root_key.clone()]),
-    ] {
-        for healthy in [true, false] {
-            for (contract, fixture) in [("v1", apc_terminal_fixture()), ("v2", apc_granted())] {
-                let label = format!("{case} healthy={healthy} {contract}");
-                let mut index = fixture;
-                for key in &vanished {
-                    index.files.remove(key);
-                }
-                apc_apply(&mut index, true, healthy);
-                assert!(
-                    !index
-                        .claude_usage_authority_quarantine
-                        .contains_key(APC_ROOT),
-                    "{label}: the existing vanish rule clears the record"
-                );
-                assert!(!index.claude_usage_family_pending.contains_key(APC_ROOT));
-                let path = scratch.join(format!("{case}-{healthy}-{contract}.json"));
-                index.save(&path).unwrap();
-                let loaded = ScanIndex::load(&path).unwrap();
-                assert!(path.exists(), "{label}: the saved index reloads intact");
-                assert_eq!(
-                    serde_json::to_vec(&loaded).unwrap(),
-                    serde_json::to_vec(&index).unwrap(),
-                    "{label}"
-                );
-            }
-        }
-    }
-}
-
 /// No-body completion. A member whose current recorded revision
 /// parses complete, valid and empty drains as a no-body completion only when
 /// the census is complete, offering nothing to upload; only the correction
-/// changes. At an incomplete census the paired facts persist, and the next
-/// complete healthy census drains them at its authority apply after restart.
+/// changes. At an incomplete census the paired facts persist, and a later page
+/// of a complete census drains them after restart.
 #[test]
 fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_census() {
     let [root, agent] = apc_members();
@@ -1074,7 +730,7 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
         assert_eq!(apc_owed(&index), Some(expected), "complete={complete}");
         let mut loaded = apc_save_reload(&mut index, &scratch.join(format!("{complete}.json")));
         if !complete {
-            apc_apply(&mut loaded, true, true);
+            apc_later_page(&mut loaded, true);
             assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([agent.clone()])));
             assert_eq!(apc_frame(&loaded), frame);
             assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
@@ -1087,7 +743,7 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
 /// snapshot and no confirmation, a failed read at the recorded revision, an
 /// incomplete census, a map advanced past a restored entry, and an empty
 /// entry and mark the map never advanced to: each stays owed through the
-/// advance, the current-page drain and a complete healthy authority apply
+/// advance, the current-page drain and a later page of a complete census
 /// (an incomplete one where the read failed), and reloads intact. The last
 /// shape then advances on its own same-pass empty parse and drains.
 #[test]
@@ -1171,14 +827,14 @@ fn m2_older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
         index.settle_empty_claude_proof_corrections(&scan);
         assert_eq!(apc_quarantine_bytes(&index), before, "{case}: page seams");
         let mut loaded = apc_save_reload(&mut index, &scratch.join(format!("{case}.json")));
-        apc_apply(&mut loaded, apply_complete, true);
+        apc_later_page(&mut loaded, apply_complete);
         assert_eq!(apc_owed(&loaded), Some(both.clone()), "{case}: stays owed");
         assert_eq!(apc_frame(&loaded), apc_frame(&index), "{case}");
         if case == "entry-and-mark-without-map" {
             // The next same-pass empty parse pairs the map, then drains.
             apc_empty_page(&mut loaded, 0, &advanced, false);
             assert_eq!(apc_map(&loaded)[&root], advanced);
-            apc_apply(&mut loaded, true, true);
+            apc_later_page(&mut loaded, true);
             assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([agent.clone()])));
         }
     }
@@ -1230,7 +886,7 @@ fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
 /// an earlier partial page advances only the member's map revision, with the
 /// owed set, counter, deadline, proof and every acceptance and entity debt
 /// byte-identical; the three facts persist together through restart; the
-/// next complete healthy census then drains the member with no upload.
+/// next page of a complete census then drains the member with no upload.
 #[test]
 fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_drains() {
     let [root, agent] = apc_members();
@@ -1276,7 +932,7 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
         PARSE_FOR_AUTHORITY,
         "an owed member is still re-read until it drains"
     );
-    apc_apply(&mut loaded, true, true);
+    apc_later_page(&mut loaded, true);
     assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([agent])));
     assert_eq!(apc_frame(&loaded), frame);
     assert_eq!(apc_debts(&loaded), debts);
@@ -1288,7 +944,7 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
 /// parses that newer revision to a body a hold keeps from the upload. Neither
 /// the non-empty parse nor borrowed or consuming held restoration of the old
 /// empty entry advances the map, and neither the current-page drain nor a
-/// complete healthy census after restart drains the member.
+/// later page of a complete census after restart drains the member.
 #[test]
 fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     let [root, agent] = apc_members();
@@ -1338,7 +994,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     assert_eq!(apc_quarantine_bytes(&restored), before);
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-a3-stale");
     let mut loaded = apc_save_reload(&mut restored, &scratch.join("index.json"));
-    apc_apply(&mut loaded, true, true);
+    apc_later_page(&mut loaded, true);
     assert_eq!(
         apc_owed(&loaded),
         Some(BTreeSet::from([root, agent])),
@@ -1390,12 +1046,11 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
             Some(BTreeSet::from([root.clone()])),
             "complete={complete}: the last owed member stays owed"
         );
-        assert!(subset.claude_usage_family_pending.contains_key(APC_ROOT));
         assert_eq!(apc_frame(&subset), apc_frame(&committed));
         assert_eq!(apc_debts(&subset), apc_debts(&committed));
         let mut loaded =
             apc_save_reload(&mut subset, &scratch.join(format!("shed-{complete}.json")));
-        apc_apply(&mut loaded, true, true);
+        apc_later_page(&mut loaded, true);
         assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([root.clone()])));
         assert_eq!(apc_debts(&loaded), apc_debts(&committed));
         assert_eq!(
@@ -1420,8 +1075,8 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
 /// Restoration carriage: the LAST owed member has
 /// no prior entity (a delivery-free entry). Its empty advance on a shed page
 /// is carried by the checkpoint selection together with the file entry and
-/// empty mark, persists through restart, and the next complete healthy census
-/// drains it and clears the record and its pending proof.
+/// empty mark, persists through restart, and a later page of a complete census
+/// drains it and clears the record.
 #[test]
 fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_complete_census() {
     let [root, agent] = apc_members();
@@ -1454,14 +1109,13 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
     assert_eq!(apc_owed(&subset), Some(BTreeSet::from([agent])));
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-a2-carry");
     let mut loaded = apc_save_reload(&mut subset, &scratch.join("shed.json"));
-    apc_apply(&mut loaded, true, true);
+    apc_later_page(&mut loaded, true);
     assert!(
         !loaded
             .claude_usage_authority_quarantine
             .contains_key(APC_ROOT),
         "the last owed member's no-body completion clears the record"
     );
-    assert!(!loaded.claude_usage_family_pending.contains_key(APC_ROOT));
     assert_eq!(
         loaded.accepted_snapshot_fingerprints,
         committed.accepted_snapshot_fingerprints
@@ -1499,7 +1153,7 @@ fn a3_a_non_empty_parse_never_advances_the_map() {
     assert_eq!(apc_decision(&index, &candidate), PARSE_FOR_AUTHORITY);
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-a3-nonempty");
     let mut loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
-    apc_apply(&mut loaded, true, true);
+    apc_later_page(&mut loaded, true);
     assert_eq!(apc_owed(&loaded), Some(BTreeSet::from([root, agent])));
 }
 
@@ -1967,179 +1621,6 @@ mod previous_release_0_1_173 {
     }
 }
 
-/// A proven family using real parsed synthetic requests and paired reports.
-fn binding_family() -> (
-    crate::test_scratch::ScratchDir,
-    String,
-    ScanIndex,
-    Vec<SnapshotItem>,
-    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-) {
-    let scratch = crate::test_scratch::ScratchDir::new("authority-binding");
-    let (dir, root, mut items) = claude_account_family_fixture(true);
-    let mut index = ScanIndex::default();
-    for (n, item) in items.iter_mut().enumerate() {
-        item.source_file_fingerprint = Some(apc_hex(if n == 0 { 'a' } else { 'b' }));
-        let key = if n == 0 {
-            dir.join(format!("{root}.jsonl"))
-        } else {
-            dir.join(&root)
-                .join("subagents/agent-a4d1585d310070d0f.jsonl")
-        };
-        index.files.insert(
-            local_index_key(&key),
-            apc_entry(
-                item.source_file_fingerprint.as_ref().unwrap(),
-                &apc_hex('c'),
-            ),
-        );
-    }
-    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-        evidence: BTreeMap::from([(
-            root.clone(),
-            (1..=5)
-                .map(|n| {
-                    complete_api_row(
-                        &root,
-                        &format!("req_{n}"),
-                        n,
-                        10,
-                        if n == 5 { 1 } else { 10 },
-                        0,
-                    )
-                })
-                .collect(),
-        )]),
-        ..Default::default()
-    };
-    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
-        evidence: BTreeMap::from([(
-            root.clone(),
-            (1..=5)
-                .map(|n| {
-                    complete_trace_row(
-                        &root,
-                        &format!("req_{n}"),
-                        if n == 5 { "a4d1585d310070d0f" } else { "" },
-                    )
-                })
-                .collect(),
-        )]),
-        ..Default::default()
-    };
-    apply_claude_reported_usage_with_index(&mut items, &api, &trace, &mut index, true, APC_WINDOW);
-    assert!(index.claude_usage_family_witnesses.contains_key(&root));
-    for entry in index.files.values_mut() {
-        entry.source_file_fingerprint = apc_hex('a');
-    }
-    fs::remove_dir_all(dir).unwrap();
-    (scratch, root, index, items, api, trace)
-}
-
-#[test]
-fn demotion_after_same_call_reproof_binds_current_witness() {
-    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
-
-    let (scratch, root, mut index, items, mut api, trace) = binding_family();
-    let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
-    let row = &mut api.evidence.get_mut(&root).unwrap()[0];
-    row.cost_usd_micros = Some(200);
-    row.fingerprint.clear();
-    row.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(row).unwrap())
-    );
-    // Controlled seam: native observations retain the complete real family;
-    // the page item has no matching rows, so its rebuild cannot become v1.
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        &items,
-        &mut index.claude_usage_family_pending,
-        APC_WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    )
-    .unwrap();
-    let observations = ClaudeNativeObservations {
-        counts,
-        census_window_end: APC_WINDOW.to_string(),
-        index_generation: index.generation,
-    };
-    let mut page = vec![items[1].clone()];
-    page[0].claude_usage_request_ids.clear();
-    page[0].claude_usage_occurrences.clear();
-    let disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
-        &mut page,
-        &api,
-        &trace,
-        &mut index,
-        true,
-        APC_WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-        &BTreeSet::new(),
-        Some(observations),
-        None,
-        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
-    );
-    assert!(disposition
-        .quarantined_source_session_ids
-        .contains(&page[0].source_session_id));
-    let current =
-        claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
-    assert_ne!(old, current, "this call actually reproves the family");
-    assert_eq!(
-        index.claude_usage_authority_quarantine[&root].proven_witness_fingerprint, current,
-        "demotion binds the current proof"
-    );
-    apc_save_reload(&mut index, &scratch.join("index.json"));
-}
-
-#[test]
-fn witness_removed_while_member_demotes_does_not_quarantine_index() {
-    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
-
-    let (scratch, root, mut index, mut items, api, trace) = binding_family();
-    index.files.insert(
-        format!("/synthetic/twin/{root}.jsonl"),
-        apc_entry(&apc_hex('d'), &apc_hex('e')),
-    );
-    items[0].claude_usage_request_ids.clear();
-    items[0].claude_usage_occurrences.clear();
-    let unwitnessed = claude_authority_unwitnessed_demotions_for_test();
-    apply_claude_reported_usage_with_index_limits_and_current_files(
-        &mut items,
-        &api,
-        &trace,
-        &mut index,
-        true,
-        APC_WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-        &BTreeSet::new(),
-        None,
-        None,
-        ClaudeEvidenceRows::Whole(&BTreeMap::new()),
-    );
-    assert!(
-        !index.claude_usage_family_witnesses.contains_key(&root),
-        "twin makes the family incomplete"
-    );
-    assert!(
-        !index.claude_usage_authority_quarantine.contains_key(&root),
-        "no witness means no new authority record"
-    );
-    assert_eq!(
-        claude_authority_unwitnessed_demotions_for_test(),
-        unwitnessed + 1,
-        "SOURCE U3: the unwitnessed demotion is counted"
-    );
-    let count = index.files.len();
-    let loaded = apc_save_reload(&mut index, &scratch.join("index.json"));
-    assert_eq!(loaded.files.len(), count);
-}
-
 /// An index whose authority record is unbound: unbound on load or on save.
 fn apc_unbound_fixture() -> ScanIndex {
     let mut index = apc_terminal_fixture();
@@ -2170,12 +1651,11 @@ fn apc_unbound_fixture() -> ScanIndex {
     index
 }
 
-/// The fail-closed shape of `index`: only the authority record and its
-/// pending proof go, and only that family's indexed members are re-armed.
+/// The fail-closed shape of `index`: only the authority record goes, and only
+/// that family's indexed members are re-armed.
 fn apc_without_unbound_record(index: &ScanIndex) -> Value {
     let mut expected = index.clone();
     expected.claude_usage_authority_quarantine.remove(APC_ROOT);
-    expected.claude_usage_family_pending.remove(APC_ROOT);
     for key in apc_keys() {
         expected
             .files
@@ -2368,7 +1848,6 @@ fn apc_r2_page(last_owed: bool, revision: &str) -> (ScanIndex, ScanIndex, Claude
                 .contains_key(APC_ROOT),
             "the last owed member's drain clears the record"
         );
-        assert!(!working.claude_usage_family_pending.contains_key(APC_ROOT));
     } else {
         assert_eq!(apc_map(&working)[&root], revision);
     }
@@ -2378,8 +1857,8 @@ fn apc_r2_page(last_owed: bool, revision: &str) -> (ScanIndex, ScanIndex, Claude
 /// R2 (main, production default): a no-op drain at a revision the partial
 /// save does not select is reverted. The shed page restores the committed
 /// entry, so the member stays owed with its pre-drain pair: the saved record
-/// names the saved file's revision. Proof, counter, deadline, pending proof
-/// and every accepted body are unchanged, and the restarted index parses the
+/// names the saved file's revision. Proof, counter, deadline and every
+/// accepted body are unchanged, and the restarted index parses the
 /// member again for its correction.
 #[test]
 fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed() {
@@ -2411,11 +1890,6 @@ fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed()
             apc_map(&subset)[&root],
             subset.files[&root_key].source_file_fingerprint,
             "{label}: the saved record names the saved file's revision"
-        );
-        assert_eq!(
-            subset.claude_usage_family_pending.get(APC_ROOT),
-            committed.claude_usage_family_pending.get(APC_ROOT),
-            "{label}: the pending proof stays with its record"
         );
         assert_eq!(apc_debts(&subset), apc_debts(&committed), "{label}");
         let drops = claude_authority_drops_for_test();

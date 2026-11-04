@@ -1016,35 +1016,50 @@ mod application_cases {
         }
     }
 
-    /// [format] real-data traversal admission: 3 MiB imports byte-equal in chunks;
-    /// over-cap JSON refuses at row admission, on expansion and on fenced save.
+    /// [regress] a scan-progress row reached 61% of its former 16 MiB refusal
+    /// limit on a real store. traversal and birth_store rows between 16 and
+    /// 64 MiB now admit and roundtrip raw and compressed; a 3 MiB import stays
+    /// byte-equal in chunks; a 16 MiB traversal saves and reopens unchanged;
+    /// JSON over 64 MiB still refuses at admission and on expansion.
     #[test]
     fn large_traversal_import_roundtrips_and_above_cap_refuses() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/scan_index/real-shaped-v1.json"
         ))
         .unwrap();
-        // Above the cap, admission refuses the row itself: no 16 MiB import.
-        {
-            let key = mapper::key("scan_state.traversal", "", 0).unwrap();
-            let over = "x".repeat(16 * 1024 * 1024 - 1);
+        for kind in ["scan_state.traversal", "v1_field.birth_store"] {
+            let key = mapper::key(kind, "", 0).unwrap();
+            assert_eq!(value_cap(&key), VALUE_BYTES);
             let c = Corpus::new();
             let mut db =
                 sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import"))
                     .unwrap();
             let mut tx = db.begin(TxnMode::Write).unwrap();
+            // Between the former 16 MiB limit and the value bound: admitted.
+            let wide = "x".repeat(17 * 1024 * 1024);
+            let json = serde_json::to_vec(&wide).unwrap();
+            mapper::put(&mut tx, &key, &wide).unwrap();
+            let header = tx.get(&key).unwrap().unwrap();
+            let stored = mapper::bytes(&mut tx, &header).unwrap();
+            assert!(stored.starts_with(codec::MAGIC), "{kind}: compressed");
+            assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), json);
+            assert_eq!(codec::expand(&json, value_cap(&key)).unwrap(), json);
+            // Above the value bound, admission refuses the row itself.
+            let over = "x".repeat(VALUE_BYTES as usize - 1);
             let error = mapper::put(&mut tx, &key, &over).unwrap_err();
             assert!(error.to_string().contains("state_v2_value_admission"));
             let json = serde_json::to_vec(&over).unwrap();
             assert!(json.len() as u64 > value_cap(&key));
             let compressed = codec::encode(&json).unwrap();
             assert!(compressed.len() < 1024 * 1024);
-            assert_eq!(
-                codec::expand(&compressed, value_cap(&key))
-                    .unwrap_err()
-                    .to_string(),
-                "state_v2_value_admission"
-            );
+            for bytes in [&compressed, &json] {
+                assert_eq!(
+                    codec::expand(bytes, value_cap(&key))
+                        .unwrap_err()
+                        .to_string(),
+                    "state_v2_value_admission"
+                );
+            }
         }
         {
             let target = 3 * 1024 * 1024;
@@ -1109,28 +1124,41 @@ mod application_cases {
                 .unwrap()
                 .0
                 .unwrap();
-            let fence_bytes = fs::read(&c.path).unwrap();
             current.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
-            telemetry::take_thread_event_for_test("save_ceiling_alarm");
-            telemetry::take_thread_event_for_test("save_ceiling_cause");
-            let error =
+            let wide = serde_json::to_vec(&current.traversal).unwrap();
+            assert!(wide.len() > 16 * 1024 * 1024);
+            assert!(
                 super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
-                    .unwrap_err();
-            // Value admission is save pressure: the paced named hold, not DbUnavailable.
-            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-            assert!(telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some());
-            assert_eq!(
-                telemetry::take_thread_event_for_test("save_ceiling_cause"),
-                Some(serde_json::json!("value_admission"))
+                    .unwrap()
             );
+            // Loads keep account archives cold; compare the bytes the store holds.
+            let saved = super::super::runtime::materialized(&current);
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
                 .unwrap();
-            assert_eq!(reloaded.generation, 1);
-            assert_eq!(serde_json::to_vec(&reloaded.traversal).unwrap(), expected);
-            assert_eq!(fs::read(&c.path).unwrap(), fence_bytes);
+            assert_eq!(reloaded.generation, 2);
+            assert_eq!(serde_json::to_vec(&reloaded.traversal).unwrap(), wide);
+            // Every other row, money and placement included, reopens unchanged.
+            assert_eq!(
+                serde_json::to_vec(&super::super::runtime::materialized(&reloaded)).unwrap(),
+                serde_json::to_vec(&saved).unwrap()
+            );
             assert_eq!(fs::read(&progress_path).unwrap(), progress);
+            // An older build's 16 MiB decode bound refuses the widened row
+            // rather than reading a narrower value: it holds until upgrade.
+            super::super::runtime::with_session_db(&reloaded, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                let header = tx.get(&key).unwrap().unwrap();
+                let stored = mapper::bytes(&mut tx, &header).unwrap();
+                assert_eq!(codec::expand(&stored, value_cap(&key)).unwrap(), wide);
+                assert_eq!(
+                    codec::expand(&stored, 16 * 1024 * 1024)
+                        .unwrap_err()
+                        .to_string(),
+                    "state_v2_value_admission"
+                );
+            });
         }
     }
 
@@ -1600,9 +1628,10 @@ mod codec_mapper_regressions {
     fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
         let scratch = crate::test_scratch::ScratchDir::canonical("codec-ref-readback");
         let index: ScanIndex = serde_json::from_value(serde_json::json!({
-            "schema_version":2,"files":{},"claude_usage_family_pending":{"f":{
-                "census_window_end":"A","invalid":false,
-                "member_request_id_hashes":{"a":[],"b":[]}
+            "schema_version":2,"files":{},"claude_usage_family_witnesses":{"f":{
+                "evidence_fingerprint":"A","member_request_id_fingerprints":{},
+                "assigned_request_id_fingerprints":{},
+                "legacy_excluded_request_id_hashes":{"a":[],"b":[]}
             }}
         }))
         .unwrap();

@@ -11,7 +11,9 @@
 //! only: no point repeats them (§13). Stored state that cannot be
 //! reused is a counted reconstruction (`tail_reconstruct`) and the read starts
 //! at once as a Full; a file shorter than its head reads Full (`Shrunk`) and
-//! is counted in `tail_shorter_file_full`. Only a head from a newer build, a
+//! is counted in `tail_shorter_file_full`. A head whose session owes a
+//! head-CAS answer reads Full, counted under the `head_conflict` change
+//! reason (`native_change_reasons`). Only a head from a newer build, a
 //! session fact of a kind or version this build does not know, or a live
 //! input that is not available now, holds the file, untouched. A session
 //! fact that does not match its head (a count mismatch) is corrupt: that
@@ -47,8 +49,9 @@ pub(in crate::snapshots) enum Load {
 
 /// A selection of an unchanged transcript for evidence read at finish (late
 /// telemetry or side calls, a family or account proof, a quarantine retry).
-/// Its re-fold from stored state reads 0 transcript bytes; a body that is not
-/// the ACKed one goes as an ordinary update, counted `tail_refold{reason}`.
+/// Its re-fold from stored state reads 0 transcript bytes, counted
+/// `tail_refold{reason}` at the load; a body that is not the ACKed one goes as
+/// an ordinary update.
 pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool {
     matches!(
         reason,
@@ -66,14 +69,17 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// continues as well. Growth beats a quarantine-retry or activity selection,
 /// which precedes `TranscriptChanged`: a file that `grew` past its committed
 /// entry is an append and continues as for `TranscriptChanged`, even while a
-/// body of it waits on a retry. `BodyWitnessAdoption` and every legacy
+/// body of it waits on a retry (unless its session owes a head-CAS answer).
+/// `BodyWitnessAdoption` and every legacy
 /// selection stay native. A `NewFile` is a first read, except one `e2` withheld
 /// (`held_new`): its committed head is custody, never acceptance, and it
 /// continues as a changed file does.
 ///
-/// A late-evidence re-fold needs complete stored state and never answers a
-/// server challenge: a set-aside file, or one whose body waits on a retry (a
-/// head-CAS conflict among them), reads natively instead.
+/// A late-evidence re-fold needs complete stored state: a set-aside file
+/// reads natively instead. A body waiting on a server retry re-folds: it is
+/// the same body a native read sends. Whatever the selection, a file whose
+/// session owes a head-CAS answer never continues from stored state; the
+/// load refuses it ([`conflict_owed`]) once the head names the session.
 pub(in crate::snapshots) fn reuses_stored(
     index: &ScanIndex,
     key: &str,
@@ -90,7 +96,7 @@ pub(in crate::snapshots) fn reuses_stored(
         ) => true,
         Some(CandidateParseReason::ActivityOrQuarantineRetry) if grew => true,
         Some(CandidateParseReason::NewFile) => held_new,
-        Some(reason) => late_evidence(reason) && !set_aside(index, key) && !retry_held(index, key),
+        Some(reason) => late_evidence(reason) && !set_aside(index, key),
     }
 }
 
@@ -101,22 +107,18 @@ pub(in crate::snapshots) fn held_new(index: &ScanIndex, key: &str) -> bool {
     !index.files.contains_key(key) && index.claude_request_census.get(key).is_some()
 }
 
-/// A body of this file waits in the upload ledger for a retry: the server
-/// refused it (a head-CAS conflict, a held decrease) and the ledger keeps it.
-fn retry_held(index: &ScanIndex, key: &str) -> bool {
-    index
-        .file_snapshot_fingerprints
-        .get(key)
-        .is_some_and(|set| {
-            set.iter().any(|fingerprint| {
-                index
-                    .quarantined_snapshot_fingerprints
-                    .get(fingerprint)
-                    .is_some_and(|record| {
-                        record.disposition == SnapshotQuarantineDisposition::RetryPending
-                    })
-            })
-        })
+/// The stored head's session owes a head-CAS answer: the upload ledger holds
+/// an open challenge for it. The answer attaches to any outgoing body of the
+/// session and claims a full rescan, so it rides only a real native Full: the
+/// file reads Full whatever its selection, a grown file included.
+pub(in crate::snapshots) fn conflict_owed(
+    index: &ScanIndex,
+    path: &Path,
+    head: &SnapshotAccumulator,
+) -> bool {
+    head.wire_source_session_id(path).is_some_and(|session| {
+        index.head_conflict_owed(&crate::snapshot_sync::cache_session_key(&session))
+    })
 }
 
 /// The per-candidate marker check, before an ordinary Skip: a file whose
@@ -238,6 +240,8 @@ enum Miss {
     Reconstruct(ReconstructCause),
     /// A live input is not available now: the file holds with its debt.
     LiveUnavailable,
+    /// The head's session owes a head-CAS answer: a native Full answers.
+    ConflictOwed,
 }
 
 /// What a hit loaded: the reduction, its base, and the bytes it read.
@@ -282,6 +286,16 @@ pub(super) fn load<S: TailSource>(
             }
             ("miss", None, Load::Cold(Some(reason)))
         }
+        // Counted with the read under the `head_conflict` change reason.
+        Err(Miss::ConflictOwed) => {
+            crate::local_resource_diagnostics::change_reason::selected(
+                source.api_slug(),
+                key.to_owned(),
+                crate::local_resource_diagnostics::change_reason::Token::HeadConflict,
+                false,
+            );
+            ("miss", None, Load::Cold(None))
+        }
         Err(Miss::NoHead) => {
             counters::bump(source, "tail_bootstrap_full", "no_head");
             ("miss", Some("no_head"), Load::Cold(None))
@@ -317,12 +331,6 @@ pub(super) fn load<S: TailSource>(
         counters::add(source, "tail_reconstruct_bytes", cause, bytes);
         if after_head {
             counters::bump(source, "tail_reconstruct_after_head", cause);
-            if counters::restart_full_alarm_due(source) {
-                crate::local_resource_diagnostics::tail_restart_full_alarm(
-                    source.api_slug(),
-                    &serde_json::json!({ "cause": cause }),
-                );
-            }
         }
     }
     counters::bump(source, "tail_db_loads", outcome);
@@ -356,6 +364,9 @@ fn stored<S: TailSource>(
     let toggled = id.check(&head.body).map_err(Miss::Reconstruct)?;
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     let decoded = S::decode_head(head.revision, &head.body, &mut acc).map_err(Miss::Reconstruct)?;
+    if conflict_owed(index, &fresh.path, &acc) {
+        return Err(Miss::ConflictOwed);
+    }
     // The file against the certificate, before any page.
     let checkpoint = match decoded.certificate.restore_grown(held, scope.clone()) {
         Ok((checkpoint, _)) => checkpoint,
@@ -398,7 +409,7 @@ fn stored<S: TailSource>(
     })?;
     let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
     if toggled {
-        reduction.scrub_identity(true, false);
+        reduction.scrub_context_digest();
     }
     let taken = Taken {
         modified_hint: checkpoint.modified_hint(),

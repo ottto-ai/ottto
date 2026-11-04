@@ -2,7 +2,7 @@
 //! `freshness_alarm` is each source's persisted per-file debt (`g7_debt`) under
 //! `debt`, aggregated at each root walk's end, so it survives restarts.
 //! `Counts` are count-only Claude gauges over the bounded FirstPending stamps.
-use super::g7_debt::{Report, Walk};
+use super::g7_debt::{Report, Roster, Walk};
 use super::SnapshotSource;
 use serde::Serialize;
 
@@ -36,9 +36,19 @@ impl WalkFold {
     }
 
     /// `debt`: the walk's aggregate, `None` for a graph with no Tail store.
-    pub(super) fn page_end(self, source: SnapshotSource, walk_ended: bool, debt: Option<Report>) {
+    /// A walk's end replaces the source's retirement roster.
+    pub(super) fn page_end(
+        mut self,
+        source: SnapshotSource,
+        walk_ended: bool,
+        debt: Option<Report>,
+    ) {
         if walk_ended {
-            with_walks(|walks| walks.last[source as usize] = debt);
+            let roster = self.debt.complete_roster().map(std::sync::Arc::new);
+            with_walks(|walks| {
+                walks.last[source as usize] = debt;
+                walks.roster[source as usize] = roster;
+            });
             emit(source, &self, "walk", debt.as_ref());
         } else {
             with_walks(|walks| walks.folds[source as usize] = self);
@@ -46,15 +56,34 @@ impl WalkFold {
     }
 }
 
-/// Each source's walk in progress and its last walk's aggregate.
+/// Each source's walk in progress, its last walk's aggregate, the roster of
+/// its last walk when that walk was complete (RAM only), and whether this
+/// process already ran its one backlog retirement on a roster.
 struct Walks {
     folds: [WalkFold; 3],
     last: [Option<Report>; 3],
+    roster: [Option<std::sync::Arc<Roster>>; 3],
+    backlog_ran: [bool; 3],
 }
 const NO_WALKS: Walks = Walks {
     folds: [WalkFold::EMPTY; 3],
     last: [None; 3],
+    roster: [None, None, None],
+    backlog_ran: [false; 3],
 };
+
+/// The one gate for deleting by absence: the source's last root walk began
+/// in this process and listed every root with no walk issue. Its roster, and
+/// whether the process's one backlog run is still due (claimed by this call).
+pub(super) fn index_current_since_start(
+    source: SnapshotSource,
+) -> Option<(std::sync::Arc<Roster>, bool)> {
+    with_walks(|walks| {
+        let roster = walks.roster[source as usize].clone()?;
+        let backlog = !std::mem::replace(&mut walks.backlog_ran[source as usize], true);
+        Some((roster, backlog))
+    })
+}
 
 #[cfg(not(test))]
 static WALKS: std::sync::Mutex<Walks> = std::sync::Mutex::new(NO_WALKS);
@@ -77,6 +106,25 @@ fn with_walks<T>(body: impl FnOnce(&mut Walks) -> T) -> T {
 #[cfg(test)]
 fn with_walks<T>(body: impl FnOnce(&mut Walks) -> T) -> T {
     WALKS_FOR_TEST.with(|walks| body(&mut walks.borrow_mut()))
+}
+
+/// A new process whose first root walk ended with this roster (`None`: not
+/// complete).
+#[cfg(test)]
+pub(crate) fn set_roster_for_test(
+    source: SnapshotSource,
+    roster: Option<(u64, std::collections::BTreeMap<String, Option<u64>>)>,
+) {
+    let roster = roster.map(|(started_at_ms, listed)| {
+        std::sync::Arc::new(Roster {
+            started_at_ms,
+            listed,
+        })
+    });
+    with_walks(|walks| {
+        walks.roster[source as usize] = roster;
+        walks.backlog_ran[source as usize] = false;
+    });
 }
 
 /// A restart forgets every walk in progress and every aggregate.

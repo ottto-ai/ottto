@@ -10,8 +10,8 @@ use serde_json::json;
 
 /// [money] Codex sessions whose rows record no login mode, named from their
 /// creator record by its single registered subscription slot, emit after a
-/// restart (Codex keeps only its RAM reduction, so a new owner reads Full) and
-/// on the warm RAM Tail what a cold Full emits, in totals and placement: each
+/// restart from its committed Tail heads and on the current owner's Tail what
+/// a cold Full emits, in totals and placement: each
 /// named session's rows carry its matched slot's account, and a session whose
 /// creator matches no slot stays untagged on every route. Control: swapped
 /// account tags fail the comparator.
@@ -41,7 +41,7 @@ fn shared_codex_creator_slot_naming_matches_cold_full() {
         )
     });
     let c = corpus("transition-codex-creator-slot");
-    let mut disk = Disk::new(&c);
+    let mut disk = Disk::with_route(&c, source);
     // The session id in the file name lets each header's creator pair reach
     // the row as account evidence.
     let files = [ROOT, SECOND, UNMATCHED].map(|session| {
@@ -64,6 +64,11 @@ fn shared_codex_creator_slot_naming_matches_cold_full() {
         std::fs::write(path, header).unwrap();
     }
     let page = |scanner: &E2ScanFixture, prior: ScanIndex| {
+        let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            source,
+            Some(scanner.cache.as_ref()),
+            prior,
+        );
         other_page_with_slots(&c, scanner, source, prior, &slots, |_| {})
     };
     // Every row of each session carries exactly its matched slot's account.
@@ -103,16 +108,16 @@ fn shared_codex_creator_slot_naming_matches_cold_full() {
     let (restart_index, restart_scan, restart_modes) = page(&owner, prior.clone());
     assert_eq!(
         restart_modes,
-        (3, 0, 0),
-        "a restarted Codex owner reads Full"
+        (0, 3, 0),
+        "a restarted Codex owner continues from its committed heads"
     );
     disk.begin(&scanner, source);
     let (ram_index, ram_scan, ram_modes) = page(&scanner, prior.clone());
     assert_eq!(ram_modes, (0, 3, 0));
     for (scan, route) in [
         (&cold_scan, "cold Full"),
-        (&restart_scan, "restarted Full"),
-        (&ram_scan, "RAM Tail"),
+        (&restart_scan, "restarted Tail"),
+        (&ram_scan, "current-owner Tail"),
     ] {
         assert_tags(scan, route);
     }

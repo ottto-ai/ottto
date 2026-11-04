@@ -1,6 +1,7 @@
-//! Codex earliest-prefix uploads and accepted-state budget regressions.
+//! Uploads past the server's per-patch and per-session cache bounds, and
+//! accepted-state budget regressions.
 //! No fixture content comes from a provider account.
-use super::cache_observations::{Operation, MAX_OPERATIONS};
+use super::cache_observations::{Operation, MAX_OPERATIONS, MAX_ROWS, MAX_STATE_BYTES};
 use super::*;
 
 fn request(name: &str, read: u64, second: i64) -> OwnedRequest {
@@ -63,7 +64,7 @@ fn retracted(wire: &CacheObservations) -> usize {
 /// The upload step for one pass, given the accepted state of the last one.
 fn upload(requests: &[OwnedRequest], prior: Option<&Value>) -> (CacheObservations, Value) {
     let mut item = super::tests::sample_session_artifact_item();
-    item.cache_observations = codex_cache_wire_for_requests("s", requests);
+    item.cache_observations = Some(cache_wire("s", requests, true));
     prepare_cache_observations(&mut item, prior);
     let wire = item.cache_observations.unwrap();
     assert!(wire.validate());
@@ -73,67 +74,91 @@ fn upload(requests: &[OwnedRequest], prior: Option<&Value>) -> (CacheObservation
     (wire, item.cache_observations_state.unwrap())
 }
 
-#[test]
-fn over_cap_session_uploads_first_breaks_with_exact_omitted_count() {
-    for (breaks, omitted) in [(64, None), (65, Some(1)), (10_000, Some(9_936))] {
-        let wire = codex_cache_wire_for_requests("s", &session("", breaks)).unwrap();
-        assert!(wire.validate(), "{breaks}");
-        let mut refs = upserted(&wire);
-        if omitted.is_none() {
-            // Complete patches preserve the existing event-ID wire order.
-            refs.sort_by_key(|name| name["cold_".len()..].parse::<usize>().unwrap());
+/// The accepted state a session with `breaks` breaks settles to.
+pub(crate) fn settled_state(breaks: usize) -> Value {
+    settle(&session("", breaks), None)
+}
+
+/// Upload passes until the accepted state stops changing.
+fn settle(requests: &[OwnedRequest], mut prior: Option<Value>) -> Value {
+    loop {
+        let (wire, state) = upload(requests, prior.as_ref());
+        assert_eq!(retracted(&wire), 0);
+        if prior.as_ref() == Some(&state) {
+            return state;
         }
-        assert_eq!(refs, colds(0..breaks.min(MAX_OPERATIONS)), "{breaks}");
-        assert_eq!(wire.omitted_observation_count, omitted, "{breaks}");
-        let coverage = if omitted.is_some() {
-            "partial"
-        } else {
-            "complete"
-        };
-        assert_eq!(wire.coverage, coverage, "{breaks}");
+        prior = Some(state);
+    }
+}
+
+/// [behaviour] The detector keeps every break. Each upload sends at most
+/// one patch (64 operations); the rest follow on later uploads up to the
+/// server's per-session state bound, past which the count stays exact.
+#[test]
+fn long_session_uploads_every_break_across_patches_with_exact_omitted_count() {
+    // One patch, one past it, past the old row bound (128), and one past the
+    // per-session row bound.
+    for breaks in [64, 65, 200, MAX_ROWS + 1] {
+        let requests = session("", breaks);
+        let wire = cache_wire("s", &requests, true);
+        assert_eq!(upserted(&wire), colds(0..breaks), "{breaks}");
+        assert_eq!(wire.coverage, "complete", "{breaks}");
+        let state = settle(&requests, None);
+        let rows = state["observations"].as_array().unwrap();
+        let omitted = state["omitted_observation_count"].as_u64().unwrap_or(0);
         assert_eq!(
-            upserted(&wire).len() as u64 + omitted.unwrap_or(0),
+            rows.len() as u64 + omitted,
             breaks as u64,
-            "every break is either uploaded or counted"
+            "every break is either accepted or counted"
         );
+        let mut refs = rows
+            .iter()
+            .map(|row| row["affected_request_ref"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        refs.sort_by_key(|name| name["cold_".len()..].parse::<usize>().unwrap());
+        assert_eq!(refs, colds(0..rows.len()), "earliest breaks first");
+        assert_eq!(rows.len(), breaks.min(MAX_ROWS), "{breaks}");
+        let coverage = if breaks <= MAX_ROWS {
+            "complete"
+        } else {
+            "partial"
+        };
+        assert_eq!(state["coverage"], coverage, "{breaks}");
     }
 }
 
 #[test]
 fn over_cap_duplicates_and_out_of_order_times_keep_session_order() {
     let requests = session("", 65);
-    let expected = codex_cache_wire_for_requests("s", &requests).unwrap();
+    let expected = cache_wire("s", &requests, true);
     // A replayed request, adjacent or far back, is one request.
     let mut replayed = requests
         .iter()
         .flat_map(|request| [request.clone(), request.clone()])
         .collect::<Vec<_>>();
     replayed.push(requests[1].clone());
-    assert_eq!(
-        codex_cache_wire_for_requests("s", &replayed).unwrap(),
-        expected
-    );
+    assert_eq!(cache_wire("s", &replayed, true), expected);
     // A replay with different counters stays a lossy parse with no rows.
     let mut conflicting = requests.clone();
     let mut changed = requests[1].clone();
     changed.slot.output_tokens = Some(1);
     conflicting.push(changed);
-    let lossy = codex_cache_wire_for_requests("s", &conflicting).unwrap();
+    let lossy = cache_wire("s", &conflicting, true);
     assert!(lossy.operations.is_empty());
     assert_eq!(
         (lossy.coverage.as_str(), lossy.omitted_observation_count),
         ("partial", None)
     );
-    // Clock order never reorders the session: the first breaks in the file
-    // are kept, and a backwards clock reports no gap.
+    // Clock order never reorders the session, and a backwards clock reports
+    // no gap.
     let mut reversed = requests;
     let count = reversed.len() as i64;
     for (index, request) in reversed.iter_mut().enumerate() {
         request.slot.occurred_at = request_time(count - index as i64);
     }
-    let wire = codex_cache_wire_for_requests("s", &reversed).unwrap();
-    assert_eq!(upserted(&wire), colds(0..MAX_OPERATIONS));
-    assert_eq!(wire.omitted_observation_count, Some(1));
+    let wire = cache_wire("s", &reversed, true);
+    assert_eq!(upserted(&wire), colds(0..65));
+    assert_eq!(wire.omitted_observation_count, None);
     assert!(wire.operations.iter().all(|operation| matches!(
         operation,
         Operation::Upsert { observation } if observation.report_gap_seconds.is_none()
@@ -145,49 +170,46 @@ fn request_time(second: i64) -> String {
 }
 
 #[test]
-fn over_cap_tail_uploads_match_one_full_upload_without_retractions() {
-    let full = session("", 200);
+fn growing_session_uploads_match_full_uploads_without_retractions() {
+    // Within the server's state bound: every break is accepted either way.
+    let full = session("", 90);
+    let fresh = settle(&full, None);
+    assert_eq!(fresh["observations"].as_array().unwrap().len(), 90);
+    assert_eq!(fresh["coverage"], "complete");
     // The daemon before this fix left an empty partial state for big sessions.
     let empty = json!({"schema_version":1,"observations":[],"coverage":"partial","omitted_observation_count":131});
     for start in [None, Some(empty)] {
         let mut prior = start;
-        // 128 ends at selected row 64 awaiting its next request; 129 completes it.
-        // 130 ends on the first omitted break awaiting its next request.
+        // 128 ends at row 64 awaiting its next request; 129 completes it.
+        // 130 ends on the 65th break awaiting its next request.
         for length in [21, 127, 128, 129, 130, 131, 141, full.len()] {
             let (wire, state) = upload(&full[..length], prior.as_ref());
             assert_eq!(retracted(&wire), 0, "length {length}");
             assert!(wire.operations.len() <= MAX_OPERATIONS);
-            let last_selected = state["observations"]
+            let row_64 = state["observations"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|row| row["affected_request_ref"] == "cold_63");
             if length == 127 {
-                assert!(last_selected.is_none());
+                assert!(row_64.is_none());
             } else if length >= 128 {
-                let last_selected = last_selected.unwrap();
+                let row_64 = row_64.unwrap();
                 assert_eq!(
-                    last_selected["event_id"],
+                    row_64["event_id"],
                     cache_observations::event_id("s", "cold_63")
                 );
                 if length == 128 {
-                    assert_eq!(last_selected["status"], "awaiting_next");
-                    assert!(last_selected["immediate_next"].is_null());
+                    assert_eq!(row_64["status"], "awaiting_next");
+                    assert!(row_64["immediate_next"].is_null());
                 } else {
-                    assert_eq!(last_selected["status"], "complete");
-                    assert_eq!(last_selected["immediate_next"]["request_ref"], "warm_64");
+                    assert_eq!(row_64["status"], "complete");
+                    assert_eq!(row_64["immediate_next"]["request_ref"], "warm_64");
                 }
             }
             prior = Some(state);
         }
-        let (wire, fresh) = upload(&full, None);
-        assert_eq!(prior.unwrap(), fresh, "tail passes equal one full read");
-        assert_eq!(upserted(&wire), colds(0..MAX_OPERATIONS));
-        assert_eq!(wire.omitted_observation_count, Some(136));
-        assert_eq!(
-            fresh["observations"].as_array().unwrap().len(),
-            MAX_OPERATIONS
-        );
+        assert_eq!(settle(&full, prior), fresh, "tail passes equal full reads");
     }
 }
 
@@ -222,6 +244,13 @@ fn rows(wire: &CacheObservations) -> Vec<cache_observations::Observation> {
         .collect()
 }
 
+/// The first patch's rows of a session past the operation bound.
+fn first_patch(requests: &[OwnedRequest]) -> Vec<cache_observations::Observation> {
+    let mut rows = rows(&cache_wire("s", requests, true));
+    rows.truncate(MAX_OPERATIONS);
+    rows
+}
+
 fn partial(rows: Vec<cache_observations::Observation>) -> CacheObservations {
     CacheObservations {
         schema_version: 1,
@@ -240,31 +269,46 @@ fn encoded(state: &Value) -> usize {
     crate::canonical_json::canonicalize(state).unwrap().len()
 }
 
+/// Grow the state's condition strings, within the schema's 256 characters,
+/// until it encodes to exactly `target` bytes.
+fn pad_to(state: &mut Value, target: usize) {
+    let mut remaining = target - encoded(state);
+    for row in state["observations"].as_array_mut().unwrap() {
+        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
+            let text = condition.as_str().unwrap();
+            let add = remaining.min(256 - text.len());
+            *condition = json!(format!("{text}{}", "x".repeat(add)));
+            remaining -= add;
+        }
+    }
+    assert_eq!(remaining, 0);
+}
+
 pub(crate) fn large_prior_and_replacement_fixture() -> (CacheObservations, Value) {
-    let desired = rows(&codex_cache_wire_for_requests("s", &session("", 65)).unwrap());
+    let desired = first_patch(&session("", 65));
     // Place shrinking replacements last, so trimming first restores their larger
     // accepted versions. Unrelated accepted rows cannot be deleted under S3.
     let mut selected = desired[10..].to_vec();
     selected.extend_from_slice(&desired[..10]);
-    let extra = rows(&codex_cache_wire_for_requests("s", &session("old_", 10)).unwrap());
     let candidate = partial(selected);
-    // Build the boundary by measured canonical bytes, not guessed row sizes.
-    for conditions in 1..=32 {
-        let old = desired[..10]
-            .iter()
-            .chain(extra.iter())
-            .cloned()
-            .map(|row| large_row(row, conditions))
-            .collect();
-        let prior = cache_state_from_patch(None, &partial(old)).unwrap();
-        let merged = cache_state_from_patch(Some(&prior), &candidate).unwrap();
-        if encoded(&prior) <= cache_observations::MAX_WIRE_BYTES
-            && encoded(&merged) > cache_observations::MAX_WIRE_BYTES
-        {
-            return (candidate, prior);
-        }
+    // The replaced rows hold one full condition, so padding skips them; the
+    // unrelated rows take the padding.
+    let mut old = desired[..10]
+        .iter()
+        .cloned()
+        .map(|row| large_row(row, 1))
+        .collect::<Vec<_>>();
+    for mut row in rows(&cache_wire("s", &session("old_", 96), true)) {
+        row.supporting_conditions = vec!["x".into(); 32];
+        old.push(row);
     }
-    panic!("schema-valid near-cap prior fixture must exist");
+    let mut prior = cache_state_from_patch(None, &partial(old)).unwrap();
+    // Padding unrelated rows moves prior and merge alike, so measure the
+    // merge's growth once and place the cap halfway through it.
+    let growth =
+        encoded(&cache_state_from_patch(Some(&prior), &candidate).unwrap()) - encoded(&prior);
+    pad_to(&mut prior, MAX_STATE_BYTES - growth / 2);
+    (candidate, prior)
 }
 
 #[test]
@@ -299,7 +343,7 @@ fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_tri
 
 #[test]
 fn dropped_replacement_is_present_and_not_counted_as_omitted() {
-    let desired = rows(&codex_cache_wire_for_requests("s", &session("", 65)).unwrap());
+    let desired = first_patch(&session("", 65));
     let prior = cache_state_from_patch(None, &partial(desired[..10].to_vec())).unwrap();
     let mut selected = desired[10..].to_vec();
     selected.extend_from_slice(&desired[..10]);
@@ -322,11 +366,8 @@ fn dropped_replacement_is_present_and_not_counted_as_omitted() {
 
 #[test]
 fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
-    let mut accepted = rows(&codex_cache_wire_for_requests("s", &session("old_", 64)).unwrap());
-    accepted.extend(rows(
-        &codex_cache_wire_for_requests("s", &session("other_", 64)).unwrap(),
-    ));
-    // Use short witnesses so 128 rows fit the byte budget independently.
+    let mut accepted = rows(&cache_wire("s", &session("old_", MAX_ROWS), true));
+    // Use short witnesses so MAX_ROWS rows fit the byte budget independently.
     for row in &mut accepted {
         row.previous = None;
         row.immediate_next = None;
@@ -344,37 +385,19 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
     // cache member entirely rather than publishing a false exact count.
     let mut exact = cache_state_from_patch(
         None,
-        &partial(rows(
-            &codex_cache_wire_for_requests("s", &session("old_", 10)).unwrap(),
-        )),
+        &partial(rows(&cache_wire("s", &session("old_", 10), true))),
     )
     .unwrap();
     exact["omitted_observation_count"] = json!(0);
-    // Fill using schema-valid condition strings within per-field limits.
-    let budget = cache_observations::MAX_WIRE_BYTES;
     // This fixture targets refusal, so the prior is a server-sized state rather
-    // than a detector output. Spread padding over many schema-valid rows.
-    let mut base = rows(&codex_cache_wire_for_requests("s", &session("old_", 64)).unwrap());
+    // than a detector output. Spread schema-valid padding over many rows.
+    let mut base = rows(&cache_wire("s", &session("old_", 96), true));
     for row in &mut base {
-        row.supporting_conditions = vec![String::new(); 32];
+        row.supporting_conditions = vec!["x".into(); 32];
     }
     exact["observations"] = serde_json::to_value(base).unwrap();
-    // Replace empty conditions with valid strings, and grow to exactly the cap.
-    for row in exact["observations"].as_array_mut().unwrap() {
-        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
-            *condition = json!("x");
-        }
-    }
-    let mut remaining = budget - encoded(&exact);
-    for row in exact["observations"].as_array_mut().unwrap() {
-        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
-            let add = remaining.min(255);
-            *condition = json!("x".repeat(1 + add));
-            remaining -= add;
-        }
-    }
-    assert_eq!(remaining, 0);
-    assert_eq!(encoded(&exact), budget);
+    pad_to(&mut exact, MAX_STATE_BYTES);
+    assert_eq!(encoded(&exact), MAX_STATE_BYTES);
     let mut item = super::tests::sample_session_artifact_item();
     item.cache_observations = Some(CacheObservations {
         schema_version: 1,
@@ -416,16 +439,15 @@ fn partial_retracted_status_is_not_a_deletion_backdoor() {
 
 #[test]
 fn malformed_accepted_rows_refuse_complete_and_partial_cache_updates() {
-    let candidate = codex_cache_wire_for_requests("s", &session("", 2)).unwrap();
+    let candidate = cache_wire("s", &session("", 2), true);
     let valid = cache_state_from_patch(None, &candidate).unwrap();
     let mut malformed = valid.clone();
     // Keep the accepted ID but break a required field. Previously this row was
     // silently dropped, even when its raw size exceeded the cumulative budget.
     malformed["observations"][0]["affected"] = Value::Null;
     let mut oversized = malformed.clone();
-    oversized["observations"][0]["supporting_conditions"] =
-        json!(["x".repeat(cache_observations::MAX_WIRE_BYTES)]);
-    assert!(encoded(&oversized) > cache_observations::MAX_WIRE_BYTES);
+    oversized["observations"][0]["supporting_conditions"] = json!(["x".repeat(MAX_STATE_BYTES)]);
+    assert!(encoded(&oversized) > MAX_STATE_BYTES);
     let mut wrong_shape = valid.clone();
     wrong_shape["observations"] = Value::Null;
     for prior in [malformed, oversized, wrong_shape] {
@@ -453,7 +475,7 @@ fn under_cap_byte_trim_keeps_the_session_prefix_even_with_backwards_clocks() {
     for (index, request) in requests.iter_mut().enumerate() {
         request.slot.occurred_at = request_time(count - index as i64);
     }
-    let candidate = codex_cache_wire_for_requests("s", &requests).unwrap();
+    let candidate = cache_wire("s", &requests, true);
     assert_eq!(candidate.coverage, "complete");
     // Fitting complete patches retain the preexisting event-ID wire order.
     let mut item = super::tests::sample_session_artifact_item();

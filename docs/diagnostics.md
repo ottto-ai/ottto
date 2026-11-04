@@ -68,6 +68,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | --- | --- |
 | `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
+| `retained_heap_bytes.active_graph.{census_hashes,census_occupancy_alarm}` | Request hashes the Claude census holds, and whether they reach 75% of 2,097,152. An alarm only: nothing is capped. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
@@ -150,13 +151,13 @@ process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
 Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
-`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
-capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
-record right after `native_collection_page`; `context_composition_read` carries
-them inline. 16 MiB is only a release point: a completed record above it
-frees its line buffer; byte targets yield between records. The counts-only
-`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
-on consecutive native pages, without changing reading or retries.
+`max_line_bytes` and `max_line_buffer_bytes` (line-buffer capacity, not RSS or
+an upper bound) go in their own `native_collection_jsonl_lines` record right
+after `native_collection_page`; `context_composition_read` carries them inline.
+16 MiB is only a release point: a completed record above it frees its line
+buffer; byte targets yield between records. The former `lines_over_16_mib`
+count and `jsonl_repeat_parse_failure_alarm` are retired; malformed/UTF-8 lines
+stay counted by the existing read report.
 
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
@@ -169,12 +170,21 @@ accepting version 1 binaries; there is no version negotiation.
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
 | `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
+| `shutdown` | none (`counts` is `{}`) | Once when the process receives SIGTERM, after startup diagnostics. Unix only. Records that the stop signal arrived; it does not detect hangs or say who sent it. The process still dies by SIGTERM. A missing row proves nothing: SIGKILL, a crash, a signal before startup or a failed write leave none. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Claude page counters `claude_sidecar_reparse_files` and
 `claude_sidecar_reparse_bytes` report side-file read attempts and actual input
 bytes since the previous Claude page. Repeated reads count again; absent keys
 mean zero. Nonzero values remain exact, with no separate diagnostic record.
+On the same line, `claude_telemetry_retired_roots` and
+`claude_telemetry_retired_bytes` count Claude telemetry pairs deleted because
+every transcript of their session is gone, `claude_telemetry_held_roots` the
+candidate pairs kept (a live reader, a copy of their requests, a listed
+transcript with no loss-free census read, a write after the walk began, or a
+change while deleting),
+and `claude_telemetry_read_fault` the pairs kept because a member could not be
+read cleanly or unlinked.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -296,8 +306,7 @@ no authority and do not imply a continuation page ran. No raw ticket means no
 mint decision; authority/lifetime refusals remain outside these five outcomes.
 
 The inventory check performs at most one `lstat` per carried rollout path
-(up to 32,768), stopping on the first mismatch. It includes ledger parents and
-the held file. Any changed rollout holds continuation, so active Codex sessions
+(up to 32,768), stopping on the first mismatch. It includes the held file. Any changed rollout holds continuation, so active Codex sessions
 usually leave it idle. Additions wait for the ordinary census; an EOF park that
 cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
 keeping the prior body rather than emitting a zero replacement.
@@ -348,8 +357,8 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
-Claude Code's local-evidence stage adds three such footprint records (empty
-counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+Claude Code's local-evidence stage adds three such footprint records (none on
+panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
@@ -357,6 +366,16 @@ final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
 step) and no footprint fields. `evidence_cross_root` counts carry
 `demanded_requests`: the page's demanded request ids each root is joined against.
+Of the three footprint records, only `evidence_read` has counts: one
+`evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
+bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
+after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
+footprint at the first two points; the third is `stage_end_footprint_bytes`),
+`kept_rows` (API plus trace rows the pass keeps for the fold),
+`largest_root_rows` with `largest_root_kept` (the root with the most rows and
+whether the pass kept it), and `legacy_owners` (legacy request owners). Compare
+deltas between the points only; footprint also charges memory the allocator
+does not report.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
 around folding stored usage families into heads.
 
@@ -388,17 +407,14 @@ they reset at process start and never decide anything.
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
 | `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is not in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
 | `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
-| `tail_refold{reason}` | A file selected for late evidence on an unchanged transcript (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) re-folded from stored state with 0 transcript bytes, and its body was not the ACKed one: sent as an ordinary update on the head CAS, the body a native read sends. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead. |
+| `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
 | `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
-
-`tail_restart_full_alarm` is emitted on the first reconstruction after a head,
-then at most once per 24 h; the time is RAM only, so a restart alarms again.
 
 `tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
 directory beside a scan index. Each pass removes the record directory alone
@@ -415,7 +431,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | Old | New or retired |
 |---|---|
 | `store_write_failed_restart_full[files,bytes]` (upper bound) | `tail_reconstruct`, `tail_reconstruct_bytes`, `tail_reconstruct_after_head` (exact) |
-| `durable_tail_restart_full_alarm` | `tail_restart_full_alarm` |
+| `durable_tail_restart_full_alarm` | retired: `tail_reconstruct_after_head` counts each case |
 | `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
 | `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
@@ -429,42 +445,22 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `retail_*`, `stale_full`, `pace_anomaly`, `pace_evicted`, `upgrade_missing_full`, `d3`, `restore_pending_quiet` | Retired with their mechanisms |
 | `store_disabled`, `t14_*`, `mode_repaired`, `stale_record_refused`, `temp_*`, `resource_pause*`, `memo_evicted`, `receipt_*`, `uninventoried_records`, `owed_overflow_discovery_only`, `native_stage_skipped`, `restore_unavailable_*` | Retired, `.rec` mechanics. A corrupt row is `tail_reconstruct{corrupt}`; the database owner's mode is the store's own |
 | `gc_*`, `rec_orphans_erased`, `native_class_*`, `records_invalidated`, `off_v1_*` | `tail_legacy_dir`, `tail_apply.retired`, the erasure epoch and deadline, `tail_reconstruct{identity}` |
-| `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
+| `private_label_*`, `skill_label_native_dropped` | Retired: local labels are data and consent filters upload only. Uninstall, identity-failure erasure and failed-purge alarms stay; source removal and forget keep local data |
 
 Not built, and so absent from the counters: `tail_candidate_owed`,
 `tail_set_aside_probe`.
 
-### Claude Census Retirement Overlap
+### Claude Census Holder Lifetime
 
-A complete Claude terminal retires transcript census records whose file was
-last modified more than 35 days before the census window. An aged record that
-shares a request id with another unretired census record is kept instead, so a
-resumed copy keeps its cross-session copy proof while both files stay indexed.
-The terminal then emits `claude_census_retire_kept_overlap` with
-`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
-`census_retire_kept_overflow` and its two reasons,
-`census_retire_kept_overflow_occupancy` and
-`census_retire_kept_overflow_admission`, each with a `_total` process total,
-and `census_missing_over_budget`: the same terminal's census-full tombstone
-count (the shadow's `missing_over_budget`), so both read together.
-Kept records stay while the census, after the other aged records retire, is
-at most 90% full by both its hash budget and its serialized budget. Above
-that, the oldest kept records (equal ages in path order) retire until it is
-back at 90%, counted as occupancy overflow, so one index always yields one
-kept set. Kept records never cost another record its admission: a transcript
-record that does not fit whole first retires, oldest first, the records the
-age rule would retire at that window but that still hold their hashes, only
-as many as it needs; if retiring all of them would still not admit it, none
-retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
-`census_missing_over_budget`, and the records it retired as admission
-overflow. The census holds at most 65,536 records, live as on load: a new
-transcript key past that gets no record (read as missing) and emits a row
-with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
-Every row carries `census_record_limit_refused` and its `_total`. A positive
-overflow, by either reason, or a positive refusal also emits
-`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
-decides again, so a kept record retires once its partner is pruned or
-retired. Counts only; no path, id or wire event.
+A Claude transcript census record lives while its file is indexed or is held
+new custody; it is dropped, with its file's money marks and stored copy
+removals, only when the file leaves the index. No age, overlap, occupancy or
+size rule retires, refuses or strips a record, and the census and the stored
+copy removals have no capacity limit. The one signal is the occupancy alarm on
+the retained-heap line: `census_hashes`, the request hashes the census holds,
+and `census_occupancy_alarm`, true once they reach 75% of 2,097,152. Records an
+older release stored retired (no request ids) or over budget keep that shape
+until their file is re-read. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
@@ -566,8 +562,8 @@ written. Counts saturate at `u64::MAX`.
 
 `counts.line_delivery` is keyed by the fixed name of the page's one registered
 line observer, for example `{"footprint": {...}}`. The observer receives the
-physical lines the page's primary reads already consumed; proof, parent, side,
-group, native-comparison and one-shot reads deliver nothing. All values are
+physical lines the page's primary reads already consumed; group,
+native-comparison and one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
 
 - `lines`: newline-complete physical lines delivered, including blank,
@@ -582,8 +578,7 @@ page events, not gauges, and are never summed across observers:
 
 **Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
 one shared exemption from the discovery window, used by every age gate: the
-Claude/Pi walk, candidate revalidation and open, the Codex roster and
-`codex_parent_outside_window`. A key owed by a registered source stays
+Claude/Pi walk, candidate revalidation and open, and the Codex roster. A key owed by a registered source stays
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
@@ -598,10 +593,14 @@ observations are retired with whole-file refusal. `last_oversized_file_count`
 remains on the wire and emits zero. Saved refusal debt stays decodable and is
 cleared after load through the ordinary save path.
 
-The `local_resources` stage `file_size` reports the process high-water
-`largest_file_bytes` per source, with `file_over_1gib` on that same record.
-`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
-and existing footprint observations through native finish. Existing
+`native_collection_page` carries nonzero page scalars `largest_file_bytes`
+(the largest file listed or read since the source's previous page),
+`first_read_files` (files new to the index whose read finished) and
+`first_read_max_ms` (the slowest of those reads). The former per-file
+`first_read` window and `file_size` point, with `first_read_over_300s` and
+`file_over_1gib`, are retired. `hold_wake` (`keys`, `oldest_expired_secs`)
+counts expired growth claims selection woke since the previous page, replacing
+the per-pass `hold_wake` point. Existing
 `bounded_traversal_transition` records report `max_unread_bytes` on retirement
 or in `previous` when replacing a traversal, with no per-file log emissions.
 This traversal maximum uses disk length minus the last native checkpoint's size
@@ -613,14 +612,17 @@ or identities and never gate reads.
 
 `counts.line_delivery_unselected.age` counts a discovery decision outside the
 window without an owed-growth, verification or unresolved-account exemption.
-It is drained by that source's completed page, whether or not an observer is
-registered, and counts decisions rather than distinct files or bytes.
+`counts.line_delivery_unselected.first_read_age` counts a file not admitted for
+its first read: no read evidence, committed debt or queued read, and modified
+more than 60 days before the census. Files already read keep the window above.
+Both are drained by that source's completed page, whether or not an observer is
+registered, and count decisions rather than distinct files or bytes.
 
 `DiscoveryRetention::owes_with_len` also retains a file whose current length
 exceeds its committed indexed `size_bytes`, using metadata already available at
 the age gate. Grown since committed: retention ends when the growth is committed
 (`size_bytes` catches up). Untouched and truncated files gain no exemption. This
-covers the walk, candidate/open rechecks, Codex roster and opened parent.
+covers the walk, candidate/open rechecks and Codex roster.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by
 source on the #799 page line, drained per page and omitted at zero. It counts
 one event per gate check, even if another retention source also matches; a file
@@ -891,8 +893,9 @@ bounded-lifetime release remains a SOURCE follow-up.
 
 After each source's `native_collection_page` line, a `native_change_reasons`
 line carries `counts.change_reasons` when any count is nonzero (its own line
-keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
-local diagnostics only; they gate, cap and upload nothing.
+keeps the page line under its size bound): nonzero counts of why a body was
+read or uploaded, by one first cause. They are local diagnostics only; they
+gate, cap and upload nothing.
 
 - **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
@@ -907,10 +910,9 @@ local diagnostics only; they gate, cap and upload nothing.
   `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
   Placement is known only for Claude with complete accepted state; else `u`.
   An exact resend of a held, refused or catch-up body takes its delivery cause.
-- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
-  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
-  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
-  why.
+- **`read`** (per file): per cause, `files`, `native_bytes` and
+  `validation_bytes`. How a file was read stays in
+  `sampled_acquisition.page_events.full_reasons`.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
@@ -1316,8 +1318,8 @@ facts as well as telemetry. Native transcript duplicates retain a structural
 veto even under an unrelated invalid family. A stable native copy keeps vetoing every due terminal by design.
 `counts.rearm_structural_native_duplicate` counts due closed-fence terminals
 where this native-duplicate veto is present (other vetoes may coexist). It is
-sparse, saturating and count-only. Unique appends, unique new sessions/members
-and routine census retirement do not enter a scheduling projection: no such
+sparse, saturating and count-only. Unique appends and unique new
+sessions/members do not enter a scheduling projection: no such
 projection is added. Telemetry duplicate rows/multi-root claims alone do not
 activate this native veto. Strict loader/read-health failures remain retryable even when their malformed rows would also fail a
 semantic reducer. No extra reader, output stream or persisted diagnostic state
@@ -1677,12 +1679,12 @@ sessions, decoded bytes or money. No path or session id is included.
 | Cause | Unsupported boundary |
 | --- | --- |
 | `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
-| `CompressedProofParentUnsupported` | Proof parent reader |
-| `CompressedProofChildUnsupported` | Proof child reader |
-| `CompressedParentSideUnsupported` | Parent side acquisition |
+| `CompressedProofParentUnsupported` | Retired proof parent reader; not emitted by current builds |
+| `CompressedProofChildUnsupported` | Retired proof child reader; not emitted by current builds |
+| `CompressedParentSideUnsupported` | Retired parent side acquisition; not emitted by current builds |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Parent rollout is compressed and cannot supply ledger evidence, or the shared ownership parser held an ordinary archive fork after Full decoding without proven parent-prefix evidence |
+| `CompressedParentLedgerUnbound` | Retired parent-ledger hold; not emitted by current builds. A compressed legacy user fork counts best effort like a plain one |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
@@ -1695,7 +1697,7 @@ legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
 retained → cursor before taking the durable Stores leaf lock. It keeps a
-fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
+fixed admission floor (one 8 MiB primary entry) free
 for primary Tail reads and never charges retained bytes twice. When free room is
 short and the claim can fit beside the whole cursor state, it reclaims optional
 header facts, then releases retained copies, counted in
@@ -1788,7 +1790,7 @@ scalar remain separate from S and the bucket partition.
 | --- | --- |
 | 1. `inventory_hold` | Compound A1/group-preparation refusal: group member count. Incomplete-inventory remaining-singleton clear: remaining candidate count. |
 | 2. `other_group_receipt_legacy` | Strict group member count; one per terminal member disclosure or failed tier replay candidate; receipt-cap alias members (minimum one); incomplete joined-replacement alias members; distinct affected keys per legacy-hold invocation. |
-| 3. `parent_unresolvable` | One per held parsed rollout with an exact parent cause, including Absent, DeferredRef and DeferredRestart. |
+| 3. `parent_unresolvable` | Retired: no current build increments it, because no rollout is held for its parent. The slot stays for decode compatibility and reads zero. |
 | 4. `created_thread_proof` | One per held parsed rollout in the native-created-thread-only path, including failed parentless A2 conjuncts, after parent precedence. |
 | 5. `protected_absent` | Newly missing protected path index keys excluded by the existing traversal residue set. |
 | 6. `other_parser` | One per remaining ownership-incomplete parsed rollout. |
@@ -2000,12 +2002,11 @@ Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`,
 on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
-`save_payload_alarm` (>32 MiB), `save_page_reduced` and the existing WAL alarm
-(>64 MiB) flag pressure without splitting a save. `save_ceiling_alarm` records
-charged bytes with `save_ceiling_cause`: `charged_work` above 256 MiB alarms while
-the complete valid save commits; `value_admission` for one row over its physical
-limit (64 MiB, or a kind's smaller fixed limit) still refuses the save. At page size one, a value-admission failure raises
-`save_oversize_alarm` and `state_v2_save_oversize` holds the source. `sqlite_full` counts disk-full failures;
+`save_page_reduced` and the existing WAL alarm (>64 MiB) flag pressure without
+splitting a save; the complete valid save commits. A row over the 64 MiB decode
+bound refuses that save as `state_v2_db_unavailable` (`db_unavailable_cause` at
+`state_v2_value_admission`), reloads and retries next pass; a Tail-staged (Claude)
+file is set aside alone. `sqlite_full` counts disk-full failures;
 `state_v2_sqlite_full` holds uploads through rollback/reload until a save succeeds.
 `path_diff_conservative` (`bytes`, `rows`) records a save whose replaced-row
 string diff passed its 32 MiB memory budget: the save commits and requires

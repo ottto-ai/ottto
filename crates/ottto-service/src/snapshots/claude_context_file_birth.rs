@@ -41,114 +41,67 @@ const MAX_TELEMETRY_PARTITION_DOUBLINGS: usize = 4;
 const MAX_CONTEXT_BASIS_VERSION_KEYS: usize = 16;
 const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 
-/// Claude Code versions verified to keep every copied record's original
-/// timestamp when they write a copy (`/branch`, `/resume` copy, fork). Only
-/// such a writer lets the money birth rule skip pre-birth records; any other
-/// or mixed writer counts and discloses them.
-///
-/// Frozen. Never append (an append re-enables a copy route for new resumes).
-/// An unlisted version takes request-id proof instead (`Holders`, and the
-/// same-session page proof for a path twin). Append-only is only a decode
-/// guarantee for stored heads: `ClaudeWriterRun` stores a position and
-/// `ClaudeOwnWriters` one slot per entry, so an insert, reorder or removal
-/// would silently remap stored writers.
-pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
-
-/// Sticky response writer certificate. Zero = no responses, 255 = invalid.
-/// A missing/unknown version or two different known writers invalidates it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudeWriterRun(u8);
-crate::durable_tail_codec::durable_struct!(ClaudeWriterRun(N x0: u8));
-impl ClaudeWriterRun {
-    fn observe(&mut self, version: Option<&str>) {
-        let id = version
-            .and_then(|v| KNOWN_COPY_WRITERS.iter().position(|k| *k == v))
-            .map_or(255, |i| i as u8 + 1);
-        self.0 = if self.0 == 0 || self.0 == id { id } else { 255 };
-    }
-    fn certified(self) -> bool {
-        self.0 != 0 && self.0 != 255
-    }
-}
-crate::heap_layout_bound::no_heap!(true; ClaudeWriterRun);
-
-/// Money only: the writer certificate of the lines at or after a cutoff that
-/// finalize decides (the EFFECTIVE money birth, earlier than the physical
-/// birth after a proven move), not only the physical birth. `others[k]` is
-/// the latest line (untimed: `i64::MAX`) NOT written by
-/// `KNOWN_COPY_WRITERS[k]`, `latest` the latest line of any writer. Lines at
-/// or after T are certified by writer k iff `latest >= T && others[k] < T`.
+/// A retired stored scalar: decoded and dropped, written as `NEUTRAL` (the
+/// value the last writer started from), so a stored head keeps its layout
+/// and still loads. Nothing reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClaudeOwnWriters {
-    latest: i64,
-    others: ClaudeWriterSlots,
+struct Retired<T>(std::marker::PhantomData<T>);
+trait Neutral {
+    const NEUTRAL: Self;
 }
-type ClaudeWriterSlots = [i64; KNOWN_COPY_WRITERS.len()];
-/// Stored as `latest`, then `others` with its length (`GrownArray`), so a
-/// head written before a writer was appended still loads. The appended slot
-/// takes the stored `latest`: a stored line from that version was observed
-/// while it was unlisted, which moved every listed slot (`observe`), so no
-/// stored line is known to be the new writer's own. The listed slots keep
-/// their values, so a stored certificate stays as it was.
-impl crate::durable_tail_codec::Durable for ClaudeOwnWriters {
+impl Neutral for i64 {
+    const NEUTRAL: Self = i64::MIN;
+}
+impl Neutral for u8 {
+    const NEUTRAL: Self = 0;
+}
+impl<T> Default for Retired<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<T: crate::durable_tail_codec::Durable + Neutral> crate::durable_tail_codec::Durable
+    for Retired<T>
+{
     fn put(
         &self,
         e: &mut crate::durable_tail_codec::Enc,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        <i64 as crate::durable_tail_codec::Durable>::put(&self.latest, e)?;
-        crate::durable_tail_codec::GrownArray::put_grown(&self.others, e)
+        <T as crate::durable_tail_codec::Durable>::put(&T::NEUTRAL, e)
     }
     fn take(
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
-        let latest = <i64 as crate::durable_tail_codec::Durable>::take(d)?;
-        let others =
-            <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::take_grown(d, || latest)?;
-        Ok(Self { latest, others })
+        T::take(d).map(|_| Self::default())
     }
     fn verify(
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
-        <i64 as crate::durable_tail_codec::Durable>::verify(d)?;
-        <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::verify_grown(d)
+        T::verify(d)
     }
     fn shape(s: &mut crate::durable_tail_codec::Shape) {
-        if s.enter("ClaudeOwnWriters") {
-            s.push("N latest");
-            <i64 as crate::durable_tail_codec::Durable>::shape(s);
-            s.push("G others");
-            <ClaudeWriterSlots as crate::durable_tail_codec::GrownArray>::shape_grown(s);
-            s.leave();
-        }
+        T::shape(s);
     }
 }
-impl Default for ClaudeOwnWriters {
-    fn default() -> Self {
-        Self {
-            latest: i64::MIN,
-            others: [i64::MIN; KNOWN_COPY_WRITERS.len()],
-        }
-    }
+
+/// Retired: the writer certificate (the latest line's time, then one slot
+/// per formerly listed writer version) earlier builds stored in the Tail head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeOwnWriters {
+    latest: Retired<i64>,
+    others: [Retired<i64>; 2],
 }
-impl ClaudeOwnWriters {
-    fn clamp(at: i128) -> i64 {
-        i64::try_from(at).unwrap_or(if at < 0 { i64::MIN } else { i64::MAX })
-    }
-    fn observe(&mut self, version: Option<&str>, at: Option<i128>) {
-        let at = at.map_or(i64::MAX, Self::clamp);
-        self.latest = self.latest.max(at);
-        for (other, known) in self.others.iter_mut().zip(KNOWN_COPY_WRITERS) {
-            if version != Some(*known) {
-                *other = (*other).max(at);
-            }
-        }
-    }
-    fn certified_from(self, cutoff: i128) -> bool {
-        let cutoff = Self::clamp(cutoff);
-        self.latest >= cutoff && self.others.iter().any(|other| *other < cutoff)
-    }
-}
-crate::heap_layout_bound::no_heap!(true; ClaudeOwnWriters);
+crate::durable_tail_codec::durable_struct!(ClaudeOwnWriters {
+    N latest: Retired<i64>,
+    G others: [Retired<i64>; 2],
+});
+crate::heap_layout_bound::no_heap!(true; ClaudeOwnWriters { latest, others });
+
+/// Retired: one stored writer byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeWriterRun(Retired<u8>);
+crate::durable_tail_codec::durable_struct!(ClaudeWriterRun(N x0: Retired<u8>));
+crate::heap_layout_bound::no_heap!(true; ClaudeWriterRun);
 
 /// Open-descriptor metadata, also used by the page's one metadata probe per twin.
 /// A zero inode means unavailable; no timestamp or file identity is invented.
@@ -240,7 +193,7 @@ pub(crate) struct ClaudeFileBirth {
     own_last_context: Option<u64>,
     /// A tagged response came before the first own response.
     tagged_before_first_own: bool,
-    /// Money only: the writer versions of the file's lines by time.
+    /// Retired, kept in the stored layout (decoded and discarded).
     writer: ClaudeOwnWriters,
     all_response_writers: ClaudeWriterRun,
     opened: ClaudeOpenedBirth,
@@ -351,7 +304,7 @@ impl ClaudeFileBirth {
         let ClaudeBirthScope::Root(birth) = self.scope else {
             return None;
         };
-        Some(at? < birth.checked_sub(slack)?)
+        before_birth(at?, birth, slack)
     }
 
     pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
@@ -395,40 +348,6 @@ impl ClaudeFileBirth {
         (self.opened.birth != 0)
             .then_some(i128::from(self.opened.birth))
             .or_else(|| self.birth_nanos())
-    }
-
-    /// Called only for usage-bearing response records, never headers/tool lines.
-    /// Copied prefix versions cannot certify a later response missing its own version.
-    pub(in crate::snapshots) fn observe_response_writer(
-        &mut self,
-        version: Option<&str>,
-        timestamp: Option<&str>,
-    ) {
-        self.all_response_writers.observe(version);
-        // An untimed response cannot prove it belongs to the copied prefix;
-        // it counts conservatively among the own responses of every cutoff.
-        self.writer
-            .observe(version, timestamp.and_then(rfc3339_unix_nanos));
-    }
-
-    /// Own lines are those at or after THIS birth's money cutoff (minus
-    /// slack), the same split `copied_with_slack` makes for money.
-    pub(in crate::snapshots) fn writer_certified(&self, first_own_sequence: Option<u64>) -> bool {
-        if first_own_sequence.is_some() {
-            self.birth_nanos().is_some_and(|birth| {
-                self.writer
-                    .certified_from(birth - super::claude_request_money::e2::SLACK)
-            })
-        } else {
-            // Restored all-pre-birth files have no own run. Require a known
-            // version on EVERY response, never a header or inherited version.
-            self.all_response_writers.certified()
-        }
-    }
-
-    /// Read through the Claude transcript parser.
-    pub(super) fn observed(&self) -> bool {
-        self.scope != ClaudeBirthScope::NotObserved
     }
 
     fn root_with_birth(&self) -> bool {
@@ -559,6 +478,61 @@ pub(super) fn apply_own_context_scalars(
         .saturating_add(id_less.after);
 }
 
+/// Cache rows only: each item's content birth, the provider time of its
+/// first own response (`e2::first_own_turn_at`). That response is at or after
+/// the first one this rule counts as own, and no earlier file of the same
+/// family on the page holds its request id: a subagent copy's prefix stays
+/// with the file it was copied from. Earlier means an earlier first
+/// response, then the lower session id: content only, so cold, Tail and
+/// restored reads agree. `None` when no own response has a readable time.
+pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
+    use super::claude_request_money::e2::{earlier_holders, first_own_turn_at};
+    let order = items
+        .iter()
+        .map(|item| {
+            (
+                first_own_turn_at(item, 0, &[]),
+                item.source_session_id.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut families = BTreeMap::<&str, Vec<usize>>::new();
+    for (at, item) in items.iter().enumerate() {
+        families
+            .entry(claude_snapshot_family_root_ref(item))
+            .or_default()
+            .push(at);
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let earlier = earlier_holders(
+                items,
+                &families[claude_snapshot_family_root_ref(item)],
+                &order[at],
+                |other| Some(order[other]),
+            );
+            first_own_turn_at(item, item.claude_file_birth.first_own_sequence?, &earlier)
+        })
+        .collect()
+}
+
+/// A cache request is the file's own unless its provider time is more than
+/// the copy slack before the content birth. An unreadable time is kept, so
+/// the wire makes the session partial instead of dropping it.
+pub(super) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
+    rfc3339_unix_nanos(occurred_at).map_or(true, |at| {
+        before_birth(at, birth, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) != Some(true)
+    })
+}
+
+/// Whether `at` is more than `slack` before `birth`; `None` when that bound
+/// does not fit.
+fn before_birth(at: i128, birth: i128, slack: i128) -> Option<bool> {
+    Some(at < birth.checked_sub(slack)?)
+}
+
 /// When the session's first own request ended (`first_own_request_at`): only for
 /// a root file whose birth was measured and
 /// whose first own request follows no copied record. Read from values the
@@ -666,26 +640,20 @@ impl ClaudeTelemetryTripwire {
         api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
         trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
         veto_api_rows: &ClaudeVetoApiRows,
-        joins: impl Fn(&str) -> bool,
     ) -> Self {
         let rows = || {
             let api = api_report
                 .evidence
                 .iter()
                 .chain(veto_api_rows)
-                .filter(|(root, _)| joins(root))
                 .flat_map(|(root, rows)| {
                     rows.iter()
                         .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
                 });
-            let trace = trace_report
-                .evidence
-                .iter()
-                .filter(|(root, _)| joins(root))
-                .flat_map(|(root, rows)| {
-                    rows.iter()
-                        .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
-                });
+            let trace = trace_report.evidence.iter().flat_map(|(root, rows)| {
+                rows.iter()
+                    .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+            });
             api.chain(trace)
                 .filter_map(|(root, session_id, request_id)| {
                     TelemetryRow::of(root, session_id, request_id)
@@ -974,8 +942,6 @@ pub(super) fn remembered_tripwire() -> std::sync::MutexGuard<'static, ClaudeReme
 pub struct ClaudeContextBasisCounts {
     /// Responses and compaction boundaries tagged as copied by file birth.
     pub tagged_record_count: u64,
-    /// Scalars from a provider-proven start (the strict rule).
-    pub proof_basis_session_count: usize,
     /// Scalars admitted by the file birth rule.
     pub file_birth_rule_session_count: usize,
     /// File-birth admissions whose every kept request telemetry assigned to
@@ -1004,34 +970,24 @@ impl ClaudeContextBasisCounts {
         if partially {
             self.partially_pre_birth_session_count += 1;
         }
-        let counter = match outcome {
-            ContextBasisOutcome::Proof => &mut self.proof_basis_session_count,
-            ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) => {
-                if confirmed {
-                    self.telemetry_confirmed_session_count += 1;
-                }
-                if remembered {
-                    self.withheld_tripwire_remembered_session_count += 1;
-                }
-                match verdict {
-                    ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
-                    ClaudeFileBirthVerdict::UnknownBirth => {
-                        &mut self.withheld_unknown_birth_session_count
-                    }
-                    ClaudeFileBirthVerdict::UntimedRecord => {
-                        &mut self.withheld_untimed_record_session_count
-                    }
-                    ClaudeFileBirthVerdict::AllCopied => {
-                        &mut self.withheld_all_copied_session_count
-                    }
-                    ClaudeFileBirthVerdict::MultiFile => {
-                        &mut self.withheld_multi_file_session_count
-                    }
-                    ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
-                    ClaudeFileBirthVerdict::EvidenceBound => {
-                        &mut self.withheld_evidence_bound_session_count
-                    }
-                }
+        let ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) = outcome;
+        if confirmed {
+            self.telemetry_confirmed_session_count += 1;
+        }
+        if remembered {
+            self.withheld_tripwire_remembered_session_count += 1;
+        }
+        let counter = match verdict {
+            ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
+            ClaudeFileBirthVerdict::UnknownBirth => &mut self.withheld_unknown_birth_session_count,
+            ClaudeFileBirthVerdict::UntimedRecord => {
+                &mut self.withheld_untimed_record_session_count
+            }
+            ClaudeFileBirthVerdict::AllCopied => &mut self.withheld_all_copied_session_count,
+            ClaudeFileBirthVerdict::MultiFile => &mut self.withheld_multi_file_session_count,
+            ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
+            ClaudeFileBirthVerdict::EvidenceBound => {
+                &mut self.withheld_evidence_bound_session_count
             }
         };
         *counter += 1;
@@ -1040,7 +996,6 @@ impl ClaudeContextBasisCounts {
 
 #[derive(Debug, Clone, Copy)]
 enum ContextBasisOutcome {
-    Proof,
     /// Verdict, telemetry confirmed, tripwire remembered from an earlier fold.
     FileBirth(ClaudeFileBirthVerdict, bool, bool),
 }
@@ -1088,8 +1043,7 @@ impl ClaudeContextFileBirthCounts {
         let tagged = birth
             .tagged_responses
             .saturating_add(birth.tagged_boundaries(&item.claude_context_curve_boundaries));
-        let partially = matches!(outcome, ContextBasisOutcome::FileBirth(..))
-            && birth.partially_pre_birth(&item.claude_context_curve_boundaries);
+        let partially = birth.partially_pre_birth(&item.claude_context_curve_boundaries);
         self.total.record(outcome, tagged, partially);
         let version = item
             .session_start
@@ -1115,10 +1069,6 @@ impl ClaudeContextFileBirthCounts {
             .record(outcome, tagged, partially);
     }
 
-    pub(super) fn record_proof(&mut self, item: &SnapshotItem) {
-        self.record(item, ContextBasisOutcome::Proof);
-    }
-
     /// Count one body the fold left without the v1 contract (R9).
     pub(super) fn record_contractless(&mut self, item: &SnapshotItem, witness_present: bool) {
         let carries_scalars = item.peak_context_fill_tokens.is_some()
@@ -1136,16 +1086,9 @@ impl ClaudeContextFileBirthCounts {
     }
 }
 
-#[cfg(not(test))]
-static RESOURCE_WITHHOLD_ALARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 // Tests share one process, so each test thread keeps its own latch.
-#[cfg(test)]
-thread_local! {
-    static RESOURCE_WITHHOLD_ALARMED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
+crate::local_resource_diagnostics::process_static!(fn with_resource_withhold_alarmed:
+    std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 #[derive(Serialize)]
 struct ResourceWithholdAlarm {
@@ -1160,10 +1103,9 @@ pub(super) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCount
     if !counts.resource_withheld() {
         return;
     }
-    #[cfg(not(test))]
-    let alarmed = RESOURCE_WITHHOLD_ALARMED.swap(true, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    let alarmed = RESOURCE_WITHHOLD_ALARMED.with(|alarmed| alarmed.replace(true));
+    let alarmed = with_resource_withhold_alarmed(|alarmed| {
+        alarmed.swap(true, std::sync::atomic::Ordering::Relaxed)
+    });
     if !alarmed {
         crate::local_resource_diagnostics::claude_context_resource_withhold(
             &ResourceWithholdAlarm {
@@ -1358,32 +1300,18 @@ impl ClaudeFileBirth {
     pub(crate) fn tagged_responses_for_test(&self) -> u64 {
         self.tagged_responses
     }
+}
 
-    pub(crate) fn set_writer_for_test(
-        &mut self,
-        latest: i64,
-        others: [i64; KNOWN_COPY_WRITERS.len()],
-    ) {
-        self.writer = ClaudeOwnWriters { latest, others };
-    }
-
-    pub(crate) fn writer_for_test(&self) -> (i64, [i64; KNOWN_COPY_WRITERS.len()]) {
-        (self.writer.latest, self.writer.others)
-    }
-
-    pub(crate) fn writer_certified_from_for_test(&self, cutoff: i128) -> bool {
-        self.writer.certified_from(cutoff)
-    }
-
-    /// The writer's stored bytes as a build with `slots` writers wrote them.
-    pub(crate) fn writer_bytes_for_test(&self, slots: usize) -> Vec<u8> {
-        let mut e = crate::durable_tail_codec::Enc::bytes(1 << 10);
-        crate::durable_tail_codec::Durable::put(&self.writer.latest, &mut e).unwrap();
-        let mut out = e.into_bytes();
-        out.extend(crate::durable_tail_codec::grown_bytes_for_test(
-            &self.writer.others,
-            slots,
-        ));
-        out
-    }
+/// The retired writer field's stored bytes: `latest`, then `slots` entries
+/// of `others` (cycled), as a build listing that many writers stored them.
+#[cfg(test)]
+pub(crate) fn retired_writer_bytes_for_test(latest: i64, others: &[i64], slots: usize) -> Vec<u8> {
+    let mut out = crate::durable_tail_codec::Enc::count_write(1 << 10, |e| {
+        crate::durable_tail_codec::Durable::put(&latest, e)
+    })
+    .unwrap();
+    out.extend(crate::durable_tail_codec::grown_bytes_for_test(
+        others, slots,
+    ));
+    out
 }

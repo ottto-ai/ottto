@@ -89,8 +89,8 @@ pub(super) fn structural_read_error(error: &anyhow::Error) -> bool {
 pub(super) const UNKNOWN_ARCHIVE_SCOPE: &str = "archive_metadata_unknown";
 
 /// Paces only committed outcomes another read cannot change: a structural refusal
-/// with no decoded byte, a decode refused on its parent, and a complete decode
-/// whose exact ACK is unproven. Unfinished work has no clock: archives are
+/// with no decoded byte, a held decode, and a complete decode whose exact ACK is
+/// unproven. Unfinished work has no clock: archives are
 /// immutable, so it retries on the next pass.
 const HELD_RETRY_SECONDS: u64 = 21600;
 
@@ -265,8 +265,8 @@ impl ArchiveEvidence {
                 }
         })
     }
-    /// Whether a Full may be reserved. A decode refused on its parent also waits,
-    /// without becoming quiet; a resource refusal never does.
+    /// Whether a Full may be reserved. A held decode also waits, without
+    /// becoming quiet; a resource refusal never does.
     pub(super) fn full_paced(&self) -> bool {
         self.body_paced()
             || matches!(self.disposition, ArchiveDisposition::Held { cause, .. } if cause != CodexZstCause::AdmissionRefused)
@@ -410,16 +410,6 @@ impl ArchiveEvidence {
     pub(super) fn finish(&mut self, owner: Option<&str>, parsed: &super::ParsedJsonlFile) -> bool {
         if owner.is_none() || self.header().map(|h| h.owner.as_str()) != owner {
             self.transition(ArchiveTransition::Structural(CodexZstCause::OwnerUnproven));
-            return false;
-        }
-        if parsed.codex_parent_resolution_pending || parsed.codex_parent_unresolvable.is_some() {
-            self.transition(ArchiveTransition::Correctness(
-                CodexZstCause::ParentLedgerUnbound,
-            ));
-            if let Some(w) = self.work.as_mut() {
-                w.retry_after =
-                    super::sampled_scan::now_seconds().saturating_add(HELD_RETRY_SECONDS);
-            }
             return false;
         }
         if !parsed.complete() || parsed.zero_snapshot_usage_evidence {
@@ -1249,7 +1239,6 @@ pub(in crate::snapshots) mod tests {
             apply_codex_line,
             Some(&CodexTitleMetadata::default()),
             None,
-            None,
         )
         .unwrap()
     }
@@ -1746,9 +1735,8 @@ pub(in crate::snapshots) mod tests {
         serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
     }
 
-    /// [money] Standalone native ownership reads once. Ordinary forks reach
-    /// the shared parser and fail closed without a bound parent ledger;
-    /// claimants, damaged headers and unresolved roots owe no Full decode.
+    /// [money] Standalone native ownership and legacy user forks read once.
+    /// Claimants, damaged headers and unresolved roots owe no Full decode.
     /// Paid damaged-header attempts retain their cause and deadline across
     /// funded/unfunded passes and restart without physical re-reads.
     #[test]
@@ -1760,8 +1748,7 @@ pub(in crate::snapshots) mod tests {
             ("standalone", None),
             ("plain", Some(CodexZstCause::ArchiveEquivalenceUnproven)),
             ("sibling", Some(CodexZstCause::FamilyUnproven)),
-            ("parent", Some(CodexZstCause::ParentLedgerUnbound)),
-            ("stale-parent", Some(CodexZstCause::ParentLedgerUnbound)),
+            ("parent", None),
             ("root", Some(CodexZstCause::OwnerUnproven)),
             ("damaged", Some(CodexZstCause::HeaderInvalid)),
         ] {
@@ -1770,7 +1757,7 @@ pub(in crate::snapshots) mod tests {
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
-            if matches!(case, "parent" | "stale-parent") {
+            if case == "parent" {
                 rows[0]["payload"]["forked_from_id"] = json!("unresolved-parent");
             }
             let bytes = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
@@ -1815,20 +1802,6 @@ pub(in crate::snapshots) mod tests {
                     .legacy_unresolved_root_file_witnesses
                     .insert("unresolved-root".into());
             }
-            if case == "stale-parent" {
-                scan.index.codex_parent_ownership_ledgers.insert(
-                    "unresolved-parent".into(),
-                    CodexParentOwnershipLedger {
-                        signatures: vec!["stale".into()],
-                        scan_complete: true,
-                        opened_object_identity: "stale-object".into(),
-                        opened_changed_nanos: 0,
-                        opened_modified_nanos: 0,
-                        opened_birth_nanos: 0,
-                        unresolvable: None,
-                    },
-                );
-            }
             let checkpoint = fixture(b"", ".json");
             fs::remove_file(&checkpoint.0).unwrap();
             let ((index, result), logs) =
@@ -1836,21 +1809,7 @@ pub(in crate::snapshots) mod tests {
             let key = local_index_key(&f.0);
             if let Some(cause) = cause {
                 assert_eq!(index.archives[&key].owed_cause(), Some(cause), "{case}");
-                assert_eq!(
-                    full_decodes(&logs),
-                    usize::from(matches!(case, "parent" | "stale-parent")),
-                    "{case}"
-                );
-                if matches!(case, "parent" | "stale-parent") {
-                    assert!(
-                        result.snapshots.is_empty(),
-                        "held fork emits no copied prefix: {case}"
-                    );
-                    let work = index.archives[&key].work.as_ref().unwrap();
-                    assert_eq!(work.attempts, 1);
-                    assert!(work.retry_after > sampled_scan::now_seconds());
-                    assert!(index.archives[&key].full_paced());
-                }
+                assert_eq!(full_decodes(&logs), 0, "{case}");
                 assert_eq!(
                     result.unreadable_path_count, 0,
                     "archive debt stays out of plain errors"
@@ -1947,22 +1906,23 @@ pub(in crate::snapshots) mod tests {
                 });
                 assert_eq!(full_decodes(&quiet), 0, "{case}");
             } else {
-                assert_eq!(result.snapshots.len(), 1);
-                assert_eq!(result.snapshots[0].input_tokens, 750);
-                assert_eq!(full_decodes(&logs), 1);
+                assert_eq!(result.snapshots.len(), 1, "{case}");
+                assert_eq!(result.snapshots[0].input_tokens, 750, "{case}");
+                assert_eq!(full_decodes(&logs), 1, "{case}");
             }
         }
     }
-    /// [regress] Non-ledger children use the shared ownership parser even
-    /// after restart from an old parent-held header. Plain/archive money and
-    /// placement agree; ordinal children never charge the inherited prefix.
+    /// [regress] Fork children, legacy user forks included, use the shared
+    /// ownership parser even after restart from an old parent-held header.
+    /// Plain/archive money and placement agree; ordinal children never charge
+    /// the inherited prefix.
     #[test]
     fn archive_nonledger_children_resume_through_shared_ownership() {
         use sampled_scan::transition_fixture::{money_oracle, scan_money, Mode, RouteResult};
         let _lock = DECODER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for kind in ["subagent", "ordinal", "history_base"] {
+        for kind in ["subagent", "ordinal", "history_base", "legacy"] {
             let mut rows: Vec<Value> = String::from_utf8(synthetic_rollout())
                 .unwrap()
                 .lines()
@@ -1988,6 +1948,9 @@ pub(in crate::snapshots) mod tests {
                 }
                 "history_base" => {
                     rows[0]["payload"]["history_base"] = json!({"thread_id": "unresolved-parent"});
+                }
+                "legacy" => {
+                    rows[0]["payload"]["forked_from_id"] = json!("unresolved-parent");
                 }
                 _ => unreachable!(),
             }
@@ -2029,7 +1992,6 @@ pub(in crate::snapshots) mod tests {
                 index.archives[&key].owed_cause(),
                 Some(CodexZstCause::ParentLedgerUnbound)
             );
-            assert!(index.codex_parent_ownership_ledgers.is_empty());
             assert_eq!(
                 result.snapshots[0].input_tokens,
                 if kind == "ordinal" { 650 } else { 750 }
@@ -2068,7 +2030,7 @@ pub(in crate::snapshots) mod tests {
             );
             assert_eq!(
                 items[0].session_account_evidence.is_some(),
-                kind != "history_base"
+                !matches!(kind, "history_base" | "legacy")
             );
             let mut batch = crate::snapshots::tests::valid_v6_batch_request();
             batch.source = SnapshotSource::Codex.api_slug().into();
@@ -3773,7 +3735,7 @@ pub(in crate::snapshots) mod tests {
         for label in ["stable", "r1"] {
             let (index, origin) =
                 ScanIndex::load_inner(&root.join(format!("{label}.json")), None).unwrap();
-            assert!(matches!(origin, LoadOrigin::Loaded(_)));
+            assert!(matches!(origin, LoadOrigin::Loaded));
             assert_eq!(index.files.len(), 2);
             assert_eq!(
                 index.file_snapshot_fingerprints,
@@ -3892,17 +3854,6 @@ pub(in crate::snapshots) mod tests {
                 matches!(a.disposition, ArchiveDisposition::Empty),
                 !evidence
             );
-            if evidence {
-                // A decode refused on its parent waits without becoming quiet.
-                let mut held = ArchiveEvidence::from_metadata(fs::metadata(&f.0).unwrap()).unwrap();
-                held.work.as_mut().unwrap().header = a.work.as_ref().unwrap().header.clone();
-                held.transition(ArchiveTransition::Reserve);
-                held.work.as_mut().unwrap().decoded = true;
-                parsed.codex_parent_resolution_pending = true;
-                assert!(!held.finish(Some("compressed-fixture"), &parsed));
-                assert_eq!(held.owed_cause(), Some(CodexZstCause::ParentLedgerUnbound));
-                assert!(held.full_paced() && !held.quiet_disposition());
-            }
         }
     }
 }

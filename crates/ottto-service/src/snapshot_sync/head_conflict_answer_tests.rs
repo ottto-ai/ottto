@@ -913,3 +913,161 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
         progress.head_conflict_challenges
     );
 }
+
+/// The cycle's upload-context activation, on a copy of the ledger: whether
+/// the scan index then holds the session as owing an answer (its files read
+/// a native Full, never a Tail re-fold).
+fn mirrored(progress: &SnapshotUploadProgress, key: &str) -> bool {
+    let mut index = ScanIndex::default();
+    activate_source_upload_context(
+        SnapshotSource::Codex,
+        "a".repeat(64),
+        &mut index,
+        &mut progress.clone(),
+    );
+    index.head_conflict_owed(key)
+}
+
+/// The server's conditions on a POSTed envelope: `forced_full_rescan` is set
+/// exactly when `conflict_head_challenge` is, and then with the refused and
+/// current revision hashes, under the head-CAS contract and with no base.
+fn assert_rescan_claim(wire: &Value, answered: bool) {
+    let envelope = envelope(wire);
+    assert_eq!(envelope.get("forced_full_rescan").is_some(), answered);
+    assert_eq!(envelope.get("conflict_head_challenge").is_some(), answered);
+    if answered {
+        assert_eq!(envelope["forced_full_rescan"], true);
+        assert!(envelope["rescan_from_revision_hash"].is_string());
+        assert!(envelope["revision_hash"].is_string());
+        assert!(wire["head_cas_contract"].is_string(), "enforced head CAS");
+        assert!(envelope.get("base_head_etag").is_none(), "no expected head");
+    }
+}
+
+/// [money] D142(a) on the POSTed envelope: only the upload of a session that
+/// owes an answer carries the rescan claim, and that session is mirrored
+/// into the scan index, so the body was read by a native Full. Before the
+/// conflict and after the answer the session is not mirrored, so its files
+/// may re-fold, and none of those uploads carries `forced_full_rescan`.
+#[test]
+fn only_a_conflict_owed_native_full_carries_the_rescan_claim() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let mut progress = progress_with_stale_head(&item);
+    assert!(!mirrored(&progress, &key), "healthy: may re-fold");
+
+    let (_, refused) = cycle(&mut progress, &item, 1_000, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    assert_rescan_claim(&refused, false);
+    assert!(mirrored(&progress, &key), "owed: native Full");
+
+    let (result, answer) = cycle(&mut progress, &item, 1_001, |item| {
+        accepted(item, &"2".repeat(64))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_rescan_claim(&answer, true);
+    assert_eq!(envelope(&answer)["conflict_head_challenge"], challenge(0xc));
+    assert_eq!(
+        envelope(&answer)["rescan_from_revision_hash"],
+        revision_v2(&item)
+    );
+
+    assert!(!mirrored(&progress, &key), "answered: may re-fold again");
+    let (result, later) = cycle(&mut progress, &item, 1_002, |item| {
+        accepted(item, &"3".repeat(64))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_rescan_claim(&later, false);
+}
+
+/// A stale answer refused with a FRESH challenge: the daemon records the
+/// fresh challenge from that refusal, the session stays mirrored (its next
+/// read is a native Full), and exactly one later upload carries the fresh
+/// answer: not two, and never a re-fold's.
+#[test]
+#[serial_test::serial(client_report)]
+fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let mut progress = progress_with_stale_head(&item);
+    let _ = cycle(&mut progress, &item, 1_000, |item| {
+        conflict(item, &challenge(0xa))
+    });
+    let (result, stale) = cycle(&mut progress, &item, 1_001, |item| {
+        conflict(item, &challenge(0xb))
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert_eq!(envelope(&stale)["conflict_head_challenge"], challenge(0xa));
+    assert_eq!(
+        progress.head_conflict_challenges[&key].challenge,
+        challenge(0xb)
+    );
+    assert!(mirrored(&progress, &key));
+    assert!(
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint].retry_after_unix_seconds
+            <= current_unix_seconds(),
+        "the fresh answer is due at once"
+    );
+
+    let mut fresh_answers = 0;
+    for (at, head) in [(1_002, "2"), (1_003, "3"), (1_004, "4")] {
+        let owed = mirrored(&progress, &key);
+        let (result, wire) = cycle(&mut progress, &item, at, |item| {
+            accepted(item, &head.repeat(64))
+        });
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let answered = envelope(&wire)["conflict_head_challenge"] == challenge(0xb);
+        assert_rescan_claim(&wire, answered);
+        assert!(!answered || owed, "an answer rides only a mirrored Full");
+        fresh_answers += usize::from(answered);
+    }
+    assert_eq!(fresh_answers, 1);
+    assert!(!mirrored(&progress, &key));
+}
+
+/// The mirror is runtime-only: a restart reloads the open challenge from
+/// the persisted ledger, and the first activation after it mirrors the
+/// session again; the scan index itself never stores it.
+#[test]
+fn a_restart_mirrors_the_persisted_challenge_again() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let mut progress = progress_with_stale_head(&item);
+    let _ = cycle(&mut progress, &item, 1_000, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    let root = crate::test_scratch::ScratchDir::new("head-conflict-mirror-restart");
+    let progress_path = root.join("upload-progress.json");
+    let index_path = root.join("scan-index.json");
+    progress.generation = 0;
+    progress.save(&progress_path).unwrap();
+    let mut index = ScanIndex::default();
+    activate_source_upload_context(
+        SnapshotSource::Codex,
+        "a".repeat(64),
+        &mut index,
+        &mut progress,
+    );
+    assert!(index.head_conflict_owed(&key));
+    index.save(&index_path).unwrap();
+
+    let mut restarted = SnapshotUploadProgress::load(
+        &progress_path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    let mut index = ScanIndex::load(&index_path).unwrap();
+    assert!(!index.head_conflict_owed(&key), "never persisted");
+    activate_source_upload_context(
+        SnapshotSource::Codex,
+        "a".repeat(64),
+        &mut index,
+        &mut restarted,
+    );
+    assert!(index.head_conflict_owed(&key));
+}

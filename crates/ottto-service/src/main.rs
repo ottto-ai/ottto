@@ -811,7 +811,14 @@ fn home_dir() -> Result<PathBuf> {
 fn service_bootstrap_commands(
     plan: &macos_service::LaunchAgentInstallPlan,
     loaded: bool,
+    plist_unchanged: bool,
 ) -> Vec<Vec<String>> {
+    // A loaded job whose plist does not change restarts in place. `bootout`
+    // can return before launchd has removed the job, so a `bootstrap` right
+    // after it can fail and leave no job loaded.
+    if loaded && plist_unchanged {
+        return vec![plan.enable_command.clone(), plan.kickstart_command.clone()];
+    }
     let mut commands = Vec::new();
     if loaded {
         if let Some(service_target) = plan.enable_command.last() {
@@ -1238,7 +1245,7 @@ mod tests {
             ],
         };
 
-        let commands = service_bootstrap_commands(&plan, false);
+        let commands = service_bootstrap_commands(&plan, false, false);
 
         assert_eq!(commands[0], plan.enable_command);
         assert_eq!(commands[1], plan.bootstrap_command);
@@ -1258,7 +1265,7 @@ mod tests {
         };
 
         assert_eq!(
-            service_bootstrap_commands(&plan, true),
+            service_bootstrap_commands(&plan, true, false),
             vec![
                 vec![
                     "launchctl".to_string(),

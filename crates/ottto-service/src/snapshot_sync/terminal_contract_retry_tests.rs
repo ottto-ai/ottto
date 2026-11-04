@@ -229,7 +229,6 @@ impl RetainedRetryFixture {
             "account_identifier_hash": "8".repeat(64), "workspace_identifier_hash": "9".repeat(64)}});
         index_guard["claude_request_identity_contract"] =
             serde_json::json!("retained-own-request-contract");
-        index_guard["claude_request_identity_contract_changed"] = serde_json::json!(true);
         index_guard["claude_history_gate_loaded"] = serde_json::json!(true);
         index_guard["claude_history_cutoff_unix_seconds"] = serde_json::json!(1_790_000_000_u64);
         std::fs::write(&index_path, serde_json::to_vec(&index_guard).unwrap()).unwrap();
@@ -266,7 +265,6 @@ impl RetainedRetryFixture {
         for field in [
             "session_account_bindings",
             "claude_request_identity_contract",
-            "claude_request_identity_contract_changed",
             "claude_history_gate_loaded",
             "claude_history_cutoff_unix_seconds",
         ] {
@@ -537,7 +535,6 @@ impl ReadBudgetFixture {
         for field in [
             "generation",
             "session_account_bindings",
-            "claude_request_identity_contract_changed",
             "claude_history_gate_loaded",
             "claude_history_cutoff_unix_seconds",
             "accepted_snapshot_fingerprints",
@@ -1004,7 +1001,6 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
         for field in [
             "session_account_bindings",
             "claude_request_identity_contract",
-            "claude_request_identity_contract_changed",
         ] {
             assert_eq!(value[field], fixture.retained.index_guard[field]);
         }

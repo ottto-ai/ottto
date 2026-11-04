@@ -1,5 +1,6 @@
 use crate::snapshots::{paths_from_events, SnapshotSource};
 use anyhow::Result;
+use notify::event::{EventKind, ModifyKind};
 use notify::RecursiveMode;
 use notify_debouncer_full::{
     new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
@@ -15,16 +16,74 @@ pub const MAX_PENDING_SNAPSHOT_PATHS_PER_SOURCE: usize = 4_096;
 const SNAPSHOT_WATCH_SIGNAL_CAPACITY: usize = 64;
 const SNAPSHOT_WATCH_RAW_CAPACITY: usize = 128;
 
+/// Why every root of a source must be listed again: the watcher cannot vouch
+/// for what changed while nobody watched or while events were lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListingTrigger {
+    /// The daemon started: nothing watched while it was down.
+    Start,
+    /// The watcher was (re)created or could not be.
+    Watcher,
+    /// The hint queue or the backend lost events.
+    Overflow,
+    /// FSEvents dropped events and asked for a rescan.
+    Rescan,
+    /// A non-transcript path under a root was renamed (a moved directory
+    /// reports no events for the transcripts inside it).
+    DirectoryRename,
+}
+
+const LISTING_TRIGGERS: usize = ListingTrigger::DirectoryRename as usize + 1;
+
+const LISTING_TRIGGER_LABELS: [&str; LISTING_TRIGGERS] =
+    ["start", "watcher", "overflow", "rescan", "directory_rename"];
+
+/// One source's listing request: how often each trigger fired since the
+/// last listing began. Any count requests one listing of every root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListingRequest([u32; LISTING_TRIGGERS]);
+
+impl ListingRequest {
+    pub(crate) fn record(&mut self, trigger: ListingTrigger) {
+        let count = &mut self.0[trigger as usize];
+        *count = count.saturating_add(1);
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.0.iter().any(|count| *count > 0)
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (count, more) in self.0.iter_mut().zip(other.0) {
+            *count = count.saturating_add(more);
+        }
+    }
+}
+
+impl std::fmt::Display for ListingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (position, (label, count)) in LISTING_TRIGGER_LABELS.iter().zip(self.0).enumerate() {
+            if position > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{label}={count}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct PendingSnapshotPathsState {
     paths: [BTreeSet<PathBuf>; 3],
     overflowed: [bool; 3],
+    list_all: [ListingRequest; 3],
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PendingSnapshotPaths {
     pub paths: Vec<PathBuf>,
     pub overflowed: bool,
+    pub list_all: ListingRequest,
 }
 
 fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
@@ -32,10 +91,27 @@ fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
     PENDING.get_or_init(|| Mutex::new(PendingSnapshotPathsState::default()))
 }
 
-fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBuf>) {
-    let mut state = pending_snapshot_paths()
+fn lock_pending_snapshot_paths() -> std::sync::MutexGuard<'static, PendingSnapshotPathsState> {
+    pending_snapshot_paths()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Requests a listing of every root of every source.
+pub(crate) fn request_listing_all(trigger: ListingTrigger) {
+    for request in &mut lock_pending_snapshot_paths().list_all {
+        request.record(trigger);
+    }
+}
+
+/// Returns a request a running walk could not serve yet; the next pass
+/// after that walk ends lists once for all of it.
+pub(crate) fn defer_listing(source: SnapshotSource, request: ListingRequest) {
+    lock_pending_snapshot_paths().list_all[source.slot()].merge(request);
+}
+
+fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBuf>) {
+    let mut state = lock_pending_snapshot_paths();
     let index = source.slot();
     for path in paths {
         if state.paths[index].contains(path) {
@@ -43,6 +119,7 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
         }
         if state.paths[index].len() >= MAX_PENDING_SNAPSHOT_PATHS_PER_SOURCE {
             state.overflowed[index] = true;
+            state.list_all[index].record(ListingTrigger::Overflow);
             break;
         }
         state.paths[index].insert(path.clone());
@@ -50,11 +127,51 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
 }
 
 fn record_raw_watcher_overflow() {
-    pending_snapshot_paths()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .overflowed
-        .fill(true);
+    lock_pending_snapshot_paths().overflowed.fill(true);
+    request_listing_all(ListingTrigger::Overflow);
+}
+
+/// Records one batch: each root's transcript paths as hints, and the
+/// listings it requests. A Rescan requests every source, before the
+/// transcript filter drops it. notify gives renames no folder kind, so a
+/// moved directory shows up only as a renamed path the filter drops, with no
+/// event for the transcripts inside it; that requests its own source.
+fn record_watcher_events(
+    roots: &[(SnapshotSource, PathBuf)],
+    events: &[DebouncedEvent],
+    event_tx: &mpsc::SyncSender<SnapshotFileEvent>,
+) {
+    if events.iter().any(|event| event.need_rescan()) {
+        request_listing_all(ListingTrigger::Rescan);
+    }
+    for (source, root) in roots {
+        let paths = paths_from_events(
+            *source,
+            events
+                .iter()
+                .flat_map(|event| event.paths.iter())
+                .filter(|path| path.starts_with(root))
+                .cloned(),
+        );
+        if events.iter().any(|event| {
+            matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(root) && !paths.contains(path))
+        }) {
+            lock_pending_snapshot_paths().list_all[source.slot()]
+                .record(ListingTrigger::DirectoryRename);
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        record_pending_snapshot_paths(*source, &paths);
+        let _ = event_tx.try_send(SnapshotFileEvent {
+            source: *source,
+            paths: paths.into_iter().collect(),
+        });
+    }
 }
 
 fn complete_debounce_events(result: DebounceEventResult) -> Option<Vec<DebouncedEvent>> {
@@ -72,15 +189,14 @@ pub fn take_pending_snapshot_paths(source: SnapshotSource) -> PendingSnapshotPat
     // process-global queue into a permanent manifest fence. The guarded state
     // is structurally valid after every mutation, so recover the poisoned
     // mutex and keep the explicit overflow/path witnesses moving.
-    let mut state = pending_snapshot_paths()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_pending_snapshot_paths();
     let index = source.slot();
     PendingSnapshotPaths {
         paths: std::mem::take(&mut state.paths[index])
             .into_iter()
             .collect(),
         overflowed: std::mem::take(&mut state.overflowed[index]),
+        list_all: std::mem::take(&mut state.list_all[index]),
     }
 }
 
@@ -169,24 +285,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
             let Some(events) = complete_debounce_events(result) else {
                 continue;
             };
-            for (source, root) in &roots {
-                let paths = paths_from_events(
-                    *source,
-                    events
-                        .iter()
-                        .flat_map(|event| event.paths.iter())
-                        .filter(|path| path.starts_with(root))
-                        .cloned(),
-                );
-                if paths.is_empty() {
-                    continue;
-                }
-                record_pending_snapshot_paths(*source, &paths);
-                let _ = event_tx.try_send(SnapshotFileEvent {
-                    source: *source,
-                    paths: paths.into_iter().collect(),
-                });
-            }
+            record_watcher_events(&roots, &events, &event_tx);
         }
     });
 
@@ -367,6 +466,102 @@ mod tests {
             SnapshotSource::Pi,
         ] {
             assert!(take_pending_snapshot_paths(source).overflowed);
+        }
+    }
+
+    fn requested(triggers: &[ListingTrigger]) -> ListingRequest {
+        let mut request = ListingRequest::default();
+        for trigger in triggers {
+            request.record(*trigger);
+        }
+        request
+    }
+
+    /// [behaviour] A Rescan requests a listing of every source; a renamed
+    /// non-transcript path (a moved directory) requests one for its own
+    /// source only, and a renamed transcript is a path hint, not a request.
+    /// A request a running walk returns waits, merged, for the next take.
+    #[test]
+    fn rescan_and_directory_rename_request_listings_that_wait_until_taken() {
+        use notify::event::{Event, Flag, RenameMode};
+        let _guard = pending_state_test_guard();
+        let sources = [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ];
+        for source in sources {
+            let _ = take_pending_snapshot_paths(source);
+        }
+        let root = |name: &str| PathBuf::from("/synthetic").join(name);
+        let roots = vec![
+            (SnapshotSource::Codex, root("codex")),
+            (SnapshotSource::ClaudeCode, root("claude")),
+            (SnapshotSource::Pi, root("pi")),
+        ];
+        let renamed = |path: PathBuf| {
+            DebouncedEvent::new(
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any))).add_path(path),
+                std::time::Instant::now(),
+            )
+        };
+        let (event_tx, event_rx) = mpsc::sync_channel(SNAPSHOT_WATCH_SIGNAL_CAPACITY);
+        let transcript = root("pi").join("session.jsonl");
+        record_watcher_events(
+            &roots,
+            &[
+                renamed(root("claude").join("moved-project")),
+                renamed(transcript.clone()),
+            ],
+            &event_tx,
+        );
+        record_watcher_events(
+            &roots,
+            &[DebouncedEvent::new(
+                Event::new(EventKind::Other).set_flag(Flag::Rescan),
+                std::time::Instant::now(),
+            )],
+            &event_tx,
+        );
+        assert_eq!(
+            event_rx.try_iter().collect::<Vec<_>>(),
+            vec![SnapshotFileEvent {
+                source: SnapshotSource::Pi,
+                paths: vec![transcript],
+            }]
+        );
+        let rescan = requested(&[ListingTrigger::Rescan]);
+        let moved = requested(&[ListingTrigger::DirectoryRename, ListingTrigger::Rescan]);
+        assert_eq!(
+            take_pending_snapshot_paths(SnapshotSource::Codex).list_all,
+            rescan
+        );
+        assert_eq!(
+            take_pending_snapshot_paths(SnapshotSource::ClaudeCode).list_all,
+            moved
+        );
+        assert_eq!(
+            take_pending_snapshot_paths(SnapshotSource::Pi).list_all,
+            rescan
+        );
+
+        defer_listing(SnapshotSource::Pi, moved);
+        request_listing_all(ListingTrigger::Watcher);
+        let pi = take_pending_snapshot_paths(SnapshotSource::Pi).list_all;
+        assert!(pi.requested());
+        assert_eq!(
+            pi,
+            requested(&[
+                ListingTrigger::DirectoryRename,
+                ListingTrigger::Rescan,
+                ListingTrigger::Watcher,
+            ])
+        );
+        assert!(!take_pending_snapshot_paths(SnapshotSource::Pi)
+            .list_all
+            .requested());
+        for source in sources {
+            let _ = take_pending_snapshot_paths(source);
         }
     }
 

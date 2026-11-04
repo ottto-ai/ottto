@@ -1,19 +1,19 @@
 //! The Tail store over the real route: published fixtures, real saves and the
 //! real exit guard. Claude and Codex share every path here; none is per source.
 use super::super::tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
-    Observation, Representation, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, Observation,
+    Representation, SetAsideCause, Shape, StagedFile, TailHead,
 };
 use super::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
-    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail, set_aside_tail,
+    stage_tail, tail_head_keys, tail_set_aside,
 };
 use super::tests::{load_with, save_with, save_with_mode, with_session_db, Fixture, G};
 use super::*;
 
 const FILE: &str = "/synthetic/tail/file.jsonl";
 const SIBLING: &str = "/synthetic/tail/z-sibling.jsonl";
-/// Larger than one stored fragment, and not zstd-compressible by accident.
+/// Larger than one raw fragment, even when its physical bytes compress.
 const LONG: usize = 17 * 1024 * 1024;
 const REVISION: u32 = 1;
 
@@ -221,9 +221,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
 
     // An overwrite of accumulating state owes no purge; a dropped private
     // string and a reset do, even with the same page count.
+    let compressed = vec![0; 2048];
     let page = |change| StagedFile {
         change,
-        ..staged(b"head2", &[(Collection::Responses, 0, b"page2")])
+        ..staged(b"head2", &[(Collection::Responses, 0, &compressed)])
     };
     for (change, marks) in [
         (Change::Ordinary, 0),
@@ -234,6 +235,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
         save_with(&f.path, &mut index).unwrap();
         assert_eq!(erasure_marks(&index), marks, "{change:?}");
         assert_eq!(all_tail_rows(&index, FILE), 2);
+        assert_eq!(
+            rows(&index, "tail.page.responses", FILE)[0].value_version,
+            3
+        );
     }
 
     // A removed progress row retires in its own commit.
@@ -260,19 +265,16 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
     assert_eq!(erasure_marks(&index), 1);
 }
 
-fn usage_family() -> crate::snapshots::ClaudeUsageFamilyPending {
-    crate::snapshots::ClaudeUsageFamilyPending {
-        census_window_end: "2026-11-02T00:00:00Z".into(),
-        member_request_id_hashes: BTreeMap::from([(
-            "family".into(),
-            std::collections::BTreeSet::from(["c".repeat(64)]),
-        )]),
-        member_occurrences: BTreeMap::new(),
-        invalid: false,
-        idless_revision: None,
-        identity_contract: None,
-        contract_unproven: false,
-    }
+/// A usage-family witness whose excluded request hashes are one shared
+/// request set.
+fn usage_witness() -> crate::snapshots::ClaudeUsageFamilyWitness {
+    serde_json::from_value(serde_json::json!({
+        "evidence_fingerprint": "e".repeat(64),
+        "member_request_id_fingerprints": {"family": "f".repeat(64)},
+        "assigned_request_id_fingerprints": {},
+        "legacy_excluded_request_id_hashes": {"family": ["c".repeat(64)]},
+    }))
+    .unwrap()
 }
 
 /// [behaviour] One bad file rolls back alone with its own graph rows: its
@@ -324,16 +326,17 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
         index.files.insert(SIBLING.into(), progress_row());
         index.accepted_snapshot_fingerprints.insert("b".repeat(64));
         index
-            .claude_usage_family_pending
-            .add("family".into(), usage_family());
+            .claude_usage_family_witnesses
+            .insert("family".into(), usage_witness());
     };
     let shared_committed = |index: &ScanIndex| {
         assert!(index.files.get(SIBLING).is_some());
         assert!(index
             .accepted_snapshot_fingerprints
             .contains(&"b".repeat(64)));
-        let family = index.claude_usage_family_pending.view("family");
-        assert_eq!(family.map(|family| family.hash_member_count()), Some(1));
+        let witness = index.claude_usage_family_witnesses.get("family");
+        let excluded = witness.map(|w| w.legacy_excluded_request_id_hashes.len());
+        assert_eq!(excluded, Some(1));
     };
     for attempts in 1..=2 {
         advance(&mut index);
@@ -432,7 +435,11 @@ fn systemic_failure_commits_neither_file_nor_marker() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| sqlite::cap_pages(db));
-    let long = vec![1_u8; 1024 * 1024];
+    // This disk-full control must require space even with compression active.
+    use sha2::{Digest, Sha256};
+    let long: Vec<u8> = (0..32_768_u64)
+        .flat_map(|n| Sha256::digest(n.to_be_bytes()))
+        .collect();
     stage_tail(
         &f.path,
         FILE,
@@ -574,7 +581,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -813,10 +820,11 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
     let index = load_with(&f.path, false).unwrap().unwrap();
     let new_roots: Vec<RowKey> = catalogue::LAYOUTS
         .iter()
-        .filter(|(_, _, layout)| *layout == 5)
+        // A retired kind is never written.
+        .filter(|(_, field, layout)| *layout == 5 && !field.starts_with("retired_"))
         .map(|(kind, _, _)| mapper::key(kind, "", 0).unwrap())
         .collect();
-    assert_eq!(new_roots.len(), 2);
+    assert_eq!(new_roots.len(), 1);
     with_session_db(&index, |db| {
         for key in &new_roots {
             sqlite::delete_row_for_test(db, key);
@@ -824,7 +832,6 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         db.control("catalogue_layout", &4_u32).unwrap();
     });
     let index = load_with(&f.path, false).unwrap().unwrap();
-    assert!(index.claude_folder_login_ledger.is_empty());
     assert_eq!(index.tail_discovery, Default::default());
     stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
     observe_tail(&f.path, FILE, observation(&[b"debt"])).unwrap();
@@ -835,7 +842,7 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         // Capability 3 refuses any store whose minimum is above it.
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     assert_eq!(revisions(&reloaded, FILE).len(), 1);
@@ -851,9 +858,10 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
 
 /// [behaviour] Debt outlives its reduction: observations never clear the marker;
 /// reset merges committed debt; retire keeps it under a metadata-only head that
-/// never loads pages; disposal leaves nothing. A future envelope holds.
+/// never loads pages; settling every revision leaves no head. A future envelope
+/// holds.
 #[test]
-fn debt_survives_reset_and_retire_until_disposed() {
+fn debt_survives_reset_and_retire_until_settled() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
@@ -933,10 +941,14 @@ fn debt_survives_reset_and_retire_until_disposed() {
         "settled and overwritten debt purge"
     );
 
-    dispose_tail(&f.path, FILE, Disposition::Settled).unwrap();
+    let mut settle_all = observation(&[]);
+    settle_all.resolved.extend([1, 2]);
+    observe_tail(&f.path, FILE, settle_all).unwrap();
     save_with(&f.path, &mut index).unwrap();
-    assert_eq!(all_tail_rows(&index, FILE), 0, "no reduction, no debt");
-    assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "disposed");
+    assert!(
+        load_head(&index, FILE, REVISION).unwrap().is_none(),
+        "no reduction, no debt"
+    );
 
     // An unknown revision id fails this file alone: set aside, nothing written.
     let mut unknown = observation(&[]);
@@ -1072,16 +1084,13 @@ fn inventory_facts_need_no_reduction_and_old_envelope_has_none() {
     assert_eq!(head.body, b"head");
     assert_eq!(head.common.inventory.as_ref(), Some(&facts));
 
-    // Retiring keeps them under kept debt; absence and plain retirement end them.
+    // Retiring keeps them under kept debt; plain retirement ends them.
     retire_tail(&f.path, [FILE.to_string(), SIBLING.to_string()]).unwrap();
     save_with(&f.path, &mut index).unwrap();
     assert_eq!(all_tail_rows(&index, FILE), 0, "no debt");
     let head = load_head(&index, SIBLING, REVISION).unwrap().unwrap();
     assert!(head.metadata_only);
     assert_eq!(head.common.inventory.as_ref(), Some(&facts));
-    dispose_tail(&f.path, SIBLING, Disposition::Absence).unwrap();
-    save_with(&f.path, &mut index).unwrap();
-    assert_eq!(all_tail_rows(&index, SIBLING), 0, "absent");
 }
 
 /// [behaviour] Scope erasure is not a reset: every row and the marker go, and

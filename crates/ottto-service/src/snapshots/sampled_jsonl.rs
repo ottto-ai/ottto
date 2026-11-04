@@ -66,15 +66,9 @@ impl CachedJsonlReduction {
         }
     }
     /// Only Claude parses hold markers; Codex and Pi have none to change.
-    /// Address first: the context scrub stands in a sentence position.
-    pub(super) fn scrub_identity(&mut self, context: bool, address: bool) {
+    pub(super) fn scrub_context_digest(&mut self) {
         if let Some(markers) = self.accumulator.claude_org_markers.as_deref_mut() {
-            if address {
-                markers.scrub_address();
-            }
-            if context {
-                markers.scrub_context_digest();
-            }
+            markers.scrub_context_digest();
         }
     }
     #[cfg(test)]
@@ -112,10 +106,9 @@ impl CachedJsonlReduction {
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {
-        // retain_reduction removes these live, shared inputs from the copy.
+        // retain_reduction removes this live, shared input from the copy.
         // Refuse frozen accounting if an adapter ever forgets that boundary.
         self.accumulator.codex_turn_traces.is_none()
-            && self.accumulator.codex_parent_ownership_ledgers.is_none()
     }
 }
 
@@ -136,8 +129,10 @@ pub(super) struct CompletedNativeAcquisition {
 }
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released, unsealed);
 
-/// A side read's certificate (U1a-2a): no retained copy and no cache event.
-#[allow(clippy::large_enum_variant, reason = "moved once to the side exit")]
+/// A completion certificate with no retained copy and no cache event (test
+/// fixtures only).
+#[cfg(test)]
+#[allow(clippy::large_enum_variant, reason = "moved once to the caller")]
 pub(super) enum SideCertificate {
     /// `len` is the held file's length when the certificate was committed.
     Certified {
@@ -154,7 +149,6 @@ pub(super) enum SideCertificate {
 // checkpoint. Keep the same exclusion for active-copy and retained-copy charges.
 pub(super) struct LiveReductionInputs {
     traces: Option<Arc<CodexTurnTraceMap>>,
-    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
 }
 
 pub(in crate::snapshots) struct PrepareRejected {
@@ -175,13 +169,11 @@ impl OwnedJsonlParser {
     pub(super) fn take_live_reduction_inputs(&mut self) -> LiveReductionInputs {
         LiveReductionInputs {
             traces: self.accumulator.codex_turn_traces.take(),
-            parents: self.accumulator.codex_parent_ownership_ledgers.take(),
         }
     }
 
     pub(super) fn restore_live_reduction_inputs(&mut self, inputs: LiveReductionInputs) {
         self.accumulator.codex_turn_traces = inputs.traces;
-        self.accumulator.codex_parent_ownership_ledgers = inputs.parents;
     }
 
     /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
@@ -362,8 +354,6 @@ impl OwnedJsonlParser {
                 .claude_file_birth
                 .refresh_opened(&self.accumulator.claude_file_birth);
             accumulator.codex_turn_traces = self.accumulator.codex_turn_traces.take();
-            accumulator.codex_parent_ownership_ledgers =
-                self.accumulator.codex_parent_ownership_ledgers.take();
             accumulator.codex_sidecar_projected_next_ordinal =
                 self.accumulator.codex_sidecar_projected_next_ordinal;
             self.accumulator = accumulator;
@@ -649,9 +639,10 @@ impl OwnedJsonlParser {
         }))
     }
 
-    /// A side read's certificate: `retain_reduction`'s completion gate and
-    /// commit, without a retained copy or any `cache_lifecycle` event. It never
-    /// touches main's cache; the caller mints the side seal from it.
+    /// `retain_reduction`'s completion gate and commit, without a retained
+    /// copy or any `cache_lifecycle` event; it never touches the cache. Test
+    /// fixtures certify a native completion through it.
+    #[cfg(test)]
     pub(super) fn certify_without_retention(
         &mut self,
         scope: &Scope,

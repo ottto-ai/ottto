@@ -142,14 +142,6 @@ impl FamilyRef {
             root: member.root.to_owned(),
         })
     }
-
-    pub(super) fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub(super) fn root(&self) -> &str {
-        &self.root
-    }
 }
 
 /// The families one page's selection touched, deduplicated and bounded.
@@ -204,26 +196,16 @@ pub(super) struct Skipped<'a> {
 /// again after a refusal), exactly what `skipped_file_count_due_to_limit`
 /// counts. Cap refusals are not in it, and it is not `scan_cap_hit`. No stat or read.
 pub(super) fn skipped_view(index: &ScanIndex) -> impl Iterator<Item = Skipped<'_>> + '_ {
-    index
-        .traversal
-        .iter()
-        .flat_map(|traversal| {
-            traversal
-                .pending_candidates
-                .iter()
-                .filter(|candidate| candidate.census_member)
-                .map(|path| Skipped {
-                    path,
-                    replay: false,
-                })
-        })
-        .chain(
-            index
-                .claude_stale_family_carry
-                .replay
-                .iter()
-                .map(|path| Skipped { path, replay: true }),
-        )
+    index.traversal.iter().flat_map(|traversal| {
+        traversal
+            .pending_candidates
+            .iter()
+            .filter(|candidate| candidate.census_member)
+            .map(|path| Skipped {
+                path,
+                replay: false,
+            })
+    })
 }
 
 /// The skipped set's paths alone.
@@ -756,7 +738,6 @@ impl<'a> View<'a> {
         for member in traversal
             .pending_candidates
             .iter()
-            .chain(index.claude_stale_family_carry.replay.iter())
             .filter_map(|candidate| claude_index_path_member_ref(&candidate.path))
         {
             let hash = hash64(member.root.as_bytes());
@@ -887,19 +868,11 @@ impl<'a> View<'a> {
     }
 
     /// The checks between `held` and the account proof.
-    fn custody(
-        &self,
-        family: &FamilyRef,
-        members: &[&str],
-        names: &[String],
-    ) -> Option<Incomplete> {
-        let index = self.index;
-        if index
+    fn custody(&self, family: &FamilyRef, members: &[&str]) -> Option<Incomplete> {
+        if self
+            .index
             .claude_usage_authority_quarantine
             .contains_key(&family.root)
-            || names
-                .iter()
-                .any(|member| index.claude_owned_start_census.contains_key(member))
         {
             return Some(Incomplete::Quarantine);
         }
@@ -922,7 +895,7 @@ impl<'a> View<'a> {
             return Some(Incomplete::Held);
         }
         let names = member_names(members);
-        if let Some(reason) = self.custody(family, members, &names) {
+        if let Some(reason) = self.custody(family, members) {
             return Some(reason);
         }
         let name_set = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
@@ -947,7 +920,10 @@ impl<'a> View<'a> {
             .iter()
             .zip(&names)
             .map(|(key, member)| {
-                let entry = index.files.get(*key).filter(|entry| !entry.rearmed())?;
+                let entry = index
+                    .files
+                    .get(*key)
+                    .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
                 let finalized = proven?
                     .member_requests
                     .get(member)?
@@ -1484,8 +1460,7 @@ pub(super) fn evaluate_page<'p>(
     );
     let queued_roots_overflowed = view.queued_roots_overflowed;
     let history_gates_overflowed = view.history_gates_overflowed;
-    let queue_entries =
-        traversal.pending_candidates.len() + index.claude_stale_family_carry.replay.len();
+    let queue_entries = traversal.pending_candidates.len();
     let history_gates = index.claude_history_emission.files.len();
     let parsed_count = parsed_keys.len();
     runtime.followup = Touched::from_keys(parsed_keys, MAX_FOLLOWUP_FAMILIES)

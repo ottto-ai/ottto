@@ -1,4 +1,4 @@
-//! One record codec: existing serde JSON, optionally a dictionary-free zstd frame.
+//! Shared dictionary-free zstd codec, with JSON validation for graph records.
 use super::*;
 use anyhow::{ensure, Context};
 use serde::de::DeserializeOwned;
@@ -54,9 +54,9 @@ pub(super) fn json<T: Serialize + ?Sized>(value: &T, cap: u64) -> Result<Vec<u8>
     serde_json::to_writer(&mut out, value)?;
     Ok(out.inner)
 }
-pub(super) fn encode(json: &[u8]) -> Result<Vec<u8>> {
-    if json.len() < 512 {
-        return Ok(json.to_vec());
+pub(super) fn encode(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 512 {
+        return Ok(bytes.to_vec());
     }
     ENCODER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -66,28 +66,32 @@ pub(super) fn encode(json: &[u8]) -> Result<Vec<u8>> {
         let compressed = slot
             .as_mut()
             .context("state_v2_zstd_context")?
-            .compress(json)?;
-        Ok(if compressed.len() < json.len() {
+            .compress(bytes)?;
+        Ok(if compressed.len() < bytes.len() {
             compressed
         } else {
-            json.to_vec()
+            bytes.to_vec()
         })
+    })
+}
+/// Expand one binary frame within the caller's raw-output and window bound.
+pub(super) fn expand_frame(bytes: &[u8], cap: u64) -> Result<Vec<u8>> {
+    DECODER.with(|context| -> Result<Vec<u8>> {
+        let mut context = context.borrow_mut();
+        context
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|_| anyhow::anyhow!("state_v2_zstd_reset"))?;
+        let mut decoder = zstd::stream::read::Decoder::with_context(bytes, &mut context);
+        decoder.window_log_max(cap.next_power_of_two().ilog2().clamp(10, 26))?;
+        let mut out = Vec::new();
+        decoder.take(cap + 1).read_to_end(&mut out)?;
+        ensure!(out.len() as u64 <= cap, "state_v2_value_admission");
+        Ok(out)
     })
 }
 pub(super) fn expand(bytes: &[u8], cap: u64) -> Result<Vec<u8>> {
     let json = if bytes.starts_with(MAGIC) {
-        DECODER.with(|context| -> Result<Vec<u8>> {
-            let mut context = context.borrow_mut();
-            context
-                .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
-                .map_err(|_| anyhow::anyhow!("state_v2_zstd_reset"))?;
-            let mut decoder = zstd::stream::read::Decoder::with_context(bytes, &mut context);
-            decoder.window_log_max(cap.next_power_of_two().ilog2().clamp(10, 26))?;
-            let mut out = Vec::new();
-            decoder.take(cap + 1).read_to_end(&mut out)?;
-            ensure!(out.len() as u64 <= cap, "state_v2_value_admission");
-            Ok(out)
-        })?
+        expand_frame(bytes, cap)?
     } else {
         ensure!(bytes.len() as u64 <= cap, "state_v2_value_admission");
         bytes.to_vec()
@@ -160,7 +164,16 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         &[
             &["counts", "listing_owed_pace_evicted"],
             &["counts", "caps", "inventory_hold_keys_discarded"],
+            &["codex_parent_resolution_retry_required"],
+            &["counts", "parent_unresolvable"],
+            &["counts", "caps", "boundary_overflow_events"],
+            &["counts", "caps", "parent_signature_clear_events"],
+            &["counts", "caps", "parent_ref_refusals"],
         ]
+    } else if row == type_name::<crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>>() {
+        // An older store marks a file whose census evidence was owed; that
+        // census is retired, so the bit is dropped.
+        &[&["evidence_owed"]]
     } else {
         &[]
     }
@@ -371,6 +384,45 @@ mod tests {
             assert!(decode::<serde_json::Value>(raw, 1024).is_err());
         }
     }
+    /// [format] Binary frames reject truncation, corruption, excessive windows
+    /// and output, even when the physical frame is tiny and has no size field.
+    #[test]
+    fn binary_frames_are_bounded_independently_of_physical_length() {
+        const CAP: u64 = 16 * 1024 * 1024;
+        let raw = vec![0; 1024];
+        let encoded = encode(&raw).unwrap();
+        assert_eq!(expand_frame(&encoded, CAP).unwrap(), raw);
+        assert!(
+            expand(&encoded, CAP).is_err(),
+            "JSON guard remains separate"
+        );
+        assert!(expand_frame(&encoded[..encoded.len() - 1], CAP).is_err());
+        let mut corrupt = encoded.clone();
+        corrupt[0] ^= 1;
+        assert!(expand_frame(&corrupt, CAP).is_err());
+        // Unknown content size, 16 MiB window, RLE blocks of at most 128 KiB.
+        let mut frame = MAGIC.to_vec();
+        frame.extend_from_slice(&[0, 0x70]);
+        for _ in 0..128 {
+            frame.extend_from_slice(&(((128_u32 * 1024) << 3) | 2).to_le_bytes()[..3]);
+            frame.push(0);
+        }
+        frame.extend_from_slice(&[11, 0, 0, 0]); // last RLE block: one extra byte
+        assert!(frame.len() < 1024);
+        assert!(expand_frame(&frame, CAP)
+            .unwrap_err()
+            .to_string()
+            .contains("state_v2_value_admission"));
+        // Same valid short frame with a window larger than the decode bound.
+        let mut window = MAGIC.to_vec();
+        window.extend_from_slice(&[0, 0x80, 11, 0, 0, 0]);
+        assert!(expand_frame(&window, CAP).is_err());
+        assert_eq!(
+            expand_frame(&encoded, CAP).unwrap(),
+            raw,
+            "context reusable after refusal"
+        );
+    }
     /// [format] generic and exact guards reject nested ignored fields, opaque
     /// census keys and noncanonical values.
     #[test]
@@ -434,11 +486,35 @@ mod tests {
         assert_eq!(reencoded, serde_json::to_vec(&current).unwrap());
         assert_eq!(seed, old);
         assert!(strict_json::<Option<Checkpoint>>(&old).is_ok());
-        row["counts"]["caps"]["parent_ref_refusals"] = 5.into();
+        row["counts"]["caps"]["price_trace_row_limit_hits"] = 5.into();
         let old = serde_json::to_vec(&row).unwrap();
         let (loaded, _) = exact_json::<Option<Checkpoint>>(&old).unwrap();
         let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
-        assert_eq!(caps, &serde_json::json!({"parent_ref_refusals": 5}));
+        assert_eq!(caps, &serde_json::json!({"price_trace_row_limit_hits": 5}));
+    }
+    /// [format] A file.progress row an older build stored with the retired
+    /// `evidence_owed` bit loads without it and seeds the stored bytes, so the
+    /// next save rewrites the row; v1 import admits it too. An unknown sibling
+    /// still refuses.
+    #[test]
+    fn retired_evidence_owed_loads_and_reencodes_without_it() {
+        type Row = crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>;
+        let current: Row =
+            crate::snapshots::tests::manifest_index_entry(Some(&"a".repeat(64))).into();
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["evidence_owed"] = true.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Row>(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(seed, old);
+        let root = serde_json::json!({"files": {"/synthetic/owed.jsonl": row}});
+        let raw = serde_json::to_vec(&root).unwrap();
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
+        row["future_unknown"] = 1.into();
+        assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
     }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
@@ -477,13 +553,6 @@ pub(super) fn check_field<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned
     strict_json::<T>(raw.get().as_bytes())
         .map(|_| ())
         .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))
-}
-/// Usage pending keeps the v1 record-map check; only its RAM shape differs.
-pub(super) fn check_usage<'de, A: serde::de::MapAccess<'de>>(
-    map: &mut A,
-    _: &super::super::usage_pending::UsagePending,
-) -> std::result::Result<(), A::Error> {
-    check_map(map, &super::super::usage_pending::Families::new())
 }
 pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned + Serialize>(
     map: &mut A,
@@ -548,40 +617,9 @@ mod alias_tests {
             .unwrap();
             assert_eq!(inventory(raw.as_slice()), Ok(()));
         }
-        assert!(strict_json::<ScanIndex>(
-            br#"{"files":{},"claude_full_rearm_progress":{"future_owed":true}}"#
-        )
-        .is_err());
-    }
-
-    /// [format] A sticky folder ledger stays unqualified across a reopen, and an
-    /// index from before the ledger imports empty.
-    #[test]
-    fn folder_login_ledger_sticky_stays_unqualified() {
-        use crate::snapshots::claude_folder_login::{qualify, OwnerReport};
-        let old = br#"{"files":{}}"#;
-        assert_eq!(inventory(old.as_slice()), Ok(()));
-        assert!(strict_json::<ScanIndex>(old)
-            .unwrap()
-            .claude_folder_login_ledger
-            .is_empty());
-        let record = |mixed: bool| {
-            serde_json::json!({"files":{},"claude_folder_login_ledger":{"folder":{
-                "fresh":true,"mixed":mixed,"login":"a","org":"o","owner_proven":true,
-                "census_complete":true,"covered_from":3600,"matched":[7]}}})
-        };
-        let owner = OwnerReport {
-            pair: Some(("a".to_string(), "o".to_string())),
-            email: Some("e".to_string()),
-            ..OwnerReport::default()
-        };
-        for (mixed, qualifies) in [(false, true), (true, false)] {
-            let raw = serde_json::to_vec(&record(mixed)).unwrap();
-            assert_eq!(inventory(raw.as_slice()), Ok(()));
-            let index = strict_json::<ScanIndex>(&raw).unwrap();
-            let folder = &index.claude_folder_login_ledger["folder"];
-            assert_eq!(qualify(folder, &owner).is_some(), qualifies);
-        }
+        assert!(
+            strict_json::<ScanIndex>(br#"{"files":{},"traversal":{"future_owed":true}}"#).is_err()
+        );
     }
 
     /// [format] v1 import inventory admits each leaf a shipped writer stored
@@ -592,6 +630,15 @@ mod alias_tests {
             crate::snapshots::claude_family_census_shadow_tests::traversal(),
         ))
         .unwrap();
+        let mut legacy_fork = traversal.clone();
+        legacy_fork["codex_parent_resolution_retry_required"] = true.into();
+        legacy_fork["counts"]["parent_unresolvable"] =
+            serde_json::json!({"counts": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]});
+        legacy_fork["counts"]["caps"] = serde_json::json!({
+            "boundary_overflow_events": 1,
+            "parent_signature_clear_events": 2,
+            "parent_ref_refusals": 3
+        });
         let mut pace = traversal.clone();
         pace["counts"]["listing_owed_pace_evicted"] = 2.into();
         let mut hold = traversal;
@@ -604,6 +651,7 @@ mod alias_tests {
             ("upload_context_proof", proof, ""),
             ("traversal", pace, "/counts"),
             ("traversal", hold, "/counts/caps"),
+            ("traversal", legacy_fork, "/counts/caps"),
         ] {
             let mut root = serde_json::json!({"files": {}});
             root[field] = value;
@@ -620,11 +668,16 @@ mod alias_tests {
         }
     }
 
-    /// [format] An older index holding the retired Desktop census witness
-    /// still passes the import inventory: the slot decodes and drops.
+    /// [format] An older index holding a retired slot (the Desktop census
+    /// witness, the folder login ledger) still passes the import inventory:
+    /// the slot decodes and drops.
     #[test]
     fn inventory_accepts_the_retired_desktop_census_witness() {
-        let raw = br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#;
-        assert_eq!(inventory(raw.as_slice()), Ok(()));
+        for raw in [
+            br#"{"files":{},"claude_desktop_census_witness":{"completed_at_unix_seconds":1,"process_id":1,"inventory":"x"}}"#.as_slice(),
+            br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":false,"login":"a","org":"o","matched":[7]}}}"#.as_slice(),
+        ] {
+            assert_eq!(inventory(raw), Ok(()));
+        }
     }
 }

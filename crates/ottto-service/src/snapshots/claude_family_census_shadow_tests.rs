@@ -38,7 +38,7 @@ pub(super) fn traversal() -> ScanTraversalCheckpoint {
         reconciliation_started: false,
         watcher_hint_seen: false,
         codex_freshness_yield: false,
-        codex_parent_resolution_retry_required: false,
+        retired_codex_parent_resolution_retry_required: serde::de::IgnoredAny,
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,
 
@@ -729,21 +729,12 @@ fn loss_vetoes_stay_up_for_the_generation() {
     assert_eq!(reattested.families.complete, 2);
 }
 
-/// [behaviour] the skipped view is queue plus replay.
+/// [behaviour] the skipped view is the census-member queue.
 #[test]
-fn the_skipped_view_is_queue_plus_replay() {
+fn the_skipped_view_is_the_census_member_queue() {
     let mut index = index();
     let keys = add_family(&mut index, "dir-q", 1, 1);
     queue(&mut index, &keys[0]);
-    index
-        .claude_stale_family_carry
-        .replay
-        .push(ScanTraversalPath {
-            scan_root: PathBuf::from(SCAN_ROOT),
-            path: PathBuf::from(&keys[1]),
-            census_member: false,
-            watcher_hint: false,
-        });
     // A re-read hint is no census member, so it is not in the view.
     index
         .traversal
@@ -757,15 +748,13 @@ fn the_skipped_view_is_queue_plus_replay() {
             watcher_hint: true,
         });
     let view = skipped_view(&index).collect::<Vec<_>>();
-    assert_eq!(view.len(), 2);
-    assert_eq!(view.iter().filter(|skipped| skipped.replay).count(), 1);
-    assert_eq!(skipped_census_members(&index).count(), 2);
+    assert_eq!(view.len(), 1);
+    assert_eq!(skipped_census_members(&index).count(), 1);
     let mut first_pending = FirstPending::default();
     let (first, _) = first_pending.observe(skipped_view(&index), |_| false, NOW, None);
-    assert_eq!((first.count, first.replay, first.replay_repeat), (2, 1, 0));
-    // Still replayed a page later: repeated, and its age a lower bound.
+    assert_eq!(first.count, 1);
+    // Still queued a page later: its age is a lower bound.
     let (again, _) = first_pending.observe(skipped_view(&index), |_| false, NOW + 60, None);
-    assert_eq!((again.replay, again.replay_repeat), (1, 1));
     assert_eq!(again.oldest_age_s, 60);
 }
 

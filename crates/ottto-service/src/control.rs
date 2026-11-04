@@ -104,9 +104,6 @@ const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const PI_SESSION_MAX_DEPTH: usize = 32;
-const PI_SESSION_MAX_ENTRIES: usize = 20_000;
-const PI_SESSION_MAX_FILES: usize = 10_000;
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
 const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
@@ -6208,8 +6205,6 @@ fn install_staged_account_switch(
             return Err(LocalApiError::StatePoisoned);
         }
         write_and_verify_pending_claim_commit(pending, candidate_secret)?;
-        crate::snapshot_sync::owe_login_address_erase(&default_support_dir())
-            .or_state_poisoned()?;
         let response = daemon.install_switched_account(
             staged.new_account.clone(),
             staged.setup_run_id.clone(),
@@ -7352,12 +7347,14 @@ fn auth_reset(
     Ok(reset)
 }
 
+const FORGOTTEN_INSTALLATION: &str = "Installation identity and credentials were cleared. Collected state and local sync receipts stay; only uninstall deletes them. Agent source data was not changed. Restart ottto-service before pairing.";
+
 /// `device_released` is `None` for a local-only reset, which never contacts
 /// Ottto, and the server's answer for a cloud reset.
 fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
     const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
     const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
-    const FORGOTTEN: &str = "Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing.";
+    const FORGOTTEN: &str = FORGOTTEN_INSTALLATION;
     let (code, text) = match (forget_installation, device_released) {
         (true, None) => (
             "installation_forgotten",
@@ -7401,9 +7398,7 @@ fn released_without_setup_run_message(forget_installation: bool) -> StableMessag
     if forget_installation {
         StableMessage {
             code: "installation_forgotten".to_string(),
-            text: format!(
-                "{RELEASED} Installation identity, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
-            ),
+            text: format!("{RELEASED} {FORGOTTEN_INSTALLATION}"),
         }
     } else {
         StableMessage {
@@ -7422,22 +7417,9 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         clear_local_release(&stores)?;
         stores.browser.delete().or_state_poisoned()?;
     }
+    // Collected state, caches and receipts stay; only uninstall deletes them.
     FileMachineStore::default().reset().or_state_poisoned()?;
-    let support_dir = default_support_dir();
-    crate::upload_receipts::clear(&support_dir).or_state_poisoned()?;
-    // Closing registered native handles must not prevent the established
-    // whole-tree privacy cleanup, including unregistered/legacy namespaces.
-    let v2_erasure = crate::snapshots::erase_claude_state_v2_artifacts(&support_dir);
-    let path = support_dir.join("snapshots");
-    if path.is_dir() {
-        fs::remove_dir_all(&path).or_state_poisoned()?;
-    } else if path.exists() {
-        fs::remove_file(&path).or_state_poisoned()?;
-    }
-    crate::snapshot_sync::erase_all_source_caches(&support_dir).or_state_poisoned()?;
-    crate::context_composition::erase_all_state(&support_dir).or_state_poisoned()?;
-    crate::backfill::remove_backfill_state(&support_dir).or_state_poisoned()?;
-    v2_erasure.or_state_poisoned()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7453,7 +7435,6 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    crate::snapshot_sync::owe_login_address_erase(&default_support_dir()).or_state_poisoned()?;
     FileAccountStore::default().reset().or_state_poisoned()?;
     FileConnectionStore::default().reset().or_state_poisoned()?;
     FileDeviceStore::default().reset().or_state_poisoned()?;
@@ -12892,9 +12873,6 @@ fn run_verify_source_action(
     action: &SetupRunActionApiResponse,
     source: SourceKind,
 ) -> Result<SetupVerifyActionOutcome, LocalApiError> {
-    if source == SourceKind::Pi {
-        return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
-    }
     if source == SourceKind::Codex {
         reconcile_codex_source_off()?;
         let result = verify_source(
@@ -12940,6 +12918,11 @@ fn run_verify_source_action(
             }),
             Some(result),
         ));
+    }
+    // Pi verifies its routes after the shared not-installed gate, so a Mac
+    // without Pi never creates Pi directories or runs a doomed smoke.
+    if source == SourceKind::Pi {
+        return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
@@ -13474,19 +13457,6 @@ struct PiSessionCensus {
     files: BTreeSet<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
-struct PiSessionSafetyLimits {
-    max_depth: usize,
-    max_entries: usize,
-    max_files: usize,
-}
-
-const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
-    max_depth: PI_SESSION_MAX_DEPTH,
-    max_entries: PI_SESSION_MAX_ENTRIES,
-    max_files: PI_SESSION_MAX_FILES,
-};
-
 fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
     Ok(pi_session_census()?
         .map(|census| census.files)
@@ -13497,40 +13467,31 @@ fn pi_session_census() -> Result<Option<PiSessionCensus>, LocalApiError> {
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     Ok(Some(PiSessionCensus { root, files }))
 }
 
 fn prepare_pi_live_session_census() -> Result<PiSessionCensus, LocalApiError> {
     let root = open_or_create_pi_session_root()?;
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     Ok(PiSessionCensus { root, files })
 }
 
 #[cfg(test)]
 fn pi_session_files_in(root: &Path) -> Result<BTreeSet<PathBuf>, LocalApiError> {
-    pi_session_files_in_with_limits(root, PI_SESSION_SAFETY_LIMITS)
-}
-
-#[cfg(test)]
-fn pi_session_files_in_with_limits(
-    root: &Path,
-    limits: PiSessionSafetyLimits,
-) -> Result<BTreeSet<PathBuf>, LocalApiError> {
     let Some(root) = open_pi_session_root_direct(root)? else {
         return Ok(BTreeSet::new());
     };
-    pi_session_files_for_root(&root, limits)
+    pi_session_files_for_root(&root)
 }
 
-fn pi_session_files_for_root(
-    root: &OpenPiSessionRoot,
-    limits: PiSessionSafetyLimits,
-) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+/// Every Pi session file under `root`, as a complete set or a refusal. The
+/// walk never follows a symlink, so it cannot loop; the tree's own size is
+/// the only bound.
+fn pi_session_files_for_root(root: &OpenPiSessionRoot) -> Result<BTreeSet<PathBuf>, LocalApiError> {
     verify_pi_session_root_path_identity(root)?;
     let mut files = BTreeSet::new();
-    let mut entries_seen = 0;
-    collect_pi_session_files(&root.path, 0, &mut entries_seen, &mut files, limits)?;
+    collect_pi_session_files(&root.path, &mut files)?;
     verify_pi_session_root_path_identity(root)?;
     validate_discovered_pi_session_files(root, files)
 }
@@ -13582,16 +13543,8 @@ fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), 
 
 fn collect_pi_session_files(
     path: &Path,
-    depth: usize,
-    entries_seen: &mut usize,
     files: &mut BTreeSet<PathBuf>,
-    limits: PiSessionSafetyLimits,
 ) -> Result<(), LocalApiError> {
-    if depth > limits.max_depth {
-        return Err(pi_session_import_refused(
-            "session traversal exceeded the maximum depth",
-        ));
-    }
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         pi_session_import_refused("session traversal could not inspect a directory entry")
     })?;
@@ -13600,11 +13553,6 @@ fn collect_pi_session_files(
     };
     if metadata.is_file() {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            if files.len() >= limits.max_files {
-                return Err(pi_session_import_refused(
-                    "session traversal exceeded the maximum file count",
-                ));
-            }
             files.insert(path.to_path_buf());
         }
         return Ok(());
@@ -13618,24 +13566,16 @@ fn collect_pi_session_files(
         let entry = entry.map_err(|_| {
             pi_session_import_refused("session traversal could not read a directory entry")
         })?;
-        *entries_seen = entries_seen.saturating_add(1);
-        if *entries_seen > limits.max_entries {
-            return Err(pi_session_import_refused(
-                "session traversal exceeded the maximum entry count",
-            ));
-        }
-        collect_pi_session_files(&entry.path(), depth + 1, entries_seen, files, limits)?;
+        collect_pi_session_files(&entry.path(), files)?;
     }
     Ok(())
 }
 
 fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
-    Ok(
-        pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
-            .difference(&before.files)
-            .cloned()
-            .collect(),
-    )
+    Ok(pi_session_files_for_root(&before.root)?
+        .difference(&before.files)
+        .cloned()
+        .collect())
 }
 
 /// Local Pi session files modified at or after `since`. The passive
@@ -13646,7 +13586,7 @@ fn recent_pi_session_files(since: SystemTime) -> Result<Option<Vec<PathBuf>>, Lo
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     pi_session_files_modified_since(&root, files, since).map(Some)
 }
 
@@ -13710,13 +13650,13 @@ struct OpenPiSessionRoot {
 
 fn open_pi_session_root() -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     let home = home_path("");
-    open_pi_session_root_from_home(&home)
+    open_pi_session_root_from_home(&home, &crate::agent_status::pi_sessions_dir(&home))
 }
 
 fn open_or_create_pi_session_root() -> Result<OpenPiSessionRoot, LocalApiError> {
     require_pi_session_import_platform_support()?;
     let home = home_path("");
-    open_or_create_pi_session_root_from_home_io(&home)
+    open_or_create_pi_session_root_from_home_io(&home, &crate::agent_status::pi_sessions_dir(&home))
         .map_err(|_| pi_session_import_refused("session root could not be safely established"))
 }
 
@@ -13730,9 +13670,12 @@ fn open_pi_session_root_direct(root: &Path) -> Result<Option<OpenPiSessionRoot>,
     }
 }
 
-fn open_pi_session_root_from_home(home: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+fn open_pi_session_root_from_home(
+    home: &Path,
+    sessions: &Path,
+) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     require_pi_session_import_platform_support()?;
-    match open_pi_session_root_from_home_io(home) {
+    match open_pi_session_root_from_home_io(home, sessions) {
         Ok(root) => Ok(Some(root)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
@@ -13752,25 +13695,62 @@ fn open_pi_session_root_direct_io(root: &Path) -> std::io::Result<OpenPiSessionR
     })
 }
 
+/// The components of `sessions` below `home`, walked one by one from the
+/// trusted home directory. A sessions directory outside `home`, relative, or
+/// with `..` is refused, and never as NotFound, so neither open path reports
+/// it as "no root". (`Path` drops interior `.` components.)
 #[cfg(unix)]
-fn open_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
-    let trusted_home = open_pi_session_root_direct_io(home)?;
-    let mut directory = trusted_home.directory;
-    let mut path = home.to_path_buf();
-    for component in [".pi", "agent", "sessions"] {
-        directory = open_pi_directory_component(&directory, component.as_ref())?;
-        path.push(component);
-    }
-    Ok(OpenPiSessionRoot { path, directory })
+fn pi_session_components<'a>(
+    home: &Path,
+    sessions: &'a Path,
+) -> std::io::Result<Vec<&'a std::ffi::OsStr>> {
+    let outside = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory is not below the home directory",
+        )
+    };
+    sessions
+        .strip_prefix(home)
+        .map_err(|_| outside())?
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(outside()),
+        })
+        .collect()
 }
 
 #[cfg(unix)]
-fn open_or_create_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_pi_session_root_from_home_io(
+    home: &Path,
+    sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
+    walk_pi_session_root_from_home(home, sessions, open_pi_directory_component)
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_session_root_from_home_io(
+    home: &Path,
+    sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
+    walk_pi_session_root_from_home(home, sessions, open_or_create_pi_directory_component)
+}
+
+/// Walks `sessions` one component at a time from the trusted home directory,
+/// each opened by `open`.
+#[cfg(unix)]
+fn walk_pi_session_root_from_home(
+    home: &Path,
+    sessions: &Path,
+    open: fn(&fs::File, &std::ffi::OsStr) -> std::io::Result<fs::File>,
+) -> std::io::Result<OpenPiSessionRoot> {
+    let components = pi_session_components(home, sessions)?;
     let trusted_home = open_pi_session_root_direct_io(home)?;
     let mut directory = trusted_home.directory;
     let mut path = home.to_path_buf();
-    for component in [".pi", "agent", "sessions"] {
-        directory = open_or_create_pi_directory_component(&directory, component.as_ref())?;
+    for component in components {
+        directory = open(&directory, component)?;
         path.push(component);
     }
     Ok(OpenPiSessionRoot { path, directory })
@@ -13859,12 +13839,18 @@ fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSession
 }
 
 #[cfg(not(unix))]
-fn open_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_pi_session_root_from_home_io(
+    _home: &Path,
+    _sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
 }
 
 #[cfg(not(unix))]
-fn open_or_create_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+fn open_or_create_pi_session_root_from_home_io(
+    _home: &Path,
+    _sessions: &Path,
+) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
 }
 
@@ -14502,17 +14488,17 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
         }
         SourceKind::Pi => {
             let command_found = executable_exists("pi");
-            let sessions = home_path(".pi/agent/sessions");
+            let present = crate::agent_configs::detection::source_present_locally(source);
             let telemetry_installed = snapshot_device_credentials_include_source("pi");
             setup_scan_source(
                 source,
                 "pi",
-                command_found || sessions.exists(),
+                present,
                 command_found,
                 telemetry_installed,
                 if telemetry_installed {
                     "healthy"
-                } else if command_found || sessions.exists() {
+                } else if present {
                     "needs_repair"
                 } else {
                     "not_found"
@@ -15253,6 +15239,17 @@ fn verify_source_unchecked(
     };
     let api_base_url = setup_credentials.connection.api_base_url.clone();
 
+    // Before anything else: if the source CLI is genuinely not installed on this
+    // Mac, there is nothing to smoke. Running the smoke anyway returns
+    // "not installed or not executable", which the health projection renders as
+    // a BLOCKING telemetry failure and stalls onboarding on a machine that never
+    // had the app. Report a clean, non-blocking not-installed result instead.
+    if !source_binary_present(&source) {
+        let result = not_installed_verification_result(source.clone(), config);
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
+
     if source == SourceKind::Pi {
         let connection = setup_credentials.connection.clone();
         let pi_token = setup_credentials.setup_run_token.clone();
@@ -15305,18 +15302,6 @@ fn verify_source_unchecked(
     // install fail to verify Codex even though the smoke ran and `fix` reported
     // success. Detect the missing provisioning up front and return an accurate,
     // actionable status instead of running a doomed smoke.
-    //
-    // Before any of that: if the source CLI is genuinely not installed on this
-    // Mac, there is nothing to smoke. Running the smoke anyway returns
-    // "not installed or not executable", which the health projection renders as
-    // a BLOCKING telemetry failure and stalls onboarding on a machine that never
-    // had the app. Report a clean, non-blocking not-installed result instead.
-    if !source_binary_present(&source) {
-        let result = not_installed_verification_result(source.clone(), config);
-        daemon.record_verification_result(&result)?;
-        return Ok(result);
-    }
-
     if !relay_device_is_provisioned() {
         let result = verification_result_with_config(
             source.clone(),
@@ -15598,7 +15583,7 @@ fn run_pi_route_pre_smoke_with<Prepare, RunSmoke>(
 ) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>>
 where
     Prepare: FnOnce() -> Result<PiSessionCensus, LocalApiError>,
-    RunSmoke: FnOnce(&PiModelRoute, Option<usize>) -> SmokeResult,
+    RunSmoke: FnOnce(&PiModelRoute) -> SmokeResult,
 {
     let before_session_census = match prepare() {
         Ok(census) => census,
@@ -15608,8 +15593,7 @@ where
         }
     };
     let smoke_after = current_rfc3339();
-    let before_session_count = Some(before_session_census.files.len());
-    let mut smoke = run_smoke(route, before_session_count);
+    let mut smoke = run_smoke(route);
     if !smoke.succeeded {
         // A failed command is already terminal for this route. Its generic
         // pathname count is not authoritative and a second filesystem error
@@ -15687,7 +15671,7 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -15712,7 +15696,7 @@ fn pi_route_post_smoke_census_failure(
         message: StableMessage {
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
-                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -15921,17 +15905,16 @@ fn pi_route_passive_result(
     }
 }
 
-fn run_pi_route_smoke_prompt(
-    route: &PiModelRoute,
-    before_session_count: Option<usize>,
-) -> SmokeResult {
+/// The live route smoke. Its local session evidence comes only from the held
+/// root's pre/post census, so the command itself counts nothing.
+fn run_pi_route_smoke_prompt(route: &PiModelRoute) -> SmokeResult {
     let command = pi_smoke_command(Some(route));
     let result = run_bounded_command(
         command.program,
         &command.args,
         PI_SMOKE_COMMAND_TIMEOUT,
         "Pi",
-        before_session_count,
+        None,
     );
     let provider = match route.classification.model_provider.as_deref() {
         Some("openai") => Some(crate::provider_calls::Provider::Openai),
@@ -16174,7 +16157,7 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Failed if all_census_failed => (
             PI_SESSION_CENSUS_FAILED_CODE,
-            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that Pi's sessions directory is a real, readable directory, then retry Verify."
                 .to_string(),
         ),
         SourceVerificationStatus::NoFreshTelemetry if all_telemetry_disabled => (
@@ -21828,8 +21811,10 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    /// [format] OFF forget-installation erases every destination/source tree, including opaque records and temps.
-    fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+    /// [format] Forget-installation clears identity and credentials only: every
+    /// collected store, cache, composition state, backfill state and receipt
+    /// stays, so a re-pair reads this Mac's Claude history as moved.
+    fn forget_installation_clears_identity_and_credentials_and_keeps_collected_state() {
         let root = telemetry_key_store_root("forget-installation");
         let support_root = root.join("support");
         let secret_root = root.join("secrets");
@@ -21907,16 +21892,50 @@ for line in sys.stdin:
             b"receipt",
         )
         .unwrap();
-        fs::write(
-            support_root.join("snapshot_backfill_state.json"),
-            b"backfill",
-        )
+        crate::backfill::update_backfill_state(&support_root, |state| {
+            crate::backfill::mark_backfill_complete_for_destination(
+                state,
+                crate::snapshots::SnapshotSource::ClaudeCode,
+                "old",
+            );
+        })
         .unwrap();
         fs::write(
             support_root.join("snapshot_upload_receipts.json"),
             b"upload receipt",
         )
         .unwrap();
+        let mut kept = vec![
+            support_root.join("snapshots/destinations/old/codex-scan-index.json"),
+            crate::backfill::backfill_state_path(&support_root),
+            support_root.join("snapshot_upload_receipts.json"),
+            support_root.join("context_composition/v2/scopes/codex-scope.json"),
+            support_root.join("context_composition/v2/scopes/codex-scope.upload.json"),
+            support_root.join("context_footprint/workspace.json"),
+            support_root.join("mcp_inventory/disabled"),
+            support_root.join("context_composition/disabled"),
+        ];
+        for source in crate::snapshots::durable_sources::SOURCES {
+            let source = source.snapshot;
+            kept.push(crate::active_sessions::active_session_cache_path(
+                &support_root,
+                source,
+            ));
+            kept.push(crate::mcp_inventory::cache_path(&support_root, source));
+            kept.push(crate::snapshot_sync::detected_uses_cache_path(
+                &support_root,
+                source,
+            ));
+        }
+        for path in &kept {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !path.exists() {
+                fs::write(path, b"synthetic-forget-canary").unwrap();
+            }
+        }
+        kept.push(crate::snapshots::state_v2::retired_record_dir(
+            &support_root.join("snapshots/destinations/other/claude_code-scan-index.json"),
+        ));
         let source_data = root.join("codex-source.jsonl");
         fs::write(&source_data, b"source data").unwrap();
 
@@ -21953,9 +21972,17 @@ for line in sys.stdin:
         assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .load()
             .is_err());
-        assert!(!support_root.join("snapshots").exists());
-        assert!(!support_root.join("snapshot_backfill_state.json").exists());
-        assert!(!support_root.join("snapshot_upload_receipts.json").exists());
+        for path in &kept {
+            assert!(path.exists(), "{path:?}: collected state stays");
+        }
+        assert_eq!(
+            crate::snapshot_sync::withheld_support::claude_prior_history_for_new_destination(
+                &support_root,
+                "new"
+            ),
+            crate::snapshots::PriorHistory::Moved,
+            "a re-pair after forget reads this Mac's Claude history as moved"
+        );
         assert_eq!(fs::read(source_data).unwrap(), b"source data");
         assert_eq!(
             response.payload.unwrap()["message"]["code"],
@@ -23236,65 +23263,6 @@ for line in sys.stdin:
         );
     }
 
-    /// [regress] forget removes more than 64 legacy claude namespaces and progress files.
-    #[test]
-    #[serial]
-    fn forget_removes_more_than_64_legacy_claude_namespaces_and_progress_files() {
-        let _lock = lock_backend_test_env();
-        let env = history_choice_test_env();
-        let snapshots = env.root.join("snapshots");
-        for namespace in 0..70 {
-            let dir = snapshots
-                .join("destinations")
-                .join(format!("{namespace:064x}"));
-            fs::create_dir_all(&dir).unwrap();
-            for name in [
-                "claude_code-legacy-scan-index.json",
-                "claude_code-legacy-scan-index-upload-progress.json",
-                "claude_code-scan-index-v3.json.v2.sqlite",
-            ] {
-                fs::write(dir.join(name), b"synthetic-forget-canary").unwrap();
-            }
-        }
-        {
-            let _identity_lock = lock_setup_run_binding();
-            forget_installation_state_locked().unwrap();
-        }
-        assert!(!snapshots.exists());
-    }
-
-    #[test]
-    #[serial]
-    fn forget_erases_source_caches_and_composition_state_and_keeps_opt_outs() {
-        use crate::snapshots::SnapshotSource;
-        let _lock = lock_backend_test_env();
-        let env = history_choice_test_env();
-        fs::create_dir_all(env.root.join("snapshots")).unwrap();
-        let mut erased = vec![env
-            .root
-            .join("context_composition/v2/scopes/codex-scope.json")];
-        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-            erased.push(crate::active_sessions::active_session_cache_path(
-                &env.root, source,
-            ));
-            erased.push(crate::mcp_inventory::cache_path(&env.root, source));
-        }
-        let kept = [
-            env.root.join("mcp_inventory/disabled"),
-            env.root.join("context_composition/disabled"),
-        ];
-        for path in erased.iter().chain(&kept) {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"synthetic-forget-canary").unwrap();
-        }
-        {
-            let _identity_lock = lock_setup_run_binding();
-            forget_installation_state_locked().unwrap();
-        }
-        assert!(erased.iter().all(|path| !path.exists()));
-        assert!(kept.iter().all(|path| path.exists()));
-    }
-
     #[test]
     #[serial]
     fn history_choice_forget_installation_invalidates_old_browser_credentials() {
@@ -23911,7 +23879,9 @@ for line in sys.stdin:
         assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
             .load()
             .is_err());
-        assert!(!support_root.join("snapshots").exists());
+        assert!(support_root
+            .join("snapshots/destinations/old/codex-scan-index.json")
+            .exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26851,21 +26821,14 @@ for line in sys.stdin:
         let original = home.join(".pi/agent/sessions-original");
         let _home_guard = EnvVarGuard::set_path("HOME", &home);
 
-        let result = run_pi_route_pre_smoke_with(
-            &live_pi_route(),
-            prepare_pi_live_session_census,
-            |_, before_session_count| {
+        let result =
+            run_pi_route_pre_smoke_with(&live_pi_route(), prepare_pi_live_session_census, |_| {
                 fs::rename(&sessions, &original).expect("move held pre-smoke root");
                 fs::create_dir(&sessions).expect("create replacement session root");
                 fs::write(sessions.join("preexisting-a.jsonl"), b"{}\n")
                     .expect("write first replacement transcript");
                 fs::write(sessions.join("preexisting-b.jsonl"), b"{}\n")
                     .expect("write second replacement transcript");
-                assert_eq!(
-                    local_session_observed(before_session_count),
-                    Some(true),
-                    "the legacy pathname count would misclassify replacement files as smoke evidence"
-                );
                 SmokeResult {
                     command_found: true,
                     succeeded: true,
@@ -26876,8 +26839,7 @@ for line in sys.stdin:
                     error_code: None,
                     local_session_observed: Some(true),
                 }
-            },
-        );
+            });
         let failed = match result {
             Ok(_) => panic!("a replaced root must fail before route evidence is accepted"),
             Err(failed) => *failed,
@@ -26915,7 +26877,11 @@ for line in sys.stdin:
         let outside = control_test_root("pi-live-root-symlink-outside");
         symlink(&outside, home.join(".pi")).expect("symlink .pi outside HOME");
 
-        assert!(open_or_create_pi_session_root_from_home_io(&home).is_err());
+        assert!(open_or_create_pi_session_root_from_home_io(
+            &home,
+            &home.join(".pi/agent/sessions")
+        )
+        .is_err());
         assert!(!outside.join("agent").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
@@ -27002,7 +26968,7 @@ for line in sys.stdin:
 
         symlink(&outside, home.join(".pi")).expect("symlink .pi outside home");
         assert!(matches!(
-            open_pi_session_root_from_home(&home),
+            open_pi_session_root_from_home(&home, &home.join(".pi/agent/sessions")),
             Err(LocalApiError::LocalOperationFailed(_))
         ));
 
@@ -27010,10 +26976,43 @@ for line in sys.stdin:
         fs::create_dir(home.join(".pi")).expect("create real .pi");
         symlink(outside.join("agent"), home.join(".pi/agent")).expect("symlink agent outside .pi");
         assert!(matches!(
-            open_pi_session_root_from_home(&home),
+            open_pi_session_root_from_home(&home, &home.join(".pi/agent/sessions")),
             Err(LocalApiError::LocalOperationFailed(_))
         ));
 
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    /// [behaviour] An overridden Pi agent directory below home is walked from
+    /// the trusted home; one outside home, relative or with `..` is refused,
+    /// never reported as no root, and nothing is created.
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_root_follows_an_override_below_home_and_refuses_others() {
+        let home = control_test_root("pi-session-root-override");
+        let sessions = home.join("alt/agent/sessions");
+        let opened = open_or_create_pi_session_root_from_home_io(&home, &sessions)
+            .expect("an override below home is created and walked");
+        assert_eq!(opened.path, sessions);
+        assert!(matches!(
+            open_pi_session_root_from_home(&home, &sessions),
+            Ok(Some(_))
+        ));
+        let outside = control_test_root("pi-session-root-override-outside");
+        for refused in [
+            outside.join("agent/sessions"),
+            PathBuf::from("agent/sessions"),
+            home.join("alt/../escape/sessions"),
+        ] {
+            assert!(matches!(
+                open_pi_session_root_from_home(&home, &refused),
+                Err(LocalApiError::LocalOperationFailed(_))
+            ));
+            assert!(open_or_create_pi_session_root_from_home_io(&home, &refused).is_err());
+        }
+        assert!(!outside.join("agent").exists());
+        assert!(!home.join("escape").exists());
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(outside);
     }
@@ -27033,7 +27032,7 @@ for line in sys.stdin:
         fs::write(root.join("outside.jsonl"), b"outside-secret\n")
             .expect("write replacement session");
 
-        let error = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+        let error = pi_session_files_for_root(&opened_root)
             .expect_err("count/selection must refuse a replaced root");
         assert!(error.to_string().contains("session root changed"));
         let _ = fs::remove_dir_all(parent);
@@ -27053,8 +27052,7 @@ for line in sys.stdin:
         fs::write(&nested_session, b"inside\n").expect("write nested session");
         fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
         let opened_root = open_pi_test_root(&root);
-        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("discover nested session");
+        let discovered = pi_session_files_for_root(&opened_root).expect("discover nested session");
 
         fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
         symlink(&outside, &nested).expect("swap directory for symlink");
@@ -27067,8 +27065,7 @@ for line in sys.stdin:
         fs::remove_file(&nested).expect("remove directory symlink");
         let final_session = root.join("final.jsonl");
         fs::write(&final_session, b"inside-final\n").expect("write final session");
-        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("discover final session");
+        let discovered = pi_session_files_for_root(&opened_root).expect("discover final session");
         fs::remove_file(&final_session).expect("remove discovered final session");
         symlink(&outside_session, &final_session).expect("swap file for symlink");
         assert!(discovered.contains(&final_session));
@@ -27080,37 +27077,22 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(outside);
     }
 
+    /// [behaviour] The census lists a whole tree, however deep or wide; there
+    /// is no size cap.
     #[cfg(unix)]
     #[test]
-    fn pi_session_traversal_refuses_deep_and_wide_trees() {
-        let root = control_test_root("pi-session-traversal-caps");
-        let deep = root.join("one").join("two");
+    fn pi_session_traversal_lists_deep_and_wide_trees() {
+        let root = control_test_root("pi-session-traversal-uncapped");
+        let deep = (0..40).fold(root.clone(), |path, level| path.join(format!("d{level}")));
         fs::create_dir_all(&deep).expect("create deep tree");
         fs::write(deep.join("session.jsonl"), b"{}\n").expect("write deep session");
-        let limits = PiSessionSafetyLimits {
-            max_depth: 1,
-            max_entries: 16,
-            max_files: 16,
-        };
-        let error = pi_session_files_in_with_limits(&root, limits)
-            .expect_err("deep traversal must be refused");
-        assert!(error.to_string().contains("maximum depth"));
-
-        let wide = control_test_root("pi-session-file-cap");
         for index in 0..3 {
-            fs::write(wide.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
+            fs::write(root.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
         }
-        let limits = PiSessionSafetyLimits {
-            max_depth: 4,
-            max_entries: 16,
-            max_files: 2,
-        };
-        let error = pi_session_files_in_with_limits(&wide, limits)
-            .expect_err("wide traversal must be refused");
-        assert!(error.to_string().contains("maximum file count"));
-
+        let files = pi_session_files_in(&root).expect("an uncapped census lists the tree");
+        assert_eq!(files.len(), 4);
+        assert!(files.contains(&deep.join("session.jsonl")));
         let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(wide);
     }
 
     #[cfg(unix)]

@@ -37,6 +37,15 @@ pub(crate) fn codex_evidence(
     index: &super::super::ScanIndex,
     scan: &super::super::SourceScanResult,
 ) -> Value {
+    codex_evidence_of_items(index, &scan.snapshots)
+}
+
+/// [`codex_evidence`] for a driver that holds the emitted items without a
+/// scan result (the Tail transition rows' native finishes).
+pub(crate) fn codex_evidence_of_items(
+    index: &super::super::ScanIndex,
+    items: &[SnapshotItem],
+) -> Value {
     json!({
         "TierReplay": index.files.iter().map(|(key, entry)| (key.clone(), json!({
             "applied": entry.codex_applied_tier_receipt,
@@ -45,11 +54,111 @@ pub(crate) fn codex_evidence(
             "owner": entry.codex_protected_owner,
             "v2": entry.codex_counting_v2,
         }))).collect::<BTreeMap<_, _>>(),
-        "token_count": scan.snapshots.iter().map(|item| (item.source_session_id.clone(), json!([
+        "token_count": items.iter().map(|item| (item.source_session_id.clone(), json!([
             item.input_tokens, item.output_tokens, item.cache_read_tokens,
             item.reasoning_output_tokens, item.request_count,
         ]))).collect::<BTreeMap<_, _>>(),
     })
+}
+
+/// The store release 0.1.217 left mid-walk: `index` as a standalone index
+/// file in which every transcript's family still carries the retired
+/// per-family pending usage evidence and every file entry the retired owed
+/// bit, the walk carries every family (stale-family carry roots, with each
+/// file queued for replay), the full re-arm progress names them structural
+/// and held with another invalidation observed, and the duplicate fence and
+/// identity-contract latch are set, in that release's field shapes. A routed
+/// index is written as its resident copy without the route, as a standalone
+/// file holds it.
+pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
+    let copy = if super::super::e2_pipeline_scan_fixture::route_of(index).is_some() {
+        let mut copy = super::super::state_v2::money_test_support::resident(index);
+        copy.v2_mut().persistence_v2 = None;
+        copy.generation = 0;
+        copy
+    } else {
+        index.clone()
+    };
+    let mut legacy = serde_json::to_value(&copy).expect("encode the index");
+    let mut pending = serde_json::Map::new();
+    let mut roots = BTreeSet::new();
+    let mut replay = Vec::new();
+    let files = legacy["files"]
+        .as_object_mut()
+        .expect("the index encodes its file entries");
+    for (key, entry) in files.iter_mut() {
+        entry["evidence_owed"] = true.into();
+        let session = std::path::Path::new(key)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("a transcript key")
+            .to_string();
+        roots.insert(session.clone());
+        replay.push(json!({
+            "scan_root": std::path::Path::new(key).parent().expect("a transcript directory"),
+            "path": key,
+            "census_member": true,
+            "watcher_hint": false,
+        }));
+        let mut members = serde_json::Map::new();
+        members.insert(session.clone(), json!(["0".repeat(64)]));
+        pending.insert(
+            session,
+            json!({
+                "census_window_end": "2026-08-02T08:00:00Z",
+                "member_request_id_hashes": members,
+                "member_occurrences": {},
+                "invalid": false,
+            }),
+        );
+    }
+    legacy["claude_usage_family_pending"] = Value::Object(pending);
+    let digests = roots
+        .iter()
+        .map(|root| {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(root.as_bytes()))[..16].to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    legacy["claude_stale_family_carry"] = json!({
+        "origin": {
+            "context_fingerprint": "c".repeat(64),
+            "process": 1,
+            "full_rearm_window": true,
+        },
+        "roots": roots,
+        "replay": replay,
+    });
+    legacy["claude_full_rearm_progress"] = json!({
+        "observed_window": "2026-08-02T08:00:00Z",
+        "structural_roots": digests,
+        "other_invalidation_observed": true,
+        "held_family_roots": digests,
+    });
+    legacy["claude_duplicate_request_witness_overflowed"] = json!(true);
+    legacy["claude_request_identity_contract_changed"] = json!(true);
+    legacy
+}
+
+/// Writes [`legacy_pending_store`] at `path` and loads it as this build does.
+pub(crate) fn upgrade_from_legacy_store(
+    index: &super::super::ScanIndex,
+    path: &std::path::Path,
+) -> super::super::ScanIndex {
+    let legacy = legacy_pending_store(index);
+    assert!(!legacy["claude_usage_family_pending"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    assert!(
+        !legacy["claude_stale_family_carry"]["roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a carrying walk"
+    );
+    std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).expect("write the legacy store");
+    super::super::ScanIndex::load(path).expect("an older release's store loads")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -982,7 +1091,7 @@ pub(crate) mod native_cold {
         file: std::fs::File,
         apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     ) -> OwnedJsonlParser {
-        OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
+        OwnedJsonlParser::new(file, path, source, apply, None, None).unwrap()
     }
     pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,
@@ -994,12 +1103,15 @@ pub(crate) mod native_cold {
     ) {
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
-        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
-            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
-                completed.checkpoint
-            }
-            _ => panic!("a clean native fixture is certified"),
-        };
+        let checkpoint = parser
+            .retain_reduction(
+                scope,
+                now,
+                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
+            )
+            .unwrap()
+            .expect("a clean native fixture is certified")
+            .checkpoint;
         (reduction, checkpoint)
     }
 }

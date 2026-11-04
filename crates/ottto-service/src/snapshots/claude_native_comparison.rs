@@ -6,161 +6,34 @@ mod metadata;
 mod settlement;
 use metadata::{Map as DescriptorMap, Set as DescriptorSet};
 use settlement::NativeCorrection;
-pub(crate) use settlement::{Completion, NativeBodyBudget, SelectedFallback};
+pub(crate) use settlement::{Completion, SelectedFallback};
 
 #[cfg(test)]
 thread_local! {
     static TARGET_UNKNOWN_ALLOWANCE_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
-#[cfg(test)]
-pub(crate) struct TargetUnknownAllowanceTest;
-#[cfg(test)]
-pub(crate) fn target_unknown_allowance_for_test() -> TargetUnknownAllowanceTest {
-    TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| assert!(state.replace(Some(0)).is_none()));
-    TargetUnknownAllowanceTest
-}
-#[cfg(test)]
-impl TargetUnknownAllowanceTest {
-    pub(crate) fn hits(&self) -> usize {
-        TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| state.get().expect("active refusal fixture"))
-    }
-}
-#[cfg(test)]
-impl Drop for TargetUnknownAllowanceTest {
-    fn drop(&mut self) {
-        TARGET_UNKNOWN_ALLOWANCE_TEST.with(|state| state.set(None));
-    }
-}
 
-/// Borrow the same process lease at the final rearm decision, rather than
-/// turning its earlier allowed() result into a durable permission bit.
-pub(crate) struct NegativeView<'a> {
-    window: &'a WindowEligibility,
-    lease: &'a lifecycle::Lease,
-}
-/// Borrow actual native completion independently of upload settlement. Neither
-/// a lease nor a possible-owner envelope can manufacture this moving owner.
+/// Borrow the process lease for the fold's diagnostics. It carries no
+/// permission and cannot complete a native census.
 pub(crate) struct FoldView<'a> {
-    pub(super) negatives: Option<NegativeView<'a>>,
-    native_window: Option<&'a str>,
     pub(super) lease: Option<&'a lifecycle::Lease>,
 }
 impl<'a> FoldView<'a> {
-    /// Observe an executed BASE fold even without a native completion. This
-    /// carries no negative permission and cannot complete a native census.
+    /// Observe an executed BASE fold.
     pub(crate) fn observation_only(lease: &'a lifecycle::Lease) -> Self {
-        Self {
-            negatives: None,
-            native_window: None,
-            lease: Some(lease),
-        }
-    }
-    pub(super) fn native_census_complete(&self, scan: &SourceScanResult) -> bool {
-        self.native_window.is_some_and(|window| {
-            scan.source == SnapshotSource::ClaudeCode
-                && window == scan.census_window_end
-                && scan.state_census_complete
-                && scan.sidecar_census_complete
-        })
+        Self { lease: Some(lease) }
     }
 }
 impl Completion {
     pub(crate) fn fold_view<'a>(&'a self, lease: Option<&'a lifecycle::Lease>) -> FoldView<'a> {
-        FoldView {
-            negatives: self.negatives(lease),
-            native_window: self.native_window(),
-            lease,
-        }
+        FoldView { lease }
     }
-    pub(crate) fn negatives<'a>(
-        &'a self,
-        lease: Option<&'a lifecycle::Lease>,
-    ) -> Option<NegativeView<'a>> {
-        let lease = lease.filter(|lease| lease.allowed())?;
-        Some(NegativeView {
-            window: self.window.as_deref()?,
-            lease,
-        })
-    }
-}
-impl<'a> NegativeView<'a> {
-    pub(super) fn keys(
-        &self,
-        index: &ScanIndex,
-        demoting: &BTreeMap<String, BTreeSet<String>>,
-        members: &BTreeMap<String, BTreeSet<String>>,
-    ) -> BTreeSet<&'a str> {
-        if !self.lease.allowed() || !self.window.accounted() {
-            return BTreeSet::new();
-        }
-        let mut keys: BTreeSet<&'a str> = self
-            .window
-            .roots
-            .iter()
-            .filter(|(root, saved)| {
-                !demoting.contains_key(*root)
-                    && !self.window.revoked_roots.contains(*root)
-                    && WindowEligibility::root_is_current(root, saved, index)
-                    && index
-                        .claude_usage_family_witnesses
-                        .get(*root)
-                        .is_some_and(|witness| {
-                            members.get(*root).is_some_and(|actual| {
-                                actual
-                                    .iter()
-                                    .eq(witness.member_request_id_fingerprints.keys())
-                            })
-                        })
-            })
-            .flat_map(|(_, saved)| saved.certified.keys().map(String::as_str))
-            .collect();
-        keys.extend(
-            self.window
-                .native_corrections
-                .iter()
-                .filter(|(key, receipt)| {
-                    !demoting.contains_key(receipt.root())
-                        && !self
-                            .window
-                            .correction_forbidden_roots
-                            .contains(receipt.root())
-                        && !self.window.correction_revoked_keys.contains(*key)
-                        && receipt.current(key, index)
-                        && index
-                            .claude_usage_family_witnesses
-                            .get(receipt.root())
-                            .is_some_and(|witness| {
-                                members.get(receipt.root()).is_some_and(|actual| {
-                                    actual
-                                        .iter()
-                                        .eq(witness.member_request_id_fingerprints.keys())
-                                })
-                            })
-                })
-                .map(|(key, _)| key.as_str()),
-        );
-        keys
-    }
-}
-
-pub(crate) fn actual_native_conjunction(disposition: &ClaudeUsageAuthorityDisposition) -> bool {
-    let census = &disposition.duplicate_census;
-    census.census_complete
-        && census.coverage_complete
-        && !census.census_invalid
-        && !census.fence_after
-        && census.pending_occurrence_count > 0
-        && disposition.transcript_ownership_complete
 }
 
 /// Retaining a previously bootstrapped permit across a bounded page requires
 /// known clean native history and the actual selected-save marker in Lease.
 /// This predicate cannot mint a permit or certify an unchanged member.
-pub(crate) fn selected_page_is_clean(
-    scan: &SourceScanResult,
-    index: &ScanIndex,
-    disposition: &ClaudeUsageAuthorityDisposition,
-) -> bool {
+pub(crate) fn selected_page_is_clean(scan: &SourceScanResult, index: &ScanIndex) -> bool {
     scan.source == SnapshotSource::ClaudeCode
         && scan.state_census_complete
         && scan.sidecar_census_complete
@@ -177,9 +50,6 @@ pub(crate) fn selected_page_is_clean(
         && scan.zero_snapshot_usage_evidence_count == 0
         && scan.dropped_usage_record_count == 0
         && !index.bounded_sweep_had_unsettled_upload
-        && !index.claude_duplicate_request_witness_overflowed
-        && !disposition.duplicate_census.census_invalid
-        && !disposition.duplicate_census.fence_after
         && (scan.census_complete
             || index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.census_window_end == scan.census_window_end
@@ -247,7 +117,6 @@ impl TerminalTraversal {
                     && traversal.pending_candidates.is_empty()
                     && !traversal.counts.has_errors()
                     && !traversal.watcher_hint_seen
-                    && !traversal.codex_parent_resolution_retry_required
             })
         {
             return None;
@@ -285,7 +154,7 @@ pub(super) fn select_recovery_before_audits(
             && requested.contains(&candidate.path)
             && files
                 .get(&local_index_key(&candidate.path))
-                .is_some_and(ScanIndexEntry::rearmed);
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty());
         if eligible {
             selected.push(candidate.clone());
         }
@@ -399,7 +268,7 @@ impl WindowEligibility {
             && claude_usage_family_witness_fingerprint(witness) == saved.proof
             && saved.certified.iter().all(|(key, skip)| {
                 index.files.get(key).is_some_and(|entry| {
-                    entry.observed_fingerprint() == skip.revision
+                    entry.source_file_fingerprint.as_str() == skip.revision
                         && entry.scan_identity_version.as_deref()
                             == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                         && entry.last_snapshot_fingerprint.is_some()
@@ -682,8 +551,8 @@ impl NativePhase {
                                                 // never eligible targets and cannot borrow this Claude prepayment.
             if !parsed.state_only_blocked_session_ids.is_empty()
                 || parsed.codex_parent_session_ref.is_some()
-                || parsed.codex_parent_ownership_ledger.is_some()
-                || parsed.codex_parent_resolution_pending
+                // Unchanged refusal: any parse that saw a source session id.
+                || parsed.source_session_id_seen
             {
                 return None;
             }
@@ -724,18 +593,6 @@ impl NativePhase {
                 path_inserts,
                 &mut cost,
             )?;
-            if parsed.snapshots.iter().any(|item| {
-                item.claude_context_curve_owned_start_proven
-                    && !index
-                        .claude_owned_start_census
-                        .contains_key(&item.source_session_id)
-            }) {
-                settlement::restore_tree_insert_peak::<String, ClaudeOwnedStartCensusWitness>(
-                    index.claude_owned_start_census.len().checked_add(1)?,
-                    1,
-                    &mut cost,
-                )?;
-            }
             if parsed.terminal_loss().is_some() {
                 settlement::restore_tree_insert_peak::<String, TerminalJsonlDisposition>(
                     index.terminal_jsonl_dispositions.len().checked_add(1)?,
@@ -1114,35 +971,6 @@ impl NativePhase {
         }
     }
 
-    /// Logical-page unit adapter: the caller actually parsed each controlled
-    /// source revision. No physical opened-file, layout or Skip claim is made.
-    /// The full SourcePreparation oracle separately covers those boundaries.
-    #[cfg(test)]
-    pub(super) fn primitive_completion_for_test(
-        scan: &SourceScanResult,
-        index: &ScanIndex,
-        rows: PairedRows<'_>,
-        lease: &mut lifecycle::Lease,
-    ) -> Completion {
-        let mut phase = Self::default();
-        for pending in &scan.pending_finalization {
-            phase.record_parse_key(Path::new(&pending.index_key));
-        }
-        assert!(phase.import_window(lease.take_window(), index, &scan.census_window_end));
-        assert!(phase.pause_before_finalization());
-        let mut qualification =
-            phase.qualify(index, &scan.snapshots, &scan.census_window_end, rows);
-        let (targets, selection) = qualification.take_target_candidates(&scan.snapshots, 0);
-        assert!(targets.is_empty() && selection.unresolved_sources.is_empty());
-        assert_eq!(
-            selection.matched_roots, 0,
-            "this unit oracle has no cross-family targets"
-        );
-        Controller::new(qualification)
-            .complete(scan, None, lease.allowed())
-            .unwrap()
-    }
-
     pub(super) fn record_actual_skip(
         &mut self,
         index: &ScanIndex,
@@ -1169,7 +997,7 @@ impl NativePhase {
             || index.terminal_jsonl_dispositions.contains_key(&key)
             || entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
             || entry.last_snapshot_fingerprint.is_none()
-            || entry.rearmed()
+            || entry.source_file_fingerprint.is_empty()
             || entry.source_file_fingerprint != candidate.source_file_fingerprint
             || !index.file_upload_context_enabled()
         {
@@ -1615,10 +1443,9 @@ impl NativePhase {
                 let (key, skip) = captured.next().expect("peeked captured certificate");
                 if !self.parsed_roots.contains(root)
                     && skip.census_window_end == census_window_end
-                    && index
-                        .files
-                        .get(&key)
-                        .is_some_and(|entry| entry.observed_fingerprint() == skip.revision)
+                    && index.files.get(&key).is_some_and(|entry| {
+                        entry.source_file_fingerprint.as_str() == skip.revision
+                    })
                     && retained
                         .member_request_id_fingerprints
                         .contains_key(&skip.member)
@@ -1981,7 +1808,6 @@ pub(crate) struct Controller {
     qualification: Qualification,
     required_roots: BTreeSet<String>,
     native_frontier: usize,
-    ordinary_body_frontier: Option<usize>,
     awaiting_targets: bool,
     failed: bool,
     acquisition: TargetAcquisition,
@@ -2010,7 +1836,6 @@ impl Controller {
             qualification,
             required_roots,
             native_frontier: 0,
-            ordinary_body_frontier: None,
             awaiting_targets: false,
             failed: false,
             acquisition: TargetAcquisition::default(),
@@ -2021,7 +1846,6 @@ impl Controller {
     /// the qualification. Fund them before the canonical constructor clones.
     pub(crate) fn new_paid(
         qualification: Qualification,
-        ordinary_body_frontier: usize,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Result<Self, crate::source_rotation::LocalRefusal> {
         use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
@@ -2050,10 +1874,7 @@ impl Controller {
         })()
         .filter(|peak| paid.grow_for(*peak))
         .ok_or(refusal)?;
-        let mut controller = Self::new(qualification);
-        // OwnedSourceScan only appends complete native target outputs after
-        // this pause; receipts are minted before finish filtering/reordering.
-        controller.ordinary_body_frontier = Some(ordinary_body_frontier);
+        let controller = Self::new(qualification);
         // Required roots and empty acquisition state are the only added heap.
         let mut extra = Counter::new(crate::source_rotation::PARKED_BUDGET);
         controller
@@ -2869,7 +2690,7 @@ crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_win
 crate::heap_layout_bound::fields!(NativePhase; disabled, retained_target_bytes, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; proof, members, envelope, certified, prior_native, paired_roots);
 crate::heap_layout_bound::fields!(FrozenNativePrior; revision, request_fingerprint, occurrence_fingerprint, assigned);
-crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, ordinary_body_frontier, awaiting_targets, failed, acquisition);
+crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
 crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowRoot; proof, certified);

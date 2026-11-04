@@ -658,16 +658,7 @@ fn keyed_hex(key: &[u8], parts: &[&str]) -> String {
         mac.update(&(part.len() as u64).to_be_bytes());
         mac.update(part.as_bytes());
     }
-    hex_bytes(&mac.finalize().into_bytes())
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("write to string");
-    }
-    output
+    crate::hex::encode(&mac.finalize().into_bytes())
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

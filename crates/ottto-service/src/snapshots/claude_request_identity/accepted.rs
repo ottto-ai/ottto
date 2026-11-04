@@ -46,7 +46,6 @@ pub(crate) struct AcceptedBuckets(
     bool,
     usize,
     bool,
-    bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,9 +174,7 @@ pub(super) struct AcceptedShare {
 }
 pub(crate) mod digest_hex {
     use super::*;
-    pub(crate) fn encode(value: &[u8; 32]) -> String {
-        value.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+    pub(crate) use crate::hex::encode;
     pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
         if !hash_is_valid(value) {
             return Err(E::custom("invalid fingerprint"));
@@ -205,7 +202,9 @@ mod optional_digest_hex {
         value: &Option<[u8; 32]>,
         encoder: S,
     ) -> Result<S::Ok, S::Error> {
-        value.as_ref().map(digest_hex::encode).serialize(encoder)
+        value
+            .map(|digest| crate::hex::encode(&digest))
+            .serialize(encoder)
     }
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         decoder: D,
@@ -227,21 +226,6 @@ fn digest(key: &FingerprintKey, value: Value) -> [u8; 32] {
     mac.update(b"ottto:session-attribution:");
     mac.update(&serde_json::to_vec(&value).expect("JSON fingerprint"));
     mac.finalize().into_bytes().into()
-}
-/// HMAC-SHA-256 of local text under the attribution key, in the caller's own
-/// domain. A SHA-256 of the same text is a different value, by design: without
-/// the key nothing can be tested against this one.
-pub(crate) fn keyed_text_digest(key: &[u8; 32], domain: &str, text: &str) -> String {
-    let key = FingerprintKey(Zeroizing::new(*key));
-    let bytes = digest(
-        &key,
-        json!([
-            domain,
-            crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
-            text
-        ]),
-    );
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn key_epoch(key: &FingerprintKey) -> [u8; 32] {
     digest(
@@ -301,29 +285,18 @@ fn wire_row_key(row: &Value) -> Option<RowKey> {
         subscription_product: text("subscription_product"),
     })
 }
-fn basis_token(basis: &str) -> Option<&'static str> {
-    match basis {
-        TELEMETRY => Some(TELEMETRY),
-        TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_RECORDED_LOGIN => Some(TRANSCRIPT_RECORDED_LOGIN),
-        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
-        TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
-        _ => None,
-    }
-}
-/// A carried or recorded-login share: placement, never proof of its row.
+/// A carried or recorded-login share: placement, never proof of its row. The
+/// stored-JSON boundary twin of `AuthorityKey::placement_only`, stricter: any
+/// present `account_source` (even null) counts.
 fn placement_only_entry(entry: &Value) -> bool {
     entry.get("account_source").is_some()
         || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
 }
 fn session_key(key: &FingerprintKey, session: &str) -> String {
-    hex(&digest(
+    crate::hex::encode(&digest(
         key,
         json!(["claude_accepted_identity_buckets:v2", session]),
     ))
-}
-fn hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The domain of the local `session_context` change detector.
@@ -379,7 +352,7 @@ pub(super) fn unbind_test_session_context_key() {
 /// The sentence's HMAC-SHA-256 under the bound key; `None` without one.
 pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
     let key = with_session_context_key(|bound| bound.clone().flatten())?;
-    Some(hex(&digest(
+    Some(crate::hex::encode(&digest(
         &key,
         json!([SESSION_CONTEXT_DOMAIN, sentence]),
     )))
@@ -634,7 +607,8 @@ impl AcceptedSession {
         self.proved
             .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
             .ok()
-            .and_then(|index| self.proved[index].account.as_ref().map(digest_hex::encode))
+            .and_then(|index| self.proved[index].account)
+            .map(|digest| crate::hex::encode(&digest))
     }
     /// Today's proof digest for a row in its fresh-tag wire form.
     pub(super) fn row_proof(&self, row: &Value, evidence: &Value) -> Option<[u8; 16]> {
@@ -726,7 +700,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     state.missing = state.missing.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None, false, false, 0, false, false))
+                Ok(AcceptedBuckets(states, None, false, false, 0, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -757,15 +731,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(
-            BTreeMap::new(),
-            Some(fixture_key()),
-            false,
-            false,
-            0,
-            false,
-            false,
-        )
+        Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -813,7 +779,6 @@ impl AcceptedBuckets {
             false,
             false,
             0,
-            false,
             false,
         )
     }
@@ -877,23 +842,6 @@ impl AcceptedBuckets {
     }
     pub(crate) fn account_source_enabled(&self) -> bool {
         self.5
-    }
-    /// Recorded-login tagging for this cycle: only the server's exact capability
-    /// token turns it on; absent keeps every byte and writes no ledger.
-    pub(crate) fn set_sole_login_enabled(&mut self, enabled: bool) {
-        self.6 = enabled;
-    }
-    pub(crate) fn sole_login_enabled(&self) -> bool {
-        self.6
-    }
-    /// The opaque per-folder count key: 8 hex of the attribution-key HMAC. No
-    /// key, no token, so the folder cannot qualify.
-    pub(crate) fn folder_token(&self, folder: &str) -> Option<String> {
-        let mac = digest(
-            self.1.as_ref()?,
-            json!(["claude_sole_login_folder:v1", folder]),
-        );
-        Some(mac[..4].iter().map(|byte| format!("{byte:02x}")).collect())
     }
     #[cfg(test)]
     pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
@@ -1363,7 +1311,6 @@ mod heap_tests {
             false,
             false,
             0,
-            false,
             false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
@@ -1852,7 +1799,6 @@ mod retained_heap_tests {
             false,
             false,
             0,
-            false,
             false,
         );
         let mut counter = Counter::new(4 * 1024 * 1024);
