@@ -92,7 +92,6 @@ fn native_parser_with(
         },
         Some(metadata),
         None,
-        None,
     )
     .unwrap();
     (parser, expected, scope)
@@ -390,67 +389,6 @@ fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
         );
         retained = next;
     }
-}
-/// The fold builds Claude sizes from the retained boundaries and owned
-/// requests, so a Tail pass that sees the next request gives the full read's
-/// sizes. Rebuilt here with every request owned, as for an exclusive root.
-#[test]
-fn sampled_native_claude_compaction_sizes_across_tail_passes() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let source = SnapshotSource::ClaudeCode;
-    let metadata = CodexTitleMetadata::default();
-    let scope = Scope(format!("synthetic-native-{source:?}"));
-    let rebuilt = |mut items: Vec<SnapshotItem>| {
-        let mut item = items.remove(0);
-        let mut owned = item
-            .claude_usage_occurrences
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        owned.sort_by_key(|occurrence| occurrence.sequence);
-        rebuild_claude_context_posture(&mut item, &owned, None);
-        item
-    };
-    let fixture = Fixture::new(source);
-    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
-    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
-        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
-        "compactMetadata":{"trigger":"manual","preTokens":900000}}));
-    let (retained, _, _, items) =
-        acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
-    assert!(retained.is_some());
-    let first = rebuilt(items);
-    assert_eq!(
-        first.compaction_events,
-        vec![SnapshotCompactionEvent {
-            at: "2026-10-07T10:30:05Z".to_string(),
-            before: first.first_turn_context_tokens,
-            after: None,
-            trigger: Some("manual".to_string()),
-        }]
-    );
-
-    fixture.append(&usage(source, 40, 1, "claude-opus-4-8"));
-    let (_, mode, _, items) =
-        acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
-    assert_eq!(mode, ReadMode::Tail);
-    let tail = rebuilt(items);
-    let mut full = parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
-    apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
-    let full = rebuilt(full);
-    assert_eq!(
-        tail.compaction_events[0].before,
-        first.first_turn_context_tokens
-    );
-    assert_eq!(
-        tail.compaction_events[0].after,
-        tail.last_turn_context_tokens
-    );
-    assert!(tail.compaction_events[0].after.is_some());
-    assert_eq!(tail.compaction_events, full.compaction_events);
-    assert_eq!(tail.local_context_points, full.local_context_points);
 }
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
@@ -852,7 +790,6 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
                 accumulator.codex_ownership_boundary
             );
             assert!(!accumulator.codex_created_thread_native_only, "{case}");
-            assert!(!accumulator.codex_parent_ledger_consulted, "{case}");
         }
         for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
             let next_ordinal = (values.len() + step) as u64;
@@ -1300,9 +1237,7 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
     fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     let traces = Arc::new(CodexTurnTraceMap::default());
-    let parents = Arc::new(Mutex::new(BTreeMap::new()));
     parser.accumulator.codex_turn_traces = Some(traces.clone());
-    parser.accumulator.codex_parent_ownership_ledgers = Some(parents.clone());
     parser.prepare_acquisition(None, &scope, None, 100).unwrap();
     while !parser.step().unwrap() {}
     for limit in [0, crate::transcript_cache::ENTRY_BYTES] {
@@ -1310,14 +1245,6 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         assert!(Arc::ptr_eq(
             parser.accumulator.codex_turn_traces.as_ref().unwrap(),
             &traces
-        ));
-        assert!(Arc::ptr_eq(
-            parser
-                .accumulator
-                .codex_parent_ownership_ledgers
-                .as_ref()
-                .unwrap(),
-            &parents
         ));
     }
     let completed = parser
@@ -1334,18 +1261,9 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         )
     );
     assert_eq!(Arc::strong_count(&traces), 2);
-    assert_eq!(Arc::strong_count(&parents), 2);
     assert!(Arc::ptr_eq(
         parser.accumulator.codex_turn_traces.as_ref().unwrap(),
         &traces
-    ));
-    assert!(Arc::ptr_eq(
-        parser
-            .accumulator
-            .codex_parent_ownership_ledgers
-            .as_ref()
-            .unwrap(),
-        &parents
     ));
 }
 
@@ -1354,87 +1272,61 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for inputs in ["traces", "parents", "both"] {
-        let fixture = ScanFixture::new(SnapshotSource::Codex);
-        fixture
-            .file
-            .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
-        fixture
-            .file
-            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let setup = |scan: &mut OwnedSourceScan| {
-            if inputs != "parents" {
-                let traces = Arc::new(CodexTurnTraceMap {
-                    since_epoch: 0,
-                    priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
-                    incomplete: false,
-                });
-                assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
-                scan.codex_turn_traces = Some(traces);
-            }
-            if inputs != "traces" {
-                let parents = Arc::new(Mutex::new(
-                    (0..5000)
-                        .map(|n| {
-                            (
-                                format!("unrelated-parent-{n}"),
-                                CodexParentOwnershipLedger {
-                                    signatures: Vec::new(),
-                                    scan_complete: true,
-                                    opened_object_identity: "synthetic-unrelated".into(),
-                                    unresolvable: None,
-                                    opened_changed_nanos: 0,
-                                    opened_modified_nanos: 0,
-                                    opened_birth_nanos: 0,
-                                },
-                            )
-                        })
-                        .collect(),
-                ));
-                assert!(crate::heap_layout_bound::bound(&parents, 31 * 1024 * 1024).is_none());
-                scan.codex_parent_ownership_ledgers = Some(parents);
-            }
-        };
-        let (index, _, _, _) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        fixture
-            .file
-            .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
-        let (_, tail, modes, bytes) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            index,
-            Some(cache),
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        assert_eq!(modes, (0, 1, 0), "unrelated live {inputs}");
-        let full_bytes = fixture.file.0.metadata().unwrap().len();
-        assert!(bytes.0 + bytes.1 < full_bytes);
-        let (_, full, _, _) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            ScanIndex::default(),
-            None,
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        assert_eq!(
-            production_body(SnapshotSource::Codex, tail),
-            production_body(SnapshotSource::Codex, full)
-        );
-        eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
-    }
+    let fixture = ScanFixture::new(SnapshotSource::Codex);
+    fixture
+        .file
+        .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
+    fixture
+        .file
+        .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let setup = |scan: &mut OwnedSourceScan| {
+        let traces = Arc::new(CodexTurnTraceMap {
+            since_epoch: 0,
+            priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+            incomplete: false,
+        });
+        assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
+        scan.codex_turn_traces = Some(traces);
+    };
+    let (index, _, _, _) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    fixture
+        .file
+        .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
+    let (_, tail, modes, bytes) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        index,
+        Some(cache),
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    assert_eq!(modes, (0, 1, 0), "unrelated live traces");
+    let full_bytes = fixture.file.0.metadata().unwrap().len();
+    assert!(bytes.0 + bytes.1 < full_bytes);
+    let (_, full, _, _) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        None,
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    assert_eq!(
+        production_body(SnapshotSource::Codex, tail),
+        production_body(SnapshotSource::Codex, full)
+    );
+    eprintln!("SAMPLED_LIVE_INPUTS inputs=traces full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
 }
 
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
@@ -1510,14 +1402,96 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
     }
 }
 
+/// [money] An ordinary Codex page over an unchanged file keeps a future
+/// exact-body refusal cooldown: it emits nothing, the cooldown survives, and
+/// the retained refusal settles before its deadline and blocks at it.
+#[test]
+fn ordinary_codex_page_preserves_future_exact_body_cooldown_and_settlement() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    for id in 1..=3 {
+        fixture
+            .file
+            .append(&usage(source, id as u64 * 100, id, "fixture-model"));
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut settled, first, _) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "cooldown-fixture",
+    );
+    assert!(!first.snapshots.is_empty(), "page 1 parsed the file");
+    let fingerprint = settled.file_snapshot_fingerprints[&local_index_key(&fixture.file.0)]
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let body = "synthetic-refused-body";
+    let now = time::OffsetDateTime::parse(NOW, &time::format_description::well_known::Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    let deadline = now + 86_400;
+    let mut record = snapshot_quarantine_record(source);
+    record.retry_after_unix_seconds = 0; // ordinary retry is due; only the exact-body cooldown defers it
+    record.upload_body_witness = Some(body.into());
+    settled.accepted_snapshot_fingerprints.remove(&fingerprint);
+    settled
+        .quarantined_snapshot_fingerprints
+        .insert(fingerprint.clone(), record.clone());
+    settled.activate_quarantine_witness_for_test(source);
+    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(
+        fingerprint.clone(),
+        body.to_string(),
+    )]));
+    assert!(settled.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(settled.reason_reoffer_cooldown_deferred_count(), 1);
+    let (index, control, _) =
+        production_scan(&fixture, source, settled, Some(cache), "cooldown-fixture");
+    assert!(
+        control.snapshots.is_empty(),
+        "ordinary selection skips the unchanged cooldown body"
+    );
+    assert!(index.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert!(
+        crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record.clone(),
+            body,
+            now,
+            deadline
+        ),
+        "future reservation remains nonblocking for settlement"
+    );
+    assert!(
+        !crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record,
+            body,
+            deadline,
+            deadline
+        ),
+        "the same retained refusal blocks at its actual deadline"
+    );
+}
+
 /// One sampled Claude page of `fixture` through `cache`: (index, modes).
 fn codec_page(
+    source: SnapshotSource,
     fixture: &ScanFixture,
     cache: &Arc<sampled_scan::SharedCache>,
     mut index: ScanIndex,
 ) -> (ScanIndex, (usize, usize, usize)) {
-    let source = SnapshotSource::ClaudeCode;
-    cache.bind_withheld(&mut index);
+    if source == SnapshotSource::ClaudeCode {
+        cache.bind_withheld(&mut index);
+    }
     let scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1543,95 +1517,139 @@ fn codec_page(
 fn an_unrouted_codec_source_keeps_no_ram_copy() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
-    let before = unrouted();
-    let ((index, modes), first) = observe(|| codec_page(&fixture, &cache, ScanIndex::default()));
-    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
-    assert_eq!(modes, (1, 0, 0), "first read");
-    assert_eq!(unrouted(), before, "a new file is no unrouted growth");
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let ((_, modes), next) = observe(|| codec_page(&fixture, &cache, index));
-    assert!(unrouted() > before, "the growth Full is counted by why");
-    assert_eq!(
-        first.insert_admitted, 0,
-        "no copy is admitted (modes {modes:?})"
-    );
-    assert_eq!(next.take_hit, 0, "no copy is taken (modes {modes:?})");
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
+        let before = unrouted();
+        let ((index, modes), first) =
+            observe(|| codec_page(source, &fixture, &cache, ScanIndex::default()));
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert_eq!(unrouted(), before, "a new file is no unrouted growth");
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let ((_, modes), next) = observe(|| codec_page(source, &fixture, &cache, index));
+        assert!(unrouted() > before, "the growth Full is counted by why");
+        assert_eq!(
+            first.insert_admitted, 0,
+            "no copy is admitted {source:?} (modes {modes:?})"
+        );
+        assert_eq!(
+            next.take_hit, 0,
+            "no copy is taken {source:?} (modes {modes:?})"
+        );
+    }
 }
 
 /// [regress] A codec source's route that cannot be read now (a poisoned
 /// session: `DbUnavailable`) is kept as an error, never read as "no route":
 /// the file is held for its next selection, unread, and RAM is no fallback
-/// (conformance B2). The page holds before it reaches the candidate, so the
-/// per-file `tail_db_loads{held}` count is printed, not asserted.
+/// (conformance B2). The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    use crate::snapshots::e2_pipeline_scan_fixture::{route_for_test, tail_counter_for_test};
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
-    let (index, modes) = codec_page(&fixture, &cache, routed);
-    assert_eq!(modes, (1, 0, 0), "first read");
-    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
-    let key = local_index_key(&fixture.file.0);
-    let size = index.files[&key].size_bytes;
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    crate::snapshots::state_v2::poison_route_for_test(&index);
-    assert!(super::tail_source::tail_route(source, &index).is_err());
-    assert!(!super::tail_source::keeps_ram(source));
-    let held = tail_counter_for_test("tail_db_loads", "held");
-    let ((index, modes), lifecycle) = observe(|| codec_page(&fixture, &cache, index));
-    eprintln!(
-        "ROUTE_ERROR_HOLD held={} modes={modes:?}",
-        tail_counter_for_test("tail_db_loads", "held") - held
-    );
-    assert_eq!(modes, (0, 0, 0), "the held file is not read");
-    assert_eq!(index.files[&key].size_bytes, size, "the file stays owed");
-    assert_eq!(
-        (lifecycle.take_hit, lifecycle.insert_admitted),
-        (0, 0),
-        "RAM is no fallback"
-    );
+    use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
+        let (index, modes) = codec_page(source, &fixture, &cache, routed);
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
+        let key = local_index_key(&fixture.file.0);
+        let size = index.files[&key].size_bytes;
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        crate::snapshots::state_v2::poison_route_for_test(&index);
+        assert!(crate::snapshots::state_v2::tail_route_path(&index).is_err());
+        assert!(!super::tail_source::keeps_ram(source));
+        let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
+        assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");
+        assert_eq!(
+            index.files[&key].size_bytes, size,
+            "the file stays owed {source:?}"
+        );
+        assert_eq!(
+            (lifecycle.take_hit, lifecycle.insert_admitted),
+            (0, 0),
+            "RAM is no fallback {source:?}"
+        );
+    }
 }
 
+/// [money] An account-witness change, then a destination change, after a
+/// restart: each production namespace (`cycle_sampled_scope`) is new, and
+/// every source's head continues from Tail with no reconstruction (D168-3:
+/// account evidence is applied from stored facts and live evidence, never by
+/// a re-read). The body equals a cold Full under the new namespace, Codex's
+/// creator placement included. A new priority still replays for real.
 #[test]
 fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let namespace = |witness: u8, destination: &str| {
+        crate::snapshot_sync::cycle_sampled_scope(
+            &[witness; 32],
+            destination,
+            Path::new("/synthetic/scan-index.json"),
+            false,
+        )
+        .0
+    };
+    let (first, witness_changed, destination_changed) = (
+        namespace(1, "destination-a"),
+        namespace(2, "destination-a"),
+        namespace(2, "destination-b"),
+    );
+    assert!(first != witness_changed && witness_changed != destination_changed);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let (index, _, _) = production_scan(
+        let (mut index, _, _) = production_scan(
             &fixture,
             source,
             ScanIndex::default(),
             Some(cache.clone()),
-            "account-a",
+            &first,
         );
-        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
-        let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "account-b");
-        // Claude's head is bound by its destination route, not the account
-        // scope (D131/D134): it continues, with the same body.
-        assert_eq!(
-            modes,
-            if source == SnapshotSource::ClaudeCode {
-                (0, 1, 0)
-            } else {
-                (1, 0, 0)
-            }
-        );
-        let (_, full, _) =
-            production_scan(&fixture, source, ScanIndex::default(), None, "account-b");
-        assert_eq!(production_body(source, scan), production_body(source, full));
+        for (n, namespace) in [&witness_changed, &destination_changed]
+            .into_iter()
+            .enumerate()
+        {
+            #[cfg(unix)]
+            let reconstructions = || {
+                crate::snapshots::tail_source::counters::totals()
+                    .into_iter()
+                    .filter(|((name, _), _)| name.starts_with("tail_reconstruct"))
+                    .map(|(_, count)| count)
+                    .sum::<u64>()
+            };
+            #[cfg(unix)]
+            let before = reconstructions();
+            fixture
+                .file
+                .append(&usage(source, 140 + 20 * n as u64, 1 + n, "fixture-model"));
+            let (next, scan, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), namespace);
+            assert_eq!(modes, (0, 1, 0), "{source:?} continues from Tail ({n})");
+            #[cfg(unix)]
+            assert_eq!(
+                reconstructions(),
+                before,
+                "{source:?}: no reconstruction ({n})"
+            );
+            let (_, full, _) =
+                production_scan(&fixture, source, ScanIndex::default(), None, namespace);
+            assert_eq!(
+                production_body(source, scan),
+                production_body(source, full),
+                "{source:?} ({n})"
+            );
+            index = next;
+        }
     }
     let source = SnapshotSource::Codex;
     let fixture = ScanFixture::new(source);
@@ -1796,7 +1814,8 @@ fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
 /// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
 /// limit, with the sidecar census incomplete) owns no optimization state. Its
 /// copy refusal must not wipe an unrelated, independently bounded resident
-/// reduction, and must not insert one of its own.
+/// reduction, and must not insert one of its own. Both sources continue on
+/// their route; a codec source keeps no RAM resident to check.
 #[test]
 fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1817,7 +1836,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -1867,7 +1887,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
         assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
         assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "the unrelated reduction survives {source:?}"
         );
         assert!(
@@ -1956,7 +1977,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -2008,7 +2030,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "{source:?}"
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "{source:?}"
         );
         assert_eq!(
@@ -2024,12 +2047,13 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         active.aliases.push(candidate);
         let counts = release(&scan, measured);
         assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
+        // Only a source that keeps a RAM copy has a resident to release.
         assert_eq!(
             counts.clear_entries_released,
-            if source == SnapshotSource::ClaudeCode {
-                0
-            } else {
+            if super::tail_source::keeps_ram(source) {
                 1
+            } else {
+                0
             },
             "{source:?}"
         );
@@ -2903,10 +2927,11 @@ fn codex_cache_break_lines(index: usize) -> [Value; 2] {
     ]
 }
 
-fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
+fn uploaded_cache_breaks(body: &Value) -> Vec<String> {
     let wire = &body[0]["cache_observations"];
-    assert_eq!(wire["coverage"], json!("partial"));
-    let refs = wire["operations"]
+    assert_eq!(wire["coverage"], json!("complete"));
+    assert_eq!(wire["omitted_observation_count"], Value::Null);
+    wire["operations"]
         .as_array()
         .unwrap()
         .iter()
@@ -2917,12 +2942,11 @@ fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
                 .unwrap()
                 .to_string()
         })
-        .collect();
-    (refs, &wire["omitted_observation_count"])
+        .collect()
 }
 
-/// A Codex session past the cache-observation cap keeps tailing with full-read
-/// parity, and every pass uploads the same first breaks with an exact count of the rest.
+/// A Codex session past one upload patch of cache breaks keeps tailing with
+/// full-read parity, and every pass keeps every break in session order.
 #[test]
 fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2936,16 +2960,18 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
             fixture.append(&line);
         }
     }
-    let first = (0..64)
-        .map(|n| format!("resp_{}", 2 * n + 1))
-        .collect::<Vec<_>>();
+    let breaks = |count: usize| {
+        (0..count)
+            .map(|n| format!("resp_{}", 2 * n + 1))
+            .collect::<Vec<_>>()
+    };
     let (retained, mode, _, body) = acquire(&fixture, source, None, 100);
     assert_eq!(
         mode,
         ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
     );
     assert_eq!(body, oracle(&fixture, source));
-    assert_eq!(uploaded_cache_breaks(&body), (first.clone(), &json!(1)));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(65));
     assert!(retained.is_some(), "the over-cap session is retained");
     for index in 130..140 {
         for line in codex_cache_break_lines(index) {
@@ -2955,7 +2981,7 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(body, oracle(&fixture, source));
-    assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(70));
 }
 
 #[cfg(unix)]
@@ -2964,7 +2990,10 @@ mod audit_retirement_tests;
 
 /// [regress] A new file was incorrectly counted as a recordless content change.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn pi_new_file_reads_once_without_transitional_full_count() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let source = SnapshotSource::Pi;
@@ -3105,7 +3134,7 @@ fn whole_large_usage_line_is_published_for_each_source() {
             .iter()
             .filter(|row| row["stage"] == "native_collection_jsonl_lines")
             .map(|row| &row["counts"])
-            .find(|counts| counts["lines_over_16_mib"] == 1)
+            .find(|counts| counts["max_line_bytes"].as_u64() > Some(16 * 1024 * 1024))
             .unwrap();
         assert!(counts["max_line_bytes"].as_u64().unwrap() > 16 * 1024 * 1024);
         assert!(

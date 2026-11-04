@@ -3,7 +3,7 @@
 use super::super::account_pending_retention::Archived;
 use super::*;
 use anyhow::{bail, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct KindCx {
@@ -32,6 +32,9 @@ pub(super) struct KindCx {
     pub(super) tail: Option<tail::TailStage>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
+    /// Rows of retired kinds this hydrate found, by key only: their values are
+    /// never read. The baseline names them, so the next save removes them.
+    pub(super) retired: BTreeSet<RowKey>,
     valid: bool,
 }
 
@@ -78,6 +81,14 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         },
         _ => true,
     });
+    // Nothing enumerates a retired kind, so the next save's `finish` removes
+    // these rows (releasing their shared sets) in its own transaction. Their
+    // digest is never compared. A failed save leaves them for the next hydrate.
+    stored.extend(
+        std::mem::take(&mut cx.retired)
+            .into_iter()
+            .map(|key| (key, [0; 32])),
+    );
     Ok(Baseline {
         generation: index.generation,
         rows: stored,
@@ -148,8 +159,10 @@ pub(super) fn hydrate_txn(
     );
     // An otherwise registered but unimplemented money kind must never vanish
     // because no group happens to scan it. Inventory the closed kind catalogue
-    // in bounded pages before installing any semantic state.
+    // in bounded pages before installing any semantic state. The same walk
+    // names every retired kind's rows, from their headers only.
     let mut after = None;
+    let mut retired = BTreeSet::new();
     loop {
         let page = tx.scan_prefix(
             RowPrefix {
@@ -169,19 +182,25 @@ pub(super) fn hydrate_txn(
                 catalogue::group(kind.name()).is_some(),
                 "state_v2_unmapped_kind"
             );
+            if catalogue::retired(kind.name()) {
+                retired.insert(header.key.clone());
+            }
         }
         after = page.last().map(|h| h.key.clone());
     }
+    super::telemetry::hydrate_checkpoint("hydrate_after_catalogue", 0, None);
     let mut index = ScanIndex::default();
     let mut cx = KindCx {
         binding: Some(binding),
         layout: mapper::layout(tx)?,
         layout_recorded: tx.get(&RowKey::Meta("catalogue_layout".into()))?.is_some(),
+        retired,
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
+    super::telemetry::hydrate_checkpoint("hydrate_after_accounts", 0, None);
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
     cx.valid = true;
     Ok((index, cx))
@@ -272,14 +291,6 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
-                // Loaded usage families now match the rows this save left.
-                if let Some(cold) = next.claude_usage_family_pending.cold_mut() {
-                    let rows = &digests.rows;
-                    cold.saved(|root| {
-                        let key = mapper::key("usage.pending", root, 1).ok()?;
-                        rows.get(&key).copied()
-                    });
-                }
                 let mut count = 0_u64;
                 let mut windows = 0_u64;
                 let mut max = 0_u64;
@@ -319,9 +330,7 @@ pub(super) fn save_graph(
                 bail!(Hold::ReloadRequired)
             }
             DurableCommitOutcome::Ambiguous => bail!(Hold::ReloadRequired),
-            DurableCommitOutcome::NotPublished => {
-                bail!(store.save_failure().unwrap_or(Hold::ReloadRequired))
-            }
+            DurableCommitOutcome::NotPublished => bail!(refused(store)),
         }
     })();
     if result.is_ok() {
@@ -336,6 +345,29 @@ pub(super) fn save_graph(
     }
     span.emit(store, next.generation);
     result
+}
+/// A commit that published nothing keeps G and reports why.
+fn refused(store: &sqlite::Sqlite) -> Hold {
+    store.save_failure().unwrap_or(Hold::ReloadRequired)
+}
+/// The span and result of a write committed from `expected`: `Ok` only for the
+/// exact commit of `next`. The `Txn` is already consumed, so this reads the
+/// store only after its commit returned.
+pub(super) fn commit_next(
+    store: &sqlite::Sqlite,
+    mut span: SaveSpan,
+    outcome: DurableCommitOutcome,
+    expected: u64,
+    next: u64,
+) -> Result<()> {
+    span.outcome(&outcome);
+    let published = outcome != DurableCommitOutcome::NotPublished;
+    span.emit(store, if published { next } else { expected });
+    match outcome {
+        DurableCommitOutcome::Committed(generation) if generation == next => Ok(()),
+        DurableCommitOutcome::NotPublished => bail!(refused(store)),
+        _ => bail!(Hold::ReloadRequired),
+    }
 }
 /// One `save_span` per write attempt: duration, commit outcome ("error"
 /// before any commit), resulting generation and rows put or removed.

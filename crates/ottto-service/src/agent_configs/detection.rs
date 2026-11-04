@@ -54,8 +54,8 @@ pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetect
 /// count. Presence is the binary, or usage-generated metadata the agent itself
 /// created (`metadata_paths` — e.g. `~/.claude/projects` session transcripts or
 /// the Claude desktop app's data dirs, covering desktop-app-only installs).
-/// Codex/Pi additionally treat a genuine user-owned config directory as
-/// presence, matching their detection specs.
+/// Codex additionally treats a genuine user-owned config directory as
+/// presence, matching its detection spec.
 pub fn source_present_locally(source: &SourceKind) -> bool {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -146,14 +146,21 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             ],
             install_docs_url: Some(CLAUDE_CODE_INSTALL_DOCS_URL),
         },
-        SourceKind::Pi => DetectionSpec {
-            binary_name: "pi",
-            version_args: &["--version"],
-            config_path: Some(home.join(".pi")),
-            installed_when_config_parent_exists: true,
-            metadata_paths: Vec::new(),
-            install_docs_url: None,
-        },
+        SourceKind::Pi => {
+            // Pi creates `auth.json` in its agent directory every time it
+            // starts its runtime, before any login, and Ottto never writes it.
+            // The agent and sessions directories are no evidence: Ottto's own
+            // Verify creates them. `--version` writes nothing.
+            let agent = crate::agent_status::pi_agent_dir(home);
+            DetectionSpec {
+                binary_name: "pi",
+                version_args: &["--version"],
+                config_path: Some(agent.join("settings.json")),
+                installed_when_config_parent_exists: false,
+                metadata_paths: vec![agent.join("auth.json")],
+                install_docs_url: None,
+            }
+        }
     }
 }
 
@@ -329,6 +336,36 @@ mod tests {
                 false
             ));
         }
+    }
+
+    /// [regress] Pi is present only by its binary or a file Pi itself writes
+    /// (`auth.json`, created on every runtime start); the directories Ottto's
+    /// own Verify creates, and the home directory, are no evidence.
+    #[test]
+    fn presence_pi_needs_its_own_auth_file_not_ottto_created_dirs() {
+        let home = test_home("presence-pi");
+        let agent = crate::agent_status::pi_agent_dir(&home);
+        fs::create_dir_all(agent.join("sessions")).expect("Ottto-created Pi sessions dir");
+        let installed = || {
+            detect_agent_installation_with_paths(
+                &SourceKind::Pi,
+                detection_spec(&SourceKind::Pi, &home),
+                None,
+                None,
+            )
+            .installed
+        };
+        assert!(!source_present_with_paths(
+            detection_spec(&SourceKind::Pi, &home),
+            false
+        ));
+        assert!(!installed());
+        fs::write(agent.join("auth.json"), b"{}").expect("Pi auth file");
+        assert!(source_present_with_paths(
+            detection_spec(&SourceKind::Pi, &home),
+            false
+        ));
+        assert!(installed());
     }
 
     #[test]

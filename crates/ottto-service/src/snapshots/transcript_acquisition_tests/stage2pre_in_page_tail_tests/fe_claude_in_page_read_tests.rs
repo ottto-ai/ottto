@@ -73,13 +73,6 @@ fn requests(ids: Range<usize>) -> impl Iterator<Item = String> {
     ids.map(|id| format!("req-{id}"))
 }
 
-/// Pending keys request ids by their full SHA-256 hex.
-fn pending_hashes(ids: Range<usize>) -> BTreeSet<String> {
-    requests(ids)
-        .map(|request| format!("{:x}", Sha256::digest(request.as_bytes())))
-        .collect()
-}
-
 /// A request-census record holds sorted 8-byte prefixes.
 fn census_hashes(ids: Range<usize>) -> Vec<u64> {
     let mut hashes = requests(ids)
@@ -270,23 +263,6 @@ fn grown_full() -> Grown {
         result,
         seen,
     }
-}
-
-/// A fresh Claude fixture with rows 0..6, read once (sampled, `Full`).
-fn quiescent() -> (ScanFixture, ScanIndex, SourceScanResult) {
-    let fixture = ScanFixture::new(CLAUDE);
-    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (index, result, seen) = plain(
-        &fixture,
-        CLAUDE,
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
-        &cache,
-    );
-    assert_eq!(seen.modes, (1, 0, 0), "precondition: one Full read");
-    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
-    assert!(result.census_complete, "precondition: a healthy terminal");
-    (fixture, index, result)
 }
 
 /// SP-1c (RED): a Claude file with no copy and a prepared (not yet due)
@@ -898,7 +874,11 @@ fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     }
     let source = SnapshotSource::Codex;
     let base = baseline(source, 4, 2);
-    base.cache.clear();
+    // No continuation: the committed head on its route is retired.
+    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+        &base.cache,
+        &base.index,
+    );
     let path = base.path.clone();
     let appended = row_bytes(source, 6..8);
     let (_, full, seen, read) = page_injecting(
@@ -1044,152 +1024,6 @@ fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
     );
 }
 
-/// Proof (RED): a prefix body never mints v1 or a family witness,
-/// even when the API evidence matches the prefix exactly.
-///
-/// Red on main: the stable-source failure (one `OpenRead`), so no prefix is published.
-#[test]
-fn fe_claude_source_prefix_never_mints_v1_or_witness() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (control_fixture, mut control_index, control_body) = quiescent();
-    assert!(
-        mints_v1(&mut control_index, &control_body, 0..6),
-        "healthy ordinary EOF mints the authority denied to this prefix"
-    );
-    drop(control_fixture);
-    let mut grown = grown_full();
-    assert_eq!(
-        grown.seen.unreadable, 0,
-        "SOURCE proof: no unreadable; causes={:?}",
-        grown.seen.causes
-    );
-    assert!(
-        !grown.result.snapshots.is_empty(),
-        "the prefix is published"
-    );
-    assert!(
-        !mints_v1(&mut grown.index, &grown.result, 0..6),
-        "SOURCE proof: no v1 from a prefix"
-    );
-    assert!(
-        !grown
-            .index
-            .claude_usage_family_witnesses
-            .contains_key(SESSION),
-        "SOURCE proof: no family witness from a prefix"
-    );
-}
-
-/// Census (RED): the published prefix enters pending as any read does: the
-/// member's request set is the prefix's, and the family stays valid.
-///
-/// Red on main: the stable-source failure (one `OpenRead`), so nothing reaches pending.
-#[test]
-fn fe_claude_census_prefix_enters_pending() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut grown = grown_full();
-    assert_eq!(
-        grown.seen.unreadable, 0,
-        "census pending: no unreadable; causes={:?}",
-        grown.seen.causes
-    );
-    let _ = record_claude_native_observations(&grown.result, &mut grown.index);
-    let index = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&grown.index);
-    let pending = &index.claude_usage_family_pending[SESSION];
-    assert!(!pending.invalid, "census pending: the family is valid");
-    assert_eq!(
-        pending.member_request_id_hashes.get(SESSION),
-        Some(&pending_hashes(0..6)),
-        "census pending: the prefix's requests"
-    );
-}
-
-/// Census (RED): a second read of the grown file in the same census window
-/// carries more requests, so pending counts `member_changed` and invalidates
-/// the family.
-///
-/// Red on main: the stable-source failure (one `OpenRead`) on the first read.
-#[test]
-fn fe_claude_census_reread_in_window_gives_member_changed() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut grown = grown_full();
-    assert_eq!(
-        grown.seen.unreadable, 0,
-        "census member_changed: no unreadable; causes={:?}",
-        grown.seen.causes
-    );
-    // The observation driver accumulates on a resident graph; a cold routed
-    // one accumulates nothing (the inactive v1 driver), so read resident.
-    grown.index = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&grown.index);
-    let _ = record_claude_native_observations(&grown.result, &mut grown.index);
-    // Past the growth pace, so the re-read lands in this census window.
-    sampled_scan::set_test_now(Some(
-        sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
-    ));
-    let (mut index, next) = next_read(
-        "census member_changed",
-        &grown.base,
-        grown.index,
-        (1, 0, 0),
-        Some(STATE_MISSING),
-    );
-    sampled_scan::set_test_now(None);
-    assert_eq!(
-        next.census_window_end, grown.result.census_window_end,
-        "precondition: one census window"
-    );
-    index = crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&index);
-    let observed = record_claude_native_observations(&next, &mut index);
-    assert_eq!(
-        observed.counts.page_invalidated_member_changed_count, 1,
-        "census member_changed: counted once"
-    );
-    assert!(
-        crate::snapshots::e2_pipeline_scan_fixture::resident_for_test(&index)
-            .claude_usage_family_pending[SESSION]
-            .invalid,
-        "census member_changed: the family is invalid"
-    );
-}
-
-/// Census (RED): proof fails closed while the API evidence reports requests
-/// beyond the published prefix (rows 6..9 were appended during the read).
-///
-/// Red on main: the stable-source failure (one `OpenRead`), so no prefix is published.
-#[test]
-fn fe_claude_census_proof_fails_closed_while_api_rows_exceed_prefix() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let mut grown = grown_full();
-    assert_eq!(
-        grown.seen.unreadable, 0,
-        "census proof: no unreadable; causes={:?}",
-        grown.seen.causes
-    );
-    assert!(
-        !grown.result.snapshots.is_empty(),
-        "the prefix is published"
-    );
-    assert!(
-        !mints_v1(&mut grown.index, &grown.result, 0..9),
-        "census proof: fails closed while API rows exceed the prefix"
-    );
-    assert!(
-        !grown
-            .index
-            .claude_usage_family_witnesses
-            .contains_key(SESSION),
-        "census proof: no family witness"
-    );
-}
-
 /// Real FE prefix provenance, rather than ordinary census-record debt,
 /// excludes API rows beyond the published native prefix.
 #[test]
@@ -1197,12 +1031,6 @@ fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (control_fixture, mut control_index, control_body) = quiescent();
-    assert!(
-        mints_v1(&mut control_index, &control_body, 0..6),
-        "healthy ordinary EOF mints the authority denied to this prefix"
-    );
-    drop(control_fixture);
     let mut grown = grown_full();
     assert_eq!(grown.seen.unreadable, 0);
     assert!(!grown.result.snapshots.is_empty());
@@ -1402,43 +1230,12 @@ fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
         .is_none());
 }
 
-/// Old, unknown and malformed tags cannot assert a complete native reduction.
-#[test]
-fn fe_claude_old_unknown_and_malformed_provenance_exclude() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (control_fixture, mut control_index, control_body) = quiescent();
-    assert!(
-        mints_v1(&mut control_index, &control_body, 0..6),
-        "healthy ordinary EOF mints the authority denied to this prefix"
-    );
-    drop(control_fixture);
-    for tag in [
-        "semantic_sync:v2+sampled_unverified:v1:9999999999",
-        "semantic_sync:v2+sampled_unverified:v99:9999999999:c",
-        "semantic_sync:v2+sampled_unverified:v2:9999999999:unknown",
-        "semantic_sync:v2+sampled_unverified:v2:bad:c",
-    ] {
-        let (fixture, mut index, result) = quiescent();
-        let key = local_index_key(&fixture.file.0);
-        index.files.get_mut(&key).unwrap().scan_identity_version = Some(tag.into());
-        assert!(!mints_v1(&mut index, &result, 0..9), "tag {tag}");
-    }
-}
-
 /// Persistence must preserve the exclusion even without a census record and after key drift.
 #[test]
 fn fe_claude_prefix_provenance_round_trips_without_d1() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (control_fixture, mut control_index, control_body) = quiescent();
-    assert!(
-        mints_v1(&mut control_index, &control_body, 0..6),
-        "healthy ordinary EOF mints the authority denied to this prefix"
-    );
-    drop(control_fixture);
     let mut grown = grown_full();
     let tag = grown.index.files[&grown.base.key]
         .scan_identity_version
@@ -1461,9 +1258,7 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
 /// The recovery Tail starts from a retained COMPLETE pre-prefix reduction,
 /// replays all later rows and revalidates EOF. No FE prefix is cached.
 #[test]
-fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
-
+fn fe_claude_prefix_then_complete_tail_at_eof_clears_the_prefix_tag() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1485,7 +1280,7 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
     // change invalidation into this provenance-recovery regression.
     let mut prefix_observation = base.index.clone();
     assert!(!mints_v1(&mut prefix_observation, &result, 0..9));
-    let ((mut index, result, seen), counts) =
+    let ((index, _, seen), counts) =
         observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
     assert_eq!(counts.prefix_tag_clears, 1);
     assert_eq!(
@@ -1503,8 +1298,6 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
         .get(&base.key)
         .unwrap()
         .unverified_or_twin());
-    assert!(mints_v1(&mut index, &result, 0..9));
-    assert!(index.claude_usage_family_witnesses.contains_key(SESSION));
 }
 
 /// A later grown Tail publication still owes the prefix exclusion, even if
@@ -1614,405 +1407,6 @@ fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
     }
 }
 
-/// Resets the thread-local sampled scan clock, panic-safe.
-struct TestClock;
-impl Drop for TestClock {
-    fn drop(&mut self) {
-        sampled_scan::set_test_now(None);
-    }
-}
-
-/// A held N1 Tail (marker-preserving versions): Full one
-/// interval before `due`, then an actual identity-incomplete id-less Tail
-/// just before it, which cannot reconstruct the saved witness until its
-/// hourly Full audit (the identical body can once N1 verification holds).
-/// Then a marker-erasing downgrade: 0.1.189's parse-free migrate rewrites
-/// the entry to plain v2, the index is saved, the retained copy lost and
-/// the index reloaded.
-struct ErasedHold {
-    fixture: ScanFixture,
-    key: String,
-    cache: Arc<sampled_scan::SharedCache>,
-    /// The saved index file `index` was loaded from (save is CAS-bound to it).
-    index_path: PathBuf,
-    index: ScanIndex,
-    witness: ClaudeUsageFamilyWitness,
-}
-
-fn erased_hold(due: u64) -> ErasedHold {
-    use crate::snapshots::claude_request_census::ClaudeRequestCensusShape as Shape;
-    sampled_scan::set_test_now(Some(
-        due - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    ));
-    let fixture = ScanFixture::new(CLAUDE);
-    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
-    let key = local_index_key(&fixture.file.0);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, first, seen) = plain(
-        &fixture,
-        CLAUDE,
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default()),
-        &cache,
-    );
-    assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.unreadable, 0);
-    let mut proven = index.clone();
-    assert!(mints_v1(&mut proven, &first, 0..6));
-    index.claude_usage_family_witnesses = proven.claude_usage_family_witnesses;
-    let witness = index.claude_usage_family_witnesses[SESSION].clone();
-    // Keep the six keyed occurrences unchanged and add a real id-less
-    // response. Native finish marks the census IdentityIncomplete; only the
-    // saved witness, not a fresh identity-complete transcript proof, can bind.
-    let mut idless = row(CLAUDE, 6);
-    idless.as_object_mut().unwrap().remove("requestId");
-    fixture.file.append(&idless);
-    sampled_scan::set_test_now(Some(due - 1));
-    let (mut index, tail, seen) = plain(&fixture, CLAUDE, index, &cache);
-    assert_eq!(seen.modes, (0, 1, 0), "real continued Tail");
-    assert_eq!(seen.unreadable, 0);
-    assert_eq!(index.files[&key].unverified_deadline(), Some(due));
-    assert!(!index.files[&key].audit_requires_full(due - 1));
-    let record = index.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(record.identity_incomplete_hold());
-    assert!(record.unverified_or_twin());
-    assert!(!record.can_bind_recomposed_body(), "Exact|Empty refusal");
-    // Isolate the binding decision from the fold's separate retry/rearm
-    // bookkeeping: the held Tail cannot bind, the identical body can once
-    // N1 verification holds.
-    assert!(!mints_v1(&mut index.clone(), &tail, 0..6));
-    let mut verified_control = index.clone();
-    let record = verified_control
-        .claude_request_census_for_test()
-        .get(&key)
-        .unwrap()
-        .clone()
-        .with_unverified_for_test(false);
-    verified_control
-        .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record);
-    assert!(
-        mints_v1(&mut verified_control, &tail, 0..6),
-        "the identical body can reconstruct once N1 verification holds"
-    );
-
-    let entry = index.files.get_mut(&key).unwrap();
-    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-    assert!(!entry.has_unverified_source());
-    assert_eq!(entry.audit_obligation(due), None, "the deadline is lost");
-    let path = fixture.dir.join("erased-index.json");
-    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
-    drop(index);
-    cache.clear();
-    let index =
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::load(&path).unwrap());
-    assert!(cache.retained_checkpoint(&key).is_none());
-    assert_eq!(
-        index.files[&key].scan_identity_version.as_deref(),
-        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-    );
-    let record = index.claude_request_census_for_test().get(&key).unwrap();
-    assert!(record.identity_incomplete_hold(), "the hold survives");
-    assert!(!mints_v1(&mut index.clone(), &tail, 0..6));
-    ErasedHold {
-        fixture,
-        key,
-        cache,
-        index_path: path,
-        index,
-        witness,
-    }
-}
-
-/// The restoration a sampled scan's setup runs, dated one interval before
-/// `due`. Real-clock pages prove no-read scheduling; the injected scan clock
-/// then advances both slot preparation and candidate selection to the due time.
-fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
-    sampled_audit::restore_held_audit_deadlines(
-        index,
-        due - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    )
-}
-
-/// After a marker-erasing downgrade, nothing reads
-/// the unchanged held file again. A sampled scan re-derives its deadline from
-/// the persisted hold without reading, one interval out and once. The
-/// restored deadline survives save/reload and selects the missing-checkpoint
-/// Full(StateMissing), never a Full caused by audit age, and
-/// the verified source lets the saved witness re-prove.
-#[test]
-fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
-
-    use crate::snapshots::claude_request_census::{
-        identity_incomplete_hold_deadlines_restored_total as restored,
-        identity_incomplete_hold_totals, ClaudeRequestCensusShape as Shape,
-    };
-    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    let before = identity_incomplete_hold_totals();
-    let restored_before = restored();
-    let hold = erased_hold(due);
-    let key = hold.key.clone();
-    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
-    assert_eq!(restored(), restored_before, "save/load restores nothing");
-
-    // At the real clock, the restoring page reads nothing: the deadline is
-    // one interval out, and a second page neither reads nor restores again.
-    sampled_scan::set_test_now(None);
-    let start = sampled_scan::now_seconds();
-    let (paced, _, seen) = plain(&hold.fixture, CLAUDE, hold.index.clone(), &hold.cache);
-    let end = sampled_scan::now_seconds();
-    assert_eq!(seen.modes, (0, 0, 0), "restoration is no read");
-    assert_eq!(seen.unreadable, 0);
-    assert_eq!(restored(), restored_before + 1);
-    let entry = &paced.files[&key];
-    let deadline = entry.unverified_deadline().expect("deadline restored");
-    assert!((start + INTERVAL..=end + INTERVAL).contains(&deadline));
-    assert!(entry.has_prefix_provenance(), "fail closed to `p`");
-    assert!(!entry.audit_requires_full(end));
-    let (paced, _, seen) = plain(&hold.fixture, CLAUDE, paced, &hold.cache);
-    assert_eq!(seen.modes, (0, 0, 0));
-    assert_eq!(paced.files[&key].unverified_deadline(), Some(deadline));
-    assert_eq!(restored(), restored_before + 1, "restored once");
-
-    // Restore the saved downgraded index one interval before `due`, save
-    // and reload: the deadline persists and is not restored again.
-    let mut restored_index = hold.index.clone();
-    assert_eq!(restore_dated(&mut restored_index, due), 1);
-    assert_eq!(restored(), restored_before + 2);
-    assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(
-        &mut restored_index,
-        &hold.index_path,
-    );
-    drop(restored_index);
-    let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
-        ScanIndex::load(&hold.index_path).unwrap(),
-    );
-    loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(loaded);
-    assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
-    assert_eq!(restore_dated(&mut loaded, due), 0);
-    assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
-    assert_eq!(restored(), restored_before + 2, "a restored marker is kept");
-    // Neither a reload nor loss of the optional retained copy cancels the
-    // held record or its read.
-    assert!(hold.cache.retained_checkpoint(&key).is_none());
-    let record = loaded.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(record.unverified_or_twin());
-    assert!(!record.can_bind_recomposed_body());
-    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
-
-    sampled_scan::set_test_now(Some(due));
-    assert!(loaded.files[&key].audit_requires_full(due));
-    let (mut audited, result, seen, read) = page_injecting(
-        &hold.fixture,
-        CLAUDE,
-        loaded,
-        &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::StateMissing),
-        |_| {},
-    );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
-    assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
-    assert_eq!(seen.unreadable, 0);
-    assert!(!audited.files[&key].has_unverified_source());
-    let record = audited.claude_request_census_for_test().get(&key).unwrap();
-    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
-    assert!(!record.unverified_or_twin(), "Full verifies the source");
-    assert!(
-        !record.can_bind_recomposed_body(),
-        "shape gate stays narrow"
-    );
-    assert_eq!(audited.claude_usage_family_witnesses[SESSION], hold.witness);
-    assert!(
-        mints_v1(&mut audited, &result, 0..6),
-        "the audit releases the hold"
-    );
-    assert_eq!(
-        identity_incomplete_hold_totals(),
-        (before.0 + 1, before.1 + 1)
-    );
-    assert_eq!(restored(), restored_before + 2);
-}
-
-/// Option B keeps the age-window rescue: an erased hold whose file aged out
-/// of the backfill window leaves discovery. While the audit-slot budget
-/// defers its restoration, reconciliation keeps the unobserved entry and its
-/// hold; a later scan restores it without reading, and the restored marker
-/// brings it back for its one due Full, where the saved witness re-proves.
-/// Its age rejections (at candidate conversion or after stat but before
-/// open) settle as ordinary removals, never as vanished-file retirement.
-#[test]
-fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
-    // v1 reported-usage witness oracle (mints_v1); gate on, `e2` items skip the v1 fold.
-
-    use crate::snapshots::claude_request_census::identity_incomplete_hold_deadlines_restored_total as restored;
-    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
-    use std::time::{Duration, UNIX_EPOCH};
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let _clock = TestClock;
-    let due = sampled_scan::now_seconds();
-    let restored_before = restored();
-    let mut hold = erased_hold(due);
-    let key = hold.key.clone();
-    let traversal = || ScanTraversalPath {
-        scan_root: hold.fixture.root.clone(),
-        path: hold.fixture.file.0.clone(),
-        census_member: true,
-        watcher_hint: false,
-    };
-    let mut at_open = ScanCensus::default();
-    let candidate = candidate_from_traversal_path(
-        CLAUDE,
-        traversal(),
-        &mut at_open,
-        Some(due),
-        BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
-    )
-    .expect("retained while recent");
-    OpenOptions::new()
-        .write(true)
-        .open(&hold.fixture.file.0)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
-        .unwrap();
-    assert!(
-        !sampled_audit::path_requires_verification(&hold.index.files, &hold.fixture.file.0),
-        "the erased marker lost the age-window rescue"
-    );
-    // The member becomes old after its stat but before open, or at
-    // candidate conversion. Both age rejections settle as ordinary
-    // removals, never as explicit vanished-file retirement.
-    assert!(open_and_identify_scan_candidate(
-        CLAUDE,
-        candidate,
-        &mut at_open,
-        Some(due),
-        BACKFILL_WINDOW_DAYS,
-        discovery_retention!(hold.index),
-    )
-    .is_none());
-    let mut at_conversion = ScanCensus::default();
-    assert!(candidate_from_traversal_path(
-        CLAUDE,
-        traversal(),
-        &mut at_conversion,
-        Some(due),
-        BACKFILL_WINDOW_DAYS,
-        &mut crate::snapshots::CandidateDiscovery::new(&mut hold.index, None),
-    )
-    .is_none());
-    for census in [&at_open, &at_conversion] {
-        assert!(census.removed_index_keys.contains(&key));
-        assert!(!census.claude_vanished_index_keys.contains(&key));
-    }
-    let held = |index: &ScanIndex| {
-        index
-            .claude_request_census_for_test()
-            .get(&key)
-            .is_some_and(|record| record.identity_incomplete_hold())
-    };
-
-    // Other pending audits leave only the slot restoration never takes.
-    let mut crowded = hold.index.clone();
-    // Synthetic keys outside the scan root, never walked or opened.
-    let pending = (0..crate::transcript_cache::CACHE_ENTRIES - 1)
-        .map(|slot| format!("/option-b-pending/{slot}"))
-        .collect::<Vec<_>>();
-    for pending_key in &pending {
-        let mut entry = crowded.files[&key].clone();
-        entry.set_unverified_deadline(due);
-        crowded.files.insert(pending_key.clone(), entry);
-    }
-    // One pinned real second for both pages: the crowded page's progress
-    // slot owes `now + INTERVAL`, and restoration keeps that earlier due.
-    sampled_scan::set_test_now(None);
-    let now = sampled_scan::now_seconds();
-    sampled_scan::set_test_now(Some(now));
-    let (crowded, _, seen) = plain(&hold.fixture, CLAUDE, crowded, &hold.cache);
-    assert_eq!(seen.modes, (0, 0, 0));
-    assert_eq!(restored(), restored_before, "no free slot to restore into");
-    assert_eq!(
-        crowded.files[&key].scan_identity_version.as_deref(),
-        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION),
-        "the deferred aged entry is kept"
-    );
-    assert!(held(&crowded), "and so is its hold");
-    assert!(sampled_audit::awaits_hold_deadline_restoration(
-        &crowded, &key
-    ));
-
-    // A freed slot: the next scan restores it, reading nothing.
-    let mut freed = crowded;
-    freed.files.remove(&pending[0]);
-    let (freed, _, seen) = plain(&hold.fixture, CLAUDE, freed, &hold.cache);
-    assert_eq!(seen.modes, (0, 0, 0), "restoration is no read");
-    assert_eq!(restored(), restored_before + 1);
-    assert_eq!(
-        freed.files[&key].unverified_deadline(),
-        Some(now + INTERVAL)
-    );
-    assert!(sampled_audit::path_requires_verification(
-        &freed.files,
-        &hold.fixture.file.0
-    ));
-    assert!(freed.files[&key].has_prefix_provenance());
-    assert!(held(&freed));
-
-    // Dated one interval before `due` (the candidate clock stays real):
-    // save, reload, and the due audit reaches the aged file.
-    let mut restored_index = hold.index.clone();
-    assert_eq!(restore_dated(&mut restored_index, due), 1);
-    assert_eq!(restored(), restored_before + 2);
-    assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    crate::snapshots::e2_pipeline_scan_fixture::save_for_test(
-        &mut restored_index,
-        &hold.index_path,
-    );
-    drop(restored_index);
-    let loaded = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
-        ScanIndex::load(&hold.index_path).unwrap(),
-    );
-
-    sampled_scan::set_test_now(Some(due));
-    let (mut audited, result, seen, read) = page_injecting(
-        &hold.fixture,
-        CLAUDE,
-        loaded,
-        &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::StateMissing),
-        |_| {},
-    );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
-    assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
-    assert_eq!(seen.unreadable, 0);
-    assert!(
-        !result.snapshots.is_empty(),
-        "every age gate admits the audit"
-    );
-    assert!(!audited.files[&key].has_unverified_source());
-    assert!(!held(&audited));
-    assert!(!audited
-        .claude_request_census_for_test()
-        .get(&key)
-        .unwrap()
-        .unverified_or_twin());
-    assert_eq!(audited.claude_usage_family_witnesses[SESSION], hold.witness);
-    assert!(mints_v1(&mut audited, &result, 0..6));
-    assert_eq!(restored(), restored_before + 2);
-}
-
 /// Historical replay keeps every stem entry and
 /// re-sets its deadline with the prefix flag preserved, so a replay reset
 /// cannot turn an FE prefix into `None` or a clean identity. Before the next
@@ -2045,51 +1439,28 @@ fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
     assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
 }
 
-/// N4 (fe-seam-ack §5, #660 second-lander parity): only a completion that
-/// retains a copy retires a suspended Codex proof beside it. An ordinary
-/// retaining Claude Full still passes its copy budget to the retire
-/// (unchanged); an H3c grown Claude read retains nothing, so it passes none
-/// (`retaining && !h3c_route`) and the suspended proof is kept.
+/// [behaviour] An H3c grown Claude read retains nothing and supplies no
+/// copy budget, so the pre-clone reclamation site does not run.
 #[test]
-fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
-    use crate::snapshots::sampled_scan::codex_cursor::{ProofJob, ProofLease};
+fn fe_n4_h3c_grown_read_runs_no_budgeted_reclamation() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let suspend = |cache: &Arc<sampled_scan::SharedCache>| {
-        let job = Box::new(ProofJob {
-            namespace: "n4-proof".to_owned(),
-            index_path: PathBuf::from("/n4/index.json"),
-            incarnation: "n4".to_owned(),
-            entries: vec![("k".repeat(1 << 20), 1)],
-            next_row_end: 0,
-            touched_page: 0,
-            readers: None,
-        });
-        assert!(
-            ProofLease::new(cache, job).suspend(),
-            "precondition: suspended"
-        );
-        assert!(cache.proof_suspended_for_test().is_some());
-        sampled_scan::copy_retire_probe();
-    };
-
     // H3c: the grown in-page Full publishes its sealed prefix and passes no
-    // copy budget, so no budgeted retire runs and the proof is kept.
+    // copy budget, so no budgeted reclamation runs.
     let mut base = baseline(CLAUDE, 4, 2);
     crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
         &base.cache,
         &base.index,
     );
-    suspend(&base.cache);
+    sampled_scan::copy_retire_probe();
     let path = base.path.clone();
     let index = std::mem::take(&mut base.index);
-    let ((index, _, seen, read), counts) = observe_side(|| {
+    let (index, _, seen, read) = {
         page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
             append_raw(&path, &row_bytes(CLAUDE, 6..9))
         })
-    });
+    };
     assert!(is_full(read.mode), "precondition: an in-page Full");
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
     assert!(
@@ -2101,22 +1472,16 @@ fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
         sampled_scan::copy_retire_probe().is_none(),
         "no budgeted retire on the H3c route"
     );
-    assert!(
-        base.cache.proof_suspended_for_test().is_some(),
-        "proof kept"
-    );
-    assert_eq!(counts.side_proof_drops, 0);
 }
 
 /// #665/#702 second-lander control. The same continued Tail is short of
 /// copy room in both worlds. Without growth it proves and executes a release;
-/// H3c growth keeps every resident and the suspended proof, with no copy,
+/// H3c growth keeps every resident, with no copy,
 /// X_out proof, reserved retention peak or deferred release. Pressure uses
 /// R0's existing test-only insert-term seam; all ranks and releases are real.
 #[test]
-fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
-    use crate::snapshots::sampled_scan::codex_cursor::{bound_for_main, ProofJob, ProofLease};
+fn fe_second_lander_h3c_release_pressure_keeps_victims() {
+    use crate::snapshots::sampled_scan::codex_cursor::bound_for_main;
     use sampled_scan::test_hooks;
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -2184,40 +1549,26 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
         .filter(|(key, _, _)| key != &base.key)
         .collect::<Vec<_>>();
     assert_eq!(before.len(), older.len(), "precondition: older residents");
-    let job = Box::new(ProofJob {
-        namespace: "fe-second-lander-proof".to_owned(),
-        index_path: PathBuf::from("/fe-second-lander/index.json"),
-        incarnation: "fe-second-lander".to_owned(),
-        entries: vec![("k".repeat(1 << 20), 1)],
-        next_row_end: 0,
-        touched_page: 0,
-        readers: None,
-    });
-    assert!(ProofLease::new(&base.cache, job).suspend());
-    let proof = base.cache.proof_suspended_for_test();
-    assert!(proof.is_some(), "precondition: suspended proof");
     sampled_scan::copy_retire_probe();
     test_hooks::clear();
     let mut read = None;
     let index = std::mem::take(&mut base.index);
-    let (((index, result, seen), counts), side_counts) = observe_side(|| {
-        observe(|| {
-            page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
-                if read.is_some() {
-                    return;
-                }
-                if let Some(opened) = opened(scan) {
-                    assert!(is_tail(opened.mode), "precondition: continued Tail");
-                    let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
-                        .expect("precondition: measured residents");
-                    // Give the insert term exactly the remaining room:
-                    // b_ins = 0. Only a completion-time release can fund
-                    // retention; this never changes the production limit.
-                    test_hooks::set_ins_extra(Some(state_bytes - resident));
-                    append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
-                    read = Some(opened);
-                }
-            })
+    let ((index, result, seen), counts) = observe(|| {
+        page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
+            if read.is_some() {
+                return;
+            }
+            if let Some(opened) = opened(scan) {
+                assert!(is_tail(opened.mode), "precondition: continued Tail");
+                let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
+                    .expect("precondition: measured residents");
+                // Give the insert term exactly the remaining room:
+                // b_ins = 0. Only a completion-time release can fund
+                // retention; this never changes the production limit.
+                test_hooks::set_ins_extra(Some(state_bytes - resident));
+                append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
+                read = Some(opened);
+            }
         })
     });
     let read = read.expect("precondition: opened read");
@@ -2237,8 +1588,6 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
     );
     assert!(index.files[&base.key].has_prefix_provenance());
     assert_eq!(base.cache.retained().unwrap().victims(), before);
-    assert_eq!(base.cache.proof_suspended_for_test(), proof, "proof kept");
-    assert_eq!(side_counts.side_proof_drops, 0);
     assert!(sampled_scan::copy_retire_probe().is_none());
     assert!(
         test_hooks::decisions().is_empty(),
@@ -2261,5 +1610,3 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
     );
     test_hooks::clear();
 }
-
-mod held_audit_due_carry_tests;

@@ -43,9 +43,10 @@ permissions:
 
 jobs:
   linux-first:
-    # Every macOS dispatch (full, partial, money equivalence, stack margin)
-    # needs a green Linux tests run on the same head first. mac-batch/*
-    # branches are exempt: mac_batch.py plan checked each member's head.
+    # Every expensive dispatch (macOS full, partial or stack margin, and the
+    # Linux money equivalence job) needs a green Linux tests run on the same
+    # head first. mac-batch/* branches are exempt: mac_batch.py plan checked
+    # each member's head.
     name: Linux green first
     if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref_name, 'mac-batch/')
     timeout-minutes: 5
@@ -332,13 +333,16 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # Resolve the branch PR base on dispatch.
-    # Opt-in only: no added macOS minutes on pushes/PRs. One standard Mac,
+    # Opt-in only: no added minutes on pushes/PRs. One standard Linux runner,
     # two independent builds, no matrix/retry or cache writes. Never run the
-    # expensive benchmark or ordinary Mac jobs alongside this dispatch.
+    # expensive benchmark or ordinary Mac jobs alongside this dispatch. Moved
+    # from macos-15 after a same-head macOS/Linux pair produced byte-identical
+    # manifests, inputs and cross-build bodies; the native layout tests run on
+    # 64-bit Linux with the pinned toolchain (layout_supported()).
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.money_equivalence }}
-    timeout-minutes: 55
-    runs-on: macos-15
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       MONEY_EQUIVALENCE_BASE: ${{ inputs.money_equivalence_base }}
@@ -348,6 +352,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - uses: ./.github/actions/rust-setup
+        with:
+          linux-test-env: "true"
       - name: Compare identical synthetic inputs
         env:
           GH_TOKEN: ${{ github.token }}

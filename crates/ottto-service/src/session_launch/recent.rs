@@ -362,11 +362,7 @@ fn cli_launchable(provider: Option<Provider>) -> Option<bool> {
 fn opaque_id(key: &str, path: &Path) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key");
     mac.update(path.as_os_str().as_encoded_bytes());
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex::encode(&mac.finalize().into_bytes())
 }
 
 fn codex_folders(

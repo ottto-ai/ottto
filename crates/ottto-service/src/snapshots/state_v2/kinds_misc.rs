@@ -109,6 +109,12 @@ fn read_holds(
     let mut expected = 0;
     for (field, slots) in metadata.entries {
         let kind = format!("raw_hold.{field}");
+        // This live row can still name a retired field's holds. Drop the
+        // entry: hydrate's retired walk names those rows for the next save.
+        if catalogue::retired(&kind) {
+            expected += slots.len();
+            continue;
+        }
         ensure!(
             catalogue::group(&kind) == Some(catalogue::Group::Misc),
             "state_v2_misc_unmapped_hold"
@@ -199,7 +205,6 @@ pub(super) fn merge_cas_at(
         None,
         || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
     )?;
-    kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
         .v2_entries()
@@ -208,7 +213,6 @@ pub(super) fn merge_cas_at(
         .collect();
     let roots = super::super::lenient_decode::cas_hold_roots(&custody);
     kinds_accounts::hydrate_filtered(tx, &mut custody, &mut KindCx::default(), Some(&roots))?;
-    kinds_census::hydrate_cas_families(tx, &mut custody, &roots)?;
     super::super::lenient_decode::post_decode_hydrated(&mut custody, "cas", "claude_code")?;
 
     // Outside held roots, only authority+witness binding affects the repair
@@ -395,6 +399,8 @@ pub(super) fn hydrate_txn(
                 || super::super::lenient_decode::FIELDS.contains(&s.as_str())),
         "state_v2_unknown_presence_field"
     );
+    // Retired kinds are never read: hydrate's retired walk names their rows,
+    // so the next save removes them.
     macro_rules! load {
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;

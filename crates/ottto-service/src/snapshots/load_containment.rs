@@ -155,12 +155,8 @@ impl std::error::Error for ScanIndexRebuildLoop {}
 
 // One bit per supported source, no paths or index contents retained. Tests
 // mirror the process state per thread, like the existing containment alarms.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_PAUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-thread_local! {
-    static SCAN_INDEX_REBUILD_PAUSED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
+crate::local_resource_diagnostics::process_static!(fn with_rebuild_paused:
+    std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0));
 fn scan_index_source_bit(source: SnapshotSource) -> u8 {
     match source {
         SnapshotSource::ClaudeCode => 1,
@@ -170,26 +166,16 @@ fn scan_index_source_bit(source: SnapshotSource) -> u8 {
 }
 fn note_scan_index_rebuild_paused(source: SnapshotSource, paused: bool) {
     let bit = scan_index_source_bit(source);
-    #[cfg(not(test))]
-    if paused {
-        SCAN_INDEX_REBUILD_PAUSED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        SCAN_INDEX_REBUILD_PAUSED.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
-    }
-    #[cfg(test)]
-    SCAN_INDEX_REBUILD_PAUSED.with(|state| {
-        state.set(if paused {
-            state.get() | bit
+    with_rebuild_paused(|state| {
+        if paused {
+            state.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
         } else {
-            state.get() & !bit
-        });
+            state.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+        }
     });
 }
 pub(crate) fn scan_index_rebuild_paused(source: SnapshotSource) -> bool {
-    #[cfg(not(test))]
-    let state = SCAN_INDEX_REBUILD_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    let state = SCAN_INDEX_REBUILD_PAUSED.with(std::cell::Cell::get);
+    let state = with_rebuild_paused(|state| state.load(std::sync::atomic::Ordering::Relaxed));
     state & scan_index_source_bit(source) != 0
 }
 
@@ -357,24 +343,20 @@ impl ScanIndexRebuildOverrideState {
 #[cfg(not(test))]
 static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideState; 3]> =
     std::sync::Mutex::new([ScanIndexRebuildOverrideState::NONE; 3]);
-/// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
-/// this process.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// Finite per-code counters: identity, carried-debt admission, persistence,
-/// and cooldown. No error strings or source contents become metric labels.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: [std::sync::atomic::AtomicUsize; 4] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+crate::local_resource_diagnostics::process_static!(
+    /// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
+    /// this process.
+    fn with_manual_override:
+    std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
+crate::local_resource_diagnostics::process_static!(
+    /// Finite per-code counters: identity, carried-debt admission, persistence,
+    /// and cooldown. No error strings or source contents become metric labels.
+    fn with_override_refused:
+    [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4]);
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_REBUILD_OVERRIDE: std::cell::Cell<[ScanIndexRebuildOverrideState; 3]> =
         const { std::cell::Cell::new([ScanIndexRebuildOverrideState::NONE; 3]) };
-    static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: std::cell::Cell<[usize; 4]> =
-        const { std::cell::Cell::new([0; 4]) };
 }
 
 fn scan_index_source_slot(source: SnapshotSource) -> usize {
@@ -518,26 +500,18 @@ pub(crate) fn scan_index_rebuild_auto_retry_at(source: SnapshotSource) -> Option
         .ok()
 }
 
-#[cfg(not(test))]
 fn count_scan_index_rebuild_manual_override() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1)
-}
-
-#[cfg(test)]
-fn count_scan_index_rebuild_manual_override() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(|counter| {
-        let count = counter.get().saturating_add(1);
-        counter.set(count);
-        count
+    with_manual_override(|counter| {
+        counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
     })
 }
 
 /// This thread's `scan_index_rebuild_manual_override` counter.
 #[cfg(test)]
 pub(crate) fn scan_index_rebuild_manual_override_count() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(std::cell::Cell::get)
+    with_manual_override(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 const CARRIED_ACK_ENTRIES_MAX: usize = 4096;
@@ -557,25 +531,18 @@ fn override_refusal_slot(code: &str) -> usize {
         _ => unreachable!("fixed override refusal code"),
     }
 }
-#[cfg(not(test))]
 fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED[override_refusal_slot(code)]
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1)
-}
-#[cfg(test)]
-fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| {
-        let mut counters = cell.get();
-        let slot = override_refusal_slot(code);
-        counters[slot] = counters[slot].saturating_add(1);
-        cell.set(counters);
-        counters[slot]
+    with_override_refused(|counters| {
+        counters[override_refusal_slot(code)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
     })
 }
 #[cfg(test)]
 fn scan_index_rebuild_override_refused_count(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| cell.get()[override_refusal_slot(code)])
+    with_override_refused(|counters| {
+        counters[override_refusal_slot(code)].load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 #[cfg(test)]
 pub(crate) fn scan_index_rebuild_override_identity_unrecoverable_count() -> usize {
@@ -670,7 +637,7 @@ fn note_scan_index_quarantine_rebuild(
 /// the override keeps that state too. It decodes
 /// `lenient_decode::IDENTITY_CARRY_FIELDS` by each field's policy, refusing
 /// (source stays paused, index untouched, counted, alarmed) when any of them
-/// cannot be recovered (tombstone loss instead raises its fence), and otherwise
+/// cannot be recovered, and otherwise
 /// durably REPLACES the index with a
 /// generation-0 rebuild that carries them. A replacement scan that then
 /// fails reloads that carried state, never an empty graph. The damaged bytes
@@ -712,9 +679,6 @@ fn override_scan_index_rebuild_loop(
             .accepted_rebuild_pending_since_unix_seconds
             .get_or_insert(unix_seconds_at(now));
     }
-    // This replacement bypasses save_internal, but is still a writer of the
-    // marked tombstone format. Carry already raised its fence on any loss.
-    rebuilt.claude_retired_family_tombstones_initialized = true;
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
     let prior_stamp = fs::read(&stamp_path).ok();
@@ -796,9 +760,6 @@ fn override_scan_index_rebuild_loop(
     // Once replaced, this was an actual override (never a refused press), even
     // if the final directory sync reports an uncertain durability outcome.
     result?;
-    // This function also returns directly to Repair callers. Establish the
-    // fresh-load memo here, before any first census or replay can advance it.
-    rebuilt.settle_claude_index_load(path, ScanIndexLoadOrigin::Quarantined);
     Ok(rebuilt)
 }
 
@@ -806,14 +767,11 @@ impl ScanIndex {
     /// What an override rebuild keeps from the damaged index
     /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, each field's decoder). Bindings
     /// stay authoritative, so conflicting creator evidence defers; held and
-    /// deferred families stay held; duplicate ownership and owned-start /
-    /// stale-carry posture stay fail-closed. The contract token is kept and
-    /// its latch set: nothing proves the rebuilt graph ran under it. Accepted
+    /// deferred families stay held. The contract token is kept. Accepted
     /// acknowledgements and their upload-context stamps carry only from a
     /// current ledger, so an unproven one re-offers rather than suppresses. The replay generations carry so the
     /// replacement cycle replays only what the damaged index still owed; a
-    /// spurious replay would clear the carried acknowledgements and
-    /// owned-start census. Files, traversal and the Codex ownership ledgers
+    /// spurious replay would clear the carried acknowledgements. Files, traversal and the Codex ownership ledgers
     /// (the collision-bearing fields) are rebuilt by scan.
     fn carry_identity_from(
         &mut self,
@@ -822,19 +780,6 @@ impl ScanIndex {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
-        self.claude_request_identity_contract_changed = true;
-        // Retirement evidence gates re-entry even when the file graph needs
-        // rebuilding. Its decoder has already raised any uncertainty fence.
-        self.claude_retired_family_tombstones = carry.claude_retired_family_tombstones;
-        self.claude_retired_family_tombstones_initialized =
-            carry.claude_retired_family_tombstones_initialized;
-        self.claude_retired_family_tombstones_uncertain =
-            carry.claude_retired_family_tombstones_uncertain;
-        self.claude_owned_start_census = carry.claude_owned_start_census;
-        self.claude_stale_family_carry = carry.claude_stale_family_carry;
-        self.claude_duplicate_request_owners = carry.claude_duplicate_request_owners;
-        self.claude_duplicate_request_witness_overflowed =
-            carry.claude_duplicate_request_witness_overflowed;
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             // Keep prior carried incidence, including history-held files whose
             // ordinary exact set is empty. Add only ORIGINAL accepted identities.

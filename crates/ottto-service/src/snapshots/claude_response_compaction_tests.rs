@@ -216,7 +216,6 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
         apply_claude_code_line,
         Some(&CodexTitleMetadata::default()),
         None,
-        None,
     )
     .unwrap();
     (parser, expected)

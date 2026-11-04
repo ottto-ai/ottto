@@ -1,13 +1,13 @@
 //! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
 use crate::transcript_cache::ENTRY_BYTES;
 
 fn plain_path() -> &'static Path {
@@ -371,8 +371,6 @@ fn disclosure() -> Disclosure {
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
-        parent_ref: None,
-        parent_unresolvable: None,
     }
 }
 
@@ -386,8 +384,6 @@ fn strict(reason: DebtReason) -> Disclosure {
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
-        parent_ref: None,
-        parent_unresolvable: None,
     }
 }
 
@@ -471,88 +467,35 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
 /// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
 /// only: an object change, shrink or same-length stamp change of the held
 /// file, a head or boundary sample mismatch at the refused offset, or a
-/// changed digest dependency or parent ledger.
+/// changed digest dependency.
 ///
 /// Premise (disclosed): an in-place interior edit outside the samples that
 /// also appends is not detected until the entry is lost (restart, LRU
 /// eviction) or a dependency changes. A miss is never treated as proof of
 /// uniqueness; it only costs a re-read.
 #[test]
-fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
+fn memo_entry_matches_growth_but_not_prefix_or_digest_change() {
     let temp = Temp::new("memo", b"{\"n\":1}\n{\"n\":2}\n");
     let file = File::open(&temp.0).unwrap();
     assert!(LiveWitness::read(plain_path(), &file, 0).is_none());
     assert!(LiveWitness::read(plain_path(), &file, 10_000).is_none());
     let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
-    let parent = Some(ParentDep {
-        id: "parent".into(),
-        ledger: Some("ledger-1".into()),
-        current: Some("p-1".into()),
-        witnessed: None,
-    });
-    let now = |ledger: &str, current: &str| ParentNow {
-        ledger: Some(ledger.into()),
-        current: Some(current.into()),
-        witnessed: None,
-    };
-    let now_1 = now("ledger-1", "p-1");
-    let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
-    assert_eq!(entry.parent_ref(), Some("parent"));
-    assert!(entry
-        .matches(plain_path(), "digest", &file, Some(&now_1), "")
-        .is_some());
-    assert!(entry
-        .matches(plain_path(), "other", &file, Some(&now_1), "")
-        .is_none());
-    // PR-1 L4: a changed ledger and, separately, a changed parent object
-    // each miss.
-    assert!(entry
-        .matches(
-            plain_path(),
-            "digest",
-            &file,
-            Some(&now("ledger-2", "p-1")),
-            ""
-        )
-        .is_none());
-    assert!(entry
-        .matches(
-            plain_path(),
-            "digest",
-            &file,
-            Some(&now("ledger-1", "p-2")),
-            ""
-        )
-        .is_none());
-    assert!(entry
-        .matches(
-            plain_path(),
-            "digest",
-            &file,
-            Some(&ParentNow {
-                ledger: Some("ledger-1".into()),
-                current: None,
-                witnessed: None,
-            }),
-            ""
-        )
-        .is_none());
-    assert!(entry
-        .matches(plain_path(), "digest", &file, None, "")
-        .is_none());
+    let entry = MemoEntry::new("digest".into(), live, stamp, None, disclosure());
+    assert!(entry.matches(plain_path(), "digest", &file, "").is_some());
+    assert!(entry.matches(plain_path(), "other", &file, "").is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -562,13 +505,11 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
-    assert!(entry
-        .matches(plain_path(), "digest", &file, Some(&now_1), "")
-        .is_none());
+    assert!(entry.matches(plain_path(), "digest", &file, "").is_none());
 }
 
 fn codex_line(value: Value) -> Vec<u8> {
@@ -661,7 +602,7 @@ impl crate::snapshots::CodexContinuationEvidence {
         assert!(inventory.content_unchanged(), "certified fixture inventory");
         Self {
             inventory,
-            ledgers: None,
+
             codex,
             traces: None,
         }
@@ -865,6 +806,143 @@ fn fingerprints(scan: &SourceScanResult) -> Vec<String> {
         .collect()
 }
 
+/// `index` on `cache`'s fixture route, saved and reloaded as the daemon does
+/// between passes. Codex has a Tail codec, so it keeps no RAM copy
+/// (`keeps_ram`): a routed page continues from its head on the route.
+fn routed(index: ScanIndex, cache: &SharedCache) -> ScanIndex {
+    crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+        SnapshotSource::Codex,
+        Some(cache),
+        index,
+    )
+}
+
+/// `key`'s Codex head certificate on `index`'s route (this pass's staged
+/// head, else the committed one): the continuation a retained checkpoint was.
+fn head(index: &ScanIndex, key: &str) -> Option<crate::transcript_acquisition::DurableCertificate> {
+    use crate::snapshots::tail_source::{codex::Codex, TailSource};
+    let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(index)?;
+    let (revision, body) = match crate::snapshots::state_v2::staged_head_for_test(&route, key) {
+        Some(staged) => staged,
+        None => {
+            let head = crate::snapshots::state_v2::load_head(index, key, Codex::REDUCTION_REVISION)
+                .ok()??;
+            (head.revision, head.body)
+        }
+    };
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Some(
+        Codex::decode_head(revision, &body, &mut acc)
+            .ok()?
+            .certificate,
+    )
+}
+
+/// A Pi transcript of `messages` usage lines under its own scan root, removed
+/// on drop. All sources now have codecs; cache mechanism tests explicitly
+/// admit its native reduction below instead of relying on a RAM-only source.
+struct PiRoot {
+    _dir: Temp,
+    root: PathBuf,
+}
+impl PiRoot {
+    fn new(messages: usize) -> Self {
+        let dir = Temp::new("pi", b"");
+        fs::remove_file(&dir.0).unwrap();
+        let root = dir.0.join("home/.pi/agent/sessions");
+        fs::create_dir_all(&root).unwrap();
+        let mut body = codex_line(json!({"type": "session", "version": 3,
+            "id": "native-tail-fixture", "timestamp": "2026-10-07T10:00:00Z",
+            "cwd": "/synthetic/pi"}));
+        for id in 0..messages {
+            body.extend(codex_line(
+                crate::snapshots::transcript_acquisition_tests::usage(
+                    SnapshotSource::Pi,
+                    100 + id as u64,
+                    id,
+                    "fixture-model",
+                ),
+            ));
+        }
+        let fixture = Self { _dir: dir, root };
+        fs::write(fixture.file(), body).unwrap();
+        fixture
+    }
+    fn file(&self) -> PathBuf {
+        self.root.join("native-tail-fixture.jsonl")
+    }
+    fn key(&self) -> String {
+        local_index_key(&self.file())
+    }
+}
+
+/// Exercise the existing native copy/admission mechanism directly. Production
+/// scans now persist every source's Tail head and retain no RAM reduction.
+fn retain_fixture_copy(pi: &PiRoot, cache: &Arc<SharedCache>) {
+    use crate::snapshots::sampled_scan::transition_fixture::native_cold;
+    let context = zero_context(cache, "cursor-fixture");
+    let now = super::super::now_seconds();
+    let mut parser = native_cold::parser(
+        SnapshotSource::Pi,
+        &pi.file(),
+        File::open(pi.file()).unwrap(),
+        apply_pi_line,
+    );
+    assert!(matches!(
+        parser
+            .prepare_acquisition(None, &context.namespace, None, now)
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Full(_)
+    ));
+    while !parser.step().unwrap() {}
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
+    super::super::retire_headers_beside_copy(Some(&context), budget, step);
+    let completed = parser
+        .retain_reduction(
+            &context.namespace,
+            now,
+            super::super::RetainBudget::granted_unclassified(budget),
+        )
+        .unwrap()
+        .expect("a complete native fixture");
+    assert_eq!(
+        completed.checkpoint.sealed_offset(),
+        fs::metadata(pi.file()).unwrap().len()
+    );
+    assert!(completed.reduction.is_some(), "a budgeted native copy");
+    assert!(cache.insert_admitted(pi.key(), completed, 0));
+}
+
+/// Admit `pi`'s native copy through the cache mechanism; returns its key.
+fn pi_retained(pi: &PiRoot, cache: &Arc<SharedCache>) -> String {
+    retain_fixture_copy(pi, cache);
+    let key = pi.key();
+    assert!(cache.retained_checkpoint(&key).is_some());
+    key
+}
+
+/// #641's admission setup: a real Codex cursor job paged to its certified end
+/// (cursor state and optional header facts), beside a real retained copy.
+/// The retained Pi copy is admitted by the cache fixture; returns its key.
+fn certified_beside_a_retained_copy(cache: &Arc<SharedCache>) -> String {
+    let fixture = ScanRoot::new(40);
+    let mut index = ScanIndex::default();
+    for _ in 0..64 {
+        let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(cache)), "cursor-fixture");
+        index = next;
+        if counter(cache, |c| c.jobs_certified) == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        counter(cache, |c| c.jobs_certified),
+        1,
+        "{}",
+        counters(cache)
+    );
+    pi_retained(&PiRoot::new(8), cache)
+}
+
 #[test]
 fn paged_singleton_matches_unpaged_read_across_scan_objects() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1020,9 +1098,10 @@ fn uncached_scan_never_pages() {
     assert_eq!(fingerprints(&scaled), fingerprints(&full));
 }
 
-/// Sealed-prefix retention covers cursor jobs too: a Codex fork whose
-/// ownership boundary is in-file (`Ordinal`) keeps its certified prefix, then
-/// tails from it with the output of an unpaged full read.
+/// Sealed-prefix continuation covers cursor jobs too: a Codex fork whose
+/// ownership boundary is in-file (`Ordinal`) stages its certified prefix as
+/// its head on its route, then tails from it with the output of an unpaged
+/// full read.
 #[test]
 fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1054,7 +1133,7 @@ fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
         let mut index = ScanIndex::default();
         let mut certified = false;
         for _ in 0..64 {
-            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, scan) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 assert!(!scan.snapshots.is_empty(), "the certified read publishes");
@@ -1069,16 +1148,21 @@ fn lifted_ordinal_fork_retains_sealed_prefix_then_tails_with_full_parity() {
             counters(&cache)
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
-        let prefix = cache.retained_checkpoint(&key).unwrap_or_else(|| {
-            panic!("the fork's sealed prefix is retained: {}", counters(&cache))
+        let prefix = head(&index, &key).unwrap_or_else(|| {
+            panic!("the fork's sealed prefix is its head: {}", counters(&cache))
         });
-        assert!(prefix.sealed_offset() <= fixture.len(SESSION));
+        assert!(prefix.sealed_offset <= fixture.len(SESSION));
         fixture.append(SESSION, &ordinal_token(81));
-        let (_, tail, modes) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        let (next, tail, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
         assert_eq!(modes, (0, 1), "the append tails from the sealed prefix");
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
-        let tailed = cache.retained_checkpoint(&key).expect("tail retained");
-        assert_eq!(tailed.sealed_offset(), fixture.len(SESSION));
+        let tailed = head(&next, &key).expect("tail head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
         tail
     });
     let (_, full) = page(&fixture, ScanIndex::default(), None);
@@ -1145,8 +1229,12 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             clock.set(now);
             let started = counter(&cache, |c| c.jobs_started);
             let open_length = fixture.len(SESSION);
-            let (next, scan, _) =
-                page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            let (next, scan, _) = page_in(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            );
             index = next;
             if counter(&cache, |c| c.jobs_started) > started {
                 opened = Some((now, open_length));
@@ -1161,16 +1249,15 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             now += 10;
         }
         let (t_start, open_length) = opened.expect("a cursor job opened");
-        let certified = cache
-            .retained_checkpoint(&key)
-            .unwrap_or_else(|| panic!("certified prefix retained: {}", counters(&cache)));
+        let certified = head(&index, &key)
+            .unwrap_or_else(|| panic!("certified prefix head: {}", counters(&cache)));
         // (i) `[0, s)` with `s <= L0`, verified at the read's start.
         assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
         assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
-        assert!(certified.sealed_offset() <= open_length);
-        assert!(certified.sealed_offset() < fixture.len(SESSION));
-        assert_eq!(certified.last_full_verified(), t_start);
-        assert_eq!(certified.audit_debt(), None);
+        assert!(certified.sealed_offset <= open_length);
+        assert!(certified.sealed_offset < fixture.len(SESSION));
+        assert_eq!(certified.verified_unix_seconds, t_start);
+        assert_eq!(certified.audit_debt_unix_seconds, None);
         // Appends during the job were never marked read: the path stays
         // pending as a watcher hint (C7) and the next page tails from `s`.
         assert_eq!(pending_hint(&index, &path), Some(true));
@@ -1178,13 +1265,18 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         next_line += 1;
         now += 10;
         clock.set(now);
-        let (_, scan, modes) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
         // (ii) a tail from `s` while the deadline permits.
         assert_eq!(modes, (0, 1));
         assert!(!scan.snapshots.is_empty());
-        let tailed = cache.retained_checkpoint(&key).expect("tail retained");
-        assert_eq!(tailed.sealed_offset(), fixture.len(SESSION));
-        assert_eq!(tailed.last_full_verified(), t_start);
+        let tailed = head(&next, &key).expect("tail head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
+        assert_eq!(tailed.verified_unix_seconds, t_start);
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
 
         // (iii) scaled `L > L_max` for two large files, both appended every
@@ -1207,7 +1299,8 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             let certified = counter(&cache, |c| c.jobs_certified);
             let paused = cache.cursor_job_key();
             let lengths = sessions.map(|session| fixture.len(session));
-            let retained = keys.clone().map(|key| cache.retained_checkpoint(&key));
+            index = routed(index, &cache);
+            let retained = keys.clone().map(|key| head(&index, &key));
             let (next, scan, modes) = page_at(
                 &fixture,
                 index,
@@ -1220,15 +1313,18 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                 tails += modes.1;
                 for (key, prior) in keys.iter().zip(&retained) {
                     let Some(prior) = prior else { continue };
-                    let Some(next) = cache.retained_checkpoint(key) else {
+                    let Some(next) = head(&index, key) else {
                         continue;
                     };
-                    if next.sealed_offset() > prior.sealed_offset() {
+                    if next.sealed_offset > prior.sealed_offset {
                         assert!(!scan.snapshots.is_empty(), "completed Tail publishes");
-                        assert_eq!(next.last_full_verified(), prior.last_full_verified());
-                        assert_eq!(next.audit_debt(), prior.audit_debt(), "no audit credit");
-                        if now >= prior.last_full_verified() + interval {
-                            overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset()));
+                        assert_eq!(next.verified_unix_seconds, prior.verified_unix_seconds);
+                        assert_eq!(
+                            next.audit_debt_unix_seconds, prior.audit_debt_unix_seconds,
+                            "no audit credit"
+                        );
+                        if now >= prior.verified_unix_seconds + interval {
+                            overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset));
                         }
                     }
                 }
@@ -1243,23 +1339,20 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                 // A job spans pages, so the completed one was paused before.
                 let key = paused.expect("a paused job completed");
                 let (t_start, open_length) = opened[&key];
-                let checkpoint = cache.retained_checkpoint(&key).expect("certificate");
+                let checkpoint = head(&index, &key).expect("certificate");
                 assert!(
                     !scan.snapshots.is_empty(),
                     "each audit completion publishes"
                 );
-                assert!(checkpoint.sealed_offset() <= open_length);
+                assert!(checkpoint.sealed_offset <= open_length);
                 // No deadline reset: verified at read start, still due.
-                assert_eq!(checkpoint.last_full_verified(), t_start);
-                assert_eq!(
-                    checkpoint.audit_debt().map(|debt| debt.due_unix_seconds),
-                    Some(t_start + interval)
-                );
+                assert_eq!(checkpoint.verified_unix_seconds, t_start);
+                assert_eq!(checkpoint.audit_debt_unix_seconds, Some(t_start + interval));
                 let due = index.files[&key]
                     .audit_obligation(now)
                     .map(|debt| debt.due_unix_seconds);
                 assert!(due.is_some_and(|due| due <= t_start + interval && due <= now));
-                completions.push((key, now, checkpoint.sealed_offset()));
+                completions.push((key, now, checkpoint.sealed_offset));
             } else if modes.1 == 0 {
                 assert!(scan.snapshots.is_empty(), "paused job publishes nothing");
             }
@@ -2235,9 +2328,10 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
 }
 
 /// Pages one cursor job to its certified end, `I/2` apart, from census
-/// generation `page_number + 1`. With `append_mid_read`, the file grows
-/// after the job's first page. Returns the index, the clock at the job's
-/// open and at its commit, and the opening page's full reads by reason.
+/// generation `page_number + 1`, each page on `cache`'s route. With
+/// `append_mid_read`, the file grows after the job's first page. Returns the
+/// index, the clock at the job's open and at its commit, and the opening
+/// page's full reads by reason.
 fn certify_job(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
@@ -2257,7 +2351,7 @@ fn certify_job(
         let started = counter(cache, |c| c.jobs_started);
         let (next, scan, selections) = page_selections(
             fixture,
-            index,
+            routed(index, cache),
             Some(Arc::clone(cache)),
             "cursor-fixture",
             &collected_at(*page_number),
@@ -2309,7 +2403,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// page budget is read by a cursor job that outlives the audit interval
 /// (`I/2` per page). Its complete read of the unchanged object verifies at
 /// commit: no overdue audit, no marker (a seeded past-due one is cleared),
-/// and the retained copy is verified at the commit clock. `grown` (AD-T7):
+/// and its head is verified at the commit clock. `grown` (AD-T7):
 /// an append after the job's first page keeps the grown arm (overdue, due
 /// marker); the next generation's audit of the now stable file converges.
 ///
@@ -2317,7 +2411,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
 /// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
 /// is selected. After R2's gate removal, a later append reuses the
-/// retained checkpoint as Tail even beyond `commit + I`.
+/// head as Tail even beyond `commit + I`.
 #[test]
 fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2344,8 +2438,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             assert!(entry.audit_requires_full(now));
         }
         let cache = Arc::new(SharedCache::default());
-        // The limits under which this fixture's certified cursor read is
-        // retained (`tail_eof_record_adding_first_priority_tier_…`).
+        // The limits under which this fixture's certified cursor read stages
+        // its head (`tail_eof_record_adding_first_priority_tier_…`).
         with_test_limits(2048, 8192, 64, || {
             let mut page_number = 0;
             let (next, opened, committed, reasons) = certify_job(
@@ -2368,18 +2462,21 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             if case == "grown" {
                 // AD-T7: the grown arm, as before AD-1.
                 assert_eq!(counter(&cache, |c| c.audit_overdue), 1, "{case}");
-                let retained = cache.retained_checkpoint(&key).expect("grown prefix");
-                assert_eq!(retained.last_full_verified(), opened, "{case}");
+                let grown = head(&index, &key).expect("grown prefix");
+                assert_eq!(grown.verified_unix_seconds, opened, "{case}");
                 assert_eq!(
                     index.files[&key].unverified_deadline(),
                     Some(opened + interval),
                     "{case}: due marker"
                 );
                 // Keep AD-1's stable Full-completion control distinct from
-                // R2's valid-checkpoint Tail case below. No RAM state survives
-                // this explicit eviction; missing state determines the reason.
-                cache.clear();
-                assert!(cache.retained_checkpoint(&key).is_none());
+                // R2's valid-checkpoint Tail case below. No continuation
+                // survives this explicit release and head retirement; missing
+                // state determines the reason.
+                crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+                    &cache, &index,
+                );
+                assert!(head(&index, &key).is_none());
                 let (next, opened, committed, reasons) = certify_job(
                     &fixture,
                     &cache,
@@ -2408,10 +2505,10 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 !index.files[&key].has_unverified_source(),
                 "{case}: verified, no marker"
             );
-            let retained = cache.retained_checkpoint(&key).expect("complete copy");
-            assert_eq!(retained.last_full_verified(), committed, "{case}");
-            assert_eq!(retained.audit_debt(), None, "{case}");
-            assert_eq!(retained.sealed_offset(), fixture.len(SESSION), "{case}");
+            let complete = head(&index, &key).expect("complete head");
+            assert_eq!(complete.verified_unix_seconds, committed, "{case}");
+            assert_eq!(complete.audit_debt_unix_seconds, None, "{case}");
+            assert_eq!(complete.sealed_offset, fixture.len(SESSION), "{case}");
             // Later generations past `commit + I`: the scheduler's `Skip`.
             for _ in 0..3 {
                 now += interval + 1;
@@ -2426,7 +2523,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 );
                 let (next, scan, selections) = page_selections(
                     &fixture,
-                    index,
+                    routed(index, &cache),
                     Some(Arc::clone(&cache)),
                     "cursor-fixture",
                     &collected_at(page_number),
@@ -2439,8 +2536,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 assert_eq!(selections.unchanged, 0, "{case}: not an acquisition");
             }
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
-            // A valid retained checkpoint is not reread for its age: the
-            // next append selects Tail even after the old audit horizon.
+            // A valid head is not reread for its age: the next append
+            // selects Tail even after the old audit horizon.
             assert!(now >= committed + interval);
             let before = fixture.len(SESSION);
             fixture.append(SESSION, &token_line(90));
@@ -2449,7 +2546,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             page_number += 1;
             let (next, scan, selections) = page_selections(
                 &fixture,
-                index,
+                routed(index, &cache),
                 Some(Arc::clone(&cache)),
                 "cursor-fixture",
                 &collected_at(page_number),
@@ -2476,16 +2573,15 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 !scan.snapshots.is_empty(),
                 "{case}: Tail publishes the append"
             );
-            let tailed = cache.retained_checkpoint(&key).expect("Tail retained");
-            assert_eq!(tailed.sealed_offset(), fixture.len(SESSION), "{case}");
-            assert!(tailed.sealed_offset() > retained.sealed_offset(), "{case}");
+            let tailed = head(&next, &key).expect("Tail head");
+            assert_eq!(tailed.sealed_offset, fixture.len(SESSION), "{case}");
+            assert!(tailed.sealed_offset > complete.sealed_offset, "{case}");
             assert_eq!(
-                tailed.last_full_verified(),
-                committed,
+                tailed.verified_unix_seconds, committed,
                 "{case}: no audit credit"
             );
             assert_eq!(
-                tailed.audit_debt().map(|debt| debt.due_unix_seconds),
+                tailed.audit_debt_unix_seconds,
                 Some(committed + interval),
                 "{case}: original verification determines debt, not Tail time"
             );
@@ -2515,15 +2611,20 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
         let cache = Arc::new(SharedCache::default());
         let mut index = ScanIndex::default();
         for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            let (next, _, _) = page_in(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            );
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 break;
             }
         }
         assert!(
-            cache.retained_checkpoint(&key).is_some(),
-            "a retained prefix makes the next read a tail: {}",
+            head(&index, &key).is_some(),
+            "a prefix head makes the next read a tail: {}",
             counters(&cache)
         );
         // A tail larger than the singleton budget (a cursor job) whose last,
@@ -2550,7 +2651,7 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
         for page_number in 1..=64 {
             let (next, scan, modes) = page_at(
                 &fixture,
-                index,
+                routed(index, &cache),
                 Some(Arc::clone(&cache)),
                 "cursor-fixture",
                 &collected_at(page_number),
@@ -2585,7 +2686,8 @@ fn tail_eof_record_adding_first_priority_tier_replays_before_publishing() {
 
 /// A file that grew during the job keeps its unterminated record
 /// withheld (the held FD is no longer the opened object); the next page
-/// tails it from `s`, so it is counted once, after its newline.
+/// tails it from `s` (the job's head on its route), so it is counted once,
+/// after its newline.
 #[test]
 fn grown_unterminated_last_record_stays_withheld() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2600,7 +2702,7 @@ fn grown_unterminated_last_record_stays_withheld() {
         let mut index = ScanIndex::default();
         let mut appended = false;
         for _ in 0..64 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, _) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 break;
@@ -2623,7 +2725,7 @@ fn grown_unterminated_last_record_stays_withheld() {
         let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
         let mut last_published = None;
         for _ in 0..4 {
-            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (next, scan) = page(&fixture, routed(index, &cache), Some(Arc::clone(&cache)));
             index = next;
             if !scan.snapshots.is_empty() {
                 last_published = Some(fingerprints(&scan));
@@ -3587,10 +3689,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     let new = write_dated_rollout(&fixture, "2026/11/01", NEW);
     refresh_retained_codex_roster(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
-        (&index.files).into(),
+        None,
     );
     assert!(!index
         .traversal
@@ -4905,20 +5006,15 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
 }
 
-/// B1 second symptom (N1c): a state-declared created thread whose sidecar
-/// binds a spawn parent that contradicts its header's `forked_from_id` is
-/// held as `AmbiguousFork` with the bound parent as its ref. Growth past the
-/// projected extent undoes the bind, so a fresh parse has no parent ref:
-/// the entry must miss on growth, and the re-recorded entry carries the
-/// fresh parse's ref (none), not the stale bound one. The index's parent
-/// refs are insert-only until a reset, so the memo entry, not the index, is
-/// where the fresh ref is observable.
+/// [money] A state-declared created thread held for an ambiguous fork
+/// misses when growth invalidates its sidecar bind, records the fresh hold,
+/// and then hits again with the same cold-parse money and census.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs macOS heap layout"
 )]
-fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() {
+fn bound_created_thread_fork_memo_misses_on_growth_and_records_the_fresh_hold() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
     let cache = Arc::new(SharedCache::default());
@@ -4935,8 +5031,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
         counters(&cache)
     );
     assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
-    let entry = home.memo_entry(&cache).expect("recorded entry");
-    assert_eq!(entry.parent_ref(), Some(SPAWN_PARENT));
+    assert!(home.memo_entry(&cache).is_some(), "recorded entry");
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
@@ -4959,8 +5054,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() 
         "re-read and re-recorded: {}",
         counters(&cache)
     );
-    let entry = home.memo_entry(&cache).expect("re-recorded entry");
-    assert_eq!(entry.parent_ref(), None);
+    assert!(home.memo_entry(&cache).is_some(), "re-recorded entry");
     let (index, unchanged) = home.generation(index, &cache, 3);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
@@ -5113,24 +5207,12 @@ fn replayed_census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
     ]
 }
 
-/// The memo key the fixture's held file is stored under.
-fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
-    let scope = Scope("cursor-fixture".into());
-    [home.path.clone(), fs::canonicalize(&home.path).unwrap()]
-        .iter()
-        .map(|path| memo_key(&scope, &local_index_key(path)))
-        .find(|key| cache.memo_lookup(key).is_some())
-        .expect("stored entry")
-}
-
 /// PR-1 replay and gate. A usage-bearing held fork (the full body with
 /// `forked_from_id` and no trusted parent) is now memoized.
 /// - An unchanged generation hits at zero transcript bytes and
 ///   discloses exactly what a cold full parse does: every replayed census
 ///   count, `scanned_session_count` and the blocked set. The before-parse
 ///   seam never runs for a hit.
-/// - T20: an entry forced to `own_ledger(true)` for an owed parent
-///   is bypassed (counted `memo_miss_other`) and the file is parsed again.
 /// - T18: growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
 #[test]
@@ -5177,31 +5259,6 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
     assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
 
-    // T20: the owed-parent bypass.
-    let key = stored_memo_key(&home, &cache);
-    let forced = cache.memo_lookup(&key).unwrap().own_ledger(true);
-    assert!(forced.has_own_ledger());
-    cache.memo_record(key.clone(), forced);
-    let mut index = index;
-    index.codex_parent_ownership_refs.insert(CREATED.to_owned());
-    let records = counter(&cache, |c| c.memo_records);
-    let ((mut index, _), counts) = codex_memo_lifecycle::observe(|| {
-        crate::snapshots::with_codex_before_parse(hook.clone(), || {
-            home.generation(index, &cache, 2)
-        })
-    });
-    assert_eq!(counts.memo_miss_other, 1, "{counts:?}");
-    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_eq!(parsed.borrow().len(), 2, "bypassed: parsed again");
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        records + 1,
-        "{}",
-        counters(&cache)
-    );
-    assert!(!cache.memo_lookup(&key).unwrap().has_own_ledger());
-    index.codex_parent_ownership_refs.remove(CREATED);
-
     // T18: growth alone.
     let extra = codex_line(json!({
         "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
@@ -5235,7 +5292,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
 /// L-SB site 3 (the one writer): a settleable disclosure replaces the key's
 /// attribution and releases what it no longer blocks; a strict one keeps
 /// the prior attribution and adds its owner. A replayed disclosure
-/// adds the held line and drop totals and re-requests its parent.
+/// adds the held line and drop totals with unchanged attribution.
 #[test]
 fn one_writer_attributes_and_replays_held_totals() {
     let candidate = CandidateFile {
@@ -5285,15 +5342,11 @@ fn one_writer_attributes_and_replays_held_totals() {
         dropped_usage_record: 4,
         terminal_line_loss: 2,
     };
-    held.parent_ref = Some("019fa111-2222-7333-8444-777777777777".into());
     disclose(&held, &mut index);
     assert_eq!(
         index.codex_state_only_blocked_by_file[&key],
         BTreeSet::from([SESSION.to_owned(), SESSION_B.to_owned()])
     );
-    assert!(index
-        .codex_parent_ownership_refs
-        .contains("019fa111-2222-7333-8444-777777777777"));
     // A strict disclosure keeps the prior attribution and adds.
     let mut owner = strict(DebtReason::JoinStateBound);
     owner.state_only_blocked_session_ids = vec!["019fa111-2222-7333-8444-888888888888".into()];
@@ -5323,48 +5376,9 @@ fn one_writer_attributes_and_replays_held_totals() {
     );
 }
 
-// PR-1 packet tests (rev 5 §6), adjusted to the L-5 amendment: the page
-// borrows the census the index owns, the probe memo is one slot cleared per
-// step call, and both after-parse fences re-open the parent.
+// Native memo and in-file ownership fixtures.
 
-const PARENT: &str = "019fa111-2222-7333-8444-aaaaaaaaaaaa";
 const CHILD: &str = "019fa111-2222-7333-8444-bbbbbbbbbbbb";
-
-fn turn_record(at: &str, turn: &str) -> Value {
-    json!({"timestamp": at, "type": "turn_context",
-        "payload": {"turn_id": turn, "model": "gpt-5.6-sol"}})
-}
-
-fn usage_record(at: &str, total: (u64, u64, u64, u64), last: (u64, u64, u64, u64)) -> Value {
-    let usage = |(input, cached, output, reasoning): (u64, u64, u64, u64)| {
-        json!({"input_tokens": input, "cached_input_tokens": cached,
-            "output_tokens": output, "reasoning_output_tokens": reasoning})
-    };
-    json!({"timestamp": at, "type": "event_msg", "payload": {"type": "token_count",
-        "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
-            "model": "gpt-5.6-sol"}}})
-}
-
-fn jsonl(records: &[Value]) -> Vec<u8> {
-    records
-        .iter()
-        .cloned()
-        .map(codex_line)
-        .collect::<Vec<_>>()
-        .concat()
-}
-
-/// The memo key `path` is stored under, if any (either path spelling).
-fn stored_key(cache: &SharedCache, path: &Path) -> Option<String> {
-    let scope = Scope("cursor-fixture".into());
-    [
-        path.to_path_buf(),
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-    ]
-    .iter()
-    .map(|path| memo_key(&scope, &local_index_key(path)))
-    .find(|key| cache.memo_lookup(key).is_some())
-}
 
 /// `session`'s published usage: (input, requests) per snapshot.
 fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
@@ -5408,764 +5422,6 @@ fn active_is(scan: &OwnedSourceScan, path: &Path) -> bool {
         .file
         .as_ref()
         .is_some_and(|active| active.candidate.path.file_name() == path.file_name())
-}
-
-/// A parent rollout P (two turns with usage: a complete ledger of four
-/// signatures) and an ordinary fork C of P (`forked_from_id`, a `user`
-/// thread) in one sessions root, with no sidecar.
-struct ForkHome {
-    fixture: ScanRoot,
-}
-
-impl ForkHome {
-    fn new(child: &[Value]) -> Self {
-        let home = Self {
-            fixture: ScanRoot::with_sessions(&[]),
-        };
-        fs::write(home.fixture.file(PARENT), jsonl(&Self::parent())).unwrap();
-        home.write_child(child);
-        home
-    }
-
-    fn parent() -> Vec<Value> {
-        vec![
-            json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
-                "payload": {"id": PARENT, "thread_source": "user"}}),
-            turn_record("2026-10-07T08:00:01Z", "parent-turn-1"),
-            usage_record("2026-10-07T08:00:02Z", (100, 80, 10, 2), (100, 80, 10, 2)),
-            turn_record("2026-10-07T08:30:01Z", "parent-turn-2"),
-            usage_record("2026-10-07T08:30:02Z", (160, 125, 18, 4), (60, 45, 8, 2)),
-        ]
-    }
-
-    /// Kind (iii): C's first signature is its own turn, so its prefix
-    /// diverges from P's complete ledger at signature 0 (`AmbiguousFork`,
-    /// held), followed by `usage` own `token_count`s.
-    fn diverging_child(usage: u64) -> Vec<Value> {
-        let mut records = vec![turn_record("2026-10-07T08:20:01Z", "child-turn-1")];
-        for n in 1..=usage {
-            records.push(usage_record(
-                "2026-10-07T08:20:02Z",
-                (10 * n, 5 * n, n, 0),
-                (10, 5, 1, 0),
-            ));
-        }
-        records
-    }
-
-    /// A mid-ledger divergence: P's first turn and usage, then C's own turn
-    /// and usage while later parent signatures exist (owned from there).
-    fn matching_child() -> Vec<Value> {
-        let parent = Self::parent();
-        vec![
-            parent[1].clone(),
-            parent[2].clone(),
-            turn_record("2026-10-07T08:20:01Z", "child-turn-1"),
-            usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
-        ]
-    }
-
-    fn write_child(&self, records: &[Value]) {
-        let mut all = vec![
-            json!({"timestamp": "2026-10-07T08:20:00Z", "type": "session_meta",
-            "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}}),
-        ];
-        all.extend_from_slice(records);
-        fs::write(self.fixture.file(CHILD), jsonl(&all)).unwrap();
-    }
-
-    fn generation(
-        &self,
-        index: ScanIndex,
-        cache: &Arc<SharedCache>,
-        n: u64,
-    ) -> (ScanIndex, SourceScanResult) {
-        self.generation_with(index, cache, n, |_| {})
-    }
-
-    /// One page of census generation `n`; `tweak` runs once the scan object
-    /// is constructed (page start: census frozen, ledgers validated) and
-    /// before its first step.
-    fn generation_with(
-        &self,
-        index: ScanIndex,
-        cache: &Arc<SharedCache>,
-        n: u64,
-        tweak: impl Fn(&mut OwnedSourceScan),
-    ) -> (ScanIndex, SourceScanResult) {
-        let mut index = index;
-        index.traversal = None;
-        let (index, scan, _) = page_with(
-            &self.fixture,
-            index,
-            Some(Arc::clone(cache)),
-            "cursor-fixture",
-            &collected_at(n),
-            tweak,
-        );
-        (index, scan)
-    }
-
-    /// Generations from `n` until the fork is settled: a generation that
-    /// started with P's ledger indexed discloses the same census as the one
-    /// before it. Returns the last generation and the next free `n`.
-    fn settle(
-        &self,
-        index: ScanIndex,
-        cache: &Arc<SharedCache>,
-        n: u64,
-    ) -> (ScanIndex, SourceScanResult, u64) {
-        let (mut index, mut scan) = self.generation(index, cache, n);
-        for next in n + 1..n + 8 {
-            let before = census(&index, &scan);
-            let ledgered = Self::parent_ledger(&index).is_some();
-            let (following, again) = self.generation(index, cache, next);
-            let stable = ledgered && census(&following, &again) == before;
-            index = following;
-            scan = again;
-            if stable {
-                return (index, scan, next + 1);
-            }
-        }
-        panic!("the fork did not settle: {}", counters(cache));
-    }
-
-    /// The cold oracle: a fresh index and cache, settled from generation `n`.
-    fn oracle(&self, n: u64) -> (ScanIndex, SourceScanResult) {
-        let (index, scan, _) =
-            self.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), n);
-        (index, scan)
-    }
-
-    /// The same generation read again with no memo: a fresh cache over a
-    /// copy of the warm index (C-T3's fresh side).
-    fn twin(&self, index: &ScanIndex, n: u64) -> (ScanIndex, SourceScanResult) {
-        self.generation(index.clone(), &Arc::new(SharedCache::default()), n)
-    }
-
-    fn child_entry(&self, cache: &SharedCache) -> Option<MemoEntry> {
-        stored_key(cache, &self.fixture.file(CHILD)).and_then(|key| cache.memo_lookup(&key))
-    }
-
-    /// P's indexed complete ledger identity.
-    fn parent_ledger(index: &ScanIndex) -> Option<String> {
-        index
-            .codex_parent_ownership_ledgers
-            .get(PARENT)
-            .filter(|ledger| ledger.scan_complete)
-            .map(|ledger| ledger.opened_object_identity.clone())
-    }
-}
-
-/// P rewritten in place, not appended: a turn with usage inserted after its
-/// first turn, every later signature kept.
-fn rewrite_parent(path: &Path) {
-    let parent = ForkHome::parent();
-    let mut changed = parent[..3].to_vec();
-    changed.push(turn_record("2026-10-07T08:10:01Z", "parent-turn-inserted"));
-    changed.push(usage_record(
-        "2026-10-07T08:10:02Z",
-        (130, 103, 14, 3),
-        (30, 23, 4, 1),
-    ));
-    changed.extend_from_slice(&parent[3..]);
-    fs::write(path, jsonl(&changed)).unwrap();
-}
-
-/// P appended: one more turn with usage (`n` keeps the turn ids distinct).
-fn append_parent_turn(path: &Path, n: u64) {
-    let mut file = OpenOptions::new().append(true).open(path).unwrap();
-    file.write_all(&jsonl(&[
-        turn_record("2026-10-07T09:00:01Z", &format!("parent-grown-{n}")),
-        usage_record(
-            "2026-10-07T09:00:02Z",
-            (200 + 10 * n, 150 + 5 * n, 20 + n, 4),
-            (10, 5, 1, 0),
-        ),
-    ]))
-    .unwrap();
-}
-
-/// Kind (iii): a fork whose copied prefix diverges from its
-/// parent's complete ledger at signature 0 is held with usage and memoized
-/// with the ledger it used and the parent's current identity. An unchanged
-/// generation hits at zero transcript bytes and discloses exactly what a
-/// fresh read of the same generation does (same index, no memo), field by
-/// field plus `scanned_session_count`, and what a cold settled scan does.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
-    use crate::local_resource_diagnostics::codex_memo_lifecycle;
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
-    let ledger = ForkHome::parent_ledger(&index).expect("indexed parent ledger");
-    let entry = home
-        .child_entry(&cache)
-        .unwrap_or_else(|| panic!("the kind (iii) hold is memoized: {}", counters(&cache)));
-    let dep = entry.parent.as_ref().expect("parent dependency");
-    assert_eq!(
-        (
-            dep.id.as_str(),
-            dep.ledger.as_deref(),
-            dep.current.as_deref()
-        ),
-        (PARENT, Some(ledger.as_str()), Some(ledger.as_str()))
-    );
-    assert!(session_usage(&settled, CHILD).is_empty());
-    assert_eq!(
-        settled.ownership_incomplete_file_count,
-        1,
-        "{}",
-        counters(&cache)
-    );
-    let hits = counter(&cache, |c| c.memo_hits);
-    let (twin_index, twin) = home.twin(&index, n);
-    let ((index, hit), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits + 1,
-        "{}",
-        counters(&cache)
-    );
-    assert_eq!(
-        counts.memo_hit_estimated_avoided_parser_bytes,
-        home.fixture.len(CHILD)
-    );
-    assert!(session_usage(&hit, CHILD).is_empty());
-    assert_eq!(replayed_census(&hit), replayed_census(&twin));
-    assert_eq!(census(&index, &hit), census(&twin_index, &twin));
-    let (oracle_index, oracle) = home.oracle(n + 1);
-    assert_eq!(census(&index, &hit), census(&oracle_index, &oracle));
-}
-
-/// T14: after a restart (a new `SharedCache`, the index kept) the held fork
-/// is read once and recorded, then hits with the same disclosure.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
-    let cache = Arc::new(SharedCache::default());
-    let (index, reread) = home.generation(index, &cache, n);
-    assert_eq!(
-        (
-            counter(&cache, |c| c.memo_hits),
-            counter(&cache, |c| c.memo_records)
-        ),
-        (0, 1),
-        "{}",
-        counters(&cache)
-    );
-    let (_, hit) = home.generation(index, &cache, n + 1);
-    assert_eq!(
-        (
-            counter(&cache, |c| c.memo_hits),
-            counter(&cache, |c| c.memo_records)
-        ),
-        (1, 1),
-        "{}",
-        counters(&cache)
-    );
-    assert_eq!(replayed_census(&hit), replayed_census(&reread));
-}
-
-/// T15 (PR-P §2.4): a created thread never consults a parent ledger, so it
-/// records no parent ref, before or after an index reset; its memo hit
-/// re-requests nothing. P-T32 covers an ordinary fork's re-request.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
-    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
-    home.project(home.bytes(2), 2);
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
-    assert!(!index.codex_parent_ownership_refs.contains(SPAWN_PARENT));
-    index.codex_parent_ownership_refs.clear();
-    let (index, quiet) = home.generation(index, &cache, 1);
-    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert!(
-        !index.codex_parent_ownership_refs.contains(SPAWN_PARENT),
-        "{}",
-        counters(&cache)
-    );
-    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
-}
-
-/// T15b: the parent's object is replaced (same bytes, new inode). The
-/// child's entry misses once, counted `memo_miss_other`, and the fork
-/// settles on the new parent object exactly as a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
-    use crate::local_resource_diagnostics::codex_memo_lifecycle;
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
-    let before = ForkHome::parent_ledger(&index).unwrap();
-    let hits = counter(&cache, |c| c.memo_hits);
-    let parent = home.fixture.file(PARENT);
-    let replacement = home
-        .fixture
-        .root
-        .parent()
-        .unwrap()
-        .join("parent-replacement");
-    fs::copy(&parent, &replacement).unwrap();
-    fs::rename(&replacement, &parent).unwrap();
-    let ((index, replaced), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
-    assert_eq!(
-        (
-            counts.memo_hit_estimated_avoided_parser_bytes,
-            counts.memo_miss_exact_stamp,
-            counts.memo_miss_other
-        ),
-        (0, 0, 1),
-        "{}",
-        counters(&cache)
-    );
-    assert_eq!(counter(&cache, |c| c.memo_hits), hits);
-    assert!(session_usage(&replaced, CHILD).is_empty());
-    let (index, settled, n) = home.settle(index, &cache, n + 1);
-    let after = ForkHome::parent_ledger(&index).unwrap();
-    assert_ne!(after, before);
-    let entry = home.child_entry(&cache).expect("re-recorded");
-    assert_eq!(
-        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
-        Some(after.as_str())
-    );
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// T15c, rewritten for PR-P in two legs.
-/// (a) A held created thread whose trusted spawn parent has a local,
-/// complete rollout: the hold never consults a ledger, so the parent gets no
-/// ref and no index ledger. From its second generation the unchanged hold
-/// hits every generation and discloses what a cold scan does.
-/// (b) The live case, an ordinary fork C of P whose first parse precedes P
-/// on the page: C is pending (never recorded) until P's ledger arrives at an
-/// unchanged P identity, then recorded once, then quiet: nothing is parsed
-/// again, and the census equals the cold oracle.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
-    let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
-    home.project(home.bytes(2), 2);
-    let at = |offset: i64| bounded_rfc3339_millis(home.base_ms + offset).unwrap();
-    fs::write(
-        home.fixture
-            .root
-            .join(format!("rollout-2026-10-07T08-00-00-{SPAWN_PARENT}.jsonl")),
-        jsonl(&[
-            json!({"timestamp": at(-60_000), "type": "session_meta",
-                "payload": {"id": SPAWN_PARENT, "thread_source": "user"}}),
-            turn_record(&at(-59_000), "spawn-parent-turn"),
-            usage_record(&at(-58_000), (40, 20, 4, 1), (40, 20, 4, 1)),
-        ]),
-    )
-    .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut hits = Vec::new();
-    let mut last = None;
-    for n in 0..4 {
-        let (next, scan) = home.generation(index, &cache, n);
-        assert!(
-            !next.codex_parent_ownership_refs.contains(SPAWN_PARENT)
-                && !next
-                    .codex_parent_ownership_ledgers
-                    .contains_key(SPAWN_PARENT),
-            "generation {n}: {}",
-            counters(&cache)
-        );
-        assert!(created_usage(&scan).is_empty());
-        hits.push(counter(&cache, |c| c.memo_hits));
-        index = next;
-        last = Some(scan);
-    }
-    let entry = home.memo_entry(&cache).expect("memoized hold");
-    let dep = entry.parent.as_ref().expect("spawn parent dependency");
-    assert_eq!(
-        (dep.id.as_str(), dep.ledger.as_deref()),
-        (SPAWN_PARENT, None)
-    );
-    // At most one miss after the first record, then a hit per generation.
-    assert_eq!(hits[3] - hits[1], 2, "{}", counters(&cache));
-    assert!(
-        counter(&cache, |c| c.memo_records) <= 2,
-        "{}",
-        counters(&cache)
-    );
-    assert_oracle(&home, &cache, &index, &last.unwrap(), 3, true, &[]);
-
-    // (b) C's rollout sorts before P's, so its first parse precedes P.
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let early = home
-        .fixture
-        .root
-        .join(format!("rollout-2026-10-07T09-00-00-{CHILD}.jsonl"));
-    fs::rename(home.fixture.file(CHILD), &early).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
-    let ledger = ForkHome::parent_ledger(&index).expect("indexed parent ledger");
-    let key = stored_key(&cache, &early)
-        .unwrap_or_else(|| panic!("C is held and memoized: {}", counters(&cache)));
-    let entry = cache.memo_lookup(&key).unwrap();
-    let dep = entry.parent.as_ref().expect("parent dependency");
-    assert_eq!(
-        (dep.ledger.as_deref(), dep.witnessed),
-        (Some(ledger.as_str()), None)
-    );
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        1,
-        "never recorded while pending, once after the ledger: {}",
-        counters(&cache)
-    );
-    let hits = counter(&cache, |c| c.memo_hits);
-    let ((index, quiet), parsed) = parses(|| {
-        let (index, _) = home.generation(index, &cache, n);
-        home.generation(index, &cache, n + 1)
-    });
-    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits + 2,
-        "{}",
-        counters(&cache)
-    );
-    let (oracle_index, oracle) = home.oracle(n + 2);
-    assert_eq!(census(&index, &quiet), census(&oracle_index, &oracle));
-}
-
-/// Every parse started inside `run`, by file name: the before-parse seam fires
-/// after a memo miss (or no lookup) and before the parse, never on a hit.
-fn parses<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let sink = std::rc::Rc::clone(&seen);
-    let value = crate::snapshots::with_codex_before_parse(
-        move |path: &Path| {
-            sink.borrow_mut().push(
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            );
-        },
-        run,
-    );
-    let seen = seen.borrow().clone();
-    (value, seen)
-}
-
-/// `scan`'s traversal-cumulative held-parent counts, by cause index.
-fn parent_causes(scan: &SourceScanResult) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
-    scan.local_codex_diagnostics
-        .as_ref()
-        .expect("Codex diagnostics")
-        .parent_unresolvable
-        .counts()
-}
-
-/// `count` held children under `cause` and none elsewhere.
-fn only(cause: CodexParentUnresolvable, count: u64) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
-    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
-    expected[cause.index()] = count;
-    expected
-}
-
-fn restarts_in_scope(scan: &SourceScanResult) -> Option<u64> {
-    scan.local_codex_diagnostics
-        .as_ref()
-        .expect("Codex diagnostics")
-        .parent_restarts_in_scope
-}
-
-/// T15d: a child of a growing parent never hits (the parent's identity moves
-/// every generation) and its misses are `memo_miss_other`, never an
-/// exact-stamp miss; it is never admitted.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn child_of_a_growing_parent_never_hits() {
-    use crate::local_resource_diagnostics::codex_memo_lifecycle;
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, _, mut n) = home.settle(ScanIndex::default(), &cache, 0);
-    let hits = counter(&cache, |c| c.memo_hits);
-    let mut other = 0;
-    for grown in 0..3 {
-        append_parent_turn(&home.fixture.file(PARENT), grown);
-        let ((next, scan), counts) =
-            codex_memo_lifecycle::observe(|| home.generation(index, &cache, n));
-        assert_eq!(
-            (
-                counts.memo_hit_estimated_avoided_parser_bytes,
-                counts.memo_miss_exact_stamp
-            ),
-            (0, 0),
-            "{counts:?}"
-        );
-        assert!(session_usage(&scan, CHILD).is_empty());
-        other += counts.memo_miss_other;
-        index = next;
-        n += 1;
-    }
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits,
-        "{}",
-        counters(&cache)
-    );
-    assert!(other >= 1, "{}", counters(&cache));
-}
-
-/// T1b/N2 and T3b, with PR-P (P-T1a): a `forked_from_id` fork whose parent
-/// is not on disk is pending on its first generation: its parent requested,
-/// never recorded. From the next match the parent is witnessed `Absent`, so
-/// the fork is held, counted under `Absent` (with the scope's restart
-/// count), recorded once and then hits. T7: once the parent arrives the
-/// witness drops and the fork settles exactly as a cold scan (here held and
-/// memoized: kind (iii)).
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let parent = home.fixture.file(PARENT);
-    let away = home.fixture.root.parent().unwrap().join("parent-away");
-    fs::rename(&parent, &away).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, first) = home.generation(ScanIndex::default(), &cache, 0);
-    assert!(session_usage(&first, CHILD).is_empty());
-    assert!(
-        home.child_entry(&cache).is_none(),
-        "a parent-pending fork is never recorded: {}",
-        counters(&cache)
-    );
-    assert!(index.codex_parent_ownership_refs.contains(PARENT));
-    let mut hits = counter(&cache, |c| c.memo_hits);
-    for n in 1..4 {
-        let (next, scan) = home.generation(index, &cache, n);
-        assert!(session_usage(&scan, CHILD).is_empty());
-        assert_eq!(
-            parent_causes(&scan),
-            only(CodexParentUnresolvable::Absent, 1),
-            "generation {n}: {}",
-            counters(&cache)
-        );
-        assert!(
-            restarts_in_scope(&scan).is_some_and(|restarts| restarts <= 1),
-            "generation {n}: {:?}",
-            restarts_in_scope(&scan)
-        );
-        assert_eq!(
-            counter(&cache, |c| c.memo_records),
-            1,
-            "generation {n}: {}",
-            counters(&cache)
-        );
-        if n > 1 {
-            assert_eq!(
-                counter(&cache, |c| c.memo_hits),
-                hits + 1,
-                "generation {n}: {}",
-                counters(&cache)
-            );
-        }
-        hits = counter(&cache, |c| c.memo_hits);
-        assert!(next.codex_parent_ownership_refs.contains(PARENT));
-        index = next;
-    }
-    let entry = home.child_entry(&cache).expect("held and recorded");
-    assert_eq!(
-        entry.parent.as_ref().and_then(|dep| dep.witnessed),
-        Some(CodexParentUnresolvable::Absent)
-    );
-    fs::rename(&away, &parent).unwrap();
-    let (index, settled, n) = home.settle(index, &cache, 4);
-    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
-    assert_eq!(
-        parent_causes(&settled),
-        only(CodexParentUnresolvable::Absent, 0)
-    );
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// Control: a fork that matches its parent's first signatures
-/// and diverges while later parent signatures exist is owned from there: it
-/// is admitted once with its own usage and never memoized.
-#[test]
-fn mid_ledger_divergence_is_admitted_and_never_memoized() {
-    let home = ForkHome::new(&ForkHome::matching_child());
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut published = Vec::new();
-    for n in 0..6 {
-        let (next, scan) = home.generation(index, &cache, n);
-        published.extend(session_usage(&scan, CHILD));
-        assert!(home.child_entry(&cache).is_none(), "{}", counters(&cache));
-        index = next;
-    }
-    assert_eq!(published, vec![(30, 1)], "{}", counters(&cache));
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        0,
-        "{}",
-        counters(&cache)
-    );
-}
-
-/// Scan-level liveness and safety: the child grows, so its lookup
-/// misses (exact stamp) after probing P; the seam then rewrites P before
-/// C's parse, which uses the page-start ledger. The fence re-opens P and
-/// refuses C (parent-pending: not recorded, nothing published). Later
-/// generations settle on the new P exactly as a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
-    use crate::local_resource_diagnostics::codex_memo_lifecycle;
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
-    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
-    let before = ForkHome::parent_ledger(&index).unwrap();
-    home.fixture.append(
-        CHILD,
-        &jsonl(&[usage_record(
-            "2026-10-07T08:20:03Z",
-            (40, 20, 4, 0),
-            (10, 5, 1, 0),
-        )]),
-    );
-    let fired = std::rc::Rc::new(std::cell::Cell::new(0));
-    let hook = {
-        let fired = std::rc::Rc::clone(&fired);
-        let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
-        move |path: &Path| {
-            if path.file_name() == child.file_name() {
-                fired.set(fired.get() + 1);
-                rewrite_parent(&parent);
-            }
-        }
-    };
-    let ((index, refused), counts) = codex_memo_lifecycle::observe(|| {
-        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, n))
-    });
-    assert_eq!(fired.get(), 1, "{}", counters(&cache));
-    assert_eq!(counts.memo_miss_exact_stamp, 1, "{counts:?}");
-    assert!(session_usage(&refused, CHILD).is_empty());
-    assert!(
-        home.child_entry(&cache).is_none(),
-        "refused as parent-pending, not re-recorded: {}",
-        counters(&cache)
-    );
-    let (index, settled, n) = home.settle(index, &cache, n + 1);
-    let after = ForkHome::parent_ledger(&index).unwrap();
-    assert_ne!(after, before);
-    let entry = home
-        .child_entry(&cache)
-        .expect("re-recorded on the new parent");
-    assert_eq!(
-        entry.parent.as_ref().and_then(|dep| dep.ledger.as_deref()),
-        Some(after.as_str())
-    );
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// B2-T2 (resume): C's parse spans step calls. After its header classified
-/// against P's ledger, P changes between two step calls; when C's parse
-/// finishes the fence re-opens P and refuses C. A fresh cache makes C read
-/// in full (no memo). Later generations settle exactly as a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
-    let home = ForkHome::new(&ForkHome::diverging_child(12));
-    let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
-    let before = ForkHome::parent_ledger(&index).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let (child, parent) = (home.fixture.file(CHILD), home.fixture.file(PARENT));
-    let mut rewritten = 0;
-    index.traversal = None;
-    let (index, refused) = page_between(&home.fixture, index, &cache, &collected_at(n), |scan| {
-        let classified = active_is(scan, &child)
-            && scan.active_file.file.as_ref().is_some_and(|active| {
-                active
-                    .parser
-                    .accumulator
-                    .codex_parent_ledger_identity_used
-                    .is_some()
-            });
-        if classified && rewritten == 0 {
-            rewrite_parent(&parent);
-            rewritten += 1;
-        }
-    });
-    assert_eq!(rewritten, 1, "{}", counters(&cache));
-    assert!(session_usage(&refused, CHILD).is_empty());
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        0,
-        "refused as parent-pending, not recorded: {}",
-        counters(&cache)
-    );
-    let (index, settled, n) = home.settle(index, &cache, n + 1);
-    assert_ne!(ForkHome::parent_ledger(&index).unwrap(), before);
-    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// B2-T3 (liveness): P is appended after page start (the census is frozen
-/// and its old ledger validated) and before its own parse. The ledger insert
-/// re-opens P after that parse, so the new ledger is still inserted.
-#[test]
-fn parent_appended_after_page_start_still_gets_its_ledger() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
-    let before = ForkHome::parent_ledger(&index).unwrap();
-    let parent = home.fixture.file(PARENT);
-    let (index, _) = home.generation_with(index, &cache, n, |_| append_parent_turn(&parent, 0));
-    let ledger = index
-        .codex_parent_ownership_ledgers
-        .get(PARENT)
-        .unwrap_or_else(|| panic!("no ledger: {}", counters(&cache)));
-    assert!(ledger.scan_complete);
-    assert_ne!(ledger.opened_object_identity, before);
-    assert_eq!(ledger.signatures.len(), 6);
-    let (index, settled, n) = home.settle(index, &cache, n + 1);
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
 /// A rollout-declared created thread with a spawn parent, flushed to
@@ -6356,46 +5612,6 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     assert!(session_usage(&grown, SESSION_B).is_empty());
     let _ = generation(index, 3);
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
-}
-
-/// T3 (second shape): a fork that matches every signature of its parent's
-/// ledger and ends there stays `AwaitingParentPrefix` (non-monotone, not
-/// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
-/// miss and the re-read settles exactly as a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
-    use crate::local_resource_diagnostics::codex_memo_lifecycle;
-    let home = ForkHome::new(&ForkHome::parent()[1..]);
-    let cache = Arc::new(SharedCache::default());
-    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
-    assert!(session_usage(&settled, CHILD).is_empty());
-    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
-    let hits = counter(&cache, |c| c.memo_hits);
-    let (index, _) = home.generation(index, &cache, n);
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits + 1,
-        "{}",
-        counters(&cache)
-    );
-    home.fixture.append(
-        CHILD,
-        &jsonl(&[turn_record("2026-10-07T08:40:01Z", "child-turn-1")]),
-    );
-    let ((index, _), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, n + 1));
-    assert_eq!(
-        (counts.memo_miss_exact_stamp, counts.memo_miss_other),
-        (1, 0),
-        "{counts:?}"
-    );
-    let (index, settled, n) = home.settle(index, &cache, n + 2);
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
 }
 
 /// T6 and T18 (second half): growth together with a sidecar change is not
@@ -6981,15 +6197,9 @@ fn retained_floor(cache: &SharedCache) -> usize {
     crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
 }
 
-/// F4b: everything admission keeps beside the state and a charge: the
-/// retained cache's own bound and the side ledger's fixed reservation.
-fn admission_floor(cache: &SharedCache) -> usize {
-    retained_floor(cache) + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES
-}
-
 /// Boundary requests must use the least cursor state admission can reach.
 /// Real scan pages also warm optional header facts; those can yield before
-/// provenance, witnesses or retained copies, and are not a mandatory floor.
+/// provenance or retained copies, and are not a mandatory floor.
 /// Keep `cursor_resident` whole so no-eviction assertions still include them.
 fn cursor_without_header_facts(cache: &SharedCache) -> usize {
     let headers = cache
@@ -7338,7 +6548,7 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = admission_floor(&cache);
+    let floor = retained_floor(&cache);
     let state = cache.cursor_resident();
     let claim = 4096;
     let members = join_members(&["a.jsonl", "b.jsonl"]);
@@ -7376,24 +6586,15 @@ fn hopeless_admission_evicts_nothing() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
             .retained;
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
-        let floor = admission_floor(&cache);
+        let floor = retained_floor(&cache);
         let empty = cursor_without_header_facts(&cache);
         cache.insert(
             key.clone(),
@@ -7462,20 +6663,11 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
             .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
@@ -7488,13 +6680,12 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         // Control: without a claim the copy fits.
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_some());
-        // F4b: the side ledger's reservation is part of the floor.
-        let with_copy = admission_floor(&cache);
+        // The retained cache's own bound is the admission floor.
+        let with_copy = retained_floor(&cache);
         let state = cursor_without_header_facts(&cache);
         assert!(with_copy + state <= state_bytes());
         let copy = cache.take(&key).expect("retained").retained;
-        // F4b exact boundary: a claim that leaves exactly the copy's room
-        // beside the side ledger's reservation; the copy is kept.
+        // Exact boundary: a claim leaves exactly the copy's room.
         let exact = state_bytes() - state - with_copy;
         let credit = cache.cursor_reserve(exact).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
@@ -7503,7 +6694,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             "kept at the boundary"
         );
         assert_eq!(
-            admission_floor(&cache) + cache.cursor_resident(),
+            retained_floor(&cache) + cache.cursor_resident(),
             state_bytes()
         );
         credit.refund();
@@ -7513,7 +6704,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_none(), "refused");
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
+        assert!(retained_floor(&cache) + cache.cursor_resident() <= state_bytes());
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -7605,277 +6796,23 @@ fn corrupt_credit_accounting_fails_closed() {
     }
 }
 
-// PR-P: parent witnesses, the restart table and held parent causes.
-
-fn absent_witness() -> ParentWitness {
-    ParentWitness {
-        cause: CodexParentUnresolvable::Absent,
-        identity: None,
-        waits_on: None,
-    }
-}
-
-/// The witness keys of `namespace`, read without touching anything.
-fn witness_keys(cache: &SharedCache, namespace: &str) -> Vec<String> {
-    cache
-        .with_cursor(|cursor| {
-            cursor
-                .parents
-                .get(namespace)
-                .map(|entry| entry.witnesses.entries.keys().cloned().collect())
-                .unwrap_or_default()
-        })
-        .unwrap()
-}
-
-/// A namespace's whole parent entry: scope, match mark and every witness
-/// with its stored charge.
-type WitnessEntry = (
-    String,
-    Option<(String, u64)>,
-    Vec<(String, ParentWitness, usize)>,
-);
-
-/// `namespace`'s whole parent entry, read without touching anything.
-fn witness_entry(cache: &SharedCache, namespace: &str) -> Option<WitnessEntry> {
-    cache
-        .with_cursor(|cursor| {
-            cursor.parents.get(namespace).map(|entry| {
-                (
-                    entry.scope.clone(),
-                    entry.matched.clone(),
-                    entry
-                        .witnesses
-                        .entries
-                        .iter()
-                        .map(|(parent, (witness, charge))| {
-                            (parent.clone(), witness.clone(), *charge)
-                        })
-                        .collect(),
-                )
-            })
-        })
-        .unwrap()
-}
-
-/// `namespace`'s RAM witness of `parent`, read without touching anything.
-fn witness_of(cache: &SharedCache, namespace: &str, parent: &str) -> Option<ParentWitness> {
-    cache
-        .with_cursor(|cursor| {
-            cursor
-                .parents
-                .get(namespace)
-                .and_then(|entry| entry.witnesses.entries.get(parent))
-                .map(|(witness, _)| witness.clone())
-        })
-        .unwrap()
-}
-
-/// P-T26 (L4, cache level): the inline table holds `ROTATION_KEYS` pairs.
-/// An evicting insert starts spent, and so does an evicted pair that comes
-/// back: no restart is ever refilled. `parent_state` never inserts into
-/// `parents`, and 20 later pages of another namespace change nothing.
-#[test]
-fn evicted_restart_slot_reenters_spent() {
-    let cache = SharedCache::default();
-    let first = Scope("namespace-00".into());
-    assert_eq!(cache.parent_state(&first, "scope").restarts, 0);
-    assert_eq!(cache.note_parent_restart(&first, "scope"), Some(1));
-    for n in 1..ROTATION_KEYS {
-        cache.with_cursor(|cursor| cursor.rotation.page += 1);
-        let namespace = Scope(format!("namespace-{n:02}"));
-        assert_eq!(cache.parent_state(&namespace, "scope").restarts, 0);
-    }
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 0);
-    cache.with_cursor(|cursor| cursor.rotation.page += 1);
-    let last = Scope("namespace-64".into());
-    assert_eq!(
-        cache.parent_state(&last, "scope").restarts,
-        PARENT_RESTART_BUDGET,
-        "an evicting insert starts spent"
-    );
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 1);
-    cache.with_cursor(|cursor| cursor.rotation.page += 1);
-    assert_eq!(
-        cache.parent_state(&first, "scope").restarts,
-        PARENT_RESTART_BUDGET,
-        "the evicted pair re-enters spent"
-    );
-    assert_eq!(counter(&cache, |c| c.parent_restart_slot_evicted), 2);
-    for _ in 0..20 {
-        cache.with_cursor(|cursor| cursor.rotation.page += 1);
-        assert_eq!(
-            cache.parent_state(&last, "scope").restarts,
-            PARENT_RESTART_BUDGET
-        );
-    }
-    assert_eq!(
-        cache.note_parent_restart(&first, "scope"),
-        Some(PARENT_RESTART_BUDGET + 1),
-        "counted, never reset"
-    );
-    assert!(cache
-        .with_cursor(|cursor| cursor.parents.is_empty())
-        .unwrap());
-}
-
-/// P-T17 (R2-L4): 5,000 witnesses across 80 namespaces under the production
-/// budget stay inside the state budget (at most `ROTATION_KEYS` namespace
-/// entries), and a paused job's mandatory reserve still gets its room by
-/// forgetting them.
-#[test]
-fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
-    for n in 0..5_000_u64 {
-        if n % 64 == 0 {
-            cache.with_cursor(|cursor| cursor.rotation.page += 1);
-        }
-        let namespace = Scope(format!("namespace-{:02}", n % 80));
-        cache.witness_parent(
-            &namespace,
-            "scope",
-            &format!("parent-{n:05}"),
-            ParentWitness {
-                cause: CodexParentUnresolvable::ParentHeld,
-                identity: Some(format!("identity-{n}")),
-                waits_on: None,
-            },
-        );
-    }
-    assert!(cache.cursor_resident() < state_bytes());
-    assert!(cache.with_cursor(|cursor| cursor.parents.len()).unwrap() <= ROTATION_KEYS);
-    assert!(counter(&cache, |c| c.parent_namespace_refused) > 0);
-    let credit = cache
-        .cursor_reserve(state_bytes() - empty - floor)
-        .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
-    assert!(counter(&cache, |c| c.parent_witness_evicted) > 0);
-    assert!(cache
-        .with_cursor(|cursor| cursor.parents.is_empty())
-        .unwrap());
-    credit.refund();
-    assert_eq!(cache.cursor_reserved(), 0);
-    assert_eq!(cache.cursor_resident(), empty);
-}
-
-/// #643: an optional witness or match mark for a new
-/// 65th namespace is refused before admission and changes nothing retained:
-/// the 64 namespaces keep their entries, witnesses and marks, and the
-/// newcomer gets no settling witness and no match mark, so step start applies
-/// nothing to it and its parent stays owed (re-read, fail-closed). An existing
-/// namespace's update and a mandatory admission's eviction are unchanged.
-#[test]
-fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
-    let namespace = |n: usize| Scope(format!("namespace-{n:02}"));
-    for n in 0..ROTATION_KEYS {
-        cache.with_cursor(|cursor| cursor.rotation.page += 1);
-        assert!(cache.witness_parent(&namespace(n), "scope", PARENT, absent_witness()));
-        cache.mark_parents_matched(&namespace(n), "scope", "window-end", 0);
-    }
-    let retained = |cache: &SharedCache| {
-        cache
-            .with_cursor(|cursor| {
-                cursor
-                    .parents
-                    .iter()
-                    .map(|(key, entry)| {
-                        (
-                            key.clone(),
-                            entry.scope.clone(),
-                            entry.touched,
-                            entry.matched.clone(),
-                            entry
-                                .witnesses
-                                .entries
-                                .iter()
-                                .map(|(parent, (witness, charge))| {
-                                    (parent.clone(), witness.clone(), *charge)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap()
-    };
-    let before = retained(&cache);
-    assert_eq!(before.len(), ROTATION_KEYS);
-    let resident = cache.cursor_resident();
-    let newcomer = namespace(ROTATION_KEYS);
-    cache.with_cursor(|cursor| cursor.rotation.page += 1);
-    assert!(!cache.witness_parent(&newcomer, "scope", PARENT, absent_witness()));
-    cache.mark_parents_matched(&newcomer, "scope", "window-end", 0);
-    assert_eq!(retained(&cache), before, "the retained 64 are unchanged");
-    assert_eq!(cache.cursor_resident(), resident);
-    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
-    assert_eq!(counter(&cache, |c| c.parent_witness_refused), 1);
-    assert_eq!(counter(&cache, |c| c.parent_match_unmarked), 1);
-    let state = cache.parent_state(&newcomer, "scope");
-    assert!(
-        state.witnesses.is_empty() && state.matched.is_none(),
-        "the overflow stays owed"
-    );
-    // An existing namespace still takes an update past the count bound.
-    assert!(cache.witness_parent(&namespace(0), "scope", "another-parent", absent_witness()));
-    assert_eq!(counter(&cache, |c| c.parent_namespace_refused), 2);
-    // A mandatory admission still forgets witnesses for its room.
-    let credit = cache
-        .cursor_reserve(state_bytes() - empty - floor)
-        .unwrap_or_else(|| panic!("the paused job's room: {}", counters(&cache)));
-    assert!(cache
-        .with_cursor(|cursor| cursor.parents.is_empty())
-        .unwrap());
-    credit.refund();
-}
-
-const WITNESS_NAMESPACES: [&str; 2] = ["witness-namespace-1", "witness-namespace-2"];
-const WITNESS_KEYS: [&str; 2] = ["parent-a", "parent-b"];
-
-/// #641's `hopeless_admission_evicts_nothing` setup with witnesses: a real
-/// certified retained copy, `floor` and `empty` measured with no copy, no
-/// provenance and no witnesses, then two provenance entries and two
-/// witnesses in each of two namespaces (namespace 1 strictly older).
-struct WitnessAdmission {
+struct ProvenanceAdmission {
     _fixture: ScanRoot,
     cache: Arc<SharedCache>,
-    key: String,
-    members: Vec<CandidateFile>,
     floor: usize,
     empty: usize,
 }
 
-fn witness_admission() -> WitnessAdmission {
+fn provenance_admission() -> ProvenanceAdmission {
     let fixture = ScanRoot::new(40);
-    let key = local_index_key(&fixture.file(SESSION));
     let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for _ in 0..64 {
-        let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-        index = next;
-        if counter(&cache, |c| c.jobs_certified) == 1 {
-            break;
-        }
-    }
+    let key = certified_beside_a_retained_copy(&cache);
     let copy = cache
         .take(&key)
-        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+        .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
         .retained;
-    let floor = admission_floor(&cache);
+    let floor = retained_floor(&cache);
     let empty = cursor_without_header_facts(&cache);
-    // A single-session root has no parent refs: no `parents` entry exists.
-    assert!(cache
-        .with_cursor(|cursor| cursor.parents.is_empty())
-        .unwrap());
     cache.insert(
         key.clone(),
         sampled_jsonl::CompletedNativeAcquisition {
@@ -7889,1633 +6826,31 @@ fn witness_admission() -> WitnessAdmission {
     let members = join_members(&["a.jsonl", "b.jsonl"]);
     cache.record_join_owner(JOIN_OWNER, &members);
     cache.record_join_owner(JOIN_OTHER, &members);
-    for namespace in WITNESS_NAMESPACES {
-        for parent in WITNESS_KEYS {
-            assert!(cache.witness_parent(
-                &Scope(namespace.into()),
-                "scope",
-                parent,
-                absent_witness()
-            ));
-        }
-        cache.with_cursor(|cursor| cursor.rotation.page += 1);
-    }
-    WitnessAdmission {
+    ProvenanceAdmission {
         _fixture: fixture,
         cache,
-        key,
-        members,
         floor,
         empty,
     }
 }
 
-/// P-T37 (the witness twin of `hopeless_admission_evicts_nothing`): a
-/// hopeless reserve keeps every witness, provenance entry and the retained
-/// copy, byte for byte; an optional witness inside the floor window is
-/// refused and keeps them too. A reserve that fits once both provenance
-/// entries and exactly one witness are forgotten forgets exactly that one:
-/// the oldest namespace's first key.
+/// [behaviour] A feasible mandatory reserve forgets optional provenance
+/// and succeeds without stranding its reservation.
 #[test]
-fn hopeless_admission_keeps_every_witness() {
+fn feasible_reserve_forgets_provenance() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let setup = witness_admission();
-        let cache = &setup.cache;
-        // R2-L4: every witness value, charge, scope and match mark, not
-        // only the keys.
-        let entries = WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace));
-        assert!(entries.iter().all(Option::is_some));
-        let intact = || {
-            assert!(
-                cache.retained_checkpoint(&setup.key).is_some(),
-                "the copy is kept"
-            );
-            for owner in [JOIN_OWNER, JOIN_OTHER] {
-                assert_eq!(
-                    join_entry(cache, owner),
-                    Some(joined(&setup.members)),
-                    "{owner}"
-                );
-            }
-            for namespace in WITNESS_NAMESPACES {
-                assert_eq!(witness_keys(cache, namespace), WITNESS_KEYS, "{namespace}");
-            }
-            assert_eq!(
-                WITNESS_NAMESPACES.map(|namespace| witness_entry(cache, namespace)),
-                entries
-            );
-            assert_eq!(counter(cache, |c| c.parent_witness_evicted), 0);
-            assert_eq!(cache.cursor_reserved(), 0);
-        };
-        intact();
-        let resident = cache.cursor_resident();
-        for hopeless in [state_bytes() - setup.empty - setup.floor + 1, state_bytes()] {
-            assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
-            intact();
-            assert_eq!(cache.cursor_resident(), resident);
-        }
-        // Optional twin: a third namespace inside the floor window.
-        let refused = counter(cache, |c| c.parent_witness_refused);
-        with_test_state_budget(cursor_without_header_facts(cache) + setup.floor + 1, || {
-            assert!(!cache.witness_parent(
-                &Scope("witness-namespace-3".into()),
-                "scope",
-                "parent-c",
-                absent_witness()
-            ));
-        });
-        assert_eq!(counter(cache, |c| c.parent_witness_refused), refused + 1);
-        intact();
-        assert_eq!(cache.cursor_resident(), resident);
-        // Proportional: room once both provenance entries and exactly one
-        // witness (its node and key) are forgotten.
-        let node =
-            crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>().unwrap();
-        let after = cursor_without_header_facts(cache)
-            - join_charge(JOIN_OWNER, &setup.members)
-            - join_charge(JOIN_OTHER, &setup.members)
-            - node
-            - WITNESS_KEYS[0].len();
-        let credit = cache
-            .cursor_reserve(state_bytes() - setup.floor - after)
-            .unwrap_or_else(|| panic!("fits after one witness: {}", counters(cache)));
-        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 1);
-        assert_eq!(join_entry(cache, JOIN_OWNER), None);
-        assert_eq!(join_entry(cache, JOIN_OTHER), None);
-        assert_eq!(
-            witness_keys(cache, WITNESS_NAMESPACES[0]),
-            [WITNESS_KEYS[1]]
-        );
-        assert_eq!(witness_keys(cache, WITNESS_NAMESPACES[1]), WITNESS_KEYS);
-        credit.refund();
-        assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// P-T37's feasible control (and P-T26b's feasible variant), on a fresh
-/// setup: a reserve that fits only once provenance and every witness are
-/// forgotten forgets them all and succeeds; both namespace entries go.
-#[test]
-fn feasible_reserve_forgets_provenance_then_witnesses() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let setup = witness_admission();
+        let setup = provenance_admission();
         let cache = &setup.cache;
         let credit = cache
             .cursor_reserve(state_bytes() - setup.empty - setup.floor)
             .unwrap_or_else(|| panic!("feasible: {}", counters(cache)));
         assert_eq!(join_entry(cache, JOIN_OWNER), None);
         assert_eq!(join_entry(cache, JOIN_OTHER), None);
-        assert_eq!(counter(cache, |c| c.parent_witness_evicted), 4);
-        assert!(cache
-            .with_cursor(|cursor| cursor.parents.is_empty())
-            .unwrap());
-        credit.refund();
-        assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// P-T5/P-T33b: with the ref set full, a new fork's ref does not fit,
-/// so the fork is held `DeferredRef` (counted, never published) with no
-/// restart, and memo-hits from its second generation. Once refs leave the
-/// set it resolves as a cold scan does.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS {
-        index
-            .codex_parent_ownership_refs
-            .insert(format!("prefilled-{n:03}"));
-    }
-    let mut hits = Vec::new();
-    for n in 0..3 {
-        let (next, scan) = home.generation(index, &cache, n);
-        assert!(session_usage(&scan, CHILD).is_empty());
-        assert!(!next.codex_parent_ownership_refs.contains(PARENT));
-        // [behaviour] A refused global parent-ref request is locally visible.
-        if n == 0 {
-            assert!(scan.cap_counts.parent_ref_refusals > 0);
-        }
-        assert_eq!(restarts_in_scope(&scan), Some(0), "generation {n}");
-        assert_eq!(
-            parent_causes(&scan),
-            only(CodexParentUnresolvable::DeferredRef, 1),
-            "generation {n}: {}",
-            counters(&cache)
-        );
-        hits.push(counter(&cache, |c| c.memo_hits));
-        index = next;
-    }
-    assert_eq!(hits[2] - hits[1], 1, "{}", counters(&cache));
-    index
-        .codex_parent_ownership_refs
-        .retain(|parent| !parent.starts_with("prefilled-"));
-    let (index, settled, n) = home.settle(index, &cache, 3);
-    assert_eq!(
-        parent_causes(&settled),
-        only(CodexParentUnresolvable::Absent, 0)
-    );
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// The proof hook's `Proven` transition for C over P,
-/// on the page's own index (census keys): C's proof as the job mints it (m
-/// = the leading signatures C shares with P's `parent_records`, the chain
-/// over C's s_0..s_m, P at `parent` sealed now under the proof scope), P's
-/// settled side record covering it, and C's hold memo forgotten
-/// (`forget_proven_hold_memos`). Returns C's key.
-fn prove_child(
-    scan: &mut OwnedSourceScan,
-    cache: &SharedCache,
-    parent: &Path,
-    parent_records: &[Value],
-    child: &Path,
-    child_records: &[Value],
-) -> String {
-    use crate::snapshots::codex_parent_proof_use_tests::seal_of;
-    use crate::snapshots::{
-        codex_digest_hex, codex_ownership_signature, codex_parent_prefix_chain,
-        codex_parent_prefix_seed, codex_parent_proof_scope, codex_parent_side_scope,
-        CodexParentPrefixProof, CodexParentProofState, CodexParentSide, SideVerdict,
-    };
-    let census_key = |path: &Path| {
-        let name = file_name(path);
-        scan.index
-            .traversal
-            .as_ref()
-            .and_then(|traversal| {
-                traversal
-                    .codex_rollout_paths
-                    .iter()
-                    .find(|key| key.ends_with(name.as_str()))
-                    .cloned()
-            })
-            .expect("in the census")
-    };
-    let (p_key, c_key) = (census_key(parent), census_key(child));
-    let signatures = |records: &[Value]| {
-        records
-            .iter()
-            .filter_map(codex_ownership_signature)
-            .collect::<Vec<_>>()
-    };
-    let (theirs, ours) = (signatures(parent_records), signatures(child_records));
-    let matched = theirs
-        .iter()
-        .zip(&ours)
-        .take_while(|(parent, child)| parent == child)
-        .count();
-    let mut digest = codex_parent_prefix_seed();
-    for signature in &ours[..=matched] {
-        digest = codex_parent_prefix_chain(&digest, signature);
-    }
-    let file = File::open(parent).unwrap();
-    let now = crate::snapshots::sampled_scan::now_seconds();
-    scan.index.codex_parent_prefix_proofs.insert(
-        c_key.clone(),
-        CodexParentProofState::Proven(CodexParentPrefixProof {
-            parent: PARENT.into(),
-            parent_seal: seal_of(&file, now, &codex_parent_proof_scope().0),
-            matched: matched as u64,
-            child_digest: codex_digest_hex(&digest),
-            owned: matched > 0,
-            published: false,
-        }),
-    );
-    scan.index.codex_parent_side.insert(
-        p_key,
-        CodexParentSide {
-            verdict: SideVerdict::Settled,
-            seal: seal_of(&file, now, &codex_parent_side_scope().0),
-            parsed: OpenStamp::capture(&file).unwrap(),
-            pace: None,
-            generation: 1,
-            referenced_epoch: 0,
-        },
-    );
-    cache.memo_forget(&memo_key(&Scope("cursor-fixture".into()), &c_key));
-    c_key
-}
-
-/// With the ref set full, C's parser is
-/// built while C is owed (no install), and C's proof turns `Proven` before
-/// C's parse completes (production: a cursor job paused across the hook's
-/// page; here: between two step calls of C's parse, so the record site sees
-/// the same state). C completes pending, is deferred `DeferredRef` with no
-/// step-map witness and held, and that hold is not memoized; the next page
-/// parses C, installs the proof and C resolves. Previously the hold
-/// was memoized and replayed on every later page.
-#[test]
-fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::CodexParentProofState;
-    use CodexParentUnresolvable::DeferredRef;
-    let home = ForkHome::new(&ForkHome::matching_child());
-    let mut index = ScanIndex::default();
-    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS {
-        index
-            .codex_parent_ownership_refs
-            .insert(format!("prefilled-{n:03}"));
-    }
-    let (mut index, owed) = home.generation(index, &Arc::new(SharedCache::default()), 0);
-    assert!(session_usage(&owed, CHILD).is_empty());
-    assert_eq!(parent_causes(&owed), only(DeferredRef, 1));
-
-    // A fresh cache, so C is parsed (no hold memo).
-    let cache = Arc::new(SharedCache::default());
-    let (parent, child) = (home.fixture.file(PARENT), home.fixture.file(CHILD));
-    let mut key = None;
-    index.traversal = None;
-    let ((index, held), parsed) = parses(|| {
-        page_between(&home.fixture, index, &cache, &collected_at(1), |scan| {
-            if key.is_none() && active_is(scan, &child) {
-                key = Some(prove_child(
-                    scan,
-                    &cache,
-                    &parent,
-                    &ForkHome::parent(),
-                    &child,
-                    &ForkHome::matching_child(),
-                ));
-            }
-        })
-    });
-    let key = key.expect("C's parse spans step calls");
-    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
-    assert!(session_usage(&held, CHILD).is_empty());
-    assert_eq!(
-        parent_causes(&held),
-        only(DeferredRef, 1),
-        "{}",
-        counters(&cache)
-    );
-    assert!(matches!(
-        index.codex_parent_prefix_proofs.get(&key),
-        Some(CodexParentProofState::Proven(_))
-    ));
-    assert_eq!(
-        counter(&cache, |c| c.memo_records),
-        0,
-        "the hold is not memoized: {}",
-        counters(&cache)
-    );
-    assert!(home.child_entry(&cache).is_none());
-
-    // The next page parses C, installs the proof, and C resolves.
-    let ((_, resolved), parsed) = parses(|| home.generation(index, &cache, 2));
-    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
-    assert_eq!(
-        session_usage(&resolved, CHILD),
-        vec![(30, 1)],
-        "{}",
-        counters(&cache)
-    );
-    assert_eq!(parent_causes(&resolved), only(DeferredRef, 0));
-}
-
-/// P-T14: the step-start match runs once per traversal: one census
-/// pass per generation here (each generation is one traversal and one
-/// page), and the namespace is marked matched for exactly that traversal,
-/// so a later page of it re-applies without matching.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn step_start_matches_once_per_traversal() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    fs::rename(
-        home.fixture.file(PARENT),
-        home.fixture.root.parent().unwrap().join("parent-away"),
-    )
-    .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
-    for n in 1..4 {
-        let before = crate::snapshots::codex_parent_step_start_matches_for_test();
-        let (next, _) = home.generation(index, &cache, n);
-        assert_eq!(
-            crate::snapshots::codex_parent_step_start_matches_for_test() - before,
-            1,
-            "generation {n}"
-        );
-        // The completed traversal's census window end is this page's.
-        let end = Some(collected_at(n));
-        let matched = cache
-            .with_cursor(|cursor| {
-                cursor
-                    .parents
-                    .get("cursor-fixture")
-                    .and_then(|entry| entry.matched.clone())
-            })
-            .unwrap();
-        assert_eq!(matched.map(|(at, _)| at), end, "generation {n}");
-        index = next;
-    }
-}
-
-/// P-T35 (L3, N3): referenced id A's only rollout is a file named A whose
-/// `session_meta` id is B, and a fork of B has no file named B. A is
-/// witnessed `NoLedger` at that file's identity and B `Absent`; each child
-/// is held under its parent's cause. From then on nothing is parsed. An
-/// append to the file drops A's witness and the file is read again.
-/// (Rev 5's admitted-B variant is dropped per the lease's N3.)
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn misnamed_parent_rollout_witnesses_no_ledger_and_absent() {
-    const A: &str = "019fa111-2222-7333-8444-cccccccccccc";
-    const B: &str = "019fa111-2222-7333-8444-dddddddddddd";
-    const CHILD_A: &str = "019fa111-2222-7333-8444-eeeeeeeeeeee";
-    const CHILD_B: &str = "019fa111-2222-7333-8444-ffffffffffff";
-    let fixture = ScanRoot::with_sessions(&[]);
-    let mut misnamed = ForkHome::parent();
-    misnamed[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
-        "payload": {"id": B, "thread_source": "user"}});
-    fs::write(fixture.file(A), jsonl(&misnamed)).unwrap();
-    for (child, parent) in [(CHILD_A, A), (CHILD_B, B)] {
-        let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
-            "type": "session_meta",
-            "payload": {"id": child, "forked_from_id": parent, "thread_source": "user"}})];
-        records.extend(ForkHome::diverging_child(2));
-        fs::write(fixture.file(child), jsonl(&records)).unwrap();
-    }
-    let cache = Arc::new(SharedCache::default());
-    let generation = |index: ScanIndex, n: u64| {
-        let mut index = index;
-        index.traversal = None;
-        let (index, scan, _) = page_with(
-            &fixture,
-            index,
-            Some(Arc::clone(&cache)),
-            "cursor-fixture",
-            &collected_at(n),
-            |_| {},
-        );
-        (index, scan)
-    };
-    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
-    expected[CodexParentUnresolvable::NoLedger.index()] = 1;
-    expected[CodexParentUnresolvable::Absent.index()] = 1;
-    let mut index = ScanIndex::default();
-    let mut held_at = None;
-    for n in 0..4 {
-        let (next, scan) = generation(index, n);
-        index = next;
-        assert!(restarts_in_scope(&scan).is_some_and(|restarts| restarts <= PARENT_RESTART_BUDGET));
-        if parent_causes(&scan) == expected {
-            held_at = Some(n);
-            break;
-        }
-    }
-    let held_at = held_at.unwrap_or_else(|| panic!("both children held: {}", counters(&cache)));
-    assert!(held_at <= 2, "{held_at}");
-    assert!(!index.codex_parent_ownership_ledgers.contains_key(B));
-    assert!(!index
-        .codex_parent_ownership_ledgers
-        .get(A)
-        .is_some_and(|ledger| ledger.scan_complete));
-    for n in held_at + 1..held_at + 3 {
-        let ((next, scan), parsed) = parses(|| generation(index, n));
-        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
-        assert_eq!(parent_causes(&scan), expected, "generation {n}");
-        index = next;
-    }
-    fixture.append(
-        A,
-        &jsonl(&[turn_record("2026-10-07T09:00:01Z", "appended")]),
-    );
-    let n = held_at + 3;
-    let (_, parsed) = parses(|| generation(index, n));
-    let name = fixture
-        .file(A)
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert!(parsed.contains(&name), "{parsed:?}");
-}
-
-/// One cached generation of `fixture` (a fresh traversal at page `n`).
-fn fixture_generation(
-    fixture: &ScanRoot,
-    cache: &Arc<SharedCache>,
-    index: ScanIndex,
-    n: u64,
-) -> (ScanIndex, SourceScanResult) {
-    let mut index = index;
-    index.traversal = None;
-    let (index, scan, _) = page_with(
-        fixture,
-        index,
-        Some(Arc::clone(cache)),
-        "cursor-fixture",
-        &collected_at(n),
-        |_| {},
-    );
-    (index, scan)
-}
-
-/// A rollout of `id`, optionally a fork of `parent`, with `records` after
-/// its `session_meta`.
-fn write_rollout(fixture: &ScanRoot, id: &str, parent: Option<&str>, records: &[Value]) {
-    let mut payload = json!({"id": id, "thread_source": "user"});
-    if let Some(parent) = parent {
-        payload["forked_from_id"] = json!(parent);
-    }
-    let mut all = vec![json!({"timestamp": "2026-10-07T08:00:00Z",
-        "type": "session_meta", "payload": payload})];
-    all.extend_from_slice(records);
-    fs::write(fixture.file(id), jsonl(&all)).unwrap();
-}
-
-/// P-T32: a held ordinary fork whose parent is witnessed `Absent` memo-hits
-/// after an index reset and re-requests its parent ref, exactly as its
-/// fresh parse did.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    fs::rename(
-        home.fixture.file(PARENT),
-        home.fixture.root.parent().unwrap().join("parent-away"),
-    )
-    .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for n in 0..3 {
-        index = home.generation(index, &cache, n).0;
-    }
-    assert!(home.child_entry(&cache).is_some(), "{}", counters(&cache));
-    index.codex_parent_ownership_refs.clear();
-    let hits = counter(&cache, |c| c.memo_hits);
-    let ((index, scan), parsed) = parses(|| home.generation(index, &cache, 3));
-    assert!(parsed.is_empty(), "{parsed:?}");
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits + 1,
-        "{}",
-        counters(&cache)
-    );
-    assert!(index.codex_parent_ownership_refs.contains(PARENT));
-    assert_eq!(
-        parent_causes(&scan),
-        only(CodexParentUnresolvable::Absent, 1)
-    );
-}
-
-/// P-T18 (witness lifetime): G is absent, P forks G and C forks P. P is held
-/// `Absent` and witnessed `ParentHeld`, so C is held `ParentHeld`. When G
-/// appears (sorted before P), G and P are read, P is admitted with its own
-/// usage, P's RAM witness is gone, and the chain settles as a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn admitted_parent_loses_its_witness_and_its_child_resolves() {
-    let fixture = chain_fixture(false);
-    let away = fixture.root.parent().unwrap().join("grandparent-away");
-    fs::rename(fixture.file(GRANDPARENT), &away).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
-    expected[CodexParentUnresolvable::Absent.index()] = 1;
-    expected[CodexParentUnresolvable::ParentHeld.index()] = 1;
-    let mut index = ScanIndex::default();
-    let mut held = false;
-    for n in 0..4 {
-        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-        index = next;
-        assert!(session_usage(&scan, PARENT).is_empty());
-        if parent_causes(&scan) == expected {
-            held = true;
-            break;
-        }
-    }
-    assert!(held, "P held Absent, C ParentHeld: {}", counters(&cache));
-    assert!(
-        witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
-        "{}",
-        counters(&cache)
-    );
-    fs::rename(&away, fixture.file(GRANDPARENT)).unwrap();
-    let mut published = Vec::new();
-    let mut settled = None;
-    for n in 4..10 {
-        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-        published.extend(session_usage(&scan, PARENT));
-        let stable = parent_causes(&scan) == [0; PARENT_UNRESOLVABLE_CAUSES]
-            && settled
-                .as_ref()
-                .is_some_and(|(_, before)| census(&next, &scan) == *before);
-        settled = Some((n, census(&next, &scan)));
-        index = next;
-        if stable {
-            break;
-        }
-    }
-    assert!(
-        !witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
-        "{}",
-        counters(&cache)
-    );
-    assert_eq!(published, vec![(30, 1)], "{}", counters(&cache));
-    let (n, warm) = settled.unwrap();
-    let mut oracle_index = ScanIndex::default();
-    let oracle_cache = Arc::new(SharedCache::default());
-    let mut oracle = None;
-    for m in n..n + 6 {
-        let (next, scan) = fixture_generation(&fixture, &oracle_cache, oracle_index, m);
-        oracle = Some(census(&next, &scan));
-        oracle_index = next;
-    }
-    assert_eq!(warm, oracle.unwrap());
-}
-
-/// P-T25: a parent last modified outside the backfill window is
-/// witnessed `OutOfWindow`: its fork is held under that cause and never
-/// `DeferredRestart` at two consecutive generations. Touching the parent
-/// changes its identity: the witness drops, the parent is read and the
-/// fork settles as a cold scan.
-#[test]
-fn out_of_window_parent_holds_its_fork_until_touched() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let set_modified = |at: std::time::SystemTime| {
-        OpenOptions::new()
-            .write(true)
-            .open(home.fixture.file(PARENT))
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-    };
-    set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000));
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut previous_deferred = false;
-    let mut held_at = None;
-    for n in 0..4 {
-        let (next, scan) = home.generation(index, &cache, n);
-        let causes = parent_causes(&scan);
-        let deferred = causes[CodexParentUnresolvable::DeferredRestart.index()] > 0;
-        assert!(!(deferred && previous_deferred), "generation {n}");
-        previous_deferred = deferred;
-        assert!(session_usage(&scan, CHILD).is_empty());
-        if causes == only(CodexParentUnresolvable::OutOfWindow, 1) {
-            held_at.get_or_insert(n);
-        }
-        index = next;
-    }
-    assert!(
-        held_at.is_some_and(|n| n <= 2),
-        "{held_at:?}: {}",
-        counters(&cache)
-    );
-    set_modified(std::time::SystemTime::now());
-    let (index, settled, n) = home.settle(index, &cache, 4);
-    assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
-    let (oracle_index, oracle) = home.oracle(n);
-    assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
-}
-
-/// P-T28: C forks P and P forks C. With the budget spent, both wait
-/// on each other (`DeferredRestart` wait records); the next match finds the
-/// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
-/// and neither file is read again.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn fork_cycle_is_witnessed_and_then_quiet() {
-    let fixture = ScanRoot::with_sessions(&[]);
-    write_rollout(&fixture, PARENT, Some(CHILD), &ForkHome::diverging_child(2));
-    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope();
-    for _ in 0..PARENT_RESTART_BUDGET {
-        cache.note_parent_restart(&namespace, &scope);
-    }
-    let cycle = only(CodexParentUnresolvable::ForkCycle, 2);
-    let mut index = ScanIndex::default();
-    let mut held_at = None;
-    for n in 0..5 {
-        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-        index = next;
-        assert_eq!(restarts_in_scope(&scan), Some(PARENT_RESTART_BUDGET));
-        if parent_causes(&scan) == cycle {
-            held_at = Some(n);
-            break;
-        }
-    }
-    let held_at = held_at.unwrap_or_else(|| panic!("cycle never witnessed: {}", counters(&cache)));
-    assert!(held_at <= 3, "{held_at}");
-    for n in held_at + 1..held_at + 3 {
-        let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
-        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
-        assert_eq!(parent_causes(&scan), cycle, "generation {n}");
-        index = next;
-    }
-}
-
-const GRANDPARENT: &str = "019fa111-2222-7333-8444-111111111111";
-
-/// G, P forking G (owned from a mid-ledger divergence, so admitted once G's
-/// ledger is known) and C forking P (kind (iii) against P). `reversed`
-/// names the rollouts so C sorts first and G last.
-fn chain_fixture(reversed: bool) -> ScanRoot {
-    let fixture = ScanRoot::with_sessions(&[]);
-    let grandparent = ForkHome::parent();
-    let own = [
-        grandparent[1].clone(),
-        grandparent[2].clone(),
-        turn_record("2026-10-07T08:20:01Z", "parent-own-turn"),
-        usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
-    ];
-    write_rollout(&fixture, GRANDPARENT, None, &grandparent[1..]);
-    write_rollout(&fixture, PARENT, Some(GRANDPARENT), &own);
-    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
-    if reversed {
-        for (id, hour) in [(CHILD, "07"), (PARENT, "08"), (GRANDPARENT, "09")] {
-            fs::rename(
-                fixture.file(id),
-                fixture
-                    .root
-                    .join(format!("rollout-2026-10-07T{hour}-00-00-{id}.jsonl")),
-            )
-            .unwrap();
-        }
-    }
-    fixture
-}
-
-/// P-T26b: a `ParentHeld` witness is never stale-pruned. After 20
-/// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
-/// chain's next generation parses nothing and its holds memo-hit.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn parent_held_witness_survives_another_namespaces_pages() {
-    let fixture = chain_fixture(false);
-    let away = fixture.root.parent().unwrap().join("grandparent-away");
-    fs::rename(fixture.file(GRANDPARENT), &away).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for n in 0..4 {
-        index = fixture_generation(&fixture, &cache, index, n).0;
-    }
-    assert!(
-        witness_keys(&cache, "cursor-fixture").contains(&PARENT.to_owned()),
-        "{}",
-        counters(&cache)
-    );
-    let other = ScanRoot::new(3);
-    let mut other_index = ScanIndex::default();
-    for _ in 0..20 {
-        other_index = page_in(
-            &other,
-            other_index,
-            Some(Arc::clone(&cache)),
-            "other-namespace",
-        )
-        .0;
-    }
-    let hits = counter(&cache, |c| c.memo_hits);
-    let ((_, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
-    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
-    assert!(
-        counter(&cache, |c| c.memo_hits) >= hits + 2,
-        "{}",
-        counters(&cache)
-    );
-    let mut expected = [0; PARENT_UNRESOLVABLE_CAUSES];
-    expected[CodexParentUnresolvable::Absent.index()] = 1;
-    expected[CodexParentUnresolvable::ParentHeld.index()] = 1;
-    assert_eq!(parent_causes(&scan), expected);
-}
-
-/// Generations from 0 until `scan`'s causes equal `expected` (at most
-/// `limit`), then two more that must parse nothing and keep them.
-fn held_then_quiet(
-    fixture: &ScanRoot,
-    expected: [u64; PARENT_UNRESOLVABLE_CAUSES],
-    limit: u64,
-    never: CodexParentUnresolvable,
-) {
-    let cache = Arc::new(SharedCache::default());
-    held_then_quiet_from(
-        fixture,
-        &cache,
-        ScanIndex::default(),
-        0,
-        expected,
-        limit,
-        never,
-    );
-}
-
-/// `held_then_quiet` continuing `cache` and `index` from generation `from`.
-fn held_then_quiet_from(
-    fixture: &ScanRoot,
-    cache: &Arc<SharedCache>,
-    index: ScanIndex,
-    from: u64,
-    expected: [u64; PARENT_UNRESOLVABLE_CAUSES],
-    limit: u64,
-    never: CodexParentUnresolvable,
-) {
-    let mut index = index;
-    let mut held_at = None;
-    let mut history = Vec::new();
-    for n in from..=from + limit {
-        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
-        index = next;
-        history.push(format!(
-            "{n}: causes {:?} restarts {:?} parsed {parsed:?} scanned {} incomplete {} \
-             census {} refs {} ledger {:?}",
-            parent_causes(&scan),
-            restarts_in_scope(&scan),
-            scan.scanned_file_count,
-            scan.ownership_incomplete_file_count,
-            scan.census_complete,
-            index.codex_parent_ownership_refs.contains(PARENT),
-            index
-                .codex_parent_ownership_ledgers
-                .get(PARENT)
-                .map(|ledger| ledger.scan_complete),
-        ));
-        assert_eq!(parent_causes(&scan)[never.index()], 0, "{history:#?}");
-        if parent_causes(&scan) == expected {
-            held_at = Some(n);
-            break;
-        }
-    }
-    let held_at =
-        held_at.unwrap_or_else(|| panic!("never held: {history:#?}\n{}", counters(cache)));
-    for n in held_at + 1..held_at + 3 {
-        let ((next, scan), parsed) = parses(|| fixture_generation(fixture, cache, index, n));
-        assert!(parsed.is_empty(), "generation {n}: {parsed:?}");
-        assert_eq!(parent_causes(&scan), expected, "generation {n}");
-        index = next;
-    }
-}
-
-/// P-T31: a second rollout claiming P's id makes P `Duplicated`:
-/// the fork is held under it, never `ParentLossy`, and nothing is read
-/// again.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn duplicated_parent_holds_its_fork_duplicated() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    fs::copy(
-        home.fixture.file(PARENT),
-        home.fixture
-            .root
-            .join(format!("rollout-2026-10-07T11-00-00-{PARENT}.jsonl")),
-    )
-    .unwrap();
-    held_then_quiet(
-        &home.fixture,
-        only(CodexParentUnresolvable::Duplicated, 1),
-        3,
-        CodexParentUnresolvable::ParentLossy,
-    );
-}
-
-// PR-P fix round 1: event (c), deferral chains, multi-page folds and the
-// wait-record transition.
-
-/// `id`'s rollout at `hour` on 2026-10-07 (`ScanRoot::file` is hour 10).
-fn rollout_at(fixture: &ScanRoot, id: &str, hour: &str) -> PathBuf {
-    fixture
-        .root
-        .join(format!("rollout-2026-10-07T{hour}-00-00-{id}.jsonl"))
-}
-
-/// The name `parses` records for `path`.
-fn file_name(path: &Path) -> String {
-    path.file_name().unwrap().to_string_lossy().into_owned()
-}
-
-/// `scan`'s held children under a `parent_debt()` cause.
-fn parent_debt(scan: &SourceScanResult) -> u64 {
-    let causes = parent_causes(scan);
-    causes[CodexParentUnresolvable::ParentHeld.index()]
-        + causes[CodexParentUnresolvable::ParentLossy.index()]
-}
-
-/// One line past `16_777_216` (an image row) appended to `path`:
-/// a terminal over-line-cap loss, so a complete parse of the file records a
-/// terminal disposition and publishes no ledger.
-fn append_oversized_line(path: &Path) {
-    let mut row = b"{\"timestamp\":\"2026-10-07T08:40:01Z\",\"type\":\"response_item\",\
-        \"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\
-        \"image_url\":\""
-        .to_vec();
-    row.extend(std::iter::repeat_n(b'x', 16_777_216 + 1));
-    row.extend_from_slice(b"\"}]}}\n");
-    OpenOptions::new()
-        .append(true)
-        .open(path)
-        .unwrap()
-        .write_all(&row)
-        .unwrap();
-}
-
-/// P-T34's duplicate-copy leg: a lossy P is read once and recorded with a
-/// terminal disposition. Then C (sorted first) and a second rollout named
-/// with P's id appear together. That rollout's header is another session,
-/// so the join inventory (grouped by header id) does not hold P, while the
-/// census (by path id) sees P twice: when C requests P, the skipped P
-/// reaches event (c), whose probe is `Duplicated`, so P is never witnessed
-/// `ParentLossy` (in RAM or in any count). The next match witnesses P
-/// `Duplicated`, C is held under it, and nothing is read again. (Identical
-/// copies are a join `CandidateCopy` refusal before any parse, so they
-/// never reach event (c).)
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn duplicated_large_parent_is_never_witnessed_parent_lossy() {
-    const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
-    let fixture = ScanRoot::with_sessions(&[]);
-    fs::write(fixture.file(PARENT), jsonl(&ForkHome::parent())).unwrap();
-    append_oversized_line(&fixture.file(PARENT));
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    for n in 0..2 {
-        index = fixture_generation(&fixture, &cache, index, n).0;
-    }
-    assert!(
-        !index
-            .terminal_jsonl_dispositions
-            .contains_key(&local_index_key(&fixture.file(PARENT))),
-        "{}",
-        counters(&cache)
-    );
-    let mut second = ForkHome::parent();
-    second[0] = json!({"timestamp": "2026-10-07T08:00:00Z", "type": "session_meta",
-        "payload": {"id": OTHER_HEADER, "thread_source": "user"}});
-    fs::write(rollout_at(&fixture, PARENT, "11"), jsonl(&second)).unwrap();
-    let mut records = vec![json!({"timestamp": "2026-10-07T08:20:00Z",
-        "type": "session_meta",
-        "payload": {"id": CHILD, "forked_from_id": PARENT, "thread_source": "user"}})];
-    records.extend(ForkHome::diverging_child(3));
-    fs::write(rollout_at(&fixture, CHILD, "05"), jsonl(&records)).unwrap();
-    let duplicated = only(CodexParentUnresolvable::Duplicated, 1);
-    let mut held_at = None;
-    let mut history = Vec::new();
-    for n in 2..8 {
-        let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
-        index = next;
-        let witness = witness_of(&cache, "cursor-fixture", PARENT);
-        history.push(format!(
-            "{n}: causes {:?} restarts {:?} parsed {parsed:?} witness {witness:?}",
-            parent_causes(&scan),
-            restarts_in_scope(&scan)
-        ));
-        assert_eq!(
-            parent_causes(&scan)[CodexParentUnresolvable::ParentLossy.index()],
-            0,
-            "{history:#?}"
-        );
-        assert!(
-            !matches!(
-                witness,
-                Some(ParentWitness {
-                    cause: CodexParentUnresolvable::ParentLossy,
-                    ..
-                })
-            ),
-            "{history:#?}"
-        );
-        if held_at.is_some() {
-            assert!(parsed.is_empty(), "{history:#?}");
-            assert_eq!(parent_causes(&scan), duplicated, "{history:#?}");
-        } else if parent_causes(&scan) == duplicated {
-            held_at = Some(n);
-        }
-    }
-    assert!(
-        held_at.is_some_and(|n| n <= 4),
-        "{history:#?}\n{}",
-        counters(&cache)
-    );
-}
-
-const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
-
-/// P-T5b (R2-B1): C -> P -> X with X's ref the 257th, so it never fits. P is
-/// held `DeferredRef` and witnessed `DeferredRef` (settling), and C is held
-/// `DeferredRef` under it: never a `parent_debt()` cause. P is not re-read
-/// every generation: from generation 2 nothing is parsed. P before C (P's
-/// ref already held from an earlier traversal) runs no restart; C before P
-/// runs at most one (C is pending before P's step-map entry exists).
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn deferred_intermediate_parent_is_not_reread_every_generation() {
-    for c_first in [false, true] {
-        let fixture = ScanRoot::with_sessions(&[]);
-        write_rollout(
-            &fixture,
-            PARENT,
-            Some(ABSENT_GRANDPARENT),
-            &ForkHome::parent()[1..],
-        );
-        write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
-        let mut index = ScanIndex::default();
-        for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
-            index
-                .codex_parent_ownership_refs
-                .insert(format!("prefilled-{n:03}"));
-        }
-        if c_first {
-            fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "09")).unwrap();
-        } else {
-            index.codex_parent_ownership_refs.insert(PARENT.to_owned());
-        }
-        let parent = file_name(&fixture.file(PARENT));
-        let cache = Arc::new(SharedCache::default());
-        let mut parent_parses = 0;
-        let mut history = Vec::new();
-        for n in 0..6 {
-            let ((next, scan), parsed) = parses(|| fixture_generation(&fixture, &cache, index, n));
-            index = next;
-            parent_parses += parsed.iter().filter(|name| **name == parent).count();
-            history.push(format!(
-                "{n}: causes {:?} restarts {:?} parsed {parsed:?}",
-                parent_causes(&scan),
-                restarts_in_scope(&scan)
-            ));
-            assert_eq!(parent_debt(&scan), 0, "c_first {c_first}: {history:#?}");
-            assert!(!index
-                .codex_parent_ownership_refs
-                .contains(ABSENT_GRANDPARENT));
-            let restarts = restarts_in_scope(&scan);
-            if c_first {
-                assert!(
-                    restarts.is_some_and(|restarts| restarts <= 1),
-                    "{history:#?}"
-                );
-            } else {
-                assert_eq!(restarts, Some(0), "{history:#?}");
-            }
-            if n >= 2 {
-                assert!(parsed.is_empty(), "c_first {c_first}: {history:#?}");
-                assert_eq!(
-                    parent_causes(&scan),
-                    only(CodexParentUnresolvable::DeferredRef, 2),
-                    "c_first {c_first}: {history:#?}"
-                );
-            }
-        }
-        if c_first {
-            assert!(parent_parses <= 2, "{history:#?}");
-        } else {
-            assert_eq!(parent_parses, 1, "{history:#?}");
-        }
-        let witness = witness_of(&cache, "cursor-fixture", PARENT);
-        assert!(
-            witness
-                .as_ref()
-                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::DeferredRef),
-            "c_first {c_first}: {witness:?}"
-        );
-    }
-}
-
-/// Fix round 6 (control B): C -> P -> X with X's ref never fitting, so C is
-/// held `DeferredRef` under P's step-map witness. C's hold memo ends and its
-/// proof turns `Proven` once C's parser is built (as in control A: no install,
-/// no refusal, the record site sees `Proven`). The witness arm holds C, and
-/// that hold is memoized: from the page after, C is not parsed. (An install
-/// would change nothing here: the witness arm drops a proof unused, so the
-/// record site reads the same no-proof, no-refusal parse.)
-#[test]
-fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::CodexParentProofState;
-    use CodexParentUnresolvable::DeferredRef;
-    let fixture = ScanRoot::with_sessions(&[]);
-    let parent_records = ForkHome::parent()[1..].to_vec();
-    let child_records = ForkHome::diverging_child(2);
-    write_rollout(&fixture, PARENT, Some(ABSENT_GRANDPARENT), &parent_records);
-    write_rollout(&fixture, CHILD, Some(PARENT), &child_records);
-    let mut index = ScanIndex::default();
-    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
-        index
-            .codex_parent_ownership_refs
-            .insert(format!("prefilled-{n:03}"));
-    }
-    index.codex_parent_ownership_refs.insert(PARENT.to_owned());
-    let cache = Arc::new(SharedCache::default());
-    for n in 0..3 {
-        index = fixture_generation(&fixture, &cache, index, n).0;
-    }
-    let (parent, child) = (fixture.file(PARENT), fixture.file(CHILD));
-    cache.memo_forget(&stored_key(&cache, &child).expect("C's hold memo"));
-    let mut key = None;
-    index.traversal = None;
-    let ((index, held), parsed) = parses(|| {
-        page_between(&fixture, index, &cache, &collected_at(3), |scan| {
-            if key.is_none() && active_is(scan, &child) {
-                key = Some(prove_child(
-                    scan,
-                    &cache,
-                    &parent,
-                    &parent_records,
-                    &child,
-                    &child_records,
-                ));
-            }
-        })
-    });
-    let key = key.expect("C's parse spans step calls");
-    assert_eq!(parsed, vec![file_name(&child)], "{}", counters(&cache));
-    assert_eq!(parent_causes(&held), only(DeferredRef, 2));
-    assert!(matches!(
-        index.codex_parent_prefix_proofs.get(&key),
-        Some(CodexParentProofState::Proven(_))
-    ));
-    assert!(stored_key(&cache, &child).is_some(), "{}", counters(&cache));
-    let hits = counter(&cache, |c| c.memo_hits);
-    let ((_, again), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
-    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
-    assert_eq!(parent_causes(&again), only(DeferredRef, 2));
-    assert!(
-        counter(&cache, |c| c.memo_hits) > hits,
-        "{}",
-        counters(&cache)
-    );
-}
-
-const GREAT_GRANDPARENT: &str = "019fa111-2222-7333-8444-222222222222";
-
-/// The settled census of `fixture` from generation `n` on a fresh index and
-/// cache (unspent budget): the cold oracle of a chain.
-fn cold_census(fixture: &ScanRoot, n: u64) -> (Vec<(&'static str, u64)>, BTreeSet<String>) {
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut last = None;
-    for m in n..n + 8 {
-        let (next, scan) = fixture_generation(fixture, &cache, index, m);
-        last = Some(census(&next, &scan));
-        index = next;
-    }
-    last.unwrap()
-}
-
-/// P-T10c (covers P-T10): C -> P -> G -> H in the worst page order (C
-/// first, H last) with the scope's restart budget already spent. No restart
-/// runs; links wait as `DeferredRestart` while the chain converges, never a
-/// `parent_debt()` cause; the chain then settles as a cold scan does.
-#[test]
-fn spent_budget_chain_never_counts_parent_debt_and_converges() {
-    let fixture = ScanRoot::with_sessions(&[]);
-    let root = ForkHome::parent();
-    let grandparent = [
-        root[1].clone(),
-        root[2].clone(),
-        turn_record("2026-10-07T08:20:01Z", "grandparent-own-turn"),
-        usage_record("2026-10-07T08:20:02Z", (130, 100, 14, 3), (30, 20, 4, 1)),
-        turn_record("2026-10-07T08:40:01Z", "grandparent-own-turn-2"),
-        usage_record("2026-10-07T08:40:02Z", (150, 115, 17, 4), (20, 15, 3, 1)),
-    ];
-    let mut parent = grandparent[..4].to_vec();
-    parent.push(turn_record("2026-10-07T08:30:01Z", "parent-own-turn"));
-    parent.push(usage_record(
-        "2026-10-07T08:30:02Z",
-        (145, 110, 16, 3),
-        (15, 10, 2, 0),
-    ));
-    write_rollout(&fixture, GREAT_GRANDPARENT, None, &root[1..]);
-    write_rollout(&fixture, GRANDPARENT, Some(GREAT_GRANDPARENT), &grandparent);
-    write_rollout(&fixture, PARENT, Some(GRANDPARENT), &parent);
-    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
-    for (id, hour) in [
-        (CHILD, "05"),
-        (PARENT, "06"),
-        (GRANDPARENT, "07"),
-        (GREAT_GRANDPARENT, "08"),
-    ] {
-        fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
-    }
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("cursor-fixture".into());
-    let scope = group_scope();
-    for _ in 0..PARENT_RESTART_BUDGET {
-        cache.note_parent_restart(&namespace, &scope);
-    }
-    let mut index = ScanIndex::default();
-    let mut history = Vec::new();
-    let mut previous = None;
-    let mut settled = None;
-    for n in 0..10 {
-        let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-        index = next;
-        history.push(format!(
-            "{n}: causes {:?} restarts {:?}",
-            parent_causes(&scan),
-            restarts_in_scope(&scan)
-        ));
-        assert_eq!(parent_debt(&scan), 0, "{history:#?}");
-        assert_eq!(
-            restarts_in_scope(&scan),
-            Some(PARENT_RESTART_BUDGET),
-            "{history:#?}"
-        );
-        let now = census(&index, &scan);
-        let quiet = parent_causes(&scan) == [0; PARENT_UNRESOLVABLE_CAUSES];
-        if quiet && previous.as_ref() == Some(&now) {
-            settled = Some((n, now));
-            break;
-        }
-        previous = quiet.then_some(now);
-    }
-    let (n, warm) =
-        settled.unwrap_or_else(|| panic!("never settled: {history:#?}\n{}", counters(&cache)));
-    assert_eq!(warm, cold_census(&fixture, n + 1), "{history:#?}");
-}
-
-/// P-T16: a traversal spanning pages. Twelve changed sessions and C
-/// (a fork of absent P, sorted first) are 13 candidates over 10-file pages.
-/// On each steady traversal the step-start match runs once, C's `Absent`
-/// count appears on its page and every later page of the traversal reports
-/// it again (the page-to-traversal fold, traversal-cumulative per page),
-/// P's witness survives every page, and restarts stay within budget.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn multi_page_traversal_folds_parent_causes_and_matches_once() {
-    let fillers = (0..12)
-        .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
-        .collect::<Vec<_>>();
-    let sessions = fillers
-        .iter()
-        .map(|id| (id.as_str(), 2))
-        .collect::<Vec<_>>();
-    let fixture = ScanRoot::with_sessions(&sessions);
-    write_rollout(&fixture, CHILD, Some(PARENT), &ForkHome::diverging_child(2));
-    fs::rename(fixture.file(CHILD), rollout_at(&fixture, CHILD, "05")).unwrap();
-    let absent = only(CodexParentUnresolvable::Absent, 1);
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut page = 0;
-    for traversal in 0..5 {
-        for id in &fillers {
-            fixture.append(id, &token_line(3 + traversal));
-        }
-        let before = crate::snapshots::codex_parent_step_start_matches_for_test();
-        let mut pages = Vec::new();
-        loop {
-            let (next, scan, _) = page_with(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                &collected_at(page),
-                |_| {},
-            );
-            index = next;
-            page += 1;
-            pages.push((
-                parent_causes(&scan),
-                restarts_in_scope(&scan),
-                witness_of(&cache, "cursor-fixture", PARENT).map(|witness| witness.cause),
-            ));
-            if index.traversal.is_none() {
-                break;
-            }
-            assert!(pages.len() < 10, "traversal {traversal}: {pages:?}");
-        }
-        let matches = crate::snapshots::codex_parent_step_start_matches_for_test() - before;
-        for (_, restarts, _) in &pages {
-            assert!(
-                !restarts.is_some_and(|restarts| restarts > PARENT_RESTART_BUDGET),
-                "traversal {traversal}: {pages:?}"
-            );
-        }
-        if traversal < 2 {
-            continue;
-        }
-        assert!(pages.len() >= 2, "traversal {traversal}: {pages:?}");
-        assert_eq!(matches, 1, "traversal {traversal}: {pages:?}");
-        let at = pages
-            .iter()
-            .position(|(causes, ..)| *causes == absent)
-            .unwrap_or_else(|| panic!("traversal {traversal}: {pages:?}"));
-        assert!(at + 1 < pages.len(), "traversal {traversal}: {pages:?}");
-        for (causes, ..) in &pages[..at] {
-            assert_eq!(
-                *causes, [0; PARENT_UNRESOLVABLE_CAUSES],
-                "traversal {traversal}: {pages:?}"
-            );
-        }
-        for (causes, _, witness) in &pages[at..] {
-            assert_eq!(*causes, absent, "traversal {traversal}: {pages:?}");
-            assert_eq!(
-                *witness,
-                Some(CodexParentUnresolvable::Absent),
-                "traversal {traversal}: {pages:?}"
-            );
-        }
-    }
-}
-
-/// P-T18b: P-T18 with P before G on the page. G absent: P is held
-/// `Absent` and witnessed `ParentHeld`, C is held `ParentHeld`. When G
-/// appears, P's re-read finds G not yet read, so P's settling witness is
-/// replaced by a `DeferredRestart` wait record on G (and unwitnessed in the
-/// step map) before P resolves. With P and C both before G, C is never
-/// counted `ParentHeld` after G appears. With C first (`chain_fixture(true)`)
-/// C may keep the conservative `ParentHeld` label until P's actual
-/// dependency-triggered re-read (the general bound; not one traversal by
-/// wall clock). In this fixture that re-read runs on the first such
-/// generation, so C may count `ParentHeld` then, never later. Both settle as
-/// a cold scan.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
-    for c_first in [false, true] {
-        let fixture = chain_fixture(c_first);
-        let grandparent = if c_first {
-            rollout_at(&fixture, GRANDPARENT, "09")
-        } else {
-            for (id, hour) in [(PARENT, "06"), (CHILD, "07")] {
-                fs::rename(fixture.file(id), rollout_at(&fixture, id, hour)).unwrap();
-            }
-            fixture.file(GRANDPARENT)
-        };
-        let away = fixture.root.parent().unwrap().join("grandparent-away");
-        fs::rename(&grandparent, &away).unwrap();
-        let mut held = [0; PARENT_UNRESOLVABLE_CAUSES];
-        held[CodexParentUnresolvable::Absent.index()] = 1;
-        held[CodexParentUnresolvable::ParentHeld.index()] = 1;
-        let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        let mut history = Vec::new();
-        let mut n = 0;
-        loop {
-            let (next, scan) = fixture_generation(&fixture, &cache, index, n);
-            index = next;
-            history.push(format!("{n}: causes {:?}", parent_causes(&scan)));
-            n += 1;
-            if parent_causes(&scan) == held {
-                break;
-            }
-            assert!(n < 6, "c_first {c_first}: {history:#?}");
-        }
-        let witness = witness_of(&cache, "cursor-fixture", PARENT);
-        assert!(
-            witness
-                .as_ref()
-                .is_some_and(|witness| witness.cause == CodexParentUnresolvable::ParentHeld),
-            "c_first {c_first}: {witness:?}"
-        );
-        fs::rename(&away, &grandparent).unwrap();
-        let mut published = Vec::new();
-        let mut censuses = Vec::new();
-        for m in n..n + 6 {
-            let (next, scan) = fixture_generation(&fixture, &cache, index, m);
-            index = next;
-            let witness = witness_of(&cache, "cursor-fixture", PARENT);
-            history.push(format!(
-                "{m}: causes {:?} restarts {:?} witness {witness:?}",
-                parent_causes(&scan),
-                restarts_in_scope(&scan)
-            ));
-            let parent_held = parent_causes(&scan)[CodexParentUnresolvable::ParentHeld.index()];
-            assert!(
-                parent_held == 0 || (c_first && m == n),
-                "c_first {c_first}: {history:#?}"
-            );
-            if m == n {
-                assert!(
-                    witness.as_ref().is_some_and(|witness| witness.cause
-                        == CodexParentUnresolvable::DeferredRestart
-                        && witness.waits_on.as_deref() == Some(GRANDPARENT)),
-                    "c_first {c_first}: {history:#?}\n{}",
-                    counters(&cache)
-                );
-            }
-            published.extend(session_usage(&scan, PARENT));
-            censuses.push(census(&index, &scan));
-        }
-        assert_eq!(
-            witness_of(&cache, "cursor-fixture", PARENT),
-            None,
-            "c_first {c_first}: {history:#?}"
-        );
-        assert_eq!(published, vec![(30, 1)], "c_first {c_first}: {history:#?}");
-        let warm = censuses.pop().unwrap();
-        assert_eq!(Some(&warm), censuses.last(), "c_first {c_first}");
-        assert_eq!(warm, cold_census(&fixture, n + 6), "c_first {c_first}");
-    }
-}
-
-/// P-T23: P's index ledger is admitted and the fork settled;
-/// then a copy of P appears and C changes once. The admitted ledger no
-/// longer validates and does not hide P: C is held `Duplicated` (never
-/// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, _, n) = home.settle(ScanIndex::default(), &cache, 0);
-    assert!(ForkHome::parent_ledger(&index).is_some());
-    fs::copy(
-        home.fixture.file(PARENT),
-        rollout_at(&home.fixture, PARENT, "11"),
-    )
-    .unwrap();
-    home.fixture.append(
-        CHILD,
-        &jsonl(&[usage_record(
-            "2026-10-07T08:20:03Z",
-            (40, 20, 4, 0),
-            (10, 5, 1, 0),
-        )]),
-    );
-    held_then_quiet_from(
-        &home.fixture,
-        &cache,
-        index,
-        n,
-        only(CodexParentUnresolvable::Duplicated, 1),
-        4,
-        CodexParentUnresolvable::ParentLossy,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// U1a-2a cc rows 1–5, 8 and ss-6: the proof holder (dormant until the proof
-// hook; driven directly here).
-
-fn proof_job(namespace: &str, path: &str, incarnation: &str, bytes: usize) -> Box<ProofJob> {
-    Box::new(ProofJob {
-        namespace: namespace.to_owned(),
-        index_path: PathBuf::from(path),
-        incarnation: incarnation.to_owned(),
-        entries: vec![("k".repeat(bytes), 1)],
-        next_row_end: 0,
-        touched_page: 0,
-        readers: None,
-    })
-}
-
-fn proof_charge(job: &ProofJob) -> usize {
-    crate::heap_layout_bound::bound(job, state_bytes()).unwrap()
-}
-
-/// Suspend `job` through a lease, as the proof hook will.
-fn suspend(cache: &Arc<SharedCache>, job: Box<ProofJob>) -> bool {
-    ProofLease::new(cache, job).suspend()
-}
-
-fn proof_drops(counts: crate::local_resource_diagnostics::codex_side_lifecycle::Counts) -> u64 {
-    counts.side_proof_drops
-}
-
-fn next_page(cache: &SharedCache) {
-    next_page_in(cache, "ns");
-}
-
-fn next_page_in(cache: &SharedCache, namespace: &str) {
-    PageBudget::default().note_page(cache, &Scope(namespace.into()));
-}
-
-/// cc rows 1, 5: the hook's claim. Another index's job is busy until it is
-/// `NAMESPACE_STALE_PAGES` cursor pages old, then dropped (counted); this
-/// index's job comes out with its pages touched; the same index under a new
-/// incarnation drops it (counted); a dropped lease loses its job (counted).
-#[test]
-fn proof_take_is_mine_busy_stale_or_mismatched() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let ns_a = Scope("ns-a".to_owned());
-    let ns_b = Scope("ns-b".to_owned());
-    let (a, b) = (Path::new("/idx/a.json"), Path::new("/idx/b.json"));
-    let cache = Arc::new(SharedCache::default());
-    assert!(matches!(
-        cache.proof_take(&ns_a, a, "inc-1"),
-        ProofTake::Free
-    ));
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
-    ));
-    for _ in 0..NAMESPACE_STALE_PAGES - 1 {
-        next_page(&cache);
-        assert!(matches!(
-            cache.proof_take(&ns_b, b, "inc-9"),
-            ProofTake::Busy
-        ));
-    }
-    // The same namespace with another index path is another index.
-    assert!(matches!(
-        cache.proof_take(&ns_a, b, "inc-1"),
-        ProofTake::Busy
-    ));
-    let ProofTake::Mine(mut lease) = cache.proof_take(&ns_a, a, "inc-1") else {
-        panic!("this index's own job");
-    };
-    assert_eq!(lease.job().touched_page, NAMESPACE_STALE_PAGES - 1);
-    assert_eq!(cache.proof_suspended_for_test(), None);
-    assert!(lease.suspend());
-    for _ in 0..NAMESPACE_STALE_PAGES {
-        next_page(&cache);
-    }
-    let (take, counts) = observe(|| cache.proof_take(&ns_b, b, "inc-9"));
-    assert!(matches!(take, ProofTake::Free));
-    assert_eq!(proof_drops(counts), 1, "stale");
-    assert_eq!(cache.proof_suspended_for_test(), None);
-    // A new incarnation of the same index never resumes the old job.
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
-    ));
-    let (take, counts) = observe(|| cache.proof_take(&ns_a, a, "inc-2"));
-    assert!(matches!(take, ProofTake::Free));
-    assert_eq!(proof_drops(counts), 1, "mismatch");
-    assert_eq!(cache.proof_suspended_for_test(), None);
-    // A lease dropped holding its job loses it; `finish` does not count.
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
-    ));
-    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
-        panic!("mine");
-    };
-    let ((), counts) = observe(|| drop(lease));
-    assert_eq!(proof_drops(counts), 1);
-    assert!(suspend(
-        &cache,
-        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
-    ));
-    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
-        panic!("mine");
-    };
-    let ((), counts) = observe(|| lease.finish());
-    assert_eq!(proof_drops(counts), 0);
-    assert_eq!(cache.proof_suspended_for_test(), None);
-}
-
-/// ss-6: the retained insert reserves main's cursor term, so its decision is
-/// the no-proof one; the proof is retired under the same lock exactly when
-/// the kept copy took its room, and the charged state stays within budget.
-#[test]
-fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
-        let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
-        let completed = |copy: crate::transcript_cache::Retained<_>| {
-            sampled_jsonl::CompletedNativeAcquisition {
-                checkpoint: copy.checkpoint,
-                reduction: Some(copy.state),
-                released: None,
-                unsealed: false,
-            }
-        };
-        let copy = cache.take(&key).expect("a certified copy").retained;
-        cache.insert(key.clone(), completed(copy), 0);
-        let with_copy = admission_floor(&cache);
-        let state = cache.cursor_resident();
-        let copy = cache.take(&key).expect("retained").retained;
-        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
-        let proof = proof_charge(&job);
-        // Room for the copy and the proof exactly: both stay.
-        let claim = state_bytes() - state - with_copy - proof;
-        let credit = cache.cursor_reserve(claim).expect("fits alone");
-        assert!(suspend(&cache, job));
-        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
-        assert!(cache.retained_checkpoint(&key).is_some());
-        assert!(cache.proof_suspended_for_test().is_some());
-        assert_eq!(proof_drops(counts), 0);
-        assert_eq!(
-            admission_floor(&cache) + cache.cursor_resident(),
-            state_bytes()
-        );
-        credit.refund();
-        let copy = cache.take(&key).expect("retained").retained;
-        assert!(matches!(
-            cache.proof_take(&Scope("ns-a".to_owned()), Path::new("/idx/a.json"), "inc-1"),
-            ProofTake::Mine(_)
-        ));
-        // One byte more claimed: the copy still fits beside main's state, so
-        // it is kept as with no proof, and the proof is retired.
-        let credit = cache.cursor_reserve(claim + 1).expect("fits alone");
-        assert!(suspend(
-            &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", 4096)
-        ));
-        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
-        assert!(
-            cache.retained_checkpoint(&key).is_some(),
-            "the no-proof decision"
-        );
-        assert_eq!(cache.proof_suspended_for_test(), None);
-        assert_eq!(proof_drops(counts), 1);
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -9538,7 +6873,7 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
     let cache = Arc::new(SharedCache::default());
     let credit = cache
         .cursor_reserve(
-            state_bytes() - admission_floor(&cache) - cache.cursor_resident() - 128 * 1024,
+            state_bytes() - retained_floor(&cache) - cache.cursor_resident() - 128 * 1024,
         )
         .unwrap();
     let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
@@ -9561,20 +6896,6 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
         .unwrap());
     let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
     assert_eq!((refreshed.reuse_misses, refreshed.reuse_evictions), (2, 2));
-    let job = proof_job("header-proof", "/idx/header-proof.json", "inc-1", 4096);
-    assert!(suspend(&cache, job));
-    cache.retire_headers_over_room(bytes);
-    assert!(cache
-        .with_cursor(|cursor| cursor.headers.is_empty())
-        .unwrap());
-    assert!(
-        cache.proof_suspended_for_test().is_some(),
-        "header pressure must preserve proof authority"
-    );
-    cache.retire_proof_over_room(0);
-    assert!(cache.proof_suspended_for_test().is_none());
-    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-    assert_eq!(refreshed.reuse_evictions, 2);
     let context = zero_context(&cache, "ns-main");
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
     assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
@@ -9593,7 +6914,7 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
         bytes,
         "measurement alone cannot evict"
     );
-    super::super::retire_proof_beside_copy(Some(&context), budget, step);
+    super::super::retire_headers_beside_copy(Some(&context), budget, step);
     assert!(cache
         .with_cursor(|cursor| cursor.headers.is_empty())
         .unwrap());
@@ -9640,8 +6961,7 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
                 .unwrap(),
             before
         );
-        let pinned =
-            state_bytes() - cache.cursor_resident_for_main() + before - retained_floor(&cache);
+        let pinned = state_bytes() - cache.cursor_resident() + before - retained_floor(&cache);
         assert!(release(pinned));
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
@@ -9682,82 +7002,35 @@ pub(in crate::snapshots) fn zero_context(
     }
 }
 
-/// R2-B3: main's copy budget is measured as if no proof existed. With and
-/// without a suspended proof that fits free room, main gets the same copy
-/// budget and resident measure (the proof keeps its slot: nothing was
-/// spent yet); the insert that needs the proof's room then retires it and
-/// keeps the copy (ss-6).
-#[test]
-fn a_suspended_proof_never_shrinks_mains_copy_budget() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
-        let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
-        let completed = |copy: crate::transcript_cache::Retained<_>| {
-            sampled_jsonl::CompletedNativeAcquisition {
-                checkpoint: copy.checkpoint,
-                reduction: Some(copy.state),
-                released: None,
-                unsealed: false,
-            }
-        };
-        let copy = cache.take(&key).expect("a certified copy").retained;
-        cache.insert(key.clone(), completed(copy), 0);
-        let with_copy = admission_floor(&cache);
-        let state = cache.cursor_resident();
-        let copy = cache.take(&key).expect("retained").retained;
-        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
-        let proof = proof_charge(&job);
-        let context = zero_context(&cache, "ns-main");
-        let budget = || super::super::copy_budget_step(Some(&context), None, false);
-        let (without, measured_without) = budget();
-        assert!(without > proof, "precondition: a visible difference");
-        assert!(suspend(&cache, job));
-        let (with, measured_with) = budget();
-        assert_eq!(with, without, "parity");
-        assert_eq!(measured_with.resident, measured_without.resident);
-        assert!(cache.proof_suspended_for_test().is_some());
-        // One byte short of room for both: the copy needs the proof's room.
-        let claim = state_bytes() - state - with_copy - proof + 1;
-        let credit = cache.cursor_reserve(claim).expect("fits beside the proof");
-        assert!(cache.proof_suspended_for_test().is_some());
-        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
-        assert!(
-            cache.retained_checkpoint(&key).is_some(),
-            "the copy is kept"
-        );
-        assert_eq!(cache.proof_suspended_for_test(), None);
-        assert_eq!(proof_drops(counts), 1);
-        assert!(admission_floor(&cache) + cache.cursor_resident() <= state_bytes());
-        credit.refund();
-    });
+/// Optional header bytes with a precise measured charge. Uses the real
+/// header decoder; only the cache key's allocation supplies synthetic pressure.
+fn header_pressure(cache: &SharedCache, bytes: usize) -> usize {
+    let (root, fixture) = codex_file_join::tests::fixture();
+    let paths = fixture
+        .headers
+        .iter()
+        .map(|h| local_index_key(&h.candidate.path))
+        .collect();
+    assert!(codex_file_join::header_cache_tests::page(&root, &paths, cache).complete);
+    let facts = cache
+        .with_cursor(|cursor| cursor.headers.get(paths.first().unwrap()))
+        .flatten()
+        .unwrap();
+    let charge = cache
+        .with_cursor(|cursor| {
+            cursor.headers.clear();
+            cursor.headers.refresh("h".repeat(bytes), Some(facts));
+            cursor.headers.optional_bytes().unwrap()
+        })
+        .unwrap();
+    fs::remove_dir_all(root).unwrap();
+    charge
 }
 
-/// Main's copy
-/// budget funds two shares, so where it is allocated against
-/// (`retire_proof_beside_copy`) a suspended proof over `room - budget -
-/// min(budget, ENTRY_BYTES)` is retired, even one the finish/output share
-/// alone leaves room for (`room - budget - 1`); then `bound(context)` +
-/// copy + finish/output fit `state_bytes()`. `copy_budget_step` itself retires nothing, and nothing is
-/// retired where no copy is allocated (budget 0, as an unknown room gives):
-/// no drop on unavailable inputs. The retired job keeps only its `seq`s.
+/// [behaviour] Both copy shares fit only after optional headers yield;
+/// zero-budget and unavailable measurements reclaim nothing.
 #[test]
-fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+fn headers_are_reclaimed_only_where_both_copy_shares_are_allocated() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -9767,64 +7040,45 @@ fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
     let (without, measured) = budget();
     let room = measured.room().expect("a measured room");
     assert_eq!(without, room / 2);
-    // Kept by the copy's share alone, over both shares.
-    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
-    let job = proof_job("ns-a", "/idx/a.json", "inc-1", room - without - 1 - fixed);
-    let charge = proof_charge(&job);
-    assert!(
-        charge > room - without - without.min(ENTRY_BYTES) && charge < room - without,
-        "{charge}"
-    );
-    assert!(suspend(&cache, job), "fits the free room alone");
-    let ((with, step), counts) = observe(budget);
+    let charge = header_pressure(&cache, room - without - 4096);
+    assert!(charge > room - without - without.min(ENTRY_BYTES) && charge < room - without);
+    let (with, step) = budget();
     assert_eq!(with, without, "the budget is unchanged");
     assert_eq!(step.room(), Some(room));
-    assert!(
-        cache.proof_suspended_for_test().is_some(),
-        "no retire at the step"
+    assert_eq!(
+        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
+        Some(charge)
     );
-    assert_eq!(proof_drops(counts), 0);
-    // No copy allocated: nothing retired.
-    let ((), counts) = observe(|| super::super::retire_proof_beside_copy(Some(&context), 0, step));
-    assert!(cache.proof_suspended_for_test().is_some());
-    assert_eq!(proof_drops(counts), 0);
-    // A busy cache: an unknown room and budget 0; the proof is kept.
+    super::super::retire_headers_beside_copy(Some(&context), 0, step);
+    assert_eq!(
+        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
+        Some(charge)
+    );
     let busy = {
         let _held = cache.retained().unwrap();
         budget()
     };
     assert_eq!((busy.0, busy.1.room()), (0, None));
-    let ((), counts) =
-        observe(|| super::super::retire_proof_beside_copy(Some(&context), busy.0, busy.1));
-    assert!(cache.proof_suspended_for_test().is_some());
-    assert_eq!(proof_drops(counts), 0);
-    // The allocation: retired first, and both shares fit beside the rest.
+    super::super::retire_headers_beside_copy(Some(&context), busy.0, busy.1);
+    assert_eq!(
+        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
+        Some(charge)
+    );
     super::super::copy_retire_probe();
-    let ((), counts) =
-        observe(|| super::super::retire_proof_beside_copy(Some(&context), with, step));
-    assert_eq!(cache.proof_suspended_for_test(), None, "retired first");
-    assert_eq!(proof_drops(counts), 1);
+    super::super::retire_headers_beside_copy(Some(&context), with, step);
+    assert!(cache.with_cursor(|c| c.headers.is_empty()).unwrap());
     let probe = super::super::copy_retire_probe().expect("probed");
-    assert_eq!((probe.proof, probe.used, probe.budget), (Some(0), 0, with));
+    assert_eq!(
+        (probe.headers, probe.used, probe.budget),
+        (Some(0), 0, with)
+    );
     assert!(probe.fits(), "{probe:?}");
-    let scope = Scope("ns-a".to_owned());
-    let index = std::path::Path::new("/idx/a.json");
-    assert_eq!(cache.take_retired_proof_seqs(&scope, index, "inc-1"), [1]);
-    assert!(cache
-        .take_retired_proof_seqs(&scope, index, "inc-1")
-        .is_empty());
-    // Nothing of the retired job stays charged.
     assert_eq!(budget().1.resident, measured.resident);
 }
 
-/// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
-/// nothing keep a suspended proof of a third of the state budget; the page
-/// whose completion retains the certified copy retires it before the clone:
-/// the walk's resident + the proof left there (none) + the active + both
-/// shares fit `state_bytes()`.
+/// [behaviour] A completing cursor job stages its head without a RAM copy.
 #[test]
-fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+fn a_completing_cursor_job_on_its_route_stages_its_head_without_a_copy() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -9834,44 +7088,100 @@ fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        assert!(suspend(
-            &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", state_bytes() / 3)
-        ));
         super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
         let mut certified = false;
         for _ in 0..64 {
-            let ((next, _, _), counts) =
-                observe(|| page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture"));
+            let on_route = routed(index, &cache);
+            let (next, _, _) = page_in(
+                &fixture,
+                on_route,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            );
             index = next;
             if counter(&cache, |c| c.jobs_certified) == 1 {
-                assert_eq!(cache.proof_suspended_for_test(), None);
-                assert_eq!(proof_drops(counts), 1);
                 certified = true;
                 break;
             }
-            assert!(
-                cache.proof_suspended_for_test().is_some(),
-                "a page with no clone keeps the proof"
-            );
         }
         assert!(certified, "precondition: the job certified");
-        assert!(cache.take(&key).is_some(), "the certified copy is retained");
-        let probe = super::super::copy_retire_probe().expect("probed");
-        assert!(probe.budget > 0);
-        assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
-        assert!(probe.fits(), "{probe:?}");
+        assert!(
+            head(&index, &key).is_some(),
+            "the certified prefix is staged"
+        );
+        assert!(
+            cache.take(&key).is_none(),
+            "a codec source keeps no RAM copy"
+        );
+        assert!(
+            super::super::copy_retire_probe().is_none(),
+            "no copy budget is reserved for a copy that is never kept"
+        );
     });
 }
 
-/// Fix round 3 (DM3(2)): with a room whose budget is over `ENTRY_BYTES`,
-/// the copy's share is the 8 MiB cap, so a suspended proof that fits
-/// beside both shares (`room - budget - ENTRY_BYTES`) is kept where main
-/// allocates, and the whole still fits `state_bytes()` at the clone.
+/// A codec source keeps no RAM copy, so the page budget sizes an append to a
+/// routed file from its committed head's sealed offset: a small append to a
+/// file larger than the singleton budget is a singleton Tail of the append,
+/// never a cursor job over the whole file.
 #[test]
-fn a_proof_beside_a_capped_copy_share_is_kept() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+fn a_small_append_to_a_routed_large_file_is_budgeted_as_the_append() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    // Room for the whole file: one singleton Full, committed as the head.
+    let index = with_test_limits(1 << 20, 1 << 20, 64, || {
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(ScanIndex::default(), &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
+        assert_eq!(modes, (1, 0), "precondition: a singleton Full");
+        assert!(!scan.snapshots.is_empty());
+        next
+    });
+    let committed = head(&index, &key)
+        .expect("precondition: the Full's head")
+        .sealed_offset;
+    assert_eq!(committed, fixture.len(SESSION));
+    assert!(
+        cache.take(&key).is_none(),
+        "precondition: no RAM copy to size from"
+    );
+    fixture.append(SESSION, &token_line(41));
+    let append = fixture.len(SESSION) - committed;
+    // The file is now over the singleton budget; its append is not.
+    let singleton = committed;
+    assert!(append < singleton && fixture.len(SESSION) > singleton);
+    with_test_limits(2048, singleton, 64, || {
+        let (next, scan, modes) = page_in(
+            &fixture,
+            routed(index, &cache),
+            Some(Arc::clone(&cache)),
+            "cursor-fixture",
+        );
+        assert_eq!(
+            modes,
+            (0, 1),
+            "a singleton Tail of the append: {}",
+            counters(&cache)
+        );
+        assert_eq!(counter(&cache, |c| c.jobs_started), 0, "never a cursor job");
+        assert!(!scan.snapshots.is_empty());
+        let tailed = head(&next, &key).expect("the Tail's head");
+        assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
+    });
+}
+
+/// [behaviour] The copy share is capped at ENTRY_BYTES. Headers that fit
+/// beside that share and finish/output remain present at the clone.
+#[test]
+fn headers_beside_a_capped_copy_share_are_kept() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -9880,93 +7190,48 @@ fn a_proof_beside_a_capped_copy_share_is_kept() {
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
     let room = step.room().expect("a measured room");
     assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
-    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
-    let job = proof_job(
-        "ns-a",
-        "/idx/a.json",
-        "inc-1",
-        room - budget - ENTRY_BYTES - fixed - 4096,
-    );
-    let charge = proof_charge(&job);
+    let charge = header_pressure(&cache, room - budget - ENTRY_BYTES - 4096);
     assert!(charge < room - budget - ENTRY_BYTES, "{charge}");
     assert!(
         charge > room - 2 * budget,
-        "fix round 2 retired it: {charge}"
+        "uncapped shares would reclaim it: {charge}"
     );
-    assert!(suspend(&cache, job));
     super::super::copy_retire_probe();
-    let ((), counts) =
-        observe(|| super::super::retire_proof_beside_copy(Some(&context), budget, step));
-    assert!(cache.proof_suspended_for_test().is_some(), "kept");
-    assert_eq!(proof_drops(counts), 0);
+    super::super::retire_headers_beside_copy(Some(&context), budget, step);
+    assert_eq!(
+        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
+        Some(charge)
+    );
     let probe = super::super::copy_retire_probe().expect("probed");
     assert!(
-        probe.proof.is_some_and(|proof| proof >= charge),
+        probe.headers.is_some_and(|headers| headers >= charge),
         "{probe:?}"
     );
     assert!(probe.fits(), "{probe:?}");
 }
 
-/// Fix round 3 (DM3, DL3), the completion site of an ordinary (not cursor)
-/// singleton read: it retains its copy with a budget over `ENTRY_BYTES`,
-/// and retires a suspended proof only over what both shares leave of the
-/// room: a third of the state budget is retired before the clone; one that
-/// fits beside the finish/output share and the 8 MiB-capped copy is kept.
-/// Either way the whole fits `state_bytes()` at the clone.
+/// [behaviour] An ordinary singleton completion retains its copy using
+/// both budgeted shares; the pre-clone measurement covers optional headers.
 #[test]
-fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+fn an_ordinary_completion_funds_both_copy_shares() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let room = {
-        let cache = Arc::new(SharedCache::default());
-        let context = zero_context(&cache, "ns-main");
-        let (_, step) = super::super::copy_budget_step(Some(&context), None, false);
-        step.room().expect("a measured room")
-    };
-    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
-    assert!(room / 2 > ENTRY_BYTES + (2 << 20), "precondition: {room}");
-    let beside = room / 2 - ENTRY_BYTES - (1 << 20) - fixed;
-    for (bytes, retired) in [(state_bytes() / 3, true), (beside, false)] {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
-        let cache = Arc::new(SharedCache::default());
-        assert!(suspend(
-            &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", bytes)
-        ));
-        super::super::copy_retire_probe();
-        let (_, counts) = observe(|| {
-            page_in(
-                &fixture,
-                ScanIndex::default(),
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-            )
-        });
-        assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
-        assert!(cache.take(&key).is_some(), "the copy is retained");
-        let probe = super::super::copy_retire_probe().expect("probed");
-        assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
-        assert!(probe.fits(), "{probe:?}");
-        assert_eq!(cache.proof_suspended_for_test().is_none(), retired);
-        assert_eq!(proof_drops(counts), u64::from(retired));
-        if retired {
-            assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
-        } else {
-            assert!(probe.proof.is_some_and(|proof| proof >= bytes), "{probe:?}");
-        }
-    }
+    let pi = PiRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    super::super::copy_retire_probe();
+    retain_fixture_copy(&pi, &cache);
+    assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
+    assert!(cache.take(&pi.key()).is_some(), "the copy is retained");
+    let probe = super::super::copy_retire_probe().expect("probed");
+    assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
+    assert!(probe.fits(), "{probe:?}");
 }
 
-/// Fix round 3 (DM3(1)): a completion that cannot retain a copy (an
-/// incomplete sidecar census: the cursor job publishes unverified, with no
-/// certificate) passes no copy budget, so a suspended proof of a third of
-/// the state budget is kept through every page, its completion included.
+/// [behaviour] An incomplete sidecar census retains no copy and passes
+/// no budget, so no pre-clone reclamation runs, including on completion.
 #[test]
-fn a_completion_that_retains_no_copy_keeps_the_proof() {
-    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+fn a_completion_that_retains_no_copy_runs_no_budgeted_reclamation() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -9977,26 +7242,18 @@ fn a_completion_that_retains_no_copy_keeps_the_proof() {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        assert!(suspend(
-            &cache,
-            proof_job("ns-a", "/idx/a.json", "inc-1", state_bytes() / 3)
-        ));
         super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
         for _ in 0..64 {
-            let ((next, _, _), counts) = observe(|| {
-                page_with(
-                    &fixture,
-                    index,
-                    Some(Arc::clone(&cache)),
-                    "cursor-fixture",
-                    NOW,
-                    incomplete,
-                )
-            });
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                incomplete,
+            );
             index = next;
-            assert_eq!(proof_drops(counts), 0);
-            assert!(cache.proof_suspended_for_test().is_some(), "kept");
             if counter(&cache, |c| c.jobs_certified) == 1 {
                 break;
             }
@@ -10016,47 +7273,29 @@ fn a_completion_that_retains_no_copy_keeps_the_proof() {
 }
 
 // ---------------------------------------------------------------------------
-// The release to fit measures main's cursor state (no
-// suspended proof) and retires the proof first, under the same locks.
+// Release-to-fit measures main state under the existing lock order.
 
-type SideCounts = crate::local_resource_diagnostics::codex_side_lifecycle::Counts;
 type CacheCounts = crate::local_resource_diagnostics::cache_lifecycle::Counts;
 
-/// The `FILLERS` filled shared cache (`cache_policy_tests::filled_cache`),
-/// with a suspended proof when `proof`, and its measures.
+/// The `FILLERS` filled shared cache and its release measures.
 struct ReleaseScene {
     cache: Arc<SharedCache>,
-    /// Main's cursor state (`cursor_resident_for_main`).
+    /// The whole cursor state.
     main: usize,
     /// The retained copies' bound.
     resident: usize,
     /// One filler's charge.
     filler: usize,
-    /// The proof's charge (suspended only when `proof`).
-    proof: usize,
 }
 impl ReleaseScene {
-    fn new(proof: bool) -> Self {
+    fn new() -> Self {
         let (cache, filler) = crate::snapshots::cache_policy_tests::filled_cache();
-        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
-        let charge = proof_charge(&job);
-        if proof {
-            assert!(
-                suspend(&cache, job),
-                "precondition: the proof fits beside the fillers"
-            );
-        }
-        let main = cache.cursor_resident_for_main();
-        assert_eq!(
-            cache.cursor_resident(),
-            main + if proof { charge } else { 0 }
-        );
+        let main = cache.cursor_resident();
         Self {
             resident: retained_floor(&cache),
             cache,
             main,
             filler,
-            proof: charge,
         }
     }
     /// The `pinned` at which the copies fit exactly beside main's state.
@@ -10071,26 +7310,18 @@ impl ReleaseScene {
         state_bytes() - self.main - floor + 1
     }
     /// The release (`release_to_fit`) or Path A (`release_older_to_fit`)
-    /// at `rank`, observing both counter sets.
-    fn release(
-        &self,
-        pinned: usize,
-        path_a: Option<(i64, i64)>,
-    ) -> (bool, SideCounts, CacheCounts) {
-        let ((released, side), counts) =
-            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| match path_a {
-                    Some(rank) => self.cache.release_older_to_fit(pinned, rank),
-                    None => self.cache.release_to_fit(pinned),
-                })
-            });
-        (released, side, counts)
+    /// at `rank`, observing cache lifecycle counters.
+    fn release(&self, pinned: usize, path_a: Option<(i64, i64)>) -> (bool, CacheCounts) {
+        crate::local_resource_diagnostics::cache_lifecycle::observe(|| match path_a {
+            Some(rank) => self.cache.release_older_to_fit(pinned, rank),
+            None => self.cache.release_to_fit(pinned),
+        })
     }
     fn fillers(&self) -> usize {
         crate::snapshots::cache_policy_tests::fillers_resident(&self.cache)
     }
     /// What the release charged, all of it: the copies, the whole cursor
-    /// state (any proof left included) and `pinned`.
+    /// state and `pinned`.
     fn charged(&self, pinned: usize) -> usize {
         retained_floor(&self.cache) + self.cache.cursor_resident() + pinned
     }
@@ -10107,116 +7338,8 @@ fn evicted(counts: &CacheCounts) -> (u64, u64, u64) {
 const NONE_OLDER: (i64, i64) = (0, 0);
 const ALL_OLDER: (i64, i64) = (i64::MAX, 0);
 
-/// Over budget only beside a suspended proof. `release_to_fit`
-/// retires the proof first, counted under its own cause, and evicts no
-/// copy; with room for both, the proof stays. One retained lock, then one
-/// cursor critical section: the proof's box is freed under them (a
-/// `ProofJob` and its readers have no `Drop` that locks), a relock would
-/// trip the `retained` and `with_cursor` debug guards, and both locks are
-/// free and unpoisoned after.
-#[test]
-fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests::FILLERS;
-    let scene = ReleaseScene::new(true);
-    let pinned = scene.exact() - scene.proof;
-    let (released, side, counts) = scene.release(pinned, None);
-    assert!(released);
-    assert!(scene.cache.proof_suspended_for_test().is_some());
-    assert_eq!(side, SideCounts::default());
-    assert_eq!(evicted(&counts), (0, 0, 0));
-    assert_eq!(scene.charged(pinned), state_bytes());
-    // One byte more: the proof goes, and no copy does.
-    let (released, side, counts) = scene.release(pinned + 1, None);
-    assert!(released);
-    assert_eq!(scene.cache.proof_suspended_for_test(), None);
-    assert_eq!(
-        (side.side_proof_release_drops, side.side_proof_drops),
-        (1, 0)
-    );
-    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
-    assert_eq!(scene.fillers(), FILLERS);
-    assert_eq!(scene.cache.cursor_resident(), scene.main);
-    assert!(scene.charged(pinned + 1) <= state_bytes());
-    // (d) Nothing is held, locked or poisoned after the drop.
-    assert!(!cursor_held());
-    assert!(scene.cache.inner.try_lock().is_ok());
-    assert!(scene.cache.cursor.try_lock().is_ok());
-    assert_eq!(scene.cache.cursor_reserved(), 0);
-}
-
-/// Path A likewise, with no copy ranked older than the tail: an
-/// overflow the proof covers retires the proof and evicts nothing; one past
-/// it cannot fit, so nothing goes, the proof included (fit-or-nothing).
-#[test]
-fn release_older_to_fit_retires_the_proof_only_where_path_a_fits() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests::FILLERS;
-    let scene = ReleaseScene::new(true);
-    let (released, side, counts) = scene.release(scene.exact() + 1, Some(NONE_OLDER));
-    assert!(!released);
-    assert!(scene.cache.proof_suspended_for_test().is_some());
-    assert_eq!(side, SideCounts::default());
-    assert_eq!(evicted(&counts), (0, 0, 0));
-    let pinned = scene.exact() - scene.proof + 1;
-    let (released, side, counts) = scene.release(pinned, Some(NONE_OLDER));
-    assert!(released);
-    assert_eq!(scene.cache.proof_suspended_for_test(), None);
-    assert_eq!(
-        (side.side_proof_release_drops, side.side_proof_drops),
-        (1, 0)
-    );
-    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
-    assert_eq!(scene.fillers(), FILLERS);
-    assert!(scene.charged(pinned) <= state_bytes());
-}
-
-/// No-proof parity: an overflow past the proof retires the
-/// proof first, then evicts in victim order only what main's room still
-/// needs, exactly what the same release evicts with no proof (one copy),
-/// for `release_to_fit` and for Path A with every copy ranked older.
-#[test]
-fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests::FILLERS;
-    for path_a in [None, Some(ALL_OLDER)] {
-        let mut outcomes = Vec::new();
-        for proof in [true, false] {
-            let scene = ReleaseScene::new(proof);
-            assert!(scene.proof < scene.filler / 2, "precondition");
-            let pinned = scene.exact() + scene.filler / 2;
-            let (released, side, counts) = scene.release(pinned, path_a);
-            assert!(released, "{path_a:?} proof={proof}");
-            assert_eq!(scene.cache.proof_suspended_for_test(), None);
-            assert_eq!(
-                (side.side_proof_release_drops, side.side_proof_drops),
-                (u64::from(proof), 0)
-            );
-            assert!(scene.charged(pinned) <= state_bytes());
-            outcomes.push((
-                counts.copy_refusal_entries_evicted,
-                counts.copy_refusal_admission_evicted,
-                scene.fillers(),
-            ));
-        }
-        assert_eq!(outcomes[0], outcomes[1], "the no-proof decision");
-        let one = if path_a.is_some() { (0, 1) } else { (1, 0) };
-        assert_eq!(outcomes[0], (one.0, one.1, FILLERS - 1), "{path_a:?}");
-    }
-}
-
-/// No-proof parity and the charge bound: with no proof, main's measure
-/// is the whole cursor state, so the existing limit is unchanged. `pinned` carries
-/// the side ledger's fixed charge once and nothing adds it again: copies
-/// fitting exactly beside main's state and `pinned` evict nothing (as the
-/// cursor admission floor agrees, F4b), one byte more evicts one copy, an
-/// unreachable fit evicts nothing. No proof drop is counted.
+/// [behaviour] Main's release preserves the exact-fit, ranked victim,
+/// unreachable-fit and charge-bound assertions without optional holders.
 #[test]
 fn with_no_proof_the_release_is_m1s() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -10224,15 +7347,12 @@ fn with_no_proof_the_release_is_m1s() {
     }
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     use crate::snapshots::cache_policy_tests::FILLERS;
-    use crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
-    let scene = ReleaseScene::new(false);
+
+    let scene = ReleaseScene::new();
     assert_eq!(scene.cache.cursor_resident(), scene.main);
     let exact = scene.exact();
-    assert!(exact > SIDE_LEDGER_BYTES, "precondition");
-    let (credit, counts) = observe(|| scene.cache.cursor_reserve(exact - SIDE_LEDGER_BYTES));
-    credit
-        .expect("F4b: the cursor admission floor agrees")
-        .refund();
+    let (credit, counts) = observe(|| scene.cache.cursor_reserve(exact));
+    credit.expect("the cursor admission floor agrees").refund();
     assert_eq!(counts.cursor_reservation_entries_evicted, 0);
     for path_a in [Some(NONE_OLDER), None] {
         for (pinned, fits) in [
@@ -10240,54 +7360,57 @@ fn with_no_proof_the_release_is_m1s() {
             (scene.unreachable(), false),
             (usize::MAX, false),
         ] {
-            let (released, side, counts) = scene.release(pinned, path_a);
+            let (released, counts) = scene.release(pinned, path_a);
             assert_eq!(released, fits, "{path_a:?} {pinned}");
-            assert_eq!(side, SideCounts::default());
+
             assert_eq!(evicted(&counts), (0, 0, 0));
             assert_eq!(scene.fillers(), FILLERS);
         }
     }
-    let (released, side, counts) = scene.release(exact + 1, Some(NONE_OLDER));
+    let (released, counts) = scene.release(exact + 1, Some(NONE_OLDER));
     assert!(!released, "nothing older: Path A fits or evicts nothing");
-    assert_eq!((side, evicted(&counts)), (SideCounts::default(), (0, 0, 0)));
-    let (released, side, counts) = scene.release(exact + 1, None);
+    assert_eq!(evicted(&counts), (0, 0, 0));
+    let (released, counts) = scene.release(exact + 1, None);
     assert!(released);
-    assert_eq!(side, SideCounts::default());
+
     assert_eq!(counts.copy_refusal_entries_evicted, 1);
     assert_eq!(scene.fillers(), FILLERS - 1);
     assert!(scene.charged(exact + 1) <= state_bytes());
+    assert!(!cursor_held());
+    assert!(scene.cache.inner.try_lock().is_ok());
+    assert!(scene.cache.cursor.try_lock().is_ok());
+    assert_eq!(scene.cache.cursor_reserved(), 0);
 }
 
-/// A release that cannot measure keeps its refusal and drops no
-/// proof: an unreachable fit, a `pinned` past the budget, unsupported
-/// (overflowing) cursor accounting, a poisoned cursor lock. No copy goes.
+/// [behaviour] An unavailable measurement keeps the refusal and evicts
+/// no copy: unreachable fit, overflow, or poisoned cursor lock.
 #[test]
-fn a_release_without_a_measure_drops_no_proof() {
+fn a_release_without_a_measure_evicts_nothing() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     use crate::snapshots::cache_policy_tests::FILLERS;
-    let scene = ReleaseScene::new(true);
+    let scene = ReleaseScene::new();
     let overflow = scene.exact() + scene.filler / 2;
     let refuses = |pinned: usize, label: &str| {
         for path_a in [None, Some(ALL_OLDER)] {
-            let (released, side, counts) = scene.release(pinned, path_a);
+            let (released, counts) = scene.release(pinned, path_a);
             assert!(!released, "{label} {path_a:?}");
-            assert_eq!(side, SideCounts::default(), "{label}");
+
             assert_eq!(evicted(&counts), (0, 0, 0), "{label}");
             assert_eq!(scene.fillers(), FILLERS, "{label}");
         }
     };
     refuses(scene.unreachable(), "unreachable");
     refuses(usize::MAX, "past the budget");
-    assert!(scene.cache.proof_suspended_for_test().is_some());
+
     scene
         .cache
         .with_cursor(|cursor| cursor.reserved = usize::MAX);
     refuses(overflow, "unsupported accounting");
     scene.cache.with_cursor(|cursor| cursor.reserved = 0);
-    assert!(scene.cache.proof_suspended_for_test().is_some());
+
     let unwound = catch_unwind(AssertUnwindSafe(|| {
         scene.cache.with_cursor(|_| panic!("poison the cursor"));
     }));
@@ -10386,8 +7509,8 @@ fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex,
 
 /// §7 D: a continuation page selects only the paused job's pending paths:
 /// it resumes the job and leaves every other pending path queued and
-/// unread. It never plans or starts an attempt (`jobs_started`,
-/// `groups_started` unchanged) and pages the job to its one completion,
+/// unread. It never plans or starts an attempt and pages the job to its
+/// one completion without a group replay,
 /// with the unpaged read's output.
 #[test]
 fn continuation_selects_only_job_paths_and_never_starts_attempts() {
@@ -10398,6 +7521,14 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
     let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
     let other = fixture.file(SESSION_B);
     let cache = Arc::new(SharedCache::default());
+    let group_replays = || {
+        use crate::snapshots::tail_source::counters::total;
+        (
+            total("tail_reconstruct", "group_replay"),
+            total("tail_reconstruct_bytes", "group_replay"),
+        )
+    };
+    let before = group_replays();
     with_test_limits(2048, 1024, 64, || {
         let (mut index, _) = paused_singleton(&fixture, &cache);
         // SESSION_B was read as a singleton; queue it again as a fresh
@@ -10422,7 +7553,6 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
         };
         let other_entry = entry(&index);
         let started = counter(&cache, |c| c.jobs_started);
-        let groups = counter(&cache, |c| c.groups_started);
         let mut published = None;
         for _ in 0..64 {
             let resumed = counter(&cache, |c| c.jobs_resumed);
@@ -10430,7 +7560,7 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
             index = next;
             assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             assert_eq!(counter(&cache, |c| c.jobs_started), started);
-            assert_eq!(counter(&cache, |c| c.groups_started), groups);
+            assert_eq!(group_replays(), before, "no group replay on continuation");
             assert!(pending_hint(&index, &other).is_some(), "still queued");
             assert_eq!(entry(&index), other_entry, "never read");
             assert!(
@@ -10447,6 +7577,11 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
         }
         let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
         assert!(cache.cursor_slot_free());
+        assert_eq!(
+            group_replays(),
+            before,
+            "no group replay on ordinary finish"
+        );
         // Only the job's file publishes, as the unpaged read does.
         let unpaged = fingerprints(&unpaged);
         let published = fingerprints(&published);
@@ -10459,7 +7594,7 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
 
 /// §7 D (N3): group preparation on a continuation page. The paused group's
 /// job stays parked: continuation refuses it before stepping or applying EOF.
-/// `groups_started` stays one until the ordinary pass completes the group.
+/// The ordinary pass continues the same group to completion.
 #[test]
 fn continuation_prepares_no_group_attempt() {
     use crate::snapshots::codex_file_join::tests::usage;
@@ -10520,6 +7655,17 @@ fn continuation_prepares_no_group_attempt() {
         )
     };
     let cache = Arc::new(SharedCache::default());
+    let expected = fs::metadata(sessions.join("a.jsonl")).unwrap().len()
+        + fs::metadata(sessions.join("b.jsonl")).unwrap().len();
+    let group_replays = || {
+        use crate::snapshots::tail_source::counters::total;
+        (
+            total("tail_reconstruct", "group_replay"),
+            total("tail_reconstruct_bytes", "group_replay"),
+        )
+    };
+    let replay_before = group_replays();
+    NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
     with_test_limits(2048, 1024, 64, || {
         // Ordinary pages until the group job pauses (a group whose probes
         // outran a page takes a page of its own first).
@@ -10531,7 +7677,11 @@ fn continuation_prepares_no_group_attempt() {
             }
         }
         let first = cache.counters_for_test();
-        assert_eq!(first.groups_started, 1, "{first:?}");
+        assert_eq!(
+            group_replays(),
+            replay_before,
+            "the first group is still paused"
+        );
         assert!(first.jobs_paused > 0, "{first:?}");
         let members = cache.paused_members_for_test().expect("paused group");
         assert_eq!(members.len(), 2, "both members belong to the job");
@@ -10571,18 +7721,25 @@ fn continuation_prepares_no_group_attempt() {
                 &members,
             );
             CARRIED.with(|v| v.borrow_mut().insert(sessions.clone(), evidence));
-            let ((next, scan), records) = crate::local_resource_diagnostics::capture(|| {
-                continuation_page_in(
-                    &sessions,
-                    index,
-                    &cache,
-                    "group-fixture",
-                    AT,
-                    7,
-                    None,
-                    |_| {},
-                )
+            let (((next, scan), records), bytes) = observe_consumed(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    continuation_page_in(
+                        &sessions,
+                        index,
+                        &cache,
+                        "group-fixture",
+                        AT,
+                        7,
+                        None,
+                        |_| {},
+                    )
+                })
             });
+            assert_eq!(
+                bytes, 0,
+                "the continuation never reads or restarts the group"
+            );
+            assert_eq!(group_replays(), replay_before, "no replay or replay bytes");
             let holds = records
                 .iter()
                 .filter(|row| row["stage"] == "codex_continuation")
@@ -10592,7 +7749,6 @@ fn continuation_prepares_no_group_attempt() {
             assert_eq!(holds[0]["counts"]["continuation_pages_run"], 0);
             index = next;
             let now = cache.counters_for_test();
-            assert_eq!(now.groups_started, 1, "never restarted: {now:?}");
             assert_eq!(now.jobs_started, started, "{now:?}");
             assert_eq!(
                 now.jobs_resumed, resumed,
@@ -10606,8 +7762,16 @@ fn continuation_prepares_no_group_attempt() {
         for _ in 0..128 {
             index = ordinary(index, &cache).0;
             let now = cache.counters_for_test();
-            assert_eq!(now.groups_started, 1, "ordinary resumes the same group");
             if now.jobs_certified + now.jobs_uncertified > 0 {
+                assert_eq!(
+                    group_replays().0,
+                    replay_before.0 + 1,
+                    "ordinary completes once"
+                );
+                assert!(
+                    group_replays().1 > replay_before.1,
+                    "completion records replay bytes"
+                );
                 assert!(cache.cursor_slot_free());
                 GROUP_EOF_APPLIED.with(|v| assert!(v.get() > 0, "ordinary group EOF observed"));
                 return;
@@ -10618,6 +7782,18 @@ fn continuation_prepares_no_group_attempt() {
             cache.counters_for_test()
         );
     });
+    let bytes = NATIVE_RANGES.with(|v| {
+        v.borrow_mut()
+            .take()
+            .unwrap()
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>()
+    });
+    assert_eq!(
+        bytes, expected,
+        "ordinary resumes the same group; no byte re-read"
+    );
 }
 
 /// §7 ready: `cursor_continuation_ready` readies the exact paused,
@@ -10815,7 +7991,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             page(&fixture, index, Some(Arc::clone(&cache)))
         });
         let now = cache.counters_for_test();
-        assert_eq!(now.deferred_paced, 1, "{now:?}");
         assert_eq!(now.jobs_started, 1, "{now:?}");
         assert_eq!(now.deferred_next_generation, 0, "not fenced: {now:?}");
         assert_eq!(now.jobs_lost, 1, "not a loss: {now:?}");
@@ -10844,7 +8019,6 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             page(&fixture, index, Some(Arc::clone(&cache)))
         });
         let now = cache.counters_for_test();
-        assert_eq!(now.deferred_paced, 1, "{now:?}");
         assert_eq!(now.jobs_started, 2, "{now:?}");
         let accelerated = cache
             .with_cursor(|cursor| match &cursor.slot {
@@ -10956,7 +8130,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
     let shared_root =
         crate::snapshots::sampled_scan::OFF_MAIN_SHARED_BYTES.max(size_of::<SharedCache>());
     let cache = Arc::new(SharedCache::default());
@@ -10996,7 +8169,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     cache.withheld_memo.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
-        shared_root + align_of::<SharedCache>() + 2 * size_of::<usize>() + parts.bytes + side
+        shared_root + align_of::<SharedCache>() + 2 * size_of::<usize>() + parts.bytes
     );
     // The release math: `context_overhead` without the table, beside
     // `state_for_main` with it.
@@ -11020,7 +8193,6 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
         size_of::<crate::snapshots::sampled_scan::Context>() + shared_root - size_of::<PaceTable>()
             + align_of::<SharedCache>()
             + 2 * size_of::<usize>()
-            + side
             + bound(&context.namespace, state_bytes()).unwrap()
             + bound(&context.admission, state_bytes()).unwrap()
     );
@@ -11039,18 +8211,16 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     assert_eq!(c.bytes, 0);
 }
 
-/// Carried evidence removes the parent sample re-probe. Continuation also
-/// keeps the existing G7, side-due, proof-hook and sweep exclusions.
+/// [behaviour] Continuation keeps the frozen census, performs no sample
+/// re-reads, and parks at EOF without publication.
 #[test]
-fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
-    use std::os::unix::fs::MetadataExt;
+fn continuation_carries_frozen_census_without_sample_reads() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
     let parent = fixture.file(SESSION_B);
     let cache = Arc::new(SharedCache::default());
-    let index_path = Path::new("/tmp/ottto-s1b-q1-index.json");
     with_test_limits(2048, 1024, 64, || {
         let (mut index, members) = paused_singleton(&fixture, &cache);
         assert!(!members.contains(&local_index_key(&parent)));
@@ -11063,71 +8233,7 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 .any(|path| path.ends_with(&format!("{SESSION_B}.jsonl"))),
             "the parent is in the frozen census"
         );
-        // A G7/side-due candidate on the owed parent, and a sweep orphan.
-        let meta = fs::metadata(&parent).unwrap();
-        index.codex_parent_side_requests.insert(
-            local_index_key(&parent),
-            crate::snapshots::SideRequest {
-                dev_ino: (meta.dev(), meta.ino()),
-                needed_extent: meta.len() + 1,
-                state: crate::snapshots::SideRequestState::Live,
-                state_extent: meta.len(),
-                state_ctime: (meta.ctime(), meta.ctime_nsec()),
-                attempt_extent: 0,
-                attempt_ctime: (0, 0),
-                attempts: 0,
-                not_before_unix_seconds: 0,
-                needed_charge: None,
-                referenced_epoch: 0,
-            },
-        );
-        let orphan = "/nonexistent/s1b-q1-orphan-rollout.jsonl".to_owned();
-        index.codex_parent_side.insert(
-            orphan.clone(),
-            serde_json::from_value(serde_json::json!({
-                "verdict": { "kind": "settled" },
-                "seal": {
-                    "stamp": {
-                        "length": 4096,
-                        "device": 1,
-                        "inode": 2,
-                        "modified": [1_792_540_800, 5],
-                        "changed": [1_792_540_800, 5],
-                    },
-                    "scope": crate::snapshots::codex_parent_side_scope().0,
-                    "sample_len": 4096,
-                    "head_sha256": "a".repeat(64),
-                    "boundary_sha256": "b".repeat(64),
-                    "verified_unix_seconds": 1_792_540_800,
-                    "sealed_unix_seconds": 1_792_540_800,
-                },
-                "parsed": {
-                    "dev": 1,
-                    "ino": 2,
-                    "extent": 4096,
-                    "modified": [1_792_540_800, 5],
-                    "changed": [1_792_540_800, 5],
-                },
-                "generation": 1,
-                "referenced_epoch": 0,
-            }))
-            .unwrap(),
-        );
         for page in 0..64 {
-            // The parent stays owed: referenced, with no completed ledger.
-            index
-                .codex_parent_ownership_refs
-                .insert(SESSION_B.to_owned());
-            index.codex_parent_ownership_ledgers.remove(SESSION_B);
-            let pass = crate::snapshots::begin_codex_continuation_side_pass(
-                &cache, index_path, &mut index,
-            );
-            assert_eq!(pass.kind, crate::snapshots::CodexPageKind::Continuation);
-            let ledger = cache.side_ledger().len();
-            let requests = serde_json::to_value(&index.codex_parent_side_requests).unwrap();
-            let side = serde_json::to_value(&index.codex_parent_side).unwrap();
-            let sweep = index.codex_parent_side_cursor.clone();
-            let matches = crate::snapshots::codex_parent_step_start_matches_for_test();
             let mut scan = OwnedSourceScan::new_continuation(
                 std::slice::from_ref(&fixture.root),
                 index,
@@ -11137,8 +8243,7 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                 Some(secs(600)),
                 carried(&fixture.root),
             )
-            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()))
-            .with_codex_side_pass(Some(pass));
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
             let mut singleton = 0;
             let mut steps = 0;
             let result = loop {
@@ -11157,28 +8262,7 @@ fn continuation_parent_evidence_is_carried_and_exclusions_hold() {
                     }
                 }
             };
-            let matched = crate::snapshots::codex_parent_step_start_matches_for_test() - matches;
-            assert_eq!(matched, 0, "carried evidence: no parent re-probe");
-            assert_eq!(singleton, 0, "no parent sample reads");
-            // The four exclusions, on the same page.
-            assert_eq!(cache.side_ledger().len(), ledger, "page {page}: no G7");
-            assert_eq!(
-                serde_json::to_value(&index.codex_parent_side_requests).unwrap(),
-                requests,
-                "page {page}: no G7 or side-due write"
-            );
-            assert_eq!(
-                cache.proof_suspended_for_test(),
-                None,
-                "page {page}: no hook job"
-            );
-            assert_eq!(
-                serde_json::to_value(&index.codex_parent_side).unwrap(),
-                side,
-                "page {page}: not swept"
-            );
-            assert!(index.codex_parent_side.contains_key(&orphan));
-            assert_eq!(index.codex_parent_side_cursor, sweep, "page {page}");
+            assert_eq!(singleton, 0, "no sample re-reads");
             let mut result = result;
             carry(&fixture.root, &mut result);
             if parked_eof(&cache) {
@@ -11508,7 +8592,7 @@ fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
 }
 
 /// W9: a continuation worker that panicked while holding the cursor, the
-/// retained or the side-ledger lock leaves the process running. The next
+/// retained lock leaves the process running. The next
 /// ordinary pages neither panic nor deadlock, and fail closed: they publish
 /// nothing the unpaged read would not, and a poisoned cursor admits nothing.
 #[test]
@@ -11520,7 +8604,7 @@ fn ordinary_pages_after_a_worker_panic_under_any_lock_fail_closed() {
     let fixture = ScanRoot::new(80);
     let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
     let unpaged = fingerprints(&unpaged);
-    for lock in [TestLock::Cursor, TestLock::Retained, TestLock::Side] {
+    for lock in [TestLock::Cursor, TestLock::Retained] {
         let cache = Arc::new(SharedCache::default());
         with_test_limits(2048, 1024, 64, || {
             let (mut index, _) = paused_singleton(&fixture, &cache);
@@ -11681,94 +8765,6 @@ fn retained_held_singleton_ignores_ctime_but_wakes_on_content_birth_and_inode() 
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs macOS heap layout"
 )]
-fn retained_parent_dependency_ignores_ctime_but_wakes_on_parent_append() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let cache = Arc::new(SharedCache::default());
-    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
-    assert!(home.child_entry(&cache).is_some());
-    let parent = home.fixture.file(PARENT);
-    let hits = counter(&cache, |c| c.memo_hits);
-    let records = counter(&cache, |c| c.memo_records);
-    wake_chmod(&parent);
-    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let hook = {
-        let parsed = std::rc::Rc::clone(&parsed);
-        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
-    };
-    let (index, quiet) = crate::snapshots::with_codex_before_parse(hook.clone(), || {
-        home.generation(index, &cache, n)
-    });
-    assert!(
-        parsed.borrow().is_empty(),
-        "metadata-only parent change: {:?}",
-        parsed.borrow()
-    );
-    assert_eq!(counter(&cache, |c| c.memo_hits), hits + 1);
-    assert_eq!(counter(&cache, |c| c.memo_records), records);
-    assert_eq!(replayed_census(&quiet), replayed_census(&settled));
-    append_parent_turn(&parent, 1);
-    let _ =
-        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, n + 1));
-    assert!(
-        parsed.borrow().contains(&parent),
-        "parent append must parse"
-    );
-    assert!(
-        parsed.borrow().contains(&home.fixture.file(CHILD)),
-        "changed dependency must wake child"
-    );
-}
-
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn retained_parent_witness_survives_ctime_only_change() {
-    let home = ForkHome::new(&ForkHome::diverging_child(3));
-    let parent = home.fixture.file(PARENT);
-    OpenOptions::new()
-        .write(true)
-        .open(&parent)
-        .unwrap()
-        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
-        .unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let mut index = ScanIndex::default();
-    let mut last = None;
-    for n in 0..4 {
-        let (next, scan) = home.generation(index, &cache, n);
-        index = next;
-        last = Some(scan);
-    }
-    assert_eq!(
-        parent_causes(last.as_ref().unwrap()),
-        only(CodexParentUnresolvable::OutOfWindow, 1)
-    );
-    wake_chmod(&parent);
-    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let hook = {
-        let parsed = std::rc::Rc::clone(&parsed);
-        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
-    };
-    let (_, scan) =
-        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, 4));
-    assert!(
-        parsed.borrow().is_empty(),
-        "a ctime-only parent witness must not wake: {:?}",
-        parsed.borrow()
-    );
-    assert_eq!(
-        parent_causes(&scan),
-        only(CodexParentUnresolvable::OutOfWindow, 1)
-    );
-}
-
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
 fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
     let home = CreatedThreadHome::new(10, true);
     let cache = Arc::new(SharedCache::default());
@@ -11787,7 +8783,16 @@ fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
         now,
         "a change after sampling must keep its live stamp"
     );
-    let (qualified, _, _) = cache.retained_open(&home.path, &file).unwrap();
+    let mut file = file;
+    opened_object_identity_and_stat_retained(
+        SnapshotSource::Codex,
+        &mut file,
+        Some((&cache, &home.path)),
+        false,
+        false,
+    )
+    .unwrap();
+    let qualified = cache.retained_stamp(&home.path, OpenStamp::capture(&file).unwrap());
     assert_ne!(
         qualified.changed, now.changed,
         "a fresh equal-content sample pass can qualify the stored ctime"
@@ -11879,7 +8884,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                 }
                 let before = serde_json::to_value(&index).unwrap();
                 let context = index.active_upload_context_fingerprint.clone();
-                let contract = index.claude_request_identity_contract_changed;
                 let (next, scan) = continuation_page_in(
                     &fixture.root,
                     index,
@@ -11897,7 +8901,6 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                     "{schedule} page {turn}: no traversal, census or ACK write"
                 );
                 assert_eq!(index.active_upload_context_fingerprint, context);
-                assert_eq!(index.claude_request_identity_contract_changed, contract);
                 assert!(scan.snapshots.is_empty());
                 assert!(scan.pending_finalization.is_empty());
                 assert_eq!(scan.scanned_file_count, 0);
@@ -12047,18 +9050,11 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
     let file = File::open(&temp.0).unwrap();
     let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
-    let entry = MemoEntry::new(
-        "digest".into(),
-        live,
-        stamp.clone(),
-        None,
-        None,
-        disclosure(),
-    );
+    let entry = MemoEntry::new("digest".into(), live, stamp.clone(), None, disclosure());
     let path = Path::new("rollout.jsonl.zst");
     codex_zst_refusal_tests::assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
         assert!(entry
-            .matches_stamp(path, "digest", &file, None, "", stamp)
+            .matches_stamp(path, "digest", &file, "", stamp)
             .is_none());
     });
 }
@@ -12076,44 +9072,31 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
         let primary = ScanRoot::new(40);
-        let peer = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
         let key = local_index_key(&primary.file(SESSION));
-        let peer_key = local_index_key(&peer.file(SESSION));
+        // The primary continues from its head on its route (a codec source
+        // keeps no RAM copy); the cache fixture admits the other copy.
         let mut index = ScanIndex::default();
-        for fixture in [&primary, &peer] {
-            let mut warm = ScanIndex::default();
-            for _ in 0..64 {
-                let (next, _) = page(fixture, warm, Some(Arc::clone(&cache)));
-                warm = next;
-                if cache
-                    .retained_checkpoint(&local_index_key(&fixture.file(SESSION)))
-                    .is_some()
-                {
-                    break;
-                }
-            }
-            if std::ptr::eq(fixture, &primary) {
-                index = warm;
+        for _ in 0..64 {
+            let (next, _) = page(&primary, routed(index, &cache), Some(Arc::clone(&cache)));
+            index = next;
+            if head(&index, &key).is_some() {
+                break;
             }
         }
-        assert!(cache.retained_checkpoint(&key).is_some());
-        assert!(cache.retained_checkpoint(&peer_key).is_some());
+        assert!(head(&index, &key).is_some());
+        let peer = PiRoot::new(8);
+        let peer_key = pi_retained(&peer, &cache);
         let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
         let archive = Temp::new("decoder-floor", &bytes);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
-        let floor = ENTRY_BYTES + super::super::side_ledger::SIDE_LEDGER_BYTES;
-        let budget = cache.cursor_resident()
-            + retained_floor(&cache)
-            + credit
-            + floor
-            + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        let floor = ENTRY_BYTES;
+        let budget = cache.cursor_resident() + retained_floor(&cache) + credit + floor;
         with_test_state_budget(decoder_least_budget(&cache) - 1, || {
             assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                 .unwrap()
                 .is_none());
             assert_eq!(cache.cursor_reserved(), 0);
-            assert!(cache.retained_checkpoint(&key).is_some());
             assert!(cache.retained_checkpoint(&peer_key).is_some());
         });
         with_test_state_budget(budget, || {
@@ -12122,8 +9105,9 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 .unwrap();
             input.read_exact(&mut [0; 1]).unwrap();
             primary.append(SESSION, &token_line(41));
+            let mut index = routed(index, &cache);
             index.traversal = None;
-            let (_, scan, modes) =
+            let (next, scan, modes) =
                 page_in(&primary, index, Some(Arc::clone(&cache)), "cursor-fixture");
             assert_eq!(
                 modes,
@@ -12135,7 +9119,11 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 cache.retained_checkpoint(&peer_key).is_some(),
                 "decoder causes no extra eviction"
             );
-            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(
+                head(&next, &key).map(|head| head.sealed_offset),
+                Some(primary.len(SESSION)),
+                "the primary Tail stages its append"
+            );
             assert_eq!(cache.cursor_reserved(), credit);
             input.close();
         });
@@ -12145,7 +9133,7 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
 
 /// The state budget at which a decoder claim just fits once every header fact
 /// and retained copy is gone: the whole cursor state without headers, an empty
-/// retained cache, D, the primary floor and both side ledger charges.
+/// retained cache, D, and the primary ENTRY_BYTES floor.
 fn decoder_least_budget(cache: &SharedCache) -> usize {
     let empty =
         crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), usize::MAX)
@@ -12154,21 +9142,14 @@ fn decoder_least_budget(cache: &SharedCache) -> usize {
         + empty
         + codex_compressed_input::compressed_input_credit().unwrap()
         + ENTRY_BYTES
-        + 2 * super::super::side_ledger::SIDE_LEDGER_BYTES
 }
 
-/// A cache warmed by real pages: a retained copy and optional header facts.
-fn warm_decoder_cache(fixture: &ScanRoot) -> (Arc<SharedCache>, String) {
+/// A cache warmed by real pages: optional header facts from a certified
+/// Codex cursor job, beside a native copy admitted by the cache fixture.
+/// Production source scans keep none. Returns the copy's key.
+fn warm_decoder_cache() -> (Arc<SharedCache>, String) {
     let cache = Arc::new(SharedCache::default());
-    let key = local_index_key(&fixture.file(SESSION));
-    let mut index = ScanIndex::default();
-    for _ in 0..64 {
-        let (next, _) = page(fixture, index, Some(Arc::clone(&cache)));
-        index = next;
-        if cache.retained_checkpoint(&key).is_some() {
-            break;
-        }
-    }
+    let key = certified_beside_a_retained_copy(&cache);
     assert!(cache.retained_checkpoint(&key).is_some());
     assert!(
         cache
@@ -12225,16 +9206,14 @@ fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let resident = cache.cursor_resident();
         let cursor = cursor_without_header_facts(&cache);
         let headers = resident - cursor;
         let retained = retained_floor(&cache);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
-        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
         // Without facts the free-room bar is T; with them it is T + H.
-        let budget = cursor + retained + credit + ENTRY_BYTES + 2 * side;
+        let budget = cursor + retained + credit + ENTRY_BYTES;
         let archive = synthetic_archive("decoder-reclaim");
         let admit = |limit: usize| {
             let (input, counts) = observe(|| {
@@ -12245,11 +9224,8 @@ fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
                 })
             });
             assert_eq!(cache.cursor_reserved(), credit);
-            let used = cache.cursor_resident() + retained_floor(&cache) + side;
-            assert!(
-                limit - used >= ENTRY_BYTES + side,
-                "the primary floor stays free"
-            );
+            let used = cache.cursor_resident() + retained_floor(&cache);
+            assert!(limit - used >= ENTRY_BYTES, "the primary floor stays free");
             input.close();
             assert_eq!(cache.cursor_reserved(), 0);
             counts.cursor_reservation_entries_evicted
@@ -12286,8 +9262,7 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let job = cache.cursor_reserve(1024 * 1024).expect("a job's charge");
         let budget = decoder_least_budget(&cache);
         let archive = synthetic_archive("decoder-over-room");
@@ -12311,39 +9286,30 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
     });
 }
 
-/// A suspended proof counts in the whole state and survives: it is not room a
-/// decoder may take. Join owners and witnesses stay too.
+/// [behaviour] Real archive decoder eviction preserves join provenance.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_eviction_keeps_a_suspended_proof_and_join_state() {
+fn decoder_eviction_keeps_join_state() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
-        assert!(suspend(
-            &cache,
-            proof_job("cursor-fixture", "/idx/a.json", "inc-1", 4096)
-        ));
-        let proof = cache.proof_suspended_for_test();
-        assert!(proof.is_some());
+        let (cache, key) = warm_decoder_cache();
         let joined = |cache: &SharedCache| {
             cache
-                .with_cursor(|cursor| (cursor.join_owners.len(), cursor.parents.len()))
+                .with_cursor(|cursor| cursor.join_owners.len())
                 .unwrap()
         };
         let before = joined(&cache);
         let budget = decoder_least_budget(&cache);
         let archive = synthetic_archive("decoder-proof-kept");
-        // Dropping the proof would make this fit: it refuses instead.
+        // One byte below the decoder floor: nothing is evicted.
         assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
-        assert_eq!(cache.proof_suspended_for_test(), proof);
         with_test_state_budget(budget, || {
             OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                 .unwrap()
@@ -12351,7 +9317,6 @@ fn decoder_eviction_keeps_a_suspended_proof_and_join_state() {
                 .close();
         });
         assert!(cache.retained_checkpoint(&key).is_none());
-        assert_eq!(cache.proof_suspended_for_test(), proof);
         assert_eq!(joined(&cache), before);
     });
 }
@@ -12412,8 +9377,7 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, key) = warm_decoder_cache(&fixture);
+        let (cache, key) = warm_decoder_cache();
         let (root, paths) = owed_archives("decoder-next-pass", 1);
         let archive_key = local_index_key(&paths[0]);
         let mut index = ScanIndex::default();
@@ -12467,8 +9431,7 @@ fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let (cache, _) = warm_decoder_cache(&fixture);
+        let (cache, _) = warm_decoder_cache();
         let copies = cache.retained().unwrap().entry_count();
         let (root, paths) = owed_archives("decoder-near-full", 3);
         let mut index = ScanIndex::default();
@@ -12513,17 +9476,8 @@ fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
-        let key = local_index_key(&fixture.file(SESSION));
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
-            index = next;
-            if cache.retained_checkpoint(&key).is_some() {
-                break;
-            }
-        }
+        let key = certified_beside_a_retained_copy(&cache);
         let copy = cache.take(&key).expect("real retained reduction").retained;
         // Two real reductions with large synthetic keys warm > 8 MiB, while
         // each entry remains under ENTRY_BYTES. The graph is measured normally.
@@ -12541,11 +9495,10 @@ fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
         let warm = retained_floor(&cache);
         assert!(warm > ENTRY_BYTES);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
-        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
-        let budget = cache.cursor_resident() + warm + credit + ENTRY_BYTES + 2 * side;
+        let budget = cache.cursor_resident() + warm + credit + ENTRY_BYTES;
         // An explicit budget isolates the floor rule from zstd version sizing.
         // The prior retained-sized floor would reject this same warm graph.
-        assert!(cache.cursor_resident() + 2 * warm + credit + 2 * side > budget);
+        assert!(cache.cursor_resident() + 2 * warm + credit > budget);
         with_test_state_budget(budget, || {
             let owner = DecoderOwner::acquire(&cache, credit).expect("warm cache admits");
             assert!(cache.retained_checkpoint(&warm_key).is_some());
@@ -12600,7 +9553,8 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         fingerprint_birth_nanos: 0,
         withheld_content_stamp: None,
     };
-    for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
+    const RETIRED_CAUSE: usize = 2;
+    for cause in [ownership::CREATED, RETIRED_CAUSE, ownership::PARSER] {
         let mut index = ScanIndex::default();
         let mut census = ScanCensus::default();
         census.causes = census.causes.page(Some(77));
@@ -12697,11 +9651,13 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
 }
 
 /// [money] An active-bound cursor keeps its file scope, resumes and publishes
-/// what a cold read does. Codex keeps its retained graph after a native
-/// publication; the restart-record store's no-record mode, which dropped it,
-/// is gone.
+/// what a cold read does. Its certified prefix is staged as a Tail head;
+/// a codec source keeps no retained graph after native publication.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "validated native cursor layout"
+)]
 fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     if !crate::test_isolation::run_here() {
         return;
@@ -12711,8 +9667,10 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     let (_, oracle) = page(&fixture, ScanIndex::default(), None);
     assert!(!oracle.snapshots.is_empty());
     let cache = Arc::new(SharedCache::default());
+    let key = local_index_key(&fixture.file(SESSION));
     with_test_limits(2048, 1024, 64, || {
-        let (mut index, first) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+        let on_route = routed(ScanIndex::default(), &cache);
+        let (mut index, first) = page(&fixture, on_route, Some(cache.clone()));
         assert!(first.snapshots.is_empty());
         assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
         cache
@@ -12725,19 +9683,18 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
             })
             .unwrap();
         for _ in 0..64 {
-            let (next, scan) = page(&fixture, index, Some(cache.clone()));
+            let on_route = routed(index, &cache);
+            let (next, scan) = page(&fixture, on_route, Some(cache.clone()));
             index = next;
             if counter(&cache, |c| c.jobs_certified) > 0 {
                 assert_eq!(fingerprints(&scan), fingerprints(&oracle));
                 assert!(counter(&cache, |c| c.jobs_resumed) > 0);
                 assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                let certificate = head(&index, &key).expect("the certified prefix is staged");
+                assert_eq!(certificate.sealed_offset, fixture.len(SESSION));
                 assert!(
-                    cache
-                        .retained()
-                        .unwrap()
-                        .peek(&local_index_key(&fixture.file(SESSION)))
-                        .is_some(),
-                    "a native Codex publication keeps its retained graph"
+                    cache.take(&key).is_none(),
+                    "a codec source keeps no RAM copy"
                 );
                 return;
             }
@@ -12764,8 +9721,8 @@ fn write_account_rollout(fixture: &ScanRoot, session: &str, account: &str, lines
 /// publishes, in totals and in placement, across two accounts (the positive
 /// control: swapping their evidence fails the comparator). Each row pauses the
 /// job and checks one part of its share first: a job with a spawn parent and
-/// child mints with the rows its fingerprint reads; a decided job keeps no
-/// parent ledger and an undecided one keeps all; an owner-file change holds the
+/// child mints with the rows its fingerprint reads; decided and undecided
+/// headers preserve the same job share; an owner-file change holds the
 /// continuation and an unrelated roster file's change does not.
 #[test]
 fn a_continued_job_on_its_share_keeps_money_and_placement() {
@@ -12777,8 +9734,8 @@ fn a_continued_job_on_its_share_keeps_money_and_placement() {
     }
     for case in [
         "spawned",
-        "ledger_decided",
-        "ledger_undecided",
+        "header_decided",
+        "header_undecided",
         "owner_file_changed",
         "roster_file_changed",
     ] {
@@ -12855,8 +9812,8 @@ fn a_continued_job_on_its_share_keeps_money_and_placement() {
                 assert!(share.content_unchanged(), "{case}");
             });
             match case {
-                "ledger_decided" | "ledger_undecided" => {
-                    let undecided = case == "ledger_undecided";
+                "header_decided" | "header_undecided" => {
+                    let undecided = case == "header_undecided";
                     let boundary = |to: Option<CodexOwnershipBoundary>| {
                         cache
                             .with_cursor(|cursor| match &mut cursor.slot {
@@ -12875,19 +9832,15 @@ fn a_continued_job_on_its_share_keeps_money_and_placement() {
                     if undecided {
                         boundary(Some(CodexOwnershipBoundary::Undetermined));
                     }
-                    let mut whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+                    let whole = crate::snapshots::CodexContinuationEvidence::certified_for_test(
                         roots,
                         &BTreeSet::from([job_path.to_string_lossy().into_owned()]),
                     );
-                    whole.ledgers = Some(Arc::new(Mutex::new(BTreeMap::from([
-                        (PARENT.to_owned(), Default::default()),
-                        (GRANDPARENT.to_owned(), Default::default()),
-                    ]))));
                     let share = whole
                         .for_paused_job(Some(&*cache), first.continuation_ticket().unwrap())
                         .expect("the job's share");
-                    let kept = share.ledgers.unwrap().lock().unwrap().len();
-                    assert_eq!(kept, if undecided { 2 } else { 0 }, "{case}");
+                    assert_eq!(share.inventory.headers.len(), 1, "{case}: only the job");
+                    assert!(share.content_unchanged(), "{case}");
                     boundary(Some(decided));
                 }
                 "owner_file_changed" => {
@@ -12960,4 +9913,36 @@ fn a_continued_job_on_its_share_keeps_money_and_placement() {
             }
         });
     }
+}
+
+/// [format] OpenStamp stores only required content-free scalar witnesses.
+#[test]
+fn open_stamp_round_trips_as_content_free_scalars() {
+    let temp = Temp::new("open-stamp", b"{}\n");
+    let path = &temp.0;
+    let stamp = OpenStamp::capture(&File::open(path).unwrap()).unwrap();
+    let value = serde_json::to_value(&stamp).unwrap();
+    let keys = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["changed", "dev", "extent", "ino", "modified"])
+    );
+    assert_eq!(value["extent"], 3);
+    assert_eq!(
+        serde_json::from_value::<OpenStamp>(value.clone()).unwrap(),
+        stamp
+    );
+
+    // Fail-closed: a missing field or a malformed time is an error.
+    let mut missing = value.clone();
+    missing.as_object_mut().unwrap().remove("ino");
+    assert!(serde_json::from_value::<OpenStamp>(missing).is_err());
+    let mut malformed = value;
+    malformed["changed"] = serde_json::json!([1, 2, 3]);
+    assert!(serde_json::from_value::<OpenStamp>(malformed).is_err());
 }

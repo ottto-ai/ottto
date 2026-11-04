@@ -1,8 +1,8 @@
 {
   "canonicalization": "rfc8785:integers-only:v1",
   "caps": {
-    "canonical_bytes": 131072,
-    "canonical_rows": 128,
+    "canonical_bytes": 655360,
+    "canonical_rows": 512,
     "operations": 64,
     "wire_bytes": 131072
   },

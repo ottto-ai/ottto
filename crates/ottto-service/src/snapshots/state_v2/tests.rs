@@ -1246,94 +1246,6 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
         assert_eq!(value(&mut tx, &header), b"evidence");
     }
 }
-/// [behaviour] complete saves alarm only when crossing the threshold.
-#[test]
-fn over_threshold_saves_commit_the_complete_delta_and_alarm() {
-    let tmp = Scratch::new();
-    let mut db = tmp.live_store();
-    let key = traversal("first".into());
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    put(&mut tx, &key, b"old");
-    let removed = traversal("removed".into());
-    put(&mut tx, &removed, b"retained");
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    // Lower the production alarm threshold to keep this fixture small.
-    sqlite::set_save_ceiling(&mut db, 4096);
-    telemetry::take_thread_event_for_test("save_ceiling_alarm");
-    telemetry::take_thread_event_for_test("save_ceiling_cause");
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let mut before = mapper::Rows::default();
-    before.raw(key.clone(), b"old").unwrap();
-    before.raw(removed.clone(), b"retained").unwrap();
-    let mut rows = mapper::Rows {
-        tx: Some(&mut tx),
-        old: before.finish().unwrap(),
-        ..Default::default()
-    };
-    rows.raw(key.clone(), b"new").unwrap();
-    let pending = rows.finish().unwrap();
-    let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"new");
-    assert!(tx.get(&removed).unwrap().is_none());
-    let large = traversal("over-ceiling".into());
-    let bytes = serde_json::to_vec(&"x".repeat(8192)).unwrap();
-    tx.put(RowInput {
-        key: &large,
-        fixed: &Fixed::None,
-        value_version: 1,
-        value: &bytes,
-    })
-    .unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    drop(pending);
-    assert_eq!(db.save_failure(), None);
-    assert!(db.refused_save_bytes() > 4096);
-    assert!(
-        telemetry::take_thread_event_for_test("save_ceiling_alarm")
-            .unwrap()
-            .as_u64()
-            .unwrap()
-            > 4096
-    );
-    assert_eq!(
-        telemetry::take_thread_event_for_test("save_ceiling_cause"),
-        Some(serde_json::json!("charged_work"))
-    );
-    // A second large save stays above; a small save re-arms the next crossing.
-    let changed_bytes = serde_json::to_vec(&"y".repeat(8192)).unwrap();
-    for (generation, payload, alarm) in [
-        (2, Some(changed_bytes.as_slice()), false),
-        (3, None, false),
-        (4, Some(bytes.as_slice()), true),
-    ] {
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        if let Some(payload) = payload {
-            put(&mut tx, &large, payload);
-        }
-        assert_eq!(
-            tx.commit(generation, generation + 1),
-            DurableCommitOutcome::Committed(generation + 1)
-        );
-        assert_eq!(db.refused_save_bytes() >= 4096, payload.is_some());
-        assert_eq!(
-            telemetry::take_thread_event_for_test("save_ceiling_alarm").is_some(),
-            alarm
-        );
-        assert_eq!(
-            telemetry::take_thread_event_for_test("save_ceiling_cause"),
-            alarm.then(|| serde_json::json!("charged_work"))
-        );
-    }
-    assert_eq!(db.read_control::<u64>("generation").unwrap(), Some(5));
-    drop(db);
-    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let header = tx.get(&key).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), b"new");
-    assert!(tx.get(&removed).unwrap().is_none());
-    let header = tx.get(&large).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &header), bytes);
-}
 /// [behaviour] a written row at 78% of its target reports a counts-only gauge and alarm.
 #[test]
 fn row_near_its_cap_reports_gauge_and_alarm() {
@@ -1358,22 +1270,22 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
     let key = mapper::key("scan_state.traversal", "", 0).unwrap();
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        assert!(mapper::put(&mut tx, &key, &"x".repeat(16 * 1024 * 1024)).is_err());
+        assert!(mapper::put(&mut tx, &key, &"x".repeat(VALUE_BYTES as usize)).is_err());
     });
     let gauge = serde_json::json!({ "percent": 100, "kind": "scan_state.traversal" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
 }
-/// [behaviour] a usage.pending row past its 1 MiB target commits, decodes
+/// [behaviour] a mutable map row past its 1 MiB target commits, decodes
 /// byte-identical and alarms above 100%: the target never refuses the save.
 #[test]
-fn usage_pending_row_over_its_target_commits_and_alarms() {
+fn mutable_row_over_its_target_commits_and_alarms() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = mapper::key("usage.pending", "synthetic-family", 1).unwrap();
-    // Residual family JSON once request-hash sets move to shared rows: ~1.5 MiB.
+    let key = mapper::key("proof.account", "synthetic-family", 1).unwrap();
+    // One family's proof JSON: ~1.5 MiB.
     let row = serde_json::json!({
-        "member_request_id_hashes": {},
+        "members": {},
         "occurrences": "x".repeat(1536 * 1024),
     });
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
@@ -1382,7 +1294,7 @@ fn usage_pending_row_over_its_target_commits_and_alarms() {
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     });
     let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
-    let gauge = serde_json::json!({ "percent": 150, "kind": "usage.pending" });
+    let gauge = serde_json::json!({ "percent": 150, "kind": "proof.account" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 150));
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1545,7 +1457,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
             Fixed::None,
         ),
         (
-            RowKey::record("usage.pending", b"family".to_vec(), 0).unwrap(),
+            RowKey::record("proof.usage", b"family".to_vec(), 0).unwrap(),
             Fixed::None,
         ),
         (
@@ -1638,15 +1550,16 @@ fn format_one_physical_columns_match_the_four_table_contract() {
     assert!(RecordKind::parse("not.registered").is_err());
     assert!(RecordKind::parse("raw_hold.unknown").is_err());
 }
-/// [format] the two measured >1 MiB whole fields have bounded caps and raw holds stay exact.
+/// [format] the two measured >1 MiB whole fields share the value bound and raw holds stay exact.
 #[test]
 fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
     for kind in ["scan_state.traversal", "v1_field.birth_store"] {
         let key = RowKey::record(kind, b"family".to_vec(), 0).unwrap();
         for (size, ok) in [
             (MUTABLE_VALUE_BYTES + 1, true),
-            (16 * 1024 * 1024, true),
-            (16 * 1024 * 1024 + 1, false),
+            (16 * 1024 * 1024 + 1, true),
+            (VALUE_BYTES, true),
+            (VALUE_BYTES + 1, false),
         ] {
             assert_eq!(
                 preflight(&RowInput {
@@ -1693,7 +1606,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
 fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    let rec = RowKey::record("family.requests", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
+    let rec = RowKey::record("account.current", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
     let shared = RowKey::RequestSet(1);
     assert_ne!(
         sqlite::owner_for_test(&rec),

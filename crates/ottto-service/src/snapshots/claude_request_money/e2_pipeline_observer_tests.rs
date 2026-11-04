@@ -83,16 +83,6 @@ pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
     assert!(index.claude_request_census.get(&key).is_none());
 }
 
-/// Requests the legacy fork-prefix exclusion assigns away from `member`.
-pub(crate) fn legacy_excluded(index: &ScanIndex, member: &str) -> usize {
-    index
-        .claude_usage_family_witnesses
-        .values()
-        .filter_map(|witness| witness.legacy_excluded_request_id_hashes.get(member))
-        .map(BTreeSet::len)
-        .sum()
-}
-
 /// Capture the counters of folds released by one real enrichment. This keeps
 /// acceptance assertions independent of fold lifetime, with no retained body.
 #[derive(Clone, Copy, Default)]
@@ -142,24 +132,6 @@ pub(crate) fn released_for_marks(fold: &FileFold) -> bool {
         && fold.skipped.is_empty()
 }
 
-thread_local! {
-    static IDENTITY: std::cell::RefCell<Option<serde_json::Value>> =
-        const { std::cell::RefCell::new(None) };
-}
-/// The page identity counters `finish_page` recorded, read just before the
-/// post-identity release frees the folds they derive from.
-pub(crate) fn capture_identity_counts<T>(run: impl FnOnce() -> T) -> (T, serde_json::Value) {
-    struct Restore(Option<serde_json::Value>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            IDENTITY.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(IDENTITY.with(|slot| slot.borrow_mut().replace(serde_json::json!({}))));
-    let result = run();
-    let counts = IDENTITY.with(|slot| slot.borrow().clone().expect("capture active"));
-    (result, counts)
-}
 pub(crate) fn before_release(items: &[SnapshotItem]) {
     RELEASED.with(|counts| {
         if let Some(mut page) = counts.get() {
@@ -170,17 +142,6 @@ pub(crate) fn before_release(items: &[SnapshotItem]) {
                 .map(|item| item.removed_request_count.unwrap_or(0))
                 .sum();
             counts.set(Some(page));
-        }
-    });
-    IDENTITY.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_some() {
-            *slot = Some(
-                serde_json::to_value(
-                    crate::snapshots::claude_request_identity::page_identity_counts(items),
-                )
-                .expect("identity counts serialize"),
-            );
         }
     });
 }

@@ -7,22 +7,22 @@
 // network, exact correction settlement after the upload result and before the
 // durable index settlement, no-body settlement on the selected checkpoint,
 // then a save and a reload from disk. Requests are appended naturally to
-// member transcripts together with paired local OTEL API and trace rows. The
-// NATURAL tests edit no clock, quarantine, witness or index state by hand.
-// Tests named `controlled_*` say so: one seeds the owed set through the
-// persisted index after a natural grant, and the selection and checkpoint-cost tests
-// drive the real locked partial checkpoint on a synthetic persisted index.
+// member transcripts together with paired local OTEL API and trace rows.
+// Beyond the stored starting state below, tests edit no clock, quarantine,
+// witness or index state by hand. Tests named `controlled_*` say so: one seeds
+// the owed set through the persisted index after the stored grant, and the
+// selection and checkpoint-cost tests drive the real locked partial checkpoint
+// on a synthetic persisted index.
 // Fixtures are synthetic.
 //
 // The family fixture is re-scoped from the retained stable-proof re-arm
 // pipeline fixture: the family root and both subagents sit on earlier pages
-// and an unrelated session sits on the terminal page. Repeated subagent
-// requests exhaust the family's bounded reconstruction retries until the
-// terminal quarantine stops blocking the census; the next complete census then
-// proves a changed family witness. Before the correction that census rebinding
-// left the saved record bound to the previous witness and the reload
-// quarantined the whole index. Every generation writes one count/hash-only
-// JSON receipt line directly to stderr, outside the test harness capture.
+// and an unrelated session sits on the terminal page. No build proves a new
+// family witness or grants a new correction, so the fixtures start from the
+// state an older build stored: the family witness it proved, and for the
+// correction tests its terminal record owing a correction. Every generation
+// writes one count/hash-only JSON receipt line directly to stderr, outside the
+// test harness capture.
 
 use super::p12_pipeline_original_tests::{
     rearm_evidence_lines as apc_evidence_lines, rearm_family_sessions as apc_family_sessions,
@@ -48,9 +48,9 @@ const APC_FAMILY_REQUESTS: [(Option<&str>, &str, u32); 4] = [
     (Some(APC_AGENTS[0]), "req_agent_a_1", 2),
     (Some(APC_AGENTS[1]), "req_agent_b_1", 3),
 ];
-/// First and last synthetic hour searched for the first complete census after
-/// the family's terminal authority hold.
-const APC_TERMINAL_SEARCH_HOURS: std::ops::Range<u32> = 10..16;
+/// The synthetic hour whose generation reads the grown family before the
+/// stored correction.
+const APC_GRANT_HOUR: u32 = 10;
 
 /// A transcript line with no request and no usage. It changes the member's
 /// source revision without changing any family request evidence.
@@ -79,6 +79,8 @@ struct ApcPage {
     scan: crate::snapshots::SourceScanResult,
     /// Sessions the page parsed, before any hold removed a body.
     parsed: BTreeSet<String>,
+    /// The page's parsed family bodies, before any hold removed one.
+    family_items: Vec<SnapshotItem>,
     /// Exact durable bytes and decoded state the page started from.
     before_bytes: Vec<u8>,
     before: ScanIndex,
@@ -116,14 +118,14 @@ impl ApcPage {
     }
 }
 
-/// The converged state after the first exact family proof and its cross-page
-/// correction, under the current re-arm rule.
+/// The converged baseline: the stored family witness and the latest parsed
+/// body of every family member.
 struct ApcEstablished {
     proven: String,
-    heads: BTreeMap<String, Option<String>>,
+    items: BTreeMap<String, SnapshotItem>,
 }
 
-/// The first complete census after the terminal hold: the grant under P1.
+/// An owed correction under the stored witness P1.
 struct ApcGrant {
     hour: u32,
     proof: String,
@@ -161,11 +163,6 @@ struct ApcFixture {
     next_sequence: std::cell::Cell<u64>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
-    /// Opt-in baseline for the production BASE finish's moving native receipt.
-    /// Old APC tests keep their original collector and fold unchanged.
-    retain_native_terminal: std::cell::Cell<bool>,
-    native_terminal_seen: std::cell::Cell<bool>,
-    census_before_fold: std::cell::Cell<bool>,
     /// Opt-in production account-audit release on settled pages, with no
     /// retained custody. Old APC tests keep their original finish.
     audit_release: std::cell::Cell<bool>,
@@ -195,9 +192,6 @@ impl ApcFixture {
             next_sequence: std::cell::Cell::new(1),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
-            retain_native_terminal: std::cell::Cell::new(false),
-            native_terminal_seen: std::cell::Cell::new(false),
-            census_before_fold: std::cell::Cell::new(false),
             audit_release: std::cell::Cell::new(false),
         };
         for (session, path) in [
@@ -441,74 +435,22 @@ impl ApcFixture {
         );
         self.load_exclusion_list(&mut index);
         let committed_index = index.clone();
-        let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
-            let mut state = crate::snapshots::OwnedSourceScan::new(
-                SnapshotSource::ClaudeCode,
-                std::slice::from_ref(&self.root),
-                index,
-                collected_at,
-                183,
-                self.page_files.get(),
-                Some(&self.support),
-                &[],
-                false,
-            );
-            state.enable_native_comparison();
-            loop {
-                if state.native_comparison_ready() {
-                    // The same BASE continuation used without a controller.
-                    state.resume_native_comparison_base();
-                }
-                match state.step(None) {
-                    crate::snapshots::OwnedSourceScanStep::Pending(next) => state = next,
-                    crate::snapshots::OwnedSourceScanStep::Complete {
-                        index: completed,
-                        scan,
-                        terminal_native_traversal,
-                    } => {
-                        index = completed;
-                        self.native_terminal_seen
-                            .set(terminal_native_traversal.is_some());
-                        break (
-                            scan,
-                            crate::snapshots::claude_native_comparison::Completion::base(
-                                terminal_native_traversal,
-                            ),
-                        );
-                    }
-                }
-            }
-        } else {
-            self.native_terminal_seen.set(false);
-            let scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-                std::slice::from_ref(&self.root),
-                &mut index,
-                collected_at,
-                183,
-                self.page_files.get(),
-                &self.support,
-            )
-            .expect("scan bounded Claude page");
-            (scan, None)
-        };
-        self.census_before_fold.set(scan.census_complete);
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+            std::slice::from_ref(&self.root),
+            &mut index,
+            collected_at,
+            183,
+            self.page_files.get(),
+            &self.support,
+        )
+        .expect("scan bounded Claude page");
         let parsed = scan
             .snapshots
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
-        let (mut disposition, _, _) = if self.retain_native_terminal.get() {
-            apply_claude_local_evidence_to_scan_with_comparison(
-                &self.support,
-                &mut scan,
-                &mut index,
-                None,
-                native_completion.as_mut(),
-                None,
-            )
-        } else {
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
-        };
+        let (mut disposition, _, _) =
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -584,6 +526,13 @@ impl ApcFixture {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let family = apc_family_sessions();
+        let family_items = scan
+            .snapshots
+            .iter()
+            .filter(|item| family.contains(&item.source_session_id))
+            .cloned()
+            .collect();
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
@@ -601,6 +550,7 @@ impl ApcFixture {
                 upload,
                 scan,
                 parsed,
+                family_items,
                 before_bytes,
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
@@ -759,6 +709,7 @@ impl ApcFixture {
                 upload,
                 scan,
                 parsed,
+                family_items,
                 before_bytes,
                 before,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
@@ -778,10 +729,10 @@ impl ApcFixture {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
             ResumableUploadResult::Rejected { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true, None)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
             }
             ResumableUploadResult::Deferred { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
             }
             other => panic!("unexpected synthetic upload {other:?}"),
         };
@@ -843,6 +794,7 @@ impl ApcFixture {
             upload,
             scan,
             parsed,
+            family_items,
             before_bytes,
             before,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
@@ -952,14 +904,49 @@ impl ApcFixture {
             .expect("write receipt");
     }
 
+    /// The latest parsed body of every family member across `pages`, held
+    /// or not.
+    fn collect_family_items(pages: &[ApcPage], into: &mut BTreeMap<String, SnapshotItem>) {
+        for item in pages.iter().flat_map(|page| &page.family_items) {
+            into.insert(item.source_session_id.clone(), item.clone());
+        }
+    }
+
+    /// Stores the family witness an older build proved from `items` and the
+    /// root's paired telemetry, as an upgraded store holds it, and returns its
+    /// digest after a reload. No build proves a new family witness.
+    fn store_family_witness(&self, items: &BTreeMap<String, SnapshotItem>) -> String {
+        let mut index = ScanIndex::load(&self.index_path).expect("load the delivered index");
+        assert!(
+            index.install_stored_claude_family_witness_from_support_for_test(
+                APC_ROOT,
+                items.values(),
+                &self.support,
+            )
+        );
+        index
+            .save(&self.index_path)
+            .expect("save the stored witness");
+        assert_eq!(
+            self.quarantined_index_count(),
+            0,
+            "the stored witness is valid"
+        );
+        ScanIndex::load(&self.index_path)
+            .expect("reload the stored witness")
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .expect("the stored witness reloads")
+    }
+
     /// Unlisted revision-3 baseline, as production runs it: the first
-    /// generation proves the family on its terminal page and the always-on
-    /// path delivers each member's request-owned body; the next generation
-    /// settles. Then the real list names the family root, so every later page
-    /// reads the family on ordinary (fold-absent) money, where the reported
-    /// authority, its demotion and its correction are live. Listing only
-    /// after the stamped baseline keeps unchanged members settled instead of
-    /// history-held as listed.
+    /// generation delivers each member's request-owned body and proves
+    /// nothing. The store then holds the family witness an older build proved
+    /// (an upgraded store); the next generation settles and keeps it. Then the
+    /// real list names the family root, so every later page reads the family
+    /// on ordinary (fold-absent) money, where the reported authority, its
+    /// demotion and its correction are live. Listing only after the stamped
+    /// baseline keeps unchanged members settled instead of history-held as
+    /// listed.
     fn establish(&self) -> ApcEstablished {
         let family = apc_family_sessions();
         let first = self.generation(8, |_| ApcUpload::Accept);
@@ -970,11 +957,17 @@ impl ApcFixture {
             last.parsed.is_disjoint(&family),
             "the family sits entirely on earlier pages"
         );
-        let proven = last
-            .index
-            .claude_usage_family_witness_digest_for_test(APC_ROOT)
-            .expect("first exact family proof");
+        assert!(
+            last.index
+                .claude_usage_family_witness_digest_for_test(APC_ROOT)
+                .is_none(),
+            "no fold proves a new family"
+        );
         assert!(last.record().is_none());
+        let mut items = BTreeMap::new();
+        Self::collect_family_items(&first, &mut items);
+        assert_eq!(items.keys().cloned().collect::<BTreeSet<_>>(), family);
+        let proven = self.store_family_witness(&items);
 
         let corrected = self.generation(9, |_| ApcUpload::Accept);
         let last = corrected.last().expect("terminal page");
@@ -1015,171 +1008,116 @@ impl ApcFixture {
             Some(proven.as_str())
         );
         assert!(last.record().is_none());
+        Self::collect_family_items(&corrected, &mut items);
         self.list_family();
-        ApcEstablished { proven, heads }
+        ApcEstablished { proven, items }
     }
 
-    /// Natural regression: repeated subagent requests until the first complete
-    /// census after the terminal hold. That census proves a changed witness,
-    /// and its save must reload intact with the record rebound to that proof
-    /// and owing a correction.
+    /// An owed correction as an older build left it: a new subagent request
+    /// is read under the stored witness, then the store holds the witness that
+    /// build proved for the grown family and its terminal record owing a
+    /// correction to every member (the members are re-armed). It reloads
+    /// intact. No build grants a new correction.
     fn reach_grant(&self) -> (ApcEstablished, ApcGrant) {
         let established = self.establish();
         let family = apc_family_sessions();
-        let max = crate::snapshots::MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST;
+        let hour = APC_GRANT_HOUR;
+        self.append_family_request(Some(APC_AGENTS[0]), "req_agent_a_2", 4);
+        let pages = self.generation(hour, |_| ApcUpload::Accept);
         let mut held = BTreeSet::new();
-        let mut count_before = 0;
-        for (step, hour) in APC_TERMINAL_SEARCH_HOURS.enumerate() {
-            self.append_family_request(
-                Some(APC_AGENTS[0]),
-                &format!("req_agent_a_{}", step + 2),
-                4 + step as u32,
+        for page in &pages {
+            held.extend(page.held.iter().cloned());
+            assert!(
+                page.uploaded.is_disjoint(&held),
+                "hour {hour}: a held body is never offered"
             );
-            let pages = self.generation(hour, |_| ApcUpload::Accept);
-            for page in &pages {
-                held.extend(page.held.iter().cloned());
-                assert!(
-                    page.uploaded.is_disjoint(&held),
-                    "hour {hour}: a held body is never offered"
-                );
-                if let Some(record) = page.record() {
-                    // A changed revision or an incomplete census never resets
-                    // the bounded budget and never grants a correction.
-                    assert!(
-                        record.failed_reconstruction_count >= count_before,
-                        "hour {hour}: the failure count never decreases"
-                    );
-                    count_before = record.failed_reconstruction_count;
-                    if !page.scan.census_complete {
-                        assert!(record.correction.is_none(), "hour {hour}");
-                    }
-                }
+            if let Some(record) = page.record() {
+                assert!(record.correction.is_none(), "hour {hour}: no grant");
             }
-            let last = pages.last().expect("terminal page");
-            for fingerprint in &held {
-                assert!(
-                    !last
-                        .index
-                        .accepted_snapshot_fingerprint_recorded(fingerprint),
-                    "hour {hour}: a held body is never ACKed"
-                );
-            }
-            if !last.scan.census_complete {
-                continue;
-            }
+        }
+        let last = pages.last().expect("terminal page");
+        for fingerprint in &held {
             assert!(
-                pages.len() >= 2,
-                "hour {hour}: the family precedes the terminal page"
-            );
-            let proof = last
-                .index
-                .claude_usage_family_witness_digest_for_test(APC_ROOT)
-                .expect("the complete census retains the family witness");
-            assert_ne!(
-                proof, established.proven,
-                "hour {hour}: the complete census proves the changed witness"
-            );
-            let prior = pages[pages.len() - 2]
-                .record()
-                .expect("the terminal hold precedes the proof");
-            assert!(
-                prior.terminal,
-                "hour {hour}: only a terminal hold lets the census complete"
-            );
-            assert_eq!(prior.failed_reconstruction_count, max);
-            assert_eq!(prior.proven_witness_fingerprint, established.proven);
-            assert!(prior.correction.is_none());
-            let record = last
-                .record()
-                .expect("the terminal page keeps the record, rebound");
-            let (correction_proof, owed) = record
-                .correction
-                .clone()
-                .expect("the new complete proof grants one correction");
-            assert_eq!(record.contract, "claude_usage_authority_quarantine:v2");
-            assert_eq!(record.proven_witness_fingerprint, proof);
-            assert_eq!(correction_proof, proof);
-            assert!(record.bound_to_retained_witness);
-            assert!(record.terminal);
-            assert_eq!(record.failed_reconstruction_count, max, "no counter reset");
-            assert_eq!(
-                record.retry_after_unix_seconds, prior.retry_after_unix_seconds,
-                "no deadline reset"
-            );
-            assert!(!owed.is_empty());
-            assert!(owed.is_subset(&family));
-            let members = record
-                .member_source_file_fingerprints
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            assert!(owed.is_subset(&members));
-            // R5 fallback: every recorded member owes, unless the terminal
-            // page itself already settled that member's captured body.
-            let settled_here = last.captured_members();
-            assert!(
-                members
-                    .difference(&owed)
-                    .all(|member| settled_here.contains(member)),
-                "hour {hour}: every recorded member owes the correction"
-            );
-            assert!(
-                record.family_pending_retained,
-                "the family's pending proof stays with its record"
-            );
-            assert!(
-                !last.fully_settled,
-                "hour {hour}: the pending correction keeps backfill and replay unsettled"
-            );
-            assert!(!held.is_empty(), "the terminal hold held real bodies");
-            let root = apc_member_session(None);
-            let line = serde_json::json!({
-                "receipt": "claude_authority_proof_correction_grant:v1",
-                "case": self.case,
-                "hour": hour,
-                "page_count": pages.len(),
-                "family_member_count": family.len(),
-                "record_member_count": members.len(),
-                "owed_member_count": owed.len(),
-                "owed_root": owed.contains(&root),
-                "owed_agent_count": owed.iter().filter(|member| **member != root).count(),
-                "settled_on_grant_page_count": members.difference(&owed).count(),
-                "pages_parsing_owed_members": pages
-                    .iter()
-                    .filter(|page| !page.parsed.is_disjoint(&owed))
-                    .count(),
-                "held_body_count": held.len(),
-            });
-            std::io::stderr()
-                .write_all(format!("{line}\n").as_bytes())
-                .expect("write grant receipt");
-            return (
-                established,
-                ApcGrant {
-                    hour,
-                    proof,
-                    record,
-                    owed,
-                    held,
-                },
+                !last
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint),
+                "hour {hour}: a held body is never ACKed"
             );
         }
-        panic!("a complete census follows the terminal authority hold");
+        let mut items = established.items.clone();
+        Self::collect_family_items(&pages, &mut items);
+        assert!(
+            items[&apc_member_session(Some(APC_AGENTS[0]))]
+                .claude_usage_request_ids
+                .contains("req_agent_a_2"),
+            "the stored witness covers the held read of the grown member"
+        );
+        // The witness and the record that owes under it are stored together:
+        // a saved witness alone would leave the held read's record unbound.
+        let mut index = ScanIndex::load(&self.index_path).expect("load the grown index");
+        assert!(
+            index.install_stored_claude_family_witness_from_support_for_test(
+                APC_ROOT,
+                items.values(),
+                &self.support,
+            )
+        );
+        index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
+        index
+            .save(&self.index_path)
+            .expect("save the owed correction");
+        let seeded = ScanIndex::load(&self.index_path).expect("reload the owed correction");
+        assert_eq!(
+            self.quarantined_index_count(),
+            0,
+            "the owed record is valid"
+        );
+        let proof = seeded
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .expect("the stored witness reloads");
+        assert_ne!(
+            proof, established.proven,
+            "the grown family has a changed witness"
+        );
+        let record = seeded
+            .claude_authority_record_for_test(APC_ROOT)
+            .expect("the owed record reloads");
+        let (correction_proof, owed) = record.correction.clone().expect("it owes a correction");
+        assert_eq!(record.contract, "claude_usage_authority_quarantine:v2");
+        assert_eq!(record.proven_witness_fingerprint, proof);
+        assert_eq!(correction_proof, proof);
+        assert!(record.bound_to_retained_witness);
+        assert!(record.terminal);
+        assert_eq!(owed, family, "every family member owes the correction");
+        (
+            established,
+            ApcGrant {
+                hour,
+                proof,
+                record,
+                owed,
+                held,
+            },
+        )
     }
 
     /// The premise of two regressions at the production `e2` gate
     /// (ON). A request-owned body never demotes, so no terminal hold grants a
     /// correction at that gate: in production an owed correction is one an
-    /// older build persisted before the flip. Two accepting generations prove
-    /// the family and deliver its bodies. A later note on agent a then changes
-    /// its body (last activity) but no request evidence, so the proof stays.
-    /// The persisted index gets that build's owed correction under the proof
-    /// (`bind_pre_flip_claude_correction_for_test`) and reloads intact.
+    /// older build persisted before the flip. The first accepting generation
+    /// delivers the family's bodies; the store then holds that build's family
+    /// witness, and a second generation settles. A later note on agent a then
+    /// changes its body (last activity) but no request evidence, so the
+    /// witness stays. The persisted index gets that build's owed correction
+    /// under the witness (`bind_pre_flip_claude_correction_for_test`) and
+    /// reloads intact.
     fn pre_flip_grant(&self) -> ApcGrant {
         let family = apc_family_sessions();
-        for hour in 8..10 {
-            self.generation(hour, |_| ApcUpload::Accept);
-        }
+        let first = self.generation(8, |_| ApcUpload::Accept);
+        let mut items = BTreeMap::new();
+        Self::collect_family_items(&first, &mut items);
+        let witness = self.store_family_witness(&items);
+        self.generation(9, |_| ApcUpload::Accept);
         let mut index = ScanIndex::load(&self.index_path).expect("load the delivered index");
         for (member, head) in Self::family_heads(&index) {
             let head = head.unwrap_or_else(|| panic!("{member} has a current head"));
@@ -1192,9 +1130,13 @@ impl ApcFixture {
             index.claude_authority_record_for_test(APC_ROOT).is_none(),
             "no record forms at the E2 gate"
         );
-        let witness = index
-            .claude_usage_family_witness_digest_for_test(APC_ROOT)
-            .expect("the family is proven");
+        assert_eq!(
+            index
+                .claude_usage_family_witness_digest_for_test(APC_ROOT)
+                .as_deref(),
+            Some(witness.as_str()),
+            "the stored witness stays"
+        );
         Self::append(
             &self.member_path(Some(APC_AGENTS[0])),
             &apc_note_line(APC_ROOT, 0),
@@ -1748,93 +1690,6 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
     );
 }
 
-/// R3 then R5 under natural proof churn: a new request after the grant makes
-/// the owed family fail under P1 (terminal, no correction, deadline kept),
-/// and that same generation's complete healthy census proves P2 and grants
-/// again with the conservative all-member fallback and no counter or deadline
-/// reset. Each proof therefore costs one more re-read of every recorded
-/// member; the receipt also records whether an unchanged-transcript member's
-/// corrected body differed between the proofs.
-#[test]
-#[serial(source_manifests)]
-fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
-    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
-
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-churn", false);
-    let (established, grant) = fixture.reach_grant();
-    fixture.append_family_request(Some(APC_AGENTS[0]), "req_agent_a_churn", 40);
-    let churn = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
-    let mut failed_at = None;
-    let mut regrant = None;
-    for (number, page) in churn.iter().enumerate() {
-        let transition = ApcFixture::check(page, &format!("churn page {number}"));
-        if transition.failed && failed_at.is_none() {
-            failed_at = Some(number);
-        }
-        if let Some(proof) = transition.granted {
-            regrant = Some((number, proof));
-        }
-    }
-    let failed_at = failed_at.expect("the owed family fails under P1");
-    let (regrant_at, p2) = regrant.expect("the complete healthy census grants P2");
-    assert!(failed_at < regrant_at);
-    assert_ne!(p2, grant.proof);
-    let record = churn[regrant_at].record().unwrap();
-    let (_, owed) = record.correction.clone().unwrap();
-    assert_eq!(
-        record.failed_reconstruction_count,
-        grant.record.failed_reconstruction_count
-    );
-    let members = record
-        .member_source_file_fingerprints
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let settled_here = churn[regrant_at].captured_members();
-    assert!(
-        members
-            .difference(&owed)
-            .all(|member| settled_here.contains(member)),
-        "R5 fallback: every recorded member owes under P2"
-    );
-    let regrant = ApcGrant {
-        hour: grant.hour + 1,
-        proof: p2,
-        owed,
-        record,
-        held: grant.held.clone(),
-    };
-    let before_p2 = ApcFixture::family_heads(&churn[regrant_at].index);
-    let (drained, _, p2_owed_parses) = fixture.drain_until_clear(&regrant, grant.hour + 2);
-    assert!(regrant.owed.is_subset(&drained));
-    // Body parity observation for members whose transcript did not change
-    // since the established heads: count-only, never a parity claim.
-    let settled = ScanIndex::load(&fixture.index_path).expect("load scan index");
-    let after_p2 = ApcFixture::family_heads(&settled);
-    let unchanged_transcript = [
-        apc_member_session(None),
-        apc_member_session(Some(APC_AGENTS[1])),
-    ];
-    let changed_bodies = unchanged_transcript
-        .iter()
-        .filter(|member| after_p2.get(*member) != established.heads.get(*member))
-        .count();
-    let line = serde_json::json!({
-        "receipt": "claude_authority_proof_correction_churn:v1",
-        "unchanged_transcript_member_count": unchanged_transcript.len(),
-        "unchanged_transcript_member_body_changed_count": changed_bodies,
-        "p2_owed_member_count": regrant.owed.len(),
-        "p2_record_member_count": regrant.record.member_source_file_fingerprints.len(),
-        "p2_owed_member_parse_count": p2_owed_parses,
-        "p2_drained_member_count": drained.len(),
-        "heads_changed_between_regrant_and_settlement": before_p2 != after_p2,
-    });
-    std::io::stderr()
-        .write_all(format!("{line}\n").as_bytes())
-        .expect("write churn receipt");
-}
-
 /// R2, CONTROLLED: the owed set is seeded (through the persisted index) to all
 /// three family members after the natural grant, to make this control independent of the natural grant distribution. With the sibling working,
 /// the root and one agent settle on their own separate pages by exact ACK or
@@ -2222,7 +2077,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 held_fingerprints: BTreeSet::new(),
                 account_deferred_fingerprints: BTreeSet::new(),
                 progress_blocking: false,
-                held_family_roots: None,
             };
             let selected = if outcome == "completed" {
                 settle_completed_upload(current, &committed, &progress, &holds)
@@ -2233,7 +2087,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                     &progress,
                     &holds,
                     outcome == "permanent",
-                    None,
                 )
             };
             assert_eq!(selected.fully_settled, expected_transport);
@@ -2454,86 +2307,6 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
                 .expect("write checkpoint receipt");
         }
     }
-}
-
-/// Real bounded pages, BASE native terminal, selected save and production load.
-#[test]
-#[serial(source_manifests)]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
-    // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
-
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "native terminal needs supported layout"
-    );
-    let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("authority-retry-native-terminal", false);
-    let established = fixture.establish();
-    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
-    fixture.retain_native_terminal.set(true);
-    // New real request cannot reconstruct from W0; paired evidence lets the
-    // next raw-complete native terminal prove W1 despite the withheld census.
-    fixture.append_family_request(Some(APC_AGENTS[0]), "req_recovered", 4);
-    for number in 0..APC_MAX_PAGES {
-        let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
-        // Select the native terminal that sees the RetryPending record; the
-        // ordinary census before its fold must then be withheld (before the
-        // path-(a) bridge through the sweep mark, since then through the debt
-        // itself), so only the native fold can re-prove the family.
-        let target = fixture.native_terminal_seen.get()
-            && page.record_before().is_some_and(|record| !record.terminal);
-        if !target {
-            fixture.assert_durable(&page, 10);
-            continue;
-        }
-        assert!(number > 0);
-        assert!(
-            !fixture.census_before_fold.get(),
-            "the ordinary census before the native fold is withheld"
-        );
-        assert!(page.parsed.is_disjoint(&apc_family_sessions()));
-        let before = page.record_before().unwrap();
-        assert!(before.bound_to_retained_witness);
-        assert_eq!(before.proven_witness_fingerprint, established.proven);
-        assert_eq!(
-            fixture.quarantined_index_count(),
-            0,
-            "withheld native terminal must not quarantine the whole index"
-        );
-        assert!(page.index.generation > 0);
-        let record = page.record().expect("RetryPending record survives reproof");
-        assert!(record.bound_to_retained_witness);
-        assert_ne!(record.proven_witness_fingerprint, established.proven);
-        assert_eq!(
-            record.failed_reconstruction_count,
-            before.failed_reconstruction_count
-        );
-        assert_eq!(
-            record.retry_after_unix_seconds,
-            before.retry_after_unix_seconds
-        );
-        assert_eq!(
-            record.member_source_file_fingerprints,
-            before.member_source_file_fingerprints
-        );
-        assert!(
-            record.correction.is_none(),
-            "held bodies earn no correction grant"
-        );
-        assert_eq!(
-            page.index.snapshot_unproven_terminal_count(),
-            page.before.snapshot_unproven_terminal_count()
-        );
-        let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
-        assert_eq!(reloaded.generation, page.index.generation);
-        fixture.assert_durable(&page, 10);
-        return;
-    }
-    panic!("PRECONDITION_NOT_REACHED: withheld raw-complete native terminal with RetryPending");
 }
 
 /// CONTROLLED: after a natural authority record forms, its persisted binding
@@ -2824,16 +2597,75 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     }
 }
 
-/// `e2` flip, returning tombstoned family (the tombstone formed
-/// before the flip). Gate on, each returning member's request-owned body
-/// replaces its session: offered and ACKed exactly once (no double count),
-/// the tombstone clears with that publication and no authority record is
-/// left; a quiet generation offers nothing again.
+/// [money] A family returns after retirement under a bound authority record:
+/// read while its evidence is unhealthy, held with nothing offered, then
+/// waiting unread and unindexed through a whole traversal while unchanged.
+/// After the evidence is repaired, each member is offered and ACKed exactly
+/// once (no double count) and no record is left. A quiet traversal after the
+/// accepted upload reads and offers nothing. The money matches a cold Full,
+/// with and without a restart before the return.
 #[test]
 #[serial(source_manifests)]
-fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
+fn returning_family_under_its_authority_record_publishes_once() {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
     let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("e2-tombstone-returns", false);
+    let cold = {
+        let fixture = ApcFixture::new("authority-returns-cold", false);
+        ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
+        apc_family_money(&fixture.generation(8, |_| ApcUpload::Accept))
+    };
+    let ram = apc_returning_family("authority-returns-ram", false);
+    let restart = apc_returning_family("authority-returns-restart", true);
+    money_oracle::assert_equivalent(&cold, &ram);
+    money_oracle::assert_equivalent(&cold, &restart);
+    for session in &apc_family_sessions() {
+        money_oracle::assert_no_smaller_reemit(session, &cold, &ram, &cold, false);
+        money_oracle::assert_no_smaller_reemit(session, &cold, &restart, &cold, false);
+    }
+}
+
+/// The money of the family bodies the server ACKed across `pages`, one per
+/// member.
+fn apc_family_money(
+    pages: &[ApcPage],
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let family = apc_family_sessions();
+    let last = pages.last().expect("a page");
+    let mut scan = last.scan.clone();
+    scan.snapshots = pages
+        .iter()
+        .flat_map(|page| {
+            page.scan.snapshots.iter().filter(|item| {
+                family.contains(&item.source_session_id)
+                    && page.uploaded.contains(&item.snapshot_fingerprint)
+            })
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        scan.snapshots.len(),
+        family.len(),
+        "one ACKed body per member"
+    );
+    // The routes run at different synthetic page clocks. `collected_at` is
+    // that clock, not money, so the compared bodies share one.
+    for item in &mut scan.snapshots {
+        item.collected_at = "2026-08-02T08:00:00Z".to_string();
+    }
+    crate::snapshots::sampled_scan::transition_fixture::scan_money(
+        SnapshotSource::ClaudeCode,
+        &last.index,
+        &scan,
+    )
+}
+
+/// One returning-family lifecycle with uploads accepted; `restart` restarts
+/// the process before the return. Returns the money of the returned bodies.
+fn apc_returning_family(
+    case: &'static str,
+    restart: bool,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let fixture = ApcFixture::new(case, false);
     let family = apc_family_sessions();
     let api = fixture.sidecar_path("claude-code-effort");
     let mut hour = 10;
@@ -2855,20 +2687,12 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         panic!("PRECONDITION_NOT_REACHED: {label}");
     };
 
-    // Before the flip: an unlisted baseline, then the real list names the
-    // family (`establish`), and the listed family is held, removed and
-    // retired as absent.
+    // The family is established and listed, then its members are removed
+    // until a complete traversal retires their keys.
     let established = fixture.establish();
-    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
     crate::snapshots::restart_claude_reemission_stop_for_test();
     fixture.page_files.set(16);
-    let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
-    fixture.corrupt_api_sidecar();
     ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
-    pages_until("a RetryPending hold", &|page| {
-        page.record()
-            .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
-    });
     let members = std::iter::once(None)
         .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
         .map(|agent| {
@@ -2880,30 +2704,28 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     for (path, _) in &members {
         std::fs::remove_file(path).expect("remove the family member");
     }
-    let retired = pages_until("the absent family retires", &|page| {
-        page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    let retired = pages_until("the absent family's keys are gone", &|page| {
+        ApcFixture::family_keys(&page.index).is_empty()
     });
-    // The tombstone keeps the proven witness and no
-    // member key is left.
     let retired = retired.last().expect("retiring page");
+    assert!(retired.record().is_none());
     assert_eq!(
         retired
             .index
             .claude_usage_family_witness_digest_for_test(APC_ROOT)
             .as_deref(),
         Some(established.proven.as_str()),
-        "the tombstone keeps the proven witness"
+        "retirement keeps the proven witness"
     );
-    assert!(ApcFixture::family_keys(&retired.index).is_empty());
 
-    // Before the list removal, the members return
-    // under unhealthy evidence. They are read through the authority path,
-    // never skipped, held with nothing offered, and a bounded RetryPending
-    // record re-forms against the same witness; the tombstone stays.
+    // The members return under unhealthy evidence. They are read, held with
+    // nothing offered, and a bounded RetryPending record forms against the
+    // same witness.
+    let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
+    fixture.corrupt_api_sidecar();
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
     }
-    let hits_before = crate::snapshots::claude_absence_counters_for_test().tombstone_hits;
     let held = pages_until("the returning family is held", &|page| {
         page.record()
             .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
@@ -2911,17 +2733,8 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let mut parsed = BTreeSet::new();
     for page in &held {
         parsed.extend(page.parsed.intersection(&family).cloned());
-        assert!(
-            family
-                .iter()
-                .all(|session| !page.offered_bodies.contains_key(session)),
-            "nothing is offered before the proof"
-        );
     }
-    assert_eq!(
-        parsed, family,
-        "every returning member is read, never skipped"
-    );
+    assert_eq!(parsed, family, "every returning member is read");
     let record = held.last().unwrap().record().unwrap();
     assert_eq!(record.proven_witness_fingerprint, established.proven);
     assert_eq!(record.failed_reconstruction_count, 1);
@@ -2933,40 +2746,71 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
             .collect::<BTreeSet<_>>(),
         family
     );
-    assert!(held
-        .last()
-        .unwrap()
-        .index
-        .claude_family_tombstoned_for_test(APC_ROOT));
-    assert!(
-        crate::snapshots::claude_absence_counters_for_test().tombstone_hits > hits_before,
-        "the return is counted"
-    );
+
+    // Under the record, the unchanged held members stay unindexed and wait:
+    // a whole traversal neither reads nor offers them.
+    let waited = pages_until("a traversal under the record ends", &|page| {
+        !page.index.scan_traversal_in_progress_for_test()
+    });
+    for page in &waited {
+        assert!(
+            ApcFixture::family_keys(&page.index).is_empty(),
+            "the held bodies stay unindexed"
+        );
+        assert!(
+            page.parsed.is_disjoint(&family),
+            "an unchanged held member waits for its record"
+        );
+        assert_eq!(page.record().as_ref(), Some(&record), "the record holds");
+    }
+    if restart {
+        crate::snapshots::restart_claude_reemission_stop_for_test();
+    }
+
+    // The list is cleared and the evidence repaired; the members return.
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
-
-    // After the flip: the family returns.
-
     std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
     }
-    let returned = pages_until("the tombstone clears", &|page| {
-        !page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    let returned = pages_until("the record settles", &|page| {
+        page.record().is_none() && ApcFixture::family_keys(&page.index).len() == family.len()
     });
-    let mut offers = BTreeMap::<String, usize>::new();
-    for page in &returned {
-        for item in page
-            .scan
+    for item in returned.iter().flat_map(|page| {
+        page.scan
             .snapshots
             .iter()
             .filter(|item| family.contains(&item.source_session_id))
-        {
-            assert_eq!(
-                item.usage_accounting_contract.as_deref(),
-                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
-                "a returning body is request-owned"
-            );
-        }
+    }) {
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+            "a returning body is request-owned"
+        );
+    }
+    let last = returned.last().unwrap();
+    for item in last
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| family.contains(&item.source_session_id))
+    {
+        assert!(last.uploaded.contains(&item.snapshot_fingerprint));
+    }
+
+    // After the accepted upload, a quiet traversal reads and offers nothing.
+    let quiet = pages_until("a quiet traversal ends", &|page| {
+        !page.index.scan_traversal_in_progress_for_test()
+    });
+    for page in &quiet {
+        assert!(page.record().is_none());
+        assert!(
+            page.parsed.is_disjoint(&family),
+            "an accepted member is not read again"
+        );
+    }
+    let mut offers = BTreeMap::<String, usize>::new();
+    for page in held.iter().chain(&waited).chain(&returned).chain(&quiet) {
         for session in page.offered_bodies.keys().filter(|s| family.contains(*s)) {
             *offers.entry(session.clone()).or_default() += 1;
         }
@@ -2976,28 +2820,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         family.iter().map(|session| (session.clone(), 1)).collect(),
         "each returning member is offered exactly once"
     );
-    let last = returned.last().unwrap();
-    assert!(last.record().is_none(), "no authority record is left");
-    for item in last
-        .scan
-        .snapshots
-        .iter()
-        .filter(|item| family.contains(&item.source_session_id))
-    {
-        assert!(last.uploaded.contains(&item.snapshot_fingerprint));
-    }
-    assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
-    let quiet = pages_until("a quiet traversal ends", &|page| {
-        !page.index.scan_traversal_in_progress_for_test()
-    });
-    for page in &quiet {
-        assert!(!page.index.claude_family_tombstoned_for_test(APC_ROOT));
-        assert!(page.record().is_none());
-        assert!(
-            page.offered_bodies.keys().all(|s| !family.contains(s)),
-            "nothing is offered again"
-        );
-    }
+    apc_family_money(&returned)
 }
 
 /// The R2 invariant, strictly: every member this page drained certifies the

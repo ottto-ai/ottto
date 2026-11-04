@@ -1,12 +1,10 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
-    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ClaudeAbsenceCounters, ScanIndex,
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +29,6 @@ struct Previous {
     max_unread_bytes: u64,
 }
 
-fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 #[derive(Serialize)]
 pub(super) struct Starting {
     event: &'static str,
@@ -44,50 +38,15 @@ pub(super) struct Starting {
     context_matches: bool,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
-    prior_held_family_roots: usize,
-    prior_held_family_set_digest: Option<String>,
     /// Fixed names of the paths that set `prior_unsettled_upload`. Empty
     /// exactly when it is false.
     prior_unsettled_causes: Vec<&'static str>,
     previous: Option<Previous>,
     new_retry_attempt: u8,
-    pub(super) stale_pending_families: usize,
-    pub(super) rearmed_index_files: usize,
-    pub(super) carried_pending_families: usize,
-    pub(super) carried_index_files: usize,
-    /// Fix 2: stale families whose pending came from a full-rearm window,
-    /// how many of them were carried, the files of the rest re-read whole,
-    /// and the families and files the per-deadline cap kept without reparse.
-    /// Omitted while zero, so every other start row keeps its bytes.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) rearm_window_families: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) rearm_window_carried_families: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) rearm_window_rearmed_files: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) rearm_window_rearmed_families: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) stale_rearm_capped_families: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(super) stale_rearm_capped_files: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
 impl Starting {
-    /// This start's re-arm owes evidence (keeps the fingerprint): only the
-    /// terminal-unhealthy retry.
-    pub(super) fn owes(&self) -> bool {
-        super::evidence_owed::owes(self.rearm_cause())
-    }
-    pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
-        use crate::local_resource_diagnostics::rearm_cause::Cause;
-        match self.reason {
-            StartReason::NoRetainedTraversal => Cause::NoRetainedTraversal,
-            StartReason::ContextChanged => Cause::ContextChanged,
-            StartReason::TerminalUnhealthyRetry => Cause::TerminalUnhealthyRetry,
-        }
-    }
     /// Called only AFTER the existing resume/backoff early return. Thus a
     /// retained matching traversal reached the real terminal-unhealthy retry.
     pub(super) fn capture(
@@ -109,14 +68,7 @@ impl Starting {
             counts: t.counts.clone(),
             max_unread_bytes: t.counts.max_unread_bytes,
         });
-        let (prior_held_family_roots, prior_held_family_set_digest) = prior_held_family_observation(
-            (source == SnapshotSource::ClaudeCode)
-                .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
-                .flatten(),
-        );
         Self {
-            prior_held_family_roots,
-            prior_held_family_set_digest,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
             event: "starting",
             reason: match (previous.is_some(), matches) {
@@ -132,38 +84,12 @@ impl Starting {
             prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
             previous,
             new_retry_attempt: attempt,
-            stale_pending_families: 0,
-            rearmed_index_files: 0,
-            carried_pending_families: 0,
-            carried_index_files: 0,
-            rearm_window_families: 0,
-            rearm_window_carried_families: 0,
-            rearm_window_rearmed_files: 0,
-            rearm_window_rearmed_families: 0,
-            stale_rearm_capped_families: 0,
-            stale_rearm_capped_files: 0,
         }
     }
 
     pub(super) fn emit(&self, source: SnapshotSource) {
         crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
     }
-}
-
-/// Hash only the persisted canonical digest set, never raw roots. BTreeSet
-/// supplies sorted order; fixed-width entries need no separator. Invalid or
-/// unknown scope has no digest, matching the existing scope reader's trust.
-fn prior_held_family_observation(roots: Option<&BTreeSet<String>>) -> (usize, Option<String>) {
-    let Some(roots) = roots.filter(|roots| super::held_family_scope_has_writer_shape(roots)) else {
-        return (0, None);
-    };
-    let mut digest = Sha256::new();
-    for root in roots {
-        digest.update(root.as_bytes());
-    }
-    let mut hex = format!("{:x}", digest.finalize());
-    hex.truncate(16);
-    (roots.len(), Some(hex))
 }
 
 #[derive(Serialize)]
@@ -181,7 +107,6 @@ pub(super) fn retiring(
     traversal: &ScanTraversalCheckpoint,
     raw_complete: bool,
     unsettled_causes: u16,
-    absence: Option<(ClaudeAbsenceCounters, bool)>,
     gates: CensusGates,
 ) {
     #[derive(Serialize)]
@@ -197,28 +122,6 @@ pub(super) fn retiring(
         counts: &'a ScanTraversalCounts,
         max_unread_bytes: u64,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
-        /// Claude only: path-(a) absence retirement process totals, and the
-        /// index's tombstone uncertainty fence.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_retry_pending_retired: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_hits: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        retirements_refused: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tombstone_decode_drops: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstones_cleared: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_capacity_refusals: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_uncertain: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tombstone_fence_raised_on_upgrade: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_aged_out: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fence_lowering_skipped_scratch_fallback: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -244,20 +147,6 @@ pub(super) fn retiring(
             counts: &traversal.counts,
             max_unread_bytes: traversal.counts.max_unread_bytes,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
-            absent_retry_pending_retired: absence.map(|(counts, _)| counts.absent_families_retired),
-            absent_family_tombstone_hits: absence.map(|(counts, _)| counts.tombstone_hits),
-            retirements_refused: absence.map(|(counts, _)| counts.retirements_refused),
-            tombstone_decode_drops: absence.map(|(counts, _)| counts.tombstone_decode_drops),
-            absent_family_tombstones_cleared: absence.map(|(counts, _)| counts.tombstones_cleared),
-            absent_family_tombstone_capacity_refusals: absence
-                .map(|(counts, _)| counts.tombstone_capacity_refusals),
-            absent_family_tombstone_uncertain: absence.map(|(_, uncertain)| uncertain),
-            tombstone_fence_raised_on_upgrade: absence
-                .map(|(counts, _)| counts.tombstone_fence_raised_on_upgrade),
-            absent_family_tombstone_aged_out: absence
-                .map(|(counts, _)| counts.absent_family_tombstone_aged_out),
-            fence_lowering_skipped_scratch_fallback: absence
-                .map(|(counts, _)| counts.fence_lowering_skipped_scratch_fallback),
         },
     );
 }
@@ -276,46 +165,6 @@ mod tests {
 
     fn start(index: &mut ScanIndex, now: &str, days: u64) -> Vec<Value> {
         capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days)).1
-    }
-
-    #[test]
-    fn prior_held_family_digest_tracks_only_the_canonical_set() {
-        let a = "a".repeat(32);
-        let b = "b".repeat(32);
-        let first = BTreeSet::from([a.clone(), b.clone()]);
-        let reversed = BTreeSet::from([b, a.clone()]);
-        let observed = prior_held_family_observation(Some(&first));
-        assert_eq!(observed.0, 2);
-        assert_eq!(observed.1.as_ref().unwrap().len(), 16);
-        assert_eq!(observed, prior_held_family_observation(Some(&reversed)));
-        assert_ne!(
-            observed.1,
-            prior_held_family_observation(Some(&BTreeSet::from([a]))).1
-        );
-        assert_eq!(prior_held_family_observation(None), (0, None));
-        assert_eq!(
-            prior_held_family_observation(Some(&BTreeSet::new())),
-            (0, None)
-        );
-        assert_eq!(
-            prior_held_family_observation(Some(&BTreeSet::from(["not canonical".into()]))),
-            (0, None)
-        );
-        let mut index = ScanIndex::default();
-        index.claude_full_rearm_progress.held_family_roots = Some(first);
-        let row = serde_json::to_value(Starting::capture(
-            SnapshotSource::ClaudeCode,
-            &index,
-            T1,
-            true,
-            1,
-        ))
-        .unwrap();
-        assert_eq!(row["prior_held_family_roots"], 2);
-        assert_eq!(row["prior_held_family_set_digest"], observed.1.unwrap());
-        let other = Starting::capture(SnapshotSource::Pi, &index, T1, true, 1);
-        assert_eq!(other.prior_held_family_roots, 0);
-        assert!(other.prior_held_family_set_digest.is_none());
     }
 
     #[test]
@@ -400,59 +249,6 @@ mod tests {
                 .malformed_json_line_count,
             0
         );
-    }
-
-    #[test]
-    fn traversal_transition_actual_stale_rearm_is_counted_without_content() {
-        let mut index = ScanIndex::default();
-        let key = "/not-logged/private-session.jsonl";
-        index.files.insert(
-            key.into(),
-            serde_json::from_value(json!({
-                "size_bytes": 1, "modified_unix_seconds": 0,
-                "source_file_fingerprint": "private-body-witness",
-                "last_snapshot_fingerprint": null
-            }))
-            .unwrap(),
-        );
-        index.claude_usage_family_pending.insert(
-            "private-session".into(),
-            super::super::ClaudeUsageFamilyPending {
-                census_window_end: T0.into(),
-                member_request_id_hashes: Default::default(),
-                member_occurrences: Default::default(),
-                invalid: false,
-                idless_revision: None,
-                identity_contract: None,
-                contract_unproven: false,
-            },
-        );
-        index.bounded_sweep_had_unsettled_upload = true;
-        let (_, rows) = capture(|| {
-            ensure_bounded_traversal(
-                SnapshotSource::ClaudeCode,
-                &[],
-                &mut index,
-                T1,
-                BACKFILL_WINDOW_DAYS,
-            )
-        });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["source"], "claude_code");
-        assert_eq!(rows[0]["counts"]["prior_unsettled_upload"], true);
-        assert_eq!(rows[0]["counts"]["stale_pending_families"], 1);
-        assert_eq!(rows[0]["counts"]["rearmed_index_files"], 1);
-        assert!(index.files[key].source_file_fingerprint.is_empty());
-        assert!(!index.bounded_sweep_had_unsettled_upload);
-        assert!(rows[0]["counts"]["previous"].is_null());
-        assert_eq!(rows[0]["stage"], "bounded_traversal_transition");
-        let serialized = rows[0].to_string();
-        for forbidden in [key, "private-session", "private-body-witness"] {
-            assert!(!serialized.contains(forbidden));
-        }
-        assert!(rows[0]["observation"]["shared_process_cpu_delta_us"].is_null());
-        assert!(rows[0]["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(rows[0]["process_id"].is_u64());
     }
 
     #[test]
@@ -718,7 +514,7 @@ mod tests {
     }
 
     /// The causes are diagnostics only. An index that differs only in them
-    /// takes the same census, start, carry and epoch decisions.
+    /// takes the same census, start and epoch decisions.
     #[test]
     fn unsettled_causes_alone_change_no_gate() {
         // Terminal: no clean follow-up is owed for causes without the flag.
@@ -776,7 +572,7 @@ mod tests {
             );
         }
 
-        // Claude start: the stale-family re-arm and carry read the flag only.
+        // Claude start: the start reads the flag only.
         for flag in [false, true] {
             let mut plain = ScanIndex::default();
             plain.files.insert(
@@ -787,18 +583,6 @@ mod tests {
                     "last_snapshot_fingerprint": null
                 }))
                 .unwrap(),
-            );
-            plain.claude_usage_family_pending.insert(
-                "private-session".into(),
-                super::super::ClaudeUsageFamilyPending {
-                    census_window_end: T0.into(),
-                    member_request_id_hashes: Default::default(),
-                    member_occurrences: Default::default(),
-                    invalid: false,
-                    idless_revision: None,
-                    identity_contract: None,
-                    contract_unproven: false,
-                },
             );
             plain.bounded_sweep_had_unsettled_upload = flag;
             let mut tagged = with_unsettled_causes(&plain, u16::MAX);
@@ -815,14 +599,7 @@ mod tests {
                 });
                 let counts = &rows[0]["counts"];
                 outcomes.push((
-                    [
-                        "prior_unsettled_upload",
-                        "stale_pending_families",
-                        "rearmed_index_files",
-                        "carried_pending_families",
-                        "carried_index_files",
-                    ]
-                    .map(|field| counts[field].clone()),
+                    counts["prior_unsettled_upload"].clone(),
                     without_unsettled_causes(index),
                 ));
             }
@@ -982,10 +759,6 @@ mod tests {
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
             assert_eq!(starting.prior_unsettled_causes.len(), 10);
             starting.retry_due = Some(false);
-            starting.stale_pending_families = usize::MAX;
-            starting.rearmed_index_files = usize::MAX;
-            starting.carried_pending_families = usize::MAX;
-            starting.carried_index_files = usize::MAX;
             starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
             let previous = starting.previous.as_mut().unwrap();
             previous.window_unix_seconds = Some(u64::MAX);
@@ -1007,21 +780,6 @@ mod tests {
                     index.traversal.as_ref().unwrap(),
                     true,
                     u16::MAX,
-                    // `false` is the longer spelling of the fence state.
-                    (source == SnapshotSource::ClaudeCode).then_some((
-                        ClaudeAbsenceCounters {
-                            absent_families_retired: u64::MAX,
-                            tombstone_hits: u64::MAX,
-                            retirements_refused: u64::MAX,
-                            tombstone_decode_drops: u64::MAX,
-                            tombstones_cleared: u64::MAX,
-                            tombstone_capacity_refusals: u64::MAX,
-                            tombstone_fence_raised_on_upgrade: u64::MAX,
-                            absent_family_tombstone_aged_out: u64::MAX,
-                            fence_lowering_skipped_scratch_fallback: u64::MAX,
-                        },
-                        false,
-                    )),
                     CensusGates {
                         clean_followup: true,
                         ..Default::default()
@@ -1039,128 +797,5 @@ mod tests {
             );
             assert_complete_max_row(rows[0].clone());
         }
-    }
-    // The Claude retiring row names every absence total
-    // and the fence state with their values (and the upgrade fence
-    // count, the aged-out tombstone and refused-drain
-    // counts); other sources omit them all.
-    #[test]
-    fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
-        const NAMES: [&str; 10] = [
-            "absent_retry_pending_retired",
-            "absent_family_tombstone_hits",
-            "retirements_refused",
-            "tombstone_decode_drops",
-            "absent_family_tombstones_cleared",
-            "absent_family_tombstone_capacity_refusals",
-            "absent_family_tombstone_uncertain",
-            "tombstone_fence_raised_on_upgrade",
-            "absent_family_tombstone_aged_out",
-            "fence_lowering_skipped_scratch_fallback",
-        ];
-        for source in [
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Pi,
-        ] {
-            for uncertain in [false, true] {
-                let mut index = ScanIndex::default();
-                ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
-                let (_, rows) = capture(|| {
-                    retiring(
-                        source,
-                        7,
-                        index.traversal.as_ref().unwrap(),
-                        true,
-                        0,
-                        (source == SnapshotSource::ClaudeCode).then_some((
-                            ClaudeAbsenceCounters {
-                                absent_families_retired: 1,
-                                tombstone_hits: 2,
-                                retirements_refused: 3,
-                                tombstone_decode_drops: 4,
-                                tombstones_cleared: 5,
-                                tombstone_capacity_refusals: 6,
-                                tombstone_fence_raised_on_upgrade: 8,
-                                absent_family_tombstone_aged_out: 9,
-                                fence_lowering_skipped_scratch_fallback: 10,
-                            },
-                            uncertain,
-                        )),
-                        CensusGates::default(),
-                    )
-                });
-                assert_eq!(rows.len(), 1);
-                let counts = &rows[0]["counts"];
-                if source == SnapshotSource::ClaudeCode {
-                    for (name, value) in NAMES.iter().zip(1..) {
-                        if *name == "absent_family_tombstone_uncertain" {
-                            assert_eq!(counts[*name], json!(uncertain), "{name}");
-                        } else {
-                            assert_eq!(counts[*name], json!(value), "{name}");
-                        }
-                    }
-                } else {
-                    for name in NAMES {
-                        assert!(counts.get(name).is_none(), "{source:?}: {name}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Fix 2's start counts are omitted while zero, so every other start row
-    /// keeps its bytes, and at maximum width the row stays within budget.
-    #[test]
-    fn full_rearm_window_start_counts_are_omitted_at_zero_and_bounded() {
-        const FIELDS: [&str; 6] = [
-            "rearm_window_families",
-            "rearm_window_carried_families",
-            "rearm_window_rearmed_files",
-            "rearm_window_rearmed_families",
-            "stale_rearm_capped_families",
-            "stale_rearm_capped_files",
-        ];
-        let source = SnapshotSource::ClaudeCode;
-        let mut index = ScanIndex::default();
-        ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
-        let (_, rows) = capture(|| Starting::capture(source, &index, T1, true, 1).emit(source));
-        for field in FIELDS {
-            assert!(rows[0]["counts"].get(field).is_none(), "{field}");
-        }
-
-        index.generation = u64::MAX;
-        index.traversal.as_mut().unwrap().counts = max_traversal_counts();
-        let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
-        starting.context_matches = false;
-        starting.prior_unsettled_upload = false;
-        starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
-        starting.retry_due = Some(false);
-        starting.stale_pending_families = usize::MAX;
-        starting.rearmed_index_files = usize::MAX;
-        starting.carried_pending_families = usize::MAX;
-        starting.carried_index_files = usize::MAX;
-        starting.rearm_window_families = usize::MAX;
-        starting.rearm_window_carried_families = usize::MAX;
-        starting.rearm_window_rearmed_files = usize::MAX;
-        starting.rearm_window_rearmed_families = usize::MAX;
-        starting.stale_rearm_capped_families = usize::MAX;
-        starting.stale_rearm_capped_files = usize::MAX;
-        starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
-        let previous = starting.previous.as_mut().unwrap();
-        previous.window_unix_seconds = Some(u64::MAX);
-        previous.pending_directories = usize::MAX;
-        previous.pending_candidates = usize::MAX;
-        previous.retry_attempt = u8::MAX;
-        previous.retry_not_before_unix_seconds = Some(u64::MAX);
-        previous.watcher_overflow = false;
-        previous.retryable_problems = false;
-        previous.unsettled_residue = false;
-        let (_, rows) = capture(|| starting.emit(source));
-        assert_eq!(rows.len(), 1);
-        for field in FIELDS {
-            assert_eq!(rows[0]["counts"][field], json!(usize::MAX), "{field}");
-        }
-        assert_complete_max_row(rows[0].clone());
     }
 }

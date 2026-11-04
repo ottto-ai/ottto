@@ -26,12 +26,11 @@ use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
+    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
 const WATERMARK_RETENTION_DAYS: i64 = 90;
-const MAX_WATERMARKS: usize = 5_000;
 const MAX_ACTIVE_SESSIONS: usize = 100;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,7 +63,6 @@ pub fn reconcile_active_sessions(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
-    _upload_policy: SnapshotUploadPolicy,
     scan_started_at: Option<&str>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
@@ -171,22 +169,6 @@ fn reconcile_with_registrations(
             .map(|timestamp| timestamp >= watermark_cutoff)
             .unwrap_or(false)
     });
-    if cache.watermarks.len() > MAX_WATERMARKS {
-        let mut newest = cache
-            .watermarks
-            .iter()
-            .map(|(session_id, timestamp)| (timestamp.clone(), session_id.clone()))
-            .collect::<Vec<_>>();
-        newest.sort_by(|left, right| right.cmp(left));
-        newest.truncate(MAX_WATERMARKS);
-        let keep = newest
-            .into_iter()
-            .map(|(_, session_id)| session_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        cache
-            .watermarks
-            .retain(|session_id, _| keep.contains(session_id));
-    }
 
     let changed_session_count = changed.len() as u64;
     let mut sessions = changed.into_values().collect::<Vec<_>>();
@@ -364,9 +346,13 @@ fn active_session_from_snapshot(
         bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
     let (latest_model, latest_reasoning_effort) = latest_model_identity(snapshot);
     let (current_account, account_history) = session_accounts(source, snapshot);
+    let session_kind = active_session_kind(source, snapshot);
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
-        session_display_name: snapshot.session_display_name.clone(),
+        session_display_name: snapshot
+            .session_display_name
+            .clone()
+            .or_else(|| codex_prompt_prefix_title(source, snapshot, session_kind.as_deref())),
         source_started_at: snapshot
             .source_started_at
             .as_deref()
@@ -408,7 +394,7 @@ fn active_session_from_snapshot(
         unattributed_total_tokens: (snapshot.unattributed_total_tokens > 0)
             .then_some(snapshot.unattributed_total_tokens),
         input_token_scope: snapshot.provenance.input_token_scope.clone(),
-        session_kind: active_session_kind(source, snapshot),
+        session_kind,
         provider_surface: active_session_provider_surface(source, snapshot),
         account_identifier_hash: attribution
             .as_ref()
@@ -428,6 +414,28 @@ fn active_session_from_snapshot(
         current_account,
         account_history,
     }
+}
+
+/// Display-only name for an unnamed Codex session: its existing prompt-prefix
+/// label through the first-prompt title filter. Never written to the snapshot,
+/// so uploads and fingerprints are unchanged. Subagents stay unnamed.
+fn codex_prompt_prefix_title(
+    source: SnapshotSource,
+    snapshot: &SnapshotItem,
+    session_kind: Option<&str>,
+) -> Option<String> {
+    if source != SnapshotSource::Codex || session_kind == Some("subagent") {
+        return None;
+    }
+    snapshot
+        .attribution_facts
+        .iter()
+        .find(|fact| {
+            fact.field == "template_group_id"
+                && fact.display_label_source.as_deref() == Some("prompt_prefix")
+        })
+        .and_then(|fact| fact.display_label.clone())
+        .and_then(crate::snapshots::prompt_prefix_display_title)
 }
 
 /// The account of the session's newest own request and its usage per
@@ -1035,6 +1043,7 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshots::SnapshotUploadPolicy;
     use ottto_protocol::{
         AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation,
         AgentStatusState,
@@ -1102,7 +1111,6 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1361,6 +1369,57 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// [regress] A headless Codex run's stored title is its whole first message,
+    /// which the title filter rejects, so the row had only its folder. The row
+    /// now shows the existing prompt-prefix label through the same filter.
+    /// Native names win, subagents and other sources stay unnamed, and the
+    /// snapshot (upload body and fingerprint) is untouched.
+    #[test]
+    fn unnamed_codex_rows_show_filtered_prompt_prefix_label_without_touching_upload() {
+        use SnapshotSource::{ClaudeCode, Codex, Pi};
+        let clean = "Fix the  flaky sync retry";
+        let shown = Some("Fix the flaky sync retry");
+        let cases = [
+            (Codex, None, "exec", clean, shown),
+            (Codex, None, "exec", "You are a release worker", None),
+            (Codex, None, "exec", "Continue the same session", None),
+            (Codex, None, "exec", "Read AGENTS.md instructions", None),
+            (Codex, Some("Native"), "exec", clean, Some("Native")),
+            (Codex, None, "subagent", clean, None),
+            (ClaudeCode, None, "cli", clean, None),
+            (Pi, None, "cli", clean, None),
+        ];
+        for (source, native, origin, label, expected) in cases {
+            let dir = temp_dir("codex-prefix-title");
+            let mut snapshot = test_snapshot("unnamed-session", "2026-07-19T10:04:00Z");
+            snapshot.session_display_name = native.map(str::to_string);
+            snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+                source: (origin != "subagent").then(|| origin.to_string()),
+                thread_source: (origin == "subagent").then(|| origin.to_string()),
+                ..Default::default()
+            });
+            let mut fact = direct_fact("template_group_id", "template-group");
+            fact.display_label = Some(label.to_string());
+            fact.display_label_source = Some("prompt_prefix".to_string());
+            snapshot.attribution_facts = vec![fact];
+            let upload_body = serde_json::to_vec(&snapshot).unwrap();
+            let result = reconcile_with_registrations(
+                &dir,
+                source,
+                std::slice::from_ref(&snapshot),
+                None,
+                None,
+                "2026-07-19T10:05:00Z",
+                Some("policy"),
+                BTreeMap::new,
+            )
+            .unwrap();
+            assert_eq!(result.sessions[0].session_display_name.as_deref(), expected);
+            assert_eq!(serde_json::to_vec(&snapshot).unwrap(), upload_body);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn missing_registrations_preserve_transcript_fallback_and_never_create_active_rows() {
         let dir = temp_dir("registration-missing");
@@ -1410,6 +1469,36 @@ mod tests {
     }
 
     #[test]
+    fn watermarks_expire_by_age_only() {
+        let dir = temp_dir("watermark-age");
+        let path = active_session_cache_path(&dir, SnapshotSource::ClaudeCode);
+        let mut cache = ActiveSessionCache::default();
+        for index in 0..5_001 {
+            cache.watermarks.insert(
+                format!("recent-{index}"),
+                "2026-07-01T00:00:00Z".to_string(),
+            );
+        }
+        cache
+            .watermarks
+            .insert("expired".to_string(), "2026-04-01T00:00:00Z".to_string());
+        write_cache(&path, &cache).unwrap();
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            None,
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        let cache = read_cache(&path);
+        assert_eq!(cache.watermarks.len(), 5_001);
+        assert!(!cache.watermarks.contains_key("expired"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn long_scan_keeps_activity_seen_after_scan_start_and_advances_watermark() {
         let dir = temp_dir("long-scan");
         let snapshot = test_snapshot("live", "2026-07-19T10:06:00Z");
@@ -1422,7 +1511,6 @@ mod tests {
                 test_snapshot("future", "2026-07-19T10:46:00Z"),
             ],
             None,
-            test_policy(),
             Some("2026-07-19T10:00:00Z"),
             "2026-07-19T10:40:00Z",
         )
@@ -1466,7 +1554,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1502,7 +1589,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1514,7 +1600,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:10:00Z",
         )
@@ -1533,7 +1618,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&busy),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1546,7 +1630,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:15:00Z",
         )
@@ -1561,7 +1644,6 @@ mod tests {
             SnapshotSource::Codex,
             &[busy.clone(), other],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:17:00Z",
         )
@@ -1580,7 +1662,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:20:00Z",
         )
@@ -1604,7 +1685,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1614,16 +1694,11 @@ mod tests {
         // The workspace disabled titles; the re-read snapshot carries none.
         let mut stripped = snapshot.clone();
         stripped.session_display_name = None;
-        let policy = SnapshotUploadPolicy {
-            session_titles_enabled: false,
-            ..test_policy()
-        };
         let rebuilt = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             &[stripped],
             None,
-            policy,
             None,
             "2026-07-19T10:08:00Z",
         )
@@ -1645,10 +1720,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                ..test_policy()
-            },
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1667,16 +1738,11 @@ mod tests {
             },
         );
         assert!(uploaded[0].session_display_name.is_none());
-        let policy = SnapshotUploadPolicy {
-            workspace_labels_enabled: false,
-            ..test_policy()
-        };
         let changed = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             &[],
             None,
-            policy,
             None,
             "2026-07-19T10:08:00Z",
         )
@@ -1724,17 +1790,9 @@ mod tests {
     fn current_account_and_history_come_only_from_this_reads_own_requests() {
         let dir = temp_dir("session-accounts");
         let reconcile = |snapshot: &SnapshotItem, source, at: &str| {
-            reconcile_active_sessions(
-                &dir,
-                source,
-                std::slice::from_ref(snapshot),
-                None,
-                test_policy(),
-                None,
-                at,
-            )
-            .expect("reconciliation")
-            .sessions
+            reconcile_active_sessions(&dir, source, std::slice::from_ref(snapshot), None, None, at)
+                .expect("reconciliation")
+                .sessions
         };
         let mut tagged = test_snapshot("s-claude", "2026-07-19T10:04:00Z");
         tagged.claude_account_display = Some(Box::new(account_display("account-a")));
@@ -1751,7 +1809,6 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1806,7 +1863,6 @@ mod tests {
             SnapshotSource::Codex,
             &[codex],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1846,7 +1902,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             Some(&status),
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1861,7 +1916,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             Some(&status),
-            test_policy(),
             None,
             "2026-07-19T10:06:00Z",
         )
@@ -1882,7 +1936,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             Some(&conflicting),
-            test_policy(),
             None,
             "2026-07-19T10:07:00Z",
         )
@@ -1933,7 +1986,6 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
-            test_policy(),
             None,
             "2026-07-19T10:05:00Z",
         )
@@ -1947,7 +1999,6 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
-            test_policy(),
             None,
             "2026-07-19T10:07:00Z",
         )
@@ -2117,7 +2168,6 @@ mod tests {
             identity_basis: "telemetry".to_string(),
             provider_workspace_hash: Some("organization_hash".to_string()),
             account_source: None,
-            sole_login_witness: None,
         }];
         let mut later = tagged.usage_buckets[0].clone();
         later.bucket_start = "2026-07-19T11:00:00Z".to_string();

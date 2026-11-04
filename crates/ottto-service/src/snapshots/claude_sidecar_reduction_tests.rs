@@ -372,6 +372,21 @@ fn listed(index: &ScanIndex, fixture: &Fixture) -> bool {
         .claude_reemission_exclusions
         .excludes(&fixture.session, None)
 }
+/// Stores on `index` the family witness an older build left for the
+/// fixture's family, from a fresh parse and the current evidence: an upgraded
+/// store's state. No build proves a new witness.
+fn store_family_witness(fixture: &Fixture, index: &mut ScanIndex) {
+    let parsed = raw_scan(fixture, ScanIndex::default(), None, |_| {})
+        .result
+        .snapshots;
+    assert!(
+        index.install_stored_claude_family_witness_from_support_for_test(
+            &fixture.session,
+            &parsed,
+            &fixture.support,
+        )
+    );
+}
 fn seed_ordinary_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     let index = seed_predecessor_from(fixture, cache, ordinary_money_index(fixture));
     assert!(
@@ -430,8 +445,9 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
-    let prior = seed_ordinary_predecessor(&f, &cache);
+    let mut prior = seed_ordinary_predecessor(&f, &cache);
     f.evidence(2); // Includes req_1 from before the latest transcript response.
+    store_family_witness(&f, &mut prior);
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
     assert!(listed(&cached.index, &f));
     assert_layout_mode(cached.modes, (0, 0, 1));
@@ -621,7 +637,6 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
                 cap_pace: Default::default(),
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
-                side: Default::default(),
                 quiet: Default::default(),
                 test_route: Default::default(),
             })
@@ -670,7 +685,8 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
-    let prior = seed_ordinary_predecessor(&f, &cache);
+    let mut prior = seed_ordinary_predecessor(&f, &cache);
+    store_family_witness(&f, &mut prior);
     let file = fs::OpenOptions::new()
         .write(true)
         .open(f.sidecar(false))

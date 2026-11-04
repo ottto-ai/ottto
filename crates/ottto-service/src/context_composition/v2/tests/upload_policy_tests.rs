@@ -1,6 +1,6 @@
 //! Composition lane of the upload filter, checked on the captured POST body.
 use super::super::aggregate::{FileKey, FileTotals};
-use super::super::harvest::{erase_source_state, lock_state, state_dir};
+use super::super::harvest::{drop_upload_acks, lock_state, state_dir};
 use super::super::scope::Scope;
 use super::super::upload::{ack_path, build_request, upload_scope, UploadOutcome};
 use super::super::UPLOAD_TOP_FILES;
@@ -160,18 +160,39 @@ fn top_files_withheld_sums_every_file_before_the_top_cut() {
     }
 }
 
+/// [behaviour] A resume drops only its own source's scope upload ACKs, after
+/// a running worker finishes; every scope, index, install record, run record
+/// and the other source's ACK stay.
 #[test]
-fn source_erase_waits_for_a_running_worker() {
-    let support = scratch("upload-policy-erase");
+fn resume_drops_only_this_sources_upload_acks_after_a_running_worker() {
+    let support = scratch("upload-policy-resume");
     let dir = state_dir(&support);
-    let file = dir.join("index-codex.json");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(&file, b"synthetic").unwrap();
+    let acks = [
+        dir.join("scopes/codex-scope.upload.json"),
+        dir.join("scopes/codex-other.upload.json"),
+    ];
+    let kept = [
+        dir.join("index-codex.json"),
+        dir.join("install-codex.json"),
+        dir.join("run.json"),
+        dir.join("scopes/codex-scope.json"),
+        dir.join("scopes/codex-scope.totals.1.zst"),
+        dir.join("scopes/claude-code-scope.upload.json"),
+        dir.join("quarantined-scopes/codex-scope.json"),
+    ];
+    for path in acks.iter().chain(&kept) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"synthetic").unwrap();
+    }
     let lease = lock_state(&dir).unwrap().expect("free");
-    assert!(erase_source_state(&support, crate::snapshots::SnapshotSource::Codex).is_err());
-    assert!(file.exists(), "a running worker keeps its state");
+    assert!(drop_upload_acks(&support, crate::snapshots::SnapshotSource::Codex).is_err());
+    assert!(
+        acks.iter().all(|path| path.exists()),
+        "a running worker keeps them"
+    );
     drop(lease);
-    erase_source_state(&support, crate::snapshots::SnapshotSource::Codex).unwrap();
-    assert!(!file.exists());
+    drop_upload_acks(&support, crate::snapshots::SnapshotSource::Codex).unwrap();
+    assert!(acks.iter().all(|path| !path.exists()));
+    assert!(kept.iter().all(|path| path.exists()));
     fs::remove_dir_all(support).unwrap();
 }

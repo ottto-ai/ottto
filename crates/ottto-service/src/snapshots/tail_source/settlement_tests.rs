@@ -57,7 +57,6 @@ pub(super) fn finalize(
     key: &str,
     mut items: Vec<SnapshotItem>,
     identical: bool,
-    stored_reuse: Option<CandidateParseReason>,
 ) -> SourceScanResult {
     for item in &mut items {
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
@@ -107,7 +106,6 @@ pub(super) fn finalize(
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count,
         effective_upload_body_witness_revision: 0,
-        stored_reuse,
     });
     finalize_scan_after_policy_with_body_witness(
         SnapshotSource::ClaudeCode,
@@ -262,11 +260,10 @@ fn an_identical_stored_body_takes_the_ack_path() {
     assert_eq!(native_bytes, 0);
     let count = items.len();
     assert!(count > 0);
-    let scan = finalize(&mut route, &key, items, true, Some(REASON));
+    let scan = finalize(&mut route, &key, items, true);
     assert!(scan.snapshots.is_empty());
     assert_eq!(scan.semantic_noop_count, count);
-    assert!(!route.index.files[&key].rearmed());
-    assert_eq!(counters::total("tail_refold", "rearmed"), 0);
+    assert!(!route.index.files[&key].source_file_fingerprint.is_empty());
 }
 
 /// [behaviour] A file proven changed takes its Full under the proven reason.

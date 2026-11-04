@@ -371,12 +371,13 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 #[derive(Default, Serialize)]
 struct RetainedHeap {
     account_pending: Option<u64>,
-    usage_pending: Option<u64>,
-    #[serde(rename = "family.requests")]
-    family_requests: Option<u64>,
     census: Option<u64>,
     side_maps: Option<u64>,
     files: Option<u64>,
+    /// Request hashes the census holds, and the one occupancy alarm: at
+    /// least 75% of `CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE`. Nothing is capped.
+    census_hashes: u64,
+    census_occupancy_alarm: bool,
 }
 /// Existing requested-layout accounting, excluding inline stack slots. Shared
 /// Arc buffers are conservatively charged to each owning graph. No JSON size
@@ -396,25 +397,15 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
-    // Cold: only this pass's loaded families hold request hashes in RAM.
-    use super::super::usage_pending::UsagePending;
-    let evidence = match &index.claude_usage_family_pending {
-        UsagePending::Resident(families) => families,
-        UsagePending::Cold(cold) => cold.loaded(),
-    };
-    let family_requests = evidence.values().try_fold(0_u64, |sum, p| {
-        sum.checked_add(heap(&p.member_request_id_hashes)?)
-    });
-    let usage_pending = heap(&index.claude_usage_family_pending)
-        .zip(family_requests)
-        .and_then(|(all, requests)| all.checked_sub(requests));
+    let hashes = index.claude_request_census.hash_total();
     RetainedHeap {
         account_pending: heap(&index.claude_account_family_pending),
-        usage_pending,
-        family_requests,
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
         side_maps: side_maps(index),
+        census_hashes: hashes as u64,
+        census_occupancy_alarm: hashes
+            >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
     }
 }
 fn side_maps(index: &ScanIndex) -> Option<u64> {
@@ -588,6 +579,8 @@ mod ops_tests {
                 [
                     "hydrate_route_entry",
                     "hydrate_after_ack",
+                    "hydrate_after_catalogue",
+                    "hydrate_after_accounts",
                     "hydrate_after_decode",
                     "hydrate_after_baseline",
                     "hydrate_exit",
@@ -606,7 +599,6 @@ mod ops_tests {
             }
             drop(loaded);
         }
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -641,7 +633,6 @@ mod ops_tests {
             .as_u64()
             .is_some_and(|rows| rows >= 13));
         drop(index);
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -727,39 +718,30 @@ mod ops_tests {
         );
     }
 
-    /// [behaviour] family requests heap is separate and diagnostics never contain its text.
+    /// [behaviour] The existing state_v2 line flags census occupancy at 75%
+    /// of the alarm base.
     #[test]
-    fn family_requests_heap_is_separate_and_diagnostics_never_contain_its_text() {
-        let mut index = ScanIndex::default();
-        index.claude_usage_family_pending.insert(
-            "synthetic-private-family".into(),
-            super::super::super::ClaudeUsageFamilyPending {
-                census_window_end: "synthetic-window".into(),
-                member_request_id_hashes: BTreeMap::from([(
-                    "synthetic-private-member".into(),
-                    std::collections::BTreeSet::from(["synthetic-private-request".repeat(256)]),
-                )]),
-                member_occurrences: BTreeMap::new(),
-                invalid: false,
-                idless_revision: None,
-                identity_contract: None,
-                contract_unproven: false,
-            },
-        );
-        let observation = retained_heap(&index);
-        if crate::heap_layout_bound::layout_supported() {
-            assert!(observation.family_requests.unwrap() > 4096);
-            assert!(observation.usage_pending.unwrap() > 0);
-            assert_eq!(
-                observation.usage_pending.unwrap() + observation.family_requests.unwrap(),
-                heap(&index.claude_usage_family_pending).unwrap()
+    fn state_v2_line_flags_census_occupancy_at_75pct() {
+        use super::super::super::claude_request_census::{
+            ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+            CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE as BASE,
+        };
+        for (hashes, alarm) in [(BASE / 4 * 3 - 1, false), (BASE / 4 * 3, true)] {
+            let mut index = ScanIndex::default();
+            index.claude_request_census.insert_for_test(
+                "/synthetic/projects/a.jsonl",
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    (0..hashes as u64).collect(),
+                ),
             );
-        } else {
-            assert!(observation.usage_pending.is_none());
-            assert!(observation.family_requests.is_none());
+            let observation = retained_heap(&index);
+            assert_eq!(observation.census_hashes, hashes as u64);
+            assert_eq!(observation.census_occupancy_alarm, alarm, "{hashes}");
+            let json = serde_json::to_value(&observation).unwrap();
+            assert_eq!(json["census_occupancy_alarm"], alarm);
         }
-        let json = serde_json::to_string(&observation).unwrap();
-        assert!(!json.contains("synthetic-private"));
-        assert!(json.contains("family.requests"));
     }
 }

@@ -154,13 +154,11 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
         .clone();
     into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
-    into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
-    into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
+    into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
     into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
-    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
     into.withheld_memo = from.withheld_memo.clone();
 }
 
@@ -208,8 +206,12 @@ pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> 
 pub(crate) struct Continuation {
     audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
     last_full_verified: u64,
+    sealed_offset: u64,
 }
 impl Continuation {
+    pub(crate) fn sealed_offset(&self) -> u64 {
+        self.sealed_offset
+    }
     pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
         self.audit_debt
     }
@@ -230,12 +232,14 @@ pub(crate) fn continuation_for_test(
 ) -> Option<Continuation> {
     let certificate = match source {
         SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
-        SnapshotSource::Codex | SnapshotSource::Pi => {
+        SnapshotSource::Codex => head_certificate::<tail_source::codex::Codex>(index, key)?,
+        SnapshotSource::Pi => {
             return cache
                 .retained_checkpoint(key)
                 .map(|checkpoint| Continuation {
                     audit_debt: checkpoint.audit_debt(),
                     last_full_verified: checkpoint.last_full_verified(),
+                    sealed_offset: checkpoint.sealed_offset(),
                 })
         }
     };
@@ -244,6 +248,7 @@ pub(crate) fn continuation_for_test(
             .audit_debt_unix_seconds
             .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
         last_full_verified: certificate.verified_unix_seconds,
+        sealed_offset: certificate.sealed_offset,
     })
 }
 
@@ -274,17 +279,13 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     }
 }
 
-/// A scan fixture's page of a source with a Tail codec continues from its
-/// owner's route; with no cache it reads a fixture route unrouted. Other
-/// sources are left alone.
+/// A scan fixture's page continues from its owner's route; with no cache it
+/// reads a fixture route unrouted.
 pub(crate) fn route_for_test(
-    source: SnapshotSource,
+    _source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    if !tail_source::has_codec(source) {
-        return index;
-    }
     let Some(cache) = cache else {
         // A scan with no cache to own a route is the cold oracle: it reads a
         // fixture route's graph unrouted, as before Claude kept its Tail there,
@@ -302,6 +303,32 @@ pub(crate) fn route_for_test(
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     routed_for_test(cache, index, &dir)
+}
+
+/// The saved, already-indexed walk used by a quiet restart. Like the
+/// discovery-growth fixture, it keeps the roster across the restart; only
+/// unchanged members already represented by the committed index are drained.
+pub(crate) fn retain_indexed_walk_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    collected_at: &str,
+    backfill_window_days: u64,
+) {
+    ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    advance_bounded_directory_traversal(source, index, backfill_window_days, None);
+    let walk = index.traversal.as_ref().expect("indexed walk");
+    assert!(walk.pending_directories.is_empty(), "the walk is complete");
+    for candidate in &walk.pending_candidates {
+        let metadata = std::fs::symlink_metadata(&candidate.path).unwrap();
+        let entry = &index.files[&local_index_key(&candidate.path)];
+        assert!(entry.same_listing_stamp_as(&metadata));
+        assert!(!entry.source_file_fingerprint.is_empty());
+        // A retained walk keeps a sampled prefix until its audit deadline;
+        // listing_unchanged would reject even that not-yet-due obligation.
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+    }
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
 }
 
 /// The time a fixture's next visit is taken to come after its last. The
@@ -714,6 +741,16 @@ pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bo
     index.file_upload_context_requires_adoption(&local_index_key(path))
 }
 
+/// Files that still owe their own upload-context proof, by the per-file gate
+/// alone (no owed-count exemption).
+pub(crate) fn upload_context_unproven_files_for_test(index: &ScanIndex) -> usize {
+    index
+        .files
+        .keys()
+        .filter(|key| index.file_upload_context_requires_adoption(key))
+        .count()
+}
+
 /// Install the real exclusion input used by ordinary-money fixture families.
 /// An empty slice adopts request-owned money on the next normal source pass.
 pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
@@ -760,7 +797,6 @@ pub(super) fn parse_ordinary_with_metadata(
         apply_claude_code_line,
         None,
         None,
-        None,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());
@@ -781,4 +817,46 @@ pub(super) fn parse_ordinary_with_metadata(
             }),
         )
         .map(|parsed| parsed.snapshots)
+}
+
+/// Telemetry retention dependency row: an account hold on `key`.
+pub(crate) fn hold_claude_account_for_test(index: &mut ScanIndex, key: &str) {
+    index
+        .claude_account_deferred_holds
+        .insert(key.to_owned(), "held-source".to_owned());
+}
+
+/// Telemetry retention dependency row: a Tail head for `key` (no pages) on
+/// `index`'s live route, committed by an ordinary save. True when the
+/// committed heads then hold it.
+pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> bool {
+    let route = route_of(index).expect("a routed index");
+    state_v2::stage_tail(
+        &route,
+        key,
+        state_v2::StagedFile {
+            revision: 1,
+            head: b"head".to_vec(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    index.save(&route).unwrap();
+    state_v2::tail_head_keys(index).unwrap().contains(key)
+}
+
+/// Telemetry retention dependency row: `owner` is a legacy owner root of
+/// `root`'s family witness, under a terminal (unproven) authority record.
+pub(crate) fn legacy_owner_of_terminal_family_for_test(
+    index: &mut ScanIndex,
+    root: &str,
+    owner: &str,
+) {
+    index.insert_unproven_terminal_claude_authority_for_test(root, &"1".repeat(64));
+    index
+        .claude_usage_family_witnesses
+        .get_mut(root)
+        .expect("the terminal record retains its witness")
+        .legacy_owner_roots
+        .insert(owner.to_owned());
 }

@@ -109,6 +109,11 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
     ];
     for (map, field) in fields.into_iter().enumerate() {
         for cause in causes {
+            // The usage map's records are retired: they decode and drop, so
+            // no record in it can withhold the map.
+            if field == Field::UsagePending && cause == UnavailableCause::Decode {
+                continue;
+            }
             let mut fixture = Fixture::new();
             let healthy = fixture.load();
             assert!(healthy.persistence_available());
@@ -161,12 +166,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                     healthy.claude_account_family_pending
                 );
             }
-            if map != 1 {
-                assert_eq!(
-                    loaded.claude_usage_family_pending,
-                    healthy.claude_usage_family_pending
-                );
-            }
             if map != 2 {
                 assert_eq!(
                     serde_json::to_vec(&loaded.claude_request_census).unwrap(),
@@ -193,29 +192,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             let pending_before = loaded.claude_account_family_pending.clone();
             loaded.retire_committed_claude_account_pending_windows();
             assert_eq!(loaded.claude_account_family_pending, pending_before);
-            assert_eq!(
-                loaded.retire_absent_retry_pending_claude_families(
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    "fixture"
-                ),
-                0
-            );
-            assert!(matches!(
-                loaded.lower_claude_retired_family_tombstone_fence(
-                    &BTreeSet::new(),
-                    &BTreeSet::new()
-                ),
-                ClaudeTombstoneFenceRepair::Kept { .. }
-            ));
-            assert!(!claude_stale_rearm_can_reopen_fence(
-                &loaded,
-                &BTreeSet::new()
-            ));
-            assert!(!claude_fence_held_only_by_witnessed_families(
-                &loaded,
-                "2026-10-29T00:00:00Z"
-            ));
             let old_move_hold = loaded.claude_history_move_released;
             loaded.note_claude_history_cutoff(PriorHistory::Moved, true, false);
             assert_eq!(loaded.claude_history_move_released, old_move_hold);
@@ -565,7 +541,6 @@ fn recovery_emission_boundaries(
     scan.snapshots = items;
     scan.census_complete = true;
     scan.pending_finalization.push(PendingIndexFinalization {
-        stored_reuse: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -635,17 +610,6 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
                     unknown.retire_committed_claude_account_pending_windows();
-                    assert!(matches!(
-                        unknown.lower_claude_retired_family_tombstone_fence(
-                            &BTreeSet::new(),
-                            &BTreeSet::new()
-                        ),
-                        ClaudeTombstoneFenceRepair::Kept { .. }
-                    ));
-                    assert!(!claude_stale_rearm_can_reopen_fence(
-                        &unknown,
-                        &BTreeSet::new()
-                    ));
                     recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })
             });
@@ -863,6 +827,100 @@ fn estimate_index_reader_refuses_unpublished_init_without_removing_files() {
     assert_eq!(inspection_files(&fixture.scratch), before);
     assert!(fixture.shards.is_dir());
     assert!(!fixture.root.exists());
+}
+
+fn replay_indexed(index: &mut ScanIndex, key: &str) {
+    index.files.insert(
+        key.into(),
+        crate::snapshots::tests::manifest_index_entry(Some("synthetic-fingerprint")),
+    );
+}
+
+fn replay_delivered(index: &ScanIndex, key: &str) -> bool {
+    index
+        .files
+        .get(key)
+        .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some())
+}
+
+/// [behaviour] A pass replays through the sync expression
+/// `pending && index.prepare_historical_replay(generation)`, which takes no
+/// source, so Claude, Codex and Pi share it: no pending replay changes
+/// nothing; a pending one resets delivery and records its generation; a
+/// repeated same-generation replay resets nothing indexed since; a new
+/// generation replays again.
+#[test]
+fn historical_replay_runs_once_per_generation_only_when_pending() {
+    let key = "/s/replay.jsonl";
+    let replay = |index: &mut ScanIndex, pending: bool, generation: &str| {
+        pending && index.prepare_historical_replay(generation.into())
+    };
+    let mut index = ScanIndex::default();
+    replay_indexed(&mut index, key);
+
+    assert!(!replay(&mut index, false, "g1"));
+    assert_eq!(index.historical_replay_generation, None);
+    assert!(replay_delivered(&index, key));
+
+    assert!(replay(&mut index, true, "g1"));
+    assert_eq!(index.historical_replay_generation.as_deref(), Some("g1"));
+    assert!(!replay_delivered(&index, key));
+
+    // The replay pass indexes the file again.
+    replay_indexed(&mut index, key);
+    assert!(!replay(&mut index, true, "g1"));
+    assert!(
+        replay_delivered(&index, key),
+        "a repeated replay resets nothing"
+    );
+
+    assert!(replay(&mut index, true, "g2"));
+    assert_eq!(index.historical_replay_generation.as_deref(), Some("g2"));
+    assert!(!replay_delivered(&index, key));
+}
+
+/// [behaviour] Replay custody on a real index file: a replay whose save
+/// fails leaves the pre-replay file, so the reloaded pass replays again;
+/// once saved, the reloaded generation holds, nothing is pending, and a
+/// repeated replay resets nothing indexed since.
+#[test]
+fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
+    const GENERATION: &str = "codex:replay-custody:g1";
+    let key = "/s/replay-custody.jsonl";
+    let scratch = crate::test_scratch::private_dir("replay-custody");
+    let path = scratch.join("index.json");
+    let pending =
+        |index: &ScanIndex| index.historical_replay_generation.as_deref() != Some(GENERATION);
+    let mut disk = ScanIndex::default();
+    replay_indexed(&mut disk, key);
+    disk.save(&path).unwrap();
+
+    // The replay resets the loaded copy; its save fails.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert!(pending(&index));
+    assert!(index.prepare_historical_replay(GENERATION.into()));
+    assert!(!replay_delivered(&index, key));
+    drop(index);
+
+    // The reloaded file is still pre-replay: the replay re-runs, and the
+    // pass that indexes the file again saves.
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(index.historical_replay_generation, None);
+    assert!(replay_delivered(&index, key));
+    assert!(pending(&index));
+    assert!(index.prepare_historical_replay(GENERATION.into()));
+    replay_indexed(&mut index, key);
+    index.save(&path).unwrap();
+
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        index.historical_replay_generation.as_deref(),
+        Some(GENERATION)
+    );
+    assert!(!pending(&index));
+    assert!(!index.prepare_historical_replay(GENERATION.into()));
+    assert!(replay_delivered(&index, key));
+    fs::remove_dir_all(&scratch).unwrap();
 }
 
 // F10: count surviving complete offers at the real post-policy finalizer.

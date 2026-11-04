@@ -136,11 +136,6 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
             serde_json::json!({"members": 17}),
         ),
         (
-            "claude_usage_family_pending",
-            "family".into(),
-            serde_json::json!({"members": 17}),
-        ),
-        (
             "claude_usage_family_witnesses",
             "family".into(),
             serde_json::json!({"legacy_owners": [17]}),
@@ -224,10 +219,6 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
         "schema_version",
         "generation",
         "accepted_snapshot_fingerprint_ledger_version",
-        "codex_parent_side_generation",
-        "codex_parent_proof_seq",
-        "codex_parent_proof_wrap_epoch",
-        "codex_proof_index_incarnation",
     ] {
         for bad in [
             "null",
@@ -240,17 +231,7 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
             "\"not-a-token\"",
         ] {
             // Some matrix values are valid native controls; test only hostile combinations.
-            if matches!(
-                field,
-                "generation"
-                    | "codex_parent_side_generation"
-                    | "codex_parent_proof_seq"
-                    | "codex_parent_proof_wrap_epoch"
-            ) && bad == "256"
-            {
-                continue;
-            }
-            if field == "codex_proof_index_incarnation" && bad.starts_with('"') {
+            if field == "generation" && bad == "256" {
                 continue;
             }
             for bounded in [false, true] {
@@ -554,7 +535,6 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
         "files",
         "accepted_snapshot_fingerprints",
         "quarantined_snapshot_fingerprints",
-        "claude_usage_family_pending",
     ] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-unkeyed");
         let path = scratch.as_ref().join("index.json");
@@ -695,7 +675,6 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
-        stored_reuse: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -1047,12 +1026,6 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
         "session_account_bindings",
         "claude_account_deferred_holds",
         "claude_request_identity_contract",
-        "claude_request_identity_contract_changed",
-        "claude_stale_family_carry",
-        "claude_owned_start_census",
-        "claude_duplicate_request_owners",
-        "codex_parent_ownership_refs",
-        "codex_parent_ownership_ledgers",
         "bounded_sweep_had_unsettled_upload",
     ];
     for field in fields {
@@ -1062,11 +1035,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
             serde_json::json!([]),
             serde_json::json!({}),
             serde_json::json!("x"),
-            if field == "claude_stale_family_carry" {
-                serde_json::json!({"roots":[17]})
-            } else {
-                serde_json::json!({"bad":17})
-            },
+            serde_json::json!({"bad":17}),
         ] {
             let mut seed = fixture();
             seed.generation = 37;
@@ -1083,12 +1052,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
             // optional token, and null for Option. Pin those lawful cells too.
             let valid = match field {
                 "claude_request_identity_contract" => bad.is_null() || bad.is_string(),
-                "claude_request_identity_contract_changed"
-                | "bounded_sweep_had_unsettled_upload" => false,
-                "codex_parent_ownership_refs" => bad == serde_json::json!([]),
-                "claude_stale_family_carry" => {
-                    bad == serde_json::json!({}) || bad == serde_json::json!([])
-                }
+                "bounded_sweep_had_unsettled_upload" => false,
                 _ => bad == serde_json::json!({}),
             };
             let bytes = serde_json::to_vec_pretty(&value).unwrap();
@@ -1181,29 +1145,24 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
 }
 
 #[test]
-fn si_unknown_contract_latches_through_observation_save_and_restart() {
+fn si_unknown_contract_persists_through_save_and_restart() {
     for bounded in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("si-unknown-contract");
         let path = scratch.as_ref().join("index.json");
         let mut seed = fixture();
         seed.claude_request_identity_contract = Some("FUTURE_UNKNOWN".into());
-        seed.claude_request_identity_contract_changed = false;
         seed.save(&path).unwrap();
         let mut loaded = ScanIndex::load(&path).unwrap();
         assert_eq!(
             loaded.claude_request_identity_contract.as_deref(),
             Some("FUTURE_UNKNOWN")
         );
-        assert!(!loaded.claude_request_identity_contract_changed);
-        loaded.observe_claude_request_identity_contract(true);
-        assert!(loaded.claude_request_identity_contract_changed);
         if bounded {
             loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
         } else {
             loaded.save(&path).unwrap();
         }
         let restarted = ScanIndex::load(&path).unwrap();
-        assert!(restarted.claude_request_identity_contract_changed);
         assert_eq!(
             restarted.claude_request_identity_contract,
             loaded.claude_request_identity_contract
@@ -1405,19 +1364,13 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
 fn every_persisted_field_fixture() -> ScanIndex {
     let mut seed = fixture();
     seed.insert_retry_pending_claude_authority_for_test("valid-family");
-    seed.codex_parent_prefix_proofs.insert(
-        "child".into(),
-        CodexParentProofState::Owed(CodexParentProofOwed::new(
-            "parent".into(),
-            1,
-            CAUSE_NO_EVIDENCE,
-            OwedOrigin::Lineage,
-        )),
-    );
     let mut value = serde_json::to_value(&seed).unwrap();
     // Explicit, non-default fixture for EVERY registry member. New fields must
     // add native evidence here as well as serializer/registry/dispatch entries.
     for &field in lenient_decode::FIELDS {
+        if retired_codex_field(field) {
+            continue;
+        }
         let replacement = match field {
             "schema_version"
             | "files"
@@ -1467,7 +1420,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,
                 "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
                 "seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},
-                    "scope":codex_parent_side_scope().0,"sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+                    "scope":"retired","sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
             "claude_desktop_title_files" => {
                 serde_json::json!({"sidecar":{"cli_session_id":"session","title":"title","user_set":true}})
             }
@@ -1601,16 +1554,31 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             .iter()
             .copied()
             .filter(|name| {
-                !matches!(
-                    *name,
-                    "reread_guard"
-                        | "upload_context_fingerprint"
-                        | "claude_desktop_census_witness"
-                        | "claude_desktop_store_inventory"
-                        | "context_curve_capability_enabled"
-                        | "context_curve_replay_epoch"
-                        | "completed_context_curve_replay_generation"
-                )
+                !retired_codex_field(name)
+                    && !matches!(
+                        *name,
+                        "reread_guard"
+                            | "upload_context_fingerprint"
+                            | "claude_desktop_census_witness"
+                            | "claude_desktop_store_inventory"
+                            | "claude_folder_login_ledger"
+                            | "context_curve_capability_enabled"
+                            | "context_curve_replay_epoch"
+                            | "completed_context_curve_replay_generation"
+                            | "claude_usage_family_pending"
+                            | "claude_duplicate_request_owners"
+                            | "claude_duplicate_request_witness_overflowed"
+                            | "claude_owned_start_census"
+                            | "claude_duplicate_fence_rearm_attempt"
+                            | "claude_duplicate_fence_next_full_rearm_unix_seconds"
+                            | "claude_full_rearm_progress"
+                            | "claude_request_identity_contract_changed"
+                            | "claude_stale_family_carry"
+                            | "held_audit_progress"
+                            | "claude_retired_family_tombstones"
+                            | "claude_retired_family_tombstones_initialized"
+                            | "claude_retired_family_tombstones_uncertain"
+                    )
             })
             .collect()
     );
@@ -1620,24 +1588,37 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
 }
 
-/// [format] An older index holding the retired Desktop census witness still
-/// loads on every decoder; the slot is dropped and never written again.
+/// [format] An older index holding a retired slot (the Desktop census
+/// witness, the folder login ledger, damaged or not) still loads on every
+/// decoder; the slot is dropped and never written again.
 #[test]
 fn retired_desktop_census_witness_decodes_and_drops() {
     let current = serde_json::to_value(fixture()).unwrap();
-    assert!(current.get("claude_desktop_census_witness").is_none());
-    let mut older = current.clone();
-    older["claude_desktop_census_witness"] = serde_json::json!({
-        "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
-    });
-    let bytes = serde_json::to_vec(&older).unwrap();
-    let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
-    let streaming =
-        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-    for decoded in [native, streaming, bounded] {
-        assert!(decoded.decode_holds.is_empty());
-        assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
+    for (field, value) in [
+        (
+            "claude_desktop_census_witness",
+            serde_json::json!({
+                "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
+            }),
+        ),
+        (
+            "claude_folder_login_ledger",
+            serde_json::json!({"folder": {"fresh": true, "mixed": true, "matched": [7]}}),
+        ),
+        ("claude_folder_login_ledger", serde_json::json!(17)),
+    ] {
+        assert!(current.get(field).is_none());
+        let mut older = current.clone();
+        older[field] = value;
+        let bytes = serde_json::to_vec(&older).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        for decoded in [native, streaming, bounded] {
+            assert!(decoded.decode_holds.is_empty(), "{field}");
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), current, "{field}");
+        }
     }
 }
 
@@ -1721,16 +1702,14 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
 const DESKTOP_INVENTORY: &str = "claude_desktop_store_inventory";
 
 #[test]
-fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts() {
+fn desktop_inventory_production_load_save_drops_key_with_exact_bytes() {
     let scratch = crate::test_scratch::ScratchDir::new("desktop-inventory-load-save");
     let path = scratch.as_ref().join("index.json");
     let seed = fixture();
     let without = serde_json::to_string(&seed).unwrap();
     let load_and_save = |input: &str, inventory: Option<&str>| {
         fs::write(&path, input).unwrap();
-        let before = claude_absence_counters_for_test().tombstone_decode_drops;
         let mut loaded = ScanIndex::load(&path).unwrap();
-        let drops = claude_absence_counters_for_test().tombstone_decode_drops - before;
         assert_eq!(fs::read(&path).unwrap(), input.as_bytes());
         assert!(loaded.decode_holds.is_empty());
         assert_eq!(loaded.generation, seed.generation);
@@ -1739,23 +1718,20 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
         let saved = fs::read(&path).unwrap();
         let value: Value = serde_json::from_slice(&saved).unwrap();
         assert!(value.get(DESKTOP_INVENTORY).is_none());
-        (saved, drops)
+        saved
     };
-    let (baseline, drops) = load_and_save(&without, None);
-    assert_eq!(drops, 0);
+    let baseline = load_and_save(&without, None);
     let digest = "a".repeat(64);
-    for (case, fields, inventory, expected_drops) in [
+    for (case, fields, inventory) in [
         (
             "valid",
             format!("\"{DESKTOP_INVENTORY}\":\"{digest}\""),
             Some(digest.as_str()),
-            0,
         ),
         (
             "wrong-length",
             format!("\"{DESKTOP_INVENTORY}\":\"{}\"", "a".repeat(63)),
             None,
-            1,
         ),
         (
             "duplicate",
@@ -1764,13 +1740,11 @@ fn desktop_inventory_production_load_save_drops_key_with_exact_bytes_and_counts(
                 "b".repeat(64)
             ),
             Some(digest.as_str()),
-            1,
         ),
     ] {
         let input = format!("{{{fields},{}", &without[1..]);
-        let (saved, drops) = load_and_save(&input, inventory);
+        let saved = load_and_save(&input, inventory);
         assert_eq!(saved, baseline, "{case}: production save bytes");
-        assert_eq!(drops, expected_drops, "{case}: one count per dropped value");
     }
 }
 
@@ -2415,10 +2389,9 @@ fn struct_order_budget_damage(index: &ScanIndex, tail: &str) -> Vec<u8> {
     format!("{}{tail}}}", &text[..text.len() - 1]).into_bytes()
 }
 
-/// An old owner A for `session`, a deferred hold, accepted fingerprints, the
-/// contract token and latch, owned-start and stale-carry posture, duplicate
-/// ownership and the closed duplicate fence.
-fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
+/// An old owner A for `session`, a deferred hold, accepted fingerprints and
+/// the contract token.
+fn override_identity_seed(session: &str) -> ScanIndex {
     let mut index = fixture();
     index.session_account_bindings.insert(
         sha256_hex(&["session_owner:v1", "machine-a", session]),
@@ -2431,18 +2404,6 @@ fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
         .claude_account_deferred_holds
         .insert("/synthetic/held.jsonl".into(), "d".repeat(64));
     index.claude_request_identity_contract = Some("prior-contract".into());
-    index.claude_request_identity_contract_changed = latch;
-    index.claude_owned_start_census = serde_json::from_value(
-        serde_json::json!({"member":{"marker_source_file_fingerprint":"fp"}}),
-    )
-    .unwrap();
-    index.claude_stale_family_carry =
-        serde_json::from_value(serde_json::json!({"roots":["carried-family"]})).unwrap();
-    index.claude_duplicate_request_owners = serde_json::from_value(serde_json::json!(
-        {"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]}
-    ))
-    .unwrap();
-    index.claude_duplicate_request_witness_overflowed = true;
     // A replay this index had already completed.
     index.historical_replay_generation = Some("replay-generation".into());
     assert!(!index.accepted_snapshot_fingerprints.is_empty());
@@ -2468,26 +2429,6 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         index.claude_request_identity_contract, seed.claude_request_identity_contract,
         "{context}"
     );
-    assert!(index.claude_request_identity_contract_changed, "{context}");
-    assert_eq!(
-        as_json(&index.claude_owned_start_census),
-        as_json(&seed.claude_owned_start_census),
-        "{context}"
-    );
-    assert_eq!(
-        as_json(&index.claude_stale_family_carry),
-        as_json(&seed.claude_stale_family_carry),
-        "{context}"
-    );
-    assert_eq!(
-        as_json(&index.claude_duplicate_request_owners),
-        as_json(&seed.claude_duplicate_request_owners),
-        "{context}"
-    );
-    assert!(
-        index.claude_duplicate_request_witness_overflowed,
-        "{context}"
-    );
     assert_eq!(
         index.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
         "{context}"
@@ -2497,7 +2438,7 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         "{context}"
     );
     // The completed replay stays complete: no spurious replay preparation
-    // clears the carried acknowledgements or owned-start census.
+    // clears the carried acknowledgements.
     let mut replayed = index.clone();
     assert!(
         !replayed.prepare_historical_replay("replay-generation".into()),
@@ -2505,11 +2446,6 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
     );
     assert_eq!(
         replayed.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
-        "{context}"
-    );
-    assert_eq!(
-        as_json(&replayed.claude_owned_start_census),
-        as_json(&seed.claude_owned_start_census),
         "{context}"
     );
 }
@@ -2533,7 +2469,7 @@ fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() 
             let path = scratch.join("index.json");
             let support = scratch.join("support");
             let source = SnapshotSource::ClaudeCode;
-            let mut seed = override_identity_seed("handoff-owner", true);
+            let mut seed = override_identity_seed("handoff-owner");
             seed.save(&path).unwrap();
             let mut value = serde_json::to_value(&seed).unwrap();
             value["upload_ack_retirement_handoff"] = damaged;
@@ -2599,8 +2535,8 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
     let session = item.source_session_id.clone();
     let owner_key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
     let source = SnapshotSource::ClaudeCode;
-    for (damage_kind, latch) in [("budget", true), ("collision", true), ("budget", false)] {
-        let context = format!("{damage_kind} latch={latch}");
+    for damage_kind in ["budget", "collision"] {
+        let context = damage_kind.to_string();
         reset_override_state_for_restart();
         let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
         let path = scratch.join("index.json");
@@ -2610,7 +2546,7 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
         fs::write(&path, b"{").unwrap();
         assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
 
-        let seed = override_identity_seed(&session, latch);
+        let seed = override_identity_seed(&session);
         let damage = match damage_kind {
             "budget" => struct_order_budget_damage(&seed, ""),
             _ => {
@@ -2748,17 +2684,6 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
         (
             "bindings",
             struct_order_budget_damage(&fixture(), ",\"session_account_bindings\":17"),
-        ),
-        (
-            "latch",
-            struct_order_budget_damage(
-                &fixture(),
-                ",\"claude_request_identity_contract_changed\":\"x\"",
-            ),
-        ),
-        (
-            "owned_start",
-            struct_order_budget_damage(&fixture(), ",\"claude_owned_start_census\":17"),
         ),
     ] {
         reset_override_state_for_restart();
@@ -3511,585 +3436,6 @@ fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override(
     }
 }
 
-// #705/#718 composition: retirement evidence remains fail-closed at every
-// persistence boundary, alongside bindings, accepted ACKs and contract latch.
-fn retired_family_decode_seed() -> ScanIndex {
-    let mut index = override_identity_seed("retired-decode-owner", true);
-    index
-        .claude_retired_family_tombstones
-        .insert("a".repeat(64), 7);
-    index.claude_retired_family_tombstones_initialized = true;
-    index
-}
-
-fn assert_retired_family_decode_identity(index: &ScanIndex, seed: &ScanIndex) {
-    assert_eq!(
-        index.session_account_bindings,
-        seed.session_account_bindings
-    );
-    assert_eq!(
-        index.accepted_snapshot_fingerprints,
-        seed.accepted_snapshot_fingerprints
-    );
-    assert_eq!(
-        index.claude_request_identity_contract,
-        seed.claude_request_identity_contract
-    );
-    assert!(index.claude_request_identity_contract_changed);
-    assert!(index.claude_retired_family_tombstones_initialized);
-}
-
-#[test]
-fn retired_family_damage_keeps_identity_and_fence_on_load_and_both_cas_readers() {
-    for bounded in [false, true] {
-        for case in [
-            "container",
-            "entries",
-            "missing",
-            "cap",
-            "initialized",
-            "uncertain",
-            "both_flags",
-            "overflow",
-        ] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-retired-family");
-            let path = scratch.join("index.json");
-            let mut seed = retired_family_decode_seed();
-            seed.save(&path).unwrap();
-            let mut stale = seed.clone();
-            let mut value = serde_json::to_value(&seed).unwrap();
-            let (expected, uncertain) = match case {
-                "container" => {
-                    value["claude_retired_family_tombstones"] = serde_json::json!([false]);
-                    (BTreeMap::new(), true)
-                }
-                "entries" => {
-                    value["claude_retired_family_tombstones"] = serde_json::json!({
-                        "a".repeat(64): 7, "bad-root": 1, "b".repeat(64): "bad-time"
-                    });
-                    (BTreeMap::from([("a".repeat(64), 7)]), true)
-                }
-                "missing" => {
-                    value
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("claude_retired_family_tombstones");
-                    (BTreeMap::new(), true)
-                }
-                "cap" => {
-                    let entries = (0..=MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES)
-                        .map(|n| (format!("{n:064x}"), n as u64))
-                        .collect::<BTreeMap<_, _>>();
-                    value["claude_retired_family_tombstones"] =
-                        serde_json::to_value(&entries).unwrap();
-                    (entries.into_iter().skip(1).collect(), true)
-                }
-                "initialized" => {
-                    value["claude_retired_family_tombstones_initialized"] =
-                        serde_json::json!({"bad": true});
-                    (seed.claude_retired_family_tombstones.entries.clone(), false)
-                }
-                "uncertain" => {
-                    value["claude_retired_family_tombstones_uncertain"] = serde_json::json!(null);
-                    (seed.claude_retired_family_tombstones.entries.clone(), true)
-                }
-                "both_flags" => {
-                    value["claude_retired_family_tombstones_initialized"] = serde_json::json!([]);
-                    value["claude_retired_family_tombstones_uncertain"] = serde_json::json!(17);
-                    value["claude_retired_family_tombstones"] = serde_json::json!({"bad-root": 1});
-                    (BTreeMap::new(), true)
-                }
-                "overflow" => {
-                    value["claude_retired_family_tombstones"] = serde_json::json!("overflow-token");
-                    value["claude_retired_family_tombstones_initialized"] =
-                        serde_json::json!("overflow-token");
-                    value["claude_retired_family_tombstones_uncertain"] =
-                        serde_json::json!("overflow-token");
-                    (BTreeMap::new(), true)
-                }
-                _ => unreachable!(),
-            };
-            let bytes = serde_json::to_string(&value)
-                .unwrap()
-                .replace("\"overflow-token\"", "1e400")
-                .into_bytes();
-            fs::write(&path, &bytes).unwrap();
-            let mut loaded = ScanIndex::load(&path).unwrap();
-            assert_retired_family_decode_identity(&loaded, &seed);
-            assert_eq!(loaded.generation, seed.generation);
-            assert_eq!(
-                loaded.claude_retired_family_tombstones.entries, expected,
-                "{case}"
-            );
-            assert_eq!(
-                loaded.claude_retired_family_tombstones_uncertain, uncertain,
-                "{case}"
-            );
-            assert!(loaded.decode_holds.is_empty(), "no opaque tombstone hold");
-            let (daemon, origin) = ScanIndex::load_for_snapshot_source_with_origin(
-                &path,
-                SnapshotSource::ClaudeCode,
-                &scratch.join("support"),
-            )
-            .unwrap();
-            assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
-            assert_retired_family_decode_identity(&daemon, &seed);
-            assert_eq!(daemon.claude_retired_family_tombstones.entries, expected);
-            assert_eq!(daemon.claude_retired_family_tombstones_uncertain, uncertain);
-            assert_eq!(
-                fs::read(&path).unwrap(),
-                bytes,
-                "load never rewrites {case}"
-            );
-            assert_eq!(corrupt_count(&scratch), 0);
-            let refused = if bounded {
-                stale.save_with_read_limit(&path, 1024 * 1024)
-            } else {
-                stale.save(&path)
-            };
-            assert!(
-                format!("{:#}", refused.unwrap_err()).contains("current_index_requires_reload"),
-                "{case}"
-            );
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert_eq!(stale.generation, seed.generation);
-            if bounded {
-                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                loaded.save(&path).unwrap();
-            }
-            let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["claude_retired_family_tombstones_initialized"], true);
-            assert_eq!(
-                saved
-                    .get("claude_retired_family_tombstones_uncertain")
-                    .is_some(),
-                uncertain
-            );
-            let restarted = ScanIndex::load(&path).unwrap();
-            assert_retired_family_decode_identity(&restarted, &seed);
-            assert_eq!(restarted.claude_retired_family_tombstones.entries, expected);
-            assert_eq!(
-                restarted.claude_retired_family_tombstones_uncertain,
-                uncertain
-            );
-            assert_eq!(corrupt_count(&scratch), 0);
-        }
-    }
-}
-
-#[test]
-fn duplicate_retired_family_root_fields_refuse_load_and_both_cas_without_quarantine() {
-    for field in [
-        "claude_retired_family_tombstones",
-        "claude_retired_family_tombstones_initialized",
-        "claude_retired_family_tombstones_uncertain",
-    ] {
-        for bounded in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-retired-duplicate");
-            let path = scratch.join("index.json");
-            let mut seed = retired_family_decode_seed();
-            seed.claude_retired_family_tombstones_uncertain = true;
-            seed.save(&path).unwrap();
-            let original = serde_json::to_string(&seed).unwrap();
-            let encoded = serde_json::to_value(&seed).unwrap();
-            let bytes = format!(
-                "{},\"{field}\":{}}}",
-                &original[..original.len() - 1],
-                encoded[field]
-            )
-            .into_bytes();
-            fs::write(&path, &bytes).unwrap();
-            let error = ScanIndex::load(&path).unwrap_err();
-            assert!(format!("{error:#}").contains("duplicate index field"));
-            let result = if bounded {
-                seed.save_with_read_limit(&path, 1024 * 1024)
-            } else {
-                seed.save(&path)
-            };
-            assert!(format!("{:#}", result.unwrap_err()).contains("duplicate index field"));
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert_eq!(corrupt_count(&scratch), 0);
-            assert!(seed.claude_request_identity_contract_changed);
-            assert!(!seed.session_account_bindings.is_empty());
-            assert!(!seed.accepted_snapshot_fingerprints.is_empty());
-        }
-    }
-}
-
-#[test]
-fn repair_identity_carry_keeps_retirement_evidence_with_its_own_decode_policy() {
-    for damaged in [false, true] {
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-retired-carry");
-        let path = scratch.join("index.json");
-        let seed = retired_family_decode_seed();
-        let mut value = serde_json::to_value(&seed).unwrap();
-        if damaged {
-            value["claude_retired_family_tombstones"]["bad-root"] = serde_json::json!(false);
-            value["claude_retired_family_tombstones_initialized"] = serde_json::json!(null);
-            value["claude_retired_family_tombstones_uncertain"] = serde_json::json!([]);
-        }
-        let bytes = serde_json::to_vec(&value).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        let carry =
-            lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code").unwrap();
-        assert_retired_family_decode_identity(&carry, &seed);
-        assert_eq!(
-            carry.claude_retired_family_tombstones.entries,
-            seed.claude_retired_family_tombstones.entries
-        );
-        assert_eq!(carry.claude_retired_family_tombstones_uncertain, damaged);
-        let mut rebuilt = ScanIndex::default();
-        rebuilt.carry_identity_from(carry).unwrap();
-        assert_retired_family_decode_identity(&rebuilt, &seed);
-        assert_eq!(
-            rebuilt.claude_retired_family_tombstones.entries,
-            seed.claude_retired_family_tombstones.entries
-        );
-        assert_eq!(rebuilt.claude_retired_family_tombstones_uncertain, damaged);
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(&scratch), 0);
-    }
-}
-
-fn write_repair_collision(path: &Path, value: &mut Value) -> Vec<u8> {
-    let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-    value["codex_state_only_snapshot_fingerprints"] = serde_json::json!({
-        key: "lower", key.to_ascii_uppercase(): "upper"
-    });
-    let bytes = serde_json::to_vec(value).unwrap();
-    fs::write(path, &bytes).unwrap();
-    bytes
-}
-
-#[test]
-fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fence() {
-    let source = SnapshotSource::ClaudeCode;
-    for case in [
-        "intact",
-        "entries",
-        "container",
-        "missing_map",
-        "cap",
-        "uncertain",
-        "no_marker",
-        "false_marker",
-        "damaged_marker",
-        "pre_bridge",
-    ] {
-        reset_override_state_for_restart();
-        let scratch = crate::test_scratch::ScratchDir::new("repair-retirement-loss");
-        let path = scratch.join("index.json");
-        let support = scratch.join("support");
-        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
-        fs::write(&path, b"{").unwrap();
-        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
-        let seed = retired_family_decode_seed();
-        let mut value = serde_json::to_value(&seed).unwrap();
-        let mut kept = seed.claude_retired_family_tombstones.entries.clone();
-        match case {
-            "intact" => {}
-            "entries" => {
-                value["claude_retired_family_tombstones"]["bad-root"] = serde_json::json!(false);
-            }
-            "container" => {
-                value["claude_retired_family_tombstones"] = serde_json::json!([false]);
-                kept.clear();
-            }
-            "missing_map" => {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("claude_retired_family_tombstones");
-                kept.clear();
-            }
-            "cap" => {
-                let all = (0..=MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES)
-                    .map(|n| (format!("{n:064x}"), n as u64))
-                    .collect::<BTreeMap<_, _>>();
-                value["claude_retired_family_tombstones"] = serde_json::to_value(&all).unwrap();
-                kept = all.into_iter().skip(1).collect();
-            }
-            "uncertain" => {
-                value["claude_retired_family_tombstones_uncertain"] = serde_json::json!(true);
-            }
-            "no_marker" => {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("claude_retired_family_tombstones_initialized");
-            }
-            "false_marker" => {
-                value["claude_retired_family_tombstones_initialized"] = serde_json::json!(false);
-            }
-            "damaged_marker" => {
-                value["claude_retired_family_tombstones_initialized"] =
-                    serde_json::json!({"lost":true});
-            }
-            "pre_bridge" => {
-                for field in [
-                    "claude_retired_family_tombstones",
-                    "claude_retired_family_tombstones_initialized",
-                    "claude_retired_family_tombstones_uncertain",
-                ] {
-                    value.as_object_mut().unwrap().remove(field);
-                }
-                kept.clear();
-            }
-            _ => unreachable!(),
-        }
-        let bytes = write_repair_collision(&path, &mut value);
-        assert!(
-            load()
-                .unwrap_err()
-                .downcast_ref::<ScanIndexRebuildLoop>()
-                .is_some(),
-            "{case}"
-        );
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(
-            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-            ScanIndexRebuildOverride::Armed
-        );
-        let count = scan_index_rebuild_manual_override_count();
-        let (mut rebuilt, origin) = load().unwrap();
-        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{case}");
-        assert_eq!(
-            scan_index_rebuild_manual_override_count(),
-            count + 1,
-            "Repair was not refused: {case}"
-        );
-        assert_retired_family_decode_identity(&rebuilt, &seed);
-        assert_identity_carried(&rebuilt, &seed, case);
-        assert_eq!(
-            rebuilt.claude_retired_family_tombstones.entries, kept,
-            "{case}"
-        );
-        assert_eq!(
-            rebuilt.claude_retired_family_tombstones_uncertain,
-            case != "intact",
-            "{case}"
-        );
-        assert!(rebuilt.claude_history_unverified_in_process, "{case}");
-        assert!(rebuilt.files.is_empty());
-        assert_eq!(rebuilt.generation, 0);
-        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["claude_retired_family_tombstones_initialized"], true);
-        assert!(saved.get("claude_history_unverified_in_process").is_none());
-        // A fence and an unrelated tombstone cannot alter identity tags or
-        // suppress an exact-owner correction. Conflicting creator B still
-        // defers; matching creator A still proceeds, with ACKs unchanged.
-        let mut item = tests::valid_v6_batch_request().snapshots.remove(0);
-        let session = item.source_session_id.clone();
-        let key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
-        rebuilt.session_account_bindings.insert(
-            key,
-            SessionAccountBinding {
-                account_identifier_hash: OVERRIDE_OWNER_A.into(),
-                workspace_identifier_hash: None,
-            },
-        );
-        let accepted = rebuilt.accepted_snapshot_fingerprints.clone();
-        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
-        assert!(rebuilt
-            .bind_session_accounts(source, "machine-a", &mut [item.clone()], &[])
-            .contains(&session));
-        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_A));
-        item.request_evidence.push(SnapshotRequestEvidence {
-            identity_basis: claude_request_identity::TELEMETRY.to_owned(),
-            provider_workspace_hash: Some("d".repeat(64)),
-            account_source: None,
-            sole_login_witness: None,
-        });
-        let tags = as_json(&item.request_evidence);
-        let mut items = [item];
-        assert!(rebuilt
-            .bind_session_accounts(source, "machine-a", &mut items, &[])
-            .is_empty());
-        assert_eq!(as_json(&items[0].request_evidence), tags);
-        assert_eq!(rebuilt.accepted_snapshot_fingerprints, accepted);
-        assert_eq!(rebuilt.session_account_bindings, {
-            let mut bindings = seed.session_account_bindings.clone();
-            bindings.insert(
-                sha256_hex(&["session_owner:v1", "machine-a", &session]),
-                SessionAccountBinding {
-                    account_identifier_hash: OVERRIDE_OWNER_A.into(),
-                    workspace_identifier_hash: None,
-                },
-            );
-            bindings
-        });
-    }
-}
-
-#[test]
-fn real_repair_override_marks_history_unverified_before_return_and_first_census() {
-    reset_override_state_for_restart();
-    restart_claude_reemission_stop_for_test();
-    let scratch = crate::test_scratch::ScratchDir::new("repair-first-census");
-    let path = scratch.join("index.json");
-    let support = scratch.join("support");
-    let source = SnapshotSource::ClaudeCode;
-    fs::write(&path, b"{").unwrap();
-    assert_eq!(
-        ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support)
-            .unwrap()
-            .1,
-        ScanIndexLoadOrigin::Quarantined
-    );
-    let seed = retired_family_decode_seed();
-    let mut value = serde_json::to_value(&seed).unwrap();
-    write_repair_collision(&path, &mut value);
-    assert!(
-        ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support)
-            .unwrap_err()
-            .downcast_ref::<ScanIndexRebuildLoop>()
-            .is_some()
-    );
-    assert_eq!(
-        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-        ScanIndexRebuildOverride::Armed
-    );
-    // Forget the priming load: the real override must establish its own memo.
-    forget_claude_unverified_history_indexes_for_test();
-    let mut rebuilt = override_scan_index_rebuild_loop(
-        &path,
-        "codex_identity_collision",
-        source,
-        &support,
-        SystemTime::now(),
-    )
-    .unwrap();
-    assert!(
-        rebuilt.claude_history_unverified_in_process,
-        "before the outer source loader can help"
-    );
-    assert_retired_family_decode_identity(&rebuilt, &seed);
-    assert_eq!(rebuilt.generation, 0);
-    assert!(rebuilt.files.is_empty());
-    rebuilt.insert_retry_pending_claude_authority_for_test("first-census-absent");
-    let traversal: ScanTraversalCheckpoint = serde_json::from_value(serde_json::json!({
-        "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
-        "scan_roots":[], "pending_directories":[], "pending_candidates":[],
-        "observed_index_keys":[], "reconciliation_upper_bound":null,
-        "reconciliation_after":null, "reconciliation_started":true, "counts":{}
-    }))
-    .unwrap();
-    let before = claude_absence_counters_for_test().absent_families_retired;
-    assert_eq!(
-        rebuilt.retire_positively_absent_claude_families(&traversal, ""),
-        Err(ClaudeAbsenceRetirementRefusal::UnverifiedHistory)
-    );
-    assert_eq!(
-        claude_absence_counters_for_test().absent_families_retired,
-        before
-    );
-    assert!(rebuilt
-        .claude_authority_record_for_test("first-census-absent")
-        .is_some());
-    let mut control = rebuilt.clone();
-    control.claude_history_unverified_in_process = false;
-    assert_eq!(
-        control.retire_positively_absent_claude_families(&traversal, ""),
-        Ok(1)
-    );
-    // Generation and membership now look historic. Only the override's fresh
-    // path memo can keep the subsequent ordinary load unverified.
-    rebuilt.files.insert(
-        "/synthetic/post-repair.jsonl".into(),
-        tests::manifest_index_entry(Some(&"c".repeat(64))),
-    );
-    rebuilt.save(&path).unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.generation > 0 && !loaded.files.is_empty());
-    assert!(loaded.claude_history_unverified_in_process);
-    assert!(loaded
-        .claude_authority_record_for_test("first-census-absent")
-        .is_some());
-}
-
-#[test]
-fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
-    let mut seed = fixture();
-    seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
-    seed.claude_request_identity_contract_changed = true;
-    seed.session_account_bindings.insert(
-        "/synthetic/0.jsonl".into(),
-        SessionAccountBinding {
-            account_identifier_hash: "a".repeat(64),
-            workspace_identifier_hash: Some("b".repeat(64)),
-        },
-    );
-    let pending = ClaudeUsageFamilyPending {
-        census_window_end: "2026-10-25T00:00:00Z".into(),
-        member_request_id_hashes: BTreeMap::from([("family".into(), BTreeSet::new())]),
-        member_occurrences: BTreeMap::new(),
-        invalid: true,
-        idless_revision: None,
-        identity_contract: None,
-        contract_unproven: false,
-    };
-    seed.claude_usage_family_pending
-        .insert("family".into(), pending.clone());
-    for positional in [false, true] {
-        let mut value = serde_json::to_value(&seed).unwrap();
-        if positional {
-            value["claude_usage_family_pending"]["family"] = serde_json::json!([
-                pending.census_window_end,
-                pending.member_request_id_hashes,
-                {},
-                true,
-                "MARKER"
-            ]);
-        } else {
-            value["claude_usage_family_pending"]["family"]["idless_revision"] = "MARKER".into();
-        }
-        let template = serde_json::to_string(&value).unwrap();
-        for marker in ["1e400", "{\"wrong\":true}"] {
-            let scratch = crate::test_scratch::ScratchDir::new("idless-marker-identity");
-            let path = scratch.join("index.json");
-            fs::write(&path, template.replace("\"MARKER\"", marker)).unwrap();
-            let mut loaded = ScanIndex::load(&path).expect("field damage cannot quarantine index");
-            for round in 0..2 {
-                assert_eq!(corrupt_count(scratch.as_ref()), 0);
-                assert!(loaded.decode_holds.is_empty());
-                assert_eq!(loaded.claude_usage_family_pending["family"], pending);
-                assert_eq!(
-                    loaded.session_account_bindings,
-                    seed.session_account_bindings
-                );
-                assert_eq!(
-                    loaded.accepted_snapshot_fingerprints,
-                    seed.accepted_snapshot_fingerprints
-                );
-                assert_eq!(
-                    loaded.file_snapshot_fingerprints,
-                    seed.file_snapshot_fingerprints
-                );
-                assert_eq!(
-                    loaded.claude_request_identity_contract,
-                    seed.claude_request_identity_contract
-                );
-                assert!(loaded.claude_request_identity_contract_changed);
-                assert_eq!(
-                    serde_json::to_value(&loaded.files).unwrap(),
-                    serde_json::to_value(&seed.files).unwrap()
-                );
-                assert!(
-                    !claude_stale_carry_start_admitted(&loaded),
-                    "BASE; no proof from marker damage"
-                );
-                if round == 0 {
-                    loaded
-                        .save(&path)
-                        .expect("normalized index retains CAS custody");
-                    loaded = ScanIndex::load(&path).unwrap();
-                }
-            }
-        }
-    }
-}
-
 /// [format] Legacy count slots survive load/save while retired refusal counts become zero.
 #[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
@@ -4132,7 +3478,9 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 } else {
                     defaults[*name].clone()
                 };
-                expected[*name] = value.clone();
+                if *name != "parent_unresolvable" {
+                    expected[*name] = value.clone();
+                }
                 value
             })
             .collect::<Vec<_>>();
@@ -4260,28 +3608,54 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "archives",
             "archive_deferred_alarm_count",
             "copy_prefix_last_accepted_nonce",
-            "claude_folder_login_ledger",
+            "claude_folder_login_ledger", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "tail_discovery",
         ]
     );
 }
+fn retired_codex_field(field: &str) -> bool {
+    matches!(
+        field,
+        "codex_parent_ownership_refs"
+            | "codex_parent_ownership_ledgers"
+            | "codex_parent_side_requests"
+            | "codex_parent_side"
+            | "codex_parent_side_generation"
+            | "codex_parent_proof_wrap_epoch"
+            | "codex_parent_prefix_proofs"
+            | "codex_parent_proof_cursor"
+            | "codex_parent_side_cursor"
+            | "codex_parent_proof_seq"
+            | "codex_proof_index_incarnation"
+    )
+}
 
+/// [format] Retired fields consume old values in native, bounded and streaming
+/// decoders, without admitting damage in neighboring live controls.
 #[test]
-fn folder_login_ledger_old_state_loads_empty_and_damage_never_refuses() {
-    let read = |bytes: &[u8]| {
-        lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap()
-    };
-    assert!(read(br#"{"files":{}}"#)
-        .claude_folder_login_ledger
-        .is_empty());
-    assert_eq!(
-        read(br#"{"files":{},"claude_folder_login_ledger":17}"#).claude_folder_login_ledger,
-        crate::snapshots::claude_folder_login::damaged_ledger(),
-        "damage can never un-stick a mixed folder"
-    );
-    let kept = read(
-        br#"{"files":{},"claude_folder_login_ledger":{"folder":{"fresh":true,"mixed":true}}}"#,
-    );
-    assert_eq!(kept.claude_folder_login_ledger.len(), 1);
-    assert!(kept.claude_folder_login_ledger.contains_key("folder"));
+fn retired_codex_fields_decode_and_drop() {
+    let current = serde_json::to_value(fixture()).unwrap();
+    for field in lenient_decode::FIELDS
+        .iter()
+        .filter(|f| retired_codex_field(f))
+    {
+        assert!(current.get(*field).is_none());
+        for old in [
+            Value::Null,
+            serde_json::json!({"old": [1, 2]}),
+            serde_json::json!("old"),
+        ] {
+            let mut document = current.clone();
+            document[*field] = old;
+            let bytes = serde_json::to_vec(&document).unwrap();
+            let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+            let streaming =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+            let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+            for decoded in [native, streaming, bounded] {
+                assert!(decoded.decode_holds.is_empty());
+                assert_eq!(serde_json::to_value(decoded).unwrap(), current);
+            }
+        }
+    }
 }

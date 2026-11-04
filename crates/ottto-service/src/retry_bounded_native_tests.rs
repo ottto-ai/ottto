@@ -891,15 +891,38 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     assert_eq!(f.baseline.files.len(), 2);
 }
 
-// #660: Codex side state that enlarges the index past `RESPONSE_BYTES`
-// must not loosen any cap. Bounded retry declines before any copy (the
-// caller's existing `None` → ordinary path), and the ordinary unbounded
-// checkpoint then settles the ACK and keeps the side state.
-fn bounded_native_enlarged_by_side_state() -> SameSourceAckFixture {
+// #660: persisted state that enlarges the index past `RESPONSE_BYTES` must
+// not loosen any cap. Bounded retry declines before any copy (the caller's
+// existing `None` → ordinary path), and the ordinary unbounded checkpoint
+// then settles the ACK and keeps the filler entries.
+const ENLARGING_FILLER_FILES: usize = 1_000;
+
+fn enlarging_filler_key(n: usize) -> String {
+    format!(
+        "/synthetic/filler/.codex/sessions/2026/10/21/\
+         rollout-2026-10-21T05-43-00-0199f0a1-2b3c-7d4e-8f90-{n:012}.jsonl"
+    )
+}
+
+fn add_enlarging_filler(index: &mut ScanIndex) {
+    for n in 0..ENLARGING_FILLER_FILES {
+        index.files.insert(
+            enlarging_filler_key(n),
+            crate::snapshots::ScanIndexEntry {
+                size_bytes: 1_000_000,
+                modified_unix_seconds: 1_792_540_800,
+                source_file_fingerprint: format!("sha256:{}", "f".repeat(64)),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+fn bounded_native_enlarged_by_filler() -> SameSourceAckFixture {
     let mut f = SameSourceAckFixture::new();
-    f.baseline.add_codex_side_state_for_test(100);
+    add_enlarging_filler(&mut f.baseline);
     f.baseline.save(&f.index_path).unwrap();
-    f.working.add_codex_side_state_for_test(100);
+    add_enlarging_filler(&mut f.working);
     f.working.generation = f.baseline.generation;
     assert!(
         std::fs::metadata(&f.index_path).unwrap().len()
@@ -925,7 +948,7 @@ fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_lo
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let mut f = bounded_native_enlarged_by_side_state();
+    let mut f = bounded_native_enlarged_by_filler();
     f.send(0, same_source_fixture_ack).unwrap();
     let accepted = f.progress.accepted_fingerprints.len();
     let index = std::fs::read(&f.index_path).unwrap();
@@ -954,5 +977,6 @@ fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_lo
     f.restart_preparation();
     assert_eq!(f.progress.accepted_fingerprints.len(), accepted);
     assert!(f.baseline.files.contains_key(&f.keys[0]));
-    assert_eq!(f.baseline.codex_side_state_len_for_test(), (100, 100));
+    assert!((0..ENLARGING_FILLER_FILES)
+        .all(|n| f.baseline.files.contains_key(&enlarging_filler_key(n))));
 }

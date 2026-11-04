@@ -156,11 +156,6 @@ pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) twins: &'a std::cell::OnceCell<ClaudeTwinGroups>,
 }
 impl ReadContext<'_> {
-    /// Current membership plus this page's metadata generation probe.
-    /// No filesystem lookup here: T4's twin walk already paid for it.
-    fn live(&self, member: &str, location: LocationKey) -> bool {
-        self.index.claude_money_birth_store.witnessed(location) && self.indexed(member, location)
-    }
     /// An indexed path, or one this traversal observed that is not indexed
     /// yet (a first-seen twin or a new copy still to be read on this page).
     fn indexed(&self, member: &str, location: LocationKey) -> bool {
@@ -211,11 +206,14 @@ crate::heap_layout_bound::no_heap!(false; Located);
 /// request once per page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CopyProof {
-    /// The earliest live same-session path twin (its index key).
-    Twin(String),
-    /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
-    /// With the index key of the original its `fork-context-ref` line names.
-    Holders(Option<String>),
+    /// Earlier MAIN files of other sessions in the copy's own folder
+    /// (`folder`: its parent directory's index key), for /branch and
+    /// resume. `parent`: the index key of the original its
+    /// `fork-context-ref` line names.
+    Holders {
+        parent: Option<String>,
+        folder: String,
+    },
     /// A subagent's family root (its index key): a forked subagent repeats
     /// the parent's last response as its first line, so that first response
     /// counts once, at the root, when the root holds its request id.
@@ -224,8 +222,13 @@ enum CopyProof {
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Twin(key) | Self::Holders(Some(key)) | Self::Family(key) => key.heap_bound(c),
-            Self::Holders(None) => c.add(0),
+            Self::Holders { parent, folder } => {
+                if let Some(parent) = parent {
+                    parent.heap_bound(c)?;
+                }
+                folder.heap_bound(c)
+            }
+            Self::Family(key) => key.heap_bound(c),
         }
     }
 }
@@ -384,17 +387,17 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         prefix_inherited,
         copied: _,
         first_own,
+        first_own_at: _,
+        grandfathered: _,
         ambiguous,
         disclosed: _,
         e2_nanos: _,
         responses: _,
         root_fallbacks: _,
         side: _,
-        side_requests: _,
         telemetry,
         accounts,
         prefix: _,
-        folder_trace,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -413,7 +416,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
-    *folder_trace = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -898,6 +900,10 @@ pub(crate) struct FileFold {
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
     first_own: Option<u64>,
+    /// The provider time of the `first_own` response (RAM only).
+    first_own_at: Option<i128>,
+    /// An accepted copy decided before `COPY_PROOF_FROM` keeps its decision.
+    grandfathered: bool,
     /// Request hashes two responses of this file claim; filled on demand.
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
@@ -906,15 +912,12 @@ pub(crate) struct FileFold {
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
-    pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
-    /// Which file this fold read, for the folder ledger; set as it becomes an item.
-    pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1034,7 +1037,6 @@ impl FileFold {
             ambiguous,
             accounts,
             proof,
-            crate::snapshots::claude_folder_login::FolderTrace::finish_heap_bound(),
         ] {
             out = out.checked_add(bytes)?;
         }
@@ -1132,17 +1134,17 @@ impl FileFold {
             prefix_inherited: None,
             copied: 0,
             first_own: None,
+            first_own_at: None,
+            grandfathered: false,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
             e2_nanos: FoldNanos::default(),
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
-            side_requests: 0,
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
-            folder_trace: None,
         };
         fold.spend(started);
         fold
@@ -1236,23 +1238,6 @@ impl FileFold {
             && !self.is_skipped(occurrence.sequence)
     }
 
-    /// Whether this file holds a prefix from elsewhere: a response older than
-    /// its birth, a held pre-birth range, or a birth inherited across a move.
-    pub(crate) fn copied_or_moved<'a>(
-        &self,
-        mut occurrences: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
-    ) -> bool {
-        !self.skipped.is_empty()
-            || matches!(
-                (self.money_birth.birth_nanos(), self.physical),
-                (Some(effective), Some(physical)) if effective != physical
-            )
-            || occurrences.any(|occurrence| {
-                let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
-                self.money_birth.copied_with_slack(at, SLACK) == Some(true)
-            })
-    }
-
     /// `placed` is the native finalizer's own placement of this response
     /// (None: zero usage, no native row), so the grain key equals the native
     /// row's without placing twice.
@@ -1281,8 +1266,9 @@ impl FileFold {
     ) {
         self.responses += 1;
         let copied = self.money_birth.copied_with_slack(at, SLACK);
-        if copied == Some(false) {
-            self.first_own.get_or_insert(sequence);
+        if copied == Some(false) && self.first_own.is_none() {
+            self.first_own = Some(sequence);
+            self.first_own_at = at;
         }
         let Some(placed) = placed else {
             return;
@@ -1372,16 +1358,12 @@ impl FileFold {
         key.put(into, &tokens, requests, at, account);
     }
 
-    /// Confirm, or undo, the held pre-birth skip. A partial copy (own lines
-    /// after birth) is skipped on timestamps with a writer certificate from
-    /// those own lines. Every other skip needs a PROOF that
-    /// `decide_page_copies` checks per request on the page: a same-session
-    /// earlier path twin (stored birth, total (birth, location) order, a
-    /// certified writer) or, for an all-pre-birth MAIN file or the copied
-    /// prefix of a resumed MAIN file with an uncertified writer, earlier
-    /// main files of other sessions (/branch, resume; the request ids are the
-    /// proof, no writer certificate). Without one the copies count and are
-    /// disclosed.
+    /// Confirm, or undo, the held pre-birth skip. A copied MAIN file
+    /// (all-pre-birth /branch, or the prefix of a resume) needs a PROOF that
+    /// `decide_page_copies` checks per request on the page: earlier main
+    /// files of other sessions in its folder hold the request ids. An
+    /// accepted copy decided before `COPY_PROOF_FROM` keeps its decision.
+    /// Without a proof the copies count and are disclosed.
     /// `fork_parent`: the session a `fork-context-ref` line names (empty:
     /// none single).
     pub(in crate::snapshots) fn finish_native(
@@ -1419,43 +1401,28 @@ impl FileFold {
             self.finish_identity_start(false, markers);
             return;
         }
-        // The witness order is total over (effective birth, location), so of
-        // two live all-pre-birth paths exactly one is skipped, whatever role
-        // (an equal-birth owner can lose to its twin).
-        let needs_original = self.first_own.is_none()
-            || matches!(self.role, Role::Twin)
-            || context.is_some_and(|context| {
-                self.location.is_some_and(|Located(location)| {
-                    context
-                        .index
-                        .claude_money_birth_store
-                        .staged_location(location)
-                })
-            });
-        let certified = self.money_birth.writer_certified(self.first_own);
-        if certified && !needs_original {
-            // Timestamp skip: id-less copies stay skipped with the rest.
+        if self.grandfathered(context) {
+            // Accepted history keeps its decision: id-less copies stay
+            // skipped with the rest.
+            self.grandfathered = true;
             self.idless_copy = None;
             self.idless_inherited = None;
             self.keep_copies(markers);
             return;
         }
-        if certified {
-            if let Some(witness) = self.original_witness(context) {
-                self.proof = Some(CopyProof::Twin(witness));
-                self.keep_copies(markers);
-                return;
-            }
-        }
-        if self.cross_session_candidate(context, certified) {
+        if let Some(context) = context.filter(|context| self.cross_session_candidate(context)) {
             // The named original is a sibling file of the same project.
             let parent = fork_parent
                 .filter(|parent| !parent.is_empty())
-                .zip(context)
-                .map(|(parent, context)| {
+                .map(|parent| {
                     local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
                 });
-            self.proof = Some(CopyProof::Holders(parent));
+            let folder = context
+                .path
+                .parent()
+                .map(local_index_key)
+                .unwrap_or_default();
+            self.proof = Some(CopyProof::Holders { parent, folder });
             // Should the page find no holder, the restored copies keep the
             // accounts their own markers give them (QUOTA: never moved).
             // Keep marker-dependent grains staged until the page decides
@@ -1471,9 +1438,6 @@ impl FileFold {
             self.entity.absorb_grains(&copy);
         }
         self.restore_idless();
-        if let Some(accounts) = self.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
         self.entity.removed = Default::default();
         self.entity.removed_requests = 0;
         self.skipped.clear();
@@ -1511,37 +1475,33 @@ impl FileFold {
         }
     }
 
-    /// The key of the earliest live same-session path twin, if any.
-    fn original_witness(&self, context: Option<&ReadContext<'_>>) -> Option<String> {
-        let (Some(context), Some(physical)) = (context, self.physical) else {
-            return None;
+    /// Forward-only: a resumed copy whose first own response (provider
+    /// time) is before `COPY_PROOF_FROM`, whose body was settled with copies
+    /// removed and accepted, and that has no saved removal, keeps that
+    /// decision. A later copy, an all-copy file or an unaccepted one takes
+    /// the request-id proof.
+    fn grandfathered(&self, context: Option<&ReadContext<'_>>) -> bool {
+        let (Some(context), Some(at), Some(Located(location))) =
+            (context, self.first_own_at, self.location)
+        else {
+            return false;
         };
-        let member = session_member(context.path)?;
-        let key = local_index_key(context.path);
-        let location = context.index.claude_money_birth_store.original_witness_at(
-            &member,
-            &key,
-            physical,
-            |location| context.live(&member, location),
-        )?;
-        context.twin_key(&member, location).map(str::to_owned)
+        let index = context.index;
+        !from_copy_proof_cutoff(at)
+            && index.claude_money_birth_store.money_marks(location) & money_mark::COPY != 0
+            && index.file_has_accepted_body(&local_index_key(context.path))
+            && index.claude_copy_removals.get(location).is_empty()
     }
 
-    /// /branch and --fork-session: an all-pre-birth MAIN file
-    /// whose copies `decide_page_copies` checks against other sessions'
-    /// earlier main files, in one census walk per page. Copy-family fix:
-    /// a resumed MAIN file (own turns after its copied
-    /// prefix) whose writer is not certified gets the same per-request check
-    /// for its prefix, whatever the writer version. A certified resumed file
-    /// keeps its timestamp or twin rule (never two removals of one request).
-    fn cross_session_candidate(&self, context: Option<&ReadContext<'_>>, certified: bool) -> bool {
-        (self.first_own.is_none() || !certified)
-            && self.physical.is_some()
+    /// /branch and --fork-session (an all-pre-birth MAIN file) and resume
+    /// (the copied prefix of a MAIN file with own turns): its copies
+    /// `decide_page_copies` checks against other sessions' earlier main
+    /// files in its folder, in one census walk per folder per page.
+    fn cross_session_candidate(&self, context: &ReadContext<'_>) -> bool {
+        self.physical.is_some()
             && self.location.is_some()
-            && context.is_some_and(|context| {
-                claude_index_path_member_ref(context.path)
-                    .is_some_and(|member| member.subagent_stem.is_none())
-            })
+            && claude_index_path_member_ref(context.path)
+                .is_some_and(|member| member.subagent_stem.is_none())
     }
 
     /// This fold's (effective birth, location): the total copy order.
@@ -1995,7 +1955,7 @@ pub(crate) fn decide_page_copies(
             ..PrefixTally::default()
         };
         let proof = fold.proof.clone();
-        if !matches!(proof, Some(CopyProof::Holders(_))) {
+        if !matches!(proof, Some(CopyProof::Holders { .. })) {
             if let Some(Located(file)) = fold.location {
                 if index.claude_copy_removals.pending(file) {
                     resolved_holds.push(file);
@@ -2003,8 +1963,7 @@ pub(crate) fn decide_page_copies(
             }
         }
         match proof {
-            Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
-            Some(CopyProof::Holders(_)) => holders.push(at),
+            Some(CopyProof::Holders { .. }) => holders.push(at),
             Some(CopyProof::Family(root)) => decide_family(items, at, &root, index),
             None => {}
         }
@@ -2142,25 +2101,16 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
 pub(crate) struct CopyRemovalUpdates {
     state: Option<super::copy_removals::CopyRemovals>,
     added: u64,
-    unrecorded: u64,
 }
 impl CopyRemovalUpdates {
-    /// The bounded replacement carries stored decisions and retry debt in the
-    /// same index save. A refused decision still removes proven copies.
+    /// The replacement carries stored decisions and retry debt in the same
+    /// index save.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
         if let Some(state) = self.state {
             index.claude_copy_removals = state;
         }
         diag("copy_removal_stored", self.added);
-        diag("copy_removal_store_overflow", self.unrecorded);
-        diag("copy_removed_unrecorded", self.unrecorded);
-        if self.unrecorded > 0 {
-            eprintln!(
-                "local Claude money: alarm=copy_removal_store_full copy_removed_unrecorded={}",
-                self.unrecorded
-            );
-        }
-        record_counts(Counts::removal_store(self.added, self.unrecorded));
+        record_counts(Counts::removal_store(self.added));
     }
 }
 
@@ -2244,20 +2194,6 @@ fn current_witness<'a>(
     }
 }
 
-fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
-    let session = &items[at].source_session_id;
-    let uncovered = current_witness(items, session, witness, index).map(|witness| {
-        skipped_ids(&items[at])
-            .filter(|id| !witness.holds(id))
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    match uncovered {
-        Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
-        None => hold_copies(&mut items[at], "held_twin_unproven"),
-    }
-}
-
 /// A forked subagent's first line repeats the parent's last response: the
 /// subagent's first response counts once, at the root, when the root's
 /// current witness holds its request id. A root not read at its current
@@ -2281,7 +2217,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
                 .claude_request_census
                 .get(root_key)
                 .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
-            record_counts(Counts::one(29, u64::from(deferred)));
+            record_counts(Counts::one(27, u64::from(deferred)));
             diag("family_copy_deferred", u64::from(deferred));
             false
         }
@@ -2334,7 +2270,7 @@ fn scan_evidence(
     let settled = index
         .files
         .get(key)
-        .filter(|entry| record.proves_current(entry.observed_fingerprint()));
+        .filter(|entry| record.proves_current(entry.source_file_fingerprint.as_str()));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
     if let Some(metadata) = &metadata {
         let now = metadata
@@ -2376,19 +2312,11 @@ fn queued(index: &ScanIndex, key: &str) -> bool {
 
 /// Another session's main file this traversal has not put on any page yet
 /// and that has no scan state: queued, without a census record (unscanned,
-/// or indexed without one). Only these, and a queued stale holder
-/// (`Evidence::Queued`), can make a copy wait. A scanned file, held or not,
-/// is evidence (`scan_evidence`), never a reason to wait, so held sessions
-/// never wait on each other; with the queue drained (traversal complete)
-/// nothing is pending and what exists decides.
-fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
-    unscanned_main_files(index)
-        .into_iter()
-        .map(|(root, _)| root)
-        .collect()
-}
-
-/// `unscanned_main_roots` with each file's index key.
+/// or indexed without one): (session root, index key). Only these, and a
+/// queued stale holder (`Evidence::Queued`), can make a copy wait. A scanned
+/// file, held or not, is evidence (`scan_evidence`), never a reason to wait,
+/// so held sessions never wait on each other; with the queue drained
+/// (traversal complete) nothing is pending and what exists decides.
 fn unscanned_main_files(index: &ScanIndex) -> Vec<(String, String)> {
     index
         .traversal
@@ -2407,32 +2335,26 @@ fn unscanned_main_files(index: &ScanIndex) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Unscanned other main files: (session root, copy order when known).
-type UnscannedOrders = Vec<(String, Option<(i128, LocationKey)>)>;
-
-/// Copy-family fix: a resumed file waits only for an unscanned main file
-/// of another session that may be its earlier holder (born before it, or
-/// birth unknown); a later file cannot hold its copied prefix.
-fn unscanned_earlier_main(
+/// A copy waits only for an unscanned main file of another session in its
+/// own folder that may hold its prefix; a resumed copy only for one born
+/// before it (or of unknown birth): a later file cannot hold its prefix.
+fn unscanned_may_hold(
     index: &ScanIndex,
-    pending: &std::cell::OnceCell<UnscannedOrders>,
+    pending: &[(String, String)],
     session: &str,
-    order: (i128, LocationKey),
+    folder: &str,
+    resumed: Option<(i128, LocationKey)>,
 ) -> bool {
-    pending
-        .get_or_init(|| {
-            unscanned_main_files(index)
-                .into_iter()
-                .map(|(root, key)| {
-                    let order = holder_order(&index.claude_money_birth_store, &root, &key);
-                    (root, order)
-                })
-                .collect()
-        })
-        .iter()
-        .any(|(root, holder)| {
-            root != session && !matches!(holder, Some(holder) if *holder >= order)
-        })
+    pending.iter().any(|(root, key)| {
+        root != session
+            && Path::new(key).parent() == Some(Path::new(folder))
+            && resumed.map_or(true, |order| {
+                !matches!(
+                    holder_order(&index.claude_money_birth_store, root, key),
+                    Some(holder) if holder >= order
+                )
+            })
+    })
 }
 
 /// A holder's place in the total copy order: (effective birth, location).
@@ -2483,10 +2405,15 @@ fn parent_proves(
             .is_some_and(|holder| holder < order)
 }
 
-/// 2026-11-04T00:00:00Z (UTC ms). Only a copy whose own turns start at or
-/// after it takes the same-session page proof; an earlier copy keeps the
-/// count it already had.
-const TWIN_ID_PROOF_FROM: i64 = 1_793_750_400_000;
+/// 2026-11-04T00:00:00Z (UTC ms). A copy whose own turns start at or after
+/// it takes the request-id proofs alone (also the same-session page proof);
+/// an earlier accepted copy keeps the decision it already had.
+const COPY_PROOF_FROM: i64 = 1_793_750_400_000;
+
+/// A provider time (UTC ns) at or after `COPY_PROOF_FROM`.
+fn from_copy_proof_cutoff(at: i128) -> bool {
+    at >= i128::from(COPY_PROOF_FROM) * 1_000_000
+}
 
 /// The held copies of `items[at]` that an EARLIER fold of the same session
 /// on this page holds, by that fold's parse (the `Witness::Page` evidence):
@@ -2499,19 +2426,19 @@ fn twin_page_held(
     order: (i128, LocationKey),
 ) -> BTreeSet<u64> {
     let item = &items[at];
-    let earlier = page_folds
-        .get(item.source_session_id.as_str())
-        .into_iter()
-        .flatten()
-        .filter(|&&other| {
+    let earlier = earlier_holders(
+        items,
+        page_folds
+            .get(item.source_session_id.as_str())
+            .map_or(&[][..], Vec::as_slice),
+        &order,
+        |other| {
             items[other]
                 .claude_money
                 .as_deref()
                 .and_then(FileFold::copy_order)
-                .is_some_and(|earlier| earlier < order)
-        })
-        .map(|&other| &items[other].claude_usage_request_ids)
-        .collect::<Vec<_>>();
+        },
+    );
     if earlier.is_empty() || !twin_copy_born_from_cutoff(item, &earlier) {
         return BTreeSet::new();
     }
@@ -2521,25 +2448,51 @@ fn twin_page_held(
         .collect()
 }
 
-/// The copy's birth from its lines alone: the time of its first response
-/// no earlier twin holds (its first own turn). Never a file system birth,
-/// which a copy, rewrite or restore resets, so cold and stored reads agree.
+/// The request ids of the files in `group` that come before `at` in the
+/// caller's `order`; a file without a place in that order holds nothing.
+pub(in crate::snapshots) fn earlier_holders<'a, K: Ord>(
+    items: &'a [SnapshotItem],
+    group: &[usize],
+    at: &K,
+    order: impl Fn(usize) -> Option<K>,
+) -> Vec<&'a BTreeSet<String>> {
+    group
+        .iter()
+        .filter(|&&other| order(other).is_some_and(|key| key < *at))
+        .map(|&other| &items[other].claude_usage_request_ids)
+        .collect()
+}
+
 /// An unknown time keeps today's decision.
 fn twin_copy_born_from_cutoff(item: &SnapshotItem, earlier: &[&BTreeSet<String>]) -> bool {
+    first_own_turn_at(item, 0, earlier).is_some_and(from_copy_proof_cutoff)
+}
+
+/// The copy's birth from its lines alone: the time of its first response at
+/// or after sequence `from` that no earlier twin holds (its first own turn).
+/// Never a file system birth, which a copy, rewrite or restore resets, so
+/// cold and stored reads agree.
+pub(in crate::snapshots) fn first_own_turn_at(
+    item: &SnapshotItem,
+    from: u64,
+    earlier: &[&BTreeSet<String>],
+) -> Option<i128> {
     item.claude_usage_occurrences
         .iter()
-        .filter(|(id, _)| !earlier.iter().any(|ids| ids.contains(*id)))
+        .filter(|(id, occurrence)| {
+            occurrence.sequence >= from && !earlier.iter().any(|ids| ids.contains(*id))
+        })
         .min_by_key(|(_, occurrence)| occurrence.sequence)
         .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
         .and_then(rfc3339_unix_nanos)
-        .is_some_and(|at| at >= i128::from(TWIN_ID_PROOF_FROM) * 1_000_000)
 }
 
-/// One census walk for every all-pre-birth main file of the page. A holder
-/// proves a request when it is another session's main file whose scan state
-/// holds it (`scan_evidence`) and earlier in (effective birth, location).
-/// The walk deadline, a queued size change, a holder modified since its
-/// census read, an unscanned other-session main file or an unaccepted holder delay it.
+/// One census walk per folder for every copied main file of the page. A
+/// holder proves a request when it is another session's main file in the
+/// copy's folder whose scan state holds it (`scan_evidence`) and earlier in
+/// (effective birth, location). The folder's walk deadline, a queued size
+/// change, a holder modified since its census read, an unscanned
+/// other-session main file of the folder or an unaccepted holder delay it.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2566,7 +2519,7 @@ fn decide_holders(
         /// Of `stored`, those whose recorded holder is no longer indexed.
         absent: BTreeSet<u64>,
         /// Own turns follow the copied prefix: waits only for a possibly
-        /// earlier unscanned holder (`unscanned_earlier_main`).
+        /// earlier unscanned holder (`unscanned_may_hold`).
         resumed: bool,
         /// A holder that would cover it changed and is still queued.
         waiting: bool,
@@ -2576,6 +2529,8 @@ fn decide_holders(
         unaccepted: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
+        /// The copy's folder: only holders there prove its requests.
+        folder: String,
         /// Hashes an earlier same-session fold on this page counts
         /// (`twin_page_held`): removed, never stored.
         twin_held: BTreeSet<u64>,
@@ -2600,9 +2555,8 @@ fn decide_holders(
             let fold = item.claude_money.as_deref()?;
             let order = fold.copy_order()?;
             let resumed = fold.first_own.is_some();
-            let parent = match &fold.proof {
-                Some(CopyProof::Holders(parent)) => parent.clone(),
-                _ => None,
+            let Some(CopyProof::Holders { parent, folder }) = fold.proof.clone() else {
+                return None;
             };
             let mut hashes = skipped_ids(item)
                 .map(|id| claude_request_hash(id))
@@ -2610,11 +2564,13 @@ fn decide_holders(
             hashes.sort_unstable();
             hashes.dedup();
             // Addendum 1: a stored removal stays removed after its holder's
-            // id list retires. A holder whose census disproves it invalidates
-            // that saved decision. Positive proof also remains valid if the
-            // walk hits its deadline. A holder no longer indexed
-            // (its transcript deleted) cannot disprove anything; its recorded
-            // removals stand, counted, instead of re-adding a proven copy.
+            // id list retires. Only a holder whose census disproves it
+            // invalidates that saved decision; a holder family on the
+            // re-emission list keeps it (listing pauses new removals only).
+            // Positive proof also remains valid if the walk hits its
+            // deadline. A holder no longer indexed (its transcript deleted)
+            // cannot disprove anything; its recorded removals stand,
+            // counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
             let mut unaccepted = BTreeSet::new();
@@ -2630,10 +2586,10 @@ fn decide_holders(
                         continue;
                     }
                     // Stays recorded; applies again once the indexed holder is accepted.
-                    if let Some(key) = key.filter(|key| !origin_accepted(index, key)) {
-                        if !index.claude_family_listed(key) {
-                            unaccepted.insert(hash);
-                        }
+                    if key.is_some_and(|key| {
+                        !index.claude_family_listed(key) && !index.file_has_accepted_body(key)
+                    }) {
+                        unaccepted.insert(hash);
                         continue;
                     }
                     stored.insert(hash);
@@ -2657,78 +2613,90 @@ fn decide_holders(
                 stale: BTreeSet::new(),
                 unaccepted,
                 parent,
+                folder,
             })
         })
         .collect::<Vec<_>>();
-    // (hash, wanted file), sorted: each holder hit finds the files that want
-    // it directly, never a pass over every wanted file per holder record.
-    let mut wanting = wanted
-        .iter()
-        .enumerate()
-        .flat_map(|(at, wanted)| wanted.hashes.iter().map(move |&hash| (hash, at)))
-        .collect::<Vec<_>>();
-    wanting.sort_unstable();
-    let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
-    union.dedup();
+    // Per folder, (hash, wanted file), sorted: each holder hit finds the
+    // files that want it directly, never a pass over every wanted file per
+    // holder record.
+    let mut by_folder = BTreeMap::<String, Vec<(u64, usize)>>::new();
+    for (at, file) in wanted.iter().enumerate() {
+        by_folder
+            .entry(file.folder.clone())
+            .or_default()
+            .extend(file.hashes.iter().map(|&hash| (hash, at)));
+    }
     let store = &index.claude_money_birth_store;
-    let walked = index.claude_request_census.main_transcript_holders(
-        &union,
-        Instant::now() + SIDE_CALL_DEADLINE,
-        |key, root, record, hits| {
-            // Per holder record, each at most once and only when another
-            // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
-            for &hash in hits {
-                let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
-                for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
-                    let file = &mut wanted[at];
-                    if file.session == root {
-                        continue;
-                    }
-                    let holder = *holder.get_or_insert_with(|| {
-                        let evidence = scan_evidence(index, key, record);
-                        if evidence == Evidence::None {
-                            return None;
+    let deadline = Instant::now() + SIDE_CALL_DEADLINE;
+    // Folders whose walk passed the page deadline: only their copies defer.
+    let mut unwalked = BTreeSet::new();
+    for (folder, mut wanting) in by_folder {
+        wanting.sort_unstable();
+        let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
+        union.dedup();
+        let walked = index.claude_request_census.main_transcript_holders(
+            &folder,
+            &union,
+            deadline,
+            |key, root, record, hits| {
+                // Per holder record, each at most once and only when another
+                // session wants one of its ids: evidence, then (birth, location).
+                let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
+                for &hash in hits {
+                    let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
+                    for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
+                        let file = &mut wanted[at];
+                        if file.session == root {
+                            continue;
                         }
-                        Some((
-                            evidence,
-                            holder_order(store, root, key)?,
-                            origin_accepted(index, key),
-                        ))
-                    });
-                    match holder {
-                        Some((evidence, holder, proven)) if holder < file.order => match evidence {
-                            Evidence::Queued => file.waiting = true,
-                            Evidence::Stale => {
-                                file.stale.insert(hash);
+                        let holder = *holder.get_or_insert_with(|| {
+                            let evidence = scan_evidence(index, key, record);
+                            if evidence == Evidence::None {
+                                return None;
                             }
-                            Evidence::Current if proven => {
-                                let earliest = file.covered.entry(hash).or_insert(holder);
-                                *earliest = (*earliest).min(holder);
-                            }
-                            Evidence::Current => {
-                                if !index.claude_family_listed(key) {
-                                    file.unaccepted.insert(hash);
+                            Some((
+                                evidence,
+                                holder_order(store, root, key)?,
+                                origin_accepted(index, key),
+                            ))
+                        });
+                        match holder {
+                            Some((evidence, holder, proven)) if holder < file.order => {
+                                match evidence {
+                                    Evidence::Queued => file.waiting = true,
+                                    Evidence::Stale => {
+                                        file.stale.insert(hash);
+                                    }
+                                    Evidence::Current if proven => {
+                                        let earliest = file.covered.entry(hash).or_insert(holder);
+                                        *earliest = (*earliest).min(holder);
+                                    }
+                                    Evidence::Current => {
+                                        if !index.claude_family_listed(key) {
+                                            file.unaccepted.insert(hash);
+                                        }
+                                    }
+                                    Evidence::None => {}
                                 }
                             }
-                            Evidence::None => {}
-                        },
-                        _ => {}
+                            _ => {}
+                        }
                     }
                 }
-            }
-        },
-    );
-    let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
-    let pending_files = std::cell::OnceCell::new();
-    let mut updates = CopyRemovalUpdates::default();
-
-    {
-        let mut state = index.claude_copy_removals.clone();
-        let live = live.get_or_init(|| indexed_main_files(index));
-        state.retain_files(|file| live.contains_key(&file));
-        updates.state = Some(state);
+            },
+        );
+        if walked.is_none() {
+            unwalked.insert(folder);
+        }
     }
+    let pending = std::cell::OnceCell::new();
+    let mut updates = CopyRemovalUpdates {
+        // Stored removals leave only with their file
+        // (`ScanIndex::drop_file_entry`); no page sweeps them.
+        state: Some(index.claude_copy_removals.clone()),
+        ..Default::default()
+    };
 
     for wanted in wanted {
         let decided =
@@ -2741,7 +2709,7 @@ fn decide_holders(
             .collect::<Vec<_>>();
         let twin_removed = wanted.twin_held.iter().filter(|&h| !decided(h)).count() as u64;
         diag("copy_prefix_twin_page_removed", twin_removed);
-        record_counts(Counts::one(30, twin_removed));
+        record_counts(Counts::one(28, twin_removed));
         let reused = wanted
             .stored
             .iter()
@@ -2754,7 +2722,7 @@ fn decide_holders(
             .count() as u64;
         if absent_kept > 0 {
             diag("copy_removal_holder_absent_kept", absent_kept);
-            record_counts(Counts::one(25, absent_kept));
+            record_counts(Counts::one(23, absent_kept));
         }
         // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
         if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
@@ -2764,19 +2732,17 @@ fn decide_holders(
                 .filter(|hash| !wanted.stored.contains(hash))
                 .count() as u64;
             diag("copy_prefix_late_origin_removed", late);
-            record_counts(Counts::one(26, late));
+            record_counts(Counts::one(24, late));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
-            let stored = state.store(wanted.order.1, groups);
-            updates.added += stored.added;
-            updates.unrecorded += stored.overflow;
+            updates.added += state.store(wanted.order.1, groups);
         }
         note_reused(&mut items[wanted.at], reused);
         // Only the unresolved prefix waits. Persisted retry debt reselects
         // the file after its own-turn ACK, even when it is unchanged; its
         // third decision emits any remaining unproven requests flagged.
-        if walked.is_none() {
+        if unwalked.contains(&wanted.folder) {
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -2806,8 +2772,8 @@ fn decide_holders(
                 .is_some_and(|state| !state.pending(wanted.order.1));
             diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
             diag("copy_prefix_origin_unaccepted_passes", 1);
-            record_counts(Counts::one(27, u64::from(first)));
-            record_counts(Counts::one(28, 1));
+            record_counts(Counts::one(25, u64::from(first)));
+            record_counts(Counts::one(26, 1));
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -2835,17 +2801,16 @@ fn decide_holders(
             restore_uncovered(&mut items[wanted.at], &[]);
             continue;
         }
-        // A resumed file waits only for a possible earlier holder; an
-        // all-copy file for any unscanned main file (unchanged).
+        // A resumed file waits only for a possible earlier holder of its
+        // folder; an all-copy file for any unscanned main file there.
         let blocked = !uncovered.is_empty()
-            && if wanted.resumed {
-                unscanned_earlier_main(index, &pending_files, &wanted.session, wanted.order)
-            } else {
-                pending
-                    .get_or_init(|| unscanned_main_roots(index))
-                    .iter()
-                    .any(|root| *root != wanted.session)
-            };
+            && unscanned_may_hold(
+                index,
+                pending.get_or_init(|| unscanned_main_files(index)),
+                &wanted.session,
+                &wanted.folder,
+                wanted.resumed.then_some(wanted.order),
+            );
         if blocked {
             defer_prefix(
                 &mut items[wanted.at],
@@ -2860,8 +2825,9 @@ fn decide_holders(
         if let Some(state) = updates.state.as_mut() {
             state.clear_hold(wanted.order.1);
         }
-        // What no holder proves now (its id list retired,
-        // over budget or missing, no stored removal) counts, flagged.
+        // What no holder proves now (its id list retired, over budget or
+        // missing, an origin deleted or in another folder, no stored
+        // removal) counts, flagged.
         let ids = skipped_ids(&items[wanted.at])
             .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
             .cloned()
@@ -2993,13 +2959,13 @@ fn defer_prefix(
         fold.entity.held = true;
         if accepted_prefix {
             diag("copy_prefix_accepted_session_holds", 1);
-            record_counts(Counts::one(24, 1));
+            record_counts(Counts::one(22, 1));
         }
         // Whole-body undecided counters are otherwise suppressed at finish;
         // the held prefix must still be visible in production diagnostics.
         let mut held = Counts::default();
-        held.0[16] = fold.prefix.held_requests;
-        held.0[17] = u64::from(fold.prefix.held_requests > 0);
+        held.0[14] = fold.prefix.held_requests;
+        held.0[15] = u64::from(fold.prefix.held_requests > 0);
         record_counts(held);
     }
     fold.proof = None;
@@ -3050,7 +3016,7 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     else {
         return;
     };
-    let holder_proof = matches!(fold.proof, Some(CopyProof::Holders(_)));
+    let holder_proof = matches!(fold.proof, Some(CopyProof::Holders { .. }));
     for id in uncovered {
         if fold.is_ambiguous(id) {
             // Two responses claim it: no single grain to give back.
@@ -3062,12 +3028,6 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     }
     fold.restore_idless();
     fold.proof = None;
-    if fold.copied == 0 {
-        // Every copy counts after all: their inherited-marker tally too.
-        if let Some(accounts) = fold.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
-    }
     if !holder_proof {
         fold.absorb_prefix_inherited(false);
     }
@@ -3832,7 +3792,6 @@ pub(crate) fn side_calls_page(
                 )
             });
             fold.side.add(&tokens);
-            fold.side_requests += 1;
             if fallback {
                 fold.root_fallbacks += 1;
             }
@@ -4032,7 +3991,6 @@ pub(crate) fn finish_page(
         .unwrap_or_default();
 
     claude_request_identity::inherit_root_accounts(items, true);
-    claude_request_identity::record_page_identity_counts(items);
 
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<String, Session>::new();
@@ -4047,12 +4005,9 @@ pub(crate) fn finish_page(
             continue;
         };
         let source_session_id: &String = source_session_id;
-        // Released money restored an uncertified resumed prefix. Count only a
-        // proven removal, never a held/unproven request or certified skip.
-        if fold.first_own.is_some()
-            && !fold.money_birth.writer_certified(fold.first_own)
-            && fold.entity.removed_requests > 0
-        {
+        // Released money restored a resumed prefix. Count only a proven
+        // removal, never a held/unproven request or a grandfathered skip.
+        if fold.first_own.is_some() && !fold.grandfathered && fold.entity.removed_requests > 0 {
             corrected_sessions.insert(source_session_id.clone());
         }
         // Work counts on every read; decisions only when decided (below).
@@ -4091,7 +4046,7 @@ pub(crate) fn finish_page(
         );
         diag("copy_prefix_hold_expired", fold.prefix.hold_expired);
         session.decided.add(&Counts::prefix(&fold.prefix));
-        session.decided.0[22] += fold.own_requests;
+        session.decided.0[20] += fold.own_requests;
         diag(
             "copy_prefix_removed_priced_requests",
             fold.prefix.removed_priced_requests,
@@ -4194,7 +4149,7 @@ pub(crate) fn finish_page(
         if emitted {
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
-                counts.0[19] = marked.rows;
+                counts.0[17] = marked.rows;
                 record_counts(counts);
                 diag("copy_prefix_unproven_rows", marked.rows);
             }
@@ -4270,8 +4225,8 @@ pub(crate) fn finish_page(
             .collect::<BTreeSet<_>>();
         if !corrected_families.is_empty() {
             let mut counts = Counts::default();
-            counts.0[23] = corrected_families.len() as u64;
-            diag("copy_prefix_families_corrected", counts.0[23]);
+            counts.0[21] = corrected_families.len() as u64;
+            diag("copy_prefix_families_corrected", counts.0[21]);
             record_counts(counts);
         }
     }
@@ -4350,7 +4305,7 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         if let Some(record) = index.claude_request_census.get(key).filter(|record| {
             !record.request_hashes().is_empty()
                 && index.files.get(key).is_some_and(|entry| {
-                    record.current_for(entry.observed_fingerprint())
+                    record.current_for(entry.source_file_fingerprint.as_str())
                         && entry.same_listing_stamp_as(&metadata)
                 })
         }) {
@@ -4522,15 +4477,13 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copy-family fix, class N, diagnostics only: the
     // flagged copied-prefix requests and files, the matched priced share
     // with its reported cost, stored removals reused without a current
-    // holder, and stored-removal writes and cap refusals.
+    // holder, and stored-removal writes.
     "copy_prefix_unproven_requests",
     "copy_prefix_unproven_files",
     "copy_prefix_unproven_priced_requests",
     "copy_prefix_unproven_cost_micros",
     "copy_removal_reused",
     "copy_removal_stored",
-    "copy_removal_store_overflow",
-    "copy_removed_unrecorded",
     "copy_removal_metadata_lost",
     "copy_prefix_held_requests",
     "copy_prefix_held_files",
@@ -4555,7 +4508,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
 ];
-const COUNT_LEN: usize = 31;
+const COUNT_LEN: usize = 29;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4614,22 +4567,20 @@ impl Counts {
             tally.cost_micros,
             tally.reused,
         ]);
-        all[15] = tally.metadata_lost;
-        all[16] = tally.held_requests;
-        all[17] = u64::from(tally.held_requests > 0);
-        all[18] = tally.hold_expired;
-        all[20] = tally.removed_priced_requests;
-        all[21] = tally.removed_cost_micros;
+        all[13] = tally.metadata_lost;
+        all[14] = tally.held_requests;
+        all[15] = u64::from(tally.held_requests > 0);
+        all[16] = tally.hold_expired;
+        all[18] = tally.removed_priced_requests;
+        all[19] = tally.removed_cost_micros;
         Self(all)
     }
-    fn removal_store(added: u64, overflow: u64) -> Self {
+    fn removal_store(added: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[12] = added;
-        all[13] = overflow;
-        all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..30) by `n`.
+    /// One enable-readiness counter (index 22..28) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;

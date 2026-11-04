@@ -61,38 +61,17 @@ fn e2_page(
     support: &Path,
     index: &mut ScanIndex,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
-    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index);
-    (items, disposition, failed)
+    e2_page_with(dirs, support, index, None)
 }
 
-/// `e2_page` plus the page identity counters `finish_page` recorded (read
-/// before the emitted folds they derive from are released).
-fn e2_page_counted(
-    dirs: &[PathBuf],
-    support: &Path,
-    index: &mut ScanIndex,
-) -> (
-    Vec<SnapshotItem>,
-    ClaudeUsageAuthorityDisposition,
-    bool,
-    serde_json::Value,
-) {
-    e2_page_counted_with(dirs, support, index, None)
-}
-
-/// `e2_page_counted` under this cycle's accepted-identity state (its
-/// capabilities); `None` is the plain evidence stage.
-fn e2_page_counted_with(
+/// `e2_page` under this cycle's accepted-identity state (its capabilities);
+/// `None` is the plain evidence stage.
+fn e2_page_with(
     dirs: &[PathBuf],
     support: &Path,
     index: &mut ScanIndex,
     accepted: Option<&claude_request_identity::AcceptedBuckets>,
-) -> (
-    Vec<SnapshotItem>,
-    ClaudeUsageAuthorityDisposition,
-    bool,
-    serde_json::Value,
-) {
+) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
     {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -108,27 +87,23 @@ fn e2_page_counted_with(
             index,
             "e2-identity-machine",
         );
-        let ((disposition, _, stats), counts) =
-            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                match accepted {
-                    None => crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-                        support, &mut scan, index,
-                    ),
-                    Some(accepted) => {
-                        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                            support,
-                            &mut scan,
-                            index,
-                            Some(accepted),
-                        )
-                    }
-                }
-            });
+        let (disposition, _, stats) = match accepted {
+            None => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
+            }
+            Some(accepted) => {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                    support,
+                    &mut scan,
+                    index,
+                    Some(accepted),
+                )
+            }
+        };
         (
             scan.snapshots,
             disposition,
             stats.effort_evidence_load_failed,
-            counts,
         )
     }
 }
@@ -208,6 +183,8 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [money] A later-born same-session copy read beside its original counts
+/// the copied history once and tags every row with the one proven login.
 #[test]
 fn e2_pipeline_tags_a_copied_transcript_once() {
     let (dir, root, _) = claude_account_family_fixture(false);
@@ -245,15 +222,17 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let mut index = ScanIndex::default();
     // The first page may meet the twins in either order (disclosed residual).
     e2_page(&dirs, &support, &mut index);
-    // The copy continues on its own (one known writer): the twin family is
-    // re-read together and the copied history is skipped.
+    // The copy continues on its own: the twin family is re-read together,
+    // and its own turn starts on or after the page proof's cutoff
+    // (2026-11-04T00:00:00Z), so the history its original holds is skipped.
     let mut own: serde_json::Value =
         serde_json::from_str(fs::read_to_string(&copy).unwrap().lines().next().unwrap()).unwrap();
     own["requestId"] = json!("req_own");
-    own["version"] = json!("2.1.309");
+    let proof_from = OffsetDateTime::parse("2026-11-04T00:00:00Z", &Rfc3339).unwrap();
     own["timestamp"] = json!(OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .unwrap()
+        .max(proof_from)
         .format(&Rfc3339)
         .unwrap());
     let mut file = fs::OpenOptions::new().append(true).open(&copy).unwrap();
@@ -426,8 +405,8 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
                 },
             );
         }
-        let (items, disposition, failed, counts) =
-            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index);
+        let (items, disposition, failed) =
+            e2_page(std::slice::from_ref(&dir), &support, &mut index);
         assert!(!failed);
         let item = items
             .iter()
@@ -443,21 +422,6 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some(if partial { "0.0002" } else { "0.0004" })
         );
-        if partial {
-            assert_eq!(
-                counts["claude_inherited_org_requests"], 2,
-                "missing requests inherit A then B, counted"
-            );
-        } else {
-            assert!(
-                counts.get("claude_inherited_org_requests").is_none(),
-                "own evidence needs no fill: {counts}"
-            );
-        }
-        assert!(
-            counts.get("claude_identity_conflict_fallbacks").is_none(),
-            "no conflict: {counts}"
-        );
         assert_eq!(disposition.quarantined_entity_count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -466,7 +430,7 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
 /// The A-to-B family (req_1-2 own A, req_3-4 own B) with the `gaps` API rows
 /// removed and the `no_account` rows naming no account, evidence-staged once
 /// per mode on the same files: `None` the plain stage, `Some(capability)`
-/// this cycle's `session_request_account_source:v1` state. Root item + counts.
+/// this cycle's `session_request_account_source:v1` state. Root items.
 fn e2_carry_pages(
     gaps: &[&str],
     no_account: &[(&str, bool)],
@@ -474,96 +438,112 @@ fn e2_carry_pages(
     acknowledge: bool,
     marker: bool,
     zero_and_side: bool,
-) -> Vec<(SnapshotItem, serde_json::Value)> {
+) -> Vec<SnapshotItem> {
     // These are ordinary session requests, not a newly copied August
     // prefix. Keep the production copy-prefix seed refusal enabled.
     claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-    let (dir, root, _) = claude_account_family_fixture(false);
-    let support = dir.join("support");
-    if marker {
-        let path = dir.join(format!("{root}.jsonl"));
-        let native = fs::read_to_string(&path).unwrap();
-        let start = json!({"type":"attachment", "sessionId":root,
+        let (dir, root, _) = claude_account_family_fixture(false);
+        let support = dir.join("support");
+        if marker {
+            let path = dir.join(format!("{root}.jsonl"));
+            let native = fs::read_to_string(&path).unwrap();
+            let start = json!({"type":"attachment", "sessionId":root,
             "timestamp":"2026-08-02T06:59:59Z", "attachment":{
                 "type":"credential_org", "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
-        fs::write(path, format!("{start}\n{native}")).unwrap();
-    }
-    let (mut api, mut trace) = e2_family_evidence(&root);
-    if zero_and_side {
-        let path = dir.join(format!("{root}.jsonl"));
-        let zero = json!({"type":"assistant", "sessionId":root,
+            fs::write(path, format!("{start}\n{native}")).unwrap();
+        }
+        let (mut api, mut trace) = e2_family_evidence(&root);
+        if zero_and_side {
+            let path = dir.join(format!("{root}.jsonl"));
+            let zero = json!({"type":"assistant", "sessionId":root,
             "timestamp":"2026-08-02T07:00:06Z", "requestId":"req_zero",
             "message":{"id":"msg_zero", "model":"claude-haiku-4-5",
                 "usage":{"input_tokens":0,"output_tokens":0}}});
-        let native = fs::read_to_string(&path).unwrap();
-        fs::write(path, format!("{native}{zero}\n")).unwrap();
-        let mut side = complete_api_row(&root, "req_side", 7, 3, 2, 0);
-        side.request_identity = Some(serde_json::from_value(json!({
-            "identity_hash_scheme": "provider-sha256:v1", "disposition": "complete",
-            "account": {"origin": "log_record", "disposition": "complete",
-                "log_record_hash": e2_account()},
-            "organization": {"origin": "log_record", "disposition": "complete",
-                "log_record_hash": "1".repeat(64)}
-        })).unwrap());
-        e2_resign(&mut side);
-        api.push(side);
-        trace.push(complete_trace_row(&root, "req_side", ""));
-    }
-    for row in &mut api[2..4] {
-        row.account_identifier_hash = Some("b".repeat(64));
-        e2_resign(row);
-    }
-    for row in &mut api {
-        if let Some((_, contradictory)) = no_account.iter().find(|(id, _)| *id == row.request_id) {
-            row.account_identifier_hash = None;
-            if *contradictory {
-                row.request_identity = Some(serde_json::from_value(json!({
-                    "identity_hash_scheme": "provider-sha256:v1",
-                    "disposition": "invalid",
-                    "account": {"origin": "missing", "disposition": "invalid"},
-                    "organization": {"origin": "missing", "disposition": "missing"}
-                })).unwrap());
-            }
+            let native = fs::read_to_string(&path).unwrap();
+            fs::write(path, format!("{native}{zero}\n")).unwrap();
+            let mut side = complete_api_row(&root, "req_side", 7, 3, 2, 0);
+            side.request_identity = Some(
+                serde_json::from_value(json!({
+                    "identity_hash_scheme": "provider-sha256:v1", "disposition": "complete",
+                    "account": {"origin": "log_record", "disposition": "complete",
+                        "log_record_hash": e2_account()},
+                    "organization": {"origin": "log_record", "disposition": "complete",
+                        "log_record_hash": "1".repeat(64)}
+                }))
+                .unwrap(),
+            );
+            e2_resign(&mut side);
+            api.push(side);
+            trace.push(complete_trace_row(&root, "req_side", ""));
+        }
+        for row in &mut api[2..4] {
+            row.account_identifier_hash = Some("b".repeat(64));
             e2_resign(row);
         }
-    }
-    api.retain(|row| !gaps.contains(&row.request_id.as_str()));
-    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
-    e2_write_rows(
-        &support,
-        "local-otel/claude-code-trace-ownership",
-        &root,
-        &trace,
-    );
-    let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-    let pages = modes
-        .iter()
-        .map(|mode| {
-            accepted.set_account_source_enabled(*mode == Some(true));
-            let (items, _, failed, counts) = e2_page_counted_with(
-                std::slice::from_ref(&dir),
-                &support,
-                &mut ScanIndex::default(),
-                mode.map(|_| &accepted),
-            );
-            assert!(!failed);
-            // req_5 belongs to the child stream and keeps its own account;
-            // it cannot seed the parent's leading gaps or take the parent's B.
-            if *mode == Some(true) {
-                let child = items.iter().find(|item| item.source_session_id != root).unwrap();
-                assert_eq!(e2_source_counts(child), BTreeMap::from([((Some(e2_account()), None), 1)]));
-            }
-            if acknowledge {
-                for item in &items {
-                    accepted.record(&serde_json::to_value(item).unwrap());
+        for row in &mut api {
+            if let Some((_, contradictory)) =
+                no_account.iter().find(|(id, _)| *id == row.request_id)
+            {
+                row.account_identifier_hash = None;
+                if *contradictory {
+                    row.request_identity = Some(
+                        serde_json::from_value(json!({
+                            "identity_hash_scheme": "provider-sha256:v1",
+                            "disposition": "invalid",
+                            "account": {"origin": "missing", "disposition": "invalid"},
+                            "organization": {"origin": "missing", "disposition": "missing"}
+                        }))
+                        .unwrap(),
+                    );
                 }
+                e2_resign(row);
             }
-            let item = items.into_iter().find(|item| item.source_session_id == root).unwrap();
-            (item, counts)
-        })
-        .collect();
-    fs::remove_dir_all(dir).unwrap();
-    pages
+        }
+        api.retain(|row| !gaps.contains(&row.request_id.as_str()));
+        e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+        e2_write_rows(
+            &support,
+            "local-otel/claude-code-trace-ownership",
+            &root,
+            &trace,
+        );
+        let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
+        let pages = modes
+            .iter()
+            .map(|mode| {
+                accepted.set_account_source_enabled(*mode == Some(true));
+                let (items, _, failed) = e2_page_with(
+                    std::slice::from_ref(&dir),
+                    &support,
+                    &mut ScanIndex::default(),
+                    mode.map(|_| &accepted),
+                );
+                assert!(!failed);
+                // req_5 belongs to the child stream and keeps its own account;
+                // it cannot seed the parent's leading gaps or take the parent's B.
+                if *mode == Some(true) {
+                    let child = items
+                        .iter()
+                        .find(|item| item.source_session_id != root)
+                        .unwrap();
+                    assert_eq!(
+                        e2_source_counts(child),
+                        BTreeMap::from([((Some(e2_account()), None), 1)])
+                    );
+                }
+                if acknowledge {
+                    for item in &items {
+                        accepted.record(&serde_json::to_value(item).unwrap());
+                    }
+                }
+                items
+                    .into_iter()
+                    .find(|item| item.source_session_id == root)
+                    .unwrap()
+            })
+            .collect();
+        fs::remove_dir_all(dir).unwrap();
+        pages
     })
 }
 
@@ -581,9 +561,19 @@ fn e2_source_counts(item: &SnapshotItem) -> BTreeMap<(Option<String>, Option<Acc
         let shares = match &row.identity_parts {
             Some(parts) => parts
                 .iter()
-                .map(|part| (&part.account_identifier_hash, part.evidence_ref, part.request_count))
+                .map(|part| {
+                    (
+                        &part.account_identifier_hash,
+                        part.evidence_ref,
+                        part.request_count,
+                    )
+                })
                 .collect::<Vec<_>>(),
-            None => vec![(&row.account_identifier_hash, row.evidence_ref, row.request_count)],
+            None => vec![(
+                &row.account_identifier_hash,
+                row.evidence_ref,
+                row.request_count,
+            )],
         };
         for (login, evidence_ref, requests) in shares {
             *counts
@@ -592,10 +582,6 @@ fn e2_source_counts(item: &SnapshotItem) -> BTreeMap<(Option<String>, Option<Acc
         }
     }
     counts
-}
-
-fn e2_count(counts: &serde_json::Value, name: &str) -> u64 {
-    counts.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0)
 }
 
 /// [money] Under `session_request_account_source:v1` a gap's share moves only
@@ -607,7 +593,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
     use AccountSource::{CarriedBackward, CarriedForward};
     let a = Some(e2_account());
     let b = Some("b".repeat(64));
-    for (gaps, expected, forward, backward, ambiguous) in [
+    for (gaps, expected) in [
         (
             &["req_2", "req_4"][..],
             vec![
@@ -616,10 +602,6 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
                 ((b.clone(), None), 1),
                 ((b.clone(), Some(CarriedForward)), 1),
             ],
-            2,
-            0,
-            // req_2 was carried from A, then B took over.
-            1,
         ),
         (
             &["req_1", "req_2", "req_4"][..],
@@ -629,16 +611,24 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
                 ((b.clone(), None), 1),
                 ((b.clone(), Some(CarriedForward)), 1),
             ],
-            1,
-            2,
-            0,
         ),
     ] {
-        let pages = e2_carry_pages(gaps, &[], &[Some(false), Some(true), Some(true)], true, false, true);
-        let [(off, _), (on, counts), (again, _)] = &pages[..] else {
+        let pages = e2_carry_pages(
+            gaps,
+            &[],
+            &[Some(false), Some(true), Some(true)],
+            true,
+            false,
+            true,
+        );
+        let [off, on, again] = &pages[..] else {
             unreachable!()
         };
-        assert_eq!(e2_source_counts(on), BTreeMap::from_iter(expected), "{gaps:?}");
+        assert_eq!(
+            e2_source_counts(on),
+            BTreeMap::from_iter(expected),
+            "{gaps:?}"
+        );
         // req_3 is observed B inside the gap stream: carry cannot replace it.
         assert_eq!(e2_source_counts(on).get(&(b.clone(), None)), Some(&1));
         // Marking the old merged carry and acknowledging it never strips the
@@ -646,9 +636,6 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         assert_eq!(on.request_identity_refusals, 0);
         assert_eq!(again.request_identity_refusals, 0);
         assert_eq!(e2_source_counts(again), e2_source_counts(on));
-        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), forward);
-        assert_eq!(e2_count(counts, "claude_carried_backward_requests"), backward);
-        assert_eq!(e2_count(counts, "claude_carry_ambiguous_gap_requests"), ambiguous);
         let totals = |item: &SnapshotItem| {
             (
                 item.request_count,
@@ -660,21 +647,39 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             )
         };
         assert_eq!(totals(on), totals(off), "{gaps:?}: money never changes");
-        assert_eq!(on.request_count, 5, "four non-zero responses plus the side call");
-        assert_eq!(e2_count(counts, "claude_carry_skipped_incomplete_transcripts"), 0);
+        assert_eq!(
+            on.request_count, 5,
+            "four non-zero responses plus the side call"
+        );
     }
     // The first ACK is already ON. req_1's native marker and req_4's
     // carried B share the same native row; record stores {marker, None}.
     // Its next body must retain carried B without treating it as proof.
-    let pages = e2_carry_pages(&["req_1", "req_4"], &[], &[Some(true), Some(true)], true, true, false);
-    let [(first, _), (again, _)] = &pages[..] else { unreachable!() };
+    let pages = e2_carry_pages(
+        &["req_1", "req_4"],
+        &[],
+        &[Some(true), Some(true)],
+        true,
+        true,
+        false,
+    );
+    let [first, again] = &pages[..] else {
+        unreachable!()
+    };
     assert_eq!(e2_source_counts(first), e2_source_counts(again));
     assert_eq!(first.request_identity_refusals, 0);
     assert_eq!(again.request_identity_refusals, 0);
-    assert_eq!(e2_source_counts(again).get(&(b.clone(), Some(CarriedForward))), Some(&1));
-    assert!(again.usage_buckets.iter().flat_map(|bucket| &bucket.model_usage)
-        .any(|row| row.identity_parts.as_ref().is_some_and(|parts|
-            parts.iter().any(|part| part.account_identifier_hash.is_none())
+    assert_eq!(
+        e2_source_counts(again).get(&(b.clone(), Some(CarriedForward))),
+        Some(&1)
+    );
+    assert!(again
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .any(|row| row.identity_parts.as_ref().is_some_and(|parts| parts
+            .iter()
+            .any(|part| part.account_identifier_hash.is_none())
             && parts.iter().any(|part| part.account_identifier_hash == b))));
 }
 
@@ -682,8 +687,15 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
 /// the plain evidence stage, no `account_source`, main's unmarked fill.
 #[test]
 fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
-    let pages = e2_carry_pages(&["req_2", "req_4"], &[], &[None, Some(false), Some(true)], false, false, false);
-    let [(plain, _), (off, _), (on, _)] = &pages[..] else {
+    let pages = e2_carry_pages(
+        &["req_2", "req_4"],
+        &[],
+        &[None, Some(false), Some(true)],
+        false,
+        false,
+        false,
+    );
+    let [plain, off, on] = &pages[..] else {
         unreachable!()
     };
     let bytes = |item: &SnapshotItem| serde_json::to_string(item).unwrap();
@@ -697,14 +709,21 @@ fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
 }
 
 /// [behaviour] A telemetry row naming no account blocks the carry: it stays
-/// Unknown and is counted; the next own account seeds again.
+/// Unknown; the next own account seeds again.
 #[test]
 fn e2_pipeline_no_account_row_blocks_the_carry() {
     for contradictory in [false, true] {
         // req_3 is a gap AFTER the invalid row; neither it nor req_2 may
         // inherit A. req_4's own B restarts the stream.
-        let pages = e2_carry_pages(&["req_3"], &[("req_2", contradictory)], &[Some(true)], false, false, false);
-        let [(on, counts)] = &pages[..] else { unreachable!() };
+        let pages = e2_carry_pages(
+            &["req_3"],
+            &[("req_2", contradictory)],
+            &[Some(true)],
+            false,
+            false,
+            false,
+        );
+        let [on] = &pages[..] else { unreachable!() };
         assert_eq!(
             e2_source_counts(on),
             BTreeMap::from([
@@ -713,18 +732,22 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
                 ((Some("b".repeat(64)), None), 1),
             ])
         );
-        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
-        assert_eq!(e2_count(counts, "claude_carried_forward_requests"), 0);
-        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 1);
         // A first invalid row also blocks a pre-existing marker. There is
         // no later own root account; the child's A cannot seed the root.
-        let pages = e2_carry_pages(&["req_2", "req_3", "req_4"], &[("req_1", contradictory)],
-            &[Some(true)], false, true, false);
-        let [(on, counts)] = &pages[..] else { unreachable!() };
+        let pages = e2_carry_pages(
+            &["req_2", "req_3", "req_4"],
+            &[("req_1", contradictory)],
+            &[Some(true)],
+            false,
+            true,
+            false,
+        );
+        let [on] = &pages[..] else { unreachable!() };
         assert_eq!(e2_source_counts(on), BTreeMap::from([((None, None), 4)]));
-        assert!(on.request_evidence.is_empty(), "old org marker cannot cross invalid telemetry");
-        assert_eq!(e2_count(counts, "claude_carry_blocked_no_account_requests"), 1);
-        assert_eq!(e2_count(counts, "claude_carry_no_seed_requests"), 3);
+        assert!(
+            on.request_evidence.is_empty(),
+            "old org marker cannot cross invalid telemetry"
+        );
     }
 }
 
@@ -759,7 +782,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         root,
         &trace,
     );
-    let (items, disposition, failed, counts) = e2_page_counted(
+    let (items, disposition, failed) = e2_page(
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
@@ -786,7 +809,6 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         Some("identity_withheld")
     );
     assert_eq!(item.request_identity_refusals, 1);
-    assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
     // The existing seventeen-request fixture also reaches the cap through
     // a forward twin, a backward twin, and a twin occupying a later own key's
@@ -800,30 +822,50 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &own);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-            let (off, off_disposition, failed, _) = e2_page_counted_with(
-                std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
+            let (off, off_disposition, failed) = e2_page_with(
+                std::slice::from_ref(&dir),
+                &support,
+                &mut ScanIndex::default(),
+                Some(&accepted),
             );
             assert!(!failed);
             assert_eq!(off_disposition.quarantined_entity_count(), 0);
             accepted.set_account_source_enabled(true);
-            let (on, disposition, failed, _) = e2_page_counted_with(
-                std::slice::from_ref(&dir), &support, &mut ScanIndex::default(), Some(&accepted),
+            let (on, disposition, failed) = e2_page_with(
+                std::slice::from_ref(&dir),
+                &support,
+                &mut ScanIndex::default(),
+                Some(&accepted),
             );
             assert!(!failed);
             assert_eq!(on.len(), 1);
-            assert_eq!(disposition.quarantined_entity_count(), 1, "{gaps:?}: item Held");
+            assert_eq!(
+                disposition.quarantined_entity_count(),
+                1,
+                "{gaps:?}: item Held"
+            );
             assert!(disposition.quarantined_source_session_ids.contains(root));
             assert_eq!(on[0].request_count, off[0].request_count);
             assert_eq!(on[0].input_tokens, off[0].input_tokens);
             assert_eq!(on[0].output_tokens, off[0].output_tokens);
-            assert_eq!(on[0].cost, off[0].cost, "{gaps:?}: money conserved while Held");
+            assert_eq!(
+                on[0].cost, off[0].cost,
+                "{gaps:?}: money conserved while Held"
+            );
             assert_eq!(on[0].request_count, 17);
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
-            assert!(e2_source_counts(&on[0]).keys().any(|(account, _)| account.is_some()),
-                "known identity is retained while the item is owed");
+            assert!(
+                e2_source_counts(&on[0])
+                    .keys()
+                    .any(|(account, _)| account.is_some()),
+                "known identity is retained while the item is owed"
+            );
             let mut uploadable = on;
             disposition.retain_uploadable(&mut uploadable);
-            assert!(uploadable.is_empty(), "no held revision can upload or settle");
+            assert!(
+                uploadable.is_empty(),
+                "no held revision can upload or settle"
+            );
         });
     }
     fs::remove_dir_all(dir).unwrap();
@@ -1037,16 +1079,10 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
-        let ((disposition, _, stats), counts) =
-            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                    support, &mut scan, index, accepted,
-                )
-            });
-        if unhealthy {
-            assert_eq!(counts.get("claude_inherited_org_requests"), None,
-                "no request is filled from the retained, start or root account: {counts}");
-        }
+        let (disposition, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
+                support, &mut scan, index, accepted,
+            );
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
             assert_eq!(gated.previous.as_ref(), Some(&previous), "custody is kept");
@@ -1129,15 +1165,23 @@ fn e2_set_billing(dir: &Path, root: &str, billing: &str) {
     }
     for path in [
         dir.join(format!("{root}.jsonl")),
-        dir.join(root).join("subagents").join(format!("agent-{E2_CHILD}.jsonl")),
+        dir.join(root)
+            .join("subagents")
+            .join(format!("agent-{E2_CHILD}.jsonl")),
     ] {
-        let lines = fs::read_to_string(&path).unwrap().lines().map(|line| {
-            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
-            if billing == "external" || matches!(row["requestId"].as_str(), Some("req_3" | "req_4")) {
-                row["auth_mode"] = json!("api_key");
-            }
-            format!("{row}\n")
-        }).collect::<String>();
+        let lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if billing == "external"
+                    || matches!(row["requestId"].as_str(), Some("req_3" | "req_4"))
+                {
+                    row["auth_mode"] = json!("api_key");
+                }
+                format!("{row}\n")
+            })
+            .collect::<String>();
         fs::write(path, lines).unwrap();
     }
 }
@@ -1148,7 +1192,9 @@ fn e2_tagged_bucket_rows(item: &SnapshotItem) -> u64 {
         .iter()
         .flat_map(|bucket| &bucket.model_usage)
         .filter(|row| match &row.identity_parts {
-            Some(parts) => parts.iter().any(|part| part.account_identifier_hash.is_some()),
+            Some(parts) => parts
+                .iter()
+                .any(|part| part.account_identifier_hash.is_some()),
             None => row.account_identifier_hash.is_some(),
         })
         .count() as u64
@@ -1196,7 +1242,8 @@ fn e2_bound_trace_case(
         .join("local-otel/claude-code-trace-ownership")
         .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
     if listed {
-        let list = crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::path(&support);
+        let list =
+            crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::path(&support);
         fs::create_dir_all(list.parent().unwrap()).unwrap();
         fs::write(list, format!("{:x}\n", Sha256::digest(root.as_bytes()))).unwrap();
     }
@@ -1219,7 +1266,10 @@ fn e2_bound_trace_case(
     let b = Some(own.repeat(64));
     let child_login = Some(if split_logins { "c" } else { own }.repeat(64));
     if listed {
-        assert!(clean.iter().all(|item| item.claude_money.is_none()), "listed: no E2 fold");
+        assert!(
+            clean.iter().all(|item| item.claude_money.is_none()),
+            "listed: no E2 fold"
+        );
     } else {
         e2_bound_trace_assert_logins(&clean, &root, b.clone(), child_login.clone());
     }
@@ -1234,11 +1284,17 @@ fn e2_bound_trace_case(
                 refusals.insert(item.source_session_id.clone(), e2_tagged_bucket_rows(item));
             }
         }
-        assert!(refusals.values().any(|rows| *rows > 0), "a tagged body was accepted: {refusals:?}");
+        assert!(
+            refusals.values().any(|rows| *rows > 0),
+            "a tagged body was accepted: {refusals:?}"
+        );
     }
     let accepted = accepted_ledger.then_some(&accepted);
     if billing != "subscription" {
-        let root_item = clean.iter().find(|item| item.source_session_id == root).unwrap();
+        let root_item = clean
+            .iter()
+            .find(|item| item.source_session_id == root)
+            .unwrap();
         assert!(
             e2_rows(root_item).any(|row| !claude_request_accounts::local_subscription(row)),
             "this arm bypasses contract-5 identity grouping"
@@ -1259,14 +1315,23 @@ fn e2_bound_trace_case(
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     match mode {
         "malformed" => {
-            fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"malformed\n").unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"malformed\n")
+                .unwrap();
             // Stable malformed input is truly unhealthy, even with all valid
             // rows retained.
             let report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                &support, [root.clone()],
+                &support,
+                [root.clone()],
             );
             assert_eq!(report.malformed_lines, 1);
-            assert!(!report.is_complete(), "the case must take the unhealthy path");
+            assert!(
+                !report.is_complete(),
+                "the case must take the unhealthy path"
+            );
             assert_eq!(report.evidence[&root], trace);
             assert!(report.rows_discarded.is_empty());
         }
@@ -1278,8 +1343,12 @@ fn e2_bound_trace_case(
         "incomplete" => fs::remove_file(&path).unwrap(),
         // Sparse NUL padding is malformed evidence; size alone no longer
         // refuses pairing or the strict read.
-        "oversized" => fs::OpenOptions::new().write(true).open(&path).unwrap()
-            .set_len(64 * 1024 * 1024).unwrap(),
+        "oversized" => fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap(),
         "cap" | "generation" => {
             let expected = path.clone();
             let duplicate = serde_json::to_string(&trace[0]).unwrap();
@@ -1292,8 +1361,12 @@ fn e2_bound_trace_case(
                     fs::copy(path, &replacement).unwrap();
                     fs::rename(replacement, path).unwrap();
                 } else {
-                    fs::OpenOptions::new().append(true).open(path).unwrap()
-                        .write_all(format!("{duplicate}\n").as_bytes()).unwrap();
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .unwrap()
+                        .write_all(format!("{duplicate}\n").as_bytes())
+                        .unwrap();
                 }
                 fired.set(true);
             });
@@ -1317,10 +1390,20 @@ fn e2_bound_trace_case(
     // no `e2` fold to count.
     let reason = if discarded { "discarded" } else { mode };
     let requests = if listed { 0 } else { 5 };
-    let expected = if listed { json!({}) } else { json!({ reason: requests }) };
-    assert_eq!(serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(), expected);
-    assert_eq!(stats.trace_discard_no_fallback_requests, if discarded { requests } else { 0 },
-        "#932's scalar equals the discarded reason");
+    let expected = if listed {
+        json!({})
+    } else {
+        json!({ reason: requests })
+    };
+    assert_eq!(
+        serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(),
+        expected
+    );
+    assert_eq!(
+        stats.trace_discard_no_fallback_requests,
+        if discarded { requests } else { 0 },
+        "#932's scalar equals the discarded reason"
+    );
     // The production account owner after this page: a body with no login on
     // the session bound to A is held unless this scan admitted it.
     let mut bound = items.clone();
@@ -1338,7 +1421,11 @@ fn e2_bound_trace_case(
         e2_assert_family_deferred(&items, &disposition);
         if billing != "subscription" {
             // Only the root is bound (to A).
-            assert_eq!(held, BTreeSet::from([root.clone()]), "#932's discard keeps main's account hold");
+            assert_eq!(
+                held,
+                BTreeSet::from([root.clone()]),
+                "#932's discard keeps main's account hold"
+            );
         }
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
@@ -1365,14 +1452,25 @@ fn e2_bound_trace_case(
             // Main's hold for a login other than A (B) stays.
             assert_eq!(held, BTreeSet::from([root.clone()]), "main's B != A hold");
         }
-        assert_eq!(disposition.quarantined_entity_count(), 0, "Unknown, not deferred");
+        assert_eq!(
+            disposition.quarantined_entity_count(),
+            0,
+            "Unknown, not deferred"
+        );
         assert_eq!(stats.trace_discard_deferred_items, 0);
-        assert!(stats.trace_rows_discarded.is_empty(), "{mode} is not a discard");
+        assert!(
+            stats.trace_rows_discarded.is_empty(),
+            "{mode} is not a discard"
+        );
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
         if mode == "malformed" {
             // The same paired read: money is unchanged, only the account moves.
-            assert_eq!(e2_bound_trace_totals(&items), totals, "per-session money is unchanged");
+            assert_eq!(
+                e2_bound_trace_totals(&items),
+                totals,
+                "per-session money is unchanged"
+            );
         }
         for item in &items {
             assert_eq!(item.telemetry_owned_complete, Some(false));
@@ -1380,7 +1478,8 @@ fn e2_bound_trace_case(
             assert_eq!(
                 item.request_identity_refusals,
                 refusals.get(&item.source_session_id).copied().unwrap_or(0),
-                "{}", item.source_session_id
+                "{}",
+                item.source_session_id
             );
         }
     }
@@ -1388,7 +1487,12 @@ fn e2_bound_trace_case(
     if mode == "unreadable" {
         fs::remove_dir(&path).unwrap();
     }
-    e2_write_rows(&support, "local-otel/claude-code-trace-ownership", &root, &trace);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
     if !discarded {
         index = bound_index();
     }
@@ -1398,15 +1502,25 @@ fn e2_bound_trace_case(
         // Addendum 3: the accepted tags are kept, nothing is refused.
         for item in &recovered {
             let logins = e2_login_counts(item);
-            assert!(logins.keys().all(|login| login.is_some() && *login != Some(e2_account())),
-                "{logins:?}");
+            assert!(
+                logins
+                    .keys()
+                    .all(|login| login.is_some() && *login != Some(e2_account())),
+                "{logins:?}"
+            );
             assert_eq!(item.request_identity_refusals, 0);
         }
     } else {
         e2_bound_trace_assert_logins(&recovered, &root, b, child_login);
-        assert!(recovered.iter().all(|item| item.request_identity_refusals == 0));
+        assert!(recovered
+            .iter()
+            .all(|item| item.request_identity_refusals == 0));
     }
-    assert_eq!(e2_bound_trace_totals(&recovered), totals, "no usage is dropped");
+    assert_eq!(
+        e2_bound_trace_totals(&recovered),
+        totals,
+        "no usage is dropped"
+    );
     assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     assert_eq!(stats.trace_discard_deferred_items, 0);
     assert!(stats.trace_rows_discarded.is_empty());
@@ -1532,176 +1646,4 @@ fn e2_pipeline_accepted_bucket_unhealthy_root_keeps_909_refusal() {
 #[test]
 fn e2_pipeline_listed_family_accepted_cap_discard_is_held_then_keeps_tags() {
     e2_bound_trace_case("cap", true, "subscription", true, true);
-}
-
-const RECORDED_ORG_UUID: &str = "11111111-1111-4111-8111-111111111111";
-const RECORDED_ADDRESS: &str = "one.login@example.test";
-
-/// The family fixture under `<dir>/cfg/projects/p`, starting with the recorded
-/// email sentence and org marker, and no telemetry row at all. Returns the
-/// transcript root and the session.
-fn recorded_login_transcripts() -> (PathBuf, PathBuf, String) {
-    let (dir, root, _) = claude_account_family_fixture(false);
-    let project = dir.join("cfg/projects/p");
-    fs::create_dir_all(&project).unwrap();
-    let native = fs::read_to_string(dir.join(format!("{root}.jsonl"))).unwrap();
-    let email = json!({"type":"attachment", "sessionId":root,
-        "timestamp":"2026-08-02T06:59:58Z", "attachment":{
-            "type":"session_context", "context":{"userEmail":format!(
-                "The user's email address is {RECORDED_ADDRESS}. Use it only to identify the user, such as for authorship, attribution, or filtering their own work. Never send it to an unrelated service, such as in a request header, URL, or payload, unless the user explicitly asks."
-            )}}});
-    let start = json!({"type":"attachment", "sessionId":root,
-        "timestamp":"2026-08-02T06:59:59Z", "attachment":{
-            "type":"credential_org", "organizationUuid":RECORDED_ORG_UUID}});
-    fs::write(
-        project.join(format!("{root}.jsonl")),
-        format!("{email}\n{start}\n{native}"),
-    )
-    .unwrap();
-    fs::remove_file(dir.join(format!("{root}.jsonl"))).unwrap();
-    fs::rename(dir.join(&root), project.join(&root)).unwrap();
-    let projects = dir.join("cfg/projects");
-    (dir, projects, root)
-}
-
-fn recorded_login_page(dir: &Path, projects: &Path, on: bool) -> (Vec<SnapshotItem>, ScanIndex) {
-    claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-        use crate::snapshots::claude_folder_login as folder;
-        let mut index = ScanIndex::default();
-        let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-        accepted.set_sole_login_enabled(on);
-        folder::begin_page(
-            &mut index,
-            &ScanIndex::default(),
-            &[projects.to_path_buf()],
-            on,
-        );
-        crate::claude_status_coverage::bind_address_key(
-            on.then(|| zeroize::Zeroizing::new([0x42; 32])),
-        );
-        let org = ottto_core::billing_identity_hash("anthropic", "organization", RECORDED_ORG_UUID)
-            .unwrap();
-        let pair = (e2_account(), org);
-        crate::claude_status_coverage::observe(
-            folder::folder_key(projects.parent().unwrap()),
-            folder::OwnerReport {
-                slot: false,
-                pair: Some(pair.clone()),
-                proven: Some(pair),
-                email: crate::claude_status_coverage::address_digest(RECORDED_ADDRESS),
-                other_account: false,
-            },
-        );
-        let (items, _, failed, _) = e2_page_counted_with(
-            &[projects.to_path_buf()],
-            &dir.join("support"),
-            &mut index,
-            Some(&accepted),
-        );
-        assert!(!failed);
-        (items, index)
-    })
-}
-
-/// Totals one item conserves whatever its rows are labelled.
-fn recorded_login_totals(items: &[SnapshotItem]) -> Vec<(String, u64, u64, u64, Option<String>)> {
-    let mut totals = items
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.clone(),
-                item.request_count,
-                item.input_tokens,
-                item.output_tokens,
-                item.cost
-                    .as_ref()
-                    .and_then(|cost| cost.total_cost_usd.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
-    totals.sort();
-    totals
-}
-
-fn recorded_login_row_shares(items: &[SnapshotItem]) -> u64 {
-    items
-        .iter()
-        .flat_map(e2_rows)
-        .map(|row| {
-            row.identity_parts
-                .as_ref()
-                .map_or(row.request_count, |parts| {
-                    parts.iter().map(|part| part.request_count).sum()
-                })
-        })
-        .sum()
-}
-
-/// Oracle: the same transcripts tagged and untagged. Totals, costs and rows'
-/// request counts are equal; only the placement differs, and that difference is
-/// what a re-offered read uploads. A subagent file stands on its own record.
-#[test]
-fn recorded_login_tag_conserves_totals_and_changes_only_placement() {
-    let (dir, projects, root) = recorded_login_transcripts();
-    let (off, off_index) = recorded_login_page(&dir, &projects, false);
-    let (on, on_index) = recorded_login_page(&dir, &projects, true);
-    assert!(off_index.claude_folder_login_ledger.is_empty());
-    assert_eq!(on_index.claude_folder_login_ledger.len(), 1);
-
-    assert_eq!(recorded_login_totals(&off), recorded_login_totals(&on));
-    assert_eq!(
-        recorded_login_row_shares(&off),
-        recorded_login_row_shares(&on)
-    );
-    assert!(recorded_login_totals(&on).iter().any(|total| total.1 > 0));
-
-    let basis = claude_request_identity::TRANSCRIPT_RECORDED_LOGIN;
-    let tagged = on
-        .iter()
-        .find(|item| item.source_session_id == root)
-        .unwrap();
-    let entry = tagged
-        .request_evidence
-        .iter()
-        .find(|entry| entry.identity_basis == basis)
-        .expect("a matched own session is named");
-    let witness = entry.sole_login_witness.as_ref().unwrap();
-    assert_eq!(witness.v, 1);
-    assert_eq!(witness.kind, "folder");
-    assert_eq!(witness.folder.len(), 8);
-    assert_eq!(witness.covered_from, "2026-08-02T07:00:00Z");
-    assert!(
-        e2_rows(tagged).any(|row| row.account_identifier_hash.as_deref()
-            == Some(e2_account().as_str())
-            || row.identity_parts.as_ref().is_some_and(|parts| parts
-                .iter()
-                .any(
-                    |part| part.account_identifier_hash.as_deref() == Some(e2_account().as_str())
-                )))
-    );
-    assert!(
-        on.iter()
-            .filter(|item| item.source_session_id != root)
-            .all(|item| item
-                .request_evidence
-                .iter()
-                .all(|entry| entry.identity_basis != basis)),
-        "a file with no recorded login of its own stays untagged"
-    );
-    let untagged = off
-        .iter()
-        .find(|item| item.source_session_id == root)
-        .unwrap();
-    assert_ne!(
-        untagged.snapshot_fingerprint, tagged.snapshot_fingerprint,
-        "the tag reaches the upload decision"
-    );
-    assert!(untagged
-        .request_evidence
-        .iter()
-        .all(|entry| entry.identity_basis != basis));
-    let body = serde_json::to_string(untagged).unwrap();
-    assert!(!body.contains("sole_login_witness"));
-    let tagged_body = serde_json::to_string(tagged).unwrap();
-    assert!(!tagged_body.contains(RECORDED_ADDRESS));
 }
