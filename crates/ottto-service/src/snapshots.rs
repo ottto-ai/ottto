@@ -47666,14 +47666,22 @@ mod tests {
         let path = root.join(format!("rollout-{id}.jsonl"));
         let mut body = format!(
             "{}\n{}\n",
-            json!({"type":"session_meta","timestamp":"2026-09-30T10:00:00Z","payload":{"id":id}}),
+            json!({"type":"session_meta","timestamp":"2026-09-30T00:00:00Z","payload":{"id":id}}),
             json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}})
         );
         let requests = 65_537;
         for index in 0..requests {
+            let n = index as u64 + 1;
+            let timestamp = format!(
+                "2026-09-30T{:02}:{:02}:{:02}Z",
+                n / 3600,
+                n / 60 % 60,
+                n % 60
+            );
             body.push_str(&format!(
-                "{}\n",
-                json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:01Z","payload":{"response_id":format!("resp_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"cache_write_input_tokens":0,"output_tokens":1}}})
+                "{}\n{}\n",
+                json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"cache_write_input_tokens":0,"output_tokens":1}}}),
+                json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*n,"cached_input_tokens":90_000*n,"output_tokens":n},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"output_tokens":1}}}})
             ));
         }
         fs::write(&path, body).unwrap();
