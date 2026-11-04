@@ -413,8 +413,8 @@ pub(in crate::snapshots) trait TailSource {
     }
     /// Installs the live inputs of this read into a validated stored state,
     /// before the load publishes it as reused. `live` is the read's fresh
-    /// accumulator, configured before any line (traces, parent ledgers and
-    /// proof, sidecar projection, counting rule); a load never parses with it.
+    /// accumulator, configured before any line (traces, sidecar projection,
+    /// counting rule); a load never parses with it.
     /// By default a source's live inputs join at finish, never into the
     /// stored state.
     fn install_live(
