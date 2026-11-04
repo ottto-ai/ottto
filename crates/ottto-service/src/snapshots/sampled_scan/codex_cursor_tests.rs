@@ -9340,7 +9340,8 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         fingerprint_birth_nanos: 0,
         withheld_content_stamp: None,
     };
-    for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
+    const RETIRED_CAUSE: usize = 2;
+    for cause in [ownership::CREATED, RETIRED_CAUSE, ownership::PARSER] {
         let mut index = ScanIndex::default();
         let mut census = ScanCensus::default();
         census.causes = census.causes.page(Some(77));
