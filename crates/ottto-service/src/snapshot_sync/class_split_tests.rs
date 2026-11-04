@@ -364,8 +364,9 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
 }
 
 /// [money] The observed seed (challenge, no base or state, no attempt)
-/// with a no-patch offer beside a patched sibling. The owed session reads a
-/// native Full, goes out in an ordinary request, is accepted, and its exact
+/// with a no-patch offer beside a patched sibling. With no saved base the
+/// owed session can carry no answer, so it is not mirrored and its files may
+/// re-fold. It goes out in an ordinary request, is accepted, and its exact
 /// ACK clears the challenge without an answer. A restart keeps it clear.
 #[test]
 fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
@@ -382,8 +383,8 @@ fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
     let key = cache_session_key("owed");
     owe(&mut progress, &owed, challenge(0xc));
     assert!(
-        mirrored(&progress, &key),
-        "the owed session reads a native Full"
+        !mirrored(&progress, &key),
+        "no saved base: no answer can ride, so it may re-fold"
     );
 
     let (result, wires) = page(
@@ -439,7 +440,8 @@ fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
 /// [money] The observed seed when the session regains a patch, including a
 /// partial-empty one. The existing ordinary bootstrap probe's ACK clears the
 /// challenge, its exact CAS repeat saves the head, and the patched main offer
-/// declares CAS with that base and carries its whole patch.
+/// declares CAS with that base and carries its whole patch. With no saved
+/// base the session is never mirrored, and no POST carries the rescan claim.
 #[test]
 fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
     let none = BTreeSet::new();
@@ -453,6 +455,7 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
         let key = cache_session_key("owed");
         store.seed("owed");
         owe(&mut progress, &item, challenge(0xc));
+        assert!(!mirrored(&progress, &key), "no saved base");
 
         let probes = vec![cache_head_probe(&item)];
         let mut probe_wires = Vec::new();
@@ -512,6 +515,127 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
         );
         assert_eq!(progress.accepted_cache_heads[&key], store.heads["owed"].0);
         assert!(progress.head_conflict_challenges.is_empty());
+        assert!(!mirrored(&progress, &key));
+        for wire in probe_wires.iter().chain(&wires) {
+            for body in wire["snapshots"].as_array().unwrap() {
+                assert!(body.get("forced_full_rescan").is_none());
+                assert!(body["semantic_envelope"]
+                    .get("forced_full_rescan")
+                    .is_none());
+            }
+        }
+    }
+}
+
+/// [money] A mixed owed page beside the class split: a base-holding patched
+/// owed body, a base-less unpatched owed body and a healthy patched sibling.
+/// Requests are class-pure. Only the base-holding session is mirrored (its
+/// body is a native Full) and only its body carries the answer and the
+/// rescan claim. The base-less session is not mirrored, travels alone in a
+/// class-0 request with no claim, and its ordinary accept clears its
+/// challenge. Every body settles by its exact ACK, stored once.
+#[test]
+fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
+    let none = BTreeSet::new();
+    let mut store = HeadStore::default();
+    let mut progress = fresh_progress();
+    let based = body("owed-based", Some(item().cache_observations.unwrap()));
+    let baseless = body("owed-baseless", None);
+    let sibling = body("patched-sibling", Some(item().cache_observations.unwrap()));
+    let (based_key, baseless_key, sibling_key) = (
+        cache_session_key("owed-based"),
+        cache_session_key("owed-baseless"),
+        cache_session_key("patched-sibling"),
+    );
+    // The saved base is stale: the server head moved on and challenged it.
+    let stale = store.seed("owed-based");
+    store.seed("owed-based");
+    store.challenges.insert("owed-based".into(), challenge(0xa));
+    progress
+        .accepted_cache_heads
+        .insert(based_key.clone(), stale);
+    owe(&mut progress, &based, challenge(0xa));
+    store.seed("owed-baseless");
+    owe(&mut progress, &baseless, challenge(0xb));
+    let head = store.seed("patched-sibling");
+    progress
+        .accepted_cache_heads
+        .insert(sibling_key.clone(), head);
+    assert!(mirrored(&progress, &based_key), "a saved base: native Full");
+    assert!(!mirrored(&progress, &baseless_key), "no base: may re-fold");
+    assert!(!mirrored(&progress, &sibling_key), "healthy");
+    assert_eq!(snapshot_upload_batch_class(&baseless, false), 0);
+    assert_eq!(snapshot_upload_batch_class(&based, false), 1);
+    assert_eq!(snapshot_upload_batch_class(&sibling, false), 1);
+
+    let (result, wires) = page(
+        &mut progress,
+        &[based.clone(), baseless.clone(), sibling.clone()],
+        &none,
+        |request, wire| Ok(store.post(request, wire)),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    let mut answered = Vec::new();
+    for wire in &wires {
+        let cas = wire["head_cas_contract"].is_string();
+        for sent in wire["snapshots"].as_array().unwrap() {
+            assert_eq!(
+                !sent["cache_observations"].is_null(),
+                cas,
+                "a request mixes cache-patch classes"
+            );
+            let envelope = &sent["semantic_envelope"];
+            assert_eq!(
+                envelope.get("forced_full_rescan").is_some(),
+                envelope.get("conflict_head_challenge").is_some()
+            );
+            if envelope.get("conflict_head_challenge").is_some() {
+                assert_eq!(envelope["forced_full_rescan"], true);
+                assert_eq!(envelope["conflict_head_challenge"], challenge(0xa));
+                assert_eq!(envelope["rescan_from_revision_hash"], revision_v2(&based));
+                answered.push(sent["source_session_id"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        answered,
+        ["owed-based"],
+        "only the base-holding body answers"
+    );
+    let ordinary = wires
+        .iter()
+        .filter(|wire| sessions(wire).contains(&"owed-baseless".to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(ordinary.len(), 1);
+    assert_eq!(sessions(ordinary[0]), ["owed-baseless"], "class 0 alone");
+    assert!(ordinary[0].get("head_cas_contract").is_none(), "class 0");
+    let envelope = envelope(ordinary[0]);
+    for field in [
+        "base_head_etag",
+        "conflict_head_challenge",
+        "rescan_from_revision_hash",
+        "forced_full_rescan",
+    ] {
+        assert!(envelope.get(field).is_none(), "{field}");
+    }
+
+    assert!(
+        progress.head_conflict_challenges.is_empty(),
+        "the answer and the ordinary accept clear both"
+    );
+    for item in [&based, &baseless, &sibling] {
+        assert_eq!(
+            progress.accepted_body_witnesses[&item.snapshot_fingerprint],
+            snapshot_upload_body_witness(item),
+            "exact receipt"
+        );
+    }
+    let mut stored = store.stored.clone();
+    stored.sort();
+    assert_eq!(stored, ["owed-based", "owed-baseless", "patched-sibling"]);
+    assert!(!progress.accepted_cache_heads.contains_key(&baseless_key));
+    for key in [&based_key, &baseless_key, &sibling_key] {
+        assert!(!mirrored(&progress, key), "nothing owed: may re-fold");
     }
 }
 

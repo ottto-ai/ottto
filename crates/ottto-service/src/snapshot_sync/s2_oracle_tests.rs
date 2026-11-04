@@ -403,7 +403,11 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         // still reads Full.
         let refolded = page(&c, activated(&challenged), 100, true);
         assert_eq!(refolded.modes.0, 0, "a base-less challenge re-folds");
-        money_oracle::assert_equivalent(&cold, &result(&refolded, Mode::Restart));
+        let refolded_route = result(&refolded, Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &refolded_route);
+        // Its requests are class-pure: the body travels in the class its own
+        // cache patch selects, never under another body's CAS contract.
+        money_oracle::assert_class_pure_requests(&refolded_route);
         let mirrored = page(&c, activated(&based), 100, true);
         assert!(mirrored.modes.0 > 0, "control: a saved base reads Full");
 
