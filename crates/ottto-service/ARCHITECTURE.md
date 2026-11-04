@@ -29,7 +29,8 @@ file-system hint / periodic listing → select file → read new bytes from save
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
   inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
   census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
-  population/read-volume limit. A compressed rollout ages by its own modification time.
+  population/read-volume limit. Compressed rollouts keep their original modification time,
+  so they age as the plain file did.
   A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
   EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
 - **Codex ownership.** One secure header opener supplies ordinary membership proof for either

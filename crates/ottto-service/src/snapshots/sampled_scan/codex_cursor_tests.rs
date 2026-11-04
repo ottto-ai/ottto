@@ -3281,9 +3281,16 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     sessions.push((SESSION, 4));
     sessions.push((REREAD, 4));
     let fixture = ScanRoot::with_sessions(&sessions);
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), MEMBERS + 2);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 3);
     for id in &ids {
         index
             .files
@@ -3292,13 +3299,6 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             .source_file_fingerprint
             .clear();
     }
-    let archive = fixture
-        .root
-        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
-    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
-        "type": "session_meta", "payload": {"id": ARCHIVE}}));
-    body.extend(token_line(1));
-    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     ensure_bounded_traversal(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
@@ -3375,6 +3375,14 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         index
             .files
             .get_mut(&reread_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        // This is known ordinary work, like the plaintext reread. A newly
+        // discovered compressed file now legitimately participates as fresh.
+        index
+            .files
+            .get_mut(&archive_key)
             .unwrap()
             .source_file_fingerprint
             .clear();

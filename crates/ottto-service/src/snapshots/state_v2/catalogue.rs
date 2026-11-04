@@ -284,7 +284,9 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     scan_index_fields!(each check);
     if matches!(
         field,
-        "upload_context_fingerprint"
+        "archives"
+            | "archive_deferred_alarm_count"
+            | "upload_context_fingerprint"
             | "claude_desktop_census_witness"
             | "claude_folder_login_ledger"
     ) {

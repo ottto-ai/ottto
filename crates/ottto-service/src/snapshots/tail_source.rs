@@ -258,35 +258,6 @@ pub(in crate::snapshots) fn carry_codex_head(
     Ok(out)
 }
 
-#[cfg(test)]
-pub(in crate::snapshots) fn carry_head_for_test(
-    route: &Path,
-    root: &Path,
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Vec<u8> {
-    let identity = HeadIdentity::new(route, SnapshotSource::Codex, root, path, true);
-    let certificate = DurableCertificate {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        length: metadata.len(),
-        modified: (metadata.mtime(), metadata.mtime_nsec()),
-        birth_nanos: metadata.created().ok().and_then(unix_nanos).unwrap_or(0),
-        sealed_offset: metadata.len(),
-        sample_len: 0,
-        head_sha256: [0; 32],
-        boundary_sha256: [0; 32],
-        verified_unix_seconds: 31,
-        audit_debt_unix_seconds: Some(17),
-    };
-    Enc::count_write(usize::MAX, |e| {
-        identity.put(e)?;
-        certificate.put(e)?;
-        e.raw(b"opaque reduction")
-    })
-    .unwrap()
-}
-
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum LiveLoadError {

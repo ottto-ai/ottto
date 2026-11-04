@@ -1368,47 +1368,6 @@ fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<(
     tx.delete(&row(HEAD, from, 0)?)?;
     Ok(())
 }
-/// Shared alias rows may name more than one move, so all pairs in a save share
-/// their one isolation unit. Unpaired files retain their original boundaries.
-fn apply_carries(
-    rows: &mut mapper::Rows<'_>,
-    stage: &TailStage,
-    applied: &mut Applied,
-) -> Result<()> {
-    let mut closure = rows.take_carry_aliases()?;
-    for (to, carry) in stage.carries() {
-        closure.extend(rows.take_closure(carry.from.as_bytes())?);
-        closure.extend(rows.take_closure(to)?);
-    }
-    let result = rows.tx()?.isolated(&mut |tx| {
-        write_closure(tx, &closure)?;
-        for (to, carry) in stage.carries() {
-            move_tail(tx, to, carry)?;
-            let staged = match stage.files.get(to) {
-                Some(Entry::File(file)) => Some(file),
-                _ => None,
-            };
-            let debt = stage.debt.get(to);
-            // No debt write means no replacement and no marker clearing.
-            if staged.is_some() || debt.is_some() {
-                write_file(tx, to, staged, debt)?;
-            }
-            if let Some(Entry::Failed(cause)) = stage.files.get(to) {
-                mark_set_aside(tx, to, *cause)?;
-            }
-        }
-        Ok(())
-    })?;
-    if result.is_err() {
-        rows.revert(closure);
-        applied.rolled_back += 1;
-        for (_, carry) in stage.carries() {
-            mark_set_aside(rows.tx()?, carry.from.as_bytes(), SetAsideCause::Row)?;
-            applied.set_aside += 1;
-        }
-    }
-    Ok(())
-}
 fn write_closure(tx: &mut dyn Transaction, closure: &[mapper::ClosureRow]) -> Result<()> {
     for row in closure {
         match &row.value {
@@ -1436,7 +1395,23 @@ pub(super) fn apply(
         .flat_map(|(to, carry)| [to.clone(), carry.from.as_bytes().to_vec()])
         .collect();
     if !paired.is_empty() {
-        apply_carries(rows, stage.expect("paired stage"), &mut applied)?;
+        let stage = stage.expect("paired stage");
+        for (to, carry) in stage.carries() {
+            let mut closure = rows.take_closure(carry.from.as_bytes())?;
+            closure.extend(rows.take_closure(to)?);
+            write_closure(rows.tx()?, &closure)?;
+            move_tail(rows.tx()?, to, carry)?;
+            let staged = match stage.files.get(to) {
+                Some(Entry::File(file)) => Some(file),
+                _ => None,
+            };
+            if staged.is_some() || stage.debt.contains_key(to) {
+                applied.absorb(write_file(rows.tx()?, to, staged, stage.debt.get(to))?);
+            }
+            if let Some(Entry::Failed(cause)) = stage.files.get(to) {
+                mark_set_aside(rows.tx()?, to, *cause)?;
+            }
+        }
     }
     let keys: BTreeSet<&Vec<u8>> = stage
         .into_iter()

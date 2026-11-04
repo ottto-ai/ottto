@@ -397,8 +397,8 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
             "synthetic-archive": {"context": delivery, "disposition": "Acquired"},
             "other-archive": {"context": "another-delivery-context", "disposition": "Acquired"}
         });
-        f.index = serde_json::from_value(legacy_wire).unwrap();
-        assert!(serde_json::to_value(&f.index)
+        let legacy_index: ScanIndex = serde_json::from_value(legacy_wire).unwrap();
+        assert!(serde_json::to_value(&legacy_index)
             .unwrap()
             .get("archives")
             .is_none());

@@ -98,7 +98,7 @@ fn import_carries_archive_custody_from_a_v1_original() {
         "/synthetic/archived/a.jsonl.zst": {
             "context": null, "owner": null, "stamp": null,
             "disposition": {"Held": {"cause": "CompressedAdmissionRefused", "quiet": false}},
-            "work": {"attempts": 1}
+            "work": {"attempts": 1, "header_attempts": 4}
         }
     });
     let c = Corpus::new();

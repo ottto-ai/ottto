@@ -25,21 +25,6 @@ fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool 
             .is_ok_and(|stamp| facts.stamp.matches_acquisition(&stamp))
     }) || tail_source::certified_physical_matches(&head.body, metadata)
 }
-fn move_set(set: &mut BTreeSet<String>, from: &str, to: &str) {
-    if set.remove(from) {
-        set.insert(to.to_owned());
-    }
-}
-fn move_map<T>(map: &mut BTreeMap<String, T>, from: &str, to: &str) {
-    if let Some(value) = map.remove(from) {
-        map.insert(to.to_owned(), value);
-    }
-}
-fn move_option(value: &mut Option<String>, from: &str, to: &str) {
-    if value.as_deref() == Some(from) {
-        *value = Some(to.to_owned());
-    }
-}
 
 impl ScanIndex {
     /// One physical equality seam for listing, hints, selection and freshness.
@@ -83,8 +68,9 @@ impl ScanIndex {
         let head = state_v2::load_head(self, &key, revision)?.context("codex_carry_certificate")?;
         let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
             .filter(|value| !value.is_empty());
-        if tail_source::codex::sidecar_binding(head.revision, &head.body)
+        if tail_source::codex::header_facts(head.revision, &head.body)
             .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
+            .0
             != binding
         {
             return Ok(None);
@@ -105,43 +91,6 @@ impl ScanIndex {
             body_witness_adoption,
             growth_only,
         )))
-    }
-
-    /// Reconcile the discovered namespace before either absence consumer.
-    /// Failures retain ordinary pending/observation custody, never grant reads.
-    pub(super) fn prepare_codex_carries(
-        &mut self,
-        sampling: Option<(
-            &sampled_scan::SharedCache,
-            Option<&crate::transcript_acquisition::Scope>,
-        )>,
-    ) {
-        let Some(walk) = self.traversal.as_ref() else {
-            return;
-        };
-        let paths = walk.codex_rollout_paths.clone();
-        let candidates: Vec<_> = paths
-            .iter()
-            .filter_map(|key| {
-                let path = Path::new(key);
-                if codex_file_join::shadowed_compressed_path(path, &paths) {
-                    return None;
-                }
-                let root = walk.owning_scan_root(path)?.clone();
-                let stat = fs::symlink_metadata(path).ok()?;
-                Some(codex_file_join::header_candidate(
-                    root,
-                    path.to_path_buf(),
-                    &stat,
-                ))
-            })
-            .collect();
-        let Ok(Some(route)) = state_v2::runtime_path(self) else {
-            return;
-        };
-        for candidate in candidates {
-            let _ = self.carry_codex_rollout_with_cache(&route, &candidate, sampling);
-        }
     }
 
     /// Called on a metadata-only candidate, before any sample/header/body read
@@ -325,58 +274,8 @@ impl ScanIndex {
                 inventory,
             },
         )?;
-        self.move_file_custody(from, &to, &candidate.scan_root);
+        self.rekey_account_custody(from, &to, Some(&candidate.scan_root));
         Ok(true)
-    }
-
-    /// Source-neutral map moves only. Codex is the sole caller; existing
-    /// Claude/Pi move semantics keep their own birth/census/withheld rules.
-    fn move_file_custody(&mut self, from: &str, to: &str, scan_root: &Path) {
-        if let Some(entry) = self.files.remove(from) {
-            self.files.insert_shared(to.to_owned(), entry);
-        }
-        if let Some(entities) = self.file_snapshot_fingerprints.remove(from) {
-            self.file_snapshot_fingerprints
-                .insert_shared(to.to_owned(), entities);
-        }
-        move_map(&mut self.accepted_rebuild_incidence, from, to);
-        move_map(&mut self.terminal_jsonl_dispositions, from, to);
-        move_map(&mut self.v2_mut().growth_retention, from, to);
-        move_map(&mut self.codex_state_only_blocked_by_file, from, to);
-        move_set(&mut self.confirmed_empty_files, from, to);
-        move_set(&mut self.legacy_unresolved_root_file_witnesses, from, to);
-        move_option(&mut self.resume_after_path, from, to);
-        move_option(&mut self.resume_upper_bound_path, from, to);
-        if let Some(slot) = self
-            .held_audit_progress
-            .as_mut()
-            .filter(|slot| slot.key == from)
-        {
-            slot.key = to.to_owned();
-        }
-        if let Some(residue) = self.scan_residue_witness.as_mut() {
-            move_set(&mut residue.index_keys, from, to);
-        }
-        if let Some(walk) = self.traversal.as_mut() {
-            move_set(walk.observed_index_keys.make_mut(), from, to);
-            move_set(&mut walk.codex_rollout_paths, from, to);
-            move_set(&mut walk.residue.index_keys, from, to);
-            move_map(&mut walk.listing_owed_requeued_unix_seconds, from, to);
-            move_map(&mut walk.oversized_discovery, from, to);
-            move_option(&mut walk.reconciliation_after, from, to);
-            move_option(&mut walk.reconciliation_upper_bound, from, to);
-            for pending in &mut walk.pending_candidates {
-                if local_index_key(&pending.path) == from {
-                    pending.path = PathBuf::from(to);
-                    pending.scan_root = scan_root.to_path_buf();
-                }
-            }
-            if let Some(hold) = walk.residue.codex_inventory_hold.as_mut() {
-                move_set(&mut hold.owed, from, to);
-                move_map(&mut hold.refused_headers, from, to);
-                move_map(&mut hold.outside_roster, from, to);
-            }
-        }
     }
 
     pub(crate) fn has_pending_codex_carry(&self) -> Result<bool> {
@@ -391,12 +290,8 @@ impl ScanIndex {
                 !self.files.contains_key(&carry.from) || !self.files.contains_key(&to),
                 "codex_carry_baseline_conflict"
             );
-            self.move_file_custody(&carry.from, &to, &carry.scan_root);
+            self.rekey_account_custody(&carry.from, &to, Some(&carry.scan_root));
         }
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "codex_rollout_carry_tests.rs"]
-mod tests;

@@ -272,50 +272,28 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed causes for native archive reader refusal and owed custody.
+/// Live compressed-input refusal causes. Numeric slots remain frozen;
+/// retired causes have no producers and their old serialized values stay inert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
     ReplayNotAuthorized = 0,
-    #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported = 1,
-    #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported = 2,
-    #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
     GroupProbeUnsupported = 4,
     #[serde(rename = "CompressedGroupReadUnsupported")]
     GroupReadUnsupported = 5,
-    #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound = 6,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported = 7,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused = 8,
     #[serde(rename = "CompressedDecodeFailed")]
     DecodeFailed = 9,
-    #[serde(rename = "CompressedOwnerUnproven")]
-    OwnerUnproven = 10,
-    #[serde(rename = "CompressedOutputHeld")]
-    OutputHeld = 11,
     #[serde(rename = "CompressedDecodedOverLimit")]
     DecodedOverLimit = 12,
-    #[serde(rename = "CompressedHeaderInvalid")]
-    HeaderInvalid = 13,
-    #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 14,
     #[serde(rename = "CompressedHeaderUnfunded")]
     HeaderUnfunded = 15,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 16,
-    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
-    #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 17,
-    #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 18,
-    #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 19,
     #[doc(hidden)]
     #[serde(skip)]
     __Count = 20,
@@ -327,28 +305,17 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-/// Every counted cause; the length is checked against `__Count`.
-const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+/// Live counted causes; holes retain the old numeric slots.
+const CODEX_ZST_ALL: [CodexZstCause; 9] = [
     CodexZstCause::ReplayNotAuthorized,
-    CodexZstCause::ProofParentUnsupported,
-    CodexZstCause::ProofChildUnsupported,
-    CodexZstCause::ParentSideUnsupported,
     CodexZstCause::GroupProbeUnsupported,
     CodexZstCause::GroupReadUnsupported,
-    CodexZstCause::ParentLedgerUnbound,
     CodexZstCause::PhysicalOffsetUnsupported,
     CodexZstCause::AdmissionRefused,
     CodexZstCause::DecodeFailed,
-    CodexZstCause::OwnerUnproven,
-    CodexZstCause::OutputHeld,
     CodexZstCause::DecodedOverLimit,
-    CodexZstCause::HeaderInvalid,
-    CodexZstCause::CorrectionUnapplied,
     CodexZstCause::HeaderUnfunded,
     CodexZstCause::CompatibilityUnfunded,
-    CodexZstCause::DecoderRefusedHeaderOccupancy,
-    CodexZstCause::FamilyUnproven,
-    CodexZstCause::ArchiveEquivalenceUnproven,
 ];
 struct CodexZstRefused {
     counters: [AtomicU64; CODEX_ZST_CAUSES],

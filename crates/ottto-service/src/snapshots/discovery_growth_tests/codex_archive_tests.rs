@@ -13,7 +13,9 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         index
             .files
             .insert(key.clone(), crate::snapshots::g7_debt::tests::entry(&path));
-        if !owed {
+        if owed {
+            index.files.get_mut(&key).unwrap().evidence_owed = true;
+        } else {
             crate::snapshots::g7_debt::tests::accept(SnapshotSource::Codex, &mut index, &path);
         }
         index

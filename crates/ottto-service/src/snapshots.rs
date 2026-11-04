@@ -22252,9 +22252,6 @@ impl OwnedSourceScan {
             Some(&resource_probe.discovery_growth),
             carry_cache.map(|(cache, scope)| (cache, Some(scope))),
         );
-        if source == SnapshotSource::Codex {
-            index.prepare_codex_carries(carry_cache.map(|(cache, scope)| (cache, Some(scope))));
-        }
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -26580,11 +26577,6 @@ impl OwnedSourceScan {
                 // derived index state directly. Any recreation after this absence witness
                 // belongs to the next generation.
                 if source == SnapshotSource::Codex {
-                    index.prepare_codex_carries(
-                        sampling
-                            .as_ref()
-                            .map(|s| (s.cache.as_ref(), Some(&s.namespace))),
-                    );
                     census.removed_index_keys.retain(|key| {
                         index.files.contains_key(key)
                             && !index
@@ -39229,9 +39221,6 @@ fn reconcile_missing_index_entries_with_side(
     cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
-    if source == SnapshotSource::Codex {
-        index.prepare_codex_carries(cache.map(|cache| (cache, None)));
-    }
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
     };
@@ -40718,6 +40707,22 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
     }
     *values = canonical;
     true
+}
+
+fn move_set(set: &mut BTreeSet<String>, from: &str, to: &str) {
+    if set.remove(from) {
+        set.insert(to.to_owned());
+    }
+}
+fn move_map<T>(map: &mut BTreeMap<String, T>, from: &str, to: &str) {
+    if let Some(value) = map.remove(from) {
+        map.insert(to.to_owned(), value);
+    }
+}
+fn move_option(value: &mut Option<String>, from: &str, to: &str) {
+    if value.as_deref() == Some(from) {
+        *value = Some(to.to_owned());
+    }
 }
 
 impl ScanIndex {
@@ -45220,7 +45225,7 @@ impl ScanIndex {
         }
         let needs_classification =
             self.files.contains_key(&key) && !self.claude_account_deferred_holds.contains_key(&key);
-        self.rekey_account_custody(old, &key);
+        self.rekey_account_custody(old, &key, None);
         // Custody is at the destination BEFORE the owner retires the source generation.
         if !self
             .claude_money_birth_store
@@ -45228,7 +45233,7 @@ impl ScanIndex {
         {
             // Roll custody back on an unexpected owner refusal. Existing
             // admitted proof/marks stay retained, and no source hold releases.
-            self.rekey_account_custody(&key, old);
+            self.rekey_account_custody(&key, old, None);
             return;
         }
         if needs_classification {
@@ -45242,7 +45247,22 @@ impl ScanIndex {
     }
 
     /// Move, never settle, existing custody. No transcript read or release/ACK credit.
-    fn rekey_account_custody(&mut self, from: &str, to: &str) {
+    fn rekey_account_custody(&mut self, from: &str, to: &str, scan_root: Option<&Path>) {
+        self.file_custody(from, Some((to, scan_root)));
+    }
+
+    /// One custody list for moves and the existing entry-only drop. Extra
+    /// path aliases move only for the caller supplying a discovered root.
+    fn file_custody(&mut self, from: &str, target: Option<(&str, Option<&Path>)>) {
+        let Some((to, scan_root)) = target else {
+            self.files.remove(from);
+            self.confirmed_empty_files.remove(from);
+            self.claude_request_census.remove(from);
+            self.claude_money_birth_store.set_money_marks(from, 0);
+            self.claude_copy_removals
+                .forget(claude_money_birth_store::location_key(from));
+            return;
+        };
         let from_location = claude_money_birth_store::location_key(from);
         let to_location = claude_money_birth_store::location_key(to);
         self.claude_copy_removals.rekey(from_location, to_location);
@@ -45304,6 +45324,41 @@ impl ScanIndex {
             slot.key = to.to_owned();
         }
         self.withheld_memo.rekey(from, to);
+        if let Some(scan_root) = scan_root {
+            if let Some(claim) = self.v2_mut().growth_retention.remove(from) {
+                sampled_audit::merge_growth_claims(
+                    &mut self.v2_mut().growth_retention,
+                    &BTreeMap::from([(to.to_owned(), claim)]),
+                );
+            }
+            move_map(&mut self.codex_state_only_blocked_by_file, from, to);
+            move_set(&mut self.legacy_unresolved_root_file_witnesses, from, to);
+            move_option(&mut self.resume_after_path, from, to);
+            move_option(&mut self.resume_upper_bound_path, from, to);
+            if let Some(residue) = self.scan_residue_witness.as_mut() {
+                move_set(&mut residue.index_keys, from, to);
+            }
+            if let Some(walk) = self.traversal.as_mut() {
+                move_set(walk.observed_index_keys.make_mut(), from, to);
+                move_set(&mut walk.codex_rollout_paths, from, to);
+                move_set(&mut walk.residue.index_keys, from, to);
+                move_map(&mut walk.listing_owed_requeued_unix_seconds, from, to);
+                move_map(&mut walk.oversized_discovery, from, to);
+                move_option(&mut walk.reconciliation_after, from, to);
+                move_option(&mut walk.reconciliation_upper_bound, from, to);
+                for pending in &mut walk.pending_candidates {
+                    if local_index_key(&pending.path) == from {
+                        pending.path = PathBuf::from(to);
+                        pending.scan_root = scan_root.to_path_buf();
+                    }
+                }
+                if let Some(hold) = walk.residue.codex_inventory_hold.as_mut() {
+                    move_set(&mut hold.owed, from, to);
+                    move_map(&mut hold.refused_headers, from, to);
+                    move_map(&mut hold.outside_roster, from, to);
+                }
+            }
+        }
     }
 
     /// Align the already owned committed baseline before held/partial restoration.
@@ -45327,7 +45382,7 @@ impl ScanIndex {
             })
             .collect::<Vec<_>>();
         for (old, new) in moves {
-            self.rekey_account_custody(&old, &new);
+            self.rekey_account_custody(&old, &new, None);
         }
     }
 
@@ -46502,12 +46557,7 @@ impl ScanIndex {
     /// it after its own guards; dispositions, fingerprints, holds and Codex
     /// proof stay with each caller. Nothing else ends a census record.
     fn drop_file_entry(&mut self, key: &str) {
-        self.files.remove(key);
-        self.confirmed_empty_files.remove(key);
-        self.claude_request_census.remove(key);
-        self.claude_money_birth_store.set_money_marks(key, 0);
-        self.claude_copy_removals
-            .forget(claude_money_birth_store::location_key(key));
+        self.file_custody(key, None);
     }
 
     /// Keep move history for 30 days after the last indexed or held member.

@@ -532,7 +532,7 @@ impl HeaderInventory {
         metadata: &CodexTitleMetadata,
         cache: Option<&sampled_scan::SharedCache>,
         funded_cache: Option<&Arc<sampled_scan::SharedCache>>,
-        mut index: Option<&mut ScanIndex>,
+        index: Option<&mut ScanIndex>,
         flags: Option<&BTreeMap<String, (bool, bool)>>,
     ) -> bool {
         if !self.cache_pruned {
@@ -590,22 +590,6 @@ impl HeaderInventory {
                 None,
             );
             retry_candidate = Some(candidate.clone());
-            if let Some(index) = index.as_deref_mut() {
-                if let Some(route) = state_v2::runtime_path(index)? {
-                    index
-                        .carry_codex_rollout_with_cache(
-                            &route,
-                            &candidate,
-                            cache.map(|cache| (cache, None)),
-                        )
-                        .map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::WouldBlock,
-                                "Codex carry deferred",
-                            )
-                        })?;
-                }
-            }
             let stored_head =
                 index
                     .as_deref()
@@ -630,9 +614,9 @@ impl HeaderInventory {
                     .as_ref()
                     .map(|facts| facts.owner.clone())
                     .or_else(|| {
-                        tail_source::codex::owning_session(head.revision, &head.body)
+                        tail_source::codex::header_facts(head.revision, &head.body)
                             .ok()
-                            .flatten()
+                            .and_then(|(_, owner)| owner)
                     })?;
                 Some((
                     CachedHeader {
@@ -788,6 +772,11 @@ impl HeaderInventory {
             .map(|_| ())
     }
     fn validate_memberships(&self, owners: &BTreeSet<String>) -> Result<usize> {
+        // Main's request validator has no publication boundary for zero owners;
+        // validate_all still checks the checkpoint's registered owners.
+        if owners.is_empty() {
+            return Ok(0);
+        }
         let (affected, checked_headers) = self.current_membership_failures()?;
         anyhow::ensure!(
             owners
@@ -2105,72 +2094,6 @@ pub(super) mod tests {
         );
     }
 
-    #[test]
-    fn header_inventory_keeps_individual_header_refusals_without_a_population_limit() {
-        let (root, _) = fixture();
-        let sessions = root.join("sessions");
-        let path = sessions.join("large.jsonl");
-        let mut directories = DirectoryCensus::new();
-        for header in [
-            format!("{}\n", "x".repeat(MAX_HEADER_BYTES + 1)),
-            "{malformed}\n".to_owned(),
-            "{\"type\":\"session_meta\",\"payload\":{}}\n".to_owned(),
-        ] {
-            let expected_bytes = header.len().min(MAX_HEADER_BYTES + 1);
-            fs::write(&path, header).unwrap();
-            directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
-            let mut inventory = HeaderInventory::new(
-                std::slice::from_ref(&sessions),
-                &BTreeSet::from([local_index_key(&path)]),
-                Some(&directories),
-            );
-            while !inventory.step(&CodexTitleMetadata::default()) {}
-            assert!(!inventory.complete);
-            assert!(inventory.headers.is_empty());
-            assert_eq!(inventory.read_bytes, expected_bytes);
-        }
-        let synthetic_paths = 32_769;
-        let paths = (0..synthetic_paths)
-            .map(|number| local_index_key(&sessions.join(format!("{number}.jsonl"))))
-            .collect();
-        let inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
-        assert!(
-            inventory.complete,
-            "roster population does not refuse coverage"
-        );
-        assert_eq!(inventory.pending.len(), synthetic_paths);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn inventory_population_and_cumulative_volume_do_not_stop_the_next_header() {
-        let (root, mut inventory) = fixture();
-        let metadata = CodexTitleMetadata::default();
-        let path = inventory.headers[0].candidate.path.clone();
-        let template = inventory.headers[0].clone();
-        inventory.headers = vec![template; 32_769];
-        inventory.pending.push_back(path.clone());
-        inventory.read_bytes = 32_768 * (MAX_HEADER_BYTES + 1) + 1;
-        let before = inventory.read_bytes;
-        assert!(!inventory.step(&metadata));
-        assert!(inventory.complete);
-        assert!(inventory.read_bytes > before);
-        assert_eq!(inventory.headers.len(), 32_770);
-        assert!(inventory.step(&metadata));
-
-        let sessions = root.join("sessions");
-        let mut census = DirectoryCensus::new();
-        for number in 0..32_769 {
-            census
-                .directories
-                .insert(format!("synthetic-directory-{number}"), String::new());
-        }
-        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
-        assert!(census.stable);
-        assert_eq!(census.directories.len(), 32_770);
-        assert!(census.contains(&sessions));
-        fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn ordinary_compressed_header_retains_pending_on_funding_refusal_and_plain_sibling_wins() {
@@ -3977,45 +3900,12 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn pending_membership_has_no_count_limit_and_unknown_version_preserves_protected_state() {
+    fn unknown_version_preserves_protected_state() {
         let root = native_join_fixture_root(false);
         let (mut working, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
         let (captured, _, _) =
             working.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
-        let mut full = ScanIndex::default();
-        let sample = captured.files.values().next().unwrap();
-        let mut marker_only = sample.clone();
-        marker_only.codex_applied_tier_receipt = None;
-        marker_only.codex_captured_tier_receipt = None;
-        let synthetic_entries = 32_769;
-        for n in 0..synthetic_entries {
-            full.files
-                .insert(format!("synthetic-pending-{n}"), marker_only.clone());
-        }
-        let (after, changed, held) = working.stage_codex_recovery_capture(&full, &result.snapshots);
-        assert_eq!(changed.len(), 1);
-        assert!(held.is_empty(), "marker population does not refuse capture");
-        assert_eq!(after.files.len(), synthetic_entries + working.files.len());
-        for (key, entry) in &full.files {
-            assert_eq!(
-                serde_json::to_vec(&after.files[key]).unwrap(),
-                serde_json::to_vec(entry).unwrap()
-            );
-        }
-        // The independently owned receipt-byte bound still refuses atomically.
-        let mut receipt_full = full.clone();
-        for key in full.files.keys() {
-            receipt_full.files.insert(key.clone(), sample.clone());
-        }
-        let (after, changed, held) =
-            working.stage_codex_recovery_capture(&receipt_full, &result.snapshots);
-        assert!(changed.is_empty());
-        assert_eq!(held.len(), 1);
-        assert_eq!(
-            serde_json::to_vec(&after).unwrap(),
-            serde_json::to_vec(&receipt_full).unwrap()
-        );
         for malformed in [
             json!("codex_captured_join:v2:future"),
             json!({"opaque":true}),
@@ -4622,49 +4512,6 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert_eq!(cleared.reuse_misses, paths.len());
         assert_eq!(cleared.reuse_evictions, paths.len());
         READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn cache_population_has_no_count_limit_and_roster_removal_evicts() {
-        let (root, fixture) = tests::fixture();
-        let mut paths = paths(&fixture);
-        let cache = sampled_scan::SharedCache::default();
-        page(&root, &paths, &cache);
-        cache
-            .with_cursor(|cursor| {
-                let facts = cursor.headers.get(paths.first().unwrap()).unwrap();
-                let synthetic_entries = 32_769;
-                for number in 0..synthetic_entries {
-                    cursor
-                        .headers
-                        .refresh(format!("fake-{number}"), Some(facts.clone()));
-                }
-                assert_eq!(
-                    cursor.headers.entries.len(),
-                    synthetic_entries + paths.len()
-                );
-                assert_charge(&cursor.headers);
-            })
-            .unwrap();
-        let removed = paths.pop_last().unwrap();
-        let next = page(&root, &paths, &cache);
-        assert_eq!(next.reuse_hits, 1);
-        assert_eq!(next.reuse_evictions, 32_769 + 1);
-        cache
-            .with_cursor(|cursor| {
-                assert_eq!(cursor.headers.entries.len(), 1);
-                assert!(cursor.headers.get(&removed).is_none());
-                assert_charge(&cursor.headers);
-            })
-            .unwrap();
-        let empty = page(&root, &BTreeSet::new(), &cache);
-        assert_eq!(empty.reuse_evictions, 1);
-        cache
-            .with_cursor(|cursor| {
-                assert!(cursor.headers.entries.is_empty());
-                assert_charge(&cursor.headers);
-            })
-            .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]

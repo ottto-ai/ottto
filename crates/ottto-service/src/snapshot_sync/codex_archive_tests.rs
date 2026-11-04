@@ -20,14 +20,16 @@ impl ScanIndex {
     ) -> (ScanIndex, Vec<Vec<u8>>) {
         let mut index = self;
         let mut posts = Vec::new();
-        let root = crate::test_scratch::ScratchDir::new("archive-upload-checkpoint");
+        let root = crate::test_scratch::ScratchDir::canonical("archive-upload-checkpoint");
         let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
         let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
-        let progress_path = root.join("progress.json");
+        let progress_path = snapshot_upload_progress_path(&index_path);
         if route.is_none() {
             std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
         }
         let mut progress = test_upload_progress();
+        progress.context_receipt_candidates =
+            index.file_upload_context_ack_candidates(&scan.snapshots);
         progress.save(&progress_path).unwrap();
         if outcome != "partial" {
             let result = upload_resumable_batches_with_body_witness(
@@ -65,6 +67,7 @@ impl ScanIndex {
                 assert_eq!(result, ResumableUploadResult::Completed);
             }
         }
+        progress.fresh_context_body_acks = progress.accepted_body_witnesses.clone();
         index.generation = previous.generation;
         if outcome == "accept" {
             index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);

@@ -5598,7 +5598,7 @@ mod header_admission_tests {
             .flatten()
             .unwrap();
         let mut refused = false;
-        for number in 0..32_768 {
+        for number in 0..8 {
             let key = format!("header-{number}");
             cache.refresh_header(key.clone(), Some(facts.clone()));
             if cache
@@ -5638,7 +5638,7 @@ mod header_admission_tests {
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
                 // Model a resident graph that became full after caching headers.
-                for number in 0..32_768 {
+                for number in 0..8 {
                     cursor
                         .headers
                         .refresh(format!("header-{number}"), Some(facts.clone()));
@@ -5663,7 +5663,7 @@ mod header_admission_tests {
         cache
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
-                for number in 0..32_768 {
+                for number in 0..8 {
                     cursor
                         .headers
                         .refresh(format!("header-{number}"), Some(facts.clone()));

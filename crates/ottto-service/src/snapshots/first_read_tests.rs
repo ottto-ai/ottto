@@ -84,8 +84,8 @@ fn first_read_bound_admits_only_files_with_read_evidence() {
             cases.extend([
                 ("held-61.jsonl.zst", now - 61 * DAY, false),
                 ("witnessed-61.jsonl.zst", now - 61 * DAY, true),
-                ("cut-out.jsonl.zst", cutoff - 1, false),
-                ("cut-in.jsonl.zst", cutoff + 1, true),
+                ("compressed-cut-out.jsonl.zst", cutoff - 1, false),
+                ("compressed-cut-in.jsonl.zst", cutoff + 1, true),
             ]);
         }
         for (name, modified, _) in &cases {

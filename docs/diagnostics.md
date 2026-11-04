@@ -1713,7 +1713,7 @@ retry timer, Held queue or separate power/work gate remains.
 
 Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
 win before header/body selection, and both encodings use the same mtime age rules;
-compressed rollouts age by their own modification time. One secure header opener
+compressed rollouts keep their original modification time, so they age as the plain file did. One secure header opener
 supplies ownership proof. The inventory has no file-count, directory-count, cache
 population or cumulative read-volume cap; optional header facts still use reclaimable
 state-memory credit, and the existing per-header recognition bound remains.

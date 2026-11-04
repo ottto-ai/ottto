@@ -152,12 +152,12 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    // The plain join inventory no longer owns archive refusal. Its bounded
-    // archive share performs admission separately, without a plain parser.
+    // An unfunded encoded header stays incomplete for an ordinary retry;
+    // it is neither decoded nor recorded as unreadable.
     let before = ACTIVITY.with(std::cell::Cell::get);
     while !inventory.step(&CodexTitleMetadata::default()) {}
     assert!(inventory.headers.is_empty());
-    assert!(inventory.complete);
+    assert!(!inventory.complete);
     assert!(inventory.refused.is_empty());
     assert_eq!(ACTIVITY.with(std::cell::Cell::get), before);
     fs::remove_dir_all(root).unwrap();

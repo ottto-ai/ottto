@@ -411,35 +411,6 @@ const CLOSURE: &[&str] = &[
     "v1_field.claude_desktop_title_files",
     "proof.deferred_account",
 ];
-/// Additional path-keyed custody is paired only for an explicitly staged
-/// carry. Ordinary Tail saves keep their existing closure and ordering.
-const CARRY_FILE: &[&str] = &[
-    "accepted.rebuild_incidence",
-    "v1_field.codex_state_only_blocked_by_file",
-];
-const CARRY_ALIASES: &[&str] = &[
-    "scan_state.traversal",
-    "scan_state.held_audit_progress",
-    "scan_state.scan_residue_witness",
-    "scan_state.resume_after_path",
-    "scan_state.resume_upper_bound_path",
-    "v1_field.legacy_unresolved_root_file_witnesses",
-];
-fn carry_file_row(key: &RowKey) -> Option<&[u8]> {
-    match key {
-        RowKey::Record {
-            kind,
-            key_bytes,
-            position,
-            ..
-        } if CARRY_FILE.contains(&kind.name()) && *position != 0 => Some(key_bytes),
-        _ => None,
-    }
-}
-fn carry_alias_row(key: &RowKey) -> bool {
-    matches!(key, RowKey::Record { kind, .. }
-        if CARRY_ALIASES.contains(&kind.name()))
-}
 /// A file-owned kind's row: (file key, position). Position 0 is the cardinality.
 fn closure_row(key: &RowKey) -> Option<(&[u8], u64)> {
     match key {
@@ -476,8 +447,6 @@ pub(super) struct Rows<'a> {
     pub(super) seed: Digests,
     /// Files staged in Tail: their changed closure rows wait for their boundary.
     pub(super) closures: BTreeMap<Vec<u8>, Vec<ClosureRow>>,
-    pub(super) carry_files: BTreeSet<Vec<u8>>,
-    pub(super) carry_aliases: Option<Vec<ClosureRow>>,
     /// Closure kinds' cardinality rows, written by `finish` from `next`.
     pub(super) counted: BTreeSet<RowKey>,
 }
@@ -491,10 +460,7 @@ pub(super) fn digest<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32]> {
 impl Rows<'_> {
     pub(super) fn put<T: Serialize + ?Sized>(&mut self, key: RowKey, value: &T) -> Result<()> {
         // A file-owned kind counts the members that commit, after the boundaries.
-        let carry_manifest = self.carry_aliases.is_some()
-            && matches!(&key, RowKey::Record { kind, position: 0, .. }
-                if CARRY_FILE.contains(&kind.name()));
-        if closure_row(&key).is_some_and(|(_, position)| position == 0) || carry_manifest {
+        if closure_row(&key).is_some_and(|(_, position)| position == 0) {
             self.counted.insert(key);
             return Ok(());
         }
@@ -522,14 +488,7 @@ impl Rows<'_> {
     ) -> Result<()> {
         let old = self.old.remove(&key);
         if old != Some(digest) {
-            let file = closure_row(&key)
-                .map(|(file, _)| file)
-                .or_else(|| carry_file_row(&key).filter(|file| self.carry_files.contains(*file)));
-            let staged = if self.carry_aliases.is_some() && carry_alias_row(&key) {
-                self.carry_aliases.as_mut()
-            } else {
-                file.and_then(|file| self.closures.get_mut(file))
-            };
+            let staged = closure_row(&key).and_then(|(file, _)| self.closures.get_mut(file));
             if let Some(closure) = staged {
                 closure.push(ClosureRow {
                     key: key.clone(),
@@ -602,16 +561,14 @@ impl Rows<'_> {
     /// `old`, so `finish` never deletes them outside the file's boundary.
     pub(super) fn take_closure(&mut self, file: &[u8]) -> Result<Vec<ClosureRow>> {
         let mut closure = self.closures.remove(file).unwrap_or_default();
-        let carried = self.carry_files.contains(file);
-        let kinds = CLOSURE.iter().chain(CARRY_FILE.iter().filter(|_| carried));
-        for kind in kinds {
+        for kind in CLOSURE {
             let first = RowKey::record(kind, file, 0)?;
             let removed: Vec<_> = self
                 .old
                 .range::<RowKey, _>(&first..)
                 .take_while(|(key, _)| {
                     record_kind(key) == Some(*kind)
-                        && matches!(key, RowKey::Record { key_bytes, .. } if key_bytes == file)
+                        && closure_row(key).is_some_and(|(key, _)| key == file)
                 })
                 .map(|(key, _)| key.clone())
                 .collect();
@@ -623,25 +580,6 @@ impl Rows<'_> {
                     value: None,
                 });
             }
-        }
-        Ok(closure)
-    }
-    /// Shared rows naming a carry leave `old` before finish, exactly as the
-    /// two file closures do; a refusal restores all three together.
-    pub(super) fn take_carry_aliases(&mut self) -> Result<Vec<ClosureRow>> {
-        let mut closure = self.carry_aliases.take().unwrap_or_default();
-        let removed: Vec<_> = self
-            .old
-            .keys()
-            .filter(|key| carry_alias_row(key))
-            .cloned()
-            .collect();
-        for key in removed {
-            closure.push(ClosureRow {
-                old: self.old.remove(&key),
-                key,
-                value: None,
-            });
         }
         Ok(closure)
     }
