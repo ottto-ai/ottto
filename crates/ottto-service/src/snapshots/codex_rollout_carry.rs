@@ -56,7 +56,6 @@ impl ScanIndex {
         metadata: &CodexTitleMetadata,
         now: u64,
         body_witness_adoption: bool,
-        growth_only: bool,
     ) -> Result<Option<(CandidateDecision, Option<CandidateParseReason>)>> {
         let key = local_index_key(&candidate.path);
         let file = open_candidate_beneath_root(candidate)?;
@@ -89,7 +88,6 @@ impl ScanIndex {
             &logical,
             now,
             body_witness_adoption,
-            growth_only,
         )))
     }
 

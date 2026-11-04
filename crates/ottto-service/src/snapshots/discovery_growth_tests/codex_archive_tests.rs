@@ -14,7 +14,11 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
             .files
             .insert(key.clone(), crate::snapshots::g7_debt::tests::entry(&path));
         if owed {
-            index.files.get_mut(&key).unwrap().evidence_owed = true;
+            index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .set_unverified_deadline(11);
         } else {
             crate::snapshots::g7_debt::tests::accept(SnapshotSource::Codex, &mut index, &path);
         }

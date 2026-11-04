@@ -1,7 +1,7 @@
 //! Carry-specific transaction cases use the existing native route fixture.
 use super::super::tail_route::carry_tail;
 use super::*;
-use crate::snapshots::{sampled_audit, ScanResidueWitness};
+use crate::snapshots::ScanResidueWitness;
 
 const MOVED: &str = "/synthetic/tail/file.jsonl.zst";
 fn facts() -> InventoryFacts {
@@ -43,7 +43,6 @@ fn pair(f: &Fixture, index: &mut ScanIndex) {
     index.v2_mut().growth_retention.insert(MOVED.into(), growth);
     index.confirmed_empty_files.remove(FILE);
     index.confirmed_empty_files.insert(MOVED.into());
-    index.held_audit_progress.as_mut().unwrap().key = MOVED.into();
     index.scan_residue_witness.as_mut().unwrap().index_keys = BTreeSet::from([MOVED.into()]);
 }
 fn seed(f: &Fixture) -> ScanIndex {
@@ -52,7 +51,7 @@ fn seed(f: &Fixture) -> ScanIndex {
     let mut entry = progress_row();
     entry.last_snapshot_fingerprint = Some("e".repeat(64));
     entry.last_upload_body_witness = Some("f".repeat(64));
-    entry.evidence_owed = true;
+    entry.set_unverified_deadline(11);
     index.files.insert(FILE.into(), entry);
     index
         .file_snapshot_fingerprints
@@ -69,11 +68,6 @@ fn seed(f: &Fixture) -> ScanIndex {
         }))
         .unwrap(),
     );
-    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
-        key: FILE.into(),
-        due: 11,
-        attempted: true,
-    });
     index.scan_residue_witness = Some(ScanResidueWitness {
         index_keys: BTreeSet::from([FILE.into()]),
         ..Default::default()
@@ -103,7 +97,8 @@ fn assert_pair(index: &ScanIndex, moved: bool) {
         entry.last_upload_body_witness.as_deref(),
         Some("f".repeat(64).as_str())
     );
-    assert!(entry.evidence_owed);
+    assert!(entry.has_unverified_source());
+    assert_eq!(entry.unverified_deadline(), Some(11));
     assert!(index.confirmed_empty_files.contains(live));
     assert!(!index.confirmed_empty_files.contains(absent));
     assert!(index.v2().growth_retention.contains_key(live));
@@ -114,8 +109,6 @@ fn assert_pair(index: &ScanIndex, moved: bool) {
     );
     assert!(index.accepted_rebuild_incidence.contains_key(live));
     assert!(!index.accepted_rebuild_incidence.contains_key(absent));
-    assert_eq!(index.held_audit_progress.as_ref().unwrap().key, live);
-    assert_eq!(index.held_audit_progress.as_ref().unwrap().due, 11);
     assert_eq!(
         index.scan_residue_witness.as_ref().unwrap().index_keys,
         BTreeSet::from([live.into()])

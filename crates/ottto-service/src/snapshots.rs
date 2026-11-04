@@ -22032,7 +22032,6 @@ impl OwnedSourceScan {
                     &codex_title_metadata,
                     audit_now,
                     true,
-                    false,
                 ) {
                     Ok(Some((CandidateDecision::Skip, _))) => {
                         page_selection(source.api_slug(), PageSelection::Skipped, 1);
