@@ -442,8 +442,12 @@ pub(super) struct Walk {
     started_at: Option<u64>,
     incomplete: bool,
     unavailable: bool,
-    /// Every key the walk counted, each once; none of them is unlisted.
-    listed: BTreeSet<String>,
+    /// A symlink, unreadable entry, too-wide directory or disappearance on
+    /// some page, or no Tail route: the roster proves nothing absent.
+    issue: bool,
+    /// The roster: every key the walk listed (excluded and out-of-window files
+    /// too) with its mtime (unix seconds), each once.
+    listed: BTreeMap<String, Option<u64>>,
     /// The walk's sums over `listed`.
     sums: Report,
 }
@@ -452,9 +456,28 @@ impl Walk {
         started_at: None,
         incomplete: false,
         unavailable: false,
-        listed: BTreeSet::new(),
+        issue: false,
+        listed: BTreeMap::new(),
         sums: Report::UNAVAILABLE,
     };
+
+    /// The roster of a complete walk begun in this process with no walk
+    /// issue; `None` otherwise. Moves the roster out of the walk.
+    pub(super) fn complete_roster(&mut self) -> Option<Roster> {
+        let started_at_ms = self
+            .started_at
+            .filter(|_| !self.incomplete && !self.unavailable && !self.issue)?;
+        Some(Roster {
+            started_at_ms,
+            listed: std::mem::take(&mut self.listed),
+        })
+    }
+}
+
+/// Every file a complete root walk listed, and when that walk began.
+pub(crate) struct Roster {
+    pub(crate) started_at_ms: u64,
+    pub(crate) listed: BTreeMap<String, Option<u64>>,
 }
 
 /// One listed file, as the walk saw it.
@@ -553,10 +576,27 @@ impl<'a> Page<'a> {
         self.fold.debt.incomplete = true;
     }
 
+    /// Any walk issue on this page (symlink, unreadable, too wide, gone).
+    pub(super) fn walk_issue(&mut self) {
+        self.fold.debt.issue = true;
+    }
+
+    /// Enter `path` in the roster once per walk; false when already listed.
+    fn roster(&mut self, path: &Path, metadata: Option<&std::fs::Metadata>) -> bool {
+        let mtime = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(unix_seconds);
+        self.fold
+            .debt
+            .listed
+            .insert(local_index_key(path), mtime)
+            .is_none()
+    }
+
     /// A file excluded from upload by the daemon's own snapshot rule is never
     /// upload-required: no debt, counted as no upload required.
-    pub(super) fn excluded(&mut self, path: &Path) {
-        if self.route.is_some() && self.fold.debt.listed.insert(local_index_key(path)) {
+    pub(super) fn excluded(&mut self, path: &Path, metadata: Option<&std::fs::Metadata>) {
+        if self.roster(path, metadata) && self.route.is_some() {
             self.fold.debt.sums.no_upload_required_files += 1;
         }
     }
@@ -666,10 +706,10 @@ impl<'a> Page<'a> {
     /// Reconcile one listed file, once per walk, and stage what changed. A head
     /// this build cannot read is counted unknown and never written.
     pub(super) fn listed(&mut self, index: &ScanIndex, listing: Listing<'_>) {
-        let key = local_index_key(listing.path);
-        if self.route.is_none() || self.fold.debt.listed.contains(&key) {
+        if !self.roster(listing.path, Some(listing.metadata)) || self.route.is_none() {
             return;
         }
+        let key = local_index_key(listing.path);
         let live = self.live(index, &key, &listing);
         // One keyed read per listed file; an absent head is `None`.
         let head = match state_v2::load_head(index, &key, u32::MAX) {
@@ -728,7 +768,6 @@ impl<'a> Page<'a> {
             debt.owed && !codex_archive_path(path) && !index.files.contains_key(&key);
         let walk = &mut self.fold.debt;
         walk.sums.never_indexed_files += u64::from(never_indexed);
-        walk.listed.insert(key);
         walk.sums.add(debt, self.now_ms);
         walk.sums.no_upload_required_files += u64::from(no_upload_required);
         if debt.owed && index.authority_terminal_member(path) {
@@ -753,6 +792,7 @@ impl<'a> Page<'a> {
             ..
         } = self;
         let walk = &mut fold.debt;
+        walk.issue |= route.is_none();
         if let Some(route) = route.as_deref().filter(|_| !staged.is_empty()) {
             walk.unavailable |= state_v2::observe_tails(route, staged).is_err();
         }
@@ -777,7 +817,10 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
     let complete = walk.started_at.filter(|_| !walk.incomplete);
     let mut report = walk.sums;
     let mut gone = Vec::new();
-    for key in keys.into_iter().filter(|key| !walk.listed.contains(key)) {
+    for key in keys
+        .into_iter()
+        .filter(|key| !walk.listed.contains_key(key))
+    {
         if complete.is_some() && !index.files.contains_key(&key) {
             gone.push(key);
         } else {
@@ -798,4 +841,4 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
 
 #[cfg(test)]
 #[path = "g7_debt_tests.rs"]
-mod tests;
+pub(super) mod tests;

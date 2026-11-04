@@ -13,7 +13,7 @@ use super::*;
 
 const FILE: &str = "/synthetic/tail/file.jsonl";
 const SIBLING: &str = "/synthetic/tail/z-sibling.jsonl";
-/// Larger than one stored fragment, and not zstd-compressible by accident.
+/// Larger than one raw fragment, even when its physical bytes compress.
 const LONG: usize = 17 * 1024 * 1024;
 const REVISION: u32 = 1;
 
@@ -221,9 +221,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
 
     // An overwrite of accumulating state owes no purge; a dropped private
     // string and a reset do, even with the same page count.
+    let compressed = vec![0; 2048];
     let page = |change| StagedFile {
         change,
-        ..staged(b"head2", &[(Collection::Responses, 0, b"page2")])
+        ..staged(b"head2", &[(Collection::Responses, 0, &compressed)])
     };
     for (change, marks) in [
         (Change::Ordinary, 0),
@@ -234,6 +235,10 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
         save_with(&f.path, &mut index).unwrap();
         assert_eq!(erasure_marks(&index), marks, "{change:?}");
         assert_eq!(all_tail_rows(&index, FILE), 2);
+        assert_eq!(
+            rows(&index, "tail.page.responses", FILE)[0].value_version,
+            3
+        );
     }
 
     // A removed progress row retires in its own commit.
@@ -432,7 +437,11 @@ fn systemic_failure_commits_neither_file_nor_marker() {
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| sqlite::cap_pages(db));
-    let long = vec![1_u8; 1024 * 1024];
+    // This disk-full control must require space even with compression active.
+    use sha2::{Digest, Sha256};
+    let long: Vec<u8> = (0..32_768_u64)
+        .flat_map(|n| Sha256::digest(n.to_be_bytes()))
+        .collect();
     stage_tail(
         &f.path,
         FILE,
@@ -574,7 +583,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -813,10 +822,11 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
     let index = load_with(&f.path, false).unwrap().unwrap();
     let new_roots: Vec<RowKey> = catalogue::LAYOUTS
         .iter()
-        .filter(|(_, _, layout)| *layout == 5)
+        // A retired kind is never written.
+        .filter(|(_, field, layout)| *layout == 5 && !field.starts_with("retired_"))
         .map(|(kind, _, _)| mapper::key(kind, "", 0).unwrap())
         .collect();
-    assert_eq!(new_roots.len(), 2);
+    assert_eq!(new_roots.len(), 1);
     with_session_db(&index, |db| {
         for key in &new_roots {
             sqlite::delete_row_for_test(db, key);
@@ -824,7 +834,6 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         db.control("catalogue_layout", &4_u32).unwrap();
     });
     let index = load_with(&f.path, false).unwrap().unwrap();
-    assert!(index.claude_folder_login_ledger.is_empty());
     assert_eq!(index.tail_discovery, Default::default());
     stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
     observe_tail(&f.path, FILE, observation(&[b"debt"])).unwrap();
@@ -835,7 +844,7 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         // Capability 3 refuses any store whose minimum is above it.
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(4)
+            Some(5)
         );
     });
     assert_eq!(revisions(&reloaded, FILE).len(), 1);

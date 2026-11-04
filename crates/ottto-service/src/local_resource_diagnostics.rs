@@ -100,6 +100,26 @@ macro_rules! sparse_lifetime_counters {
         }
     };
 }
+/// A process-wide diagnostic static behind `$with`. Each test thread gets its
+/// own copy, so a fixture never reads or drains another test's counts.
+macro_rules! process_static {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+        $(#[$attr])*
+        $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
+            #[cfg(not(test))]
+            {
+                static STATE: $ty = $init;
+                f(&STATE)
+            }
+            #[cfg(test)]
+            {
+                thread_local! { static STATE: $ty = const { $init }; }
+                STATE.with(f)
+            }
+        }
+    };
+}
+pub(crate) use process_static;
 /// The Codex cursor's logged event counters, in log key order: the one name
 /// list behind `CodexCursorEvents` (fields and keys) and the cursor's RAM
 /// `Counters` and their projection. Expands to `$callback! { fields }`.
@@ -174,13 +194,10 @@ pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
+#[cfg(unix)]
+mod shutdown;
 
-#[cfg(not(test))]
-static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_IDENTITY_OVER_CAP: [AtomicU64; 8] = const { [const { AtomicU64::new(0) }; 8] };
-}
+process_static!(fn with_claude_identity_over_cap: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]);
 
 /// Append-only reason labels, cumulative per process (not distinct sessions).
 /// Records each attempted over-cap body before its identities are stripped.
@@ -238,10 +255,7 @@ pub(crate) fn claude_identity_over_cap(
             },
         );
     };
-    #[cfg(test)]
-    CLAUDE_IDENTITY_OVER_CAP.with(record);
-    #[cfg(not(test))]
-    record(&CLAUDE_IDENTITY_OVER_CAP);
+    with_claude_identity_over_cap(record);
 }
 
 /// Wire bytes of the last over-cap tagged body by component, measured before
@@ -350,22 +364,7 @@ impl CodexZstRefused {
         }
     }
 }
-#[cfg(not(test))]
-static CODEX_ZST_REFUSED: CodexZstRefused = CodexZstRefused::new();
-#[cfg(test)]
-thread_local! {
-    static CODEX_ZST_REFUSED: CodexZstRefused = const { CodexZstRefused::new() };
-}
-fn with_codex_zst_refused<T>(f: impl FnOnce(&CodexZstRefused) -> T) -> T {
-    #[cfg(test)]
-    {
-        CODEX_ZST_REFUSED.with(f)
-    }
-    #[cfg(not(test))]
-    {
-        f(&CODEX_ZST_REFUSED)
-    }
-}
+process_static!(fn with_codex_zst_refused: CodexZstRefused = CodexZstRefused::new());
 
 /// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
@@ -447,32 +446,48 @@ pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
 /// Sidecar read attempts and actual input bytes since the last Claude page.
 /// Repeated reads count again; missing/refused files add nothing. No identities.
 /// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
+/// Retention: pairs deleted (and their bytes), pairs kept by a protection,
+/// copy or write fence, and pairs kept by a read or unlink fault.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
     #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_files: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_sidecar_reparse_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_read_fault: u64,
 }
-#[cfg(not(test))]
-static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_SIDECAR_REPARSE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
-}
-fn with_claude_sidecar_reparse<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
-    #[cfg(test)]
-    {
-        CLAUDE_SIDECAR_REPARSE.with(f)
-    }
-    #[cfg(not(test))]
-    {
-        f(&CLAUDE_SIDECAR_REPARSE)
-    }
-}
+process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]);
 pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0]);
+}
+/// One Claude telemetry retention run.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct ClaudeTelemetryRetention {
+    pub(crate) retired_roots: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) held_roots: u64,
+    pub(crate) read_fault: u64,
+}
+pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
+    add_claude_sidecar_counts([
+        0,
+        0,
+        run.retired_roots,
+        run.retired_bytes,
+        run.held_roots,
+        run.read_fault,
+    ]);
+}
+fn add_claude_sidecar_counts(deltas: [u64; 6]) {
     with_claude_sidecar_reparse(|counts| {
-        for (counter, delta) in counts.iter().zip([files, bytes]) {
+        for (counter, delta) in counts.iter().zip(deltas) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
         }
     });
@@ -481,6 +496,10 @@ fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
     with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
         claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
         claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+        claude_telemetry_retired_roots: counts[2].swap(0, Relaxed),
+        claude_telemetry_retired_bytes: counts[3].swap(0, Relaxed),
+        claude_telemetry_held_roots: counts[4].swap(0, Relaxed),
+        claude_telemetry_read_fault: counts[5].swap(0, Relaxed),
     })
 }
 
@@ -516,22 +535,7 @@ impl ClaudeRecordCounters {
         }
     }
 }
-#[cfg(not(test))]
-static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = ClaudeRecordCounters::new();
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_RECORD_COUNTERS: ClaudeRecordCounters = const { ClaudeRecordCounters::new() };
-}
-fn with_claude_record_counters<T>(f: impl FnOnce(&ClaudeRecordCounters) -> T) -> T {
-    #[cfg(test)]
-    {
-        CLAUDE_RECORD_COUNTERS.with(f)
-    }
-    #[cfg(not(test))]
-    {
-        f(&CLAUDE_RECORD_COUNTERS)
-    }
-}
+process_static!(fn with_claude_record_counters: ClaudeRecordCounters = ClaudeRecordCounters::new());
 /// `file_alarm` is the size this parser once refused past: nothing is dropped
 /// above it, the counters only show how memory grows.
 pub(crate) fn claude_record_counts(
@@ -636,6 +640,8 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
+    /// A never-read file past the first-read bound.
+    FirstReadAge = 16,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
@@ -643,16 +649,14 @@ const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
 const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
-const UNSELECTED_REASONS: usize = change_reason::END;
-/// Claude, Codex, Pi x reason, drained by that source's page line.
-#[cfg(not(test))]
-static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
-    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
-#[cfg(test)]
-thread_local! {
-    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
-        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
-}
+const FILE_READ_START: usize = change_reason::END;
+const HOLD_WAKE_START: usize = FILE_READ_START + 3;
+const UNSELECTED_REASONS: usize = HOLD_WAKE_START + 2;
+process_static!(
+    /// Claude, Codex, Pi x reason, drained by that source's page line.
+    fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS]);
+/// The one per-source slot of every process-local diagnostic array here.
 fn source_slot(source: &str) -> Option<usize> {
     ["claude_code", "codex", "pi"]
         .iter()
@@ -662,14 +666,7 @@ fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) 
     let Some(slot) = source_slot(source) else {
         return 0;
     };
-    #[cfg(test)]
-    {
-        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
-    }
-    #[cfg(not(test))]
-    {
-        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
-    }
+    with_line_unselected(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
@@ -800,12 +797,7 @@ pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::R
     })
 }
 
-#[cfg(not(test))]
-static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-#[cfg(test)]
-thread_local! {
-    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = const { [const { AtomicU64::new(0) }; 4] };
-}
+process_static!(fn with_credential_file_cap_refused: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4]);
 /// Observe typed cap errors before snapshot callers replace their detail.
 /// Ordinary snapshot sync and retained retry use these same authority loads.
 pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
@@ -839,10 +831,7 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
                 .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
                 .map_or(u64::MAX, |n| n.saturating_add(1))
         };
-        #[cfg(not(test))]
-        let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
-        #[cfg(test)]
-        let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
+        let total = with_credential_file_cap_refused(increment);
         traversal_point(
             "credential_file_cap_refusal",
             "unknown",
@@ -1132,6 +1121,10 @@ impl Probe {
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             page_selection: BTreeMap<&'static str, u64>,
+            #[serde(flatten)]
+            file_reads: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            hold_wake: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let jsonl = jsonl::take(source);
@@ -1144,6 +1137,7 @@ impl Probe {
                 source,
                 &[
                     ("age", 0),
+                    ("first_read_age", 16),
                     ("size", 1),
                     ("withheld_oversized", 2),
                     ("withheld_absence_ambiguous", 18),
@@ -1168,6 +1162,14 @@ impl Probe {
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             page_selection: drain(source, &PAGE_SELECTION),
+            file_reads: drain(source, &FILE_READS),
+            hold_wake: drain(
+                source,
+                &[
+                    ("keys", HOLD_WAKE_START),
+                    ("oldest_expired_secs", HOLD_WAKE_START + 1),
+                ],
+            ),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
@@ -1201,7 +1203,7 @@ impl Probe {
             observation: self.observation(),
             counts,
         });
-        // Own record, so the page line stays under its size bound (§13).
+        // Own records, so the page line stays under its size bound (§13).
         if let Some(change_reasons) = change_reason::drain(source) {
             #[derive(Serialize)]
             struct Counts {
@@ -1217,7 +1219,6 @@ impl Probe {
             });
         }
         jsonl.emit_page_lines(source);
-        jsonl.alarm_on_consecutive_failures(source);
     }
 }
 
@@ -1376,11 +1377,43 @@ pub(crate) struct StageWindow {
     probe: Probe,
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
-    first_read_bytes: Option<u64>,
+    evidence_mem: Option<EvidenceMem>,
+}
+/// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
+/// at A (API evidence attached), B (root loop done) and C (cross-root finish
+/// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
+/// keeps, the largest root's rows with its keep bit, and legacy owners.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct EvidenceMem {
+    in_use_bytes: [Option<u64>; 3],
+    footprint_bytes: [Option<u64>; 2],
+    pub(crate) kept_rows: usize,
+    largest_root_rows: usize,
+    largest_root_kept: bool,
+    pub(crate) legacy_owners: usize,
+}
+crate::heap_layout_bound::no_heap!(true; EvidenceMem);
+impl EvidenceMem {
+    /// Checkpoint 0 = A, 1 = B, 2 = C.
+    pub(crate) fn sample(&mut self, at: usize) {
+        self.in_use_bytes[at] = footprint::malloc_in_use();
+        if let Some(slot) = self.footprint_bytes.get_mut(at) {
+            *slot = footprint::current().phys_footprint_bytes;
+        }
+    }
+    pub(crate) fn note_root(&mut self, rows: usize, kept: bool) {
+        if rows > self.largest_root_rows {
+            self.largest_root_rows = rows;
+            self.largest_root_kept = kept;
+        }
+    }
 }
 impl StageWindow {
     pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
         self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
+    }
+    pub(crate) fn set_evidence_mem(&mut self, mem: EvidenceMem) {
+        self.evidence_mem = Some(mem);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         Self {
@@ -1389,7 +1422,7 @@ impl StageWindow {
             probe: Probe::start(),
             footprint: footprint::Stage::begin(),
             jsonl: None,
-            first_read_bytes: None,
+            evidence_mem: None,
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1398,29 +1431,12 @@ impl StageWindow {
         window.jsonl = Some(jsonl::Scope::begin(source));
         window
     }
-    pub(crate) fn first_read(
-        source: crate::snapshots::SnapshotSource,
-        bytes: u64,
-        first: bool,
-    ) -> Option<Self> {
-        observe_file_size(source, bytes);
-        first.then(|| {
-            let mut window = Self::begin(source.api_slug(), "first_read");
-            window.first_read_bytes = Some(bytes);
-            window
-        })
-    }
 }
 impl Drop for StageWindow {
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
         }
-        let observation = self.probe.stage_observation(self.footprint.as_ref());
-        let first_read = self.first_read_bytes.map_or_else(|| serde_json::json!({}), |bytes| {
-            serde_json::json!({"file_bytes": bytes, "first_read_ms": observation.wall_elapsed_us / 1000,
-                "first_read_over_300s": observation.wall_elapsed_us > 300_000_000})
-        });
         #[derive(Serialize)]
         struct Counts {
             // Zero exposure is stored as None and stays off the record.
@@ -1428,40 +1444,74 @@ impl Drop for StageWindow {
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             jsonl: Option<jsonl::Counts>,
-            #[serde(flatten)]
-            first_read: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evidence_mem: Option<EvidenceMem>,
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation,
+            observation: self.probe.stage_observation(self.footprint.as_ref()),
             counts: Counts {
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
-                first_read,
+                evidence_mem: self.evidence_mem,
             },
         });
     }
 }
-/// Process high-water file sizes, without paths or read admission decisions.
+/// The page's largest listed or read file size, without paths or read
+/// admission decisions.
 pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LARGEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-    let slot = match source {
-        crate::snapshots::SnapshotSource::ClaudeCode => 0,
-        crate::snapshots::SnapshotSource::Codex => 1,
-        crate::snapshots::SnapshotSource::Pi => 2,
-    };
-    let previous = LARGEST[slot].fetch_max(bytes, Ordering::Relaxed);
-    if bytes > previous {
-        traversal_point(
-            "file_size",
-            source.api_slug(),
-            &serde_json::json!({"largest_file_bytes": bytes, "file_over_1gib": bytes > 1024 * 1024 * 1024}),
-        );
+    source_count(source.api_slug(), FILE_READ_START + 2, |n| {
+        n.fetch_max(bytes, Relaxed)
+    });
+}
+/// A file new to the index: its read time, counted on the page when the
+/// file finishes (unwinding counts nothing).
+pub(crate) struct FirstRead {
+    source: &'static str,
+    started: Instant,
+}
+crate::heap_layout_bound::no_heap!(true; FirstRead { source, started });
+impl FirstRead {
+    pub(crate) fn begin(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| Self {
+            source: source.api_slug(),
+            started: Instant::now(),
+        })
     }
+}
+impl Drop for FirstRead {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let ms = wall_us(self.started) / 1000;
+        source_count(self.source, FILE_READ_START, |n| n.fetch_add(1, Relaxed));
+        source_count(self.source, FILE_READ_START + 1, |n| {
+            n.fetch_max(ms, Relaxed)
+        });
+    }
+}
+const FILE_READS: [(&str, usize); 3] = [
+    ("first_read_files", FILE_READ_START),
+    ("first_read_max_ms", FILE_READ_START + 1),
+    ("largest_file_bytes", FILE_READ_START + 2),
+];
+/// Expired growth claims that selection woke this page: keys woken and the
+/// oldest expiry. Counted after selection; never a gate.
+pub(crate) fn hold_wake(source: &str, keys: u64, oldest_expired_secs: u64) {
+    source_count(source, HOLD_WAKE_START, |n| n.fetch_add(keys, Relaxed));
+    source_count(source, HOLD_WAKE_START + 1, |n| {
+        n.fetch_max(oldest_expired_secs, Relaxed)
+    });
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
@@ -1708,97 +1758,6 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
-static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 6] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// One `claude_census_retire_kept_overlap` row (stopgap): a complete
-/// terminal's kept records, their hashes and those retired because the
-/// census was above 90% occupancy, with the terminal's census-full tombstone
-/// count; or the records an insert retired so it fits (admission overflow,
-/// no terminal count); or a new key refused at the live record bound.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CensusRetireKeptOverlapCounts {
-    pub(crate) records: u64,
-    pub(crate) hashes: u64,
-    pub(crate) overflow_occupancy: u64,
-    pub(crate) overflow_admission: u64,
-    /// New keys refused at the live census record bound.
-    pub(crate) record_limit_refused: u64,
-    /// The terminal's shadow `missing_over_budget`; None on admission rows.
-    pub(crate) missing_over_budget: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct CensusRetireKeptOverlap {
-    census_retire_kept_overlap_records: u64,
-    census_retire_kept_overlap_hashes: u64,
-    census_retire_kept_overflow: u64,
-    census_retire_kept_overflow_occupancy: u64,
-    census_retire_kept_overflow_admission: u64,
-    census_record_limit_refused: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    census_missing_over_budget: Option<u64>,
-    census_retire_kept_overlap_records_total: u64,
-    census_retire_kept_overlap_hashes_total: u64,
-    census_retire_kept_overflow_total: u64,
-    census_retire_kept_overflow_occupancy_total: u64,
-    census_retire_kept_overflow_admission_total: u64,
-    census_record_limit_refused_total: u64,
-}
-
-/// Local counter (stopgap): aged Claude transcript census records kept
-/// because they share a request id with another unretired record, and those
-/// retired anyway: above 90% census occupancy at a terminal, or so an insert
-/// fits. `census_retire_kept_overflow` counts both reasons, `_occupancy`
-/// and `_admission` each one. `census_record_limit_refused` counts new keys
-/// refused at the live record bound. The row's counts and saturating process totals; a positive
-/// overflow or refusal (each loses money proof) also emits
-/// `claude_census_retire_kept_overlap_alarm`. Counts only; no path, id or
-/// wire event.
-pub(crate) fn claude_census_retire_kept_overlap(counts: CensusRetireKeptOverlapCounts) {
-    let add = |slot: usize, count: u64| {
-        CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |total| Some(total.saturating_add(count)),
-            )
-            .unwrap_or(u64::MAX)
-            .saturating_add(count)
-    };
-    let overflow = counts
-        .overflow_occupancy
-        .saturating_add(counts.overflow_admission);
-    let row = CensusRetireKeptOverlap {
-        census_retire_kept_overlap_records: counts.records,
-        census_retire_kept_overlap_hashes: counts.hashes,
-        census_retire_kept_overflow: overflow,
-        census_retire_kept_overflow_occupancy: counts.overflow_occupancy,
-        census_retire_kept_overflow_admission: counts.overflow_admission,
-        census_record_limit_refused: counts.record_limit_refused,
-        census_missing_over_budget: counts.missing_over_budget,
-        census_retire_kept_overlap_records_total: add(0, counts.records),
-        census_retire_kept_overlap_hashes_total: add(1, counts.hashes),
-        census_retire_kept_overflow_total: add(2, overflow),
-        census_retire_kept_overflow_occupancy_total: add(3, counts.overflow_occupancy),
-        census_retire_kept_overflow_admission_total: add(4, counts.overflow_admission),
-        census_record_limit_refused_total: add(5, counts.record_limit_refused),
-    };
-    traversal_point("claude_census_retire_kept_overlap", "claude_code", &row);
-    if overflow > 0 || counts.record_limit_refused > 0 {
-        traversal_point(
-            "claude_census_retire_kept_overlap_alarm",
-            "claude_code",
-            &row,
-        );
-    }
-}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts, once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
@@ -1819,10 +1778,6 @@ pub(crate) fn claude_state_v2(counts: &impl Serialize) {
 /// wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
-}
-/// At most once per 24 h while reconstructions after a head persist.
-pub(crate) fn tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
-    traversal_point("tail_restart_full_alarm", source, counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
@@ -1847,6 +1802,13 @@ pub fn log_startup_resources() {
                 .and_then(|value| value.parse::<u64>().ok()),
         }),
     );
+    // The shutdown row is process-wide; a captured unit test only checks startup.
+    #[cfg(test)]
+    if TEST_OUTPUT.with(|output| output.borrow().is_some()) {
+        return;
+    }
+    #[cfg(unix)]
+    shutdown::install();
 }
 
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
@@ -2341,6 +2303,99 @@ mod tests {
         assert!(value.is_null() || value.is_u64());
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "private subprocess shutdown fixture"]
+    fn shutdown_record_fixture() {
+        if std::env::var_os("OTTTO_SHUTDOWN_FIXTURE").is_none() {
+            return;
+        }
+        super::log_startup_resources();
+        println!("shutdown-fixture-ready");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    /// [behaviour] Startup diagnostics install the shutdown row: SIGTERM
+    /// writes exactly one, and the process still dies by SIGTERM.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_writes_one_shutdown_row() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        let now_ms = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_resource_diagnostics::tests::shutdown_record_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OTTTO_SHUTDOWN_FIXTURE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let before = now_ms();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("shutdown-fixture-ready") {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "fixture ended early"
+            );
+        }
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let status = child.wait().unwrap();
+        let after = now_ms();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("local_resources ") && line.contains("\"shutdown\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        // The handler's fixed stack buffer holds the whole row with room for
+        // longer process ids and timestamps.
+        assert!(
+            lines[0].len() < super::shutdown::LINE_BUFFER / 2,
+            "{}",
+            lines[0]
+        );
+        let (_, json) = lines[0]
+            .split_once("ottto-service: local_resources ")
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(row["stage"], "shutdown");
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], child.id());
+        assert_eq!(row["source"], "unknown");
+        assert_eq!(row["counts"], serde_json::json!({}));
+        let observed = row["observation"]["observed_unix_ms"].as_u64().unwrap();
+        assert!(
+            (before..=after).contains(&observed),
+            "{before} {observed} {after}"
+        );
+    }
+
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
@@ -2415,6 +2470,7 @@ mod tests {
         let maximum = serde_json::to_value(ClaudeSidecarReparse {
             claude_sidecar_reparse_files: u64::MAX,
             claude_sidecar_reparse_bytes: u64::MAX,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
@@ -2466,7 +2522,7 @@ mod tests {
     #[test]
     fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
         use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
-        CREDENTIAL_FILE_CAP_REFUSED.with(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        with_credential_file_cap_refused(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
         let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
         std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
         let store = FileDeviceStore::new(&path);
@@ -3675,9 +3731,6 @@ pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
         "claude_code",
         &serde_json::json!({"consecutive_passes": passes}),
     );
-}
-pub(crate) fn census_retire_skipped_grown() {
-    claude_state_v2(&serde_json::json!({"census_retire_skipped_grown": 1}));
 }
 
 /// Current process memory, not lifetime ru_maxrss. Unavailable is never zero.

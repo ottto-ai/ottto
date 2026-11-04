@@ -7,6 +7,7 @@
 //! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
 //! memory to derive content-free observations.
 
+use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
 use crate::locked_state_dir::FileLock;
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
@@ -1796,6 +1797,7 @@ pub trait CloudSessionTransport {
     /// Perform one bounded authenticated grant-list lookup and return the
     /// exact bound grant. Implementations must fail closed on any network,
     /// authentication, parsing, ambiguity, or absence error.
+    #[cfg(test)]
     fn revalidate_grant(
         &self,
         _grant: &CloudSessionGrant,
@@ -2013,13 +2015,6 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
 
     fn supports_grant_revalidation(&self) -> bool {
         self.is_configured()
-    }
-
-    fn revalidate_grant(
-        &self,
-        grant: &CloudSessionGrant,
-    ) -> Result<CloudSessionBackendGrantResponseV1> {
-        self.revalidate_grant_bounded(grant, CYCLE_BUDGET)
     }
 
     fn revalidate_grant_bounded(
@@ -3776,15 +3771,6 @@ fn validate_backend_grant_response(
     Ok(())
 }
 
-fn is_uuid(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
 fn grant_preflight_eligible(store: &CloudSessionGrantStore) -> bool {
     store
         .load()
@@ -4024,16 +4010,6 @@ fn random_scan_id() -> Result<String> {
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
         bytes[15]
     ))
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-fn decode_hex(raw: &str) -> Option<Vec<u8>> {
-    (raw.len() % 2 == 0).then_some(())?;
-    (0..raw.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&raw[index..index + 2], 16).ok())
-        .collect()
 }
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path

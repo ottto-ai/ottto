@@ -5,7 +5,7 @@ MANIFEST=""
 SUBJECT_CHECKSUMS=""
 REPOSITORY="${OTTTO_RELEASE_REPOSITORY:-ottto-ai/ottto}"
 SIGNER_WORKFLOW="${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/macos-stable-release.yml}"
-SOURCE_REF="${OTTTO_RELEASE_SOURCE_REF:-refs/heads/main}"
+SOURCE_REF="${OTTTO_RELEASE_SOURCE_REF:-}"
 SOURCE_DIGEST="${OTTTO_RELEASE_SOURCE_DIGEST:-}"
 SLSA_ATTESTATION_URL=""
 SBOM_ATTESTATION_URL=""
@@ -22,7 +22,7 @@ both SLSA provenance and CycloneDX SBOM attestations.
 Options:
   --repo <owner/repo>              Expected GitHub repository. Default: ottto-ai/ottto
   --signer-workflow <path>         Expected signer workflow path.
-  --source-ref <ref>               Expected source git ref. Default: refs/heads/main
+  --source-ref <ref>               Expected source git ref (required). Default: OTTTO_RELEASE_SOURCE_REF
   --source-digest <sha>            Expected source commit digest. Default: manifest commit
   --slsa-attestation-url <url>     Optional URL recorded on supply_chain.slsa_build.
   --sbom-attestation-url <url>     Optional URL recorded on supply_chain.sbom.
@@ -107,6 +107,10 @@ if [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
 fi
 if [[ "$SIGNER_WORKFLOW" != .github/workflows/*.yml && "$SIGNER_WORKFLOW" != .github/workflows/*.yaml ]]; then
   echo "Signer workflow must be a GitHub workflow path: $SIGNER_WORKFLOW" >&2
+  exit 2
+fi
+if [[ -z "$SOURCE_REF" ]]; then
+  echo "Source ref is required: set OTTTO_RELEASE_SOURCE_REF or pass --source-ref" >&2
   exit 2
 fi
 if [[ "$SOURCE_REF" != refs/* ]]; then

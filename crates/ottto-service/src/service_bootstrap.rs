@@ -84,10 +84,18 @@ fn install_with(
     if !migrate_owner && state.owner_drift {
         return Err(macos_service::owner_conflict_error(&state));
     }
+    // Same program and same plist bytes: the loaded job needs a new process,
+    // not a new definition.
+    let plist_unchanged = state.loaded_executable_path.as_deref()
+        == Some(config.executable_path.as_path())
+        && std::fs::read(plist).is_ok_and(|current| {
+            macos_service::render_launch_agent_plist(config)
+                .is_ok_and(|rendered| rendered == current)
+        });
     let plan = macos_service::write_launch_agent(config, plist)
         .map_err(macos_service::LaunchAgentLifecycleFailure)?;
     if execute {
-        for args in super::service_bootstrap_commands(&plan, state.loaded) {
+        for args in super::service_bootstrap_commands(&plan, state.loaded, plist_unchanged) {
             mutate(&args)
                 .with_context(|| {
                     format!(

@@ -760,10 +760,6 @@ pub struct ActivityHintResponse {
     /// so older servers never receive the field.
     #[serde(default)]
     pub session_request_account_source_contract: Option<String>,
-    /// Server capability for `transcript_recorded_login` and its witness. Anything
-    /// but the exact token computes no tag and sends no new byte.
-    #[serde(default)]
-    pub session_request_sole_login_witness_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
     #[serde(skip)]
     pub max_snapshot_item_bytes: Option<u64>,
@@ -2925,7 +2921,7 @@ impl SnapshotApiClient {
         grant_version: u64,
         timeout: Duration,
     ) -> Result<Value> {
-        if !valid_cloud_grant_id(grant_id) || grant_version == 0 {
+        if !crate::hex::is_uuid(grant_id) || grant_version == 0 {
             return Err(anyhow!("cloud-session authority identity is invalid"));
         }
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
@@ -3014,7 +3010,7 @@ impl SnapshotApiClient {
         operation: &'static str,
         timeout: Duration,
     ) -> Result<Value> {
-        if !valid_cloud_scan_id(scan_id)
+        if !crate::hex::is_uuid(scan_id)
             || request.get("scan_id").and_then(Value::as_str) != Some(scan_id)
         {
             return Err(anyhow!(
@@ -3222,19 +3218,6 @@ fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
         "pi" => ottto_protocol::SourceKind::Pi,
         _ => ottto_protocol::SourceKind::Codex,
     }
-}
-
-fn valid_cloud_scan_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
-fn valid_cloud_grant_id(value: &str) -> bool {
-    valid_cloud_scan_id(value)
 }
 
 fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {
@@ -5336,7 +5319,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; session_request_sole_login_witness_contract, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

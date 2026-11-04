@@ -789,6 +789,34 @@ struct UploadIndexSettlement {
 #[cfg(test)]
 pub(crate) mod withheld_support {
     use super::*;
+    /// A re-paired destination's Claude prior history, read as its first cycle
+    /// reads it: before any upload ledger record.
+    pub(crate) fn claude_prior_history_for_new_destination(
+        support_dir: &Path,
+        destination_namespace: &str,
+    ) -> crate::snapshots::PriorHistory {
+        let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
+        let scoped = snapshot_destination_scoped_index_path(&stable, destination_namespace);
+        claude_prior_history(
+            &load_backfill_state(support_dir),
+            destination_namespace,
+            &SnapshotUploadProgress::new(
+                destination_namespace.to_string(),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            ),
+            &snapshot_v3_index_path(&scoped),
+            support_dir,
+        )
+    }
+
+    pub(crate) fn source_erasure_failures_for_test(
+        support_dir: &Path,
+        source: SnapshotSource,
+    ) -> u32 {
+        let marker = source_marker_path(support_dir, source);
+        source_erasure_turn().get(&marker).copied().unwrap_or(0)
+    }
+
     pub(crate) fn settle_withheld(
         previous: &ScanIndex,
         mut index: ScanIndex,
@@ -1466,7 +1494,7 @@ fn cache_head_index_key(index_key: &str) -> String {
     )
 }
 
-fn cache_session_key(session: &str) -> String {
+pub(crate) fn cache_session_key(session: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(session.as_bytes()))
 }
@@ -4483,8 +4511,7 @@ impl PermanentRefusalCounts {
 
 /// Last retained-refusal log line per source. A quiet cycle that re-discloses
 /// the same list does not log it again.
-static SOURCE_REFUSAL_LOGS: OnceLock<Mutex<BTreeMap<&'static str, RefusalLogLine>>> =
-    OnceLock::new();
+static SOURCE_REFUSAL_LOGS: Mutex<[Option<RefusalLogLine>; 3]> = Mutex::new([None, None, None]);
 
 /// Retained refusal counts, the authority-downgrade share of the dominated
 /// ones, and whether they were reported as settled residue.
@@ -4501,14 +4528,9 @@ fn log_retained_permanent_refusals(
     settled_residue: bool,
 ) {
     let line = (retained, authority_downgrades, settled_residue);
-    let previous = SOURCE_REFUSAL_LOGS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()
-        .and_then(|mut logged| logged.insert(source.api_slug(), line));
-    if previous == Some(line) {
+    let Some(previous) = rejection_log::changed(&SOURCE_REFUSAL_LOGS, source, line) else {
         return;
-    }
+    };
     if previous.is_some_and(|p| retained.exposure.owed_entities > p.0.exposure.owed_entities) {
         eprintln!("ottto-service: refusal exposure alarm source={} reason=accepted_log_stale_older_upload owed_entities={} oldest_age_seconds={}", source.api_slug(), retained.exposure.owed_entities, retained.exposure.oldest_age_seconds);
     }
@@ -5061,8 +5083,8 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Before credentials: a removed source erases even with no live device.
-    erase_disabled_sources(support_dir, &daemon.transcript_cache);
+    // Before credentials: a re-enabled source resumes even with no live device.
+    resume_reconnected_sources(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5872,10 +5894,19 @@ fn upload_local_health_projection_with(
 
 pub(crate) fn agent_status_source_enabled(source: &SourceKind) -> bool {
     load_snapshot_device_credentials().is_ok_and(|(device, _)| {
-        enabled_snapshot_sources(&device)
-            .into_iter()
-            .any(|item| &source_kind(item) == source)
+        agent_status_source_enabled_in(&device, &default_support_dir(), source)
     })
+}
+
+/// Granted and not paused: the source's automatic status passes run.
+pub(crate) fn agent_status_source_enabled_in(
+    device: &LocalDeviceBinding,
+    support_dir: &Path,
+    source: &SourceKind,
+) -> bool {
+    enabled_snapshot_sources_in(device, support_dir)
+        .into_iter()
+        .any(|item| &source_kind(item) == source)
 }
 
 pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Result<usize> {
@@ -6457,7 +6488,7 @@ fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace:
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
 /// namespace (pure; a continuation page must use the same bytes, K5).
-fn cycle_sampled_scope(
+pub(crate) fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,
@@ -6762,26 +6793,13 @@ fn prepare_sync_source_inner(
         encoded_key.zeroize();
     }
     if source == SnapshotSource::ClaudeCode {
-        // No capability or no key: no address digest, so no verdict.
-        let sole_login = activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
-        let key = attribution_context
-            .as_ref()
-            .filter(|_| sole_login)
-            .map(SessionAttributionContext::accepted_fingerprint_key);
-        // A key or capability change only scrubs what retained parses compare
-        // under the old key: every parse, cursor and count stays, so a server
-        // hint never causes a re-read.
-        let address = crate::claude_status_coverage::bind_address_key(key);
-        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
+        // A key change only scrubs what retained parses compare under the old
+        // key: every parse, cursor and count stays, so a server hint never
+        // causes a re-read.
+        if crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        );
-        if context || address {
-            daemon
-                .transcript_cache
-                .scrub_retained_identity(context, address);
+        ) {
+            daemon.transcript_cache.scrub_retained_context_digests();
         }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
@@ -7706,6 +7724,11 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Telemetry retention keeps the sessions this page names, read before any
+    // page filter drops a snapshot.
+    let telemetry_named = claude_scan_roots
+        .as_ref()
+        .map(|_| claude_evidence_session_ids(&scan_result.snapshots));
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
@@ -7734,21 +7757,6 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
-    if source == SnapshotSource::ClaudeCode {
-        let sole_login = activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
-        upload_progress
-            .accepted_identity_buckets
-            .set_sole_login_enabled(sole_login);
-        crate::snapshots::claude_folder_login::begin_page(
-            &mut index,
-            &committed_index,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            sole_login,
-        );
-    }
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -7991,7 +7999,6 @@ fn finish_sync_source(
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
-        upload_policy,
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
     )
@@ -8652,6 +8659,9 @@ fn finish_sync_source(
                 }
             }
         };
+    // Telemetry retention follows only a completed upload: a rejected,
+    // deferred, shed, disabled or failed page drops it even when it settles.
+    let upload_completed = matches!(upload_result, Ok(ResumableUploadResult::Completed));
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -9010,6 +9020,9 @@ fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
+        crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
+    });
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
@@ -9065,6 +9078,20 @@ fn finish_sync_source(
         &mut index,
         &index_path,
     );
+    if let Some(((roots, removed), named)) = claude_scan_roots
+        .as_deref()
+        .zip(telemetry_removed.as_ref())
+        .zip(telemetry_named.as_deref())
+        .filter(|_| upload_completed && upload_fully_settled)
+    {
+        crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
+            support_dir,
+            &index,
+            roots,
+            removed,
+            named,
+        );
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
@@ -9381,7 +9408,8 @@ fn prepare_upload_progress_for_cycle(
     )
 }
 
-/// Ordinary and continuation prepares bind both runtime witnesses together.
+/// Ordinary and continuation prepares bind both runtime witnesses together,
+/// and mirror the open head-CAS challenge sessions into the index.
 /// Neither retained body ACKs nor receipt candidates acquire new authority here.
 fn activate_source_upload_context(
     source: SnapshotSource,
@@ -9393,6 +9421,10 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
+    // A session that owes a head-CAS answer reads natively, never from Tail.
+    index.activate_head_conflict_sessions(
+        progress.head_conflict_challenges.keys().cloned().collect(),
+    );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
@@ -10054,8 +10086,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         "claude_code",
         "claude_local_evidence",
     );
-    let read_window =
+    let mut read_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
+    let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -10083,6 +10116,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    evidence_mem.sample(0);
     #[cfg(test)]
     E2_AFTER_API_ATTACH.with(|hook| {
         if let Some(after_attach) = hook.borrow_mut().take() {
@@ -10312,6 +10346,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        evidence_mem.note_root(
+            api_rows.as_ref().map_or(0, Vec::len) + trace_rows.as_ref().map_or(0, Vec::len),
+            keep,
+        );
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
         }
@@ -10328,9 +10366,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
+    evidence_mem.kept_rows = api_report.evidence.values().map(Vec::len).sum::<usize>()
+        + trace_report.evidence.values().map(Vec::len).sum::<usize>();
+    evidence_mem.legacy_owners = cross.legacy_request_owners.owner_count();
+    evidence_mem.sample(1);
     cross_window.time(|| cross.finish());
     drop(decode_window);
     drop(cross_window);
+    evidence_mem.sample(2);
+    read_window.set_evidence_mem(evidence_mem);
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
@@ -10365,24 +10409,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
-    if let Some(accepted) =
-        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
-    {
-        let census_clean =
-            scan_result.census_complete && scan_result.census_residue_index_key_count == 0;
-        crate::snapshots::claude_folder_login::note_page(
-            index,
-            &scan_result.snapshots,
-            &api_report,
-            census_clean,
-        );
-        crate::snapshots::claude_folder_login::stamp_page(
-            &mut scan_result.snapshots,
-            index,
-            &api_report,
-            accepted,
-        );
-    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -12540,8 +12566,25 @@ fn report_status_with_fresh_relay_token(
         );
     }
     client.report_status(&relay_token, &request)?;
+    // Content-free, after a successful send: the closed error-code slug and
+    // enabled flag, once per change per source (and once after start).
+    let line = (request.enabled, request.last_error_code);
+    if rejection_log::changed(&SOURCE_STATUS_LOGS, source, line.clone()).is_some() {
+        let code = line.1.as_deref().unwrap_or("none");
+        eprintln!(
+            "ottto-service: collector status source={} enabled={} code={code}",
+            source.api_slug(),
+            line.0
+        );
+    }
     Ok(())
 }
+
+/// Last reported status log line per source slot.
+static SOURCE_STATUS_LOGS: Mutex<[Option<StatusLogLine>; 3]> = Mutex::new([None, None, None]);
+
+/// Enabled flag and closed error-code slug of one terminal status report.
+type StatusLogLine = (bool, Option<String>);
 
 /// A policy stop before scanning: withdraw this source's manifest, clear its
 /// active sessions, then report `status` with the manifest withdrawn.
@@ -12819,8 +12862,9 @@ fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
     device.sources.iter().any(|slug| slug == source.api_slug())
 }
 
-/// Consecutive failures per marker. Held across each erase turn, so a concurrent
-/// control-thread marker change cannot be overwritten by that turn's completion.
+/// Consecutive resume failures per marker. Held across each resume turn, so a
+/// concurrent control-thread marker change cannot be overwritten by that
+/// turn's completion.
 static SOURCE_ERASURE_TURN: Mutex<BTreeMap<PathBuf, u32>> = Mutex::new(BTreeMap::new());
 
 fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32>> {
@@ -12829,13 +12873,14 @@ fn source_erasure_turn() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32
         .unwrap_or_else(|p| p.into_inner())
 }
 
-/// Outside every erased file set: `pending`, `done` or `reconnect`.
+/// Any content but `reconnect` means paused (`pending`; `done` from older
+/// builds). Nothing local is erased while a source is off.
 fn source_marker_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     snapshot_index_path(support_dir, source)
         .with_file_name(format!("{}.source-disabled", source.api_slug()))
 }
 
-/// `None` only when clearly absent. An unreadable marker stays pending.
+/// `None` only when clearly absent. An unreadable marker stays paused.
 pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Option<String> {
     match std::fs::read_to_string(source_marker_path(support_dir, source)) {
         Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -12848,13 +12893,13 @@ fn write_source_marker(path: &Path, state: &str) -> Result<()> {
     sync_progress_parent(path)
 }
 
-/// Stops collection now; the next sync cycle erases. Never erases on this thread.
+/// Stops collection now and keeps every local file.
 pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let _turn = source_erasure_turn();
     write_source_marker(&source_marker_path(support_dir, source), "pending")
 }
 
-/// The explicit way back. A source that was never removed has nothing to erase.
+/// The explicit way back. A source that was never paused has nothing to resume.
 pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
     let _turn = source_erasure_turn();
     match source_marker(support_dir, source) {
@@ -12863,7 +12908,7 @@ pub(crate) fn reconnect_snapshot_source(support_dir: &Path, source: SnapshotSour
     }
 }
 
-/// A credential generation that drops a source removes it like an explicit disable.
+/// A credential generation that drops a source pauses it like an explicit disable.
 pub(crate) fn disable_sources_dropped_from_grant(
     support_dir: &Path,
     current: &LocalDeviceBinding,
@@ -12875,212 +12920,58 @@ pub(crate) fn disable_sources_dropped_from_grant(
         .try_for_each(|source| disable_snapshot_source(support_dir, source))
 }
 
-/// One attempt per owed source, under the cycle lock. Errors can name paths, so
-/// only counts are logged.
-pub(crate) fn erase_disabled_sources(
-    support_dir: &Path,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
-) {
-    erase_owed_login_addresses(support_dir, cache);
+/// One attempt per re-enabled source, under the cycle lock. The kept index,
+/// Tail rows and backfill progress make its next pass a warm Tail. Its upload
+/// witnesses go first and are synced, so what the server erased at source-off
+/// is sent again at each loop's own cadence; then the marker goes. A failure
+/// keeps the source paused for the next cycle. Errors can name paths, so only
+/// counts are logged.
+pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
-        let state = source_marker(support_dir, source);
-        if matches!(state.as_deref(), None | Some("done")) {
+        if source_marker(support_dir, source).as_deref() != Some("reconnect") {
             continue;
         }
-        // Transcript readers close before the first unlink.
-        if source == SnapshotSource::Codex {
-            cache.forget_codex_jobs();
-        }
-        if source == SnapshotSource::ClaudeCode {
-            crate::claude_status_coverage::forget_addresses();
-            cache.forget_retained_transcripts();
-        }
         let marker = source_marker_path(support_dir, source);
-        let erased = erase_source_files(support_dir, source, || {
-            cache.quiet_forget_source(source);
-            // Reconnect is this source's first bootstrap again: a full replay.
-            update_backfill_state(support_dir, |backfill| {
-                let slug = source.api_slug();
-                backfill.completed_parser_versions.remove(slug);
-                backfill.completed_replay_revisions.remove(slug);
-                backfill.completed_destination_namespaces.remove(slug);
-            })?;
-            if state.as_deref() == Some("reconnect") {
-                std::fs::remove_file(&marker)?;
-                sync_progress_parent(&marker)
-            } else {
-                write_source_marker(&marker, "done")
-            }
+        let resumed = drop_upload_witnesses(support_dir, source).and_then(|()| {
+            std::fs::remove_file(&marker)?;
+            sync_progress_parent(&marker)
         });
         let failures = turn.entry(marker).or_default();
-        *failures = if erased.is_ok() { 0 } else { *failures + 1 };
+        *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
 }
 
-#[cfg(test)]
-pub(crate) fn source_erasure_failures_for_test(support_dir: &Path, source: SnapshotSource) -> u32 {
-    let marker = source_marker_path(support_dir, source);
-    source_erasure_turn().get(&marker).copied().unwrap_or(0)
-}
-
-/// `Some(consecutive failures)` while a login-address erase is owed.
-#[cfg(test)]
-pub(crate) fn login_address_erase_owed_for_test(support_dir: &Path) -> Option<u32> {
-    let marker = login_address_erase_marker(support_dir);
-    marker
-        .exists()
-        .then(|| source_erasure_turn().get(&marker).copied().unwrap_or(0))
-}
-
-fn login_address_erase_marker(support_dir: &Path) -> PathBuf {
-    snapshot_index_path(support_dir, SnapshotSource::ClaudeCode)
-        .with_file_name("claude-login-addresses.erase-owed")
-}
-
-/// Account removal: the next sync cycle erases what is kept of recorded login
-/// addresses, under the cycle lock and even with no live device.
-pub(crate) fn owe_login_address_erase(support_dir: &Path) -> Result<()> {
-    let marker = login_address_erase_marker(support_dir);
-    if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _turn = source_erasure_turn();
-    write_source_marker(&marker, "pending")
-}
-
-/// One attempt per owed erase. Only retained parses and Claude's Tail rows (a
-/// head's org markers) hold an address digest: the folder ledger holds none,
-/// and the rest of the index stays so the account's history is not replayed.
-/// The marker clears only once every route's erase succeeded.
-fn erase_owed_login_addresses(
-    support_dir: &Path,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
-) {
-    let marker = login_address_erase_marker(support_dir);
-    let mut turn = source_erasure_turn();
-    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == ErrorKind::NotFound)
-    {
-        return;
-    }
-    crate::claude_status_coverage::forget_addresses();
-    cache.forget_retained_transcripts();
-    let erased = erase_claude_tail_rows(support_dir).and_then(|()| {
-        std::fs::remove_file(&marker)?;
-        sync_progress_parent(&marker)
-    });
-    let failures = turn.entry(marker).or_default();
-    *failures = if erased.is_ok() { 0 } else { *failures + 1 };
-    if *failures > 3 {
-        crate::snapshots::state_v2::source_erasure_alarm(*failures);
-    }
-}
-
-/// Every Claude store's Tail rows, stable and in each destination namespace,
-/// and any retired restart-record directory beside them. Every route is tried;
-/// the first error is returned.
-fn erase_claude_tail_rows(support_dir: &Path) -> Result<()> {
-    let stable = snapshot_index_path(support_dir, SnapshotSource::ClaudeCode);
-    let family = stable.file_stem().and_then(|stem| stem.to_str());
-    let family = family.context("source_erasure_family")?;
-    let mut parents: Vec<PathBuf> = stable.parent().map(Path::to_path_buf).into_iter().collect();
-    match std::fs::read_dir(support_dir.join("snapshots/destinations")) {
-        Ok(namespaces) => {
-            for namespace in namespaces {
-                let namespace = namespace?.file_name();
-                let scoped =
-                    snapshot_destination_scoped_index_path(&stable, &namespace.to_string_lossy());
-                parents.extend(scoped.parent().map(Path::to_path_buf));
-            }
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let mut failed = None;
-    for parent in parents {
-        let entries = match std::fs::read_dir(&parent) {
-            Ok(entries) => entries,
+/// Every per-destination upload witness of `source`, each folder synced: its
+/// composition scope ACKs, its MCP inventory upload time (identity and version
+/// seed stay) and its footprint witnesses. No collected state is touched.
+fn drop_upload_witnesses(support_dir: &Path, source: SnapshotSource) -> Result<()> {
+    crate::context_composition::drop_upload_acks(support_dir, source)?;
+    crate::mcp_inventory::invalidate_upload_witness(support_dir, source)?;
+    let footprint = crate::snapshots::durable_sources::DurableSource::from_snapshot(source)
+        .map_or(&[][..], |row| row.properties().footprint_witnesses);
+    for dir in footprint {
+        let dir = support_dir.join(dir);
+        let entries = match std::fs::read_dir(&dir) {
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            entries => entries?,
         };
-        let mut stores = Vec::new();
+        // Opt-out markers beside them have no extension.
         for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with(family) {
-                continue;
-            }
-            if let Some(index) = name.strip_suffix(".v2.sqlite") {
-                stores.push(parent.join(index));
-            } else if name.ends_with(".durable-tail") {
-                crate::snapshots::state_v2::remove_retired_record_dir(&entry.path())?;
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                std::fs::remove_file(&path)?;
             }
         }
-        for index in stores {
-            if let Err(error) = crate::snapshots::state_v2::erase_tail_rows(&index) {
-                failed.get_or_insert(error);
-            }
-        }
-        sync_progress_parent(&parent.join("erased"))?;
-    }
-    failed.map_or(Ok(()), Err)
-}
-
-/// A source's caches outside `snapshots`, with their temp copies.
-fn source_cache_files(support_dir: &Path, source: SnapshotSource) -> Vec<PathBuf> {
-    [
-        crate::active_sessions::active_session_cache_path(support_dir, source),
-        detected_uses_cache_path(support_dir, source),
-        crate::mcp_inventory::cache_path(support_dir, source),
-    ]
-    .into_iter()
-    .flat_map(|path| [path.with_extension("json.tmp"), path])
-    .collect()
-}
-
-/// Forget: every source's caches. The opt-out markers beside them stay.
-pub(crate) fn erase_all_source_caches(support_dir: &Path) -> std::io::Result<()> {
-    for path in SNAPSHOT_SOURCES
-        .into_iter()
-        .flat_map(|source| source_cache_files(support_dir, source))
-    {
-        match std::fs::remove_file(path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
+        crate::context_composition::sync_dir(&dir)?;
     }
     Ok(())
-}
-
-fn erase_source_files(
-    support_dir: &Path,
-    source: SnapshotSource,
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    crate::context_composition::erase_source_state(support_dir, source)?;
-    let others = source_cache_files(support_dir, source);
-    let stable = snapshot_index_path(support_dir, source);
-    let destinations = support_dir.join("snapshots/destinations");
-    // Every parent exists, so an fsync of it fails only on a real I/O error.
-    for dir in others.iter().filter_map(|path| path.parent()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::create_dir_all(&destinations)?;
-    let mut indexes = vec![snapshot_v3_index_path(&stable)];
-    for namespace in std::fs::read_dir(&destinations)? {
-        let namespace = namespace?.file_name();
-        let namespace = namespace.to_string_lossy();
-        withdraw_source_manifest(&namespace, source);
-        let scoped = snapshot_destination_scoped_index_path(&stable, &namespace);
-        indexes.push(snapshot_v3_index_path(&scoped));
-    }
-    let family = stable.file_stem().and_then(|stem| stem.to_str());
-    let family = family.context("source_erasure_family")?;
-    crate::snapshots::state_v2::erase_source(&indexes, family, &others, complete)
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {
@@ -14824,7 +14715,12 @@ mod tests {
         assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 0);
         // Missing authority remains explicitly pending; the file stays owed
         // under the new context until its exact ACK.
-        assert_eq!(loaded.upload_context_owed_file_count(), 1);
+        assert_eq!(
+            crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
+                &loaded
+            ),
+            1
+        );
         // Existing exact ordinary CAS transport supplies the actual prerequisite;
         // the marker itself neither schedules this probe nor invents head authority.
         bootstrap_cache_heads(
@@ -19607,10 +19503,10 @@ mod tests {
         );
         assert_eq!(
             safe_error(
-                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
+                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveFull)
                     .context("scan local snapshots /synthetic/private/path")
             ),
-            "local state store held: state_v2_save_ceiling"
+            "local state store held: state_v2_sqlite_full"
         );
         assert_eq!(
             safe_error(&SourcesFailed(vec!["claude_code", "codex"]).into()),
@@ -22504,7 +22400,8 @@ mod tests {
             ),
         )
         .expect("write old replay fixture");
-        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+        // Older than the policy window, inside the first-read bound.
+        let old_mtime = OffsetDateTime::parse("2026-07-16T12:00:00Z", &Rfc3339)
             .expect("old fixture mtime")
             .unix_timestamp() as u64;
         std::fs::OpenOptions::new()
@@ -22524,7 +22421,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut policy_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, false),
+            scan_request_window_days(30, false),
         )
         .expect("policy-width scan");
         assert_eq!(policy_scan.discovered_file_count, 0);
@@ -22536,7 +22433,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut replay_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, true),
+            scan_request_window_days(30, true),
         )
         .expect("wide replay scan");
         assert_eq!(replay_scan.backfill_window_days, 730);
@@ -23202,6 +23099,10 @@ mod tests {
         #[cfg(unix)]
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
+        }
+        #[cfg(unix)]
+        mod claude_telemetry_retention_tests {
+            include!("snapshot_sync/claude_telemetry_retention_tests.rs");
         }
     }
     mod p12_pipeline_original_tests {
@@ -24274,7 +24175,9 @@ mod tests {
                 let recovery = f.progress.ack_recovery.take();
                 // Every restart below reloads this exact saved ledger.
                 let saved = std::fs::read(&f.progress_path).unwrap();
-                let adopted = |index: &ScanIndex| index.upload_context_owed_file_count() == 0;
+                let adopted = |index: &ScanIndex| {
+                    crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(index) == 0
+                };
                 for _ in 0..3 {
                     f.restart_preparation();
                     assert!(f.items.is_empty(), "accepted bodies stay suppressed");
@@ -25104,6 +25007,10 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[cfg(test)]
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
+
+#[cfg(test)]
+#[path = "snapshot_sync/tail_ack_ledger.rs"]
+pub(crate) mod tail_ack_ledger;
 
 #[cfg(test)]
 #[path = "snapshot_sync/usage_decrease_hold_tests.rs"]

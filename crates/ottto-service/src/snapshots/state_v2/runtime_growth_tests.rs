@@ -623,190 +623,6 @@ fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
     }
 }
 
-/// [regress] claim-only saves undid page halving and page-one oversize retries stormed
-/// after value-admission failures.
-#[test]
-fn claims_preserve_page_reduction_and_oversize_retries_are_paced() {
-    let f = Fixture::new();
-    let mut index = f.load();
-    assert_eq!(collection_page_limit(&index, 250), 250);
-    index
-        .file_snapshot_fingerprints
-        .insert(f.key.clone(), tests::over_row_limit());
-    assert!(index.save(&f.path).is_err());
-    let mut index = f.load();
-    assert_eq!(collection_page_limit(&index, 250), 125);
-    index.save_growth_claim(&f.path).unwrap();
-    assert_eq!(collection_page_limit(&index, 250), 125);
-    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err());
-
-    // Simulate successive value-admission reductions reaching a page of one.
-    with_state(&f.path, |state| {
-        state.page_limit = 1;
-        Ok(())
-    })
-    .unwrap();
-    assert!(save_read_admitted(&index, &f.key, NOW).unwrap());
-    index
-        .file_snapshot_fingerprints
-        .insert(f.key.clone(), tests::over_row_limit());
-    assert!(index.save(&f.path).is_err());
-    let mut index = f.load();
-    assert!(save_oversize_active(&index).unwrap());
-    for now in [NOW - 1, NOW, NOW + INTERVAL - 1] {
-        assert!(!save_read_admitted(&index, &f.key, now).unwrap());
-    }
-    assert!(!save_read_admitted(&index, "/synthetic/other.jsonl", NOW + INTERVAL).unwrap());
-    let candidate = f.candidate(&index);
-    assert!(save_read_admitted(&index, &f.key, NOW + INTERVAL).unwrap());
-    assert!(sampled_audit::growth_read_admitted_at(
-        &mut index,
-        &candidate,
-        ReadMode::Tail,
-        NOW + INTERVAL
-    ));
-    assert_eq!(collection_page_limit(&index, 250), 1);
-    assert!(
-        save_oversize_active(&index).unwrap(),
-        "the claim does not lift the fence"
-    );
-    // A cursor-only save after a skipped read cannot resolve the held file.
-    index.save(&f.path).unwrap();
-    invalidate_locked(&f.path).unwrap();
-    let mut reopened = f.load();
-    assert!(save_oversize_active(&reopened).unwrap());
-    assert!(!save_read_admitted(&reopened, &f.key, NOW + INTERVAL + 1).unwrap());
-    assert!(!sampled_audit::growth_read_admitted_at(
-        &mut reopened,
-        &candidate,
-        ReadMode::Full(FullReason::StateMissing),
-        NOW + INTERVAL + 1
-    ));
-    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &reopened)().is_err());
-    // A complete retry may have unACKed bodies: its recovery subset keeps the
-    // old file entry, but a successful local save must allow the next upload.
-    assert!(save_read_admitted(&reopened, &f.key, NOW + 2 * INTERVAL).unwrap());
-    assert!(sampled_audit::growth_read_admitted_at(
-        &mut reopened,
-        &candidate,
-        ReadMode::Tail,
-        NOW + 2 * INTERVAL
-    ));
-    sampled_audit::settle_growth(&mut reopened, &f.key);
-    let previous = f.load();
-    let entry = reopened.files.get_mut(&f.key).unwrap();
-    entry.size_bytes = 999;
-    entry.source_file_fingerprint = "b".repeat(64);
-    entry.last_snapshot_fingerprint = Some("d".repeat(64));
-    let mut subset =
-        reopened.committable_subset(&previous, &Default::default(), &Default::default());
-    assert_eq!(
-        subset.files[&f.key].size_bytes, 4,
-        "unACKed progress stays owed"
-    );
-    subset.save(&f.path).unwrap();
-    assert_eq!(
-        subset.files[&f.key].size_bytes,
-        previous.files[&f.key].size_bytes
-    );
-    crate::snapshots::state_v2_side_effect_guard(&f.path, &subset)().unwrap();
-
-    // [money] A native value over the physical row limit at save retains the
-    // page-one SaveOversize hold, alarm and pacing.
-    let mut index = f.load();
-    let before = index.clone();
-    with_state(&f.path, |state| {
-        state.page_limit = 1;
-        Ok(())
-    })
-    .unwrap();
-    let held_at = NOW + 3 * INTERVAL;
-    assert!(save_read_admitted(&index, &f.key, held_at).unwrap());
-    index
-        .file_snapshot_fingerprints
-        .insert(f.key.clone(), tests::over_row_limit());
-    telemetry::event("save_oversize_alarm", &0);
-    let (error, records) =
-        crate::local_resource_diagnostics::capture(|| index.save(&f.path).unwrap_err());
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    assert!(records
-        .iter()
-        .any(|row| row["counts"]["latest"]["save_oversize_alarm"] == 1));
-    let reopened = f.load();
-    assert_eq!(reopened.generation, before.generation);
-    assert_eq!(
-        serde_json::to_value(&reopened.files).unwrap(),
-        serde_json::to_value(&before.files).unwrap(),
-        "owed progress kept"
-    );
-    assert_eq!(
-        reopened.file_snapshot_fingerprints,
-        before.file_snapshot_fingerprints
-    );
-    assert_eq!(reopened.v2().growth_retention, before.v2().growth_retention);
-    assert!(save_oversize_active(&reopened).unwrap());
-    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &reopened)().is_err());
-    assert!(!save_read_admitted(&reopened, &f.key, held_at + INTERVAL - 1).unwrap());
-    assert!(save_read_admitted(&reopened, &f.key, held_at + INTERVAL).unwrap());
-}
-
-/// [regress] the scan's source fence ran for Claude only: a Codex SaveOversize
-/// hold named no page-one file, so its retry never completed and it never lifted.
-#[test]
-fn codex_save_oversize_hold_lifts_after_its_page_one_retry() {
-    use crate::snapshots::{codex_file_join, OwnedSourceScan, OwnedSourceScanStep};
-    let f = Fixture::on_route("codex-test-scan-index.json", BTreeMap::new());
-    let sessions = f.support.join("sessions");
-    fs::create_dir(&sessions).unwrap();
-    let rows =
-        codex_file_join::tests::member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r", 100, 100);
-    let body = rows
-        .iter()
-        .map(|row| serde_json::to_string(row).unwrap() + "\n")
-        .collect::<String>();
-    fs::write(sessions.join("a.jsonl"), body).unwrap();
-    with_state(&f.path, |state| {
-        state.page_limit = 1;
-        Ok(())
-    })
-    .unwrap();
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap();
-    let mut scan = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&sessions),
-        f.load(),
-        &now,
-        30,
-        1,
-        None,
-        &[],
-        false,
-    );
-    while let OwnedSourceScanStep::Pending(next) = scan.step(None) {
-        scan = next;
-    }
-    let (key, read_at) = with_state(&f.path, |state| Ok(state.last_read.clone()))
-        .unwrap()
-        .expect("the scan's fence names its page-one file");
-
-    let mut index = f.load();
-    index
-        .file_snapshot_fingerprints
-        .insert(key.clone(), tests::over_row_limit());
-    assert!(index.save(&f.path).is_err());
-    let mut held = f.load();
-    assert!(save_oversize_active(&held).unwrap());
-    let due = read_at + INTERVAL;
-    assert!(!save_read_admitted(&held, &key, due - 1).unwrap());
-    assert!(!save_read_admitted(&held, "/synthetic/other.jsonl", due).unwrap());
-    assert!(save_read_admitted(&held, &key, due).unwrap());
-    sampled_audit::settle_growth(&mut held, &key);
-    held.save(&f.path).unwrap();
-    assert!(!save_oversize_active(&held).unwrap());
-}
-
 /// [regress] grown and undiscovered keys kept old Exact proof after lossy/failed parses.
 #[test]
 fn growth_never_suppresses_lossy_records_or_failed_validation() {
@@ -816,7 +632,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
     };
     for case in [
         "lossy",
-        "lossy_at_cap",
+        "lossy_past_old_cap",
         "incomplete",
         "no_record",
         "invalidate",
@@ -838,9 +654,9 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
             inode: 1,
         }));
         index.claude_request_census.insert_for_test(&f.key, record);
-        if case == "lossy_at_cap" {
-            let cap =
-                crate::snapshots::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
+        if case == "lossy_past_old_cap" {
+            // The hashes the census held before it lost its caps.
+            let cap = 2_097_152_u64;
             index.claude_request_census.insert_for_test(
                 "/synthetic/young.jsonl",
                 ClaudeRequestCensusRecord::synthetic_for_test(
@@ -870,7 +686,6 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
             claude_request_census::record_claude_request_census(
                 &mut index,
                 ClaudeRequestCensusParse {
-                    held_index_keys: &Default::default(),
                     path: &f.source,
                     index_key: &f.key,
                     source_file_fingerprint: if case == "no_record" {
@@ -886,7 +701,6 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
                     itemless_request_hashes: vec![8, 9],
                     opened_birth: None,
                     modified_unix_seconds: 1,
-                    accepted_recovery_member: false,
                 },
                 &[],
             );
@@ -895,7 +709,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
         assert!(!record.request_hashes_for_test().contains(&7), "{case}");
         if matches!(case, "no_record" | "invalidate") {
             assert!(record.is_birth_stub(), "{case}");
-        } else if case != "lossy_at_cap" {
+        } else {
             assert_eq!(
                 record.shape_for_test(),
                 ClaudeRequestCensusShape::Lossy,
@@ -916,91 +730,4 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
             "{case}"
         );
     }
-}
-
-/// [regress] excluded grown stock evicted overlapping #920 proofs at the soft cap.
-#[test]
-fn excluded_growth_stock_does_not_evict_overlapping_proofs() {
-    use crate::snapshots::claude_request_census::{
-        ClaudeRequestCensusRecord, ClaudeRequestCensusShape, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
-    };
-    let f = Fixture::new();
-    let mut index = f.load();
-    let overlap = crate::snapshots::local_index_key(&f.support.join("overlap.jsonl"));
-    let copy = crate::snapshots::local_index_key(&f.support.join("copy.jsonl"));
-    let nongrown = crate::snapshots::local_index_key(&f.support.join("nongrown.jsonl"));
-    let residue = crate::snapshots::local_index_key(&f.support.join("residue.jsonl"));
-    for key in [&overlap, &copy, &nongrown, &residue] {
-        fs::write(key, b"old\n").unwrap();
-    }
-    let cap = MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64;
-    for (key, age, hashes) in [
-        (f.key.clone(), 1, (0..cap / 10).collect()),
-        (overlap.clone(), 1, (cap / 10..cap / 5).collect()),
-        (
-            copy.clone(),
-            40 * 86400,
-            (cap / 10..cap * 85 / 100).collect(),
-        ),
-        (nongrown.clone(), 1, vec![cap + 1]),
-        (residue.clone(), 1, vec![cap + 2]),
-    ] {
-        let entry = index.files[&f.key].clone();
-        index.files.insert(key.clone(), entry);
-        index.claude_request_census.insert_for_test(
-            &key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                ClaudeRequestCensusShape::Exact,
-                hashes,
-            )
-            .with_modified_for_test(Some(age)),
-        );
-    }
-    crate::snapshots::ensure_bounded_traversal(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&f.support),
-        &mut index,
-        "2026-10-07T12:00:00Z",
-        30,
-    );
-    let walk = index.traversal.as_mut().unwrap();
-    walk.reconciliation_upper_bound = Some("z".into());
-    walk.reconciliation_after = None;
-    walk.residue.index_keys.insert(residue.clone());
-    let (aged, kept, _, overflow) = index.retire_claude_transcript_records_for_test(40 * 86400);
-    assert_eq!(
-        aged, 2,
-        "neither an unchecked range nor untracked residue is growth debt"
-    );
-    assert_eq!(kept, 1);
-    assert_eq!(overflow, 0);
-    assert_eq!(
-        index
-            .claude_request_census
-            .get(&overlap)
-            .unwrap()
-            .retired_for_test(),
-        None
-    );
-    assert_eq!(
-        index
-            .claude_request_census
-            .get(&f.key)
-            .unwrap()
-            .retired_for_test(),
-        None
-    );
-    sampled_audit::settle_growth(&mut index, &f.key);
-    assert_eq!(
-        index
-            .retire_claude_transcript_records_for_test(40 * 86400)
-            .0,
-        1
-    );
-    assert_eq!(
-        index.claude_request_census.totals_for_test(),
-        index.claude_request_census.recounted_for_test()
-    );
 }

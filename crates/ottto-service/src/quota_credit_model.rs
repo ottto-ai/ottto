@@ -82,7 +82,7 @@ impl Provider {
 /// case-preserving: never trimmed, never case-folded.
 pub(crate) fn credit_grant_key(provider: Provider, id: &str) -> String {
     let digest = Sha256::digest(format!("{}:credit_grant:{id}", provider.token()).as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::hex::encode(&digest)
 }
 
 /// A provider value the adapter extracted: absent (null or missing), present,

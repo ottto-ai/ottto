@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Portable synthetic receipt checks. Never builds or executes native binaries."""
 import copy
+import hashlib
 import json
 import unittest
 from pathlib import Path
 import tempfile
 
-from money_equivalence import (decode_receipt, has_forbidden_diff, receipt_diff,
-                               require_base_harness, require_base_scan_fixture)
+from money_equivalence import (canonical_declarations, decode_receipt, has_forbidden_diff,
+                               parse_declarations, pr_declarations, receipt_diff,
+                               require_base_harness, require_base_scan_fixture,
+                               signed_mismatch, signed_money_lists, value_sha256)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -348,6 +351,470 @@ class MoneyEquivalenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as error:
                     decode_receipt(invalid)
                 self.assertNotIn("DO_NOT_LOG_THIS_VALUE", str(error.exception))
+
+
+HEAD_CAS = "head_cas_contract"
+HEAD_CAS_VALUE = "snapshot_head_etag:v1"
+NEW_FIELD = "cache_observations"
+DECLARED = {"envelope": {HEAD_CAS: HEAD_CAS_VALUE}, "snapshot": {NEW_FIELD: []}}
+FENCE = "`" * 3
+DECLARED_INFO = "money-eq-declared-additions"
+
+
+def pr_body(*blocks):
+    return "Summary.\r\n\r\n" + "".join(
+        f"{FENCE}money-eq-declared-additions\r\n{block}\r\n{FENCE}\r\n\r\n" for block in blocks)
+
+
+class DeclaredAdditionTests(unittest.TestCase):
+    """Additions the PR body declares: shaped like the observed cross-build diff."""
+
+    def setUp(self):
+        self.base = envelope()
+        self.head = copy.deepcopy(self.base)
+
+    def compare(self, declarations=DECLARED):
+        return receipt_diff(receipt([self.base]), receipt([self.head]), declarations)
+
+    def add_observed(self):
+        self.head[HEAD_CAS] = HEAD_CAS_VALUE
+        self.head["snapshots"][0][NEW_FIELD] = []
+
+    def test_declared_snapshot_and_envelope_additions_pass(self):
+        self.add_observed()
+        diff = self.compare()
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(diff["allowed_additions"], [
+            "/0/0/" + HEAD_CAS, "/0/0/snapshots/0/" + NEW_FIELD])
+
+    def test_declared_envelope_contract_alone_passes(self):
+        self.head[HEAD_CAS] = HEAD_CAS_VALUE
+        diff = self.compare(parse_declarations(pr_body(json.dumps(
+            {"envelope": {HEAD_CAS: HEAD_CAS_VALUE}}))))
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(diff["allowed_additions"], ["/0/0/" + HEAD_CAS])
+
+    def test_declared_empty_object_passes(self):
+        self.head["snapshots"][0][NEW_FIELD] = {}
+        diff = self.compare({"snapshot": {NEW_FIELD: {}}})
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(diff["allowed_additions"], ["/0/0/snapshots/0/" + NEW_FIELD])
+
+    def test_undeclared_additions_stay_added(self):
+        self.add_observed()
+        for declarations in (None, {}, {"snapshot": {"other_field": []}}):
+            with self.subTest(declarations=declarations):
+                diff = self.compare(declarations)
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertEqual(diff["added"], ["/0/0/" + HEAD_CAS, "/0/0/snapshots/0/<key#2>"])
+                self.assertEqual(diff["allowed_additions"], [])
+
+    def test_declared_key_with_other_value_or_type_stays_added(self):
+        # A declared key carrying content (possibly money) is not the declared empty value.
+        for value in ([{}], ["x"], "x", {}, {"input_tokens": 1}, None, 0, False):
+            with self.subTest(value=value):
+                self.head = copy.deepcopy(self.base)
+                self.head["snapshots"][0][NEW_FIELD] = value
+                diff = self.compare()
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertEqual(diff["added"], ["/0/0/snapshots/0/" + NEW_FIELD])
+                self.assertNotIn("input_tokens", json.dumps(diff))
+        for value in ("snapshot_head_etag:v2", "", ["snapshot_head_etag:v1"]):
+            with self.subTest(value=value):
+                self.head = copy.deepcopy(self.base)
+                self.head[HEAD_CAS] = value
+                self.assertEqual(self.compare()["added"], ["/0/0/" + HEAD_CAS])
+
+    def test_declared_addition_with_money_change_fails(self):
+        self.add_observed()
+        self.head["snapshots"][0]["usage"]["output_tokens"] += 1
+        diff = self.compare()
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["changed"], ["/0/0/snapshots/0/usage/output_tokens"])
+        self.assertEqual(len(diff["allowed_additions"]), 2)
+
+    def test_declared_key_nested_or_new_entity_stays_added(self):
+        self.head["snapshots"][0]["usage"][NEW_FIELD] = []
+        self.assertEqual(self.compare()["added"], ["/0/0/snapshots/0/usage/<key#0>"])
+        self.head = copy.deepcopy(self.base)
+        self.head["snapshots"].append({NEW_FIELD: []})
+        self.assertEqual(self.compare()["added"], ["/0/0/snapshots/1"])
+        # A snapshot only the head has is never a declared position.
+        self.base["snapshots"] = []
+        self.head = copy.deepcopy(self.base)
+        self.head["snapshots"].append({NEW_FIELD: []})
+        self.assertEqual(self.compare()["added"], ["/0/0/snapshots/0"])
+        # Data maps and the envelope's other records are not declared positions.
+        self.base = envelope()
+        self.base["client_report"] = {}
+        self.base["snapshots"][0]["semantic_envelope"]["component_hashes"] = {}
+        self.head = copy.deepcopy(self.base)
+        self.head["client_report"][NEW_FIELD] = []
+        self.head["snapshots"][0]["semantic_envelope"]["component_hashes"][NEW_FIELD] = []
+        self.head["snapshots"][0][HEAD_CAS] = HEAD_CAS_VALUE
+        diff = self.compare()
+        self.assertEqual(diff["allowed_additions"], [])
+        self.assertEqual(len(diff["added"]), 3)
+
+    def test_declared_key_seen_in_base_stays_added(self):
+        # A field that moved from anywhere in the base is not an addition.
+        for location in (("snapshots", 0, "usage"), ("snapshots", 0, "semantic_envelope"), ()):
+            with self.subTest(location=location):
+                self.base = envelope()
+                target = self.base
+                for key in location:
+                    target = target[key]
+                target[NEW_FIELD] = []
+                self.head = envelope()
+                self.head["snapshots"][0][NEW_FIELD] = []
+                diff = self.compare()
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertIn("/0/0/snapshots/0/" + NEW_FIELD, diff["added"])
+                self.assertEqual(diff["allowed_additions"], [])
+        self.base = envelope()
+        self.base["snapshots"][0]["semantic_envelope"][HEAD_CAS] = HEAD_CAS_VALUE
+        self.head = copy.deepcopy(self.base)
+        self.head[HEAD_CAS] = HEAD_CAS_VALUE
+        self.assertEqual(self.compare()["added"], ["/0/0/" + HEAD_CAS])
+
+    def test_decimal_text_must_match(self):
+        a = b'{"snapshots":[{"cost_usd":1.0}]}'
+        b = b'{"snapshots":[{"cost_usd":1.00}]}'
+        diff = receipt_diff(json.dumps([list(a)]), json.dumps([list(b)]))
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["changed"], ["/0/snapshots/0/cost_usd"])
+        self.assertFalse(has_forbidden_diff(receipt_diff(json.dumps([list(a)]), json.dumps([list(a)]))))
+
+    def test_number_spelling_must_match_even_with_declared_addition(self):
+        # Equal values, different JSON bytes: the declared addition must not hide them.
+        for base, head in (("0.01", "1e-2"), ("1.0", "1.0e0"), ("0", "-0"), ("1.0", "1.00")):
+            with self.subTest(base=base, head=head):
+                a = '{"snapshots":[{"cost_usd":' + base + '}]}'
+                b = '{"snapshots":[{"cost_usd":' + head + ',"cache_observations":[]}]}'
+                diff = receipt_diff(json.dumps([list(a.encode())]), json.dumps([list(b.encode())]),
+                                    {"snapshot": {NEW_FIELD: []}})
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertEqual(diff["changed"], ["/0/snapshots/0/cost_usd"])
+                self.assertEqual(diff["allowed_additions"], ["/0/snapshots/0/" + NEW_FIELD])
+
+    def test_number_never_equals_string_or_bool(self):
+        for base, head in (('"1"', "1"), ('"0.01"', "0.01"), ("0", "false"), ("1", "true")):
+            with self.subTest(base=base, head=head):
+                a = '{"snapshots":[{"cost_usd":' + base + '}]}'
+                b = '{"snapshots":[{"cost_usd":' + head + '}]}'
+                diff = receipt_diff(json.dumps([list(a.encode())]), json.dumps([list(b.encode())]))
+                self.assertEqual(diff["changed"], ["/0/snapshots/0/cost_usd"])
+
+    def test_parser_follows_fences(self):
+        block = '\n{"snapshot": {"new_field": []}}\n'
+        declared = {"snapshot": {"new_field": []}}
+        # A declaration inside another fence is example text, not a declaration.
+        self.assertIsNone(parse_declarations(
+            "````\n" + FENCE + DECLARED_INFO + block + FENCE + "\n````\n"))
+        self.assertIsNone(parse_declarations(
+            "~~~\n" + FENCE + DECLARED_INFO + block + FENCE + "\n~~~\n"))
+        self.assertIsNone(parse_declarations("> " + FENCE + DECLARED_INFO + "\n> {}\n> " + FENCE + "\n"))
+        # Only the same character, at least as long and without info, closes a fence.
+        self.assertEqual(parse_declarations("````" + DECLARED_INFO + block + "````\n"), declared)
+        self.assertEqual(parse_declarations("````" + DECLARED_INFO + block + "`````\n"), declared)
+        self.assertEqual(parse_declarations("~~~" + DECLARED_INFO + block + "~~~\r\n"), declared)
+        self.assertEqual(parse_declarations("~~~~ " + DECLARED_INFO + " " + block + "  ~~~~~\n"), declared)
+        # Another info string is an ordinary fence.
+        self.assertIsNone(parse_declarations(FENCE + DECLARED_INFO + "-old" + block + FENCE + "\n"))
+        for body in (
+                "~~~" + DECLARED_INFO + block + "~~~\n" + FENCE + DECLARED_INFO + block + FENCE + "\n",
+                "````" + DECLARED_INFO + block + FENCE + "\n",
+                "~~~" + DECLARED_INFO + block + FENCE + "\n",
+                FENCE + DECLARED_INFO + block + FENCE + " json\n"):
+            with self.subTest(body=body), self.assertRaisesRegex(RuntimeError, "declared additions"):
+                parse_declarations(body)
+
+    def test_parser_accepts_one_block(self):
+        self.assertIsNone(parse_declarations(None))
+        self.assertIsNone(parse_declarations("No declarations. `money-eq-declared-additions` is the tag."))
+        # An indented example documents the format without declaring anything.
+        self.assertIsNone(parse_declarations(
+            f"Example:\n\n    {FENCE}money-eq-declared-additions\n    {{}}\n    {FENCE}\n"))
+        self.assertEqual(parse_declarations(pr_body(json.dumps(DECLARED))), DECLARED)
+        self.assertEqual(parse_declarations(pr_body('{"snapshot": {"new_field": {}}}')),
+                         {"snapshot": {"new_field": {}}})
+
+    def test_parser_rejects_invalid_blocks(self):
+        invalid = [
+            pr_body(json.dumps(DECLARED), json.dumps(DECLARED)),
+            pr_body("{not json"),
+            pr_body('{"snapshot": {"a": [], "a": []}}'),
+            pr_body('{"envelope": {}, "extra": {}}'),
+            pr_body("[]"),
+            pr_body('{"snapshot": []}'),
+            f"{FENCE}money-eq-declared-additions\n{{}}\n",
+        ]
+        for value in ("1", "1.5", "true", "null", "[{}]", '{"a": []}', '[""]', '"x"', "NaN"):
+            invalid.append(pr_body('{"snapshot": {"new_field": ' + value + "}}"))
+        for value in ("1", "true", "null", '""', "[]", "{}"):
+            invalid.append(pr_body('{"envelope": {"new_contract": ' + value + "}}"))
+        for key in ("cost_usd", "usage", "request_id", "bucket", "account_id", "input_tokens",
+                    "model_usage", "model", "total_cost_usd", "account_identifier_hash", ""):
+            invalid.append(pr_body(json.dumps({"snapshot": {key: []}})))
+        for key in ("machine_id", "source", "snapshots", "client_report", "schema_version",
+                    "usage_decrease_hold_ack_contract", "contracts"):
+            invalid.append(pr_body(json.dumps({"envelope": {key: "x"}})))
+        for body in invalid:
+            with self.subTest(body=body), self.assertRaisesRegex(RuntimeError, "declared additions"):
+                parse_declarations(body)
+
+    def test_explicit_base_or_no_unique_pr_uses_no_declarations(self):
+        pr = {"number": 7, "baseRefName": "main", "body": pr_body(json.dumps(DECLARED))}
+        self.assertEqual(pr_declarations([pr], explicit=False), (7, DECLARED))
+        self.assertEqual(pr_declarations([pr], explicit=True), (None, None))
+        self.assertEqual(pr_declarations([], explicit=False), (None, None))
+        self.assertEqual(pr_declarations([pr, dict(pr, number=8)], explicit=False), (None, None))
+        self.assertEqual(pr_declarations([dict(pr, body="")], explicit=False), (7, None))
+        self.add_observed()
+        self.assertTrue(has_forbidden_diff(self.compare(None)))
+
+    def test_canonical_declarations_receipt(self):
+        self.assertEqual(canonical_declarations(None), (None, None))
+        text, digest = canonical_declarations(DECLARED)
+        self.assertEqual(text, '{"envelope":{"head_cas_contract":"snapshot_head_etag:v1"},'
+                               '"snapshot":{"cache_observations":[]}}')
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(canonical_declarations(dict(reversed(list(DECLARED.items())))),
+                         (text, digest))
+
+
+def sha(canonical_text):
+    return hashlib.sha256(canonical_text.encode()).hexdigest()
+
+
+def entry_sha(raw_path_text, value_text):
+    """Signed digest from literal canonical text: the raw path and the value."""
+    return sha('{"path":' + raw_path_text + ',"value":' + value_text + "}")
+
+
+RAW_SNAPSHOT = '[0,0,"snapshots",0,'
+
+
+SIGNED_HEAD = "0123456789abcdef0123456789abcdef01234567"
+SNAPSHOT = "/0/0/snapshots/0/"
+FIXTURES = ["duplicate_request_ids.json", "side_owner.json"]
+
+
+def money_block(diff, **extra):
+    return dict(extra, money={"signed_by": "independent money review", "head": SIGNED_HEAD, "diff": diff})
+
+
+class SignedMoneyTests(unittest.TestCase):
+    """An intended money change passes only when its signed expected diff matches exactly."""
+
+    def setUp(self):
+        self.base = envelope()
+        self.head = copy.deepcopy(self.base)
+        snapshot = self.head["snapshots"][0]
+        snapshot["usage"]["input_tokens"] = 101
+        del snapshot["bucket"]
+        snapshot["new_money"] = {"z": 1, "a": ["\u00e9"]}
+        # Digests of the raw path and value as canonical JSON text, computed independently.
+        self.signed = [
+            {"path": SNAPSHOT + "usage/input_tokens", "class": "changed",
+             "sha256": entry_sha(RAW_SNAPSHOT + '"usage","input_tokens"]', "101")},
+            {"path": SNAPSHOT + "bucket", "class": "removed",
+             "sha256": entry_sha(RAW_SNAPSHOT + '"bucket"]', '"synthetic-bucket"')},
+            {"path": SNAPSHOT + "<key#3>", "class": "added",
+             "sha256": entry_sha(RAW_SNAPSHOT + '"new_money"]', '{"a":["\u00e9"],"z":1}')},
+        ]
+
+    def compare(self, signed, declarations=None):
+        return receipt_diff(receipt([self.base]), receipt([self.head]), declarations, signed)
+
+    def assert_red(self, diff):
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["signed_money"], [])
+
+    def test_exact_signed_match_passes(self):
+        diff = self.compare(self.signed)
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(sorted(diff["signed_money"], key=str), sorted(self.signed, key=str))
+        self.assertEqual([diff[kind] for kind in ("added", "changed", "removed", "signed_missing")],
+                         [[], [], [], []])
+        self.assertNotIn("synthetic-bucket", json.dumps(diff))
+
+    def test_without_money_part_signed_paths_stay_red(self):
+        diff = self.compare(None)
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["changed"], [SNAPSHOT + "usage/input_tokens"])
+
+    def test_extra_observed_path_is_red(self):
+        diff = self.compare(self.signed[:2])
+        self.assert_red(diff)
+        self.assertEqual(diff["added"], [SNAPSHOT + "<key#3>"])
+        self.assertEqual(signed_mismatch(diff["observed"], self.signed[:2]), ([], [self.signed[2]]))
+
+    def test_missing_signed_path_is_red(self):
+        missing = {"path": SNAPSHOT + "usage/output_tokens", "class": "changed", "sha256": sha("3")}
+        diff = self.compare(self.signed + [missing])
+        self.assert_red(diff)
+        self.assertEqual(diff["signed_missing"], [missing["path"]])
+        # Nothing observed at all, but the file signs a change: still red.
+        self.head = copy.deepcopy(self.base)
+        diff = self.compare([missing])
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["signed_missing"], [missing["path"]])
+
+    def test_wrong_class_is_red(self):
+        signed = copy.deepcopy(self.signed)
+        signed[0]["class"] = "added"
+        self.assert_red(self.compare(signed))
+
+    def test_file_signed_for_older_head_with_other_diff_is_red(self):
+        # Same path, other value digest (the older head emitted 102).
+        signed = copy.deepcopy(self.signed)
+        signed[0]["sha256"] = sha("102")
+        self.assert_red(self.compare(signed))
+        # Other path set.
+        signed = copy.deepcopy(self.signed)
+        signed[0]["path"] = SNAPSHOT + "usage/output_tokens"
+        self.assert_red(self.compare(signed))
+
+    def test_same_paths_one_changed_leaf_differs_is_red(self):
+        self.head["snapshots"][0]["usage"]["output_tokens"] = 3
+        signed = self.signed + [
+            {"path": SNAPSHOT + "usage/output_tokens", "class": "changed",
+             "sha256": entry_sha(RAW_SNAPSHOT + '"usage","output_tokens"]', "3")}]
+        self.assertFalse(has_forbidden_diff(self.compare(signed)))
+        self.head["snapshots"][0]["usage"]["output_tokens"] = 4
+        diff = self.compare(signed)
+        self.assert_red(diff)
+        self.assertEqual(diff["changed"], [SNAPSHOT + "usage/input_tokens", SNAPSHOT + "usage/output_tokens"])
+
+    def test_same_paths_added_subtree_differs_inside_is_red(self):
+        self.head["snapshots"][0]["new_money"]["a"] = ["e"]
+        diff = self.compare(self.signed)
+        self.assert_red(diff)
+        self.assertEqual(diff["added"], [SNAPSHOT + "<key#3>"])
+        self.assertNotIn('"e"', json.dumps(diff))
+
+    def test_renamed_opaque_added_key_is_red(self):
+        # Same display path (<key#3>), same subtree, other real key.
+        snapshot = self.head["snapshots"][0]
+        snapshot["new_money_v2"] = snapshot.pop("new_money")
+        diff = self.compare(self.signed)
+        self.assert_red(diff)
+        self.assertEqual(diff["added"], [SNAPSHOT + "<key#3>"])
+        missing, extra = signed_mismatch(diff["observed"], self.signed)
+        self.assertEqual([entry["path"] for entry in missing + extra], [SNAPSHOT + "<key#3>"] * 2)
+        self.assertNotIn("new_money", json.dumps(diff))
+
+    def raw_compare(self, base, head, signed):
+        return receipt_diff(json.dumps([list(base.encode())]), json.dumps([list(head.encode())]),
+                            None, signed)
+
+    def test_renamed_data_map_key_is_red(self):
+        base = '{"snapshots":[{"model_usage":[{"selector_context":{}}]}]}'
+        path = "/0/snapshots/0/model_usage/0/selector_context/<key#0>"
+        signed = [{"path": path, "class": "added", "sha256": entry_sha(
+            '[0,"snapshots",0,"model_usage",0,"selector_context","account-A"]', "101")}]
+        head_a = '{"snapshots":[{"model_usage":[{"selector_context":{"account-A":101}}]}]}'
+        self.assertFalse(has_forbidden_diff(self.raw_compare(base, head_a, signed)))
+        head_b = head_a.replace("account-A", "account-B")
+        diff = self.raw_compare(base, head_b, signed)
+        self.assert_red(diff)
+        self.assertEqual(diff["added"], [path])
+        self.assertNotIn("account", json.dumps(diff))
+
+    def test_changed_opaque_ancestor_key_is_red(self):
+        # Same display path, class and leaf value; only an opaque ancestor key differs.
+        path = "/0/snapshots/0/model_usage/0/selector_context/<key#0>/<key#0>"
+        signed = [{"path": path, "class": "changed", "sha256": entry_sha(
+            '[0,"snapshots",0,"model_usage",0,"selector_context","acct-1","x"]', "2")}]
+
+        def body(account, x):
+            return '{"snapshots":[{"model_usage":[{"selector_context":{"' + account + '":{"x":' + x + "}}}]}]}"
+        self.assertFalse(has_forbidden_diff(self.raw_compare(body("acct-1", "1"), body("acct-1", "2"), signed)))
+        diff = self.raw_compare(body("acct-2", "1"), body("acct-2", "2"), signed)
+        self.assert_red(diff)
+        self.assertEqual(diff["changed"], [path])
+        self.assertNotIn("acct", json.dumps(diff))
+
+    def test_declared_key_cannot_look_like_a_redacted_label(self):
+        for declared in ({"snapshot": {"<key#0>": []}}, {"envelope": {"<key#0>_contract": "v1"}}):
+            with self.subTest(declared=declared), self.assertRaisesRegex(RuntimeError, "redacted-key label"):
+                parse_declarations(pr_body(json.dumps(declared)))
+
+    def test_fixture_absent_from_signed_file_with_diff_is_red(self):
+        lists = signed_money_lists(money_block({"side_owner.json": self.signed}), FIXTURES)
+        self.assertEqual(lists, {"duplicate_request_ids.json": [], "side_owner.json": self.signed})
+        self.assert_red(self.compare(lists["duplicate_request_ids.json"]))
+        self.assertFalse(has_forbidden_diff(self.compare(lists["side_owner.json"])))
+        self.assertIsNone(signed_money_lists(None, FIXTURES))
+        self.assertIsNone(signed_money_lists({"snapshot": {NEW_FIELD: []}}, FIXTURES))
+
+    def test_unknown_fixture_name_is_an_error(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown fixtures"):
+            signed_money_lists(money_block({"no_such_fixture.json": []}), FIXTURES)
+
+    def test_declared_addition_and_signed_change_in_one_fixture_both_pass(self):
+        self.head = copy.deepcopy(self.base)
+        self.head["snapshots"][0][NEW_FIELD] = []
+        self.head["snapshots"][0]["usage"]["input_tokens"] = 101
+        declarations = parse_declarations(pr_body(json.dumps(money_block(
+            {"side_owner.json": self.signed[:1]}, snapshot={NEW_FIELD: []}))))
+        signed = signed_money_lists(declarations, FIXTURES)["side_owner.json"]
+        diff = self.compare(signed, declarations)
+        self.assertFalse(has_forbidden_diff(diff))
+        self.assertEqual(diff["allowed_additions"], [SNAPSHOT + NEW_FIELD])
+        self.assertEqual(diff["signed_money"], self.signed[:1])
+
+    def test_explicit_base_ignores_money(self):
+        pr = {"number": 7, "body": pr_body(json.dumps(money_block({"side_owner.json": self.signed})))}
+        self.assertEqual(pr_declarations([pr], explicit=False)[1]["money"]["head"], SIGNED_HEAD)
+        number, declarations = pr_declarations([pr], explicit=True)
+        self.assertEqual((number, declarations), (None, None))
+        diff = self.compare(signed_money_lists(declarations, FIXTURES))
+        self.assertTrue(has_forbidden_diff(diff))
+        self.assertEqual(diff["signed_money"], [])
+
+    def test_value_digest_uses_exact_number_text(self):
+        def value(text):
+            return decode_receipt(json.dumps([list(text)]))[0][0]["v"]
+        self.assertEqual(value_sha256(value(b'{"v":1e-2}')), sha("1e-2"))
+        self.assertEqual(value_sha256(value(b'{"v":0.01}')), sha("0.01"))
+        self.assertNotEqual(value_sha256(value(b'{"v":1e-2}')), value_sha256(value(b'{"v":0.01}')))
+        self.assertEqual(value_sha256(value(b'{"v":{"b":-0, "a":[1.0e0,"1",true,null]}}')),
+                         sha('{"a":[1.0e0,"1",true,null],"b":-0}'))
+
+    def test_parser_rejects_bad_money_parts(self):
+        entry = {"path": SNAPSHOT + "usage/input_tokens", "class": "changed", "sha256": sha("101")}
+        good = money_block({"side_owner.json": [entry]})
+        self.assertEqual(parse_declarations(pr_body(json.dumps(good))), good)
+        bad = []
+        for signed_by in ("", "   ", "x" * 201, "line\nMONEY_EQUIVALENCE_FAKE", 7, None):
+            bad.append(dict(good["money"], signed_by=signed_by))
+        for head in (SIGNED_HEAD.upper(), SIGNED_HEAD[:39], SIGNED_HEAD + "0", "", None):
+            bad.append(dict(good["money"], head=head))
+        for changes in ({"class": "moved"}, {"class": "Changed"}, {"sha256": sha("101").upper()},
+                        {"sha256": sha("101")[:63]}, {"sha256": None}, {"path": "relative"},
+                        {"path": 3}, {"extra": 1}):
+            bad.append(dict(good["money"], diff={"side_owner.json": [dict(entry, **changes)]}))
+        bad.append(dict(good["money"], diff={"side_owner.json": [entry, dict(entry, sha256=sha("102"))]}))
+        bad.append(dict(good["money"], diff={"side_owner.json": [entry, dict(entry, **{"class": "added"})]}))
+        bad.append(dict(good["money"], diff={"side_owner.json": [{"path": entry["path"], "class": "changed"}]}))
+        bad.append(dict(good["money"], diff={"side_owner.json": entry}))
+        bad.append(dict(good["money"], diff=[entry]))
+        bad.append({"signed_by": "review", "head": SIGNED_HEAD})
+        bad.append(dict(good["money"], extra="x"))
+        bodies = [pr_body(json.dumps({"money": money})) for money in bad]
+        bodies.append(pr_body('{"money": []}'))
+        # The same path both declared as a non-money addition and signed as money.
+        both = money_block({"side_owner.json": [dict(entry, path=SNAPSHOT + NEW_FIELD, **{"class": "added"})]},
+                           snapshot={NEW_FIELD: []})
+        bodies.append(pr_body(json.dumps(both)))
+        both = money_block({"side_owner.json": [dict(entry, path="/0/0/" + HEAD_CAS, **{"class": "added"})]},
+                           envelope={HEAD_CAS: HEAD_CAS_VALUE})
+        bodies.append(pr_body(json.dumps(both)))
+        for body in bodies:
+            with self.subTest(body=body), self.assertRaisesRegex(RuntimeError, "declared additions"):
+                parse_declarations(body)
 
 
 class TransplantTests(unittest.TestCase):

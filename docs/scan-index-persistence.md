@@ -19,7 +19,8 @@ applied before compression and again during bounded decompression:
 
 | Record kind | Cap |
 | --- | --- |
-| `scan_state.traversal` | 16 MiB |
+| `scan_state.traversal` | 64 MiB |
+| `v1_field.birth_store` | 64 MiB |
 | `scan_state.scan_residue_witness` | 16 MiB |
 | `scan_state.claude_stale_family_carry` | 16 MiB |
 
@@ -29,7 +30,7 @@ carry members reached 24,083 and 1,171 bytes respectively. The bounded exception
 allows collection-wide queues to grow without splitting their semantic members.
 Stored bytes still use the same optional zstd codec and `value_chunks` (256 KiB
 per part); compression cannot bypass the logical cap. Other kind caps are
-unchanged, including the existing 8 MiB birth-store allowance. This exception
+unchanged. This exception
 does not replace the mutable account/usage segmentation policy
 (64 KiB target / 1 MiB segment target).
 
@@ -104,9 +105,8 @@ still require platform qualification before routing or enabling conversion.
 Verified completion covers the current DB/WAL/SHM and the removed migration
 backup. The retained read-only v1 baseline is an explicit policy exception:
 it is never used to resurrect a forgotten file, and its 14-day hard age raises
-an escalation alarm. Forget, uninstall and source removal immediately delete
-that source's DB/WAL/SHM, v1-readonly and private remnants under their existing
-exclusive cleanup owner. Temporary remnants and external restart records have
+an escalation alarm. Uninstall deletes the DB/WAL/SHM, v1-readonly and private
+remnants under its existing cleanup owner; source removal and forget keep them. Temporary remnants and external restart records have
 separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
 APFS snapshots and physical SSD erasure are outside the promise. No application
 deletion or money-debt retirement is authorized merely by this storage maintenance.
@@ -537,9 +537,9 @@ progress lock through database fsync and fence publication. Original inventory
 commitments and the copied `v1-readonly` baseline are verified before publication.
 There is one retained pre-import baseline, including its referenced immutable
 shards; saves and hydration create no additional backup copies. The baseline
-retains its explicit erasure exception and 14-day hard-age escalation. Source
-erasure, forget and uninstall delete it and its shards immediately alongside the
-DB/WAL/SHM, import remnants, exact ACK companion and restart records.
+retains its explicit erasure exception and 14-day hard-age escalation. Uninstall
+deletes it and its shards immediately alongside the DB/WAL/SHM, import remnants,
+exact ACK companion and restart records; turning a source off and forget keep them.
 
 Schema revision one uses the forward-only `user_version` runner and checks
 `minimum_writer_capability` before writes. Nonempty revision-zero layouts are
@@ -547,7 +547,7 @@ refused rather than adopted. There are no destructive migration steps or automat
 backup restoration; newer schema/writer capabilities hold the source. Exact ACK
 receipt reconciliation remains required before collection or settlement.
 
-Explicit source erasure also removes the exact ACK companion. Maintenance reports
+Uninstall also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
 or GC authority. Baseline age/escalation gauges refresh after import preservation,
 on authenticated saves and at maintenance/load boundaries.
@@ -577,20 +577,14 @@ transaction and must not be reported by the adapter as a per-file exclusion.
 The 5,000-mutation / 32 MiB soft target sizes the next collection page. A save over
 target still commits and halves the next page; a collection save under target
 grows it by 25 files up to the requested page. Claim-only saves preserve the page
-limit and any save-pressure hold. Charged work includes old/new values, chunks,
-reference updates, metadata, tombstones and restart staging. More than 256 MiB
-raises a counts-only alarm; the complete valid delta still commits. A logical
-value-admission failure rolls back the whole save, reloads the committed graph
-and halves the page for a retry from committed checkpoints. If value admission
-still fails at a page of one, the source holds with `state_v2_save_oversize` and
-an alarm. Uploads and ACKs stay fenced
-until a completed native retry and its recovery save succeed. UnACKed file
-entries keep their accepted progress during recovery. That file retries at most
-once per six hours, using the existing durable growth Full claim before payload
-acquisition; intervening passes skip its transcript reads. The source-wide fence
-remains because upload recovery and accepted progress share the source owner.
-A held cycle uses the existing local partial-checkpoint settlement path before
-any upload, then starts a fresh pass; unACKed file progress stays owed.
+limit and any `state_v2_sqlite_full` hold. Charged work includes old/new values,
+chunks, reference updates, metadata, tombstones and restart staging; the
+complete valid delta commits at any size. A row over the 64 MiB decode bound
+refuses that save as `state_v2_db_unavailable`, reloads and retries next pass;
+a Tail-staged (Claude) file is set aside alone. One shared aggregate row
+(traversal, birth store, request set) cannot be set aside without dropping its
+state, so it still refuses the whole save; uncommitted work replays from
+committed checkpoints and unACKed file progress stays owed.
 SQLITE_FULL likewise rolls back and holds for retry. No partial publication or deferred-work journal exists; transcripts and
 committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 

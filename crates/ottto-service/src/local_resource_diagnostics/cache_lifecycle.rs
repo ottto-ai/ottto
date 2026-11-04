@@ -63,9 +63,3 @@ sparse_lifetime_counters! {
 pub(crate) fn snapshot() -> Counts {
     Counts::totals()
 }
-/// This thread's counts so far inside `observe`, for a mid-run phase split
-/// (tests only); `None` outside `observe`.
-#[cfg(test)]
-pub(crate) fn observed() -> Option<Counts> {
-    TEST_EVENTS.with(|events| events.get().map(Counts::from_array))
-}

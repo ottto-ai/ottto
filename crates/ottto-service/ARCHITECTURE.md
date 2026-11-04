@@ -15,7 +15,9 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Discovery.** The recursive watcher (`snapshot_watcher.rs`) turns file-system events into
   hints. File-system events are advisory and can be missed, so a periodic listing that compares
   size, modification time and file identity remains the safety net (`snapshot_roots.rs`). A file
-  whose length grew past its saved size is never dropped from discovery because of its age.
+  whose length grew past its saved size is never dropped from discovery because of its age. A file
+  never read, last modified more than 60 days before the walk, is not read for the first time;
+  a file already read, owed or queued keeps the walk's window.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
@@ -45,12 +47,15 @@ non-permanent reasons hold their entity without invalidating sibling ACKs. See
   the archive-read allowance is spent; a refused family waits for the next load.
   Queued rollovers and opaque decode holds defer compaction. Row deletion and exact cold
   metadata publish together; loading stays read-only and idle maintenance owns reclaim.
-- **Claude continuation** (`snapshots/tail_source/`, `durable_tail_codec.rs`): a completed read stages
+- **Claude, Codex and Pi continuation** (`snapshots/tail_source/`, `durable_tail_codec.rs`): a completed read stages
   its running reduction into the state database; the pass's save commits it with the index. A later
   read loads the committed head, checks identity and the file certificate, and streams the pages,
-  session facts (title, first prompt, workspace, opening settings) among them: no transcript byte is
+  session facts (title, first prompt, workspace, opening settings; Codex also stores its agent
+  label and prelude) among them: no transcript byte is
   read back for content. A refusal is a counted Full; only a newer build's
-  head holds. Codex and Pi keep RAM reductions and read Full after a restart. Each pass removes the
+  head holds. Codex checks its ownership-affecting sidecar binding before reusing a head; changed
+  ownership evidence reconstructs through the counted Full path. Pi stores its usage ledger,
+  totals and fork state on the same Tail seam. Each pass removes the
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
   retried, never via full erasure.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
@@ -128,8 +133,10 @@ What a privacy setting removes from an upload is decided in `upload_policy.rs`, 
 that read its settings; it never refuses a body, and hashes are computed afterwards from what is
 sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
-Erasure (retirement, source removal, forget installation, uninstall) reaches every
-store and is counted when it fails. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+Erasure (retirement, uninstall) reaches every store and is counted when it fails.
+Source removal, grant loss, logout, account switch and forget installation only stop
+collection and keep local state; re-enabling a source resumes from it and drops only
+that source's upload witnesses. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
 
 Local collection never depends on an upload setting. No read-side identity (file scope, Codex
 group scope, traversal, memos, tier receipts, archives) includes a setting, the attribution key, a

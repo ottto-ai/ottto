@@ -377,6 +377,10 @@ struct RetainedHeap {
     census: Option<u64>,
     side_maps: Option<u64>,
     files: Option<u64>,
+    /// Request hashes the census holds, and the one occupancy alarm: at
+    /// least 75% of `CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE`. Nothing is capped.
+    census_hashes: u64,
+    census_occupancy_alarm: bool,
 }
 /// Existing requested-layout accounting, excluding inline stack slots. Shared
 /// Arc buffers are conservatively charged to each owning graph. No JSON size
@@ -408,6 +412,7 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     let usage_pending = heap(&index.claude_usage_family_pending)
         .zip(family_requests)
         .and_then(|(all, requests)| all.checked_sub(requests));
+    let hashes = index.claude_request_census.hash_total();
     RetainedHeap {
         account_pending: heap(&index.claude_account_family_pending),
         usage_pending,
@@ -415,6 +420,9 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
         side_maps: side_maps(index),
+        census_hashes: hashes as u64,
+        census_occupancy_alarm: hashes
+            >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
     }
 }
 fn side_maps(index: &ScanIndex) -> Option<u64> {
@@ -588,6 +596,8 @@ mod ops_tests {
                 [
                     "hydrate_route_entry",
                     "hydrate_after_ack",
+                    "hydrate_after_catalogue",
+                    "hydrate_after_accounts",
                     "hydrate_after_decode",
                     "hydrate_after_baseline",
                     "hydrate_exit",
@@ -606,7 +616,6 @@ mod ops_tests {
             }
             drop(loaded);
         }
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -641,7 +650,6 @@ mod ops_tests {
             .as_u64()
             .is_some_and(|rows| rows >= 13));
         drop(index);
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -761,5 +769,32 @@ mod ops_tests {
         let json = serde_json::to_string(&observation).unwrap();
         assert!(!json.contains("synthetic-private"));
         assert!(json.contains("family.requests"));
+    }
+
+    /// [behaviour] The existing state_v2 line flags census occupancy at 75%
+    /// of the alarm base.
+    #[test]
+    fn state_v2_line_flags_census_occupancy_at_75pct() {
+        use super::super::super::claude_request_census::{
+            ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+            CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE as BASE,
+        };
+        for (hashes, alarm) in [(BASE / 4 * 3 - 1, false), (BASE / 4 * 3, true)] {
+            let mut index = ScanIndex::default();
+            index.claude_request_census.insert_for_test(
+                "/synthetic/projects/a.jsonl",
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    (0..hashes as u64).collect(),
+                ),
+            );
+            let observation = retained_heap(&index);
+            assert_eq!(observation.census_hashes, hashes as u64);
+            assert_eq!(observation.census_occupancy_alarm, alarm, "{hashes}");
+            let json = serde_json::to_value(&observation).unwrap();
+            assert_eq!(json["census_occupancy_alarm"], alarm);
+        }
     }
 }

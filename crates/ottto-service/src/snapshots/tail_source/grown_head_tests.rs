@@ -9,14 +9,19 @@ use super::super::seam::tests::{route, Route};
 use super::tests::{counted, loaded};
 use super::*;
 use crate::durable_tail_codec::{Durable, Enc, Shape};
-use crate::snapshots::claude_context_file_birth::KNOWN_COPY_WRITERS;
+use crate::snapshots::claude_context_file_birth::retired_writer_bytes_for_test;
 use crate::snapshots::session_start::SessionStartState;
 use sha2::{Digest, Sha256};
 
-/// Slots in this build's writer array.
-const N: usize = KNOWN_COPY_WRITERS.len();
+/// Slots in the retired writer array.
+const N: usize = 2;
 /// The latest stored line, as Unix nanos.
 const LATEST: i64 = 1_792_000_000_123_456_789;
+
+/// The retired writer field as this build writes it: an empty certificate.
+fn neutral_writer() -> Vec<u8> {
+    retired_writer_bytes_for_test(i64::MIN, &[i64::MIN], N)
+}
 
 /// Replaces the one occurrence of `from` in `head` with `to`.
 fn splice(head: &mut Vec<u8>, from: &[u8], to: &[u8]) {
@@ -69,45 +74,24 @@ fn opening_lens(state: &SessionStartState) -> (usize, usize) {
     )
 }
 
-/// [money] A head stored before the last writer was appended loads as a
-/// hit. The appended slot takes the stored `latest`, so a stored certificate
-/// stays (all stored lines by an already-listed writer) and no stored line
-/// is certified as the appended writer's own (lines of a then-unlisted
-/// version moved every listed slot, so they read as another writer's).
+/// [format] The retired writer certificate stays in the head layout: a head
+/// that stored one (of either slot count) loads as a hit, the stored value
+/// is dropped, and the next encode writes the empty certificate.
 #[test]
-fn a_head_from_before_an_appended_writer_is_a_hit_that_keeps_its_certificate() {
+fn a_stored_writer_certificate_loads_as_a_hit_and_is_dropped() {
     let mut route = route();
-    let cutoff = i128::from(LATEST) - 1;
-    // (file, slot 0 as stored, certified from `cutoff`)
-    for (name, first, certified) in [
-        ("listed-writer.jsonl", i64::MIN, true),
-        ("other-writer.jsonl", LATEST, false),
-    ] {
-        let mut others = [LATEST; N];
-        others[0] = first;
-        let (path, key) = committed_spliced(&mut route, name, |acc| {
-            let birth = &mut acc.claude_file_birth;
-            birth.set_writer_for_test(LATEST, others);
-            assert_eq!(birth.writer_certified_from_for_test(cutoff), certified);
-            (
-                birth.writer_bytes_for_test(N),
-                birth.writer_bytes_for_test(N - 1),
-            )
-        });
+    for (name, slots) in [("one-writer.jsonl", N - 1), ("two-writers.jsonl", N)] {
+        let stored = retired_writer_bytes_for_test(LATEST, &[LATEST - 1, i64::MIN], slots);
+        let (path, key) =
+            committed_spliced(&mut route, name, |_| (neutral_writer(), stored.clone()));
         let (load, records) = loaded(&route, &path, &key);
         assert!(matches!(load, Load::Reused(..)), "{name}");
         assert_eq!(counted(&records), ("hit".into(), vec![]), "{name}");
         let acc = decoded(&route, &key);
-        let birth = &acc.claude_file_birth;
-        let (latest, decoded_others) = birth.writer_for_test();
-        assert_eq!(latest, LATEST, "{name}");
-        assert_eq!(decoded_others[..N - 1], others[..N - 1], "{name}");
-        assert_eq!(decoded_others[N - 1], LATEST, "{name}: the stored latest");
-        assert_eq!(
-            birth.writer_certified_from_for_test(cutoff),
-            certified,
-            "{name}: the stored certificate is unchanged"
-        );
+        let again = round_trips(&acc.claude_file_birth);
+        let contains = |field: &[u8]| again.windows(field.len()).any(|w| w == field);
+        assert!(contains(&neutral_writer()), "{name}: written empty");
+        assert!(!contains(&stored), "{name}: the stored value is dropped");
     }
 }
 
@@ -155,12 +139,10 @@ fn a_longer_stored_array_is_a_counted_corrupt_reconstruction() {
     let mut route = route();
     type Longer = fn(&mut SnapshotAccumulator) -> (Vec<u8>, Vec<u8>);
     let cases: [(&str, Longer); 3] = [
-        ("writers.jsonl", |acc| {
-            let birth = &mut acc.claude_file_birth;
-            birth.set_writer_for_test(LATEST, [i64::MIN; N]);
+        ("writers.jsonl", |_| {
             (
-                birth.writer_bytes_for_test(N),
-                birth.writer_bytes_for_test(N + 1),
+                neutral_writer(),
+                retired_writer_bytes_for_test(LATEST, &[i64::MIN], N + 1),
             )
         }),
         ("parts.jsonl", |acc| {
@@ -197,10 +179,10 @@ fn a_longer_stored_array_is_a_counted_corrupt_reconstruction() {
 /// `value` put, taken back and put again: the same bytes both times.
 fn round_trips<T: Durable>(value: &T) -> Vec<u8> {
     let put = |value: &T| {
-        let mut e = Enc::bytes(1 << 20);
-        e.with_moved_field("OpeningCall.files", |e| value.put(e))
-            .unwrap();
-        e.into_bytes()
+        Enc::count_write(1 << 20, |e| {
+            e.with_moved_field("OpeningCall.files", |e| value.put(e))
+        })
+        .unwrap()
     };
     let first = put(value);
     let mut d = crate::durable_tail_codec::Dec::new(&first);
@@ -218,17 +200,10 @@ fn the_current_shape_round_trips_byte_identical() {
     let route = route();
     let mut stored = None;
     let (mut tail, _native) = route.complete("a.jsonl", &lines(3), None, |acc| {
-        let mut others = [LATEST; N];
-        others[0] = i64::MIN;
-        acc.claude_file_birth.set_writer_for_test(LATEST, others);
         acc.session_start.set_grown_for_test();
         let (parts, requests) = opening_lens(&acc.session_start);
         let (parts, requests) = acc.session_start.grown_bytes_for_test(parts, requests);
-        stored = Some((
-            acc.claude_file_birth.writer_bytes_for_test(N),
-            parts,
-            requests,
-        ));
+        stored = Some((neutral_writer(), parts, requests));
     });
     let head = tail.take_staged_for_test().head;
     let (writer, parts, requests) = stored.expect("PRE ran");
@@ -248,15 +223,10 @@ fn the_current_shape_round_trips_byte_identical() {
     assert!(once(&start, &parts) && once(&start, &requests));
 }
 
-/// [money] Append-only pins. `KNOWN_COPY_WRITERS` is frozen (an append
-/// re-enables a copy route); a stored head keeps writers by position, so the
-/// listed prefix never changes. `Part` is stored by position too.
+/// [money] Append-only pin: `Part` is stored by position, so the listed
+/// prefix never changes.
 #[test]
 fn stored_slot_lists_are_append_only() {
-    assert!(
-        KNOWN_COPY_WRITERS.starts_with(&["2.1.309", "2.1.310"]),
-        "{KNOWN_COPY_WRITERS:?}"
-    );
     let parts = SessionStartState::part_order_for_test();
     assert!(
         parts.starts_with(&[
@@ -298,14 +268,53 @@ fn claude_layout() -> String {
     ClaudeCompactionObservation::shape(&mut s);
     <(String, String, String)>::shape(&mut s);
     u64::shape(&mut s);
+    // These ignored Codex-only markers store no Claude bytes. Keep the
+    // Claude descriptor (and its pin) identical to main's shared shape.
+    s.text()
+        .replace(
+            "I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots;",
+            "",
+        )
+        .replace("I codex_sidecar_binding: Option<String>;", "")
+}
+
+/// The Codex head envelope, trailer, collection geometry, page elements and
+/// full-content prelude fact. An appended grown-array slot keeps this shape.
+fn codex_layout() -> String {
+    let mut s = Shape::default();
+    s.push("HeadIdentity{H binding;digest32;N capture;bool;H key_epoch;digest32;}");
+    crate::transcript_acquisition::DurableCertificate::shape(&mut s);
+    JsonlReadReport::shape(&mut s);
+    <(usize, usize, bool)>::shape(&mut s);
+    super::super::shape_fields(&mut s);
+    super::super::codex::shape_layout(&mut s);
     s.text().to_owned()
+}
+
+const CODEX_LAYOUT_SHA256: &str =
+    "241516630645f3bbc0b72232025c2b826b25663c4802bc3cc549d735db7eac8b";
+
+/// [format] Codex's persisted head, pages and prelude fact have one layout pin.
+#[test]
+fn the_codex_head_page_and_prelude_layout_is_pinned() {
+    let layout = codex_layout();
+    let digest: String = Sha256::digest(layout.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, CODEX_LAYOUT_SHA256,
+        "the Codex Tail layout changed; layout:\n{layout}"
+    );
+    assert!(layout.contains("G block_chars;[len];u64;"));
 }
 
 /// SHA-256 of `claude_layout()`. A change here is a layout change: decide
 /// whether old heads still decode (a `G` append does), or bump
 /// `Claude::REDUCTION_REVISION`, then update this pin.
+// Main's exact pin; the Claude descriptor omits only ignored Codex markers.
 const CLAUDE_LAYOUT_SHA256: &str =
-    "7b524958b42c394491662b40f42f762bb51526f5c31689be1a130f5008cfb69e";
+    "292b38dad1f7aaaf7010d40285e1f68e5cb32418496c619707b32e1e6e0603d1";
 
 /// [money] Any drift of the stored Claude head or page layout fails here.
 #[test]

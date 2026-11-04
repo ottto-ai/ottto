@@ -122,6 +122,7 @@ macro_rules! scan_index_fields {
             claude_reemission_exclusions => Misc (runtime none) [] side,
             reason_reoffer_retries => Misc (runtime none) [] side,
             terminal_contract_retries => Misc (runtime none) [] side,
+            head_conflict_sessions => Misc (runtime none) [] side,
             refusal_exposure => Misc (runtime none) [] side,
             claude_history_unverified_in_process => Misc (runtime none) [] side,
             claude_rebuild_read_load_eligible => Misc (runtime none) [] side,
@@ -147,8 +148,8 @@ macro_rules! scan_index_fields {
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
-            copy_prefix_recovery_scope => Misc (runtime none) [] side,
-            claude_folder_login_ledger => Misc (misc check_field Map) ["v1_field.claude_folder_login_ledger" => 5] side,
+            // An earlier store's row stays accepted and is never read or written.
+            retired_claude_folder_login_ledger => Misc (retired none) ["v1_field.claude_folder_login_ledger" => 5] side,
             tail_discovery => Misc (misc check_field Field) ["scan_state.tail_discovery" => 5] side,
         }
     };
@@ -275,6 +276,7 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
             | "codex_state_only_blocked_unattributed"
             | "codex_state_only_blocked_legacy"
             | "codex_state_only_blocked_attributed"
+            | "claude_folder_login_ledger"
     ) {
         // TOMBSTONE: decode-and-drop, as the v1 decoder does.
         map.next_value::<serde::de::IgnoredAny>()?;
