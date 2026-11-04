@@ -17,7 +17,9 @@ fail (exit 1). Notes never fail.
   budget        at most 25 entries per directory; module depth at most 3 below
                 snapshots/, 5 inside a tests/ directory.
   path-include  `#[path]` and item-level `include!` only as listed in
-                scripts/source_layout_includes.tsv, a list that may only shrink.
+                scripts/source_layout_includes.tsv, a list that may only shrink:
+                against the base commit a new row must replace a removed row
+                of the same kind and target file name (a moved include).
   names         no generic stems (util(s), helper(s), misc, common, shared,
                 base, core, types, stuff, tmp, new, old) in any `_` part of a
                 file or directory name, and no coded stems (a1_, e2_, g7_,
@@ -205,8 +207,19 @@ def check_path_include(rows: list[tuple[str, str, str]], allowed: list[tuple[str
                                                        f"\"{row[2]}\" is not in {INCLUDES}"))
     for row in sorted(allowed_set - set(rows)):
         out.append(Finding("path-include", row[0], f"row \"{row[2]}\" in {INCLUDES} can go", note=True))
-    if base_allowed is not None and len(allowed) > len(base_allowed):
+    if base_allowed is None:
+        return
+    if len(allowed) > len(base_allowed):
         out.append(Finding("path-include", INCLUDES, f"{len(allowed)} rows, up from {len(base_allowed)} at base"))
+    # A new row is only a relocated old one: same kind and target file name.
+    gone = [row for row in base_allowed if row not in allowed_set]
+    for row in [row for row in allowed if row not in set(base_allowed)]:
+        twin = next((old for old in gone if old[1] == row[1]
+                     and posixpath.basename(old[2]) == posixpath.basename(row[2])), None)
+        if twin is None:
+            out.append(Finding("path-include", row[0], f"row \"{row[2]}\" in {INCLUDES} is new, not a relocated row"))
+        else:
+            gone.remove(twin)
 
 
 def names_of(files: list[str], dirs: list[str]) -> list[tuple[str, str]]:

@@ -148,7 +148,22 @@ class LayoutTests(unittest.TestCase):
         self.write({'scripts/source_layout_includes.tsv': f'{SRC}/snapshots.rs\tpath\tsnapshots/extra.rs\n'
                                                           f'{SRC}/snapshots.rs\tinclude\tsnapshots/other.rs\n'})
         _, found, _ = self.findings('--base', base)
-        self.assertEqual(found, ['path-include: scripts/source_layout_includes.tsv: 2 rows, up from 1 at base'])
+        self.assertEqual(found, ['path-include: scripts/source_layout_includes.tsv: 2 rows, up from 1 at base',
+                                 ('path-include: snapshots.rs: row "snapshots/other.rs" in '
+                                  'scripts/source_layout_includes.tsv is new, not a relocated row')])
+        # Swapping a row for a new include keeps the count but is still new.
+        self.write({'scripts/source_layout_includes.tsv': f'{SRC}/snapshots.rs\tinclude\tsnapshots/other.rs\n'})
+        _, found, _ = self.findings('--base', base)
+        self.assertIn('path-include: snapshots.rs: row "snapshots/other.rs" in '
+                      'scripts/source_layout_includes.tsv is new, not a relocated row', found)
+        # A row whose include moved with its file is a relocation.
+        self.write({f'{SRC}/snapshots.rs': CLEAN[f'{SRC}/snapshots.rs'] + 'mod wire_moved;\n',
+                    f'{SRC}/snapshots/wire_moved.rs': '//! Moved.\n\n#[path = "inner/extra.rs"]\nmod extra;\n',
+                    f'{SRC}/snapshots/wire_moved/inner/extra.rs': '//! Extra.\n',
+                    f'{SRC}/snapshots/extra.rs': None,
+                    'scripts/source_layout_includes.tsv': f'{SRC}/snapshots/wire_moved.rs\tpath\tinner/extra.rs\n'})
+        _, found, _ = self.findings('--base', base)
+        self.assertEqual([f for f in found if f.startswith('path-include')], [])
 
     def test_name_header_and_stutter_rules(self):
         self.write({

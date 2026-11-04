@@ -192,6 +192,8 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
             if item.kind in GLUE:
                 lead_comments(item, module, chain, container)
             elif item.kind == "mod" and item.members is not None:
+                # Plain comments above the wrapper are kept; its docs may become `//!`.
+                lead_comments(item, module, chain, container)
                 inner = module + (item.name,) if module else None
                 visit(item.members, inner, chain | rst.module_attrs(item.attrs), "")
             elif item.kind == "impl" and item.members is not None:

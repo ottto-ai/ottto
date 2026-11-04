@@ -318,6 +318,7 @@ class LedgerTests(unittest.TestCase):
     def test_inline_module_becomes_a_file_with_its_cfg_and_indentation(self):
         base = self.repo.commit({src('snapshots.rs'): ROOT + code('''
 
+            // Checks the formatter.
             #[cfg(test)]
             mod tests {
                 use super::*;
@@ -340,14 +341,18 @@ class LedgerTests(unittest.TestCase):
                 assert_eq!(helper(1), "1");
             }
         ''')
-        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n#[cfg(test)]\nmod tests;\n',
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n// Checks the formatter.\n#[cfg(test)]\nmod tests;\n',
                                  src('snapshots/tests.rs'): tests})
         status, out = run(self.repo, base, head)
         self.assertEqual(status, 0, out)
-        head = self.repo.commit({src('snapshots.rs'): ROOT + '\nmod tests;\n'})
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n// Checks the formatter.\nmod tests;\n'})
         status, out = run(self.repo, base, head)
         self.assertEqual(status, 1)
         self.assertIn("module attributes changed for fn formats", out)
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n#[cfg(test)]\nmod tests;\n'})
+        status, out = run(self.repo, base, head)
+        self.assertEqual(status, 1)
+        self.assertIn("removed or changed: comment before mod tests", out)
 
     def test_include_str_paths_must_reach_the_same_bytes(self):
         reader = 'fn golden() -> &\'static str {\n    include_str!("../fixtures/a.json")\n}\n'

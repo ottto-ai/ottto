@@ -285,6 +285,13 @@ class RetryTests(unittest.TestCase):
         self.assertFalse(runner.never_retry('relay::upload::x', set(), modules))
         self.assertFalse(runner.never_retry('snapshots::upload::tests::x', set(), modules))
 
+    def test_folders_above_the_crates_root_do_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'src' / 'checkout' / 'crates'
+            (root / 'c' / 'tests' / 'support').mkdir(parents=True)
+            (root / 'c' / 'tests' / 'support' / 'ledger.rs').write_text('money_oracle::assert_held();\n')
+            self.assertEqual(runner.oracle_modules(root), {'ledger'})
+
     def test_owner_qualified_names_keep_every_current_never_retry_decision(self):
         def old_module_name(path):
             if path.stem in ('mod', 'lib', 'main'):
@@ -292,9 +299,11 @@ class RetryTests(unittest.TestCase):
             return f'{path.parent.name}::tests' if path.stem == 'tests' else path.stem
 
         source = SCRIPT.parent.parent / 'crates'
-        changed = {path.relative_to(source).as_posix(): runner.module_name(path) for path in source.rglob('*.rs')
+        relative = [path.relative_to(source) for path in source.rglob('*.rs')]
+        changed = {path.as_posix(): runner.module_name(path) for path in relative
                    if runner.module_name(path) != old_module_name(path)}
         # Only files under a src/**/tests/ directory get a new name, and none of them use the money oracle.
+        self.assertTrue(changed)
         self.assertTrue(all('/src/' in path and '/tests/' in path for path in changed), changed)
         self.assertFalse([path for path in changed if 'money_oracle' in (source / path).read_text()])
         new = runner.oracle_modules(source)
