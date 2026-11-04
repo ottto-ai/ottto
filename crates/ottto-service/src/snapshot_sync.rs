@@ -1801,9 +1801,12 @@ impl SnapshotUploadProgress {
                             && state
                                 .get("observations")
                                 .and_then(serde_json::Value::as_array)
-                                .is_some_and(|rows| rows.len() <= 128)
-                            && serde_json::to_vec(state)
-                                .is_ok_and(|bytes| bytes.len() <= 128 * 1024)
+                                .is_some_and(|rows| {
+                                    rows.len() <= crate::snapshots::cache_observations::MAX_ROWS
+                                })
+                            && serde_json::to_vec(state).is_ok_and(|bytes| {
+                                bytes.len() <= crate::snapshots::cache_observations::MAX_STATE_BYTES
+                            })
                     })
                     && progress
                         .quarantined_fingerprints
@@ -15635,7 +15638,7 @@ mod tests {
             crate::canonical_json::canonicalize(&expected)
                 .unwrap()
                 .len()
-                <= crate::snapshots::cache_observations::MAX_WIRE_BYTES
+                <= crate::snapshots::cache_observations::MAX_STATE_BYTES
         );
         progress.record_cache_state(&network, false).unwrap();
         assert_eq!(

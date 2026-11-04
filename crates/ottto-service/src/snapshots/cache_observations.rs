@@ -13,12 +13,13 @@ pub(crate) fn event_id(session_ref: &str, request_ref: &str) -> String {
 }
 
 // Server-enforced bounds (the backend's cache observation schema): at most
-// MAX_OPERATIONS operations per uploaded patch, and MAX_ROWS rows and
-// MAX_WIRE_BYTES per session's accepted state. The detector itself keeps
-// every row; the upload sends what these bounds admit.
+// MAX_OPERATIONS operations and MAX_PATCH_BYTES per uploaded patch, and
+// MAX_ROWS rows and MAX_STATE_BYTES per session's accepted state. The
+// detector itself keeps every row; the upload sends what these bounds admit.
 pub const MAX_OPERATIONS: usize = 64;
-pub const MAX_ROWS: usize = 128;
-pub const MAX_WIRE_BYTES: usize = 128 * 1024;
+pub const MAX_PATCH_BYTES: usize = 128 * 1024;
+pub const MAX_ROWS: usize = 512;
+pub const MAX_STATE_BYTES: usize = 640 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RequestSlot {
@@ -93,7 +94,7 @@ impl CacheObservations {
             })
             && serde_json::to_value(self).is_ok_and(|value| {
                 crate::canonical_json::canonicalize(&value)
-                    .is_ok_and(|bytes| bytes.len() <= MAX_WIRE_BYTES)
+                    .is_ok_and(|bytes| bytes.len() <= MAX_PATCH_BYTES)
             })
     }
 }
