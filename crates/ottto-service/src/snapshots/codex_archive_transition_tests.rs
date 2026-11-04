@@ -576,7 +576,6 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     money_oracle::assert_equivalent(&emitted(&index, &cold_a), &route(&index, &recovered, posts));
     let (mut index, _) = assert_quiet(&c, index, &accepted);
     // Unknown headers remain a wildcard, including a misleading owner name.
-    fs::remove_file(sibling.with_extension("")).unwrap();
     fs::write(&sibling, b"unknown header").unwrap();
     append(&c.path(OTHER), &turn(4));
     e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
