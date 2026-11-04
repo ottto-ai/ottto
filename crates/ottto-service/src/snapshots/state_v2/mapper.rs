@@ -154,7 +154,8 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
 }
 /// Shared-evidence kinds: (kind, field holding request-set references, class).
 /// `file.census` keeps one set in its field; the others keep a map of sets.
-/// Retired `usage.pending` stays listed so removing its rows releases its sets.
+/// Retired `account_window` and `usage.pending` stay listed so removing their
+/// rows releases their sets.
 const SHARED: [(&str, &str, &str); 4] = [
     ("account_window", "r", "account"),
     ("usage.pending", "member_request_id_hashes", "requests"),

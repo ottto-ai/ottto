@@ -79,7 +79,7 @@ fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     index.record_accepted_snapshot_fingerprints(&accepted);
-    let prior = session.save_reload(&mut index).0;
+    let prior = session.save_reload(&mut index);
 
     let restart = E2ScanFixture::default();
     let ((_, scan, modes), consumed) = fixture::observe_consumed(|| page(&c, &restart, prior));

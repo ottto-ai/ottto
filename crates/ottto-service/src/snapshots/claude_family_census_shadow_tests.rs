@@ -1,12 +1,10 @@
 // The count-only per-family Claude census shadow. Every fixture is
 // synthetic and content-free, evaluates with transcript I/O denied, and checks
-// that the shadow leaves the index (including every `census_complete` bit)
-// byte-identical.
+// that the shadow leaves the index byte-identical.
 use super::claude_family_census_shadow::*;
 use super::*;
 
 const WINDOW: &str = "2026-10-30T00:00:00Z";
-const OLD_WINDOW: &str = "2026-10-29T00:00:00Z";
 const NOW: u64 = 1_793_318_400;
 const SCAN_ROOT: &str = "/synthetic/projects";
 
@@ -56,46 +54,6 @@ fn index() -> ScanIndex {
     }
 }
 
-fn request_hash(seed: usize) -> String {
-    format!("{seed:016x}{}", "0".repeat(48))
-}
-
-/// Account proof for exactly `members`, one distinct request each.
-fn pending(members: &[String], window: &str, seed: usize) -> ClaudeAccountFamilyPending {
-    let member_requests = members
-        .iter()
-        .enumerate()
-        .map(|(offset, member)| {
-            let hashes = BTreeSet::from([request_hash(seed * 64 + offset)]);
-            (
-                member.clone(),
-                ClaudeAccountRequestSet::from_full_hashes(&hashes).expect("distinct prefixes"),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    ClaudeAccountFamilyPending {
-        current: ClaudeAccountFamilyPendingWindow {
-            version: CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
-            census_window_end: window.into(),
-            account_identifier_hash: "a".repeat(64),
-            evidence_request_count: members.len() as u128,
-            census_complete: false,
-            members: members.iter().map(|member| (member.clone(), 1)).collect(),
-            member_requests,
-            invalid: false,
-        },
-        previous_windows: Default::default(),
-        confirmed_absent_members: BTreeSet::new(),
-    }
-}
-
-fn member_name(root: &str, agent: Option<usize>) -> String {
-    match agent {
-        Some(agent) => format!("{root}_agent-{agent}"),
-        None => root.to_string(),
-    }
-}
-
 /// An index entry at a finalized source/entity/body tuple.
 fn finalized_entry() -> ScanIndexEntry {
     let mut entry = tests::manifest_index_entry(Some("entity"));
@@ -103,37 +61,13 @@ fn finalized_entry() -> ScanIndexEntry {
     entry
 }
 
-/// Finalize every member's account proof at its current tuple, as ordinary
-/// finalization does for a qualified member.
-fn bind_revisions(index: &mut ScanIndex) {
-    for (key, entry) in &index.files {
-        let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
-            continue;
-        };
-        if let Some(requests) = index
-            .claude_account_family_pending
-            .get_mut(&root)
-            .and_then(|pending| pending.member_requests.get_mut(&member))
-        {
-            requests.identity_revision = claude_account_identity_revision(
-                &entry.source_file_fingerprint,
-                entry.last_snapshot_fingerprint.as_deref(),
-                entry.last_upload_body_witness.as_deref(),
-            );
-        }
-    }
-}
-
-/// Index a family observed this generation at its current revision, with a
-/// current-window account proof finalized at that revision. Returns its member
-/// keys, root first.
+/// Index a family observed this generation at its current revision. Returns
+/// its member keys, root first.
 fn add_family(index: &mut ScanIndex, dir: &str, n: usize, subagents: usize) -> Vec<String> {
     let root = root_id(n);
     let mut keys = vec![root_key(dir, &root)];
-    let mut names = vec![member_name(&root, None)];
     for agent in 0..subagents {
         keys.push(subagent_key(dir, &root, agent));
-        names.push(member_name(&root, Some(agent)));
     }
     for key in &keys {
         index.files.insert(key.clone(), finalized_entry());
@@ -144,10 +78,6 @@ fn add_family(index: &mut ScanIndex, dir: &str, n: usize, subagents: usize) -> V
             .observed_index_keys
             .insert(key.clone());
     }
-    index
-        .claude_account_family_pending
-        .insert(root, pending(&names, WINDOW, n));
-    bind_revisions(index);
     keys
 }
 
@@ -231,13 +161,6 @@ fn assert_partition(counts: &FamilyCounts) {
     );
 }
 
-fn no_census_bits(index: &ScanIndex) -> bool {
-    index
-        .claude_account_family_pending
-        .values()
-        .all(|pending| !pending.census_complete)
-}
-
 type Mutation = Box<dyn Fn(&mut ScanIndex)>;
 
 fn case(
@@ -263,7 +186,6 @@ fn current_families_complete_and_singletons_are_counted() {
     assert_eq!(counts.evaluated, 2);
     assert_eq!(counts.singletons, 1);
     assert!(counts.incomplete.is_empty());
-    assert!(no_census_bits(&index));
     // A subagent key and its root key name the same family.
     assert_eq!(family(&family_keys[0]), family(&family_keys[2]));
 }
@@ -351,39 +273,16 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
                     .insert(key.clone());
             }
         }),
+        // A member re-armed: its revision is empty.
         case(Incomplete::Evidence, 1, {
-            let root = target_root.clone();
+            let key = target[1].clone();
             move |index| {
                 index
-                    .claude_account_family_pending
-                    .get_mut(&root)
+                    .files
+                    .get_mut(&key)
                     .unwrap()
-                    .invalid = true;
-            }
-        }),
-        // A proof of no finalized revision, or of an older one.
-        case(Incomplete::Evidence, 1, {
-            let root = target_root.clone();
-            move |index| {
-                index
-                    .claude_account_family_pending
-                    .get_mut(&root)
-                    .unwrap()
-                    .member_requests
-                    .values_mut()
-                    .for_each(|requests| requests.identity_revision = None);
-            }
-        }),
-        case(Incomplete::Evidence, 1, {
-            let root = target_root.clone();
-            move |index| {
-                index
-                    .claude_account_family_pending
-                    .get_mut(&root)
-                    .unwrap()
-                    .member_requests
-                    .values_mut()
-                    .for_each(|requests| requests.identity_revision = Some("0".repeat(64)));
+                    .source_file_fingerprint
+                    .clear();
             }
         }),
         case(Incomplete::Held, 1, {
@@ -397,16 +296,6 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
                         ..Default::default()
                     },
                 );
-            }
-        }),
-        case(Incomplete::NotCurrentWindow, 1, {
-            let root = target_root.clone();
-            move |index| {
-                index
-                    .claude_account_family_pending
-                    .get_mut(&root)
-                    .unwrap()
-                    .census_window_end = OLD_WINDOW.into();
             }
         }),
         // The same root also has a path in another directory.
@@ -433,7 +322,6 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
         assert_eq!(counts.incomplete, only(reason, affected), "{reason:?}");
         assert_eq!(counts.complete, 5 - affected, "{reason:?}");
         assert_eq!(counts.evaluated, 5);
-        assert!(no_census_bits(&index));
     }
 }
 
@@ -538,19 +426,13 @@ fn coverage_needs_an_attestation_of_the_current_revision() {
     let attested = attest_all(&base);
     assert_eq!(evaluate_attested(&base, &refs, &attested).complete, 1);
 
-    // A later revision: the proof is stale until it finalizes, and the old
-    // attestation does not name it either.
+    // A later revision: the old attestation does not name it.
     let mut grown = base.clone();
     grown
         .files
         .get_mut(&keys[1])
         .unwrap()
         .source_file_fingerprint = "source-2".into();
-    assert_eq!(
-        evaluate_attested(&grown, &refs, &attest_all(&grown)).incomplete,
-        only(Incomplete::Evidence, 1)
-    );
-    bind_revisions(&mut grown);
     assert_eq!(
         evaluate_attested(&grown, &refs, &attested).incomplete,
         presence_only
@@ -781,20 +663,8 @@ fn changed_new_and_deleted_members_never_count_as_covered() {
         .clear();
     assert_eq!(reason(&cleared), only(Incomplete::Evidence, 1));
 
-    // New: an indexed subagent the account proof does not name, or one
-    // observed this generation with no index entry yet.
+    // New: a subagent observed this generation with no index entry yet.
     let new_member = subagent_key("dir-a", &root, 9);
-    let mut unproven = base.clone();
-    unproven
-        .files
-        .insert(new_member.clone(), tests::manifest_index_entry(None));
-    unproven
-        .traversal
-        .as_mut()
-        .unwrap()
-        .observed_index_keys
-        .insert(new_member.clone());
-    assert_eq!(reason(&unproven), only(Incomplete::Evidence, 1));
     let mut unindexed = base.clone();
     unindexed
         .traversal
@@ -804,8 +674,7 @@ fn changed_new_and_deleted_members_never_count_as_covered() {
         .insert(new_member);
     assert_eq!(reason(&unindexed), only(Incomplete::Evidence, 1));
 
-    // Deleted: indexed but not enumerated this generation, or gone from the
-    // index while the proof still names it.
+    // Deleted: indexed but not enumerated this generation.
     let mut unlisted = base.clone();
     unlisted
         .traversal
@@ -814,33 +683,6 @@ fn changed_new_and_deleted_members_never_count_as_covered() {
         .observed_index_keys
         .remove(&keys[1]);
     assert_eq!(reason(&unlisted), only(Incomplete::MembershipUnknown, 1));
-    let mut removed = base.clone();
-    removed.files.remove(&keys[1]);
-    removed
-        .traversal
-        .as_mut()
-        .unwrap()
-        .observed_index_keys
-        .remove(&keys[1]);
-    assert_eq!(reason(&removed), only(Incomplete::Evidence, 1));
-    assert!(base.claude_account_family_pending.contains_key(&root));
-}
-
-/// [behaviour] old window carry alone stays incomplete.
-#[test]
-fn old_window_carry_alone_stays_incomplete() {
-    let mut index = index();
-    let keys = add_family(&mut index, "dir-a", 3, 2);
-    // Every member observed this generation at a non-empty revision, and an
-    // otherwise exact proof, but from the previous window.
-    index
-        .claude_account_family_pending
-        .get_mut(&root_id(3))
-        .unwrap()
-        .census_window_end = OLD_WINDOW.into();
-    let counts = evaluate(&index, &[family(&keys[0])]);
-    assert_eq!(counts.incomplete, only(Incomplete::NotCurrentWindow, 1));
-    assert_eq!(counts.complete, 0);
 }
 
 /// [behaviour] quantum admits 64 complete families and defers the rest.
@@ -956,7 +798,6 @@ fn m4_shape_drains_3000_queued_members_at_100_per_page() {
             .families
             .incomplete
             .contains_key(&Incomplete::EvidencePresenceOnly));
-        assert!(no_census_bits(&index));
     }
     assert_eq!(completed.len(), FAMILIES);
 }
@@ -973,13 +814,6 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
         }
         match n % 5 {
             1 => queue(&mut index, &keys[0]),
-            2 => {
-                index
-                    .claude_account_family_pending
-                    .get_mut(&root_id(n))
-                    .unwrap()
-                    .census_window_end = OLD_WINDOW.into();
-            }
             3 => {
                 index
                     .traversal
@@ -1040,9 +874,7 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
     assert_eq!(second.families.complete, 0);
     assert_eq!(
         reason(&second.families, Incomplete::EvidencePresenceOnly),
-        first.families.complete
-            + first.families.deferred.quantum
-            + reason(&first.families, Incomplete::NotCurrentWindow)
+        first.families.complete + first.families.deferred.quantum
     );
     for kept in [Incomplete::Queued, Incomplete::Residue] {
         assert_eq!(
@@ -1056,7 +888,6 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
         first.pending_census_members.count
     );
     assert_eq!(second.skipped_set.digest, first.skipped_set.digest);
-    assert!(no_census_bits(&reloaded));
 }
 
 /// [behaviour] first pending at is bounded and counts pace evictions.
@@ -1188,7 +1019,6 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
         // One member was served and its sibling is still queued: the source
         // census stays open and the shadow sets no bit.
         assert!(!scan.census_complete);
-        assert!(no_census_bits(&index));
     }
     let _ = fs::remove_dir_all(root);
 }
@@ -1789,9 +1619,9 @@ fn the_merged_pass_counts_a_shared_key_once_across_a_budget_stop() {
 }
 
 /// One production Claude page of one file, through the real step, the page
-/// hooks, account accumulation and, when `finalize`, ordinary finalization.
-/// Returns the page's shadow row.
-fn production_page(dir: &Path, index: &mut ScanIndex, finalize: bool) -> Value {
+/// hooks, own account evidence and ordinary finalization. Returns the page's
+/// shadow row.
+fn production_page(dir: &Path, index: &mut ScanIndex) -> Value {
     let dirs = [dir.to_path_buf()];
     let (mut scan, records) = crate::local_resource_diagnostics::capture(|| {
         scan_source_roots_with_test_limit(
@@ -1804,16 +1634,8 @@ fn production_page(dir: &Path, index: &mut ScanIndex, finalize: bool) -> Value {
         )
         .unwrap()
     });
-    apply_claude_effort_evidence_with_index(
-        &mut scan.snapshots,
-        &root_evidence(),
-        index,
-        false,
-        PAGE_WINDOW,
-    );
-    if finalize {
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
-    }
+    apply_claude_effort_evidence_with_index(&mut scan.snapshots, &root_evidence(), index);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
     records
         .iter()
         .rev()
@@ -1826,68 +1648,14 @@ fn complete_count(row: &Value) -> u64 {
     row["family_census_complete"].as_u64().unwrap()
 }
 
-fn root_revision(index: &ScanIndex) -> Option<String> {
-    index.claude_account_family_pending[ROOT].member_requests[ROOT]
-        .identity_revision
-        .clone()
-}
-
-/// [behaviour] a real parse and finalization complete a family on a later production page.
+/// [behaviour] a real parse completes a family on a later production page.
 #[test]
-fn a_real_parse_and_finalization_complete_a_family_on_a_later_production_page() {
+fn a_real_parse_completes_a_family_on_a_later_production_page() {
     let dir = production_corpus("e7-8a-production-complete");
     let mut index = ScanIndex::default();
-    let first = production_page(&dir, &mut index, true);
-    assert_eq!(complete_count(&first), 0, "not finalized when it parsed");
-    assert!(root_revision(&index).is_some(), "ordinary finalization ran");
-    // The parse's attestation and the finalized proof now meet.
-    let second = production_page(&dir, &mut index, true);
+    production_page(&dir, &mut index);
+    // The parse's attestation covers the next page's evaluation.
+    let second = production_page(&dir, &mut index);
     assert_eq!(complete_count(&second), 1, "{second}");
-    assert!(no_census_bits(&index));
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// [behaviour] a proof that never finalized stays evidence on production pages.
-#[test]
-fn a_proof_that_never_finalized_stays_evidence_on_production_pages() {
-    let dir = production_corpus("e7-8a-production-missing");
-    let mut index = ScanIndex::default();
-    production_page(&dir, &mut index, false);
-    assert_eq!(root_revision(&index), None, "no finalization ran");
-    let second = production_page(&dir, &mut index, false);
-    assert_eq!(complete_count(&second), 0, "{second}");
-    assert!(second["family_census_incomplete"]["evidence"].as_u64() >= Some(1));
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// [behaviour] same window growth is incomplete until the new revision finalizes.
-#[test]
-fn same_window_growth_is_incomplete_until_the_new_revision_finalizes() {
-    let dir = production_corpus("e7-8a-production-growth");
-    let mut index = ScanIndex::default();
-    production_page(&dir, &mut index, true);
-    assert_eq!(complete_count(&production_page(&dir, &mut index, true)), 1);
-    let finalized = root_revision(&index);
-    // The file grows by a line with no new request, and the walk re-reads it.
-    let path = dir.join(format!("{ROOT}.jsonl"));
-    let mut grown = fs::read_to_string(&path).unwrap();
-    grown.push_str("{\"type\":\"summary\",\"summary\":\"grown\"}\n");
-    fs::write(&path, grown).unwrap();
-    index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .pending_candidates
-        .push_front(ScanTraversalPath {
-            scan_root: dir.clone(),
-            path,
-            census_member: true,
-            watcher_hint: false,
-        });
-    // R0's proof and R1's parse on one page: attested, but not bound.
-    let parsed = production_page(&dir, &mut index, false);
-    assert_eq!(complete_count(&parsed), 0, "{parsed}");
-    assert!(parsed["family_census_incomplete"]["evidence"].as_u64() >= Some(1));
-    assert_eq!(root_revision(&index), finalized, "still R0's proof");
     let _ = fs::remove_dir_all(dir);
 }

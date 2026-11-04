@@ -118,8 +118,6 @@ impl Holds {
                 field,
                 "files"
                     | "growth_retention"
-                    | "claude_account_family_witnesses"
-                    | "claude_account_family_pending"
                     | "claude_usage_family_witnesses"
                     | "claude_usage_authority_quarantine"
                     | "quarantined_snapshot_fingerprints"
@@ -337,8 +335,6 @@ impl Serialize for ScanIndex {
         field!(codex_state_only_blocked_legacy, BTreeSet::is_empty);
         field!(codex_state_only_blocked_attributed, std::ops::Not::not);
         field!(claude_desktop_title_files, BTreeMap::is_empty);
-        field!(held claude_account_family_witnesses);
-        field!(held claude_account_family_pending);
         field!(held claude_usage_family_witnesses);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
         field!(
@@ -442,8 +438,8 @@ pub(super) const FIELDS: &[&str] = &[
     "codex_parent_proof_seq",
     "codex_proof_index_incarnation",
     "claude_desktop_title_files",
-    "claude_account_family_witnesses",
-    "claude_account_family_pending",
+    "claude_account_family_witnesses", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_account_family_pending", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_usage_family_witnesses",
     "claude_usage_family_pending", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_request_census",
@@ -1190,8 +1186,6 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
                 );
             }};
         }
-        field!(claude_account_family_witnesses);
-        field!(claude_account_family_pending);
         field!(claude_usage_family_witnesses);
         field!(claude_usage_authority_quarantine);
         self.reader = std::io::Cursor::new(input.0);
@@ -1268,8 +1262,6 @@ pub(super) fn post_decode_hydrated(
             .growth_retention
             .extend(decoder.records("growth_retention", span, true)?);
     }
-    records!(claude_account_family_witnesses);
-    records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
@@ -1911,10 +1903,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             if let Some(name) = name {
                 if matches!(
                     name,
-                    "claude_account_family_witnesses"
-                        | "claude_account_family_pending"
-                        | "claude_usage_family_witnesses"
-                        | "claude_usage_authority_quarantine"
+                    "claude_usage_family_witnesses" | "claude_usage_authority_quarantine"
                 ) {
                     self.family_spans.insert(name, value);
                 }
@@ -2036,21 +2025,16 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_title_files" => {
                             index.claude_desktop_title_files = self.typed(value)?
                         }
-                        "claude_account_family_witnesses" => {
-                            index.claude_account_family_witnesses =
-                                self.records("claude_account_family_witnesses", value, true)?
-                        }
-                        "claude_account_family_pending" => {
-                            index.claude_account_family_pending =
-                                self.records("claude_account_family_pending", value, true)?
-                        }
                         "claude_usage_family_witnesses" => {
                             index.claude_usage_family_witnesses = self
                                 .records::<Shared<_>>("claude_usage_family_witnesses", value, true)?
                                 .into()
                         }
-                        // TOMBSTONE: decode-and-drop (retired global census state).
+                        // TOMBSTONE: decode-and-drop (retired global census
+                        // and family account state).
                         "claude_usage_family_pending"
+                        | "claude_account_family_witnesses"
+                        | "claude_account_family_pending"
                         | "claude_duplicate_request_owners"
                         | "claude_duplicate_request_witness_overflowed"
                         | "claude_owned_start_census"
@@ -2423,12 +2407,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         self.counts.authority_repairs -= 1;
                     }
                     match field {
-                        "claude_account_family_witnesses" => {
-                            index.claude_account_family_witnesses.remove(&key);
-                        }
-                        "claude_account_family_pending" => {
-                            index.claude_account_family_pending.remove(&key);
-                        }
                         "claude_usage_family_witnesses" => {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
@@ -2528,8 +2506,6 @@ impl ScanIndex {
             || self.decode_holds.2.contains(&repair_key(root))
             || [
                 "claude_usage_authority_quarantine",
-                "claude_account_family_witnesses",
-                "claude_account_family_pending",
                 "claude_usage_family_witnesses",
             ]
             .iter()

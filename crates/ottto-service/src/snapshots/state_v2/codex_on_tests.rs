@@ -140,15 +140,9 @@ impl Drop for Route {
     }
 }
 
-/// Serialized graph with cold rows read back from the session store.
+/// Serialized graph.
 fn view(index: &ScanIndex) -> serde_json::Value {
-    let cold = money_test_support::has_cold_archive(index);
-    serde_json::to_value(if cold {
-        money_test_support::resident(index)
-    } else {
-        index.clone()
-    })
-    .unwrap()
+    serde_json::to_value(index).unwrap()
 }
 fn assert_same(expected: &ScanIndex, actual: &ScanIndex) {
     assert_eq!(view(actual), view(expected));
@@ -240,18 +234,22 @@ fn v2_reload_keeps_per_path_first_load_membership() {
 }
 
 /// [format] A previous release's store holds rows of every retired kind:
-/// Claude's with usage members (a request set shared with a live row, a value
-/// stored in chunks) and a raw usage hold, Codex's and Pi's manifest-only.
-/// One hydrate and save removes them all, releases their request sets and
-/// chunks, and leaves every live row as it was; a reopen finds none.
+/// Claude's with usage and account members (request sets shared with a live
+/// row or between retired rows, values stored in chunks), Codex's and Pi's
+/// manifest-only. A save that fails leaves every live row as it was; one
+/// hydrate and save removes the retired rows, releases each request set by
+/// its retired owners and their chunks, and leaves every live row, account
+/// bindings and deferred holds included, as it was; a reopen finds none.
 #[test]
 fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
     use kinds::tests::{referenced_sets, set_refs};
-    const LIVE: [&str; 4] = [
+    const LIVE: [&str; 6] = [
         "accepted.entity",
         "refusal.authority",
         "proof.usage",
         "file.census",
+        "setting.binding",
+        "proof.deferred_account",
     ];
     let live = |db: &mut sqlite::Sqlite| {
         let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -270,9 +268,26 @@ fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
         let scratch = crate::test_scratch::ScratchDir::canonical("retired-purge");
         let path = scratch.join("state.v2.sqlite.import");
         let index = if claude {
-            kinds::tests::with_co_owned_witness(build())
+            let mut index = kinds::tests::with_co_owned_witness(build());
+            let (file, entry) = index.files.iter().next().expect("a Claude file");
+            let (file, fingerprint) = (file.clone(), entry.source_file_fingerprint.clone());
+            index
+                .claude_account_deferred_holds
+                .insert(file, fingerprint);
+            index.session_account_bindings.insert(
+                crate::snapshots::sha256_hex(&["session_owner:v1", "synthetic-machine", "s"]),
+                serde_json::from_value(json!({"account_identifier_hash": "a".repeat(64)})).unwrap(),
+            );
+            index
         } else {
             build()
+        };
+        let accounts = |index: &ScanIndex| {
+            serde_json::to_value((
+                &index.session_account_bindings,
+                &index.claude_account_deferred_holds,
+            ))
+            .unwrap()
         };
         let mut db = money_test_support::populate(source, &path, &index, BTreeMap::new());
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
@@ -282,42 +297,61 @@ fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
             !claude || before.len() > LIVE.len(),
             "Claude holds live members"
         );
-        // Each usage row's request sets, with their counts before the purge.
-        let mut sets = Vec::new();
+        // Each retired member row's request sets: the count before the purge
+        // and how many retired owners hold it.
+        let mut sets = BTreeMap::<RowKey, (u64, u64)>::new();
         {
             let mut tx = db.begin(TxnMode::Read).unwrap();
             for key in retired.iter().filter(|key| {
-                matches!(key, RowKey::Record { kind, position: 1, .. } if kind.name() == "usage.pending")
+                matches!(key, RowKey::Record { kind, position, .. }
+                    if *position > 0 && matches!(kind.name(), "usage.pending" | "account_window"))
             }) {
                 let h = tx.get(key).unwrap().unwrap();
-                if key == &mapper::key("usage.pending", kinds::tests::CHUNKED, 1).unwrap() {
-                    assert!(h.parts > 0, "{source:?}: stored in chunks");
+                for chunked in ["usage.pending", "account_window"] {
+                    if key == &mapper::key(chunked, kinds::tests::CHUNKED, 1).unwrap() {
+                        assert!(h.parts > 0, "{source:?}: {chunked} stored in chunks");
+                    }
                 }
                 for set in referenced_sets(&mut tx, key) {
                     let refs = set_refs(&mut tx, &set).unwrap();
-                    sets.push((set, refs));
+                    sets.entry(set).or_insert((refs, 0)).1 += 1;
                 }
             }
         }
-        assert_eq!(sets.len(), if claude { 2 } else { 0 }, "{source:?}");
+        assert_eq!(sets.len(), if claude { 4 } else { 0 }, "{source:?}");
+        // A failed save changes no live row.
+        sqlite::fence_commit_writing(&db, "generation");
+        let error = kinds::tests::purge(&mut db, money_test_support::binding(source)).unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+        assert_eq!(live(&mut db), before, "{source:?}: a failed save");
         kinds::tests::purge(&mut db, money_test_support::binding(source)).unwrap();
         drop(db);
         let mut db = sqlite::Sqlite::open(&path, &identity).unwrap();
-        let (_, cx) = kinds::hydrate(&mut db, money_test_support::binding(source)).unwrap();
+        let (reopened, cx) = kinds::hydrate(&mut db, money_test_support::binding(source)).unwrap();
         assert!(cx.retired.is_empty(), "{source:?}");
+        assert_eq!(accounts(&reopened), accounts(&index), "{source:?}");
         {
             let mut tx = db.begin(TxnMode::Read).unwrap();
             for key in &retired {
                 assert!(tx.get(key).unwrap().is_none(), "{source:?}: {key:?}");
             }
-            for (set, refs) in &sets {
-                // One reference less: a set only the retired row held is released.
+            for (set, (refs, owners)) in &sets {
+                // Less its retired owners: a set only retired rows held is released.
                 let after = set_refs(&mut tx, set);
-                assert_eq!(after, refs.checked_sub(1).filter(|n| *n > 0), "{source:?}");
+                assert_eq!(
+                    after,
+                    refs.checked_sub(*owners).filter(|n| *n > 0),
+                    "{source:?}"
+                );
             }
         }
+        // A live row's set survives; one two retired rows shared does not.
         assert!(
-            sets.iter().any(|(_, refs)| *refs == 2) == claude,
+            sets.values().any(|(refs, owners)| refs > owners) == claude,
+            "{source:?}"
+        );
+        assert!(
+            sets.values().any(|(_, owners)| *owners == 2) == claude,
             "{source:?}"
         );
         assert_eq!(live(&mut db), before, "{source:?}: live rows untouched");

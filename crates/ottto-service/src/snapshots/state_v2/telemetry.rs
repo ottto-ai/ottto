@@ -191,13 +191,7 @@ pub(super) fn hydrate_checkpoint(
         process_cpu_us: crate::local_resource_diagnostics::state_v2_cpu_us(),
         save_digests: Some(save_digests),
         // Hydrate-owned maps; no key/value walks or serialized size estimates.
-        kind_cx_entries: cx.map(|cx| {
-            cx.presence.len()
-                + cx.account_ids.len()
-                + cx.digests.len()
-                + cx.cold_rolled.len()
-                + cx.compaction.done.len()
-        }),
+        kind_cx_entries: cx.map(|cx| cx.presence.len() + cx.digests.len()),
         ..Default::default()
     };
     #[cfg(test)]
@@ -370,7 +364,6 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 
 #[derive(Default, Serialize)]
 struct RetainedHeap {
-    account_pending: Option<u64>,
     census: Option<u64>,
     side_maps: Option<u64>,
     files: Option<u64>,
@@ -399,7 +392,6 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     let hashes = index.claude_request_census.hash_total();
     RetainedHeap {
-        account_pending: heap(&index.claude_account_family_pending),
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
         side_maps: side_maps(index),
