@@ -19,23 +19,16 @@ struct ClaudeProofBodyDrain {
 }
 
 /// Exact-ACK and proven no-op drains settled on the working index before save
-/// selection, with each drained family's pre-drain record and pending proof.
-/// Not persisted.
+/// selection, with each drained family's pre-drain record. Not persisted.
 #[derive(Debug, Default)]
 pub(crate) struct ClaudeProofBodyDrains {
     drains: Vec<ClaudeProofBodyDrain>,
-    families: BTreeMap<
-        String,
-        (
-            ClaudeUsageAuthorityQuarantineRecord,
-            Option<ClaudeUsageFamilyPending>,
-        ),
-    >,
+    families: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
 }
 
 impl ClaudeProofBodyDrains {
     /// Adds a later settlement's drains. A family keeps its earliest
-    /// pre-drain record and pending proof.
+    /// pre-drain record.
     pub(crate) fn append(&mut self, later: Self) {
         self.drains.extend(later.drains);
         for (root, family) in later.families {
@@ -100,8 +93,6 @@ const CLAUDE_AUTHORITY_DROP_LOGGED_REFS: usize = 4;
 thread_local! {
     static CLAUDE_AUTHORITY_DROPS_FOR_TEST: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
-    static CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
 }
 
 /// This thread's dropped records and re-armed files.
@@ -110,15 +101,8 @@ pub(crate) fn claude_authority_drops_for_test() -> (usize, usize) {
     CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
-pub(crate) fn claude_authority_unwitnessed_demotions_for_test() -> usize {
-    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(std::cell::Cell::get)
-}
-
 fn count_claude_authority_unwitnessed_demotion() {
     CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
 }
 
 fn claude_authority_record_contract_is_valid(
@@ -146,57 +130,8 @@ impl ScanIndex {
             .any(|record| record.proof_correction.is_some())
     }
 
-    fn rebind_claude_authority_proof(&mut self, root: &str, new: &ClaudeUsageFamilyWitness) {
-        let Some(old) = self.claude_usage_family_witnesses.get(root) else {
-            return;
-        };
-        let Some(record) = self.claude_usage_authority_quarantine.get(root) else {
-            return;
-        };
-        let proof = claude_usage_family_witness_fingerprint(new);
-        if record.disposition != ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
-            || !claude_usage_authority_preserves_pending(record, old)
-            || proof == record.proven_witness_fingerprint
-        {
-            return;
-        }
-        // Conservative R5 fallback: a changed provider proof can alter a body
-        // without changing transcript bytes. Until body equivalence is proved,
-        // every member owes a correction under each genuinely new proof.
-        let record = self
-            .claude_usage_authority_quarantine
-            .get_mut(root)
-            .unwrap();
-        record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
-        record.proven_witness_fingerprint = proof.clone();
-        record.proof_correction = Some(ClaudeAuthorityProofCorrection {
-            proof_witness_fingerprint: proof,
-            owed_member_ids: record
-                .member_source_file_fingerprints
-                .keys()
-                .cloned()
-                .collect(),
-        });
-    }
-
-    // RetryPending members were held, never uploaded under the old proof.
-    // Reproof changes only their binding; no correction grant or retry reset.
-    fn rebind_retry_pending_claude_authority(&mut self, root: &str) {
-        let Some(witness) = self.claude_usage_family_witnesses.get(root) else {
-            return;
-        };
-        let Some(record) = self.claude_usage_authority_quarantine.get_mut(root) else {
-            return;
-        };
-        if record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-            && claude_usage_authority_deadline_is_bounded(record)
-        {
-            record.proven_witness_fingerprint = claude_usage_family_witness_fingerprint(witness);
-        }
-    }
-
     // An unbound or ill-formed record fails closed alone, on
-    // load and on save, with its pending proof state. Terminal refusals and
+    // load and on save. Terminal refusals and
     // the upload ledger stay. Its indexed members are re-armed, bounded by
     // family size, so the next pass re-reads the family and re-forms the
     // record against the current witness, or leaves unproven residue.
@@ -218,7 +153,6 @@ impl ScanIndex {
         }
         for root in &unbound {
             self.claude_usage_authority_quarantine.remove(root);
-            self.claude_usage_family_pending.discard(root);
         }
         let mut rearmed = 0_usize;
         for (index_key, entry) in self.files.slots_mut() {
@@ -266,46 +200,6 @@ impl ScanIndex {
         );
     }
 
-    // Only the existing complete healthy census can retire absent grants.
-    fn retire_absent_claude_proof_corrections(
-        &mut self,
-        complete: &BTreeMap<String, BTreeSet<String>>,
-    ) {
-        let mut resolved = Vec::new();
-        for (root, record) in &mut self.claude_usage_authority_quarantine {
-            let Some(correction) = &mut record.proof_correction else {
-                continue;
-            };
-            let Some(members) = complete.get(root) else {
-                resolved.push(root.clone());
-                continue;
-            };
-            if !record
-                .member_source_file_fingerprints
-                .keys()
-                .any(|member| members.contains(member))
-            {
-                // Only whole-family authoritative absence may clear an empty
-                // map. Keep malformed partial-family bookkeeping fail-closed.
-                eprintln!("local snapshot sync: claude proof correction reason=member_map_absence_mismatch owed_members={}", correction.owed_member_ids.len());
-                continue;
-            }
-            correction
-                .owed_member_ids
-                .retain(|member| members.contains(member));
-            record
-                .member_source_file_fingerprints
-                .retain(|member, _| members.contains(member));
-            if correction.owed_member_ids.is_empty() {
-                resolved.push(root.clone());
-            }
-        }
-        for root in resolved {
-            self.claude_usage_authority_quarantine.remove(&root);
-            self.claude_usage_family_pending.discard(&root);
-        }
-    }
-
     // A1: exact completed zero-entity parse advances only its revision pairing.
     // The owed set and all acceptance/debt fields are unchanged.
     pub(crate) fn advance_empty_claude_proof_corrections(&mut self, result: &SourceScanResult) {
@@ -322,7 +216,7 @@ impl ScanIndex {
             let Some(entry) = self.files.get(&pending.index_key) else {
                 continue;
             };
-            if entry.observed_fingerprint() != pending.source_file_fingerprint
+            if entry.source_file_fingerprint.as_str() != pending.source_file_fingerprint
                 || entry.last_snapshot_fingerprint.is_some()
                 || self
                     .file_snapshot_fingerprints
@@ -372,7 +266,7 @@ impl ScanIndex {
                 continue;
             };
             if !self.files.get(key).is_some_and(|entry| {
-                entry.observed_fingerprint() == *revision
+                entry.source_file_fingerprint.as_str() == *revision
                     && entry.last_snapshot_fingerprint.is_none()
             }) || self
                 .file_snapshot_fingerprints
@@ -403,7 +297,7 @@ impl ScanIndex {
         for advance in advances {
             let carried = self.confirmed_empty_files.contains(&advance.key)
                 && self.files.get(&advance.key).is_some_and(|entry| {
-                    entry.observed_fingerprint() == advance.revision
+                    entry.source_file_fingerprint.as_str() == advance.revision
                         && entry.last_snapshot_fingerprint.is_none()
                 })
                 && !self
@@ -452,8 +346,8 @@ impl ScanIndex {
     // The body-drain analogue of the restore above: a drain certifies
     // only the revision and entity set the selected save keeps. Any other
     // selected entry leaves the member owed under the same proof with its
-    // pre-drain pair. A record its last drain removed is re-bound with its
-    // pending proof. Returns whether any member owes again.
+    // pre-drain pair. A record its last drain removed is re-bound. Returns
+    // whether any member owes again.
     pub(crate) fn restore_unselected_claude_proof_body_drains(
         &mut self,
         drains: ClaudeProofBodyDrains,
@@ -465,7 +359,7 @@ impl ScanIndex {
         let (carried, reverted): (Vec<_>, Vec<_>) = drains.into_iter().partition(|drain| {
             self.files
                 .get(&drain.key)
-                .is_some_and(|entry| entry.observed_fingerprint() == drain.revision)
+                .is_some_and(|entry| entry.source_file_fingerprint.as_str() == drain.revision)
                 && self.file_snapshot_fingerprints.get(&drain.key) == Some(&drain.fingerprints)
         });
         for drain in &reverted {
@@ -475,7 +369,7 @@ impl ScanIndex {
             {
                 continue;
             }
-            let Some((mut record, pending)) = families.remove(&drain.root) else {
+            let Some(mut record) = families.remove(&drain.root) else {
                 continue;
             };
             if !self
@@ -502,10 +396,6 @@ impl ScanIndex {
             }
             self.claude_usage_authority_quarantine
                 .insert(drain.root.clone(), record);
-            if let Some(pending) = pending {
-                self.claude_usage_family_pending
-                    .add_absent(drain.root.clone(), pending);
-            }
         }
         let mut owed_again = false;
         for drain in reverted {
@@ -536,68 +426,6 @@ impl ScanIndex {
         owed_again
     }
 
-    // Earlier-page A1 pairs must drain before the generic proof re-arm clears
-    // source fingerprints. This is local no-body completion, not entity deletion.
-    fn settle_known_empty_claude_proof_corrections(
-        &mut self,
-        current_files: &BTreeSet<String>,
-        snapshots: &[SnapshotItem],
-    ) {
-        if !self.claude_authority_proof_correction_pending() {
-            return;
-        }
-        let pairs = self
-            .confirmed_empty_files
-            .iter()
-            .filter_map(|key| {
-                let (root, member) = claude_index_path_family_member(Path::new(key))?;
-                if current_files.contains(key)
-                    || snapshots.iter().any(|snapshot| {
-                        snapshot.source_session_id == member
-                            && claude_snapshot_family_root(snapshot) == root
-                    })
-                {
-                    return None;
-                }
-                let record = self.claude_usage_authority_quarantine.get(&root)?;
-                let correction = record.proof_correction.as_ref()?;
-                let entry = self.files.get(key)?;
-                (correction.owed_member_ids.contains(&member)
-                    && !entry.rearmed()
-                    && record.member_source_file_fingerprints.get(&member)
-                        == Some(&entry.source_file_fingerprint)
-                    && entry.last_snapshot_fingerprint.is_none()
-                    && !self
-                        .file_snapshot_fingerprints
-                        .get(key)
-                        .is_some_and(|fps| !fps.is_empty()))
-                .then_some((root, member))
-            })
-            .collect::<Vec<_>>();
-        for (root, member) in pairs {
-            let record = self
-                .claude_usage_authority_quarantine
-                .get_mut(&root)
-                .unwrap();
-            record
-                .proof_correction
-                .as_mut()
-                .unwrap()
-                .owed_member_ids
-                .remove(&member);
-            if record
-                .proof_correction
-                .as_ref()
-                .unwrap()
-                .owed_member_ids
-                .is_empty()
-            {
-                self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.discard(&root);
-            }
-        }
-    }
-
     // This settlement drains only local authority correction bookkeeping, never old entity
     // or manifest debt. Partial checkpoint keeps its existing prior-entity rule.
     pub(crate) fn settle_empty_claude_proof_corrections(&mut self, result: &SourceScanResult) {
@@ -625,7 +453,7 @@ impl ScanIndex {
             let known_current = record.member_source_file_fingerprints.get(&member)
                 == Some(&entry.source_file_fingerprint);
             if !known_current
-                || entry.rearmed()
+                || entry.source_file_fingerprint.is_empty()
                 || self
                     .file_snapshot_fingerprints
                     .get(key)
@@ -635,7 +463,8 @@ impl ScanIndex {
                     pending.index_key == *key
                         && (!pending.parse_complete
                             || pending.parsed_snapshot_count != 0
-                            || pending.source_file_fingerprint != entry.observed_fingerprint())
+                            || pending.source_file_fingerprint
+                                != entry.source_file_fingerprint.as_str())
                 })
             {
                 continue;
@@ -654,7 +483,6 @@ impl ScanIndex {
             correction.owed_member_ids.remove(&member);
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine.remove(&root);
-                self.claude_usage_family_pending.discard(&root);
             }
         }
     }
@@ -838,7 +666,7 @@ impl ScanIndex {
                 .get(&candidate.root)
                 .is_some_and(|witness| claude_usage_authority_preserves_pending(record, witness))
                 || !self.files.get(&candidate.index_key).is_some_and(|entry| {
-                    entry.observed_fingerprint() == candidate.revision
+                    entry.source_file_fingerprint.as_str() == candidate.revision
                         && entry.last_snapshot_fingerprint.is_none()
                 })
                 || !self.confirmed_empty_files.contains(&candidate.index_key)
@@ -861,7 +689,6 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.discard(&candidate.root);
             }
             eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
         }
@@ -928,10 +755,9 @@ impl ScanIndex {
                         || item.proof != candidate.proof
                         || item.revision != candidate.revision
                 })
-                || !self
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| entry.observed_fingerprint() == candidate.revision)
+                || !self.files.get(key).is_some_and(|entry| {
+                    entry.source_file_fingerprint.as_str() == candidate.revision
+                })
             {
                 continue;
             }
@@ -990,31 +816,13 @@ impl ScanIndex {
                 .filter(|item| rejected(item))
                 .map(|item| item.body_witness.as_str())
                 .collect();
-            // Cold: the drained family's pending is the preimage a revert
-            // restores, so it is loaded first. Unknown leaves this drain owed
-            // (counted); nothing of it is applied.
-            let roots = BTreeSet::from([candidate.root.clone()]);
-            if !drains.families.contains_key(&candidate.root)
-                && state_v2::load_usage(self, &roots).is_err()
-            {
-                continue;
-            }
-            let Ok(pending) = self.claude_usage_family_pending.family(&candidate.root) else {
-                continue;
-            };
-            let pending = pending.cloned();
             for body_witness in rejected_bodies {
                 eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={body_witness}");
             }
             drains
                 .families
                 .entry(candidate.root.clone())
-                .or_insert_with(|| {
-                    (
-                        self.claude_usage_authority_quarantine[&candidate.root].clone(),
-                        pending,
-                    )
-                });
+                .or_insert_with(|| self.claude_usage_authority_quarantine[&candidate.root].clone());
             let record = self
                 .claude_usage_authority_quarantine
                 .get_mut(&candidate.root)
@@ -1027,7 +835,6 @@ impl ScanIndex {
             if correction.owed_member_ids.is_empty() {
                 self.claude_usage_authority_quarantine
                     .remove(&candidate.root);
-                self.claude_usage_family_pending.discard(&candidate.root);
             }
             drains.drains.push(ClaudeProofBodyDrain {
                 root: candidate.root.clone(),

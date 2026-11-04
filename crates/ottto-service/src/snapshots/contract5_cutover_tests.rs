@@ -63,9 +63,9 @@ fn version_two_reowes_nothing_and_seeds_no_mark() {
     let (three, two) = ("/p/three.jsonl", "/p/two.jsonl");
     for record in [
         Some(claude_request_identity::E2_GROUPING),
-        Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING),
+        Some("e2_identity_adoption_pending"),
         Some(""),
-        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL),
+        Some("changed_within_traversal"),
         None,
         Some(claude_request_identity::COLLECTOR),
     ] {
@@ -91,8 +91,8 @@ fn version_two_reowes_nothing_and_seeds_no_mark() {
 }
 
 /// A store written by a #825 build may carry the retired bit. It decodes
-/// unchanged through a save and load, a money-rule pass re-owes nothing for
-/// it, and the contract latch neither clears nor replays it.
+/// unchanged through a save and load, and neither a money-rule pass nor a
+/// contract change re-owes, clears or replays it.
 #[test]
 fn a_retired_permit_bit_is_decoded_and_never_replayed() {
     let root = temp("retired-bit");
@@ -133,9 +133,8 @@ fn a_retired_permit_bit_is_decoded_and_never_replayed() {
 }
 
 /// The always-on contract meets a permit-era record (`""`, none, or the
-/// other collector): it lowers no revision and keeps every mark, and the
-/// latch is set exactly as for any contract change. Was
-/// `a_late_identity_permit_lowers_no_revision`.
+/// other collector): it lowers no revision, keeps every mark and records the
+/// current contract. Was `a_late_identity_permit_lowers_no_revision`.
 #[test]
 fn the_always_on_contract_lowers_no_revision() {
     claude_request_identity::with_cycle_contract_for_test(
@@ -158,7 +157,7 @@ fn the_always_on_contract_lowers_no_revision() {
                 assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
                 assert_eq!(
                     index.claude_request_identity_contract_for_test(),
-                    (Some(claude_request_identity::E2_GROUPING), true),
+                    Some(claude_request_identity::E2_GROUPING),
                     "{record:?}"
                 );
             }

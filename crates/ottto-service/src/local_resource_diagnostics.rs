@@ -1141,7 +1141,7 @@ impl Probe {
                 ],
             ),
             reread: if claude {
-                self.page_events.with_current().without_terminal_rearm()
+                self.page_events.with_current()
             } else {
                 self.page_events.with_current().retained_cache_only()
             },
@@ -1190,34 +1190,6 @@ impl Probe {
         }
         jsonl.emit_page_lines(source);
     }
-}
-
-// Terminal scheduling runs after collection. Same carrier, zero scan counts,
-// no process sampling or draining another producer's identity/money counters.
-fn rearm_collection(rearm: claude_reread::Counts) {
-    #[derive(Serialize)]
-    struct Counts {
-        #[serde(flatten)]
-        collection: CollectionCounts,
-        #[serde(flatten)]
-        rearm: claude_reread::Counts,
-    }
-    emit(&Record {
-        schema_version: SCHEMA_VERSION,
-        process_id: std::process::id(),
-        stage: "native_collection_page",
-        source: Source::from_slug("claude_code"),
-        observation: Observation::point(),
-        counts: Counts {
-            collection: CollectionCounts {
-                scanned_files: 0,
-                semantic_noops: 0,
-                sampled_acquisition: None,
-                full_causes: Default::default(),
-            },
-            rearm,
-        },
-    });
 }
 
 /// All retained account-pending families, including held/incomplete families;
@@ -1624,12 +1596,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
-/// Local alarm, once per park: a held Claude key's progress audit failed its
-/// secure open 8 times in a row and is parked, its audit debt still owed.
-/// Counts only; no path, id or wire event.
-pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
-    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
-}
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
 /// need a tombstone than fit under the cap. Counts only; no path, id or wire
@@ -1802,7 +1768,6 @@ pub(crate) struct NativeComparisonDecision {
     pub(crate) allowed_at_bind: Option<bool>,
     pub(crate) controller_created: bool,
     pub(crate) controller_current_at_finish: Option<bool>,
-    pub(crate) bootstrap: Option<NativeBootstrap>,
     pub(crate) selected_save: bool,
     pub(crate) upload_fully_settled: Option<bool>,
     pub(crate) clean_at_finish: Option<bool>,
@@ -1813,7 +1778,6 @@ pub(crate) struct NativeComparisonDecision {
     pub(crate) deferred_decisions: usize,
     pub(crate) latched_base_decisions: usize,
     pub(crate) other_base_decisions: usize,
-    pub(crate) terminal_rearm: Option<NativeRearm>,
     pub(crate) correction_mint: Option<NativeMint>,
     pub(crate) outcome: NativeDecisionOutcome,
 }
@@ -1825,26 +1789,6 @@ pub(crate) enum NativeDecisionOutcome {
     CadenceWait,
     Finished,
     DisabledBeforeLease,
-}
-#[derive(Clone, Copy, Debug, Serialize)]
-pub(crate) struct NativeBootstrap {
-    pub(crate) native_census_complete: bool,
-    pub(crate) coverage_complete: bool,
-    pub(crate) census_valid: bool,
-    pub(crate) fence_open: bool,
-    pub(crate) pending_occurrences_present: bool,
-    pub(crate) transcript_ownership_complete: bool,
-    pub(crate) scan_census_complete: bool,
-    pub(crate) not_withheld: bool,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub(crate) struct NativeRearm {
-    pub(crate) negative_keys: usize,
-    pub(crate) proof_candidates: usize,
-    /// Actual no-clear decisions: other rearm disjuncts must also be false.
-    pub(crate) suppressed: usize,
-    pub(crate) other_rearm_matches: usize,
-    pub(crate) clear_calls: usize,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct NativeMint {
@@ -1893,7 +1837,7 @@ impl NativeDecision {
             "claude_code",
             &Counts {
                 decision: self.0.get(),
-                events: self.1.get().with_current().without_terminal_rearm(),
+                events: self.1.get().with_current(),
             },
         );
     }
@@ -2710,8 +2654,6 @@ mod tests {
         assert_eq!(a["selected_save"], false);
         assert_eq!(a["retained_permit"], false);
         for unknown in [
-            "bootstrap",
-            "terminal_rearm",
             "correction_mint",
             "controller_current_at_finish",
             "upload_fully_settled",
@@ -2744,16 +2686,6 @@ mod tests {
                 allowed_at_bind: Some(false),
                 controller_created: false,
                 controller_current_at_finish: Some(false),
-                bootstrap: Some(NativeBootstrap {
-                    native_census_complete: false,
-                    coverage_complete: false,
-                    census_valid: false,
-                    fence_open: false,
-                    pending_occurrences_present: false,
-                    transcript_ownership_complete: false,
-                    scan_census_complete: false,
-                    not_withheld: false,
-                }),
                 selected_save: false,
                 upload_fully_settled: Some(false),
                 clean_at_finish: Some(false),
@@ -2764,13 +2696,6 @@ mod tests {
                 deferred_decisions: usize::MAX,
                 latched_base_decisions: usize::MAX,
                 other_base_decisions: usize::MAX,
-                terminal_rearm: Some(NativeRearm {
-                    negative_keys: usize::MAX,
-                    proof_candidates: usize::MAX,
-                    suppressed: usize::MAX,
-                    other_rearm_matches: usize::MAX,
-                    clear_calls: usize::MAX,
-                }),
                 correction_mint: Some(NativeMint {
                     window_available: false,
                     candidates: usize::MAX,
@@ -3008,7 +2933,7 @@ mod tests {
     fn claude_page_events_use_existing_carriers_without_source_leakage() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::clear(true);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -3023,7 +2948,7 @@ mod tests {
             );
             // Another source's page: its retained-cache events and nothing else.
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::clear(true);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -3043,7 +2968,10 @@ mod tests {
         });
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["source"], "claude_code");
-        assert_eq!(rows[0]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(
+            rows[0]["counts"]["claude_reread"]["account_reproof_cleared"],
+            1
+        );
         assert_eq!(
             rows[0]["counts"]["retained_cache_page_events"]["take_hit"],
             1
@@ -3061,75 +2989,6 @@ mod tests {
         for row in rows {
             assert_eq!(row["schema_version"], 2);
             assert!(serde_json::to_string(&row).unwrap().len() < 4096);
-        }
-    }
-
-    #[test]
-    fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
-        let (_, rows) = capture(|| {
-            let scope = claude_reread::Scope::begin(true);
-            claude_record_counts(2, 1, 4);
-            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
-            claude_reread::terminal_rearm(
-                claude_reread::IgnoredVeto::WithheldAccount.bit(),
-                7,
-                false,
-            );
-            claude_reread::terminal_rearm(0, 0, true);
-            // Zero deltas never manufacture a scheduling row.
-            claude_reread::terminal_rearm(0, 99, false);
-            NativeDecision::new().emit();
-            let counts = scope.finish();
-            assert_eq!(counts.rearm_structural_native_duplicate, 1);
-            assert_eq!(counts.rearm_fingerprints_preserved, 7);
-            // The ordinary page still owns its cap observation. It must not
-            // repeat terminal counters from the parent scope or kept counts.
-            let mut probe = Probe::start();
-            probe.page_events = counts;
-            probe.collection(
-                "claude_code",
-                CollectionCounts {
-                    scanned_files: 1,
-                    semantic_noops: 0,
-                    sampled_acquisition: None,
-                    full_causes: Default::default(),
-                },
-            );
-            // Disabled comparison must omit these fields too.
-            claude_reread::emit_without_lease(counts);
-        });
-        assert_eq!(rows.len(), 5);
-        for row in &rows[..2] {
-            assert_eq!(row["stage"], "native_collection_page");
-            assert_eq!(row["source"], "claude_code");
-            assert_eq!(row["schema_version"], 2);
-            assert_eq!(row["counts"]["scanned_files"], 0);
-            assert_eq!(row["counts"]["semantic_noops"], 0);
-            assert!(row["counts"]
-                .get("claude_money_record_cap_half_files")
-                .is_none());
-        }
-        assert_eq!(
-            rows[0]["counts"]["rearm_veto_ignored"],
-            serde_json::json!({"withheld_account": 1})
-        );
-        assert_eq!(rows[0]["counts"]["rearm_fingerprints_preserved"], 7);
-        assert_eq!(rows[1]["counts"]["rearm_structural_native_duplicate"], 1);
-        assert_eq!(rows[2]["stage"], "native_comparison_decision");
-        assert_eq!(rows[2]["counts"]["claude_reread"]["owned_start_cleared"], 1);
-        assert_eq!(rows[3]["counts"]["claude_money_record_cap_half_files"], 1);
-        assert_eq!(rows[4]["stage"], "native_comparison_decision");
-        for row in &rows[2..] {
-            for key in [
-                "rearm_veto_ignored",
-                "rearm_fingerprints_preserved",
-                "rearm_structural_native_duplicate",
-            ] {
-                assert!(
-                    row["counts"].get(key).is_none(),
-                    "terminal delta repeated: {row}"
-                );
-            }
         }
     }
 

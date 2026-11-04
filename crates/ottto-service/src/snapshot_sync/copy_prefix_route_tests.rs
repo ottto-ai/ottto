@@ -2,7 +2,7 @@
 // Not a cross-build receipt: it prints no MONEY_EQUIVALENCE line.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::{
-    money_oracle, observe_consumed, Mode, RouteResult,
+    money_oracle, observe_consumed, upgrade_from_legacy_store, Mode, RouteResult,
 };
 
 fn route(arm: Settled, mode: Mode, page: &Page) -> RouteResult {
@@ -209,7 +209,9 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// file whose uncertified writer copied an earlier session's requests, with
 /// own turns after them, two accounts, a side call and an evidence gap. RAM
 /// Tail, cold Full and a restored owner remove the same copied prefix and
-/// emit the same bodies, totals and placement, with a restart between pages;
+/// emit the same bodies, totals and placement, with a restart between pages,
+/// as does a new owner of the same committed state upgraded from the store an
+/// older release left (pending usage evidence and owed bits on every file);
 /// no grown body is smaller than the accepted one, and a restart after the
 /// last delivered page parses and sends nothing. The prefix stays removed when
 /// the delivered holder proves it, when an earlier build's accepted removal
@@ -283,12 +285,19 @@ fn copy_prefix_routes(arm: Settled) {
                 "{arm:?} page {request}: the {owner} prior owes the holder again"
             );
         }
+        // The committed prior as an older release's store holds it, loaded
+        // by this build.
+        let upgraded =
+            upgrade_from_legacy_store(&priors[2], &c.base.join("legacy-scan-index.json"));
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
         finish_claude_pages(&c, &mut pages);
         bodies.push(compare_claude_uploads(&pages));
         let [tail, full, mut disk_page] = pages;
         let cold = route(arm, Mode::ColdFull, &full);
+        let mut upgrade = c.raw(&E2ScanFixture::default(), upgraded, 100, true, &[]);
+        upgrade.enrich(&c);
+        upgrade.finish();
         assert!(
             accounts(&cold) >= 2,
             "{arm:?} page {request}: positive control, two placed accounts"
@@ -309,6 +318,7 @@ fn copy_prefix_routes(arm: Settled) {
         for other in [
             route(arm, Mode::Ram, &tail),
             route(arm, Mode::DiskRestore, &disk_page),
+            route(arm, Mode::Restart, &upgrade),
         ] {
             money_oracle::assert_equivalent(&cold, &other);
             money_oracle::assert_no_smaller_reemit(COPY, &accepted, &other, &cold, false);

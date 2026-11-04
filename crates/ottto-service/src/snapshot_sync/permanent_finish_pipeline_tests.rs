@@ -6,11 +6,10 @@ use super::*;
 
 #[derive(Clone, Copy, Debug)]
 enum FinishOutcome {
+    /// The backend accepts every body.
     Accept,
-    Permanent,
     Retryable,
     PermanentStatusFailure,
-    PermanentWithoutSidecars,
     PermanentUncleanCensus,
     /// Every body is refused for a reason the backend already dominates with
     /// an accepted record; `admit_residue` is the activity-hint admission of
@@ -24,10 +23,7 @@ enum FinishOutcome {
 impl FinishOutcome {
     /// The refused body is retained, then two quiet cycles re-disclose it.
     fn retains_refusal_across_quiet_cycles(self) -> bool {
-        matches!(
-            self,
-            FinishOutcome::Permanent | FinishOutcome::Dominated { .. }
-        )
+        matches!(self, FinishOutcome::Dominated { .. })
     }
 }
 
@@ -218,9 +214,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         "device-secret",
     )
     .unwrap();
-    if !matches!(outcome, FinishOutcome::PermanentWithoutSidecars) {
-        write_native_bootstrap_sidecars(&fixture, &support);
-    }
+    write_native_bootstrap_sidecars(&fixture, &support);
     if matches!(outcome, FinishOutcome::PermanentUncleanCensus) {
         // A real parse loss makes the native census unclean. Missing optional
         // sidecars alone does not invalidate this root's native request census.
@@ -443,14 +437,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
-    permanent_finish_pipeline(FinishOutcome::Permanent, true);
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
 fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
     for outcome in [
         FinishOutcome::PermanentStatusFailure,
@@ -469,116 +455,6 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(client_report)]
 fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
     permanent_finish_pipeline(FinishOutcome::Retryable, false);
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
-    permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
-}
-
-/// [regress] Dominated residue and retained stale-owed debt keep successful
-/// status. First refusal and quiet cycles retain the residue receipt shape;
-/// owed debt is never accepted or relabelled dominated.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
-    for reason in [
-        "usage_accounting_authority_downgrade",
-        "accepted_log_stale_older_upload",
-    ] {
-        permanent_finish_pipeline(
-            FinishOutcome::Dominated {
-                reason,
-                admit_residue: true,
-            },
-            true,
-        );
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let mut progress = test_upload_progress();
-    let fingerprint = "a".repeat(64);
-    let body = "b".repeat(64);
-    progress.quarantine_permanent_body(&fingerprint, &body, "accepted_log_stale_older_upload");
-    let current = PermanentRefusalCounts::of(&progress);
-    assert_eq!(current.dominated, 1);
-    assert_eq!(current.exposure.owed_entities, 0);
-    assert!(matches!(
-        refused_entity_state(true, current, true),
-        CollectorState::Success
-    ));
-    assert_eq!(
-        progress.quarantined_fingerprints[&fingerprint].disposition,
-        SnapshotQuarantineDisposition::UnprovenTerminal
-    );
-    // A retained refusal predating exposure remains owed, with its existing
-    // terminal disposition unchanged; no migration or fresh read grants proof.
-    progress
-        .permanent_rejections
-        .get_mut(&fingerprint)
-        .unwrap()
-        .exposure = None;
-    let refusals = PermanentRefusalCounts::of(&progress);
-    assert_eq!(refusals.dominated, 0);
-    assert_eq!(refusals.exposure.owed_entities, 1);
-    assert!(matches!(
-        refused_entity_state(true, refusals, true),
-        CollectorState::Success
-    ));
-    assert_eq!(
-        progress.quarantined_fingerprints[&fingerprint].disposition,
-        SnapshotQuarantineDisposition::UnprovenTerminal
-    );
-    // Existing terminal records keep their disposition, their owed custody
-    // and the same admitted successful-residue receipt across an upgrade.
-    let record = progress
-        .quarantined_fingerprints
-        .get_mut(&fingerprint)
-        .unwrap();
-    record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-    record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-    record.retry_after_unix_seconds = 0;
-    let mut index = ScanIndex::default();
-    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-    let mut counts = SyncCounts::for_policy(183).with_snapshot_terminal_counts(&index);
-    counts.census_complete = true;
-    let receipt = captured_terminal_receipt_under_hint(
-        counts,
-        refused_entity_state(true, PermanentRefusalCounts::of(&progress), true),
-        TerminalManifestSource::Withdraw,
-        183,
-        RESIDUE_ADMITTING_HINT,
-    );
-    assert_eq!(receipt["last_error_code"], "census_residue");
-    assert_eq!(receipt["last_census_residue_settled"], true);
-    assert_eq!(receipt["consecutive_failures"], 0);
-    assert!(receipt["last_success_at"].is_string());
-    assert_eq!(
-        PermanentRefusalCounts::of(&progress).exposure.owed_entities,
-        1
-    );
-    assert!(progress.owed_stale_body(&fingerprint, &body));
-    assert!(progress.accepted_fingerprints.is_empty());
-}
-
-/// T4: a backend that does not admit `census_residue_status:v1` never
-/// receives the `census_residue` code.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
-    permanent_finish_pipeline(
-        FinishOutcome::Dominated {
-            reason: "usage_accounting_authority_downgrade",
-            admit_residue: false,
-        },
-        true,
-    );
 }
 
 /// F1: body A is refused as dominated, then a newer body B of the same entity

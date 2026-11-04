@@ -435,7 +435,6 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                     &progress,
                     &holds,
                     false,
-                    None,
                 )
                 .index;
                 settle_index_after_upload(&mut settled, &page.committed, &progress);
@@ -667,16 +666,9 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
         held_fingerprints: BTreeSet::new(),
         account_deferred_fingerprints: BTreeSet::new(),
         progress_blocking: false,
-        held_family_roots: None,
     };
-    let settlement = settle_checkpointed_upload(
-        scanned.clone(),
-        &committed,
-        &progress,
-        &no_holds,
-        false,
-        None,
-    );
+    let settlement =
+        settle_checkpointed_upload(scanned.clone(), &committed, &progress, &no_holds, false);
     assert!(
         !settlement.fully_settled,
         "the refused item keeps a follow-up owed"
@@ -745,7 +737,6 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
         held_fingerprints: held_fingerprints.clone(),
         account_deferred_fingerprints: BTreeSet::new(),
         progress_blocking: true,
-        held_family_roots: None,
     };
     let settle = |outcome: &str, holds: &LocalHoldSettlement| {
         let settlement = match outcome {
@@ -756,7 +747,6 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
                 &progress,
                 holds,
                 other == "rejected",
-                None,
             ),
         };
         let mut index = settlement.index;

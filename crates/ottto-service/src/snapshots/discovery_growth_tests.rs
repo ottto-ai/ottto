@@ -960,6 +960,44 @@ fn run_pages(f: &Fixture, source: SnapshotSource, mut index: ScanIndex) -> Run {
     panic!("{source:?}: the re-listing pass must drain within 8 pages");
 }
 
+/// Each indexed file's proven revision; a re-arm clears it.
+fn proven_revisions(index: &ScanIndex) -> BTreeMap<String, String> {
+    index
+        .files
+        .iter()
+        .filter(|(_, entry)| !entry.source_file_fingerprint.is_empty())
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect()
+}
+
+/// Every re-arm a diagnostic row names: a `rearm_cleared{…}` Full cause or a
+/// nonzero `rearmed` count.
+fn rearm_labels(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key.starts_with("rearm_cleared{") {
+                    out.push(key.clone());
+                }
+                let zero = value.is_null()
+                    || value == &json!(false)
+                    || value == &json!(0)
+                    || value["count"] == json!(0);
+                if key == "rearmed" && !zero {
+                    out.push(format!("rearmed {value}"));
+                }
+                rearm_labels(value, out);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rearm_labels(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Census completion and every loss count a page reports.
 fn census(scan: &SourceScanResult) -> Value {
     json!([
@@ -1038,41 +1076,79 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
         }
 
         // Quiet corpus after a restart: saved index, no retained checkpoint.
-        let mut f = Fixture::new();
-        let mut index = kept_generation(&f, source, true);
-        let path = f.root.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
-        let index = ScanIndex::load(&path).unwrap();
-        f.cache = Arc::new(sampled_scan::SharedCache::default());
-        let opens = all_transcript_opens_for_test();
-        let ((quiet_index, scan, reads, rows), consumed) =
-            sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
-        // The reloaded generation ran its due pass; no first walk replaced it.
-        assert!(!rows.iter().any(|row| {
-            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
-        }));
-        if let Some(traversal) = quiet_index.traversal.as_ref() {
-            assert!(traversal.counts.listing_generations >= 1, "{source:?}");
-        }
-        assert!(scan.snapshots.is_empty(), "{source:?}");
-        assert_eq!(scan.scanned_file_count, 0, "{source:?}");
-        // Zero opens measures zero identity, cheap and other reads.
-        let measured = (all_transcript_opens_for_test() == opens).then_some(0);
-        let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
-            sampled_scan::transition_fixture::Mode::Restart,
-            source,
-            Vec::new(),
-            &[],
-        );
-        quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
-        quiet.io = sampled_scan::transition_fixture::IoBytes {
-            consumed,
-            cheap_checks: measured,
-            anchor_reads: measured,
-            other_reads: measured,
-            ..Default::default()
+        // Claude's store is also restarted as release 0.1.217 left it mid-walk
+        // (pending usage evidence, an owed bit on every file, every family
+        // carried with its files queued for replay, full re-arm progress, the
+        // fence and latch set): the upgrade re-arms and reads nothing either.
+        let legacies: &[bool] = if source == SnapshotSource::ClaudeCode {
+            &[false, true]
+        } else {
+            &[false]
         };
-        sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        for &legacy in legacies {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, true);
+            let path = f.root.join("index.json");
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+            let index = ScanIndex::load(&path).unwrap();
+            let proven = proven_revisions(&index);
+            assert!(!proven.is_empty(), "{source:?}: a proven corpus");
+            let index = if legacy {
+                sampled_scan::transition_fixture::upgrade_from_legacy_store(&index, &path)
+            } else {
+                index
+            };
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let opens = all_transcript_opens_for_test();
+            let ((quiet_index, scan, reads, rows), consumed) =
+                sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+            // The reloaded generation ran its due pass; no first walk replaced it.
+            assert!(!rows.iter().any(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            }));
+            if let Some(traversal) = quiet_index.traversal.as_ref() {
+                assert!(
+                    traversal.counts.listing_generations >= 1,
+                    "{source:?} legacy {legacy}"
+                );
+            }
+            assert!(scan.snapshots.is_empty(), "{source:?} legacy {legacy}");
+            assert_eq!(scan.scanned_file_count, 0, "{source:?} legacy {legacy}");
+            // No file is re-armed: every proven revision survives the load and
+            // the page, no row names a re-arm, and no file reads Full.
+            assert_eq!(
+                proven_revisions(&quiet_index),
+                proven,
+                "{source:?} legacy {legacy}: re-armed a file"
+            );
+            let mut rearms = Vec::new();
+            for row in &rows {
+                rearm_labels(row, &mut rearms);
+            }
+            assert!(rearms.is_empty(), "{source:?} legacy {legacy}: {rearms:?}");
+            assert!(
+                !modes(&reads).iter().any(|mode| mode.starts_with("Full")),
+                "{source:?} legacy {legacy}: a Full read"
+            );
+            // Zero opens measures zero identity, cheap and other reads.
+            let measured = (all_transcript_opens_for_test() == opens).then_some(0);
+            let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
+                sampled_scan::transition_fixture::Mode::Restart,
+                source,
+                Vec::new(),
+                &[],
+            );
+            quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
+            quiet.io = sampled_scan::transition_fixture::IoBytes {
+                consumed,
+                cheap_checks: measured,
+                anchor_reads: measured,
+                other_reads: measured,
+                ..Default::default()
+            };
+            sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        }
     }
 }
 

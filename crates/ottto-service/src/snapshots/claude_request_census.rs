@@ -23,8 +23,10 @@
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref, rfc3339_unix_seconds,
     ClaudeRequestCensusShadowCounts, ScanIndex, ScanIndexEntry, SharedMap, SnapshotItem,
-    MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
 };
+
+/// The duplicate-owner bound of the shadow disjointness measure.
+const MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS: usize = 250_000;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -38,9 +40,9 @@ use std::sync::Arc;
 // N1 diagnostics only: process totals on the existing local census line.
 // Reloading a held record does not enter it again; a lost/over-budget record
 // is not a successful clearance. No persisted or uploaded bookkeeping.
-// Slots: entered, cleared, audit deadline restored (option B).
+// Slots: entered, cleared.
 crate::local_resource_diagnostics::process_static!(fn with_identity_incomplete_holds:
-    [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3]);
+    [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2]);
 
 fn add_identity_incomplete_hold_total(slot: usize, count: u64) {
     with_identity_incomplete_holds(|totals| {
@@ -71,16 +73,6 @@ pub(super) fn identity_incomplete_hold_totals() -> (u64, u64) {
         identity_incomplete_hold_total(0),
         identity_incomplete_hold_total(1),
     )
-}
-
-/// Held entries whose erased audit deadline a sampled scan re-derived. A
-/// restoration whose index is never saved is restored, and counted, again.
-pub(super) fn note_identity_incomplete_hold_deadlines_restored(count: u64) {
-    add_identity_incomplete_hold_total(2, count);
-}
-
-pub(super) fn identity_incomplete_hold_deadlines_restored_total() -> u64 {
-    identity_incomplete_hold_total(2)
 }
 
 /// Bumped only when request-id or occurrence extraction, or the shape rule,
@@ -393,40 +385,6 @@ impl ClaudeRequestCensusRecord {
             && self.verified_not_twin_or_retired()
             && fingerprint_matches(self, entry_fingerprint)
     }
-
-    /// Negative provenance check for the narrow id-less pending exception,
-    /// and for an owed re-stamp from an identity-incomplete record of this
-    /// revision (`evidence_owed`). The pending marker or the stored evidence
-    /// supplies the exact cause; this only refuses parse loss, stale
-    /// derivation, decode invalidation, twins and retirement. It never
-    /// supplies a body ACK, coverage or a duplicate proof.
-    pub(super) fn idless_native_for(&self, entry_fingerprint: &str) -> bool {
-        self.current_derivation()
-            && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
-            && self.verified_not_twin_or_retired()
-            && fingerprint_matches(self, entry_fingerprint)
-    }
-
-    /// `reproduces` in `window`, or in any window from `since` on.
-    pub(super) fn reproduces_since(
-        &self,
-        entry_fingerprint: &str,
-        window: u64,
-        since: Option<u64>,
-    ) -> bool {
-        (self.window == window || since.is_some_and(|since| self.window >= since))
-            && self.reproduces(entry_fingerprint, self.window)
-    }
-
-    /// Owed-evidence keep (`evidence_owed`): this exact revision was
-    /// parsed in `window` under the current derivation, whatever its shape,
-    /// so a re-read reproduces it. Never proof, coverage or an ACK.
-    pub(super) fn reproduces(&self, entry_fingerprint: &str, window: u64) -> bool {
-        self.current_derivation()
-            && self.window == window
-            && self.verified_not_twin_or_retired()
-            && fingerprint_matches(self, entry_fingerprint)
-    }
 }
 
 /// Keys of the retired money ledger. An older build could leave one in the
@@ -458,12 +416,6 @@ pub(crate) fn claude_request_hash(request_id: &str) -> u64 {
     let mut prefix = [0_u8; 8];
     prefix.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(prefix)
-}
-
-/// `claude_request_hash` from a pending key (the full SHA-256 hex of the
-/// request id): its first 16 hex digits. None for a malformed key.
-pub(super) fn claude_request_hash_from_pending_key(sha256_hex: &str) -> Option<u64> {
-    u64::from_str_radix(sha256_hex.get(..16)?, 16).ok()
 }
 
 /// `ScanIndex::claude_request_census`: every record by index key, with the
@@ -562,14 +514,6 @@ impl ClaudeRequestCensus {
         self.records
             .get(key)
             .filter(|record| !record.is_birth_stub())
-    }
-
-    /// Retry carry must see retained invalidation stubs as negative evidence.
-    /// An absent census is allowed for an accepted upload body, but a stub
-    /// left by selected restore or failed finish must not look absent. This
-    /// exposes no positive proof and leaves ordinary census readers unchanged.
-    pub(super) fn retry_carry_record(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
-        self.records.get(key)
     }
 
     /// Every record; birth stubs are skipped.
@@ -1955,9 +1899,7 @@ pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
 
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
-/// one, never with an older revision's. A virtual recovery audit retains its
-/// old unverified hold solely as an exclusion/retry obligation until a fully
-/// finalized, verified Full replaces it.
+/// one, never with an older revision's.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
     if !index.persistence_available() {
         return;
@@ -1967,16 +1909,6 @@ pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Pat
     // Growth debt prevents retirement, not invalidation after a failed
     // object/scope check. Keep scheduling debt, but make old proof inert;
     // unverified alone is insufficient because proves_scan accepts it.
-    // A recovery Full has no sampled marker to retain its obligation. Its
-    // old unverified IdentityIncomplete record cannot bind a body or grant
-    // proof; keep that exclusion/retry obligation after failed validation.
-    // Successful Full verification and explicit vanished-file retirement
-    // still replace/remove it at their existing authority boundaries.
-    if super::sampled_audit::progress_debt(index, &key, super::sampled_scan::now_seconds())
-        .is_some()
-    {
-        return;
-    }
     if claude_index_path_family_member(path).is_some() {
         index.claude_request_census.invalidate_keeping_birth(&key);
     }
@@ -2282,9 +2214,8 @@ impl ClaudeRequestCensusJoin {
         if let Some(record) =
             record.filter(|record| record.shape != ClaudeRequestCensusShape::OverBudget)
         {
-            if !entry.evidence_owed
-                && decode_fingerprint(&entry.source_file_fingerprint)
-                    .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
+            if decode_fingerprint(&entry.source_file_fingerprint)
+                .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
             {
                 return ClaudeRequestCensusCoverage::Fingerprint;
             }
@@ -2302,7 +2233,7 @@ impl ClaudeRequestCensusJoin {
             && !index.file_snapshot_fingerprints.contains_key(key)
         {
             ClaudeRequestCensusCoverage::Placeholder
-        } else if entry.rearmed() {
+        } else if entry.source_file_fingerprint.is_empty() {
             ClaudeRequestCensusCoverage::EmptyFingerprint
         } else if record.is_some() {
             ClaudeRequestCensusCoverage::FingerprintMismatch
@@ -2650,20 +2581,6 @@ impl ScanIndex {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let pending = self
-            .claude_usage_family_pending
-            .iter()
-            .map(|(root, pending)| {
-                (
-                    root.clone(),
-                    serde_json::json!({
-                        "invalid": pending.invalid,
-                        "window": pending.census_window_end,
-                        "members": pending.member_request_id_hashes,
-                    }),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let quarantine = self
             .claude_usage_authority_quarantine
             .iter()
@@ -2681,24 +2598,8 @@ impl ScanIndex {
             .collect::<BTreeMap<_, _>>();
         serde_json::json!({
             "files": files,
-            "fence_closed": self.claude_duplicate_request_witness_overflowed,
-            "duplicate_owners": self.claude_duplicate_request_owners,
-            "rearm_attempt": self.claude_duplicate_fence_rearm_attempt,
-            "next_full_rearm": self.claude_duplicate_fence_next_full_rearm_unix_seconds,
-            "pending": pending,
             "witnesses": self.claude_usage_family_witnesses,
             "quarantine": quarantine,
-            "owned_start": self
-                .claude_owned_start_census
-                .iter()
-                .map(|(member, witness)| (
-                    member.clone(),
-                    (
-                        witness.verified_source_file_fingerprint.is_some(),
-                        witness.emitted_source_file_fingerprint.is_some(),
-                    ),
-                ))
-                .collect::<BTreeMap<_, _>>(),
             "deferred_holds": self
                 .claude_account_deferred_holds
                 .keys()

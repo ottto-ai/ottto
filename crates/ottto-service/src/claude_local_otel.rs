@@ -1038,30 +1038,6 @@ pub(crate) fn claude_trace_read_generation(
         .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
-/// Both sidecars' generations, taken before a strict read so a later reread
-/// of the same pair can prove it read the same bytes. `None` when either
-/// file has no generation witness (missing, not a file, or no unix metadata).
-#[derive(PartialEq, Eq)]
-pub(crate) struct ClaudePairGeneration {
-    api: ApiFileGeneration,
-    trace: ApiFileGeneration,
-}
-
-pub(crate) fn claude_pair_generation(
-    support_dir: &Path,
-    session_id: &str,
-) -> Option<ClaudePairGeneration> {
-    let generation = |path: PathBuf| {
-        fs::metadata(path)
-            .ok()
-            .and_then(|metadata| api_file_generation(&metadata))
-    };
-    Some(ClaudePairGeneration {
-        api: generation(evidence_path(support_dir, session_id))?,
-        trace: generation(trace_evidence_path(support_dir, session_id))?,
-    })
-}
-
 pub(crate) fn load_claude_trace_paid(
     support_dir: &Path,
     root: &str,
@@ -3241,7 +3217,7 @@ mod tests {
         let mut reference_scan = scan.clone();
         let mut reference_index = index.clone();
         API_READ_RECEIPT.with(|r| r.set((0, 0, true)));
-        let mut reference = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+        let reference = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &dir,
             &mut reference_scan,
             &mut reference_index,
@@ -3249,17 +3225,8 @@ mod tests {
         let reference_receipt = API_READ_RECEIPT.with(|r| r.get());
         assert_eq!(reference_receipt.0, 2);
         API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
-        let (mut disposition, withheld, mut stats) =
+        let (disposition, withheld, stats) =
             crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index);
-        // The terminal's wall-clock time is logged, never compared.
-        for stream in [
-            &mut disposition.terminal_stream,
-            &mut reference.0.terminal_stream,
-            &mut stats.terminal_stream,
-            &mut reference.2.terminal_stream,
-        ] {
-            stream.terminal_ms = 0;
-        }
         assert_eq!(disposition, reference.0);
         assert_eq!(withheld, reference.1);
         assert_eq!(stats, reference.2);

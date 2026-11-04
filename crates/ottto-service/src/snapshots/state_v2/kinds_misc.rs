@@ -109,6 +109,12 @@ fn read_holds(
     let mut expected = 0;
     for (field, slots) in metadata.entries {
         let kind = format!("raw_hold.{field}");
+        // This live row can still name a retired field's holds. Drop the
+        // entry: hydrate's retired walk names those rows for the next save.
+        if catalogue::retired(&kind) {
+            expected += slots.len();
+            continue;
+        }
         ensure!(
             catalogue::group(&kind) == Some(catalogue::Group::Misc),
             "state_v2_misc_unmapped_hold"
@@ -208,7 +214,6 @@ pub(super) fn merge_cas_at(
         .collect();
     let roots = super::super::lenient_decode::cas_hold_roots(&custody);
     kinds_accounts::hydrate_filtered(tx, &mut custody, &mut KindCx::default(), Some(&roots))?;
-    kinds_census::hydrate_cas_families(tx, &mut custody, &roots)?;
     super::super::lenient_decode::post_decode_hydrated(&mut custody, "cas", "claude_code")?;
 
     // Outside held roots, only authority+witness binding affects the repair
@@ -395,18 +400,9 @@ pub(super) fn hydrate_txn(
                 || super::super::lenient_decode::FIELDS.contains(&s.as_str())),
         "state_v2_unknown_presence_field"
     );
+    // Retired kinds are never read: hydrate's retired walk names their rows,
+    // so the next save removes them.
     macro_rules! load {
-        // These earlier retirements keep their stored rows, as before D203.
-        (retired_upload_context_fingerprint, $($rest:tt)*) => {};
-        (retired_claude_desktop_census_witness, $($rest:tt)*) => {};
-        ($f:ident, Misc, (retired none), [$kind:literal], $h:ident) => {
-            // Consume and seed old bytes without installing any retired state.
-            mapper::rows(tx, $kind, |tx, h| {
-                let _: Box<serde_json::value::RawValue> =
-                    mapper::read(tx, &h, Some(&mut cx.digests))?;
-                Ok(())
-            })?;
-        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };

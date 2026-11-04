@@ -98,12 +98,12 @@ fn admitted_file_ships_cache_rows_for_its_own_requests_only() {
     let (path, parsed) = root_session(&dir, ROOT, &lines);
     let fold_with = |rule_on: bool| {
         let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], true);
+        let mut index = indexed(&[&path]);
         let disposition = if rule_on {
-            fold(&mut items, &no_reports(), &mut index, true)
+            fold(&mut items, &no_reports(), &mut index)
         } else {
             claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
-                fold(&mut items, &no_reports(), &mut index, true)
+                fold(&mut items, &no_reports(), &mut index)
             })
         };
         (disposition, items.remove(0))
@@ -139,13 +139,12 @@ fn admitted_file_ships_cache_rows_for_its_own_requests_only() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [money] The strict owned-start arm takes the same copy filter. A fork
-/// marker proves the owned start; the copied prefix the parser keeps
-/// (unmarked, days before the file's birth) has a break of its own. Only
-/// the own suffix ships rows; without the filter the prefix break would
-/// ship too.
+/// [money] A forkedFrom start is admitted by the file birth rule and takes
+/// the same copy filter. The copied prefix the parser keeps (unmarked, days
+/// before the file's birth) has a break of its own. Only the own suffix
+/// ships rows; without the filter the prefix break would ship too.
 #[test]
-fn strict_owned_start_ships_cache_rows_for_its_own_suffix_only() {
+fn forked_from_start_ships_cache_rows_for_its_own_suffix_only() {
     let dir = temp_dir("claude-cache-gate-strict-owned");
     let now = OffsetDateTime::now_utc();
     let forked = cached(ROOT, "req_f0", &stamp(now, COPIED - 10), 90_000).replacen(
@@ -167,11 +166,14 @@ fn strict_owned_start_ships_cache_rows_for_its_own_suffix_only() {
     let (path, parsed) = root_session(&dir, ROOT, &lines);
     assert!(parsed.claude_context_curve_owned_start_proven);
     let mut items = vec![parsed.clone()];
-    let mut index = indexed(&[&path], false);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     let item = items.remove(0);
-    assert_eq!(disposition.posture_admission(ROOT), Some("strict"));
-    assert_eq!(item.claude_file_birth_verdict(), None);
+    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
+    assert_eq!(
+        item.claude_file_birth_verdict(),
+        Some(ClaudeFileBirthVerdict::Admitted)
+    );
     assert_eq!(affected(&item), ["req_a2"]);
     assert!(
         named(&item).iter().all(|id| id.starts_with("req_a")),
@@ -241,8 +243,8 @@ fn copy_family_emits_each_request_once() {
     let folded = |items: Vec<SnapshotItem>| {
         let mut items = items;
         let paths = [&original_path, &copy_path];
-        let mut index = indexed(&paths.map(PathBuf::as_path), true);
-        let disposition = fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&paths.map(PathBuf::as_path));
+        let disposition = fold(&mut items, &no_reports(), &mut index);
         for item in &items {
             assert_eq!(
                 disposition.posture_admission(&item.source_session_id),
@@ -308,8 +310,8 @@ fn subagent_copy_emits_each_request_once_outside_the_slack() {
         .map(|agent| parse(&path(agent), now))
         .collect::<Vec<_>>();
     let paths = agents.map(path);
-    let mut index = indexed(&paths.each_ref().map(PathBuf::as_path), true);
-    fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&paths.each_ref().map(PathBuf::as_path));
+    fold(&mut items, &no_reports(), &mut index);
     for item in &items {
         assert_eq!(
             item.claude_file_birth_verdict(),
@@ -347,8 +349,8 @@ fn cold_tail_and_ack_replay_give_the_same_cache_rows() {
     let path = dir.join(format!("{ROOT}.jsonl"));
     let fold_one = |item: SnapshotItem| {
         let mut items = vec![item];
-        let mut index = indexed(&[&path], true);
-        fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&[&path]);
+        fold(&mut items, &no_reports(), &mut index);
         items.remove(0)
     };
     for split in 2..lines.len() {

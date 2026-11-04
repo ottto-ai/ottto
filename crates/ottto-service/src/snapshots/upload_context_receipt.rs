@@ -901,7 +901,7 @@ impl ScanIndex {
     /// absent on disk (a deleted file cannot grow unread; any other stat
     /// result stays owed); LedgerAccepted by the source's exact body-accepted
     /// predicate on a current ledger (`ledger_current`, hoisted by the
-    /// caller), with no open evidence debt. Pi has no file-body predicate.
+    /// caller). Pi has no file-body predicate.
     fn owed_count_exemption(
         &self,
         source: SnapshotSource,
@@ -918,7 +918,6 @@ impl ScanIndex {
             return absent.then_some(Exempt::Empty);
         }
         let accepted = ledger_current
-            && !entry.evidence_owed
             && match source {
                 SnapshotSource::ClaudeCode => claude_index_file_body_accepted(self, key, entry),
                 SnapshotSource::Codex => codex_index_file_body_accepted(self, key, entry),

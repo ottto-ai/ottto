@@ -153,7 +153,27 @@ fn protected_stems(
     roster: &g7_debt::Roster,
 ) -> Option<BTreeSet<String>> {
     let heads = state_v2::tail_head_keys(index).ok()?;
-    let pending = claude_pending_family_session_ids(index);
+    // Account-pending families that still owe identity, and witnessed
+    // families with their legacy owners.
+    let families = index
+        .claude_account_family_pending
+        .iter()
+        .filter(|(_, pending)| {
+            pending.invalid
+                || pending.has_history()
+                || pending
+                    .member_requests
+                    .values()
+                    .any(|requests| requests.identity_revision.is_none())
+        })
+        .map(|(root, _)| root)
+        .chain(index.claude_usage_family_witnesses.keys())
+        .chain(
+            index
+                .claude_usage_family_witnesses
+                .values()
+                .flat_map(|witness| witness.legacy_owner_roots.iter()),
+        );
     let mut roots = BTreeSet::<&str>::new();
     let keys = roster
         .listed
@@ -164,7 +184,7 @@ fn protected_stems(
         .chain(index.claude_account_deferred_holds.keys())
         .chain(&heads);
     roots.extend(keys.filter_map(|key| root_of(key)));
-    roots.extend(pending.iter().chain(named).map(String::as_str));
+    roots.extend(families.chain(named).map(String::as_str));
     for key in removed {
         let same_name_absent = scan_roots
             .iter()

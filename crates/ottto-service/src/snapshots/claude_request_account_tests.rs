@@ -351,14 +351,10 @@ pub(crate) fn claude_request_account_mixed_fixture(
         index
             .files
             .insert(local_index_key(&path), manifest_index_entry(None));
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &api,
-            &trace,
-            &mut index,
-            true,
-            "2026-08-02T07:10:00Z",
-        );
+        // An upgraded store's stored witness: no build proves a new one.
+        let root = api.evidence.keys().next().unwrap().clone();
+        assert!(index.install_stored_claude_family_witness_for_test(&root, &items, &api, &trace));
+        apply_claude_reported_usage_with_index(&mut items, &api, &trace, &mut index);
         assert_eq!(
             items[0].usage_accounting_contract.as_deref(),
             Some("session_exclusive_reported_usage:v1")
@@ -589,14 +585,10 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
     census
         .files
         .insert(local_index_key(&path), manifest_index_entry(None));
-    apply_claude_reported_usage_with_index(
-        &mut multihour,
-        &api,
-        &trace,
-        &mut census,
-        true,
-        "2026-08-02T08:30:00Z",
-    );
+    // An upgraded store's stored witness: no build proves a new one.
+    let root = api.evidence.keys().next().unwrap().clone();
+    assert!(census.install_stored_claude_family_witness_for_test(&root, &multihour, &api, &trace));
+    apply_claude_reported_usage_with_index(&mut multihour, &api, &trace, &mut census);
     assert_eq!(
         multihour[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
@@ -858,6 +850,14 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
         .unwrap()
         .session_account_evidence
         .clone();
+    // An upgraded store's stored witness: no build proves a new one.
+    assert!(
+        index.install_stored_claude_family_witness_from_support_for_test(
+            &root.source_session_id,
+            &scan.snapshots,
+            &support,
+        )
+    );
     let (_, withheld, stats) =
         crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
     assert!(!withheld);

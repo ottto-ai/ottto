@@ -8,8 +8,8 @@ use std::io::Cursor;
 
 const WINDOW_END: &str = "2026-10-25T18:18:19Z";
 
-/// The shape that dominates a live Claude index: per-family usage pending
-/// with per-request occurrences, account pending hashes and one file entry.
+/// The shape that dominates a live Claude index: per-family account pending
+/// hashes and one file entry.
 fn synthetic_index(families: usize) -> ScanIndex {
     let mut index = ScanIndex::default();
     for n in 0..families {
@@ -29,39 +29,6 @@ fn synthetic_index(families: usize) -> ScanIndex {
         let hashes = (0..8)
             .map(|request| format!("{:x}", Sha256::digest(format!("{n}:{request}").as_bytes())))
             .collect::<BTreeSet<_>>();
-        let occurrences = hashes
-            .iter()
-            .enumerate()
-            .map(|(sequence, hash)| {
-                (
-                    hash.clone(),
-                    ClaudeTranscriptUsageOccurrenceWitness {
-                        sequence: sequence as u64,
-                        input_tokens: 3,
-                        output_tokens: 1_200,
-                        cache_read_tokens: 150_000,
-                        cache_creation_5m_tokens: 0,
-                        cache_creation_1h_tokens: 2_400,
-                        reasoning_output_tokens: 0,
-                        model: Some("synthetic-model".into()),
-                        speed_mode: None,
-                        reasoning_effort: Some("high".into()),
-                    },
-                )
-            })
-            .collect();
-        index.claude_usage_family_pending.insert(
-            root.clone(),
-            ClaudeUsageFamilyPending {
-                census_window_end: WINDOW_END.into(),
-                member_request_id_hashes: BTreeMap::from([(root.clone(), hashes.clone())]),
-                member_occurrences: BTreeMap::from([(root.clone(), occurrences)]),
-                invalid: false,
-                idless_revision: None,
-                identity_contract: None,
-                contract_unproven: false,
-            },
-        );
         index.claude_account_family_pending.insert(
             root.clone(),
             ClaudeAccountFamilyPending {
@@ -90,10 +57,6 @@ fn synthetic_index(families: usize) -> ScanIndex {
 fn assert_same_state(actual: &ScanIndex, expected: &ScanIndex, label: &str) {
     assert_eq!(actual.generation, expected.generation, "{label}");
     assert_eq!(actual.files.len(), expected.files.len(), "{label}");
-    assert_eq!(
-        actual.claude_usage_family_pending, expected.claude_usage_family_pending,
-        "{label}"
-    );
     assert_eq!(
         actual.claude_account_family_pending, expected.claude_account_family_pending,
         "{label}"

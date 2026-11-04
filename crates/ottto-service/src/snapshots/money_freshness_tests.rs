@@ -38,9 +38,6 @@ fn queue(index: &mut ScanIndex, n: usize, indexed: bool) {
         index.files.insert(local_index_key(&path(n).path), entry);
     }
 }
-fn hash(n: usize) -> u64 {
-    shadow::hash64(path(n).path.as_os_str().as_encoded_bytes())
-}
 fn stamp(stamps: &mut shadow::FirstPending, index: &ScanIndex, now: u64) {
     stamps.observe(shadow::skipped_view(index), |_| false, now, Some(index));
 }
@@ -63,8 +60,6 @@ fn each_gauge_is_distinct_and_read_free() {
     queue(&mut index, 1, true);
     let mut stamps = shadow::FirstPending::default();
     stamp(&mut stamps, &index, NOW);
-    // Duplicate queue+replay occurrence must not double-count a tracked file.
-    index.claude_stale_family_carry.replay.push(path(1));
     let before = serde_json::to_vec(&index).unwrap();
     let row = with_transcript_io_denied(|| measure(&index, &mut stamps, NOW + DAY + 1));
     assert_eq!(serde_json::to_vec(&index).unwrap(), before);
@@ -77,18 +72,6 @@ fn each_gauge_is_distinct_and_read_free() {
     assert_eq!(row.freshness.indexed_or_replay_tracked_files, 1);
     assert!(row.freshness.ages_are_process_local_lower_bounds);
     assert_eq!(measure(&index, &mut stamps, NOW + DAY).over_24h, 0);
-}
-
-/// [behaviour] Replay is distinct from unread work.
-#[test]
-fn replay_without_index_is_not_never_read() {
-    let mut index = fixture();
-    index.claude_stale_family_carry.replay.push(path(1));
-    let mut stamps = shadow::FirstPending::default();
-    stamp(&mut stamps, &index, NOW);
-    let row = measure(&index, &mut stamps, NOW + DAY + 1);
-    assert_eq!(row.freshness.discovered_unread_tracked_files, 0);
-    assert_eq!(row.freshness.indexed_or_replay_tracked_files, 1);
 }
 
 /// [behaviour] Bounded coverage loss is explicit and restart ages are lower bounds.
@@ -143,22 +126,4 @@ fn stamp_clock_restarts_with_scope_and_reload() {
         .unwrap();
         assert_eq!(row.pending_census_members.stamped_for_s, age);
     }
-}
-
-/// [regress] Duplicate heap-eviction coverage bug: retained queue/replay keys keep complete coverage.
-#[test]
-fn replay_overlap_at_capacity_keeps_complete_coverage() {
-    let mut index = fixture();
-    let mut stamps = shadow::FirstPending::default();
-    for n in 0..shadow::MAX_FIRST_PENDING {
-        queue(&mut index, n, true);
-    }
-    stamp(&mut stamps, &index, NOW);
-    let duplicate = (0..shadow::MAX_FIRST_PENDING)
-        .min_by_key(|n| hash(*n))
-        .unwrap();
-    index.claude_stale_family_carry.replay.push(path(duplicate));
-    let row = measure(&index, &mut stamps, NOW + 1);
-    assert_eq!(row.tracked, shadow::MAX_FIRST_PENDING as u64);
-    assert_eq!(row.freshness.skipped_untracked_entries, 0);
 }
