@@ -19,6 +19,84 @@ pub(in crate::snapshots::tail_source) fn scope() -> Scope {
     Scope("tail-seam".into())
 }
 
+/// A cold positioned Full read of `lines` as `source`: the PRE-finalization
+/// reduction and the checkpoint's certificate. Every codec's tests parse
+/// through this.
+pub(in crate::snapshots::tail_source) fn parse_lines(
+    source: SnapshotSource,
+    apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
+    lines: &[String],
+) -> (
+    crate::snapshots::sampled_jsonl::CachedJsonlReduction,
+    DurableCertificate,
+) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ottto-tail-{}-{}-{}",
+        source.api_slug(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.jsonl");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let scope = scope();
+    let mut parser = fixture::parser(source, &path, std::fs::File::open(&path).unwrap(), apply);
+    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
+    assert!(matches!(mode, ReadMode::Full(_)));
+    let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
+    std::fs::remove_dir_all(&dir).unwrap();
+    (reduction, checkpoint.durable_certificate(0).unwrap())
+}
+
+/// A complete stage through `S`: an empty base's `Reset`.
+pub(in crate::snapshots::tail_source) fn stage_full<S: TailSource>(
+    view: &PreFinalization<'_>,
+    certificate: &DurableCertificate,
+    id: &HeadIdentity,
+) -> StagedFile {
+    TailBase::default()
+        .stage::<S>(view, certificate, id, Change::Reset)
+        .unwrap()
+        .expect("a reset always stages")
+}
+
+/// A complete stage of `reduction`'s PRE view.
+pub(in crate::snapshots::tail_source) fn stage_reduction<S: TailSource>(
+    reduction: &crate::snapshots::sampled_jsonl::CachedJsonlReduction,
+    certificate: &DurableCertificate,
+    id: &HeadIdentity,
+) -> StagedFile {
+    let (acc, report, scalars) = reduction.finish_view();
+    let view = PreFinalization::new(acc, report, scalars);
+    stage_full::<S>(&view, certificate, id)
+}
+
+pub(in crate::snapshots::tail_source) fn copy(staged: &StagedFile) -> StagedFile {
+    StagedFile {
+        revision: staged.revision,
+        head: staged.head.clone(),
+        collections: staged.collections.clone(),
+        pages: staged.pages.clone(),
+        obsolete: staged.obsolete.clone(),
+        change: staged.change,
+    }
+}
+
+/// Head first, then every page in key order, then the codec contract.
+/// `into` is replaced whole by the head.
+pub(in crate::snapshots::tail_source) fn load<S: TailSource>(
+    staged: &StagedFile,
+    into: &mut SnapshotAccumulator,
+) -> Result<super::super::DecodedHead, ReconstructCause> {
+    let head = S::decode_head(staged.revision, &staged.head, into)?;
+    for (&(collection, page), bytes) in &staged.pages {
+        S::decode_page(collection, page, bytes, into)?;
+    }
+    S::validate_loaded(into, &staged.collections)?;
+    Ok(head)
+}
+
 /// A state database route in a fresh directory.
 pub(in crate::snapshots::tail_source) struct Route {
     _session: ColdSession,

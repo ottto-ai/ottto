@@ -62,6 +62,7 @@
 //! re-scanned, or replayed; they are not consumed with its first observation. Filenames are the SHA-256 of the triple, so re-emitting the same
 //! launch resolves to the same path and can never produce a second edge.
 
+use crate::hex::is_uuid;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -712,20 +713,6 @@ fn is_claude_subagent_session_ref(value: &str) -> bool {
         return false;
     };
     is_uuid(root) && agent_ref.len() == 17 && agent_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn is_uuid(value: &str) -> bool {
-    let groups = [8usize, 4, 4, 4, 12];
-    let mut parts = value.split('-');
-    for expected in groups {
-        let Some(part) = parts.next() else {
-            return false;
-        };
-        if part.len() != expected || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return false;
-        }
-    }
-    parts.next().is_none()
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` exactly -- the emitter's own format.

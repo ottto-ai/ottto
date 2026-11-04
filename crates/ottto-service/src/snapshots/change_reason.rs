@@ -208,7 +208,7 @@ mod tests {
             let upload = page["upload"].as_object().unwrap();
             assert_eq!(upload.len(), 1, "{reason:?}");
             assert_eq!(upload[expected]["entities"], 1, "{reason:?}");
-            assert_eq!(page["read"][expected].as_object().unwrap().len(), 1);
+            assert_eq!(page["read"][expected]["files"], 1);
             counts::index_loaded("claude_code", false, None);
         }
     }

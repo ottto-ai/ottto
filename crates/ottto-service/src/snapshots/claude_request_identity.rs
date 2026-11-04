@@ -3033,25 +3033,8 @@ pub(crate) fn note_marker_line(
     }
 }
 
-#[cfg(not(test))]
-static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static CONTEXT_DIGEST_SCRUBS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-fn with_context_digest_scrubs<T>(
-    use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T,
-) -> T {
-    #[cfg(test)]
-    {
-        CONTEXT_DIGEST_SCRUBS.with(use_counter)
-    }
-    #[cfg(not(test))]
-    {
-        use_counter(&CONTEXT_DIGEST_SCRUBS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_context_digest_scrubs:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 /// This thread's count only, so a test takes no other test's identity counts.
 #[cfg(test)]
@@ -3059,23 +3042,8 @@ pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
     with_context_digest_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-#[cfg(not(test))]
-static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static ADDRESS_SCRUBS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-fn with_address_scrubs<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
-    #[cfg(test)]
-    {
-        ADDRESS_SCRUBS.with(use_counter)
-    }
-    #[cfg(not(test))]
-    {
-        use_counter(&ADDRESS_SCRUBS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_address_scrubs:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 #[cfg(test)]
 pub(crate) fn take_address_scrubs_for_test() -> u64 {
     with_address_scrubs(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed))
@@ -4271,24 +4239,8 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
     }
 }
 
-// Thread-local under test: another test's take must not race this count.
-#[cfg(not(test))]
-static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-thread_local! {
-    static NO_KEY_FLIP_REFUSALS: std::sync::atomic::AtomicU64 =
-        const { std::sync::atomic::AtomicU64::new(0) };
-}
-fn with_no_key_flip_refusals<T>(use_counter: impl FnOnce(&std::sync::atomic::AtomicU64) -> T) -> T {
-    #[cfg(test)]
-    {
-        NO_KEY_FLIP_REFUSALS.with(use_counter)
-    }
-    #[cfg(not(test))]
-    {
-        use_counter(&NO_KEY_FLIP_REFUSALS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn with_no_key_flip_refusals:
+    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {

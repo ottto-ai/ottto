@@ -85,7 +85,7 @@ struct StatusLane {
     origin: Instant,
     /// Claude: a pass an app's request starts serves stored provider readings,
     /// leaves the timer alone and uploads nothing. Provider reads come from
-    /// the lane's own passes, which also run without an upload grant.
+    /// the lane's own passes, which run only while the source is enabled.
     app_passes_saved_only: bool,
     state: Mutex<LaneState>,
     changed: Condvar,
@@ -457,15 +457,12 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
         return;
     }
     loop {
-        // Re-read ordinary device grants each pass; a disabled source is not
-        // polled automatically. Manual diagnostics retain their old behavior.
-        // Claude's own passes are its quota schedule (app requests read no
-        // provider), so they run without the grant too and only skip the
-        // upload.
+        // Re-read ordinary device grants and the source pause each pass; a
+        // disabled or paused source is not polled automatically, Claude's
+        // quota schedule included. Manual diagnostics retain their old behavior.
         let enabled = crate::snapshot_sync::agent_status_source_enabled(&source);
-        let automatic = enabled || lane.app_passes_saved_only;
         let began = Instant::now();
-        lane.pass(lane.origin.elapsed(), automatic,
+        lane.pass(lane.origin.elapsed(), enabled,
             || {
                 let captured = OffsetDateTime::now_utc();
                 let collection = collect_agent_status_collection(&source,
@@ -518,12 +515,6 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
                     .schedule
                     .deadline()
                     .saturating_sub(lane.origin.elapsed())
-            } else if automatic {
-                state
-                    .schedule
-                    .deadline()
-                    .saturating_sub(lane.origin.elapsed())
-                    .min(RETRY_DELAY)
             } else {
                 RETRY_DELAY
             };
@@ -961,6 +952,56 @@ mod tests {
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert!(pass(&lane, 300, 307, true));
         assert_eq!(lane.state.lock().unwrap().generation, 2);
+    }
+    /// [behaviour] Claude's automatic passes acquire only while the source is
+    /// granted and not paused: a pause or a missing grant reads no provider
+    /// and records no health; once resumed, the lane acquires again.
+    #[test]
+    fn claude_automatic_status_acquisition_stops_while_source_paused() {
+        use crate::snapshots::SnapshotSource;
+        let support = crate::test_scratch::canonical_private_dir("status-pause");
+        let granted = ottto_core::LocalDeviceBinding {
+            device_id: "device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        let ungranted = ottto_core::LocalDeviceBinding {
+            sources: vec!["codex".into()],
+            ..granted.clone()
+        };
+        let enabled = |device: &ottto_core::LocalDeviceBinding| {
+            crate::snapshot_sync::agent_status_source_enabled_in(
+                device,
+                &support,
+                &SourceKind::ClaudeCode,
+            )
+        };
+        let lane = StatusLane::for_source(&SourceKind::ClaudeCode);
+        let collected = std::cell::Cell::new(0);
+        let run = |automatic: bool| {
+            lane.pass(
+                seconds(0),
+                automatic,
+                || {
+                    collected.set(collected.get() + 1);
+                    specimen(SourceKind::ClaudeCode)
+                },
+                |_| true,
+                || seconds(1),
+            )
+        };
+        assert!(enabled(&granted), "positive control");
+        crate::snapshot_sync::disable_snapshot_source(&support, SnapshotSource::ClaudeCode)
+            .unwrap();
+        assert!(!run(enabled(&granted)), "paused");
+        assert!(!run(enabled(&ungranted)), "no grant");
+        assert_eq!(collected.get(), 0, "no provider read while off");
+        crate::snapshot_sync::reconnect_snapshot_source(&support, SnapshotSource::ClaudeCode)
+            .unwrap();
+        crate::snapshot_sync::resume_reconnected_sources(&support);
+        assert!(run(enabled(&granted)), "resumed");
+        assert_eq!(collected.get(), 1);
+        let _ = std::fs::remove_dir_all(support);
     }
     #[test]
     fn disabled_source_is_not_polled_and_shutdown_cancels_waiters() {

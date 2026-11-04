@@ -12,7 +12,7 @@
 use super::{
     decode_envelope, encode_envelope, fact_count, fact_pages, fixed_pages, hour_pages, page_bytes,
     read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec, DecodedHead,
-    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    HeadIdentity, ReconstructCause, TailSource, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, HDigest, Refuse};
 use crate::snapshots::state_v2::{Collection, Shape as PageShape};
@@ -291,16 +291,6 @@ impl TailSource for Claude {
     /// an HMAC under the attribution key (#1255).
     fn key_epoch() -> Option<[u8; 32]> {
         claude_request_identity::session_context_key_epoch()
-    }
-
-    /// Claude's live inputs (Desktop identity and lineage, account, sidecar
-    /// evidence) join at finish, never into the stored state.
-    fn install_live(
-        _stored: &mut SnapshotAccumulator,
-        _fresh: &CandidateFile,
-        _live: &SnapshotAccumulator,
-    ) -> Result<(), LiveLoadError> {
-        Ok(())
     }
 }
 

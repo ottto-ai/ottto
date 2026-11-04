@@ -242,14 +242,6 @@ impl SharedCache {
     }
 
     /// Bind before constructor-time discovery/selection, which consults CONTENT.
-    /// Drops every retained parse: a miss only re-reads. For source-off erase
-    /// and account removal, explicit actions that end what those parses hold.
-    pub(crate) fn forget_retained_transcripts(&self) {
-        self.retained()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-
     pub(crate) fn bind_withheld(&self, index: &mut ScanIndex) {
         index.withheld_memo = self.withheld_memo.clone();
         index
