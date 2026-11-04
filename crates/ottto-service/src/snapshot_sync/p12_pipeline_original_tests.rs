@@ -392,7 +392,6 @@ impl RearmFixture {
             retry_authority: None,
             source: SnapshotSource::ClaudeCode,
             claude_scan_roots: Some(vec![self.root.clone()]),
-            sole_login: false,
             account_witness: [7; 32],
             scan_started_at: collected_at.to_owned(),
             activity_hint: hint,
@@ -1298,152 +1297,154 @@ fn native_comparison_assert_ack_conservation(fixture: &RearmFixture, selected: &
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
+        // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(
             std::io::stderr().lock(),
             "native_comparison_novel_parity: supported_positive=UNEXECUTED parity_body_ran=false"
         )
-        .unwrap();
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let base = RearmFixture::new("native-parity-shared-source");
-    let candidate = native_comparison_independent_history(&base);
-    // Both histories share one support directory, so both run their unlisted
-    // baseline before the real list names the family (`establish`).
-    let base_proven = base.establish_baseline();
-    let candidate_proven = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.establish_baseline()
-    };
-    base.list_held(&[REARM_ROOT]);
-    let base_established = base.establish_listed(&base_proven);
-    let base_quiet = base.generation(10);
-    assert_eq!(rearm_reads(&base_quiet), 3);
-    let base_before = serde_json::to_value(&base_quiet.last().unwrap().index).unwrap();
-    let base_selected = native_comparison_selected_family(&base_quiet.last().unwrap().index);
-    let candidate_selected = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            .unwrap();
+            return;
+        }
+        let _source_manifests = SourceManifestTestGuard::new();
+        let base = RearmFixture::new("native-parity-shared-source");
+        let candidate = native_comparison_independent_history(&base);
+        // Both histories share one support directory, so both run their unlisted
+        // baseline before the real list names the family (`establish`).
+        let base_proven = base.establish_baseline();
+        let candidate_proven = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            candidate.establish_baseline()
+        };
+        base.list_held(&[REARM_ROOT]);
+        let base_established = base.establish_listed(&base_proven);
+        let base_quiet = base.generation(10);
+        assert_eq!(rearm_reads(&base_quiet), 3);
+        let base_before = serde_json::to_value(&base_quiet.last().unwrap().index).unwrap();
+        let base_selected = native_comparison_selected_family(&base_quiet.last().unwrap().index);
+        let candidate_selected = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            assert_eq!(
+                candidate.establish_listed(&candidate_proven).heads,
+                base_established.heads
+            );
+            let quiet = candidate.generation(10);
+            assert_eq!(rearm_reads(&quiet), 0);
+            native_comparison_selected_family(&quiet.last().unwrap().index)
+        };
+        assert_eq!(base_selected, candidate_selected);
+        const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
+        let import_path = native_comparison_add_import(&base, IMPORT, "req_novel_import");
+        // The novel import's ordinary reported body is the oracle: list its own
+        // root too, before its first read.
+        base.list_held(&[REARM_ROOT, IMPORT]);
+        let base_import = base.generation(11);
+        let candidate_import = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            candidate.generation(11)
+        };
+        let offered_body = |pages: &[RearmPage]| {
+            pages
+                .iter()
+                .find_map(|page| {
+                    page.scan
+                        .snapshots
+                        .iter()
+                        .find(|item| item.source_session_id == IMPORT)
+                        .map(|item| {
+                            assert!(page.offered.contains(&item.snapshot_fingerprint));
+                            assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+                            // This fixture deliberately carries no request identity tags.
+                            // Equality includes collector, evidence and row-level tags;
+                            // positive own-evidence controls remain separate tests.
+                            assert!(item.request_evidence.is_empty());
+                            assert!(item
+                                .usage_buckets
+                                .iter()
+                                .flat_map(|b| &b.model_usage)
+                                .all(|row| row.evidence_ref.is_none()
+                                    && row.identity_parts.is_none()));
+                            assert_eq!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
+                            assert_eq!(item.first_turn_context_tokens, Some(10));
+                            (
+                                serde_json::to_vec(item).unwrap(),
+                                item.snapshot_fingerprint.clone(),
+                            )
+                        })
+                })
+                .expect("exact offered and ACKed novel body")
+        };
         assert_eq!(
-            candidate.establish_listed(&candidate_proven).heads,
-            base_established.heads
+            offered_body(&base_import),
+            offered_body(&candidate_import),
+            "exact C bytes/head, including collector/evidence/tags/posture/authority"
         );
-        let quiet = candidate.generation(10);
-        assert_eq!(rearm_reads(&quiet), 0);
-        native_comparison_selected_family(&quiet.last().unwrap().index)
-    };
-    assert_eq!(base_selected, candidate_selected);
-    const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
-    let import_path = native_comparison_add_import(&base, IMPORT, "req_novel_import");
-    // The novel import's ordinary reported body is the oracle: list its own
-    // root too, before its first read.
-    base.list_held(&[REARM_ROOT, IMPORT]);
-    let base_import = base.generation(11);
-    let candidate_import = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.generation(11)
-    };
-    let offered_body = |pages: &[RearmPage]| {
-        pages
-            .iter()
-            .find_map(|page| {
-                page.scan
-                    .snapshots
-                    .iter()
-                    .find(|item| item.source_session_id == IMPORT)
-                    .map(|item| {
-                        assert!(page.offered.contains(&item.snapshot_fingerprint));
-                        assert!(page.uploaded.contains(&item.snapshot_fingerprint));
-                        // This fixture deliberately carries no request identity tags.
-                        // Equality includes collector, evidence and row-level tags;
-                        // positive own-evidence controls remain separate tests.
-                        assert!(item.request_evidence.is_empty());
-                        assert!(item
-                            .usage_buckets
-                            .iter()
-                            .flat_map(|b| &b.model_usage)
-                            .all(|row| row.evidence_ref.is_none() && row.identity_parts.is_none()));
-                        assert_eq!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
-                        assert_eq!(item.first_turn_context_tokens, Some(10));
-                        (
-                            serde_json::to_vec(item).unwrap(),
-                            item.snapshot_fingerprint.clone(),
-                        )
-                    })
-            })
-            .expect("exact offered and ACKed novel body")
-    };
-    assert_eq!(
-        offered_body(&base_import),
-        offered_body(&candidate_import),
-        "exact C bytes/head, including collector/evidence/tags/posture/authority"
-    );
-    assert_eq!(rearm_reads(&base_import), 4);
-    assert_eq!(rearm_reads(&candidate_import), 1);
-    for (pages, expected_debt, selected) in [
-        (&base_import, 3, &base_selected),
-        (&candidate_import, 0, &candidate_selected),
-    ] {
-        let terminal = pages.last().unwrap();
-        assert!(terminal.scan.census_complete && terminal.fully_settled);
-        assert!(
-            !terminal.duplicate_census.fence_after && !terminal.duplicate_census.census_invalid
-        );
-        assert!(
-            !terminal.duplicate_census.coverage_complete && !terminal.transcript_ownership_complete
-        );
-        assert!(!terminal.duplicate_census.full_rearm);
+        assert_eq!(rearm_reads(&base_import), 4);
+        assert_eq!(rearm_reads(&candidate_import), 1);
+        for (pages, expected_debt, selected) in [
+            (&base_import, 3, &base_selected),
+            (&candidate_import, 0, &candidate_selected),
+        ] {
+            let terminal = pages.last().unwrap();
+            assert!(terminal.scan.census_complete && terminal.fully_settled);
+            assert!(
+                !terminal.duplicate_census.fence_after && !terminal.duplicate_census.census_invalid
+            );
+            assert!(
+                !terminal.duplicate_census.coverage_complete
+                    && !terminal.transcript_ownership_complete
+            );
+            assert!(!terminal.duplicate_census.full_rearm);
+            assert_eq!(
+                native_comparison_selected_family(&terminal.index),
+                *selected
+            );
+            native_comparison_assert_old_bindings(&base_before, &terminal.index);
+            assert_eq!(
+                RearmFixture::family_rearm_debt(&terminal.index),
+                expected_debt
+            );
+            assert!(serde_json::to_value(&terminal.index)
+                .unwrap()
+                .get("claude_duplicate_request_owners")
+                .is_none());
+        }
         assert_eq!(
-            native_comparison_selected_family(&terminal.index),
-            *selected
+            base_import
+                .last()
+                .unwrap()
+                .duplicate_census
+                .pending_occurrence_count,
+            5
         );
-        native_comparison_assert_old_bindings(&base_before, &terminal.index);
         assert_eq!(
-            RearmFixture::family_rearm_debt(&terminal.index),
-            expected_debt
+            candidate_import
+                .last()
+                .unwrap()
+                .duplicate_census
+                .pending_occurrence_count,
+            1,
+            "Skips/envelope state never become native pending or coverage"
         );
-        assert!(serde_json::to_value(&terminal.index)
-            .unwrap()
-            .get("claude_duplicate_request_owners")
-            .is_none());
-    }
-    assert_eq!(
-        base_import
-            .last()
-            .unwrap()
-            .duplicate_census
-            .pending_occurrence_count,
-        5
-    );
-    assert_eq!(
-        candidate_import
-            .last()
-            .unwrap()
-            .duplicate_census
-            .pending_occurrence_count,
-        1,
-        "Skips/envelope state never become native pending or coverage"
-    );
-    let fp = offered_body(&candidate_import).1;
-    for hour in [12, 13] {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        let quiet = candidate.generation(hour);
-        assert_eq!(rearm_reads(&quiet), 0);
-        assert!(quiet.iter().all(|p| p.offered.is_empty()));
-        let index = &quiet.last().unwrap().index;
-        assert_eq!(native_comparison_selected_family(index), candidate_selected);
-        assert_eq!(RearmFixture::family_rearm_debt(index), 0);
-        assert!(index.accepted_snapshot_fingerprint_recorded(&fp));
-        let saved = serde_json::to_value(index).unwrap();
-        assert_eq!(
-            saved["file_snapshot_fingerprints"][import_path.to_str().unwrap()],
-            serde_json::json!([fp])
-        );
-        native_comparison_assert_old_bindings(&base_before, index);
-    }
-    writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
+        let fp = offered_body(&candidate_import).1;
+        for hour in [12, 13] {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            let quiet = candidate.generation(hour);
+            assert_eq!(rearm_reads(&quiet), 0);
+            assert!(quiet.iter().all(|p| p.offered.is_empty()));
+            let index = &quiet.last().unwrap().index;
+            assert_eq!(native_comparison_selected_family(index), candidate_selected);
+            assert_eq!(RearmFixture::family_rearm_debt(index), 0);
+            assert!(index.accepted_snapshot_fingerprint_recorded(&fp));
+            let saved = serde_json::to_value(index).unwrap();
+            assert_eq!(
+                saved["file_snapshot_fingerprints"][import_path.to_str().unwrap()],
+                serde_json::json!([fp])
+            );
+            native_comparison_assert_old_bindings(&base_before, index);
+        }
+        writeln!(std::io::stderr().lock(),"native_comparison_novel_parity: parity_body_ran=true exact_same_physical_revisions=true independent_natural_bootstrap=true exact_offered_ACKed_bytes_head_collector_evidence_tags=true empty_tag_fixture=true old_A_selected_bodies_bindings_names_unchanged=true settled_coverage_false=true no_S_pending_owner_or_tag_evidence=true quiet_base3_candidate0=true import_reads_base4_candidate1=true later_quiet0=true historical_strict_fence_oracle=UNMET_SUPERSEDED installed_savings_proved=false").unwrap();
     });
 }
 
@@ -1451,73 +1452,73 @@ fn native_comparison_novel_import_base_parity() {
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     run_on_scan_worker_stack(|| {
-    if !crate::heap_layout_bound::layout_supported() {
-        eprintln!("native_comparison_deferred_no_target: supported_positive=UNEXECUTED");
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut fixture = RearmFixture::new("native-deferred-no-target");
-    // The preserved full-path checkpoint exercised target retention refusal.
-    // The qualified shipping cut must never reach that optional target path,
-    // even with enough page capacity. Original cap2 oracle bodies stay intact.
-    fixture.native_file_limit = 8;
-    let mut bootstrap = false;
-    for hour in 8..14 {
-        let pages = fixture.generation(hour);
-        if fixture.native_lifecycle.retained_valid_for_test()
-            && pages.last().unwrap().fully_settled
-            && rearm_reads(&pages) == 0
-        {
-            bootstrap = true;
-            break;
+        if !crate::heap_layout_bound::layout_supported() {
+            eprintln!("native_comparison_deferred_no_target: supported_positive=UNEXECUTED");
+            return;
         }
-    }
-    assert!(
-        bootstrap,
-        "only actual native ACK/save/bootstrap permits qualification"
-    );
-    const COPY: &str = "b7777777-7777-4777-8777-777777777777";
-    let copy = native_comparison_add_import(&fixture, COPY, "req_root_1");
-    let before_index = std::fs::read(&fixture.index_path).unwrap();
-    let before_progress = std::fs::read(&fixture.progress_path).ok();
-    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
-    index.activate_upload_context("upload-context-rearm".into());
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        SnapshotSource::ClaudeCode,
-    ));
-    fixture.load_exclusion_list(&mut index);
-    let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
-    let target_hook =
-        crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
-    let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame).unwrap();
-    assert_eq!(
-        target_hook.hits(),
-        0,
-        "no optional in-pass target acquisition"
-    );
-    assert_eq!(scan.scanned_file_count, 1);
-    assert!(scan
-        .snapshots
-        .iter()
-        .all(|item| item.source_session_id == COPY));
-    assert_eq!(std::fs::read(&fixture.index_path).unwrap(), before_index);
-    assert_eq!(std::fs::read(&fixture.progress_path).ok(), before_progress);
-    assert!(!ScanIndex::load(&fixture.index_path)
-        .unwrap()
-        .files
-        .contains_key(copy.to_str().unwrap()));
-    let status = fixture.native_lifecycle.status();
-    assert_eq!(status.deferred_family_count, Some(1));
-    assert_eq!(status.withheld_new_local_candidate_count, Some(1));
-    assert!(!frame.native_comparison_lease.as_ref().unwrap().allowed());
-    drop(frame); // Abandon before selected save: no fabricated commit or ACK.
-    assert!(!fixture.native_lifecycle.retained_valid_for_test());
-    assert_eq!(
-        fixture.native_lifecycle.status().deferred_family_count,
-        Some(1)
-    );
-    eprintln!("native_comparison_deferred_no_target: actual_SourcePreparation=true enough_target_capacity=true native_files=1 target_finish_calls=0 no_offer_or_checkpoint=true new_local_debt_visible=true abandoned_before_save_BASE=true");
+        let _source_manifests = SourceManifestTestGuard::new();
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        let mut fixture = RearmFixture::new("native-deferred-no-target");
+        // The preserved full-path checkpoint exercised target retention refusal.
+        // The qualified shipping cut must never reach that optional target path,
+        // even with enough page capacity. Original cap2 oracle bodies stay intact.
+        fixture.native_file_limit = 8;
+        let mut bootstrap = false;
+        for hour in 8..14 {
+            let pages = fixture.generation(hour);
+            if fixture.native_lifecycle.retained_valid_for_test()
+                && pages.last().unwrap().fully_settled
+                && rearm_reads(&pages) == 0
+            {
+                bootstrap = true;
+                break;
+            }
+        }
+        assert!(
+            bootstrap,
+            "only actual native ACK/save/bootstrap permits qualification"
+        );
+        const COPY: &str = "b7777777-7777-4777-8777-777777777777";
+        let copy = native_comparison_add_import(&fixture, COPY, "req_root_1");
+        let before_index = std::fs::read(&fixture.index_path).unwrap();
+        let before_progress = std::fs::read(&fixture.progress_path).ok();
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index.activate_upload_context("upload-context-rearm".into());
+        index.activate_effective_upload_body_witness_revision(
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
+        );
+        fixture.load_exclusion_list(&mut index);
+        let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
+        let target_hook =
+            crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
+        let (frame, _, scan) = try_collect_native_preparation_with_rotation(frame).unwrap();
+        assert_eq!(
+            target_hook.hits(),
+            0,
+            "no optional in-pass target acquisition"
+        );
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id == COPY));
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), before_index);
+        assert_eq!(std::fs::read(&fixture.progress_path).ok(), before_progress);
+        assert!(!ScanIndex::load(&fixture.index_path)
+            .unwrap()
+            .files
+            .contains_key(copy.to_str().unwrap()));
+        let status = fixture.native_lifecycle.status();
+        assert_eq!(status.deferred_family_count, Some(1));
+        assert_eq!(status.withheld_new_local_candidate_count, Some(1));
+        assert!(!frame.native_comparison_lease.as_ref().unwrap().allowed());
+        drop(frame); // Abandon before selected save: no fabricated commit or ACK.
+        assert!(!fixture.native_lifecycle.retained_valid_for_test());
+        assert_eq!(
+            fixture.native_lifecycle.status().deferred_family_count,
+            Some(1)
+        );
+        eprintln!("native_comparison_deferred_no_target: actual_SourcePreparation=true enough_target_capacity=true native_files=1 target_finish_calls=0 no_offer_or_checkpoint=true new_local_debt_visible=true abandoned_before_save_BASE=true");
     });
 }
 
@@ -1525,41 +1526,41 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
+        // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
-    use sha2::{Digest, Sha256};
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(
-            std::io::stderr().lock(),
-            "native_comparison_real_copy_hit: supported_positive=UNEXECUTED hit_body_ran=false"
-        )
-        .unwrap();
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut fixture = RearmFixture::new("native-real-copy-after-quiet");
-    // The deferred-only contract applies to families that fit a native page.
-    // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
-    fixture.native_file_limit = 4;
-    // Trace every finalized and ACKed body so the
-    // own-ACK conservation check below runs on this copy-hit history.
-    fixture.owned_base_preparation = true;
-    fixture.establish();
-    assert_eq!(rearm_reads(&fixture.generation(10)), 0);
-    const COPY: &str = "e5555555-5555-4555-8555-555555555555";
-    let path = native_comparison_add_import(&fixture, COPY, "req_root_1");
-    // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
-    // own root beside the family, before its first read.
-    fixture.list_held(&[REARM_ROOT, COPY]);
-    let family = rearm_family_sessions();
-    let mut seen = BTreeMap::<String, BTreeSet<String>>::new();
-    let first = fixture.generation(11);
-    let deferred = first
-        .iter()
-        .find(|page| page.parsed.contains(COPY))
-        .expect("actual first native copy read");
-    assert!(
+        use sha2::{Digest, Sha256};
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(
+                std::io::stderr().lock(),
+                "native_comparison_real_copy_hit: supported_positive=UNEXECUTED hit_body_ran=false"
+            )
+            .unwrap();
+            return;
+        }
+        let _source_manifests = SourceManifestTestGuard::new();
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        let mut fixture = RearmFixture::new("native-real-copy-after-quiet");
+        // The deferred-only contract applies to families that fit a native page.
+        // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
+        fixture.native_file_limit = 4;
+        // Trace every finalized and ACKed body so the
+        // own-ACK conservation check below runs on this copy-hit history.
+        fixture.owned_base_preparation = true;
+        fixture.establish();
+        assert_eq!(rearm_reads(&fixture.generation(10)), 0);
+        const COPY: &str = "e5555555-5555-4555-8555-555555555555";
+        let path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+        // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
+        // own root beside the family, before its first read.
+        fixture.list_held(&[REARM_ROOT, COPY]);
+        let family = rearm_family_sessions();
+        let mut seen = BTreeMap::<String, BTreeSet<String>>::new();
+        let first = fixture.generation(11);
+        let deferred = first
+            .iter()
+            .find(|page| page.parsed.contains(COPY))
+            .expect("actual first native copy read");
+        assert!(
         deferred
             .scan
             .snapshots
@@ -1568,324 +1569,327 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
             .all(|item| !deferred.offered.contains(&item.snapshot_fingerprint)),
         "deliberate C3 policy withholds COPY on the hit page, even when native targets would fit"
     );
-    assert!(!deferred.scan.census_complete && !deferred.fully_settled);
-    let saved = serde_json::to_value(&deferred.index).unwrap();
-    assert!(
-        saved["files"].get(path.to_str().unwrap()).is_none(),
-        "new deferred copy remains uncommitted, never fake empty/ACK"
-    );
-    assert_eq!(RearmFixture::family_rearm_debt(&deferred.index), 3);
-    let family_keys = RearmFixture::family_keys(&deferred.index)
-        .into_values()
-        .collect::<BTreeSet<_>>();
-    let queued = saved["traversal"]["pending_candidates"]
-        .as_array()
-        .expect("selected C3 has a durable queue");
-    assert!(queued.len() >= 4);
-    assert!(
-        queued.iter().take(3).all(|entry| entry["path"]
-            .as_str()
-            .is_some_and(|path| family_keys.contains(path))),
-        "all A members must be queued BEFORE deferred C, ahead of ordinary audits"
-    );
-    let deferred_position = first
-        .iter()
-        .position(|page| page.parsed.contains(COPY))
-        .unwrap();
-    let next = first
-        .get(deferred_position + 1)
-        .expect("N+1 is the next actual source pass, not an eventual generation");
-    assert!(
-        next.parsed.is_superset(&family),
-        "N+1 natively reads all A before current B/C"
-    );
-    assert!(
-        !next.native_lease_allowed,
-        "N+1 is BASE under the family latch"
-    );
-    let next_copy = next
-        .scan
-        .snapshots
-        .iter()
-        .find(|item| item.source_session_id == COPY)
-        .expect("COPY has an exact N+1 outcome");
-    assert!(
-        next.offered.contains(&next_copy.snapshot_fingerprint)
-            && next.uploaded.contains(&next_copy.snapshot_fingerprint),
-        "uninterrupted N+1 offers and ACKs COPY, never a second deferral"
-    );
-    let duplicate_hash = format!("{:x}", Sha256::digest(b"req_root_1"));
-    let mut compared = false;
-    let mut completion_hour = 11;
-    let mut offered_after_comparison = false;
-    let mut first = Some(first);
-    for hour in 11..18 {
-        // Selected fallback may finish native recovery within MORE bounded
-        // pages of the same window. Generation is not a single page/offer.
-        let pages = first.take().unwrap_or_else(|| fixture.generation(hour));
-        for page in &pages {
-            let observed = seen.entry(page.scan.census_window_end.clone()).or_default();
-            observed.extend(page.parsed.intersection(&family).cloned());
-            for item in page.scan.snapshots.iter().filter(|item| {
-                item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
-            }) {
-                assert!(observed.is_superset(&family),"same frozen window must actually read all native owners before COPY is offered");
-                assert_eq!(item.first_turn_context_tokens, None);
-                assert_eq!(item.peak_context_fill_tokens, None);
-                assert_eq!(item.last_turn_context_tokens, None);
+        assert!(!deferred.scan.census_complete && !deferred.fully_settled);
+        let saved = serde_json::to_value(&deferred.index).unwrap();
+        assert!(
+            saved["files"].get(path.to_str().unwrap()).is_none(),
+            "new deferred copy remains uncommitted, never fake empty/ACK"
+        );
+        assert_eq!(RearmFixture::family_rearm_debt(&deferred.index), 3);
+        let family_keys = RearmFixture::family_keys(&deferred.index)
+            .into_values()
+            .collect::<BTreeSet<_>>();
+        let queued = saved["traversal"]["pending_candidates"]
+            .as_array()
+            .expect("selected C3 has a durable queue");
+        assert!(queued.len() >= 4);
+        assert!(
+            queued.iter().take(3).all(|entry| entry["path"]
+                .as_str()
+                .is_some_and(|path| family_keys.contains(path))),
+            "all A members must be queued BEFORE deferred C, ahead of ordinary audits"
+        );
+        let deferred_position = first
+            .iter()
+            .position(|page| page.parsed.contains(COPY))
+            .unwrap();
+        let next = first
+            .get(deferred_position + 1)
+            .expect("N+1 is the next actual source pass, not an eventual generation");
+        assert!(
+            next.parsed.is_superset(&family),
+            "N+1 natively reads all A before current B/C"
+        );
+        assert!(
+            !next.native_lease_allowed,
+            "N+1 is BASE under the family latch"
+        );
+        let next_copy = next
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == COPY)
+            .expect("COPY has an exact N+1 outcome");
+        assert!(
+            next.offered.contains(&next_copy.snapshot_fingerprint)
+                && next.uploaded.contains(&next_copy.snapshot_fingerprint),
+            "uninterrupted N+1 offers and ACKs COPY, never a second deferral"
+        );
+        let duplicate_hash = format!("{:x}", Sha256::digest(b"req_root_1"));
+        let mut compared = false;
+        let mut completion_hour = 11;
+        let mut offered_after_comparison = false;
+        let mut first = Some(first);
+        for hour in 11..18 {
+            // Selected fallback may finish native recovery within MORE bounded
+            // pages of the same window. Generation is not a single page/offer.
+            let pages = first.take().unwrap_or_else(|| fixture.generation(hour));
+            for page in &pages {
+                let observed = seen.entry(page.scan.census_window_end.clone()).or_default();
+                observed.extend(page.parsed.intersection(&family).cloned());
+                for item in page.scan.snapshots.iter().filter(|item| {
+                    item.source_session_id == COPY
+                        && page.offered.contains(&item.snapshot_fingerprint)
+                }) {
+                    assert!(observed.is_superset(&family),"same frozen window must actually read all native owners before COPY is offered");
+                    assert_eq!(item.first_turn_context_tokens, None);
+                    assert_eq!(item.peak_context_fill_tokens, None);
+                    assert_eq!(item.last_turn_context_tokens, None);
+                    assert!(
+                        item.request_evidence.is_empty(),
+                        "no borrowed marker/request tag in this identity-empty fixture"
+                    );
+                    offered_after_comparison = true;
+                }
+            }
+            let last = pages.last().unwrap();
+            let saved = serde_json::to_value(&last.index).unwrap();
+            // Exact duplicate evidence needs the actual completed native window,
+            // not completed upload settlement or unrelated skipped-file coverage.
+            if last.duplicate_census.census_complete
+                && !last.duplicate_census.fence_after
+                && saved["claude_duplicate_request_owners"][&duplicate_hash]
+                    .as_array()
+                    .is_some_and(|owners| owners.len() == 2)
+            {
                 assert!(
-                    item.request_evidence.is_empty(),
-                    "no borrowed marker/request tag in this identity-empty fixture"
+                    !last.duplicate_census.coverage_complete,
+                    "unrelated skipped siblings do not become covered from the envelope"
                 );
-                offered_after_comparison = true;
+                compared = true;
+                completion_hour = hour;
+                break;
             }
         }
-        let last = pages.last().unwrap();
-        let saved = serde_json::to_value(&last.index).unwrap();
-        // Exact duplicate evidence needs the actual completed native window,
-        // not completed upload settlement or unrelated skipped-file coverage.
-        if last.duplicate_census.census_complete
-            && !last.duplicate_census.fence_after
-            && saved["claude_duplicate_request_owners"][&duplicate_hash]
-                .as_array()
-                .is_some_and(|owners| owners.len() == 2)
-        {
-            assert!(
-                !last.duplicate_census.coverage_complete,
-                "unrelated skipped siblings do not become covered from the envelope"
-            );
-            compared = true;
-            completion_hour = hour;
-            break;
-        }
-    }
-    assert!(
-        compared,
-        "bounded real recovery durably records the exact pair, not a possible hit"
-    );
-    assert!(
-        offered_after_comparison,
-        "copy liveness after native comparison, never an indefinite invisible deferral"
-    );
-    let followup = fixture.generation(completion_hour + 1);
-    assert!(
+        assert!(
+            compared,
+            "bounded real recovery durably records the exact pair, not a possible hit"
+        );
+        assert!(
+            offered_after_comparison,
+            "copy liveness after native comparison, never an indefinite invisible deferral"
+        );
+        let followup = fixture.generation(completion_hour + 1);
+        assert!(
         followup.last().unwrap().scan.census_complete,
         "native completion does not forge upload settlement; the normal clean followup still runs"
     );
-    assert_eq!(
-        RearmFixture::family_rearm_debt(&followup.last().unwrap().index),
-        0
-    );
-    // The followup settles, and every member's
-    // latest effective body has its own strict ACK.
-    assert!(followup.last().unwrap().fully_settled);
-    native_comparison_assert_ack_conservation(
-        &fixture,
-        &native_comparison_selected_family(&followup.last().unwrap().index),
-    );
-    let quiet = fixture.generation(completion_hour + 2);
-    assert_eq!(
-        rearm_reads(&quiet),
-        0,
-        "the real hit resolves, not an endless recovery re-read"
-    );
-    assert!(quiet.iter().all(|page| page.offered.is_empty()));
-    writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
+        assert_eq!(
+            RearmFixture::family_rearm_debt(&followup.last().unwrap().index),
+            0
+        );
+        // The followup settles, and every member's
+        // latest effective body has its own strict ACK.
+        assert!(followup.last().unwrap().fully_settled);
+        native_comparison_assert_ack_conservation(
+            &fixture,
+            &native_comparison_selected_family(&followup.last().unwrap().index),
+        );
+        let quiet = fixture.generation(completion_hour + 2);
+        assert_eq!(
+            rearm_reads(&quiet),
+            0,
+            "the real hit resolves, not an endless recovery re-read"
+        );
+        assert!(quiet.iter().all(|page| page.offered.is_empty()));
+        writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
     });
 }
 
 #[inline(never)]
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
     run_on_scan_worker_stack(move || {
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let mut fixture = RearmFixture::new("native-copy-offer-interruption");
-    fixture.native_file_limit = 4; // Eligible family; interruption follows deliberate C3 recovery.
-                                   // Reuse the existing restart cases for the essential N -> N+1 boundary;
-                                   // independent BASE history sees the same physical source and native input.
-    fixture.owned_base_preparation = true;
-    let baseline = restart.then(|| native_comparison_independent_history(&fixture));
-    // BASE shares the fixture's support directory, so both run their unlisted
-    // baseline before the real list names the family (`establish`).
-    let base_proven = baseline.as_ref().map(RearmFixture::establish_baseline);
-    let proven = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        fixture.establish_baseline()
-    };
-    fixture.list_held(&[REARM_ROOT]);
-    if let (Some(base), Some(base_proven)) = (baseline.as_ref(), base_proven.as_deref()) {
-        base.establish_listed(base_proven);
-    }
-    let native = crate::snapshots::claude_native_comparison::enable_for_test();
-    fixture.establish_listed(&proven);
-    let quiet = fixture.generation(10);
-    assert_eq!(rearm_reads(&quiet), 0);
-    let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
-    const COPY: &str = "f6666666-6666-4666-8666-666666666666";
-    let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
-    // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
-    // own root beside the family, before its first read (BASE shares it).
-    fixture.list_held(&[REARM_ROOT, COPY]);
-    drop(native);
-    let baseline_outcome = baseline.as_ref().map(|base| {
-        let imported = base.generation(11);
-        let fp = imported
-            .iter()
-            .flat_map(|page| &page.scan.snapshots)
-            .find(|item| item.source_session_id == COPY)
-            .expect("ordinary BASE offers same copy")
-            .snapshot_fingerprint
-            .clone();
-        let followup = base.generation(12);
-        let saved = serde_json::to_value(&followup.last().unwrap().index).unwrap();
-        (
-            fp,
-            RearmFixture::family_heads(&followup.last().unwrap().index),
-            saved["claude_duplicate_request_owners"].clone(),
-        )
-    });
-    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut interruption = None;
-    let mut deferred_at = None;
-    for number in 0..REARM_MAX_PAGES {
-        let page = fixture.page_with_targeted_upload(
-            &format!("2026-08-02T11:{number:02}:00Z"),
-            upload,
-            Some(COPY),
-        );
-        let copy = page.scan.snapshots.iter().find(|item| {
-            item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
+            return;
+        }
+        let _source_manifests = SourceManifestTestGuard::new();
+        let mut fixture = RearmFixture::new("native-copy-offer-interruption");
+        fixture.native_file_limit = 4; // Eligible family; interruption follows deliberate C3 recovery.
+                                       // Reuse the existing restart cases for the essential N -> N+1 boundary;
+                                       // independent BASE history sees the same physical source and native input.
+        fixture.owned_base_preparation = true;
+        let baseline = restart.then(|| native_comparison_independent_history(&fixture));
+        // BASE shares the fixture's support directory, so both run their unlisted
+        // baseline before the real list names the family (`establish`).
+        let base_proven = baseline.as_ref().map(RearmFixture::establish_baseline);
+        let proven = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            fixture.establish_baseline()
+        };
+        fixture.list_held(&[REARM_ROOT]);
+        if let (Some(base), Some(base_proven)) = (baseline.as_ref(), base_proven.as_deref()) {
+            base.establish_listed(base_proven);
+        }
+        let native = crate::snapshots::claude_native_comparison::enable_for_test();
+        fixture.establish_listed(&proven);
+        let quiet = fixture.generation(10);
+        assert_eq!(rearm_reads(&quiet), 0);
+        let before = serde_json::to_value(&quiet.last().unwrap().index).unwrap();
+        const COPY: &str = "f6666666-6666-4666-8666-666666666666";
+        let copy_path = native_comparison_add_import(&fixture, COPY, "req_root_1");
+        // The copy keeps the pre-`e2` ordinary body this oracle compares: list its
+        // own root beside the family, before its first read (BASE shares it).
+        fixture.list_held(&[REARM_ROOT, COPY]);
+        drop(native);
+        let baseline_outcome = baseline.as_ref().map(|base| {
+            let imported = base.generation(11);
+            let fp = imported
+                .iter()
+                .flat_map(|page| &page.scan.snapshots)
+                .find(|item| item.source_session_id == COPY)
+                .expect("ordinary BASE offers same copy")
+                .snapshot_fingerprint
+                .clone();
+            let followup = base.generation(12);
+            let saved = serde_json::to_value(&followup.last().unwrap().index).unwrap();
+            (
+                fp,
+                RearmFixture::family_heads(&followup.last().unwrap().index),
+                saved["claude_duplicate_request_owners"].clone(),
+            )
         });
-        if let Some(at) = deferred_at {
-            assert_eq!(
-                number,
-                at + 1,
-                "COPY must reach its offer on N+1, not an eventual retry"
+        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+        let mut interruption = None;
+        let mut deferred_at = None;
+        for number in 0..REARM_MAX_PAGES {
+            let page = fixture.page_with_targeted_upload(
+                &format!("2026-08-02T11:{number:02}:00Z"),
+                upload,
+                Some(COPY),
             );
-            assert!(copy.is_some(), "N+1 has no second C3 deferral");
-            assert!(
-                page.parsed.is_superset(&rearm_family_sessions()),
-                "A is actually read on N+1 before COPY"
-            );
-            assert!(
-                !page.native_lease_allowed,
-                "restart/latch N+1 has no optimization permit"
-            );
-        }
-        if let Some(copy) = copy {
-            if let Some((base_copy, _, _)) = baseline_outcome.as_ref() {
-                assert_eq!(
-                    &copy.snapshot_fingerprint, base_copy,
-                    "restart N+1 exact copy head equals BASE throughout"
-                );
-            }
-            assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
-            // Transferred from the retired corrective-parse interruption
-            // variants: an offered, unACKed page never mints.
-            assert_eq!(
-                page.native_receipts, 0,
-                "offered/shed/pending ACK never mint"
-            );
-            assert_eq!(copy.first_turn_context_tokens, None);
-            assert_eq!(copy.peak_context_fill_tokens, None);
-            assert_eq!(copy.last_turn_context_tokens, None);
-            assert!(copy.request_evidence.is_empty());
-            assert!(page.duplicate_census.census_complete,
-                "interrupt after the actual terminal native duplicate fold, not the earlier A correction");
-            assert!(!page.fully_settled && !page.scan.census_complete);
-            let saved = serde_json::to_value(&page.index).unwrap();
-            assert!(
-                saved["files"].get(copy_path.to_str().unwrap()).is_none(),
-                "partial selected save never commits an unACKed new copy"
-            );
-            assert!(!page
-                .index
-                .accepted_snapshot_fingerprint_recorded(&copy.snapshot_fingerprint));
-            native_comparison_assert_old_bindings(&before, &page.index);
-            assert!(page.index.bounded_sweep_had_unsettled_upload());
-            assert!(!fixture.native_lifecycle.retained_valid_for_test());
-            interruption = Some(copy.snapshot_fingerprint.clone());
-            break;
-        }
-        if page.parsed.contains(COPY) {
-            assert!(
-                deferred_at.replace(number).is_none(),
-                "only one C3 deferral"
-            );
-            assert_eq!(RearmFixture::family_rearm_debt(&page.index), 3);
-            assert!(
-                serde_json::to_value(&page.index).unwrap()["files"]
-                    .get(copy_path.to_str().unwrap())
-                    .is_none(),
-                "N keeps new C uncommitted"
-            );
-            if restart {
-                fixture.native_lifecycle = std::sync::Arc::new(Default::default());
-                assert!(
-                    !fixture.native_lifecycle.retained_valid_for_test(),
-                    "restart BETWEEN N and N+1 is BASE; durable selected debt alone survives"
-                );
-            }
-        }
-    }
-    assert!(deferred_at.is_some(), "actual initial C3 N was exercised");
-    let interrupted_fp = interruption.expect("bounded actual copy offer reached and interrupted");
-    if restart {
-        // Fresh process owner only: keep the exact partial-save index and
-        // original files. No seeded permit, cursor or replay reset.
-        fixture.native_lifecycle = std::sync::Arc::new(Default::default());
-    }
-    let mut recovered = false;
-    for hour in 12..20 {
-        let pages = fixture.generation(hour);
-        for page in &pages {
-            for copy in page.scan.snapshots.iter().filter(|item| {
+            let copy = page.scan.snapshots.iter().find(|item| {
                 item.source_session_id == COPY && page.offered.contains(&item.snapshot_fingerprint)
-            }) {
+            });
+            if let Some(at) = deferred_at {
+                assert_eq!(
+                    number,
+                    at + 1,
+                    "COPY must reach its offer on N+1, not an eventual retry"
+                );
+                assert!(copy.is_some(), "N+1 has no second C3 deferral");
+                assert!(
+                    page.parsed.is_superset(&rearm_family_sessions()),
+                    "A is actually read on N+1 before COPY"
+                );
+                assert!(
+                    !page.native_lease_allowed,
+                    "restart/latch N+1 has no optimization permit"
+                );
+            }
+            if let Some(copy) = copy {
+                if let Some((base_copy, _, _)) = baseline_outcome.as_ref() {
+                    assert_eq!(
+                        &copy.snapshot_fingerprint, base_copy,
+                        "restart N+1 exact copy head equals BASE throughout"
+                    );
+                }
+                assert!(!page.uploaded.contains(&copy.snapshot_fingerprint));
+                // Transferred from the retired corrective-parse interruption
+                // variants: an offered, unACKed page never mints.
+                assert_eq!(
+                    page.native_receipts, 0,
+                    "offered/shed/pending ACK never mint"
+                );
                 assert_eq!(copy.first_turn_context_tokens, None);
                 assert_eq!(copy.peak_context_fill_tokens, None);
                 assert_eq!(copy.last_turn_context_tokens, None);
                 assert!(copy.request_evidence.is_empty());
-                assert!(page.uploaded.contains(&copy.snapshot_fingerprint));
+                assert!(page.duplicate_census.census_complete,
+                "interrupt after the actual terminal native duplicate fold, not the earlier A correction");
+                assert!(!page.fully_settled && !page.scan.census_complete);
+                let saved = serde_json::to_value(&page.index).unwrap();
+                assert!(
+                    saved["files"].get(copy_path.to_str().unwrap()).is_none(),
+                    "partial selected save never commits an unACKed new copy"
+                );
+                assert!(!page
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(&copy.snapshot_fingerprint));
+                native_comparison_assert_old_bindings(&before, &page.index);
+                assert!(page.index.bounded_sweep_had_unsettled_upload());
+                assert!(!fixture.native_lifecycle.retained_valid_for_test());
+                interruption = Some(copy.snapshot_fingerprint.clone());
+                break;
+            }
+            if page.parsed.contains(COPY) {
+                assert!(
+                    deferred_at.replace(number).is_none(),
+                    "only one C3 deferral"
+                );
+                assert_eq!(RearmFixture::family_rearm_debt(&page.index), 3);
+                assert!(
+                    serde_json::to_value(&page.index).unwrap()["files"]
+                        .get(copy_path.to_str().unwrap())
+                        .is_none(),
+                    "N keeps new C uncommitted"
+                );
+                if restart {
+                    fixture.native_lifecycle = std::sync::Arc::new(Default::default());
+                    assert!(
+                        !fixture.native_lifecycle.retained_valid_for_test(),
+                        "restart BETWEEN N and N+1 is BASE; durable selected debt alone survives"
+                    );
+                }
             }
         }
-        let last = pages.last().unwrap();
-        native_comparison_assert_old_bindings(&before, &last.index);
-        let saved = serde_json::to_value(&last.index).unwrap();
-        if last.scan.census_complete
-            && last.fully_settled
-            && saved["file_snapshot_fingerprints"][copy_path.to_str().unwrap()]
-                .as_array()
-                .is_some_and(|fps| !fps.is_empty())
-        {
-            assert!(
-                last.index
-                    .accepted_snapshot_fingerprint_recorded(&interrupted_fp),
-                "the exact corrected copy body survives interruption and is durably ACKed"
-            );
-            if let Some((_, base_heads, base_owners)) = baseline_outcome.as_ref() {
-                assert_eq!(
-                    &RearmFixture::family_heads(&last.index),
-                    base_heads,
-                    "restart recovery keeps exact BASE A heads"
-                );
-                assert_eq!(
-                    &saved["claude_duplicate_request_owners"], base_owners,
-                    "restart owner outcome equals BASE throughout"
-                );
-            }
-            recovered = true;
-            break;
+        assert!(deferred_at.is_some(), "actual initial C3 N was exercised");
+        let interrupted_fp =
+            interruption.expect("bounded actual copy offer reached and interrupted");
+        if restart {
+            // Fresh process owner only: keep the exact partial-save index and
+            // original files. No seeded permit, cursor or replay reset.
+            fixture.native_lifecycle = std::sync::Arc::new(Default::default());
         }
-    }
-    assert!(
-        recovered,
-        "partial selected debt/restart must recover within ordinary bounded generations"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
+        let mut recovered = false;
+        for hour in 12..20 {
+            let pages = fixture.generation(hour);
+            for page in &pages {
+                for copy in page.scan.snapshots.iter().filter(|item| {
+                    item.source_session_id == COPY
+                        && page.offered.contains(&item.snapshot_fingerprint)
+                }) {
+                    assert_eq!(copy.first_turn_context_tokens, None);
+                    assert_eq!(copy.peak_context_fill_tokens, None);
+                    assert_eq!(copy.last_turn_context_tokens, None);
+                    assert!(copy.request_evidence.is_empty());
+                    assert!(page.uploaded.contains(&copy.snapshot_fingerprint));
+                }
+            }
+            let last = pages.last().unwrap();
+            native_comparison_assert_old_bindings(&before, &last.index);
+            let saved = serde_json::to_value(&last.index).unwrap();
+            if last.scan.census_complete
+                && last.fully_settled
+                && saved["file_snapshot_fingerprints"][copy_path.to_str().unwrap()]
+                    .as_array()
+                    .is_some_and(|fps| !fps.is_empty())
+            {
+                assert!(
+                    last.index
+                        .accepted_snapshot_fingerprint_recorded(&interrupted_fp),
+                    "the exact corrected copy body survives interruption and is durably ACKed"
+                );
+                if let Some((_, base_heads, base_owners)) = baseline_outcome.as_ref() {
+                    assert_eq!(
+                        &RearmFixture::family_heads(&last.index),
+                        base_heads,
+                        "restart recovery keeps exact BASE A heads"
+                    );
+                    assert_eq!(
+                        &saved["claude_duplicate_request_owners"], base_owners,
+                        "restart owner outcome equals BASE throughout"
+                    );
+                }
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "partial selected debt/restart must recover within ordinary bounded generations"
+        );
+        writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} body_ran=true N_defer_Nplus1_BASE_offer=true restart_between_N_Nplus1_checked={restart} exact_BASE_owner_outcome_checked={restart} actual_copy_offer=true actual_terminal_native_fold=true partial_CAS_save=true unACKed_copy_not_committed=true prior_bindings_preserved=true no_borrowed_posture=true eventual_exact_ACK=true").unwrap();
     });
 }
 
@@ -1901,54 +1905,54 @@ fn native_comparison_copy_offer_ack_loss_restart_recovers() {
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
     run_on_scan_worker_stack(|| {
-    // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
+        // Native-comparison oracle of the pre-`e2` reported body; `e2` publishes a request-owned literal instead.
 
-    use sha2::{Digest, Sha256};
-    if !crate::heap_layout_bound::layout_supported() {
-        writeln!(
-            std::io::stderr().lock(),
-            "native_comparison_own_C5: supported_positive=UNEXECUTED"
-        )
-        .unwrap();
-        return;
-    }
-    let _source_manifests = SourceManifestTestGuard::new();
-    let mut base = RearmFixture::new("native-positive-own-C5");
-    base.request_identity = true;
-    let candidate = native_comparison_independent_history(&base);
-    // Both histories share one support directory, so both run their unlisted
-    // baseline before the real list names the family (`establish`).
-    let base_proven = base.establish_baseline();
-    let candidate_proven = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.establish_baseline()
-    };
-    base.list_held(&[REARM_ROOT]);
-    base.establish_listed(&base_proven);
-    base.generation(10);
-    {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.establish_listed(&candidate_proven);
-        assert_eq!(rearm_reads(&candidate.generation(10)), 0);
-    }
-    const OWN: &str = "d7777777-7777-4777-8777-777777777777";
-    native_comparison_add_import(&base, OWN, "req_own_C5");
-    // The own-identity body is the pre-`e2` ordinary body under test: list its
-    // own root beside the family, before its first read.
-    base.list_held(&[REARM_ROOT, OWN]);
-    // Own request-scoped OTEL identity, never an A marker or possible owner.
-    let api_path = base
-        .support
-        .join("local-otel")
-        .join("claude-code-effort")
-        .join(format!("{:x}.jsonl", Sha256::digest(OWN.as_bytes())));
-    let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
-        serde_json::from_str(&std::fs::read_to_string(&api_path).unwrap()).unwrap();
-    let login = "a".repeat(64);
-    let org = "d".repeat(64);
-    row.account_identity_checked = true;
-    row.account_identifier_hash = Some(login.clone());
-    row.request_identity = Some(
+        use sha2::{Digest, Sha256};
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(
+                std::io::stderr().lock(),
+                "native_comparison_own_C5: supported_positive=UNEXECUTED"
+            )
+            .unwrap();
+            return;
+        }
+        let _source_manifests = SourceManifestTestGuard::new();
+        let mut base = RearmFixture::new("native-positive-own-C5");
+        base.request_identity = true;
+        let candidate = native_comparison_independent_history(&base);
+        // Both histories share one support directory, so both run their unlisted
+        // baseline before the real list names the family (`establish`).
+        let base_proven = base.establish_baseline();
+        let candidate_proven = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            candidate.establish_baseline()
+        };
+        base.list_held(&[REARM_ROOT]);
+        base.establish_listed(&base_proven);
+        base.generation(10);
+        {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            candidate.establish_listed(&candidate_proven);
+            assert_eq!(rearm_reads(&candidate.generation(10)), 0);
+        }
+        const OWN: &str = "d7777777-7777-4777-8777-777777777777";
+        native_comparison_add_import(&base, OWN, "req_own_C5");
+        // The own-identity body is the pre-`e2` ordinary body under test: list its
+        // own root beside the family, before its first read.
+        base.list_held(&[REARM_ROOT, OWN]);
+        // Own request-scoped OTEL identity, never an A marker or possible owner.
+        let api_path = base
+            .support
+            .join("local-otel")
+            .join("claude-code-effort")
+            .join(format!("{:x}.jsonl", Sha256::digest(OWN.as_bytes())));
+        let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+            serde_json::from_str(&std::fs::read_to_string(&api_path).unwrap()).unwrap();
+        let login = "a".repeat(64);
+        let org = "d".repeat(64);
+        row.account_identity_checked = true;
+        row.account_identifier_hash = Some(login.clone());
+        row.request_identity = Some(
         serde_json::from_value(serde_json::json!({
             "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
             "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
@@ -1956,57 +1960,57 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
         }))
         .unwrap(),
     );
-    row.fingerprint.clear();
-    row.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&row).unwrap())
-    );
-    std::fs::write(&api_path, serde_json::to_string(&row).unwrap() + "\n").unwrap();
-    let baseline = base.generation(11);
-    let optimized = {
-        let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-        candidate.generation(11)
-    };
-    let exact = |pages: &[RearmPage]| {
-        let (page, item) = pages
-            .iter()
-            .find_map(|page| {
-                page.scan
-                    .snapshots
-                    .iter()
-                    .find(|item| item.source_session_id == OWN)
-                    .map(|item| (page, item))
-            })
-            .expect("actual own-C5 body");
-        assert!(page.offered.contains(&item.snapshot_fingerprint));
-        assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        std::fs::write(&api_path, serde_json::to_string(&row).unwrap() + "\n").unwrap();
+        let baseline = base.generation(11);
+        let optimized = {
+            let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+            candidate.generation(11)
+        };
+        let exact = |pages: &[RearmPage]| {
+            let (page, item) = pages
+                .iter()
+                .find_map(|page| {
+                    page.scan
+                        .snapshots
+                        .iter()
+                        .find(|item| item.source_session_id == OWN)
+                        .map(|item| (page, item))
+                })
+                .expect("actual own-C5 body");
+            assert!(page.offered.contains(&item.snapshot_fingerprint));
+            assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+            assert_eq!(
+                item.provenance.collector,
+                crate::snapshots::claude_request_identity::COLLECTOR
+            );
+            assert!(
+                !item.request_evidence.is_empty(),
+                "positive own identity must actually execute"
+            );
+            assert!(item.request_evidence.iter().all(|e| e.identity_basis
+                == crate::snapshots::claude_request_identity::TELEMETRY
+                && e.provider_workspace_hash.as_deref() == Some(org.as_str())));
+            assert!(item
+                .usage_buckets
+                .iter()
+                .flat_map(|b| &b.model_usage)
+                .any(|r| r.evidence_ref.is_some()));
+            assert!(
+                !page.transcript_ownership_complete,
+                "own OTEL identity survives the unsettled transcript-marker gate"
+            );
+            serde_json::to_vec(item).unwrap()
+        };
         assert_eq!(
-            item.provenance.collector,
-            crate::snapshots::claude_request_identity::COLLECTOR
+            exact(&baseline),
+            exact(&optimized),
+            "exact own C5 head, bytes, identity basis and per-request tags equal base"
         );
-        assert!(
-            !item.request_evidence.is_empty(),
-            "positive own identity must actually execute"
-        );
-        assert!(item.request_evidence.iter().all(|e| e.identity_basis
-            == crate::snapshots::claude_request_identity::TELEMETRY
-            && e.provider_workspace_hash.as_deref() == Some(org.as_str())));
-        assert!(item
-            .usage_buckets
-            .iter()
-            .flat_map(|b| &b.model_usage)
-            .any(|r| r.evidence_ref.is_some()));
-        assert!(
-            !page.transcript_ownership_complete,
-            "own OTEL identity survives the unsettled transcript-marker gate"
-        );
-        serde_json::to_vec(item).unwrap()
-    };
-    assert_eq!(
-        exact(&baseline),
-        exact(&optimized),
-        "exact own C5 head, bytes, identity basis and per-request tags equal base"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
+        writeln!(std::io::stderr().lock(), "native_comparison_own_C5: body_ran=true actual_hint_capture_and_emission=true own_telemetry_tags_positive=true base_exact_bytes_equal=true no_borrowed_identity=true transcript_settled_false=true exact_wire_ACK_save=true").unwrap();
     });
 }

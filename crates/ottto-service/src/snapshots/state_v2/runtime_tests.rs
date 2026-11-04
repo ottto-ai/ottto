@@ -90,7 +90,10 @@ pub(in crate::snapshots) fn usage_unknown_count() -> u64 {
 
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
-pub(super) fn with_session_db(index: &ScanIndex, f: impl FnOnce(&mut sqlite::Sqlite)) {
+pub(in crate::snapshots) fn with_session_db(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut sqlite::Sqlite),
+) {
     let runtime = index.v2().persistence_v2.as_ref().unwrap();
     let mut guard = runtime.session.lock().unwrap();
     f(&mut guard.as_mut().unwrap().db);
@@ -381,6 +384,29 @@ fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindo
         invalid: false,
     }
 }
+/// An `account` window ending on October `day`: one request per member,
+/// tagged with this window's identity revision (64 hex, as decode requires;
+/// accounts are hex letters).
+fn tagged_window(
+    day: u32,
+    account: char,
+    members: &[&str],
+) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
+    let mut window = account_window(day);
+    window.account_identifier_hash = account.to_string().repeat(64);
+    for (n, member) in members.iter().enumerate() {
+        // Members of one window need distinct 16-hex prefixes.
+        let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
+        let mut requests =
+            crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
+                .unwrap();
+        requests.identity_revision = Some(format!("{account}{day:063x}"));
+        window.members.insert((*member).into(), 1);
+        window.member_requests.insert((*member).into(), requests);
+        window.evidence_request_count += 1;
+    }
+    window
+}
 /// An account window with one member request set. Decode marks a window
 /// without member requests invalid, so a typed fixture stored as valid needs
 /// one to load back canonical.
@@ -407,7 +433,6 @@ fn member_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow
 fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
     use crate::snapshots::{
         ClaudeAccountFamilyPending as Family, ClaudeAccountFamilyPendingWindow as Window,
-        ClaudeAccountRequestSet,
     };
     const A: &str = "/synthetic/family/a.jsonl";
     const B: &str = "/synthetic/family/b.jsonl";
@@ -418,22 +443,8 @@ fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
             .get_mut("family")
             .unwrap()
     }
-    // One request per member, tagged with this window's identity revision
-    // (64 hex, as decode requires; accounts are hex letters).
     fn window(day: u32, account: char, members: &[&str]) -> Window {
-        let mut window = account_window(day);
-        window.account_identifier_hash = account.to_string().repeat(64);
-        for (n, member) in members.iter().enumerate() {
-            // Members of one window need distinct 16-hex prefixes.
-            let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
-            let mut requests =
-                ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash])).unwrap();
-            requests.identity_revision = Some(format!("{account}{day:063x}"));
-            window.members.insert((*member).into(), 1);
-            window.member_requests.insert((*member).into(), requests);
-            window.evidence_request_count += 1;
-        }
-        window
+        tagged_window(day, account, members)
     }
     fn roll(index: &mut ScanIndex, day: u32) {
         let family = family(index);
@@ -1519,84 +1530,164 @@ pub(super) fn over_row_limit() -> BTreeSet<String> {
     BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
 }
 
-/// [format] value admission reloads the prior generation halves then retries and grows back.
-#[test]
-fn value_admission_reloads_the_prior_generation_halves_then_retries_and_grows_back() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(collection_page_limit(&index, 250), 250);
-    index
-        .file_snapshot_fingerprints
-        .insert("oversize".into(), over_row_limit());
-    let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveCeiling));
-    assert_eq!(collection_page_limit(&index, 250), 125);
-    assert!(guard_external(
-        &f.path,
-        index.v2().persistence_v2.as_ref(),
-        index.generation
-    )
-    .is_err());
-    let mut retry = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(retry.generation, G);
-    // Reopen cannot clear a failed-save upload fence.
-    assert!(guard_external(
-        &f.path,
-        retry.v2().persistence_v2.as_ref(),
-        retry.generation
-    )
-    .is_err());
-    // [regress] Local receipt binding must not need the upload fence: the
-    // held pass that retries the save starts here, before collection.
-    assert!(
-        crate::snapshots::ProgressRecovery::for_index(&retry, &f.path)
-            .unwrap()
-            .is_some()
-    );
-    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
-        .unwrap()
-        .unwrap();
-    recovery().unwrap();
-    assert!(save_with(&f.path, &mut retry).unwrap());
-    assert_eq!(retry.generation, G + 1);
-    assert_eq!(collection_page_limit(&retry, 250), 150);
-    guard_external(
-        &f.path,
-        retry.v2().persistence_v2.as_ref(),
-        retry.generation,
-    )
+/// Real-shaped money (usage tokens, accepted proof, file progress) plus one
+/// family whose tagged windows switch account a -> b: a positive money and
+/// placement control for whole-store comparisons.
+fn two_account_graph() -> ScanIndex {
+    const A: &str = "/synthetic/family/a.jsonl";
+    const B: &str = "/synthetic/family/b.jsonl";
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+    ))
     .unwrap();
-    for expected in [175, 200, 225, 250, 250] {
-        save_with(&f.path, &mut retry).unwrap();
-        assert_eq!(collection_page_limit(&retry, 250), expected);
+    let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+    index.generation = 0;
+    for (key, c) in [(A, '1'), (B, '2')] {
+        let fingerprint = c.to_string().repeat(64);
+        let entry = crate::snapshots::tests::manifest_index_entry(Some(&fingerprint));
+        index.files.insert(key.into(), entry);
+        index.accepted_snapshot_fingerprints.insert(fingerprint);
     }
+    index.claude_account_family_pending.insert(
+        "family".into(),
+        crate::snapshots::ClaudeAccountFamilyPending {
+            current: tagged_window(27, 'b', &[A, B]),
+            previous_windows: ArchivedWindows::Resident(vec![
+                tagged_window(25, 'a', &[A]),
+                tagged_window(26, 'a', &[A]),
+            ]),
+            confirmed_absent_members: BTreeSet::new(),
+        },
+    );
+    index
 }
 
-/// [money] page one oversize holds and fences upload ack and publication.
+/// [money] A row over the 64 MiB decode bound refuses only that save, as
+/// DbUnavailable: no page change and no hold, and the failed session reloads
+/// the committed generation before any upload or ACK. With the fault removed
+/// the retried pass commits G+1 with the same money and placement as a run
+/// that never refused. Both runs save a typed traversal past the former
+/// 16 MiB limit and a typed birth store (within its 4 MiB decoder bound) and
+/// reopen them unchanged; an older build's 16 MiB decoder refuses the
+/// widened row rather than reading a narrower value.
 #[test]
-fn page_one_oversize_holds_and_fences_upload_ack_and_publication() {
-    let f = Fixture::new();
-    f.published();
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(collection_page_limit(&index, 1), 1);
-    index
-        .file_snapshot_fingerprints
-        .insert("oversize".into(), over_row_limit());
-    let error = save_with(&f.path, &mut index).unwrap_err();
-    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveOversize));
-    let current = load_with(&f.path, false).unwrap().unwrap();
-    assert_eq!(current.generation, G);
-    assert_eq!(collection_page_limit(&current, 1), 1);
-    // This is the production external boundary used before uploads and ACKs.
-    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &current);
+fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
+    let page = |index: &mut ScanIndex| {
+        index.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
+        for n in 0..12_000 {
+            index.claude_money_birth_store.record_observation(
+                &format!("session-{n}"),
+                &format!("/synthetic/birth/{n}.jsonl"),
+                1_000 + i128::from(n),
+            );
+        }
+        index
+            .files
+            .get_mut("/synthetic/family/a.jsonl")
+            .unwrap()
+            .last_snapshot_fingerprint = Some("3".repeat(64));
+    };
+    let run = |fault: bool| {
+        let f = Fixture::new();
+        let progress = br#"{"generation":0}"#;
+        let mut index =
+            super::super::money_test_support::publish(&two_account_graph(), &f.path, progress);
+        assert_eq!(index.generation, G);
+        if fault {
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            page(&mut index);
+            index
+                .file_snapshot_fingerprints
+                .insert("oversize".into(), over_row_limit());
+            telemetry::take_thread_event_for_test("db_unavailable_cause");
+            let error = save_with(&f.path, &mut index).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+            assert_eq!(
+                telemetry::take_thread_event_for_test("db_unavailable_cause").unwrap()["at"],
+                "state_v2_value_admission"
+            );
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            assert_eq!(
+                with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
+                None
+            );
+            // The refused session cannot authorize an upload or ACK.
+            assert!(guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation
+            )
+            .is_err());
+            // Reload through the production route, as publication did.
+            index = ScanIndex::load(&f.path).unwrap();
+            assert_eq!(index.generation, G);
+            assert!(!index.file_snapshot_fingerprints.contains_key("oversize"));
+            guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation,
+            )
+            .unwrap();
+            assert!(
+                crate::snapshots::state_v2_recovery_save_guard(&f.path, &index)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        page(&mut index);
+        assert!(save_with(&f.path, &mut index).unwrap());
+        assert_eq!(index.generation, G + 1);
+        assert_eq!(collection_page_limit(&index, 250), 250);
+        let saved = serde_json::to_vec(&materialized(&index)).unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(reloaded.generation, G + 1);
+        let view = materialized(&reloaded);
+        assert_eq!(serde_json::to_vec(&view).unwrap(), saved);
+        let key = mapper::key("scan_state.traversal", "", 0).unwrap();
+        with_session_db(&reloaded, |db| {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let header = tx.get(&key).unwrap().unwrap();
+            let stored = mapper::bytes(&mut tx, &header).unwrap();
+            let json = codec::expand(&stored, value_cap(&key)).unwrap();
+            assert!(json.len() > 16 * 1024 * 1024);
+            assert_eq!(
+                codec::expand(&stored, 16 * 1024 * 1024)
+                    .unwrap_err()
+                    .to_string(),
+                "state_v2_value_admission"
+            );
+        });
+        view
+    };
+    let clean = run(false);
     assert_eq!(
-        guard().unwrap_err().downcast_ref::<Hold>(),
-        Some(&Hold::SaveOversize)
+        serde_json::to_vec(&run(true)).unwrap(),
+        serde_json::to_vec(&clean).unwrap()
     );
+    // Positive control: two accounts placed, usage tokens and the typed
+    // birth store present.
+    let accounts: BTreeSet<_> = clean.claude_account_family_pending["family"]
+        .previous_windows
+        .resident()
+        .iter()
+        .chain([&clean.claude_account_family_pending["family"].current])
+        .map(|w| w.account_identifier_hash.clone())
+        .collect();
+    assert_eq!(accounts.len(), 2);
+    let value = serde_json::to_value(&clean).unwrap();
+    assert!(
+        value["claude_usage_family_pending"]["synthetic-family"]["member_occurrences"]
+            ["synthetic-file"]
+            .as_object()
+            .is_some_and(|occurrences| !occurrences.is_empty())
+    );
+    let birth = serde_json::to_vec(&clean.claude_money_birth_store).unwrap();
+    assert!((1024 * 1024..4 * 1024 * 1024).contains(&birth.len()));
     assert_eq!(
-        with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
-        Some(Hold::SaveOversize)
+        clean
+            .claude_money_birth_store
+            .observed_birth("session-7", "/synthetic/birth/7.jsonl"),
+        Some(1_007)
     );
 }
 

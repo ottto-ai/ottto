@@ -301,9 +301,8 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
 
 /// [money] A late-evidence re-fold whose body is not the ACKed one reads 0
 /// native bytes and is sent as an ordinary update (L02): its body is the
-/// cold Full's whole body, never a rescan claim or a challenge answer,
-/// counted by its reason, and nothing is owed afterwards. An append's body
-/// is not a re-fold.
+/// cold Full's whole body, never a rescan claim or a challenge answer, and
+/// nothing is owed afterwards.
 #[test]
 fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let mut route = route();
@@ -311,10 +310,9 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
     let (items, bytes) = stored_finish(&route, &path, &key);
     assert_eq!(bytes, 0);
     let count = items.len();
-    let scan = finalize(&mut route, &key, items.clone(), false, Some(REASON));
+    let scan = finalize(&mut route, &key, items, false);
     assert_eq!(scan.snapshots.len(), count, "the re-fold is sent");
     assert_eq!(scan.semantic_noop_count, 0);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
     money_oracle::assert_equivalent(
         &full(&route, &path),
         &emitted(Mode::Restart, &scan.snapshots),
@@ -337,8 +335,4 @@ fn differing_stored_body_is_sent_as_the_cold_full_body() {
         false,
         false
     ));
-
-    let scan = finalize(&mut route, &key, items, false, None);
-    assert_eq!(scan.snapshots.len(), count);
-    assert_eq!(counters::total("tail_refold", "rearmed"), 1);
 }

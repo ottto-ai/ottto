@@ -519,3 +519,6 @@ fn protected_origin_keeps_the_prefix_without_a_wait() {
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(support);
 }
+
+#[path = "e2_copy_route_tests.rs"]
+mod copy_route_tests;

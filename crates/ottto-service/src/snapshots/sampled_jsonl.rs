@@ -66,15 +66,9 @@ impl CachedJsonlReduction {
         }
     }
     /// Only Claude parses hold markers; Codex and Pi have none to change.
-    /// Address first: the context scrub stands in a sentence position.
-    pub(super) fn scrub_identity(&mut self, context: bool, address: bool) {
+    pub(super) fn scrub_context_digest(&mut self) {
         if let Some(markers) = self.accumulator.claude_org_markers.as_deref_mut() {
-            if address {
-                markers.scrub_address();
-            }
-            if context {
-                markers.scrub_context_digest();
-            }
+            markers.scrub_context_digest();
         }
     }
     #[cfg(test)]

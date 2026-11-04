@@ -1,10 +1,35 @@
 //! Lowercase hex encoding and shape checks (SHA-256 digests, UUIDs).
 
+use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 /// Two lowercase hex digits per byte.
 pub(crate) fn encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    LowerHex(bytes).to_string()
+}
+
+/// [`encode`] without the `String`: written 32 bytes at a time through a stack
+/// buffer.
+pub(crate) struct LowerHex<'a>(pub(crate) &'a [u8]);
+impl fmt::Display for LowerHex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = [0_u8; 64];
+        for chunk in self.0.chunks(32) {
+            for (slot, byte) in text.chunks_exact_mut(2).zip(chunk) {
+                slot[0] = DIGITS[usize::from(byte >> 4)];
+                slot[1] = DIGITS[usize::from(byte & 15)];
+            }
+            f.write_str(std::str::from_utf8(&text[..chunk.len() * 2]).map_err(|_| fmt::Error)?)?;
+        }
+        Ok(())
+    }
+}
+impl Serialize for LowerHex<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 /// Inverse of [`encode`] (either case); `None` on odd length or a non-hex pair.

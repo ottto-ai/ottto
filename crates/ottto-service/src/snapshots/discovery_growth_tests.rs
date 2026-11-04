@@ -365,7 +365,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .unwrap()
         .write_all(token(20).as_bytes())
         .unwrap();
-    f.age(91); // age BEFORE binding the completion; no artificial stale witness
+    // Past the 7-day window, inside the 60-day first-read bound used by
+    // the cold Full oracle. Bind after this one backdate for APFS birth clamping.
+    f.age(59);
     let aged_metadata = fs::metadata(&f.path).unwrap();
     let aged_modified = aged_metadata.modified().unwrap();
     #[cfg(target_os = "macos")]

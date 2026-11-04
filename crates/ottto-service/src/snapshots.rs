@@ -143,7 +143,6 @@ mod shared_value;
 #[cfg(test)]
 mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
-pub(crate) mod claude_folder_login;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
@@ -240,6 +239,8 @@ mod discovery_growth_tests;
 pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
+#[cfg(test)]
+mod first_read_tests;
 #[cfg(test)]
 mod held_audit_restore_tests;
 pub(crate) mod line_delivery;
@@ -1452,13 +1453,7 @@ impl SnapshotSource {
                 home.join(".codex").join("archived_sessions"),
             ],
             SnapshotSource::ClaudeCode => vec![home.join(".claude").join("projects")],
-            SnapshotSource::Pi => {
-                if let Some(override_dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
-                    vec![PathBuf::from(override_dir).join("sessions")]
-                } else {
-                    vec![home.join(".pi").join("agent").join("sessions")]
-                }
-            }
+            SnapshotSource::Pi => vec![crate::agent_status::pi_sessions_dir(home)],
         }
     }
 }
@@ -2160,23 +2155,7 @@ pub struct SnapshotRequestEvidence {
     /// never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
-    /// Present only on `transcript_recorded_login`, under its capability. Outside
-    /// the semantic leaf: a witness-only change causes no upload.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sole_login_witness: Option<SoleLoginWitness>,
 }
-
-/// Why a recorded-login request was named: the folder's kind, a count key and
-/// how far back the folder's evidence reaches. No path, email, plan or org type.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SoleLoginWitness {
-    pub v: u8,
-    /// `folder` or `slot`.
-    pub kind: String,
-    pub folder: String,
-    pub covered_from: String,
-}
-crate::heap_layout_bound::fields!(SoleLoginWitness; v, kind, folder, covered_from);
 
 /// Exact shared activity-hint capability for carried-account provenance.
 /// Missing/null/unknown keeps existing wire bytes for every source.
@@ -4160,9 +4139,10 @@ pub struct ScanIndex {
     /// Local destination-scoped publication authority, saved with re-owed marks.
     #[serde(default)]
     pub(crate) copy_prefix_last_accepted_nonce: Option<String>,
-    /// Per-config-folder login evidence, written only under its capability.
-    #[serde(default)]
-    pub(crate) claude_folder_login_ledger: BTreeMap<String, claude_folder_login::FolderRecord>,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// The per-folder login ledger, retired with its only consumer.
+    #[serde(rename = "claude_folder_login_ledger", default)]
+    retired_claude_folder_login_ledger: serde::de::IgnoredAny,
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
@@ -4385,7 +4365,7 @@ impl Default for ScanIndex {
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
             copy_prefix_last_accepted_nonce: None,
-            claude_folder_login_ledger: BTreeMap::new(),
+            retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: TailDiscovery::default(),
             copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
@@ -8295,9 +8275,6 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
-    /// This read re-folded late evidence from stored state: a body that is
-    /// not the ACKed one goes as an ordinary update, counted by its reason.
-    stored_reuse: Option<CandidateParseReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -8520,19 +8497,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
             .map(snapshot_file_upload_body_set_hex);
-        // A late-evidence re-fold that is not the ACKed body is an ordinary
-        // update on the head CAS, the body a native read would send now.
-        #[cfg(unix)]
-        if let Some(reason) = pending.stored_reuse.filter(|_| {
-            final_group_fingerprint != pending.previous_snapshot_fingerprint
-                || final_upload_body_witness != pending.previous_upload_body_witness
-        }) {
-            tail_source::counters::bump(
-                source,
-                "tail_refold",
-                CANDIDATE_PARSE_REASON_NAMES[reason as usize],
-            );
-        }
         if pending.sampled_audit_verified {
             crate::local_resource_diagnostics::sampled_audit_comparison(
                 source.api_slug(),
@@ -12914,7 +12878,7 @@ impl ClaudeLegacyRequestOwners {
             let evidence_fingerprint = <[u8; 32]>::from(sha256_digest(&[
                 "claude_legacy_request_owner:v1",
                 root_session_id,
-                claude_request_identity::digest_hex::encode(&request_hash).as_str(),
+                crate::hex::encode(&request_hash).as_str(),
                 row.fingerprint.as_str(),
                 trace.fingerprint.as_str(),
             ]));
@@ -13124,9 +13088,7 @@ fn claude_legacy_exclusion_evidence_fingerprint(
         digest.update(b"\0");
         digest.update(owner.root_session_id.as_bytes());
         digest.update(b"\0");
-        digest.update(
-            claude_request_identity::digest_hex::encode(owner.evidence_fingerprint).as_bytes(),
-        );
+        digest.update(crate::hex::encode(owner.evidence_fingerprint).as_bytes());
         digest.update(b"\0");
     }
     Some(format!("{:x}", digest.finalize()))
@@ -19698,10 +19660,6 @@ impl SnapshotAccumulator {
         reasoning_effort: Option<String>,
         computed_effective_input_context: Option<u64>,
     ) {
-        self.claude_file_birth.observe_response_writer(
-            value.get("version").and_then(Value::as_str),
-            timestamp.as_deref(),
-        );
         let tool_uses = claude_response_tool_uses(value);
         let cache_slot = claude_cache_request_slot(
             value,
@@ -20522,9 +20480,9 @@ impl SnapshotAccumulator {
                     .map_or(0, String::capacity),
             )?;
         let path_text = path.as_os_str().len();
-        // The twin's index key (lossy text of a path no longer than
-        // PATH_MAX) beside `original_witness`' own key and member; or
-        // the fork parent's key with its path and lossy copies.
+        // The copy's folder key (lossy text of its parent directory, no
+        // longer than PATH_MAX) with its path and lossy copies, beside the
+        // fork parent's key with its path and lossy copies.
         let proof = usize::try_from(libc::PATH_MAX)
             .ok()?
             .checked_mul(3)?
@@ -20953,13 +20911,6 @@ impl SnapshotAccumulator {
             && claude_transcript_excluded_from_snapshots(path)
         {
             return Vec::new();
-        }
-        if let Some(fold) = self.claude_money.as_deref_mut() {
-            let forked =
-                self.claude_fork_parent.is_some() || self.claude_context_curve_owned_start_proven;
-            fold.folder_trace = Some(Box::new(claude_folder_login::FolderTrace::of_file(
-                path, forked,
-            )));
         }
         let Some(source_session_id) = self
             .source_session_id
@@ -24728,14 +24679,11 @@ fn codex_parent_step_start(
                 },
                 Ok((path, identity, file))
                     if codex_parent_outside_window(
-                        discovery_retention!(index),
+                        index,
                         &path,
                         &file,
                         census_unix_seconds,
                         backfill_window_days,
-                        DiscoveryRecovery {
-                            files: &index.files,
-                        },
                     ) =>
                 {
                     ParentWitness {
@@ -26778,14 +26726,13 @@ impl OwnedSourceScan {
         let hinted_paths = changed_watcher_hints(index, hinted_paths);
         let next_generation_hints;
         {
-            let traversal = index.traversal.as_mut().expect("traversal initialized");
             refresh_retained_codex_roster(
                 source,
-                traversal,
+                index,
                 backfill_window_days,
-                discovery_retention!(index, &resource_probe.discovery_growth),
-                DiscoveryRecovery::from(&index.files),
+                Some(&resource_probe.discovery_growth),
             );
+            let traversal = index.traversal.as_mut().expect("traversal initialized");
             start_due_listing_pass(traversal, collected_at);
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
@@ -29719,7 +29666,7 @@ impl OwnedSourceScan {
                     sampling: file_sampling,
                     candidate,
                     decision,
-                    parse_reason,
+                    parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -30272,22 +30219,6 @@ impl OwnedSourceScan {
                 // local buffer, published only on the native finish's verdict.
                 #[cfg(unix)]
                 let tail_base = parser.take_tail_base();
-                #[cfg(unix)]
-                let stored_reuse = parser
-                    .take_stored_read()
-                    .then_some(parse_reason)
-                    .flatten()
-                    .filter(|reason| tail_source::load::late_evidence(*reason))
-                    .filter(|_| {
-                        file_sampling.as_ref().is_some_and(|active| {
-                            !matches!(
-                                active.mode,
-                                crate::transcript_acquisition::ReadMode::Full(_)
-                            )
-                        })
-                    });
-                #[cfg(not(unix))]
-                let stored_reuse = None;
                 #[cfg(unix)]
                 let mut tail = completed_acquisition
                     .as_ref()
@@ -31251,7 +31182,6 @@ impl OwnedSourceScan {
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
                                 .active_effective_upload_body_witness_revision,
-                            stored_reuse: None,
                         });
                         let alias_items = parsed
                             .iter()
@@ -31322,7 +31252,6 @@ impl OwnedSourceScan {
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
                         .active_effective_upload_body_witness_revision,
-                    stored_reuse,
                 });
                 if source == SnapshotSource::Codex
                     && parse_complete
@@ -32835,13 +32764,6 @@ impl OwnedSourceScan {
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
                 sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
-            if sampled_audit::growth_active(index)
-                && !state_v2::save_read_admitted(index, &rescue_key, audit_now).unwrap_or(false)
-            {
-                sampled_audit::queue_growth_retry(index, &candidate);
-                census.record_unreadable(UnreadableCause::Reduction, 1);
-                pending!();
-            }
             let archive_candidate = codex_archive_path(&candidate.path);
             let mut archive_census = ScanCensus::default();
             let Some((mut candidate, opened_file)) =
@@ -33966,7 +33888,17 @@ impl OwnedSourceScan {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
-                                        parser.set_stored_read();
+                                        // A late-evidence re-fold from
+                                        // stored state, counted by its reason.
+                                        if let Some(reason) = parse_reason.filter(|reason| {
+                                            tail_source::load::late_evidence(*reason)
+                                        }) {
+                                            tail_source::counters::bump(
+                                                source,
+                                                "tail_refold",
+                                                CANDIDATE_PARSE_REASON_NAMES[reason as usize],
+                                            );
+                                        }
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -35249,12 +35181,8 @@ struct ParserPending {
     /// PRE seam's encode.
     #[cfg(unix)]
     tail_base: Option<tail_source::seam::TailBase>,
-    /// This read continues from a loaded head, with or without a base.
-    #[cfg(unix)]
-    stored_read: bool,
 }
-crate::heap_layout_bound::fields!(ParserPending; #[cfg(unix)] tail_base,
-    #[cfg(unix)] stored_read);
+crate::heap_layout_bound::fields!(ParserPending; #[cfg(unix)] tail_base);
 
 struct OwnedJsonlParser {
     #[cfg(test)]
@@ -35278,18 +35206,6 @@ impl OwnedJsonlParser {
     #[cfg(unix)]
     fn take_tail_base(&mut self) -> Option<tail_source::seam::TailBase> {
         self.pending.as_mut()?.tail_base.take()
-    }
-    #[cfg(unix)]
-    fn set_stored_read(&mut self) {
-        self.pending
-            .get_or_insert_with(Default::default)
-            .stored_read = true;
-    }
-    #[cfg(unix)]
-    fn take_stored_read(&mut self) -> bool {
-        self.pending
-            .as_mut()
-            .is_some_and(|pending| std::mem::take(&mut pending.stored_read))
     }
     fn new(
         file: File,
@@ -43914,14 +43830,31 @@ fn pace_listing_owed(traversal: &mut ScanTraversalCheckpoint, key: &str) -> bool
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
 /// (ctime-only events included) is dropped; a vanished one is kept for the
 /// exact removal path. Owner requests keep their unchanged files: a leased reason re-offer
-/// here, the audit retry by calling the queue directly.
+/// here, the audit retry by calling the queue directly. A hint never admits a
+/// first read past the first-read bound.
 fn changed_watcher_hints(index: &ScanIndex, hinted_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let census_unix_seconds = index
+        .traversal
+        .as_ref()
+        .and_then(|walk| rfc3339_unix_seconds(&walk.census_window_end));
     hinted_paths
         .iter()
         .filter(|path| {
             index.reason_reoffer_leased(&local_index_key(path))
-                || !fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.is_file() && index.hint_settled(path, &metadata))
+                || !fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && (index.hint_settled(path, &metadata)
+                            || first_read_aged(
+                                index,
+                                path,
+                                metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(unix_seconds)
+                                    .unwrap_or_default(),
+                                census_unix_seconds,
+                            ))
+                })
         })
         .cloned()
         .collect()
@@ -44032,14 +43965,30 @@ fn enqueue_watcher_hints(
 /// existing holds apply until a later tick or the next walk.
 fn refresh_retained_codex_roster(
     source: SnapshotSource,
+    index: &mut ScanIndex,
+    backfill_window_days: u64,
+    growth: Option<&discovery_growth::Page>,
+) {
+    let mut traversal = index.traversal.take().expect("traversal initialized");
+    refresh_retained_codex_directories(source, &mut traversal, backfill_window_days, index, growth);
+    index.traversal = Some(traversal);
+}
+
+fn refresh_retained_codex_directories(
+    source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
-    retention: DiscoveryRetention<'_>,
-    recovery: DiscoveryRecovery<'_>,
+    index: &ScanIndex,
+    growth: Option<&discovery_growth::Page>,
 ) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
     }
+    let recovery = DiscoveryRecovery::from(&index.files);
+    let retention = DiscoveryRetention {
+        growth,
+        ..discovery_retention!(index)
+    };
     let moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
@@ -44145,6 +44094,10 @@ fn refresh_retained_codex_roster(
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery && aged && !owes_stamped {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                continue;
+            }
+            if first_read_aged(index, &path, modified_unix_seconds, census_unix_seconds) {
+                line_delivery_unselected(source.api_slug(), UnselectedReason::FirstReadAge);
                 continue;
             }
             crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
@@ -44683,10 +44636,12 @@ fn advance_bounded_directory_traversal_with_budget(
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
+            let first_read_aged = !pending.contains_key(&path)
+                && first_read_aged(index, &path, modified_unix_seconds, census_unix_seconds);
             let listing = g7_debt::Listing {
                 path: &path,
                 metadata: &metadata,
-                in_window: !aged,
+                in_window: !(aged || first_read_aged),
             };
             debt.listed(index, listing);
             let owes_stamped = aged
@@ -44708,6 +44663,12 @@ fn advance_bounded_directory_traversal_with_budget(
             {
                 if !relisting {
                     line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
+                }
+                continue;
+            }
+            if first_read_aged {
+                if !relisting {
+                    line_delivery_unselected(source.api_slug(), UnselectedReason::FirstReadAge);
                 }
                 continue;
             }
@@ -45389,6 +45350,46 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
+/// The first-read bound in days. It is in no walk identity: the walk, its
+/// pruning and the uploaded window keep `backfill_window_days`.
+const FIRST_READ_WINDOW_DAYS: u64 = 60;
+
+/// First-seen bound: a file never read, whose mtime is older than
+/// `FIRST_READ_WINDOW_DAYS` at the census time, is not admitted for a first
+/// read. Any read evidence keeps the walk window: an index entry (it also
+/// carries every recovery and verification debt), confirmed-empty, an account
+/// hold, a committed Tail head (G7 debt included; an unreadable store counts
+/// as one), or archive read evidence (settled, or a retained body witness).
+/// Checked where a file is first admitted (the walk, a watcher hint, the Codex
+/// roster refresh and an opened Codex parent), independently of the archive
+/// age exemption. Queued work and the open recheck keep the walk window.
+fn first_read_aged(
+    index: &ScanIndex,
+    path: &Path,
+    modified_unix_seconds: u64,
+    census_unix_seconds: Option<u64>,
+) -> bool {
+    if census_unix_seconds.map_or(true, |now| {
+        is_recent_enough_at(modified_unix_seconds, now, FIRST_READ_WINDOW_DAYS)
+    }) {
+        return false;
+    }
+    let key = local_index_key(path);
+    let read = index.files.contains_key(&key)
+        || index.confirmed_empty_files.contains(&key)
+        || index.claude_account_deferred_holds.contains_key(&key)
+        || index.archives.get(&key).is_some_and(|archive| {
+            archive.owed_cause().is_none()
+                || archive
+                    .work
+                    .as_ref()
+                    .is_some_and(|work| work.body_witness.is_some())
+        })
+        || (!matches!(state_v2::tail_route_path(index), Ok(None))
+            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
+    !read
+}
+
 /// Per-caller derived view, bounded by the held inventory; never move proof.
 struct AccountMoveObservations {
     paths: BTreeMap<String, Vec<String>>,
@@ -45531,16 +45532,18 @@ fn opened_candidate_is_within_frozen_window(
 }
 
 /// PR-P: the opened parent is outside this traversal's backfill window and
-/// has no verification rescue, the exact discovery filter. Discovery never
-/// makes it a candidate, so no parse can produce its ledger.
+/// has no verification rescue, or past the first-read bound, the exact
+/// discovery filter. Discovery never makes it a candidate, so no parse can
+/// produce its ledger.
 fn codex_parent_outside_window(
-    retention: DiscoveryRetention<'_>,
+    index: &ScanIndex,
     path: &Path,
     file: &File,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    recovery: DiscoveryRecovery<'_>,
 ) -> bool {
+    let retention = discovery_retention!(index);
+    let recovery = DiscoveryRecovery::from(&index.files);
     let metadata = file.metadata().ok();
     let modified = metadata
         .as_ref()
@@ -45567,7 +45570,8 @@ fn codex_parent_outside_window(
         path,
         metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
     );
-    !requires_recovery && aged && !owes_stamped
+    (!requires_recovery && aged && !owes_stamped)
+        || first_read_aged(index, path, modified, census_unix_seconds)
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -52043,7 +52047,7 @@ impl ScanIndex {
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
-            claude_folder_login_ledger: self.claude_folder_login_ledger.clone(),
+            retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: self.tail_discovery,
             copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
@@ -54490,9 +54494,7 @@ fn codex_parent_prefix_chain(previous: &PrefixDigest, signature: &str) -> Prefix
     update_length_prefixed(&mut digest, signature.as_bytes());
     digest.finalize().into()
 }
-fn codex_digest_hex(digest: &PrefixDigest) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+use crate::hex::encode as codex_digest_hex;
 /// U1a: lower-case 64-hex only.
 fn codex_digest_from_hex(hex: &str) -> Option<PrefixDigest> {
     if hex.len() != 64
@@ -56206,7 +56208,8 @@ mod tests {
                 "{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n{{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
             )).unwrap();
         }
-        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+        // Older than the receipt window, inside the first-read bound.
+        let old_mtime = OffsetDateTime::parse("2026-09-01T00:02:00Z", &Rfc3339)
             .unwrap()
             .unix_timestamp() as u64;
         for id in ["refused", "healthy"] {
@@ -82618,7 +82621,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision, stored_reuse);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 // Hand-written so an absent fork costs no visit: every Claude and Codex
 // accumulator carries an empty ledger, and their frames must keep the visit
@@ -82763,7 +82766,7 @@ crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, 
 crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
-crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source, sole_login_witness);
+crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
     U thread_source: Option<String>,
