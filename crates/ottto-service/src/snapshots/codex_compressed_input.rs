@@ -1680,15 +1680,19 @@ pub(in crate::snapshots) mod tests {
                     snapshot_upload_body_witness(expected)
                 );
             }
-            // Body corruption is an ordinary per-file read failure now;
-            // its diagnostic and census loss remain visible beside plain money.
+            // Codec corruption and an invalid mandatory receipt both fail
+            // ordinary acquisition. Preserve that file's reduction diagnostic
+            // and census loss beside the unchanged independent plain money.
+            let acquisition_failed = matches!(refusal, "body" | "receipt");
             assert_eq!(
                 result.unreadable_path_count,
-                control.unreadable_path_count + usize::from(refusal == "body")
+                control.unreadable_path_count + usize::from(acquisition_failed),
+                "{refusal}: ordinary unreadable-file accounting"
             );
             assert_eq!(
                 result.census_complete,
-                control.census_complete && refusal != "body"
+                control.census_complete && !acquisition_failed,
+                "{refusal}: ordinary census eligibility"
             );
             assert_eq!(
                 result.census_residue_index_key_count,

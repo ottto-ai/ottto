@@ -472,7 +472,20 @@ fn inventory_refusal_isolates_only_proven_dependants() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let c = Corpus::new();
-    c.write(MAIN, Some("a"));
+    // Both the retained member and its repaired sibling must satisfy main's
+    // native group proof; a UI-only member is deliberately held by that proof.
+    let mut native = codex_file_join::tests::member(MAIN, "root-response", 200, 200);
+    native[0]["payload"]["source"] = json!("cli");
+    native[0]["payload"]["creator_user_id"] = json!("synthetic-user-a");
+    native[0]["payload"]["creator_account_id"] = json!("synthetic-workspace-a");
+    fs::write(
+        c.path(MAIN),
+        native
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
     c.write(OTHER, Some("b"));
     c.write(SIDE, Some("b"));
     c.write(GAP, None);
@@ -518,7 +531,7 @@ fn inventory_refusal_isolates_only_proven_dependants() {
         .confirmed_empty_files
         .contains(&local_index_key(&sibling)));
     // Repair to a disjoint same-id response through the shared native rows.
-    let rows = codex_file_join::tests::member(MAIN, "side-response", 100, 400);
+    let rows = codex_file_join::tests::member(MAIN, "side-response", 100, 300);
     let repaired = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
     // Group replay still requires physical plaintext certificates. The
     // provider's repaired plaintext takes the existing generic group path.
@@ -528,6 +541,12 @@ fn inventory_refusal_isolates_only_proven_dependants() {
         &c,
         ScanIndex::default(),
         Arc::new(sampled_scan::SharedCache::default()),
+    );
+    assert!(
+        cold.snapshots
+            .iter()
+            .any(|item| item.source_session_id == MAIN),
+        "the repaired cold owner must be admitted before testing its recovery"
     );
     let mut cold_b = cold.clone();
     cold_b.snapshots.retain(|s| {
