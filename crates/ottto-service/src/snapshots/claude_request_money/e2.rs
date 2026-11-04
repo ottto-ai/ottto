@@ -591,13 +591,6 @@ pub(super) const COPY_UNPROVEN_KEY: &str = "__ottto_copy_unproven";
 fn mark_copy_key(key: &mut ClaudeLiveKey) {
     key.2.insert(COPY_UNPROVEN_KEY.into(), "true".into());
 }
-#[cfg(test)]
-impl ClaudeEntityBody {
-    pub(crate) fn certificate_failure_for_test(&self) -> Option<String> {
-        self.certificate_failure
-            .map(|failure| format!("{failure:?}"))
-    }
-}
 impl ClaudeEntityBody {
     fn fail_certificate(&mut self, reason: CertificateFailure) {
         self.certificate_ok = false;

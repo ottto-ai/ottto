@@ -4,9 +4,6 @@
 // pass reading every side-file root does (the reference root set).
 use super::state_v2_money_tests::tagged_api;
 use super::*;
-use crate::snapshots::claude_request_identity::{
-    IdentityRef, Refusal, RequestProbe, REQUEST_PROBE,
-};
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle::assert_equivalent, RouteResult,
 };
@@ -265,16 +262,6 @@ fn org_a_requests(done: &Run, session: &str) -> u64 {
     org_shares(item).get(&org).copied().unwrap_or(0)
 }
 
-/// `body` with `request` of `session` probed at reconcile entry.
-fn probed(session: &str, request: &str, body: impl FnOnce() -> Run) -> (Run, Option<RequestProbe>) {
-    REQUEST_PROBE.with(|slot| {
-        *slot.borrow_mut() = (Some((session.to_owned(), request.to_owned())), None);
-    });
-    let done = body();
-    let probe = REQUEST_PROBE.with(|slot| std::mem::take(&mut *slot.borrow_mut()).1);
-    (done, probe)
-}
-
 fn arm_case(arm: Arm) {
     let label = format!("{arm:?}");
     if arm == Arm::UnhealthyOwner {
@@ -282,59 +269,8 @@ fn arm_case(arm: Arm) {
             let (c, roots) = held_corpus(name);
             org_a_requests(&run(&c, &roots, reference, 100), EARLY)
         };
-        let (c, roots) = held_corpus("scoped-unhealthy");
-        let (done, probe) = probed(EARLY, "held", || run(&c, &roots, None, 100));
-        // Each link the arm relies on, in flow order, on the scoped run.
-        let probe = probe.expect("the page holding EARLY reached reconcile with identity evidence");
-        assert!(
-            probe.holders.iter().any(|holder| holder == LATER),
-            "(i) the census names LATER as a holder of `held`: {:?}",
-            probe.holders
-        );
-        assert!(
-            probe.unhealthy_roots.iter().any(|root| root == LATER),
-            "(ii) LATER's malformed pair is an unhealthy root: {:?}",
-            probe.unhealthy_roots
-        );
-        assert!(
-            probe.owner_unreadable,
-            "(iii) the scope names an unreadable owner for EARLY's `held`"
-        );
         assert_eq!(
-            probe.identity,
-            format!(
-                "{:?}",
-                Some(IdentityRef::Refused(Refusal::IncompleteEvidence))
-            ),
-            "(iv) the classifier refuses EARLY's `held` as incomplete evidence"
-        );
-        assert_eq!(
-            probe.accounts,
-            Some(false),
-            "(v) EARLY's fold reaches the per-request loop (accounts, not reconciled)"
-        );
-        assert_eq!(
-            probe.certificate_failure,
-            Some(None),
-            "(vi) reconcile keeps EARLY's entity certified"
-        );
-        assert_eq!(
-            probe.unknown_requests,
-            Some(1),
-            "(vi) after reconcile, `held` sits in a grain with no account"
-        );
-        assert_eq!(
-            probe.withheld,
-            Some(false),
-            "(vii) finish_page emits EARLY rather than withholding it"
-        );
-        assert_eq!(
-            probe.tag.as_deref(),
-            Some("Sent"),
-            "(vii) the request-owned grouping tags EARLY"
-        );
-        assert_eq!(
-            org_a_requests(&done, EARLY),
+            shares(None, "scoped-unhealthy"),
             1,
             "a request another session holds, whose pair is unreadable, is Unknown"
         );

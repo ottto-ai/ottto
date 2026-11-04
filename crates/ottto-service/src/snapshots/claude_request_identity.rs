@@ -3110,7 +3110,8 @@ struct CarryCounts {
     /// transcript, a seed over the key cap, or a run a no-account row ended.
     no_seed: bool,
     /// Counted own telemetry that names no valid account (API key, cloud,
-    /// placeholder).
+    /// placeholder), or a request refused because its named owner could not
+    /// be read. Either way no session-start fill reaches this file.
     blocked_no_account: bool,
     /// Runtime-only resource verdict, propagated into the existing item HOLD.
     keys_over_cap: bool,
@@ -3613,113 +3614,6 @@ impl RequestAccounts {
 /// earlier own request, then the start/binding; every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
 /// requests stay Unknown, counted per reason in the returned totals.
-/// One request's links at reconcile entry, for the pipeline tests.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestProbe {
-    /// The scope's census holders of the request.
-    pub(crate) holders: Vec<String>,
-    pub(crate) unhealthy_roots: Vec<String>,
-    pub(crate) owner_unreadable: bool,
-    /// The classifier's answer, as `Debug` text.
-    pub(crate) identity: String,
-    /// `Some(reconciled)` when the item's fold carries accounts.
-    pub(crate) accounts: Option<bool>,
-    /// After reconcile: the entity's certificate failure, as `Debug` text.
-    pub(crate) certificate_failure: Option<Option<String>>,
-    /// After reconcile: requests in grains with no account.
-    pub(crate) unknown_requests: Option<u64>,
-    /// After `finish_page`: whether the item was withheld.
-    pub(crate) withheld: Option<bool>,
-    /// The tagging outcome of `apply_scan_page`.
-    pub(crate) tag: Option<String>,
-}
-
-#[cfg(test)]
-pub(crate) type RequestProbeSlot = (Option<(String, String)>, Option<RequestProbe>);
-
-// Test seam: the (session, request) to probe on this thread, and the first
-// report taken from a streamed pass.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static REQUEST_PROBE: std::cell::RefCell<RequestProbeSlot> =
-        const { std::cell::RefCell::new((None, None)) };
-}
-
-/// Records the probed request's links once, before reconcile consumes them.
-#[cfg(test)]
-pub(crate) fn probe_request(items: &[SnapshotItem], evidence: &ScanEvidence<'_>) {
-    REQUEST_PROBE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some((session, request)) = slot.0.clone().filter(|_| slot.1.is_none()) else {
-            return;
-        };
-        let Some(item) = items.iter().find(|item| item.source_session_id == session) else {
-            return;
-        };
-        let root = super::claude_snapshot_family_root_ref(item);
-        let identity = item
-            .claude_usage_occurrences
-            .get(request.as_str())
-            .and_then(|occurrence| request_occurrence_facts(item, request.as_str(), occurrence))
-            .map(|facts| classify_ref(evidence, &facts));
-        let report = RequestProbe {
-            holders: evidence
-                .cross
-                .map(|cross| cross.holders_for_test(&request))
-                .unwrap_or_default(),
-            unhealthy_roots: evidence.unhealthy_roots.iter().cloned().collect(),
-            owner_unreadable: evidence.owner_unreadable(root, &request),
-            identity: format!("{identity:?}"),
-            accounts: item
-                .claude_money
-                .as_ref()
-                .and_then(|fold| fold.accounts.as_ref())
-                .map(|accounts| accounts.reconciled),
-            ..RequestProbe::default()
-        };
-        slot.1 = Some(report);
-    });
-}
-
-/// Fills the probed report's later stages once, on the pass that opened it.
-#[cfg(test)]
-pub(crate) fn probe_stage(fill: impl FnOnce(&str, &mut RequestProbe)) {
-    REQUEST_PROBE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let (Some((session, _)), Some(report)) = &mut *slot else {
-            return;
-        };
-        fill(session.as_str(), report);
-    });
-}
-
-/// After reconcile: the probed item's certificate and its Unknown requests.
-#[cfg(test)]
-pub(crate) fn probe_after_reconcile(items: &[SnapshotItem]) {
-    probe_stage(|session, report| {
-        if report.unknown_requests.is_some() {
-            return;
-        }
-        let Some(fold) = items
-            .iter()
-            .find(|item| item.source_session_id == session)
-            .and_then(|item| item.claude_money.as_deref())
-        else {
-            return;
-        };
-        report.certificate_failure = Some(fold.entity.certificate_failure_for_test());
-        report.unknown_requests = Some(
-            fold.entity
-                .grains
-                .iter()
-                .filter(|((_, _, account), _)| account.is_none())
-                .map(|(_, grain)| grain.requests)
-                .sum(),
-        );
-    });
-}
-
 pub(crate) fn reconcile_request_accounts(
     items: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
@@ -3934,12 +3828,12 @@ pub(crate) fn reconcile_request_accounts(
             }
             // The classifier's refusal for an owner the scope names but could
             // not read: no marker, carry, start or binding fills it.
-            let account = if blocked
-                || (matches!(
-                    identity,
-                    Some(IdentityRef::Refused(Refusal::IncompleteEvidence))
-                ) && evidence.owner_unreadable(root, request.as_str()))
-            {
+            let unreadable_owner = matches!(
+                identity,
+                Some(IdentityRef::Refused(Refusal::IncompleteEvidence))
+            ) && evidence.owner_unreadable(root, request.as_str());
+            let account = if blocked || unreadable_owner {
+                carry.counts.blocked_no_account |= unreadable_owner;
                 None
             } else if preserve_org {
                 own_marker.and_then(|run| run.account.clone())
@@ -5199,23 +5093,7 @@ pub(crate) fn apply_scan_page(
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        let tagged = tag_item(item, evidence, &mut reported, &mut outcome.copy_invalidated);
-        #[cfg(test)]
-        probe_stage(|session, report| {
-            if report.tag.is_none() && item.source_session_id == session {
-                report.tag = Some(
-                    match &tagged {
-                        Some(Ok(Tagged::Held)) => "Held",
-                        Some(Ok(Tagged::Sent { .. })) => "Sent",
-                        Some(Ok(Tagged::Fallback { .. })) => "Fallback",
-                        Some(Err(_)) => "Ineligible",
-                        None => "Untagged",
-                    }
-                    .to_owned(),
-                );
-            }
-        });
-        match tagged {
+        match tag_item(item, evidence, &mut reported, &mut outcome.copy_invalidated) {
             Some(Ok(Tagged::Held)) => {
                 outcome.held.insert(item.source_session_id.clone());
             }

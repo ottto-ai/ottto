@@ -202,18 +202,6 @@ impl CrossRootEvidence {
         }
     }
 
-    /// Every census holder the scope recorded for `request_id`.
-    #[cfg(test)]
-    pub(crate) fn holders_for_test(&self, request_id: &str) -> Vec<String> {
-        self.scope
-            .holders
-            .get(&claude_request_hash(request_id))
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect()
-    }
-
     /// The other sessions the scope names as owners of `request_id` in a file
     /// under `root`: the census holders and the file's named fork parents.
     pub(crate) fn named_owners<'s>(
