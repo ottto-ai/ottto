@@ -713,11 +713,10 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
 /// which input changed.
 #[test]
 fn install_live_labels_each_incompatible_check() {
+    /// Makes the stored head, or this read, differ in one input.
+    type Differ = fn(&mut SnapshotAccumulator, &mut SnapshotAccumulator);
     let live = || SnapshotAccumulator::new(SnapshotSource::Codex);
-    let rows: [(
-        &'static str,
-        fn(&mut SnapshotAccumulator, &mut SnapshotAccumulator),
-    ); 5] = [
+    let rows: [(&'static str, Differ); 5] = [
         ("incompatible_sidecar_binding", |stored, _| {
             stored.codex_sidecar_binding = Some("another binding".into());
         }),
