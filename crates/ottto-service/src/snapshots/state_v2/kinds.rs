@@ -182,7 +182,14 @@ pub(super) fn hydrate_txn(
                 catalogue::group(kind.name()).is_some(),
                 "state_v2_unmapped_kind"
             );
-            if catalogue::retired(kind.name()) {
+            // Legacy archive member keys retain first-seen evidence. Their
+            // values stay inert; no policy state or baseline digest is loaded.
+            if catalogue::retired(kind.name())
+                && !matches!(
+                    kind.name(),
+                    "v1_field.archives" | "v1_field.archive_deferred_alarm_count"
+                )
+            {
                 retired.insert(header.key.clone());
             }
         }

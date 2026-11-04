@@ -30,7 +30,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
   census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
   population/read-volume limit. Compressed rollouts keep their original modification time,
-  so they age as the plain file did.
+  so they age as the plain file did. Legacy held archive member keys count as already seen
+  for the ordinary first-read age gate; their values remain inert, and header/ownership
+  admission still applies. A provider-written new plaintext object takes the existing
+  counted Full path; only a returning original object can continue from its saved suffix.
   A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
   EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
 - **Codex ownership.** One secure header opener supplies ordinary membership proof for either

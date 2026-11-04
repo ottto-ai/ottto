@@ -634,3 +634,161 @@ pub(super) fn carried_downgrade_index(root: &Path) -> ScanIndex {
     value["traversal"] = Value::Null;
     serde_json::from_value(value).unwrap()
 }
+
+fn aged_mtime(path: &Path) {
+    let before_window = rfc3339_unix_seconds(NOW).unwrap() - (FIRST_READ_WINDOW_DAYS + 1) * 86_400;
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(before_window))
+        .unwrap();
+}
+fn legacy_age_corpus() -> (Corpus, PathBuf, Vec<u8>) {
+    let c = Corpus::new();
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("a"));
+    c.write(GAP, None);
+    let body = [
+        rollout(MAIN, Some("a")),
+        (header(MAIN, Some("switched")) + &turn(3)).into_bytes(),
+    ]
+    .concat();
+    let compressed = c.sessions.join(format!("rollout-{MAIN}.jsonl.zst"));
+    let encoded = zstd::stream::encode_all(&body[..], 1).unwrap();
+    fs::write(&compressed, &encoded).unwrap();
+    (c, compressed, encoded)
+}
+
+/// [regress] An older archive Held for AdmissionRefused is already seen;
+/// becoming readable still requires normal admission and counted acquisition.
+#[test]
+fn legacy_owed_held_archive_older_than_first_read_window_is_counted() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (c, compressed, encoded) = legacy_age_corpus();
+    let (cold_index, cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    let expected = emitted(&cold_index, &cold);
+    assert_eq!(expected.snapshots.len(), 4);
+    fs::write(&compressed, b"previously refused compressed input").unwrap();
+    aged_mtime(&compressed);
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let key = local_index_key(&compressed);
+    state_v2::seed_0217_archive_for_test(&prior, &key);
+    let mut prior = ScanIndex::load(session.path()).unwrap();
+    assert!(!prior.files.contains_key(&key));
+    // A save before discovery must not erase the old first-seen evidence.
+    prior.save(session.path()).unwrap();
+    let prior = ScanIndex::load(session.path()).unwrap();
+    assert!(!first_read_aged(
+        &prior,
+        &compressed,
+        fs::metadata(&compressed)
+            .unwrap()
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .unwrap(),
+        rfc3339_unix_seconds(NOW)
+    ));
+    fs::write(&compressed, encoded).unwrap();
+    aged_mtime(&compressed);
+    let (working, scan, _, consumed, logs) = page(
+        &c,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    assert!(consumed > 0);
+    assert!(full_decodes(&logs) > 0, "compressed first read is counted");
+    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &prior, "accept");
+    let actual = route(&index, &scan, posts);
+    money_oracle::assert_equivalent(&expected, &actual);
+    money_oracle::assert_no_smaller_reemit(MAIN, &expected, &actual, &expected, false);
+    assert!(index.files.contains_key(&key));
+}
+
+/// [regress] The ordinary first-seen predicate excludes never-seen old input
+/// equally for both encodings, while unrelated placed money still emits.
+#[test]
+fn never_seen_old_compressed_and_plain_rollouts_share_first_read_skip() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut control = None;
+    for compressed in [false, true] {
+        let (c, path, _) = legacy_age_corpus();
+        let path = if compressed {
+            path
+        } else {
+            fs::remove_file(&path).unwrap();
+            c.write(MAIN, Some("a"));
+            c.path(MAIN)
+        };
+        aged_mtime(&path);
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let (index, scan, _, _, _) =
+            page(&c, prior, Arc::new(sampled_scan::SharedCache::default()));
+        assert!(!index.files.contains_key(&local_index_key(&path)));
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != MAIN));
+        assert_eq!(scan.snapshots.len(), 3);
+        assert!(
+            state_v2::load_head(&index, &local_index_key(&path), u32::MAX)
+                .unwrap()
+                .is_none()
+        );
+        let actual = emitted(&index, &scan);
+        if let Some(control) = &control {
+            money_oracle::assert_equivalent(control, &actual);
+        } else {
+            control = Some(actual);
+        }
+        drop(session);
+    }
+}
+
+/// [format] A release-shaped archive manifest plus member (header_attempts
+/// included) loads inert and survives an unrelated ordinary save.
+#[test]
+fn release_0217_archive_manifest_members_and_header_attempts_load_inert() {
+    let c = Corpus::new();
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let key = local_index_key(&c.sessions.join(format!("rollout-{MAIN}.jsonl.zst")));
+    state_v2::seed_0217_archive_for_test(&prior, &key);
+    let mut index = ScanIndex::load(session.path()).unwrap();
+    assert!(index.decode_holds.is_empty());
+    assert!(index.files.is_empty());
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    assert!(state_v2::legacy_archive_was_seen(&index, &key).unwrap());
+    assert!(state_v2::load_head(&index, &key, REVISION)
+        .unwrap()
+        .is_none());
+    assert!(serde_json::to_value(&index)
+        .unwrap()
+        .get("archives")
+        .is_none());
+    index.save(session.path()).unwrap();
+    let index = ScanIndex::load(session.path()).unwrap();
+    assert!(state_v2::legacy_archive_was_seen(&index, &key).unwrap());
+    assert!(index.decode_holds.is_empty());
+    assert!(index.files.is_empty());
+}

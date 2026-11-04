@@ -85,7 +85,7 @@ macro_rules! scan_index_fields {
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2] side,
-            // Inert accepted catalogue entries; ordinary retired-kind cleanup applies.
+            // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
             retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
             retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_account_family_witnesses" => 1, "raw_hold.claude_account_family_pending" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,

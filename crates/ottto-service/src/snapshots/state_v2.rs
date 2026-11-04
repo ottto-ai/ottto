@@ -49,9 +49,9 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
-    pending_carries, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
-    tail_set_aside,
+    carry_tail, erase_tail, legacy_archive_was_seen, load_head, load_revisions, load_tail,
+    observe_tail, observe_tails, pending_carries, retire_tail, set_aside_tail, stage_tail,
+    tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
@@ -595,4 +595,39 @@ pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 
 pub(super) fn growth_claim_refused(reason: &'static str) {
     telemetry::event("growth_claim_refused", &reason);
+}
+
+/// A historical store fixture: ordinary layout-2 archive manifest and members,
+/// including an attempt counter that the new reader must never apply.
+#[cfg(test)]
+pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &str) {
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::put(
+            &mut tx,
+            &mapper::key("v1_field.archives", "", 0).unwrap(),
+            &1_u64,
+        )
+        .unwrap();
+        mapper::put(
+            &mut tx,
+            &mapper::key("v1_field.archives", key, 1).unwrap(),
+            &serde_json::json!({
+                "context":null,"owner":null,"stamp":null,
+                "disposition":{"Held":{"cause":"CompressedAdmissionRefused","quiet":false}},
+                "work":{"attempts":1,"header_attempts":4}
+            }),
+        )
+        .unwrap();
+        mapper::put(
+            &mut tx,
+            &mapper::key("v1_field.archive_deferred_alarm_count", "", 0).unwrap(),
+            &1_u64,
+        )
+        .unwrap();
+        assert_eq!(
+            tx.commit(index.generation, index.generation + 1),
+            DurableCommitOutcome::Committed(index.generation + 1)
+        );
+    });
 }

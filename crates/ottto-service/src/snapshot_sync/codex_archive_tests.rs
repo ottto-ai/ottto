@@ -28,10 +28,16 @@ impl ScanIndex {
             std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
         }
         let expected = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load(
+        let destination = route
+            .as_ref()
+            .and_then(|path| path.parent()?.file_name()?.to_str())
+            .unwrap_or(&expected.destination_namespace_hash);
+        let recovery = crate::snapshots::ProgressRecovery::for_index(&index, &index_path).unwrap();
+        let mut progress = SnapshotUploadProgress::load_with_recovery(
             &progress_path,
-            &expected.destination_namespace_hash,
+            destination,
             snapshot_quarantine_witness(SnapshotSource::Codex),
+            recovery,
         )
         .unwrap();
         progress.context_receipt_candidates =

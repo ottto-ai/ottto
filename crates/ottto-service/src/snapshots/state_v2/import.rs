@@ -351,8 +351,8 @@ impl<'de> serde::de::Visitor<'de> for Presence {
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
             if !claude_original_field(&name) {
-                // Codex archive custody records its presence when its rows are
-                // written (kinds_misc::ARCHIVE_KINDS); the original never does.
+                // Retired archive fields do not enter the original-field
+                // inventory or install active archive policy state.
                 map.next_value::<serde::de::IgnoredAny>()?;
                 continue;
             }

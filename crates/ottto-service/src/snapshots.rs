@@ -21153,6 +21153,12 @@ impl OwnedSourceScan {
                     for index_key in census.removed_index_keys.iter() {
                         traversal.observed_index_keys.remove(index_key);
                     }
+                    // A positive absence in this page also updates the retained
+                    // listing roster; only a present observation on THIS page wins.
+                    traversal.codex_rollout_paths.retain(|key| {
+                        !census.removed_index_keys.contains(key)
+                            || census.observed_index_keys.contains(key)
+                    });
                     traversal
                         .observed_index_keys
                         .extend(census.observed_index_keys.iter().cloned());
@@ -21256,7 +21262,7 @@ impl OwnedSourceScan {
                             && !index
                                 .traversal
                                 .as_ref()
-                                .is_some_and(|walk| walk.observed_index_keys.contains(key))
+                                .is_some_and(|walk| walk.codex_rollout_paths.contains(key))
                     });
                 }
                 let account_members = index.observed_account_members();
@@ -33471,7 +33477,8 @@ const FIRST_READ_WINDOW_DAYS: u64 = 60;
 /// read. Any read evidence keeps the walk window: an index entry (it also
 /// carries every recovery and verification debt), confirmed-empty, an account
 /// hold, a committed Tail head (G7 debt included; an unreadable store counts
-/// as one).
+/// as one), or a legacy held archive member key. The latter grants eligibility
+/// only; ordinary header and ownership admission still apply.
 /// Checked where a file is first admitted (the walk, a watcher hint, the Codex
 /// roster refresh). Queued work and the open recheck keep the walk window.
 fn first_read_aged(
@@ -33490,7 +33497,9 @@ fn first_read_aged(
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
         || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
+            && (!matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None))
+                || (codex_archive_path(path)
+                    && !matches!(state_v2::legacy_archive_was_seen(index, &key), Ok(false)))));
     !read
 }
 

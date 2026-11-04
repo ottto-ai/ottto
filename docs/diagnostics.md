@@ -1712,6 +1712,9 @@ retry timer, Held queue or separate power/work gate remains.
 Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
 win before header/body selection, and both encodings use the same mtime age rules;
 compressed rollouts keep their original modification time, so they age as the plain file did.
+Legacy archive member keys retain first-seen eligibility under the ordinary 60-day gate;
+no disposition or attempt count is applied, and normal header/ownership admission remains.
+Never-seen old plain and compressed files are skipped equally.
 One secure header opener
 supplies ownership proof. The inventory has no file-count, directory-count, cache
 population or cumulative read-volume cap; optional header facts still use reclaimable
@@ -1734,8 +1737,8 @@ A restart mid-first-read re-decodes the prefix, counted on
 `codex_zst_decoded_bytes`; completed stored bodies retry without transcript reads.
 Older archive fields and causes within them remain decode-compatible and inert; downgrade
 scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo one
-header attempt per archive; no money effect. Compatibility claims cover decoding
-only; the Linux workflow does not run the historical-binary driver.
+header attempt per archive; no money effect. Whether an older binary decodes carried
+state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
 On close, `codex_zst_input` on the #799 carrier reports consumed
 `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread

@@ -138,6 +138,16 @@ pub(in crate::snapshots) fn load_head(
         Ok(head)
     })
 }
+/// Historical first-seen evidence only; no disposition or attempt is applied.
+pub(in crate::snapshots) fn legacy_archive_was_seen(index: &ScanIndex, key: &str) -> Result<bool> {
+    Ok(read_txn(index, |tx| {
+        Ok(tx
+            .get(&super::super::mapper::key("v1_field.archives", key, 1)?)?
+            .is_some())
+    })?
+    .0)
+}
+
 /// `head`'s pages, one short read transaction, streamed to `visit`. See
 /// `tail::load_pages` for its outcomes.
 pub(in crate::snapshots) fn load_tail(
