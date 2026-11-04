@@ -104,9 +104,6 @@ const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const PI_SESSION_MAX_DEPTH: usize = 32;
-const PI_SESSION_MAX_ENTRIES: usize = 20_000;
-const PI_SESSION_MAX_FILES: usize = 10_000;
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
 const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
@@ -13458,19 +13455,6 @@ struct PiSessionCensus {
     files: BTreeSet<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
-struct PiSessionSafetyLimits {
-    max_depth: usize,
-    max_entries: usize,
-    max_files: usize,
-}
-
-const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
-    max_depth: PI_SESSION_MAX_DEPTH,
-    max_entries: PI_SESSION_MAX_ENTRIES,
-    max_files: PI_SESSION_MAX_FILES,
-};
-
 fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
     Ok(pi_session_census()?
         .map(|census| census.files)
@@ -13481,40 +13465,31 @@ fn pi_session_census() -> Result<Option<PiSessionCensus>, LocalApiError> {
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     Ok(Some(PiSessionCensus { root, files }))
 }
 
 fn prepare_pi_live_session_census() -> Result<PiSessionCensus, LocalApiError> {
     let root = open_or_create_pi_session_root()?;
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     Ok(PiSessionCensus { root, files })
 }
 
 #[cfg(test)]
 fn pi_session_files_in(root: &Path) -> Result<BTreeSet<PathBuf>, LocalApiError> {
-    pi_session_files_in_with_limits(root, PI_SESSION_SAFETY_LIMITS)
-}
-
-#[cfg(test)]
-fn pi_session_files_in_with_limits(
-    root: &Path,
-    limits: PiSessionSafetyLimits,
-) -> Result<BTreeSet<PathBuf>, LocalApiError> {
     let Some(root) = open_pi_session_root_direct(root)? else {
         return Ok(BTreeSet::new());
     };
-    pi_session_files_for_root(&root, limits)
+    pi_session_files_for_root(&root)
 }
 
-fn pi_session_files_for_root(
-    root: &OpenPiSessionRoot,
-    limits: PiSessionSafetyLimits,
-) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+/// Every Pi session file under `root`, as a complete set or a refusal. The
+/// walk never follows a symlink, so it cannot loop; the tree's own size is
+/// the only bound.
+fn pi_session_files_for_root(root: &OpenPiSessionRoot) -> Result<BTreeSet<PathBuf>, LocalApiError> {
     verify_pi_session_root_path_identity(root)?;
     let mut files = BTreeSet::new();
-    let mut entries_seen = 0;
-    collect_pi_session_files(&root.path, 0, &mut entries_seen, &mut files, limits)?;
+    collect_pi_session_files(&root.path, &mut files)?;
     verify_pi_session_root_path_identity(root)?;
     validate_discovered_pi_session_files(root, files)
 }
@@ -13566,16 +13541,8 @@ fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), 
 
 fn collect_pi_session_files(
     path: &Path,
-    depth: usize,
-    entries_seen: &mut usize,
     files: &mut BTreeSet<PathBuf>,
-    limits: PiSessionSafetyLimits,
 ) -> Result<(), LocalApiError> {
-    if depth > limits.max_depth {
-        return Err(pi_session_import_refused(
-            "session traversal exceeded the maximum depth",
-        ));
-    }
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         pi_session_import_refused("session traversal could not inspect a directory entry")
     })?;
@@ -13584,11 +13551,6 @@ fn collect_pi_session_files(
     };
     if metadata.is_file() {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            if files.len() >= limits.max_files {
-                return Err(pi_session_import_refused(
-                    "session traversal exceeded the maximum file count",
-                ));
-            }
             files.insert(path.to_path_buf());
         }
         return Ok(());
@@ -13602,24 +13564,16 @@ fn collect_pi_session_files(
         let entry = entry.map_err(|_| {
             pi_session_import_refused("session traversal could not read a directory entry")
         })?;
-        *entries_seen = entries_seen.saturating_add(1);
-        if *entries_seen > limits.max_entries {
-            return Err(pi_session_import_refused(
-                "session traversal exceeded the maximum entry count",
-            ));
-        }
-        collect_pi_session_files(&entry.path(), depth + 1, entries_seen, files, limits)?;
+        collect_pi_session_files(&entry.path(), files)?;
     }
     Ok(())
 }
 
 fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
-    Ok(
-        pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
-            .difference(&before.files)
-            .cloned()
-            .collect(),
-    )
+    Ok(pi_session_files_for_root(&before.root)?
+        .difference(&before.files)
+        .cloned()
+        .collect())
 }
 
 /// Local Pi session files modified at or after `since`. The passive
@@ -13630,7 +13584,7 @@ fn recent_pi_session_files(since: SystemTime) -> Result<Option<Vec<PathBuf>>, Lo
     let Some(root) = open_pi_session_root()? else {
         return Ok(None);
     };
-    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_for_root(&root)?;
     pi_session_files_modified_since(&root, files, since).map(Some)
 }
 
@@ -15628,7 +15582,7 @@ fn run_pi_route_pre_smoke_with<Prepare, RunSmoke>(
 ) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>>
 where
     Prepare: FnOnce() -> Result<PiSessionCensus, LocalApiError>,
-    RunSmoke: FnOnce(&PiModelRoute, Option<usize>) -> SmokeResult,
+    RunSmoke: FnOnce(&PiModelRoute) -> SmokeResult,
 {
     let before_session_census = match prepare() {
         Ok(census) => census,
@@ -15638,8 +15592,7 @@ where
         }
     };
     let smoke_after = current_rfc3339();
-    let before_session_count = Some(before_session_census.files.len());
-    let mut smoke = run_smoke(route, before_session_count);
+    let mut smoke = run_smoke(route);
     if !smoke.succeeded {
         // A failed command is already terminal for this route. Its generic
         // pathname count is not authoritative and a second filesystem error
@@ -15951,17 +15904,16 @@ fn pi_route_passive_result(
     }
 }
 
-fn run_pi_route_smoke_prompt(
-    route: &PiModelRoute,
-    before_session_count: Option<usize>,
-) -> SmokeResult {
+/// The live route smoke. Its local session evidence comes only from the held
+/// root's pre/post census, so the command itself counts nothing.
+fn run_pi_route_smoke_prompt(route: &PiModelRoute) -> SmokeResult {
     let command = pi_smoke_command(Some(route));
     let result = run_bounded_command(
         command.program,
         &command.args,
         PI_SMOKE_COMMAND_TIMEOUT,
         "Pi",
-        before_session_count,
+        None,
     );
     let provider = match route.classification.model_provider.as_deref() {
         Some("openai") => Some(crate::provider_calls::Provider::Openai),
@@ -26868,21 +26820,14 @@ for line in sys.stdin:
         let original = home.join(".pi/agent/sessions-original");
         let _home_guard = EnvVarGuard::set_path("HOME", &home);
 
-        let result = run_pi_route_pre_smoke_with(
-            &live_pi_route(),
-            prepare_pi_live_session_census,
-            |_, before_session_count| {
+        let result =
+            run_pi_route_pre_smoke_with(&live_pi_route(), prepare_pi_live_session_census, |_| {
                 fs::rename(&sessions, &original).expect("move held pre-smoke root");
                 fs::create_dir(&sessions).expect("create replacement session root");
                 fs::write(sessions.join("preexisting-a.jsonl"), b"{}\n")
                     .expect("write first replacement transcript");
                 fs::write(sessions.join("preexisting-b.jsonl"), b"{}\n")
                     .expect("write second replacement transcript");
-                assert_eq!(
-                    local_session_observed(before_session_count),
-                    Some(true),
-                    "the legacy pathname count would misclassify replacement files as smoke evidence"
-                );
                 SmokeResult {
                     command_found: true,
                     succeeded: true,
@@ -26893,8 +26838,7 @@ for line in sys.stdin:
                     error_code: None,
                     local_session_observed: Some(true),
                 }
-            },
-        );
+            });
         let failed = match result {
             Ok(_) => panic!("a replaced root must fail before route evidence is accepted"),
             Err(failed) => *failed,
@@ -27087,7 +27031,7 @@ for line in sys.stdin:
         fs::write(root.join("outside.jsonl"), b"outside-secret\n")
             .expect("write replacement session");
 
-        let error = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+        let error = pi_session_files_for_root(&opened_root)
             .expect_err("count/selection must refuse a replaced root");
         assert!(error.to_string().contains("session root changed"));
         let _ = fs::remove_dir_all(parent);
@@ -27107,8 +27051,7 @@ for line in sys.stdin:
         fs::write(&nested_session, b"inside\n").expect("write nested session");
         fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
         let opened_root = open_pi_test_root(&root);
-        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("discover nested session");
+        let discovered = pi_session_files_for_root(&opened_root).expect("discover nested session");
 
         fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
         symlink(&outside, &nested).expect("swap directory for symlink");
@@ -27121,8 +27064,7 @@ for line in sys.stdin:
         fs::remove_file(&nested).expect("remove directory symlink");
         let final_session = root.join("final.jsonl");
         fs::write(&final_session, b"inside-final\n").expect("write final session");
-        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
-            .expect("discover final session");
+        let discovered = pi_session_files_for_root(&opened_root).expect("discover final session");
         fs::remove_file(&final_session).expect("remove discovered final session");
         symlink(&outside_session, &final_session).expect("swap file for symlink");
         assert!(discovered.contains(&final_session));
@@ -27134,37 +27076,22 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(outside);
     }
 
+    /// [behaviour] The census lists a whole tree, however deep or wide; there
+    /// is no size cap.
     #[cfg(unix)]
     #[test]
-    fn pi_session_traversal_refuses_deep_and_wide_trees() {
-        let root = control_test_root("pi-session-traversal-caps");
-        let deep = root.join("one").join("two");
+    fn pi_session_traversal_lists_deep_and_wide_trees() {
+        let root = control_test_root("pi-session-traversal-uncapped");
+        let deep = (0..40).fold(root.clone(), |path, level| path.join(format!("d{level}")));
         fs::create_dir_all(&deep).expect("create deep tree");
         fs::write(deep.join("session.jsonl"), b"{}\n").expect("write deep session");
-        let limits = PiSessionSafetyLimits {
-            max_depth: 1,
-            max_entries: 16,
-            max_files: 16,
-        };
-        let error = pi_session_files_in_with_limits(&root, limits)
-            .expect_err("deep traversal must be refused");
-        assert!(error.to_string().contains("maximum depth"));
-
-        let wide = control_test_root("pi-session-file-cap");
         for index in 0..3 {
-            fs::write(wide.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
+            fs::write(root.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
         }
-        let limits = PiSessionSafetyLimits {
-            max_depth: 4,
-            max_entries: 16,
-            max_files: 2,
-        };
-        let error = pi_session_files_in_with_limits(&wide, limits)
-            .expect_err("wide traversal must be refused");
-        assert!(error.to_string().contains("maximum file count"));
-
+        let files = pi_session_files_in(&root).expect("an uncapped census lists the tree");
+        assert_eq!(files.len(), 4);
+        assert!(files.contains(&deep.join("session.jsonl")));
         let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(wide);
     }
 
     #[cfg(unix)]
