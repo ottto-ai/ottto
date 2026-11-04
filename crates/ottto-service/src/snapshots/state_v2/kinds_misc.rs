@@ -184,7 +184,6 @@ pub(super) fn merge_cas_at(
         None,
         || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
     )?;
-    kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
         .v2_entries()

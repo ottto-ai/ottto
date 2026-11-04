@@ -1555,17 +1555,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
-/// Local alarm, at most hourly: a complete Claude terminal kept the retired
-/// family tombstone uncertainty fence up, because more absent witnessed roots
-/// need a tombstone than fit under the cap. Counts only; no path, id or wire
-/// event.
-pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) {
-    traversal_point(
-        "claude_absent_family_tombstone_uncertain",
-        "claude_code",
-        counts,
-    );
-}
 /// Shadow, once per Claude page: per-family census completion counts
 /// (`family_census_complete`, `family_census_incomplete{reason}`,
 /// `family_complete_deferred{quantum}`), `pending_census_members`, the
