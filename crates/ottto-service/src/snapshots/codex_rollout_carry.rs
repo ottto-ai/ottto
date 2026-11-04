@@ -43,14 +43,15 @@ impl ScanIndex {
     /// audit, evidence, exact-body/context or sidecar dependency authority.
     pub(super) fn codex_unchanged_decision(
         &self,
-        candidate: &CandidateFile,
-        stat: &fs::Metadata,
+        candidate: &mut CandidateFile,
         metadata: &CodexTitleMetadata,
         now: u64,
         body_witness_adoption: bool,
-    ) -> Result<Option<(CandidateDecision, Option<CandidateParseReason>)>> {
+    ) -> Result<Option<(File, CandidateDecision, Option<CandidateParseReason>)>> {
         let key = local_index_key(&candidate.path);
-        let Some((true, head)) = self.codex_physical_matches(&key, stat)? else {
+        let file = open_candidate_beneath_root(candidate)?;
+        let stat = file.metadata()?;
+        let Some((true, head)) = self.codex_physical_matches(&key, &stat)? else {
             return Ok(None);
         };
         let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
@@ -72,11 +73,17 @@ impl ScanIndex {
         logical
             .source_file_fingerprint
             .clone_from(&entry.source_file_fingerprint);
-        Ok(Some(self.candidate_decision_with_reason_gated(
-            &logical,
-            now,
-            body_witness_adoption,
-        )))
+        let (decision, reason) =
+            self.candidate_decision_with_reason_gated(&logical, now, body_witness_adoption);
+        // A set-aside still uses the ordinary identity/read path before its
+        // existing decision-chain override; a physical proof grants no release.
+        Ok(
+            (decision == CandidateDecision::Skip && !tail_source::load::set_aside(self, &key))
+                .then(|| {
+                    *candidate = logical;
+                    (file, decision, reason)
+                }),
+        )
     }
 
     /// One pass after both discovery routes, before selection and absence.

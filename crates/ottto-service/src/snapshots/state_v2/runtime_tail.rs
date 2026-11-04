@@ -29,10 +29,10 @@ pub(in crate::snapshots) fn carry_tail(
                     previous
                 }
             };
-            state.tail.carry_observation(to, &carry)?;
+            let moved = state.tail.carry_observation(to, &carry)?;
             recovered_write(&path, None, &id, session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
-                session.cx.tail = Some(std::mem::take(&mut state.tail));
+                session.cx.tail = Some(moved);
                 let digests = import::save(
                     &mut session.db,
                     &id,

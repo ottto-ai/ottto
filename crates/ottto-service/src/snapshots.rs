@@ -21358,8 +21358,32 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
-            let Some((mut candidate, opened_file)) =
-                open_and_identify_scan_candidate_with_rescue_at(
+            let unchanged = if source == SnapshotSource::Codex {
+                match index.codex_unchanged_decision(
+                    &mut candidate,
+                    &codex_title_metadata,
+                    audit_now,
+                    true,
+                ) {
+                    Ok(input) => input,
+                    Err(_) => {
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                }
+            } else {
+                None
+            };
+            let logical_decision = unchanged
+                .as_ref()
+                .map(|(_, decision, reason)| (*decision, *reason));
+            let acquired = match unchanged {
+                Some((file, _, _)) => Some((candidate, file)),
+                None => open_and_identify_scan_candidate_with_rescue_at(
                     source,
                     candidate,
                     &mut census,
@@ -21371,8 +21395,9 @@ impl OwnedSourceScan {
                             .then_some(&index.v2().growth_retention),
                     },
                     sampling.as_ref().map(|context| context.cache.as_ref()),
-                )
-            else {
+                ),
+            };
+            let Some((mut candidate, opened_file)) = acquired else {
                 pending!();
             };
             if preflight_source_file_fingerprint
@@ -21391,7 +21416,7 @@ impl OwnedSourceScan {
             }
             // The preflight fences physical/sidecar identity. Local launcher facts
             // are semantic context and must not contaminate that two-open witness.
-            if let Some(events) = launch_lookup {
+            if let Some(events) = launch_lookup.filter(|_| logical_decision.is_none()) {
                 let workers =
                     launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
                 if let Some(witness) = events.witness(&workers) {
@@ -21457,30 +21482,9 @@ impl OwnedSourceScan {
                     index.candidate_decision_in_window(&candidate, audit_now, &mut source_change)
                 }
             };
-            if source == SnapshotSource::Codex {
-                match opened_file
-                    .metadata()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|stat| {
-                        index.codex_unchanged_decision(
-                            &candidate,
-                            &stat,
-                            &codex_title_metadata,
-                            audit_now,
-                            true,
-                        )
-                    }) {
-                    Ok(Some(logical)) => (decision, parse_reason) = logical,
-                    Err(_) => {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
-                        pending!();
-                    }
-                    _ => {}
-                }
+            if let Some((logical, reason)) = logical_decision {
+                decision = logical;
+                parse_reason = reason;
             }
             let target_match = native_comparison
                 .as_ref()

@@ -272,7 +272,7 @@ pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) inventory: InventoryFacts,
 }
 impl TailStage {
-    pub(super) fn carry_observation(&mut self, to: &str, carry: &PathCarry) -> Result<()> {
+    pub(super) fn carry_observation(&mut self, to: &str, carry: &PathCarry) -> Result<Self> {
         let from = carry.from.as_bytes();
         let to = to.as_bytes().to_vec();
         ensure!(
@@ -287,11 +287,12 @@ impl TailStage {
         // A provisional discovery observation is superseded by the proven
         // predecessor, including its logical representation and existing debt.
         self.debt.remove(&to);
+        let mut moved = Self::default();
         if let Some(mut debt) = self.debt.remove(from) {
             debt.inventory = Some(carry.inventory.clone());
-            self.debt.insert(to, debt);
+            moved.debt.insert(to, debt);
         }
-        Ok(())
+        Ok(moved)
     }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]

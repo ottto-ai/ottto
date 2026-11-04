@@ -472,20 +472,7 @@ fn inventory_refusal_isolates_only_proven_dependants() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let c = Corpus::new();
-    // Both the retained member and its repaired sibling must satisfy main's
-    // native group proof; a UI-only member is deliberately held by that proof.
-    let mut native = codex_file_join::tests::member(MAIN, "root-response", 200, 200);
-    native[0]["payload"]["source"] = json!("cli");
-    native[0]["payload"]["creator_user_id"] = json!("synthetic-user-a");
-    native[0]["payload"]["creator_account_id"] = json!("synthetic-workspace-a");
-    fs::write(
-        c.path(MAIN),
-        native
-            .iter()
-            .map(|row| format!("{row}\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
+    c.write(MAIN, Some("a"));
     c.write(OTHER, Some("b"));
     c.write(SIDE, Some("b"));
     c.write(GAP, None);
@@ -530,29 +517,11 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     assert!(!index
         .confirmed_empty_files
         .contains(&local_index_key(&sibling)));
-    // Repair to a disjoint same-id response through the shared native rows.
-    let mut rows = codex_file_join::tests::member(MAIN, "side-response", 100, 300);
-    rows[0]["payload"]["source"] = json!("cli");
-    rows[0]["payload"]["creator_user_id"] = json!("synthetic-user-a");
-    rows[0]["payload"]["creator_account_id"] = json!("synthetic-workspace-a");
-    let repaired = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
-    // Group replay still requires physical plaintext certificates. The
-    // provider's repaired plaintext takes the existing generic group path.
+    // The transient failed companion disappears; the original object's
+    // ordinary append supplies the next usage. Compressed grouped replay is
+    // deliberately unsupported, so recovery uses the existing singleton path.
     fs::remove_file(&sibling).unwrap();
-    fs::write(sibling.with_extension(""), repaired).unwrap();
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let paths = fs::read_dir(&c.sessions)
-        .unwrap()
-        .map(|entry| local_index_key(&entry.unwrap().path()))
-        .collect();
-    let inventory = codex_file_join::header_cache_tests::page(c.scratch.as_ref(), &paths, &cache);
-    let group = inventory
-        .groups()
-        .into_values()
-        .find(|group| group.owner == MAIN)
-        .unwrap();
-    codex_file_join::tests::replay_group(group, None, &ScanIndex::default())
-        .expect("the repaired native counter chain must be admissible");
+    append(&c.path(MAIN), &turn(3));
     let (_, cold, _, _, _) = page(
         &c,
         ScanIndex::default(),
