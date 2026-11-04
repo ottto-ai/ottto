@@ -195,7 +195,7 @@ impl ScanIndex {
         entry.set_unverified_deadline(due);
         true
     }
-    /// This caller just finished a loss-free, EOF-revalidated native Full or
+    /// This caller just finished a progress-complete, EOF-revalidated native Full or
     /// Tail recomposition. FE never retains a prefix reduction in the cache,
     /// so a Tail here replays a complete retained baseline, not an FE body.
     /// Keep the audit debt: complete provenance is not Full-audit credit.

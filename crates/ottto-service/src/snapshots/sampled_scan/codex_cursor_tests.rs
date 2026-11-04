@@ -5337,10 +5337,12 @@ fn one_writer_attributes_and_replays_held_totals() {
     let mut held = disclosure();
     held.state_only_blocked_session_ids = vec![SESSION.into(), SESSION_B.into()];
     held.held = HeldCounts {
-        over_line_cap: 2,
-        recognized_usage_drop: 3,
-        dropped_usage_record: 4,
-        terminal_line_loss: 2,
+        loss: Some(TerminalJsonlLoss {
+            malformed_json_line_count: 2,
+            recognized_usage_drop_count: 3,
+            dropped_usage_record_count: 4,
+            ..Default::default()
+        }),
     };
     disclose(&held, &mut index);
     assert_eq!(
@@ -5365,14 +5367,14 @@ fn one_writer_attributes_and_replays_held_totals() {
     // Only the first (settleable, replayed) disclosure added totals.
     assert_eq!(
         (
-            census.over_line_cap_count,
+            census.malformed_json_line_count,
             census.recognized_usage_drop_count,
             census.dropped_usage_record_count,
             census.terminal_over_line_cap_count,
             census.terminal_recognized_usage_drop_count,
             census.terminal_dropped_usage_record_count,
         ),
-        (2, 3, 4, 2, 2, 2)
+        (2, 3, 4, 0, 3, 4)
     );
 }
 

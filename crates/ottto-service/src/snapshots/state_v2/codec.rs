@@ -170,6 +170,8 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
             &["counts", "caps", "parent_signature_clear_events"],
             &["counts", "caps", "parent_ref_refusals"],
         ]
+    } else if row == type_name::<crate::snapshots::TerminalJsonlDisposition>() {
+        &[&["loss", "over_line_cap_count"]]
     } else {
         &[]
     }

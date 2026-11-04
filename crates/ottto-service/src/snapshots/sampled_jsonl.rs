@@ -403,14 +403,7 @@ impl OwnedJsonlParser {
     ) -> Result<Option<CompletedNativeAcquisition>> {
         #[cfg(test)]
         sampled_scan::test_hooks::record_budget(&budget);
-        if !self.reader.finished
-            || self.reader.failure.is_some()
-            || !loss_free_source_report(
-                &self.reader.report,
-                self.recognized_usage_drop_count,
-                self.accumulator.dropped_usage_record_count,
-            )
-        {
+        if !self.reader.finished || self.reader.failure.is_some() {
             self.reader.acquisition = None;
             record(Event::RetentionIncompleteOrLossy);
             return Ok(None);
@@ -460,7 +453,8 @@ impl OwnedJsonlParser {
         // Native EOF may apply an unterminated valid JSON row. Its reduction is
         // not the reduction through the sealed byte pointer. Conservatively
         // decline retention; keep the existing full-parser EOF output unchanged.
-        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        let unsealed = !self.reader.sealed_fragment()
+            && checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
@@ -560,7 +554,8 @@ impl OwnedJsonlParser {
         };
         let checkpoint =
             plan.commit_after_native_completion(self.reader.reader.get_ref(), scope, now)?;
-        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        let unsealed = !self.reader.sealed_fragment()
+            && checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
@@ -716,7 +711,8 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
-                unsealed: true,
+                unsealed: !self.reader.sealed_fragment()
+                    && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
             };
         }
         // The certificate consumed the acquisition plan, so charge the
@@ -742,7 +738,8 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
-                unsealed: true,
+                unsealed: !self.reader.sealed_fragment()
+                    && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
             };
         };
         let reduction = CachedJsonlReduction {
@@ -757,7 +754,8 @@ impl OwnedJsonlParser {
             checkpoint,
             reduction,
             released: None,
-            unsealed: true,
+            unsealed: !self.reader.sealed_fragment()
+                && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
         }
     }
 }
