@@ -1481,11 +1481,12 @@ fn codex_roster_retains_aged_indexed_growth() {
 
 /// [behaviour] The retained Codex roster refresh nominates an indexed rollout
 /// missing from a clean re-listing, and every indexed key beneath a moved
-/// directory that is now gone. A re-listing with a symlink nominates nothing.
+/// directory that is now gone. A re-listing with a symlink, an entry read
+/// error or a type read error nominates nothing.
 #[cfg(unix)]
 #[test]
 fn codex_roster_refresh_nominates_only_from_clean_listings() {
-    for case in ["clean", "symlink", "gone"] {
+    for case in ["clean", "symlink", "gone", "entry", "type"] {
         let root = Root::new("ld-roster-unlisted");
         let directory = root.projects().join("2026/10/01");
         fs::create_dir_all(&directory).unwrap();
@@ -1525,13 +1526,33 @@ fn codex_roster_refresh_nominates_only_from_clean_listings() {
                 std::os::unix::fs::symlink(root.projects(), directory.join("link")).unwrap();
                 BTreeSet::new()
             }
-            _ => {
+            "gone" => {
                 fs::remove_dir_all(&directory).unwrap();
                 BTreeSet::from([live, stale])
             }
+            _ => {
+                append(&directory.join("rollout-new.jsonl"), b"{}\n");
+                BTreeSet::new()
+            }
+        };
+        // The re-listing's first entry (or type) read fails in those cases.
+        let (fault, mut fired) = (
+            match case {
+                "entry" => Some(false),
+                "type" => Some(true),
+                _ => None,
+            },
+            false,
+        );
+        let fault = move |_: &std::path::Path, type_read: bool| {
+            let hit = !fired && fault == Some(type_read);
+            fired |= hit;
+            hit
         };
         assert_eq!(
-            refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None),
+            with_directory_read_fault(fault, || {
+                refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None)
+            }),
             expected,
             "{case}"
         );

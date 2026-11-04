@@ -276,9 +276,15 @@ fn copy_prefix_routes(arm: Settled) {
         .with_file_name("c0ffee00-0000-4000-8000-0000000057a1.jsonl")
         .to_string_lossy()
         .into_owned();
+    // The absence row's positive control: a nonempty accepted baseline,
+    // the stale key indexed beside the live holder and copy, with two
+    // accounts, a switch, a side call, an evidence gap and a tagged row.
+    let live = [&holder, &path].map(|path| path.to_string_lossy().into_owned());
     if arm == Settled::Holders {
         let entry = prior.files.values().next().unwrap().clone();
         prior.files.insert(stale_key.clone(), entry);
+        assert!(copy_requests(&accepted) > 0, "a nonempty accepted baseline");
+        assert!(live.iter().all(|key| prior.files.contains_key(key)));
     }
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut bodies = Vec::new();
@@ -353,6 +359,12 @@ fn copy_prefix_routes(arm: Settled) {
             .iter()
             .all(|prior| !prior.files.contains_key(&stale_key)),
         "{arm:?}: the deleted session is retired"
+    );
+    assert!(
+        priors
+            .iter()
+            .all(|prior| live.iter().all(|key| prior.files.contains_key(key))),
+        "{arm:?}: the live holder and copy stay indexed"
     );
     assert_ne!(bodies[0].raw, bodies[1].raw, "the second page adds money");
 

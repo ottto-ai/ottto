@@ -1659,7 +1659,8 @@ pub(super) mod tests {
     /// [behaviour] Only a complete directory read nominates: a missing leaf
     /// below a listed parent (also one observed earlier), a missing subtree
     /// whose directory was never queued, and a queued directory now gone. A
-    /// read cut short by the tick budget nominates nothing from it.
+    /// read cut short by the tick budget, or with an entry or type read
+    /// error, nominates nothing from it.
     #[cfg(unix)]
     #[test]
     fn walk_nominates_unlisted_keys_only_from_complete_reads() {
@@ -1675,7 +1676,8 @@ pub(super) mod tests {
         let stale = key(project.join("stale.jsonl"));
         let never_queued = key(root.join("gone-project").join("s.jsonl"));
         let queued_gone = key(root.join("queued-gone").join("t.jsonl"));
-        let walk = |budget: usize| {
+        // `fault`: fail the project read's first entry (false) or type (true) read.
+        let walk = |budget: usize, fault: Option<bool>| {
             let mut index = ScanIndex::default();
             for file in [&live, &stale, &never_queued, &queued_gone] {
                 index.files.insert(
@@ -1698,28 +1700,36 @@ pub(super) mod tests {
                 census_member: true,
                 watcher_hint: false,
             });
-            let mut unlisted = std::collections::BTreeSet::new();
-            while !index
-                .traversal
-                .as_ref()
-                .unwrap()
-                .pending_directories
-                .is_empty()
-            {
-                unlisted.extend(
-                    super::super::advance_bounded_directory_traversal_with_budget(
-                        SnapshotSource::ClaudeCode,
-                        &mut index,
-                        BACKFILL_WINDOW_DAYS,
-                        budget,
-                        None,
-                    ),
-                );
-            }
-            unlisted
+            let (faulted, mut fired) = (project.clone(), false);
+            let fault = move |directory: &Path, type_read: bool| {
+                let hit = !fired && directory == faulted.as_path() && fault == Some(type_read);
+                fired |= hit;
+                hit
+            };
+            super::super::with_directory_read_fault(fault, || {
+                let mut unlisted = std::collections::BTreeSet::new();
+                while !index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .pending_directories
+                    .is_empty()
+                {
+                    unlisted.extend(
+                        super::super::advance_bounded_directory_traversal_with_budget(
+                            SnapshotSource::ClaudeCode,
+                            &mut index,
+                            BACKFILL_WINDOW_DAYS,
+                            budget,
+                            None,
+                        ),
+                    );
+                }
+                unlisted
+            })
         };
         assert_eq!(
-            walk(1_000),
+            walk(1_000, None),
             std::collections::BTreeSet::from([
                 stale.clone(),
                 never_queued.clone(),
@@ -1728,9 +1738,16 @@ pub(super) mod tests {
         );
         // Two names exceed a one-entry budget: the project read is partial.
         assert_eq!(
-            walk(1),
+            walk(1, None),
             std::collections::BTreeSet::from([never_queued.clone(), queued_gone.clone()])
         );
+        for type_read in [false, true] {
+            assert_eq!(
+                walk(1_000, Some(type_read)),
+                std::collections::BTreeSet::from([never_queued.clone(), queued_gone.clone()]),
+                "an entry (false) or type (true) read error: the project read is partial"
+            );
+        }
     }
 
     fn unverified(entry: &mut super::super::ScanIndexEntry) {
@@ -1909,6 +1926,73 @@ pub(super) mod tests {
         assert!(index
             .files
             .contains_key(&local_index_key(&project.join(&stale_twin))));
+    }
+
+    /// [behaviour] Positive recreation wins on the same page: a key that its
+    /// directory's complete read did not list, recreated before the page's
+    /// secure absence proof, is not retired. Its entry and audit marker stay,
+    /// and the page counts no vanished retirement, lost usage or account
+    /// release. The control without the recreation retires it once.
+    #[cfg(unix)]
+    #[test]
+    fn claude_directory_proof_yields_to_same_page_recreation() {
+        const SESSION: &str = "a1111111-1111-4111-8111-111111111111";
+        const RECREATED: &str = "b2222222-2222-4222-8222-222222222222";
+        for recreate in [false, true] {
+            let dir = crate::test_scratch::ScratchDir::new("absence-same-page-recreation");
+            let root = fs::canonicalize(&dir).unwrap();
+            let project = root.join("project");
+            // The walk reads `aa`, `project`, then `zz`: the recreation runs
+            // on `zz`'s read, after `project`'s listing and before the proof.
+            for directory in [root.join("aa"), project.clone(), root.join("zz")] {
+                fs::create_dir(&directory).unwrap();
+            }
+            for directory in [root.join("aa"), root.join("zz")] {
+                fs::write(directory.join("notes.txt"), b"synthetic\n").unwrap();
+            }
+            fs::write(
+                project.join(format!("{SESSION}.jsonl")),
+                claude_line(SESSION, "r"),
+            )
+            .unwrap();
+            let path = project.join(format!("{RECREATED}.jsonl"));
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            let mut entry = super::super::tests::manifest_index_entry(Some(RECREATED));
+            unverified(&mut entry);
+            index.files.insert(key.clone(), entry);
+            let (listed, recreated, mut project_read) = (project.clone(), path.clone(), false);
+            let recreation = move |directory: &Path, _: bool| {
+                if directory == listed.as_path() {
+                    project_read = true;
+                } else if recreate && project_read && !recreated.exists() {
+                    fs::write(&recreated, claude_line(RECREATED, "r")).unwrap();
+                }
+                false
+            };
+            let ((page, vanished), rows) = crate::local_resource_diagnostics::capture(|| {
+                super::super::with_directory_read_fault(recreation, || {
+                    observe_vanished(|| claude_page(&mut index, &root, NOW, 10, &[]))
+                })
+            });
+            assert_eq!(page.disappeared_file_count, 0, "recreate {recreate}");
+            assert_eq!(path.exists(), recreate);
+            if !recreate {
+                assert!(!index.files.contains_key(&key), "the control retires");
+                assert_eq!(vanished, [[0; VANISHED], [1, 0], [0; VANISHED]]);
+                continue;
+            }
+            assert!(index
+                .files
+                .get(&key)
+                .is_some_and(|entry| entry.has_unverified_source()));
+            assert_eq!(vanished, [[0; VANISHED]; 3], "no vanished retirement");
+            for row in &rows {
+                for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
+                    assert!(row["counts"].get(count).is_none(), "{count}: {row}");
+                }
+            }
+        }
     }
 }
 

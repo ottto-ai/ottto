@@ -977,7 +977,7 @@ fn deleted_sibling_retires_without_changing_live_money() {
         let (tail_index, tail, _) = other_page(&c, &scanner, source, prior.clone());
         let (full_index, full, _) =
             other_page(&c, &E2ScanFixture::default(), source, prior.clone());
-        let (restored_index, restored, _) = other_page(&c, &restart, source, prior);
+        let (mut restored_index, restored, _) = other_page(&c, &restart, source, prior.clone());
         let wire = other_wire(source, &full);
         assert_eq!(other_wire(source, &tail), wire, "{source:?}: Tail");
         assert_eq!(other_wire(source, &restored), wire, "{source:?}: restart");
@@ -991,7 +991,133 @@ fn deleted_sibling_retires_without_changing_live_money() {
                 "{source:?}"
             );
         }
+        // Before the save, the durable state keeps the sibling's custody, and
+        // a partial upload's commit keeps the committed predecessor.
+        assert!(
+            custody(&ScanIndex::load(disk.path(source)).unwrap()),
+            "{source:?}: before the save"
+        );
+        let partial = tail_index.committable_subset(
+            &prior,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert!(custody(&partial), "{source:?}: partial upload");
+        // After the save, a restarted owner's next page brings no stale key
+        // back through its observations.
+        let saved = disk.commit(&restart.cache, source, &mut restored_index);
+        assert_eq!(custody(&saved), custody(&full_index), "{source:?}: saved");
+        let quiet = disk.owner(source);
+        let (quiet_index, _, _) = other_page(&c, &quiet, source, saved.clone());
+        assert!(
+            custody(&saved) || !custody(&quiet_index),
+            "{source:?}: a retired key comes back after the restart"
+        );
+        assert!(quiet_index.files.contains_key(&key(&live)), "{source:?}");
     }
+}
+
+/// [money] A sibling session deleted after its delivered page retires on the
+/// next page, whose live body's ACK is then lost. A lost response, a refusal
+/// and a response missing an entity ACK settle nothing; the exact stored-body
+/// ACK settles the body once, and a retry sends nothing. The live body equals
+/// the same page's without the deletion. Same-build proof only: no receipt.
+#[test]
+fn deleted_sibling_lost_ack_settles_once() {
+    const SIBLING: &str = "5b1b1b1b-0000-4000-8000-00000000c1a0";
+    let name = "deleted_sibling_lost_ack";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus(name);
+        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let sibling = c.root(SIBLING, &line(SIBLING, "s1", AT, 5));
+        input_clock(&path);
+        input_clock(&sibling);
+        let disk = Disk::new(&c);
+        let (scanner, prior) = warm_claude(&c, &disk);
+        let sibling_key = sibling.to_string_lossy().into_owned();
+        assert!(prior.files.contains_key(&sibling_key));
+        grow(&path, "r2", 20);
+        let mut control = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
+        control.enrich(&c);
+        control.finish();
+        assert!(control.index.files.contains_key(&sibling_key));
+        std::fs::remove_file(&sibling).unwrap();
+        let mut page = c.raw(&scanner, prior, 100, true, &[]);
+        page.enrich(&c);
+        page.finish();
+        assert!(
+            !page.index.files.contains_key(&sibling_key),
+            "the sibling retires"
+        );
+        let items = page.scan.snapshots.clone();
+        assert!(!items.is_empty(), "the live growth emits");
+        let lost = |_: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            Err(anyhow::anyhow!("response lost after durable remote write"))
+        };
+        let refused =
+            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+                let mut response = ack(batch)?;
+                response.rejected_entities = std::mem::take(&mut response.accepted_entities)
+                    .into_iter()
+                    .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: entity.source_session_id,
+                        snapshot_fingerprint: entity.snapshot_fingerprint,
+                        occurrence_count: entity.occurrence_count,
+                        reason: "usage_accounting_authority_downgrade".into(),
+                        detail: "synthetic refusal".into(),
+                        permanent: true,
+                    })
+                    .collect();
+                response.accepted = 0;
+                response.sessions_reconciled = 0;
+                Ok(response)
+            };
+        let mut progress = e2_progress();
+        let _ = upload(&items, &mut progress, refused);
+        assert!(progress.accepted_fingerprints.is_empty(), "refused");
+        let mut progress = e2_progress();
+        let mut omitted = std::collections::BTreeSet::new();
+        let _ = upload(&items, &mut progress, |batch| {
+            let mut response = ack(batch)?;
+            let entity = response.accepted_entities.pop().expect("one entity ACK");
+            omitted.insert(entity.snapshot_fingerprint);
+            response.accepted -= 1;
+            response.sessions_reconciled = response.accepted;
+            Ok(response)
+        });
+        assert!(!omitted.is_empty());
+        assert!(
+            omitted
+                .iter()
+                .all(|fingerprint| !progress.accepted_fingerprints.contains(fingerprint)),
+            "a missing entity ACK settles nothing"
+        );
+        let mut progress = e2_progress();
+        let (result, _, _) = upload(&items, &mut progress, lost);
+        assert!(result.is_err(), "the response is lost");
+        assert!(progress.accepted_fingerprints.is_empty(), "lost");
+        let (result, wire, _) = upload(&items, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let (_, control_wire, _) = upload(&control.scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(wire, control_wire, "the deletion moves no live money");
+        assert_eq!(
+            progress
+                .accepted_fingerprints
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            items
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the exact stored-body ACK settles every body"
+        );
+        let (result, resent, _) = upload(&items, &mut progress, ack);
+        assert!(result.is_ok() && resent.is_empty(), "settled once");
+    });
 }
 
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
@@ -1903,6 +2029,64 @@ fn pi_cli_fork_preserves_double_count() {
         ),
         EXPECTED_FORK_TOTALS
     );
+    proof.finish();
+}
+
+/// [money] A Pi fork child whose parent transcript is deleted. The next
+/// page retires the parent through its directory's complete read, and a
+/// later page with a partial census (a rejected symlink) continues the
+/// child's ledger: each growth emits a cold Full's body through the retained
+/// Tail and through a new owner restarted from the saved state.
+#[cfg(unix)]
+#[test]
+fn pi_fork_child_keeps_its_ledger_when_its_parent_retires() {
+    let name = "pi_fork_child_parent_retired";
+    pi_row!(name);
+    let (c, mut disk, parent, scanner, prior, mut proof) = pi_disk_corpus(name, &pi_seed());
+    let fork = c.root.join("fork.jsonl");
+    let copied = pi_seed()
+        .lines()
+        .skip(1)
+        .map(|s| s.to_owned() + "\n")
+        .collect::<String>();
+    let parent_ref = parent.to_string_lossy().into_owned();
+    let mut header: Value =
+        serde_json::from_str(&pi_header("synthetic-fork-session", 3, Some(&parent_ref))).unwrap();
+    header["timestamp"] = json!("2026-10-27T07:00:00Z");
+    std::fs::write(&fork, pi_json(header) + &copied).unwrap();
+    input_clock(&fork);
+    disk.begin(&scanner, SnapshotSource::Pi);
+    let (mut forked, scan, _) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+    assert_eq!(scan.snapshots.len(), 1, "the child's first read");
+    let key = |path: &Path| path.to_string_lossy().into_owned();
+    let mut prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut forked);
+    assert!(prior.files.contains_key(&key(&parent)));
+    std::fs::remove_file(&parent).unwrap();
+    for (step, response, input, at) in [
+        (0, "fork-one", 20, "2026-10-27T07:01:00Z"),
+        (1, "fork-two", 30, "2026-10-27T07:02:00Z"),
+    ] {
+        if step == 1 {
+            std::os::unix::fs::symlink(c.base.join("nowhere"), c.root.join("census-link")).unwrap();
+        }
+        pi_grow(&fork, pi_turn("message", Some(response), input, at));
+        let restart = disk.owner(SnapshotSource::Pi);
+        let (mut restored, full) = pi_pages(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            prior.clone(),
+            PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
+        );
+        assert_eq!(full.snapshots.len(), 1, "step {step}: only the child grows");
+        if step == 1 {
+            assert!(!full.census_complete, "the census is partial");
+        }
+        prior = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        assert!(!prior.files.contains_key(&key(&parent)), "step {step}");
+        assert!(prior.files.contains_key(&key(&fork)), "step {step}");
+    }
     proof.finish();
 }
 

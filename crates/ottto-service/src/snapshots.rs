@@ -28746,9 +28746,13 @@ fn refresh_retained_codex_directories(
         let mut new_directories = Vec::new();
         let mut clean = true;
         for entry in entries {
-            let Some((path, file_type)) = entry
+            let Some((path, file_type)) = directory_read_fault(&directory, false, entry)
                 .ok()
-                .and_then(|entry| entry.file_type().ok().map(|kind| (entry.path(), kind)))
+                .and_then(|entry| {
+                    directory_read_fault(&directory, true, entry.file_type())
+                        .ok()
+                        .map(|kind| (entry.path(), kind))
+                })
             else {
                 clean = false;
                 break;
@@ -29135,6 +29139,51 @@ fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+#[cfg(test)]
+type DirectoryReadFault = Box<dyn FnMut(&Path, bool) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIRECTORY_READ_FAULT: std::cell::RefCell<Option<DirectoryReadFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `result` itself outside tests. A test fault sees each listed entry's read
+/// (`false`) and type read (`true`) of `directory` and fails it with `true`.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn directory_read_fault<T>(
+    directory: &Path,
+    type_read: bool,
+    result: std::io::Result<T>,
+) -> std::io::Result<T> {
+    #[cfg(test)]
+    if TEST_DIRECTORY_READ_FAULT.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|fault| fault(directory, type_read))
+    }) {
+        return Err(std::io::Error::other("injected directory read fault"));
+    }
+    result
+}
+
+/// Runs `run` with a directory entry/type read fault, for tests only.
+#[cfg(test)]
+fn with_directory_read_fault<T>(
+    fault: impl FnMut(&Path, bool) -> bool + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DIRECTORY_READ_FAULT.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    TEST_DIRECTORY_READ_FAULT.with(|slot| *slot.borrow_mut() = Some(Box::new(fault)));
+    let _reset = Reset;
+    run()
+}
+
 fn advance_bounded_directory_traversal_with_budget(
     source: SnapshotSource,
     index: &mut ScanIndex,
@@ -29299,7 +29348,7 @@ fn advance_bounded_directory_traversal_with_budget(
         // Every name of a complete listing; an entry or type error leaves none.
         let mut names = Some(BTreeSet::new());
         for entry in entries {
-            let entry = match entry {
+            let entry = match directory_read_fault(&directory.path, false, entry) {
                 Ok(entry) => entry,
                 Err(_) => {
                     names = None;
@@ -29313,7 +29362,7 @@ fn advance_bounded_directory_traversal_with_budget(
             if let Some(names) = names.as_mut() {
                 names.insert(entry.file_name().to_string_lossy().into_owned());
             }
-            let file_type = match entry.file_type() {
+            let file_type = match directory_read_fault(&directory.path, true, entry.file_type()) {
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
                     names = None;
