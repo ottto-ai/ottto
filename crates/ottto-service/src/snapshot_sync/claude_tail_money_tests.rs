@@ -2803,16 +2803,33 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
         };
         let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
         input_clock(&other);
-        // (request, tokens, login, organization) on the patched session.
+        // (request, tokens, login, organization) on the patched session, each
+        // with its trace ownership row: an API row without an owner stays
+        // untagged (incomplete evidence).
         let root_evidence = |rows: &[(&str, u64, char, char)]| {
-            rows.iter()
+            let api = rows
+                .iter()
                 .map(|(request, tokens, login, org)| {
                     api_login(ROOT, request, *tokens, *login, Some(*org))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let traces = rows
+                .iter()
+                .map(|(request, ..)| trace_for(ROOT, request, ""))
+                .collect::<Vec<_>>();
+            c.evidence(&api, &traces);
         };
-        c.evidence(&root_evidence(&[("r1", 10, '1', '7')][..]), &[]);
-        c.evidence_for(UNPATCHED, &[api_for(UNPATCHED, "u1", 7, 70)], &[]);
+        // (request, tokens) on the unpatched session: its organizations come
+        // from transcript markers, as in E1.
+        let other_evidence = |rows: &[(&str, u64)]| {
+            let api = rows
+                .iter()
+                .map(|(request, tokens)| api_for(UNPATCHED, request, *tokens, *tokens * 10))
+                .collect::<Vec<_>>();
+            c.evidence_for(UNPATCHED, &api, &[]);
+        };
+        root_evidence(&[("r1", 10, '1', '7')][..]);
+        other_evidence(&[("u1", 7)][..]);
         let disk = Disk::new(&c);
         let warm = E2ScanFixture::capturing_identity();
         disk.begin(&warm, SnapshotSource::ClaudeCode);
@@ -2866,15 +2883,8 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             ("r2", 20, '2', '8'),
             ("mixed-side", 5, '2', '8'),
         ];
-        c.evidence(&root_evidence(&page_one[..]), &[]);
-        c.evidence_for(
-            UNPATCHED,
-            &[
-                api_for(UNPATCHED, "u1", 7, 70),
-                api_for(UNPATCHED, "u2", 9, 90),
-            ],
-            &[],
-        );
+        root_evidence(&page_one[..]);
+        other_evidence(&[("u1", 7), ("u2", 9)][..]);
         let upgraded = E2ScanFixture::capturing_identity();
         disk.begin(&upgraded, SnapshotSource::ClaudeCode);
         let upgraded_page = c.raw(&upgraded, committed.clone(), 100, true, &[]);
@@ -2931,16 +2941,8 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
         input_clock(&other);
         let mut page_two = page_one.to_vec();
         page_two.push(("r3", 30, '1', '7'));
-        c.evidence(&root_evidence(&page_two[..]), &[]);
-        c.evidence_for(
-            UNPATCHED,
-            &[
-                api_for(UNPATCHED, "u1", 7, 70),
-                api_for(UNPATCHED, "u2", 9, 90),
-                api_for(UNPATCHED, "u3", 11, 110),
-            ],
-            &[],
-        );
+        root_evidence(&page_two[..]);
+        other_evidence(&[("u1", 7), ("u2", 9), ("u3", 11)][..]);
         let restarted = E2ScanFixture::capturing_identity();
         disk.begin(&restarted, SnapshotSource::ClaudeCode);
         let mut restart_page = c.raw(&restarted, next.clone(), 100, true, &[]);
