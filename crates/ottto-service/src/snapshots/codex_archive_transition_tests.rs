@@ -847,6 +847,16 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let mut seed = ScanIndex::default();
+    let owner = codex_protected_owner(MAIN);
+    let tombstone = codex_counting_version::CountingTombstone {
+        evidence: codex_counting_version::AckEvidence::LegacyAcked,
+        retired_in: "2026-10-06T00:00:00Z".into(),
+        created_unix_ms: None,
+    };
+    seed.codex_counting_tombstones
+        .insert(owner.clone(), tombstone.clone());
     let c = Corpus::new();
     c.write(MAIN, Some("a"));
     c.write(OTHER, Some("b"));
@@ -862,15 +872,12 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     fs::remove_file(c.path(MAIN)).unwrap();
     let (cold_index, cold, _, _, _) = page(
         &c,
-        ScanIndex::default(),
+        seed.clone(),
         Arc::new(sampled_scan::SharedCache::default()),
     );
     assert_eq!(cold.snapshots.len(), 4);
-    let (session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &c.scratch.join("state"),
-    );
+    let (session, prior) =
+        StateV2ColdSession::publish(Source::Codex, &seed, &c.scratch.join("state"));
     // Ordinary part of the former incomplete-inventory hint fixture: no
     // body escapes the failed generation, and a new generation can recover.
     let mut injected = false;
@@ -914,6 +921,11 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
             > 0
     );
     assert_eq!(full_decodes(&logs), 0);
+    assert_eq!(
+        working.codex_counting_tombstones.get(&owner),
+        Some(&tombstone),
+        "an unresolved header cannot prove its counting owner absent"
+    );
     let pending = working
         .traversal
         .as_ref()
@@ -933,6 +945,11 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     );
     let (index, posts) = working.checkpoint_with_captured_posts(&refused, &prior, "accept");
     assert_eq!(posts.len(), 1);
+    assert_eq!(
+        index.codex_counting_tombstones.get(&owner),
+        Some(&tombstone),
+        "the partial checkpoint retains the Legacy carrier"
+    );
     occupied.close();
     assert_eq!(cache.cursor_reserved(), 0);
     // Reuse an ordinary funded header, then count only the body Full below.
@@ -965,6 +982,10 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
         "one funded body Full, no retry grant"
     );
     assert_eq!(funded.snapshots.len(), 1);
+    assert!(
+        !working.files[&local_index_key(&compressed)].codex_counting_v2,
+        "funding cannot discard the prior Legacy ACK evidence"
+    );
     let mut cold_main = cold;
     cold_main
         .snapshots

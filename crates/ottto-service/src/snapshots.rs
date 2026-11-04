@@ -16295,8 +16295,8 @@ impl OwnedSourceScan {
                             )
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let absence_coverage =
-                        codex_counting_version::absence_coverage_complete(index, inventory);
+                    let absence_coverage = inventory.held_owners.is_empty()
+                        && codex_counting_version::absence_coverage_complete(index, inventory);
                     codex_counting_version::note_inventory_created(index, inventory);
                     codex_counting_version::prepare_moved_evidence(
                         index,
