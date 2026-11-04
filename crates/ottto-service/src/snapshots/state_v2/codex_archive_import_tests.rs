@@ -97,7 +97,7 @@ fn import_carries_archive_custody_from_a_v1_original() {
     let archives = serde_json::json!({
         "/synthetic/archived/a.jsonl.zst": {
             "context": null, "owner": null, "stamp": null,
-            "disposition": {"Held": {"cause": "CompressedAdmissionRefused", "quiet": false}},
+            "disposition": {"Held": {"cause": "decoder_refused_header_occupancy", "quiet": false}},
             "work": {"attempts": 1, "header_attempts": 4}
         }
     });

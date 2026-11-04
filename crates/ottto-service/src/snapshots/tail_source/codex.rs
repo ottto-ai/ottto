@@ -26,14 +26,14 @@ use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
-/// Existing head dependency witness, never transcript bytes.
-pub(in crate::snapshots) fn sidecar_binding(
+/// Existing head metadata, decoded once without transcript bytes.
+pub(in crate::snapshots) fn header_facts(
     revision: u32,
     body: &[u8],
-) -> Result<Option<String>, ReconstructCause> {
+) -> Result<(Option<String>, Option<String>), ReconstructCause> {
     let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
     Codex::decode_head(revision, body, &mut stored)?;
-    Ok(stored.codex_sidecar_binding)
+    Ok((stored.codex_sidecar_binding, stored.source_session_id))
 }
 
 const DICTIONARY_G: u32 = 64;

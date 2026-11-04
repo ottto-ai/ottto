@@ -2327,36 +2327,42 @@ mod tests {
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
-        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
-            ReplayNotAuthorized,
-            ProofParentUnsupported,
-            ProofChildUnsupported,
-            ParentSideUnsupported,
-            GroupProbeUnsupported,
-            GroupReadUnsupported,
-            ParentLedgerUnbound,
-            PhysicalOffsetUnsupported,
-            AdmissionRefused,
-            DecodeFailed,
-            OwnerUnproven,
-            OutputHeld,
-            DecodedOverLimit,
-            HeaderInvalid,
-            CorrectionUnapplied,
-            HeaderUnfunded,
-            CompatibilityUnfunded,
-            DecoderRefusedHeaderOccupancy,
-            FamilyUnproven,
-            ArchiveEquivalenceUnproven,
+        // Frozen numeric slots survive as holes; only live producers keep
+        // enum variants. Old archive causes decode through the inert fields.
+        const ALL: [Option<super::CodexZstCause>; super::CODEX_ZST_CAUSES] = [
+            Some(ReplayNotAuthorized),
+            None,
+            None,
+            None,
+            Some(GroupProbeUnsupported),
+            Some(GroupReadUnsupported),
+            None,
+            Some(PhysicalOffsetUnsupported),
+            Some(AdmissionRefused),
+            Some(DecodeFailed),
+            None,
+            None,
+            Some(DecodedOverLimit),
+            None,
+            None,
+            Some(HeaderUnfunded),
+            Some(CompatibilityUnfunded),
+            None,
+            None,
+            None,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
-        assert_eq!(
-            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
-            "decoder_refused_header_occupancy"
-        );
+        assert!(serde_json::from_str::<super::CodexZstCause>(
+            "\"decoder_refused_header_occupancy\""
+        )
+        .is_err());
         let mut labels = std::collections::BTreeSet::new();
 
-        for (index, cause) in ALL.iter().enumerate() {
+        for (index, cause) in ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cause)| cause.as_ref().map(|cause| (index, cause)))
+        {
             assert_eq!(*cause as usize, index);
             let label = serde_json::to_string(cause).unwrap();
             assert!(labels.insert(label.clone()), "unique persisted label");

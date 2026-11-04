@@ -600,28 +600,42 @@ impl HeaderInventory {
                     })
                     .transpose()?
                     .flatten();
-            // Only carries persist current owning-header facts. Ordinary
-            // heads keep the existing HeaderCache/header opener path.
-            let mut reused = stored_head.and_then(|head| {
-                let facts = head.common.inventory?;
-                let current = open_candidate_beneath_root(&candidate)
-                    .ok()?
-                    .metadata()
-                    .ok()?;
-                let stamp = FileStamp::capture(current.clone()).ok()?;
-                if !facts.stamp.matches_acquisition(&stamp) {
-                    return None;
-                }
-                Some((
-                    CachedHeader {
-                        stamp,
-                        owner: facts.owner,
-                        created_unix_ms: facts.created_unix_ms,
-                        read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
-                    },
-                    metadata_witness(&current),
-                ))
-            });
+            // Existing ordinary heads have object certificates but no carried
+            // inventory. Both forms reuse proven owning facts without a read.
+            let mut reused = stored_head
+                .filter(|head| !head.metadata_only)
+                .and_then(|head| {
+                    let current = open_candidate_beneath_root(&candidate)
+                        .ok()?
+                        .metadata()
+                        .ok()?;
+                    let stamp = FileStamp::capture(current.clone()).ok()?;
+                    let facts = head.common.inventory.as_ref();
+                    let owner = if let Some(facts) = facts {
+                        if !facts.stamp.matches_acquisition(&stamp) {
+                            return None;
+                        }
+                        facts.owner.clone()
+                    } else {
+                        if !codex_rollout_carry::physical_matches(&head, &current) {
+                            return None;
+                        }
+                        tail_source::codex::header_facts(head.revision, &head.body)
+                            .ok()?
+                            .1?
+                    };
+                    Some((
+                        CachedHeader {
+                            stamp,
+                            owner,
+                            created_unix_ms: facts.and_then(|facts| facts.created_unix_ms),
+                            read_bytes: facts.map_or(0, |facts| {
+                                usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
+                            }),
+                        },
+                        metadata_witness(&current),
+                    ))
+                });
             if let Some((facts, _)) = &reused {
                 self.reuse_hits += 1;
                 self.reuse_misses -= 1;
