@@ -407,7 +407,7 @@ crate::heap_layout_bound::fields!(HeaderCache; entries, heap_bytes, evictions);
 #[derive(Clone, Debug)]
 pub(super) struct HeaderInventory {
     roots: Vec<PathBuf>,
-    pending: VecDeque<PathBuf>,
+    pub(super) pending: VecDeque<PathBuf>,
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
@@ -600,36 +600,38 @@ impl HeaderInventory {
                     })
                     .transpose()?
                     .flatten();
-            let mut reused = index.as_deref().zip(stored_head).and_then(|(index, head)| {
-                let facts = head.common.inventory.clone();
-                let current = open_candidate_beneath_root(&candidate)
-                    .ok()?
-                    .metadata()
-                    .ok()?;
-                let stamp = FileStamp::capture(current.clone()).ok()?;
-                if index.codex_physical_matches(&key, &current).ok()? != Some(true) {
-                    return None;
-                }
-                let owner = facts
-                    .as_ref()
-                    .map(|facts| facts.owner.clone())
-                    .or_else(|| {
-                        tail_source::codex::header_facts(head.revision, &head.body)
-                            .ok()
-                            .and_then(|(_, owner)| owner)
-                    })?;
-                Some((
-                    CachedHeader {
-                        stamp,
-                        owner,
-                        created_unix_ms: facts.as_ref().and_then(|facts| facts.created_unix_ms),
-                        read_bytes: facts.as_ref().map_or(0, |facts| {
-                            usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
-                        }),
-                    },
-                    metadata_witness(&current),
-                ))
-            });
+            let mut reused = stored_head
+                .filter(|head| !head.metadata_only)
+                .and_then(|head| {
+                    let facts = head.common.inventory.clone();
+                    let current = open_candidate_beneath_root(&candidate)
+                        .ok()?
+                        .metadata()
+                        .ok()?;
+                    let stamp = FileStamp::capture(current.clone()).ok()?;
+                    if !codex_rollout_carry::physical_matches(&head, &current) {
+                        return None;
+                    }
+                    let owner = facts
+                        .as_ref()
+                        .map(|facts| facts.owner.clone())
+                        .or_else(|| {
+                            tail_source::codex::header_facts(head.revision, &head.body)
+                                .ok()
+                                .and_then(|(_, owner)| owner)
+                        })?;
+                    Some((
+                        CachedHeader {
+                            stamp,
+                            owner,
+                            created_unix_ms: facts.as_ref().and_then(|facts| facts.created_unix_ms),
+                            read_bytes: facts.as_ref().map_or(0, |facts| {
+                                usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
+                            }),
+                        },
+                        metadata_witness(&current),
+                    ))
+                });
             if let Some((facts, _)) = &reused {
                 self.reuse_hits += 1;
                 self.reuse_misses -= 1;
@@ -2093,7 +2095,6 @@ pub(super) mod tests {
                 "retained_usable_bytes":allocations.usable_live})
         );
     }
-
 
     #[test]
     fn ordinary_compressed_header_retains_pending_on_funding_refusal_and_plain_sibling_wins() {

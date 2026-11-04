@@ -1679,16 +1679,14 @@ sessions, decoded bytes or money. No path or session id is included.
 | Cause | Unsupported boundary |
 | --- | --- |
 | `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
-| `CompressedProofParentUnsupported` | Retired proof parent reader; not emitted by current builds |
-| `CompressedProofChildUnsupported` | Retired proof child reader; not emitted by current builds |
-| `CompressedParentSideUnsupported` | Retired parent side acquisition; not emitted by current builds |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Retired parent-ledger hold; not emitted by current builds. A compressed legacy user fork counts best effort like a plain one |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
 | `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
+| `CompressedDecodeFailed` | Invalid or damaged encoded input |
+| `CompressedDecodedOverLimit` | An explicitly bounded decoder exceeded its caller’s bound |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
@@ -1713,7 +1711,8 @@ retry timer, Held queue or separate power/work gate remains.
 
 Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
 win before header/body selection, and both encodings use the same mtime age rules;
-compressed rollouts keep their original modification time, so they age as the plain file did. One secure header opener
+compressed rollouts keep their original modification time, so they age as the plain file did.
+One secure header opener
 supplies ownership proof. The inventory has no file-count, directory-count, cache
 population or cumulative read-volume cap; optional header facts still use reclaimable
 state-memory credit, and the existing per-header recognition bound remains.
@@ -1726,13 +1725,17 @@ read is carried on a later pass. Multi-file compressed sessions remain unsupport
 grouped replay.
 
 A proven representation/path carry preserves old logical fingerprints, ACK/context
-facts and debt in one paired save rollback unit. Rename performs no header, sample,
+facts and debt in one paired save rollback unit, using the ordinary graph delta and
+Tail save. While a carry is staged, the complete graph delta shares that rollback
+boundary; ordinary saves keep their original per-file boundaries. Rename performs no header, sample,
 decoder or body read and no POST. A compressed rollout rewritten by the provider as
 a new plaintext file is read in full once (counted), as any replaced file is today.
 A restart mid-first-read re-decodes the prefix, counted on
 `codex_zst_decoded_bytes`; completed stored bodies retry without transcript reads.
-Older archive fields and causes remain decode-compatible and inert; downgrade
-scheduling and zero replay are not promised.
+Older archive fields and causes within them remain decode-compatible and inert; downgrade
+scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo one
+header attempt per archive; no money effect. Compatibility claims cover decoding
+only; the Linux workflow does not run the historical-binary driver.
 
 On close, `codex_zst_input` on the #799 carrier reports consumed
 `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread

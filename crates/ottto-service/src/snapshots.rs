@@ -22244,14 +22244,18 @@ impl OwnedSourceScan {
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
-        advance_bounded_directory_traversal_with_cache(
+        advance_bounded_directory_traversal_with_budget(
             source,
             index,
             backfill_window_days,
             directory_entries_per_tick(),
             Some(&resource_probe.discovery_growth),
-            carry_cache.map(|(cache, scope)| (cache, Some(scope))),
         );
+        let carry_deferred = if source == SnapshotSource::Codex {
+            index.prepare_codex_carries(carry_cache.map(|(cache, scope)| (cache, Some(scope))))
+        } else {
+            BTreeSet::new()
+        };
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -22577,6 +22581,22 @@ impl OwnedSourceScan {
         } else {
             BTreeSet::new()
         };
+        let pending_paths = pending_paths
+            .into_iter()
+            .filter_map(|pending| {
+                if carry_deferred.contains(&local_index_key(&pending.path)) {
+                    index
+                        .traversal
+                        .as_mut()
+                        .expect("traversal")
+                        .pending_candidates
+                        .push_back(pending);
+                    None
+                } else {
+                    Some(pending)
+                }
+            })
+            .collect::<Vec<_>>();
         // Counts only, never a gate input.
         let owed_selected = pending_paths
             .iter()
@@ -22928,7 +22948,11 @@ impl OwnedSourceScan {
                     &traversal.codex_rollout_paths,
                     traversal.codex_join_directory_census.as_ref(),
                 );
-                inventory.complete &= traversal.pending_directories.is_empty();
+                inventory
+                    .pending
+                    .retain(|path| !carry_deferred.contains(&local_index_key(path)));
+                inventory.complete &=
+                    traversal.pending_directories.is_empty() && carry_deferred.is_empty();
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());
@@ -38517,34 +38541,12 @@ fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-#[cfg(test)]
 fn advance_bounded_directory_traversal_with_budget(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
-) {
-    advance_bounded_directory_traversal_with_cache(
-        source,
-        index,
-        backfill_window_days,
-        max_entries,
-        growth,
-        None,
-    );
-}
-
-fn advance_bounded_directory_traversal_with_cache(
-    source: SnapshotSource,
-    index: &mut ScanIndex,
-    backfill_window_days: u64,
-    max_entries: usize,
-    growth: Option<&discovery_growth::Page>,
-    carry_cache: Option<(
-        &sampled_scan::SharedCache,
-        Option<&crate::transcript_acquisition::Scope>,
-    )>,
 ) {
     let mut traversal = index
         .traversal
@@ -38770,38 +38772,6 @@ fn advance_bounded_directory_traversal_with_cache(
                     continue;
                 }
             };
-            if source == SnapshotSource::Codex {
-                let candidate = codex_file_join::header_candidate(
-                    directory.scan_root.clone(),
-                    path.clone(),
-                    &metadata,
-                );
-                index.traversal = Some(traversal);
-                let carried = state_v2::runtime_path(index).and_then(|route| {
-                    route.map_or(Ok(false), |route| {
-                        index.carry_codex_rollout_with_cache(&route, &candidate, carry_cache)
-                    })
-                });
-                traversal = index
-                    .traversal
-                    .take()
-                    .expect("carry keeps traversal custody");
-                pending = traversal
-                    .pending_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| (p.path.clone(), i))
-                    .collect();
-                if carried.is_err() {
-                    traversal.pending_candidates.push_back(ScanTraversalPath {
-                        scan_root: directory.scan_root.clone(),
-                        path,
-                        census_member: directory.census_member,
-                        watcher_hint: directory.watcher_hint,
-                    });
-                    continue;
-                }
-            }
             if source == SnapshotSource::ClaudeCode {
                 index.rehome_discovered_account_hold(
                     &mut traversal,

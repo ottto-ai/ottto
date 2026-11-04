@@ -5599,10 +5599,14 @@ mod header_admission_tests {
             .unwrap();
         let mut refused = false;
         for number in 0..8 {
-            let key = format!("header-{number}");
-            cache.refresh_header(key.clone(), Some(facts.clone()));
+            let mut key = format!("header-{number}");
+            // Preserve byte-pressure with a small population: the backing
+            // allocation, like the stored key, is charged by capacity.
+            key.reserve_exact(state_bytes() / 8);
+            let lookup = key.clone();
+            cache.refresh_header(key, Some(facts.clone()));
             if cache
-                .with_cursor(|cursor| cursor.headers.get(&key))
+                .with_cursor(|cursor| cursor.headers.get(&lookup))
                 .flatten()
                 .is_none()
             {
@@ -5639,9 +5643,9 @@ mod header_admission_tests {
                 let facts = cursor.headers.get(&key).unwrap();
                 // Model a resident graph that became full after caching headers.
                 for number in 0..8 {
-                    cursor
-                        .headers
-                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                    let mut key = format!("header-{number}");
+                    key.reserve_exact(state_bytes() / 8);
+                    cursor.headers.refresh(key, Some(facts.clone()));
                 }
                 assert!(state_for_main(cursor).is_none(), "starvation precondition");
             })
@@ -5664,9 +5668,9 @@ mod header_admission_tests {
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
                 for number in 0..8 {
-                    cursor
-                        .headers
-                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                    let mut key = format!("header-{number}");
+                    key.reserve_exact(state_bytes() / 8);
+                    cursor.headers.refresh(key, Some(facts.clone()));
                 }
                 assert!(!free_room(&retained, cursor, 1024));
                 assert!(admit_locked(&mut retained, cursor, 1024, false));

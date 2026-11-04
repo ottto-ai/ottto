@@ -16,7 +16,7 @@ fn root_of(path: &Path) -> Option<&Path> {
 fn absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
-fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
+pub(super) fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
     // A header refresh must never make newly appended bytes look applied.
     // Its inventory stamp is seeded only at the logical checkpoint or carry;
     // a later ordinary checkpoint can supersede that older physical stamp.
@@ -93,23 +93,61 @@ impl ScanIndex {
         )))
     }
 
-    /// Called on a metadata-only candidate, before any sample/header/body read
-    /// and before either absence-retirement path. Returns false for ordinary
-    /// acquisition, including a newly materialized plaintext object.
-    #[cfg(test)]
-    pub(super) fn carry_codex_rollout(
+    /// One pass after both discovery routes, before selection and absence.
+    /// Only unindexed paths naming an existing owner need a physical probe.
+    pub(super) fn prepare_codex_carries(
         &mut self,
-        index_path: &Path,
-        candidate: &CandidateFile,
-        sampling: Option<&sampled_scan::Context>,
-    ) -> Result<bool> {
-        self.carry_codex_rollout_with_cache(
-            index_path,
-            candidate,
-            sampling.map(|s| (s.cache.as_ref(), Some(&s.namespace))),
-        )
+        sampling: Option<(
+            &sampled_scan::SharedCache,
+            Option<&crate::transcript_acquisition::Scope>,
+        )>,
+    ) -> BTreeSet<String> {
+        let candidates = {
+            let Some(walk) = self.traversal.as_ref() else {
+                return BTreeSet::new();
+            };
+            let owners = self
+                .files
+                .values()
+                .filter_map(|entry| codex_counting_version::proven_owner(entry))
+                .collect::<BTreeSet<_>>();
+            walk.codex_rollout_paths
+                .iter()
+                .filter_map(|key| {
+                    let path = Path::new(key);
+                    if self.files.contains_key(key)
+                        || codex_file_join::shadowed_compressed_path(
+                            path,
+                            &walk.codex_rollout_paths,
+                        )
+                        || !codex_session_id_candidates_from_path(path)
+                            .iter()
+                            .any(|id| owners.contains(codex_protected_owner(id).as_str()))
+                    {
+                        return None;
+                    }
+                    Some(codex_file_join::header_candidate(
+                        walk.owning_scan_root(path)?.clone(),
+                        path.to_path_buf(),
+                        &fs::symlink_metadata(path).ok()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let Ok(Some(route)) = state_v2::runtime_path(self) else {
+            return BTreeSet::new();
+        };
+        candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                self.carry_codex_rollout_with_cache(&route, &candidate, sampling)
+                    .err()
+                    .map(|_| local_index_key(&candidate.path))
+            })
+            .collect()
     }
 
+    /// Called once after discovery, before any selection or absence consumer.
     pub(super) fn carry_codex_rollout_with_cache(
         &mut self,
         index_path: &Path,

@@ -1564,6 +1564,7 @@ pub(in crate::snapshots) mod tests {
         assert!(!accepted.is_empty());
         assert!(index.files.contains_key(&key));
         scan.ownership_incomplete_file_count += 1;
+        scan.causes.add(ownership_diagnostics::PARSER, 1);
         let expected_files = index.files.len();
         crate::snapshot_sync::assert_archive_debt_preserves_replay_progress(
             index,
@@ -1678,8 +1679,16 @@ pub(in crate::snapshots) mod tests {
                     snapshot_upload_body_witness(expected)
                 );
             }
-            assert_eq!(result.unreadable_path_count, control.unreadable_path_count);
-            assert_eq!(result.census_complete, control.census_complete);
+            // Body corruption is an ordinary per-file read failure now;
+            // its diagnostic and census loss remain visible beside plain money.
+            assert_eq!(
+                result.unreadable_path_count,
+                control.unreadable_path_count + usize::from(refusal == "body")
+            );
+            assert_eq!(
+                result.census_complete,
+                control.census_complete && refusal != "body"
+            );
             assert_eq!(
                 result.census_residue_index_key_count,
                 control.census_residue_index_key_count
