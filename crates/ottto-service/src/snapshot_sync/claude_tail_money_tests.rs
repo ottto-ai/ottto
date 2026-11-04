@@ -2717,11 +2717,16 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
 }
 
 /// The mixed page's placement is not vacuous: the patched session's body
-/// holds at least two tagged placements (accounts/organizations) and an
-/// explicit untagged share (the evidence gap).
+/// holds at least two tagged placements (accounts/organizations) and its
+/// request evidence. A request with no evidence carries, by design, the
+/// account of the latest earlier request with its own telemetry; it is never
+/// an untagged share. Here the gap (12 input tokens) follows r2 (20, login
+/// 2), so login 2 holds r2 and the gap, plus any 5-token share (the side call
+/// or the fork's copied line) the oracle places. Returns input tokens per
+/// placement, for the check that every arm places them the same.
 fn assert_mixed_placement_nonvacuous(
     route: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
-) {
+) -> BTreeMap<String, u64> {
     let body = &route.snapshots[ROOT];
     let evidence = body["request_evidence"]
         .as_array()
@@ -2734,29 +2739,38 @@ fn assert_mixed_placement_nonvacuous(
         let index = row.get("evidence_ref").and_then(Value::as_u64)? as usize;
         Some(evidence.get(index)?.to_string())
     };
-    let (mut tagged, mut untagged) = (BTreeSet::new(), 0usize);
+    let (mut tagged, mut untagged) = (BTreeMap::<String, u64>::new(), 0u64);
     for row in body["model_usage"].as_array().into_iter().flatten() {
         let parts = row.get("identity_parts").and_then(Value::as_array);
         for part in parts.map_or(std::slice::from_ref(row), Vec::as_slice) {
+            let input = part["input_tokens"].as_u64().unwrap_or_default();
             match placement(part) {
-                Some(key) => {
-                    tagged.insert(key);
-                }
-                None => untagged += 1,
+                Some(key) => *tagged.entry(key).or_default() += input,
+                None => untagged += input,
             }
         }
     }
     assert!(tagged.len() >= 2, "{:?}: two tagged placements", route.mode);
     assert!(
-        untagged > 0,
-        "{:?}: the evidence gap stays untagged",
-        route.mode
-    );
-    assert!(
         !evidence.is_empty(),
         "{:?}: request evidence present",
         route.mode
     );
+    // The gap carries r2's account: no untagged share, and login 2 holds
+    // r2's 20 plus the gap's 12 (and 0, 5 or 10 from 5-token shares). Under
+    // login 1 or untagged, login 2 would hold 20, 25 or 30.
+    assert_eq!(
+        untagged, 0,
+        "{:?}: the evidence gap carries the earlier account",
+        route.mode
+    );
+    let carried = tagged.get(&"2".repeat(64)).copied().unwrap_or_default();
+    assert!(
+        matches!(carried.checked_sub(12), Some(20 | 25 | 30)),
+        "{:?}: the evidence gap sits under r2's login ({carried} input tokens)",
+        route.mode
+    );
+    tagged
 }
 
 /// The oracle detects a corrupted placement and a corrupted post-ACK ledger
@@ -2778,8 +2792,9 @@ fn assert_mixed_placement_corruption_detected(
 /// [money] E1p: one combined positive control on a MIXED page. The patched
 /// forked session switches account mid-session (two accounts and two
 /// organizations), has a side call with no transcript owner and a response
-/// with no evidence (an explicit untagged gap) beside tagged rows; the
-/// unpatched session switches organization. After an older owner's quiet
+/// with no evidence beside tagged rows (by design the gap carries the
+/// account of the latest earlier request with its own telemetry, on every
+/// arm); the unpatched session switches organization. After an older owner's quiet
 /// commit, the upgraded owner, the warm Tail and the cold Full emit equal
 /// bodies, placement and actual post-ACK ledger; a restart between pages then
 /// continues to the cold Full's result again. Every request is class-pure,
@@ -2914,9 +2929,17 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             money_oracle::assert_class_pure_requests(route);
             assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
         }
-        assert_mixed_placement_nonvacuous(&routes[1]);
+        let cold_placed = assert_mixed_placement_nonvacuous(&routes[1]);
         money_oracle::assert_equivalent(&routes[1], &routes[0]);
         money_oracle::assert_equivalent(&routes[1], &routes[2]);
+        for route in [&routes[0], &routes[2]] {
+            assert_eq!(
+                assert_mixed_placement_nonvacuous(route),
+                cold_placed,
+                "{:?}: the gap's placement on every arm",
+                route.mode
+            );
+        }
         assert_mixed_placement_corruption_detected(&routes[1], &routes[2]);
         let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
         let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
@@ -2962,8 +2985,13 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             money_oracle::assert_class_pure_requests(route);
             assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
         }
-        assert_mixed_placement_nonvacuous(&cold_route);
+        let cold_placed = assert_mixed_placement_nonvacuous(&cold_route);
         money_oracle::assert_equivalent(&cold_route, &restart_route);
+        assert_eq!(
+            assert_mixed_placement_nonvacuous(&restart_route),
+            cold_placed,
+            "restart between pages: the gap's placement"
+        );
         assert_mixed_placement_corruption_detected(&cold_route, &restart_route);
         println!(
             "MIXED_CLASS_PAGE_PLACEMENT VERIFIED arms=ram_tail,cold_full,upgraded_owner,restart_between_pages"
