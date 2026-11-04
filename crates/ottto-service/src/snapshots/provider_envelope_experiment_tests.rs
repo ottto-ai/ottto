@@ -671,6 +671,7 @@ fn native_recovery_priority_scan(
         None,
         &[],
         false,
+        &mut Default::default(),
         false,
         paths,
     )

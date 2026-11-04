@@ -103,7 +103,18 @@ impl Fixture {
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, &[])
+        self.page_with(source, index, &now, &[], &mut ListingRequest::default())
+    }
+    /// One page served with a listing request; returns what stays unserved.
+    fn page_requesting(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+        mut list_all: ListingRequest,
+    ) -> (ScanIndex, Reads, Vec<Value>, ListingRequest) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let (index, _, reads, rows) = self.page_with(source, index, &now, &[], &mut list_all);
+        (index, reads, rows, list_all)
     }
     fn page_hinted(
         &self,
@@ -112,7 +123,7 @@ impl Fixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, hints)
+        self.page_with(source, index, &now, hints, &mut ListingRequest::default())
     }
     fn page_at(
         &self,
@@ -120,7 +131,7 @@ impl Fixture {
         index: ScanIndex,
         now: &str,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
-        self.page_with(source, index, now, &[])
+        self.page_with(source, index, now, &[], &mut ListingRequest::default())
     }
     fn page_with(
         &self,
@@ -128,6 +139,7 @@ impl Fixture {
         mut index: ScanIndex,
         now: &str,
         hints: &[PathBuf],
+        list_all: &mut ListingRequest,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             source,
@@ -137,7 +149,7 @@ impl Fixture {
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
-            let mut scan = OwnedSourceScan::new(
+            let mut scan = OwnedSourceScan::new_selecting(
                 source,
                 std::slice::from_ref(&self.root),
                 index,
@@ -147,6 +159,9 @@ impl Fixture {
                 None,
                 hints,
                 false,
+                list_all,
+                true,
+                &[],
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -932,6 +947,110 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
             ..Default::default()
         };
         sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    }
+}
+
+/// [behaviour] A listing request lists every root of a kept generation at
+/// once, for every source: the downtime writes are read and no generation
+/// starts. A request while that walk runs neither restarts nor drops it: it
+/// stays unserved for the pass after the walk. A context change records a
+/// fresh-traversal request; a generation start from nothing does not.
+#[test]
+fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut first = ListingRequest::default();
+        first.record(ListingTrigger::Start);
+        let (_, _, _, unserved) = f.page_requesting(source, ScanIndex::default(), first);
+        assert_eq!(unserved, first, "{source:?}: the first walk runs");
+
+        let index = kept_generation(&f, source, false);
+        append_records(
+            &f.root.join(format!("{GROWN}.jsonl")),
+            &usage_records(source, GROWN, 2, false),
+        );
+        append_records(
+            &f.root.join(format!("{CREATED}.jsonl")),
+            &usage_records(source, CREATED, 1, true),
+        );
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        let mut rescan = ListingRequest::default();
+        rescan.record(ListingTrigger::Rescan);
+        with_test_directory_entries(ROOT_ENTRIES, || {
+            let (index, reads, rows, unserved) = f.page_requesting(source, index, first);
+            assert!(!unserved.requested(), "{source:?}: served at once");
+            let walk = index.traversal.as_ref().unwrap();
+            assert_eq!(walk.counts.listing_generations, 1, "{source:?}");
+            assert!(!walk.pending_directories.is_empty(), "{source:?}");
+            let (index, more, more_rows, unserved) = f.page_requesting(source, index, rescan);
+            assert_eq!(unserved, rescan, "{source:?}: kept for after the walk");
+            assert!(
+                index
+                    .traversal
+                    .as_ref()
+                    .map_or(true, |walk| walk.counts.listing_generations == 1),
+                "{source:?}: not restarted"
+            );
+            let drained = index.traversal.as_ref().map_or(true, |walk| {
+                walk.pending_directories.is_empty() && walk.pending_candidates.is_empty()
+            });
+            let (mut modes_read, mut starts) = if drained {
+                (Vec::new(), 0)
+            } else {
+                let run = run_pages(&f, source, index);
+                (run.modes, run.starts)
+            };
+            modes_read.extend(modes(&reads));
+            modes_read.extend(modes(&more));
+            modes_read.sort();
+            assert_eq!(modes_read, expected, "{source:?}");
+            starts += rows
+                .iter()
+                .chain(&more_rows)
+                .filter(|row| {
+                    row["stage"] == "bounded_traversal_transition"
+                        && row["counts"]["event"] == "starting"
+                })
+                .count();
+            assert_eq!(starts, 0, "{source:?}: no new generation");
+        });
+
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            source,
+            Some(f.cache.as_ref()),
+            index,
+        );
+        f.cache.bind_withheld(&mut index);
+        let nested = f.root.join("nested");
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let mut request = ListingRequest::default();
+        drop(OwnedSourceScan::new_selecting(
+            source,
+            std::slice::from_ref(&nested),
+            index,
+            &now,
+            7,
+            10,
+            None,
+            &[],
+            false,
+            &mut request,
+            true,
+            &[],
+        ));
+        let mut fresh = ListingRequest::default();
+        fresh.record(ListingTrigger::FreshTraversal);
+        assert_eq!(request, fresh, "{source:?}: kept behind the fresh walk");
     }
 }
 

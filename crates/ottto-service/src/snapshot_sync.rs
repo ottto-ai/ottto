@@ -4638,7 +4638,18 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
                 if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
                     if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
-                        watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
+                        // Nothing watched the changed or new targets until now.
+                        crate::snapshot_watcher::request_listing_all(
+                            crate::snapshot_watcher::ListingTrigger::Watcher,
+                        );
+                        watcher = crate::snapshot_watcher::watch_snapshot_roots(roots)
+                            .inspect_err(|error| {
+                                eprintln!(
+                                    "local snapshot sync: filesystem watch re-create failed: {}",
+                                    safe_error(error)
+                                );
+                            })
+                            .ok();
                     }
                 }
                 match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
@@ -7134,6 +7145,7 @@ fn prepare_sync_source_inner(
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
         &watcher_hints.paths,
         watcher_hints.overflowed,
+        &mut watcher_hints.list_all,
         request_identity_capture,
         &copy_prefix_scope,
     )
@@ -7141,6 +7153,8 @@ fn prepare_sync_source_inner(
     .with_launch_events(home)
     .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
+    // A walk already running keeps the request: the first pass after it lists.
+    crate::snapshot_watcher::defer_listing(source, watcher_hints.list_all);
     scan.rehome_withheld_baseline(&mut committed_index);
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
