@@ -1895,6 +1895,10 @@ fn require_cloud_session_success(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("config upload refused: source_disabled")]
+pub(crate) struct UploadRefused;
+
 /// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
 /// error so the caller can refresh credentials; 400/422 means the `label`
 /// contract drifted.
@@ -1903,9 +1907,17 @@ fn relay_token_upload_response(
     label: &str,
 ) -> Result<Value> {
     match sent {
-        Ok(response) => response
-            .into_json()
-            .map_err(|error| anyhow!("parse {label} response failed: {error}")),
+        Ok(response) => {
+            let body: Value = response
+                .into_json()
+                .map_err(|error| anyhow!("parse {label} response failed: {error}"))?;
+            if body.get("accepted").and_then(Value::as_bool) == Some(false)
+                && body.get("reason").and_then(Value::as_str) == Some("source_disabled")
+            {
+                return Err(UploadRefused.into());
+            }
+            Ok(body)
+        }
         Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
             Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                 status: code,
@@ -3497,10 +3509,48 @@ pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)
 }
 
 #[cfg(test)]
+pub(crate) use tests::config_upload_backend;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    pub(crate) fn config_upload_backend(
+        body: &'static str,
+    ) -> (SnapshotApiClient, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        (client, server)
+    }
+
+    #[test]
+    fn source_disabled_refusal_requires_both_fields() {
+        for (body, refused) in [
+            (r#"{"accepted":false,"reason":"source_disabled"}"#, true),
+            (r#"{"accepted":true,"reason":"source_disabled"}"#, false),
+            (r#"{"reason":"source_disabled"}"#, false),
+            (r#"{"accepted":false}"#, false),
+        ] {
+            let response = ureq::Response::new(200, "OK", body).unwrap();
+            let result = relay_token_upload_response(Ok(response), "config");
+            if refused {
+                assert!(result.unwrap_err().is::<UploadRefused>());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    serde_json::from_str::<Value>(body).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn bounded_unit_test_agent_refuses_production_before_dns_or_tls() {

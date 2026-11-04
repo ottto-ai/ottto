@@ -3428,6 +3428,7 @@ done
         Disabled,
         Error,
         UploadError,
+        SourceDisabled,
         NamesOff,
     }
 
@@ -3493,12 +3494,20 @@ done
                                 r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{},"session_titles_enabled":{}}}"#,
                                 matches!(
                                     mode,
-                                    HintMode::Enabled | HintMode::UploadError | HintMode::NamesOff
+                                    HintMode::Enabled
+                                        | HintMode::UploadError
+                                        | HintMode::SourceDisabled
+                                        | HintMode::NamesOff
                                 ),
                                 !matches!(mode, HintMode::NamesOff)
                             ),
                         ),
                     }
+                } else if matches!(hint, HintMode::SourceDisabled) {
+                    (
+                        "200 OK",
+                        r#"{"accepted":false,"reason":"source_disabled"}"#.to_string(),
+                    )
                 } else if matches!(hint, HintMode::UploadError) {
                     (
                         "500 Internal Server Error",
@@ -3617,6 +3626,28 @@ done
             .iter()
             .filter(|r| r.contains("POST /api/v1/mcp/inventory"))
             .count()
+    }
+
+    #[test]
+    fn source_disabled_refusal_is_not_a_receipt() {
+        use std::sync::{Arc, Mutex};
+        let (home, support_dir) = mock_cc_home("source-disabled");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (base, server) = mock_backend(captured.clone(), 3, HintMode::SourceDisabled);
+        let client = SnapshotApiClient::new(base.clone());
+        let error = run_harvest(
+            &client,
+            &cc_device("device_test"),
+            &base,
+            &home,
+            &support_dir,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.is::<crate::snapshot_client::UploadRefused>());
+        assert_eq!(inventory_post_count(&captured.lock().unwrap()), 1);
+        assert!(!cache_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     /// End-to-end: a first harvest uploads; an unchanged second harvest still
