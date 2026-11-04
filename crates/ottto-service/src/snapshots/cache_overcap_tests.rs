@@ -1,7 +1,7 @@
 //! Uploads past the server's per-patch and per-session cache bounds, and
 //! accepted-state budget regressions.
 //! No fixture content comes from a provider account.
-use super::cache_observations::{Operation, MAX_OPERATIONS};
+use super::cache_observations::{Operation, MAX_OPERATIONS, MAX_ROWS, MAX_STATE_BYTES};
 use super::*;
 
 fn request(name: &str, read: u64, second: i64) -> OwnedRequest {
@@ -74,6 +74,11 @@ fn upload(requests: &[OwnedRequest], prior: Option<&Value>) -> (CacheObservation
     (wire, item.cache_observations_state.unwrap())
 }
 
+/// The accepted state a session with `breaks` breaks settles to.
+pub(crate) fn settled_state(breaks: usize) -> Value {
+    settle(&session("", breaks), None)
+}
+
 /// Upload passes until the accepted state stops changing.
 fn settle(requests: &[OwnedRequest], mut prior: Option<Value>) -> Value {
     loop {
@@ -91,8 +96,9 @@ fn settle(requests: &[OwnedRequest], mut prior: Option<Value>) -> Value {
 /// server's per-session state bound, past which the count stays exact.
 #[test]
 fn long_session_uploads_every_break_across_patches_with_exact_omitted_count() {
-    // One patch, one past it, and one past the per-session row bound (128).
-    for breaks in [64, 65, 129] {
+    // One patch, one past it, past the old row bound (128), and one past the
+    // per-session row bound.
+    for breaks in [64, 65, 200, MAX_ROWS + 1] {
         let requests = session("", breaks);
         let wire = cache_wire("s", &requests, true);
         assert_eq!(upserted(&wire), colds(0..breaks), "{breaks}");
@@ -111,13 +117,13 @@ fn long_session_uploads_every_break_across_patches_with_exact_omitted_count() {
             .collect::<Vec<_>>();
         refs.sort_by_key(|name| name["cold_".len()..].parse::<usize>().unwrap());
         assert_eq!(refs, colds(0..rows.len()), "earliest breaks first");
-        if breaks <= MAX_OPERATIONS + 1 {
-            assert_eq!(rows.len(), breaks);
-            assert_eq!(state["coverage"], "complete");
+        assert_eq!(rows.len(), breaks.min(MAX_ROWS), "{breaks}");
+        let coverage = if breaks <= MAX_ROWS {
+            "complete"
         } else {
-            assert!(rows.len() > MAX_OPERATIONS, "more than one patch");
-            assert_eq!(state["coverage"], "partial");
-        }
+            "partial"
+        };
+        assert_eq!(state["coverage"], coverage, "{breaks}");
     }
 }
 
@@ -263,31 +269,46 @@ fn encoded(state: &Value) -> usize {
     crate::canonical_json::canonicalize(state).unwrap().len()
 }
 
+/// Grow the state's condition strings, within the schema's 256 characters,
+/// until it encodes to exactly `target` bytes.
+fn pad_to(state: &mut Value, target: usize) {
+    let mut remaining = target - encoded(state);
+    for row in state["observations"].as_array_mut().unwrap() {
+        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
+            let text = condition.as_str().unwrap();
+            let add = remaining.min(256 - text.len());
+            *condition = json!(format!("{text}{}", "x".repeat(add)));
+            remaining -= add;
+        }
+    }
+    assert_eq!(remaining, 0);
+}
+
 pub(crate) fn large_prior_and_replacement_fixture() -> (CacheObservations, Value) {
     let desired = first_patch(&session("", 65));
     // Place shrinking replacements last, so trimming first restores their larger
     // accepted versions. Unrelated accepted rows cannot be deleted under S3.
     let mut selected = desired[10..].to_vec();
     selected.extend_from_slice(&desired[..10]);
-    let extra = rows(&cache_wire("s", &session("old_", 10), true));
     let candidate = partial(selected);
-    // Build the boundary by measured canonical bytes, not guessed row sizes.
-    for conditions in 1..=32 {
-        let old = desired[..10]
-            .iter()
-            .chain(extra.iter())
-            .cloned()
-            .map(|row| large_row(row, conditions))
-            .collect();
-        let prior = cache_state_from_patch(None, &partial(old)).unwrap();
-        let merged = cache_state_from_patch(Some(&prior), &candidate).unwrap();
-        if encoded(&prior) <= cache_observations::MAX_WIRE_BYTES
-            && encoded(&merged) > cache_observations::MAX_WIRE_BYTES
-        {
-            return (candidate, prior);
-        }
+    // The replaced rows hold one full condition, so padding skips them; the
+    // unrelated rows take the padding.
+    let mut old = desired[..10]
+        .iter()
+        .cloned()
+        .map(|row| large_row(row, 1))
+        .collect::<Vec<_>>();
+    for mut row in rows(&cache_wire("s", &session("old_", 96), true)) {
+        row.supporting_conditions = vec!["x".into(); 32];
+        old.push(row);
     }
-    panic!("schema-valid near-cap prior fixture must exist");
+    let mut prior = cache_state_from_patch(None, &partial(old)).unwrap();
+    // Padding unrelated rows moves prior and merge alike, so measure the
+    // merge's growth once and place the cap halfway through it.
+    let growth =
+        encoded(&cache_state_from_patch(Some(&prior), &candidate).unwrap()) - encoded(&prior);
+    pad_to(&mut prior, MAX_STATE_BYTES - growth / 2);
+    (candidate, prior)
 }
 
 #[test]
@@ -345,9 +366,8 @@ fn dropped_replacement_is_present_and_not_counted_as_omitted() {
 
 #[test]
 fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
-    let mut accepted = rows(&cache_wire("s", &session("old_", 64), true));
-    accepted.extend(rows(&cache_wire("s", &session("other_", 64), true)));
-    // Use short witnesses so 128 rows fit the byte budget independently.
+    let mut accepted = rows(&cache_wire("s", &session("old_", MAX_ROWS), true));
+    // Use short witnesses so MAX_ROWS rows fit the byte budget independently.
     for row in &mut accepted {
         row.previous = None;
         row.immediate_next = None;
@@ -369,31 +389,15 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
     )
     .unwrap();
     exact["omitted_observation_count"] = json!(0);
-    // Fill using schema-valid condition strings within per-field limits.
-    let budget = cache_observations::MAX_WIRE_BYTES;
     // This fixture targets refusal, so the prior is a server-sized state rather
-    // than a detector output. Spread padding over many schema-valid rows.
-    let mut base = rows(&cache_wire("s", &session("old_", 64), true));
+    // than a detector output. Spread schema-valid padding over many rows.
+    let mut base = rows(&cache_wire("s", &session("old_", 96), true));
     for row in &mut base {
-        row.supporting_conditions = vec![String::new(); 32];
+        row.supporting_conditions = vec!["x".into(); 32];
     }
     exact["observations"] = serde_json::to_value(base).unwrap();
-    // Replace empty conditions with valid strings, and grow to exactly the cap.
-    for row in exact["observations"].as_array_mut().unwrap() {
-        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
-            *condition = json!("x");
-        }
-    }
-    let mut remaining = budget - encoded(&exact);
-    for row in exact["observations"].as_array_mut().unwrap() {
-        for condition in row["supporting_conditions"].as_array_mut().unwrap() {
-            let add = remaining.min(255);
-            *condition = json!("x".repeat(1 + add));
-            remaining -= add;
-        }
-    }
-    assert_eq!(remaining, 0);
-    assert_eq!(encoded(&exact), budget);
+    pad_to(&mut exact, MAX_STATE_BYTES);
+    assert_eq!(encoded(&exact), MAX_STATE_BYTES);
     let mut item = super::tests::sample_session_artifact_item();
     item.cache_observations = Some(CacheObservations {
         schema_version: 1,
@@ -442,9 +446,8 @@ fn malformed_accepted_rows_refuse_complete_and_partial_cache_updates() {
     // silently dropped, even when its raw size exceeded the cumulative budget.
     malformed["observations"][0]["affected"] = Value::Null;
     let mut oversized = malformed.clone();
-    oversized["observations"][0]["supporting_conditions"] =
-        json!(["x".repeat(cache_observations::MAX_WIRE_BYTES)]);
-    assert!(encoded(&oversized) > cache_observations::MAX_WIRE_BYTES);
+    oversized["observations"][0]["supporting_conditions"] = json!(["x".repeat(MAX_STATE_BYTES)]);
+    assert!(encoded(&oversized) > MAX_STATE_BYTES);
     let mut wrong_shape = valid.clone();
     wrong_shape["observations"] = Value::Null;
     for prior in [malformed, oversized, wrong_shape] {

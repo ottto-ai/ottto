@@ -32002,7 +32002,7 @@ fn cache_state_within_limits(state: &Value) -> bool {
         rows.len() <= cache_observations::MAX_ROWS
             && rows.iter().all(|row| row["status"] != "retracted")
     }) && crate::canonical_json::canonicalize(state)
-        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_WIRE_BYTES)
+        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_STATE_BYTES)
 }
 
 /// One session's cache wire, shared by every source. A replayed request is
@@ -75902,7 +75902,7 @@ pub(crate) mod cache_adapter_tests {
             "schema_version":1,
             "detector_revision":"v1",
             "canonicalization":crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
-            "caps":{"operations":cache_observations::MAX_OPERATIONS,"wire_bytes":cache_observations::MAX_WIRE_BYTES,"canonical_rows":128,"canonical_bytes":128*1024},
+            "caps":{"operations":cache_observations::MAX_OPERATIONS,"wire_bytes":cache_observations::MAX_PATCH_BYTES,"canonical_rows":cache_observations::MAX_ROWS,"canonical_bytes":cache_observations::MAX_STATE_BYTES},
             "duration_policy":"nonnegative_whole_seconds_floor",
             "head_cas_contract":SNAPSHOT_HEAD_CAS_CONTRACT,
             "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
