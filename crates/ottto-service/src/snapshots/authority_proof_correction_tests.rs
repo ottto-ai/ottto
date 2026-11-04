@@ -1664,8 +1664,6 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
             .source_file_fingerprint
             .clear();
     }
-    // Every loaded or saved index carries the tombstone marker.
-    expected.claude_retired_family_tombstones_initialized = true;
     // Empty maps are omitted by ScanIndex's persisted representation.
     serde_json::to_value(expected).unwrap()
 }

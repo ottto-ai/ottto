@@ -1378,13 +1378,12 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
 }
 
 /// A protected root, named by the local
-/// re-emission list, whose family holds a stored witness and a census retired
-/// as absent (tombstoned, witness kept) and whose member then returns, through the real
-/// prepare/finish pipeline and the recording server. The return re-enters
-/// the authority path, and nothing emitted for the root is a request-owned
+/// re-emission list, whose family holds a stored witness and whose member
+/// goes absent and then returns, through the real prepare/finish pipeline and
+/// the recording server. Nothing emitted for the root is a request-owned
 /// literal (`claude_request_counting:v1`, the "new v1"), nor is any file of
 /// it stamped with body-witness revision 3. The root either settles its proof
-/// (tombstone cleared, no record) or stays held with nothing offered.
+/// (no record) or stays held with nothing offered.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -1413,7 +1412,7 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         .join(".claude/projects/-synthetic-repo")
         .join(format!("{root}.jsonl"));
     // An upgraded store's state: an older build stored the family's witness
-    // (no build proves a new one), then a census retired the family.
+    // (no build proves a new one).
     let mut index = ScanIndex::load(&first.index_path).unwrap();
     let items = crate::snapshots::parse_claude_code_jsonl_file(
         &transcript,
@@ -1429,14 +1428,12 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         ),
         "the stored witness installs"
     );
-    index.tombstone_claude_family_for_test(root);
     index.save(&first.index_path).unwrap();
     let bytes = std::fs::read(&transcript).unwrap();
     std::fs::remove_file(&transcript).unwrap();
     let absent = pipeline.cycle(t0 + 600);
     assert!(absent.result.is_ok(), "{:?}", absent.result);
     assert!(!absent.index.files.contains_key(&key));
-    assert!(absent.index.claude_family_tombstoned_for_test(root));
 
     let offered_before = pipeline.server.offered().len();
     std::fs::write(&transcript, &bytes).unwrap();
@@ -1464,20 +1461,18 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
                 <= effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
         );
     }
-    let settled = !returned.index.claude_family_tombstoned_for_test(root)
-        && returned
-            .index
-            .claude_authority_record_for_test(root)
-            .is_none();
-    let held = returned.index.claude_family_tombstoned_for_test(root)
-        && returned
-            .index
-            .claude_authority_record_for_test(root)
-            .is_some()
+    let settled = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .is_none();
+    let held = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .is_some()
         && root_offers.is_empty();
     assert!(
         settled || held,
-        "the return re-enters the authority path: settled={settled} held={held}"
+        "the return settles or stays held: settled={settled} held={held}"
     );
 }
 
@@ -2129,19 +2124,18 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
     assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
 }
 
-/// #705's returning tombstoned member under #712's move hold, on the
-/// always-on path: (a) the `e2` page clears the tombstone,
-/// whatever the proof's health; (b) the #712 hold still withholds the body,
-/// with nothing uploaded or stamped; (c) once the hold releases (an explicit
-/// `full` claim, then readable proof) the family's money is exactly its
-/// request-owned total: one request-owned body, never a legacy one beside it,
-/// and no identity beyond what the first accepted body carried.
+/// A returning member under #712's move hold, on the always-on path: (b) the
+/// #712 hold withholds the body, with nothing uploaded or stamped; (c) once
+/// the hold releases (an explicit `full` claim, then readable proof) the
+/// family's money is exactly its request-owned total: one request-owned body,
+/// never a legacy one beside it, and no identity beyond what the first
+/// accepted body carried.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn tombstoned_returning_history_obeys_the_move_hold() {
-    if !supported("tombstoned_returning_history_obeys_the_move_hold") {
+fn returning_history_obeys_the_move_hold() {
+    if !supported("returning_history_obeys_the_move_hold") {
         return;
     }
     let root = IDENTITY_PIPELINE_ROOT;
@@ -2174,9 +2168,6 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         .expect("the root is indexed");
     let settled_revision = first.index.files[&key].effective_upload_body_witness_revision;
     assert_ne!(settled_revision, 0, "the accepted baseline is stamped");
-    let mut index = ScanIndex::load(&first.index_path).unwrap();
-    index.tombstone_claude_family_for_test(root);
-    index.save(&first.index_path).unwrap();
     let transcript = pipeline
         .fixture
         .home
@@ -2187,7 +2178,6 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     let absent = pipeline.cycle(t0 + 600);
     assert!(absent.result.is_ok(), "{:?}", absent.result);
     assert!(!absent.index.files.contains_key(&key));
-    assert!(absent.index.claude_family_tombstoned_for_test(root));
     let mut saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
     std::fs::write(&transcript, &bytes).unwrap();
@@ -2197,26 +2187,21 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     assert!(!reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
 
-    // Healthy local proof may clear #705's tombstone, but cannot waive
-    // #712's history hold or stamp the body as uploaded.
+    // Healthy local proof cannot waive #712's history hold or stamp the
+    // body as uploaded.
     let proved_return = pipeline.cycle(t0 + 1_200);
     assert!(proved_return.result.is_ok(), "{:?}", proved_return.result);
     assert_eq!(pipeline.server.offered().len(), offered_before);
-    assert!(!proved_return.index.claude_family_tombstoned_for_test(root));
     assert_eq!(
         proved_return.index.files[&key].effective_upload_body_witness_revision,
         0
     );
 
-    // Retire it again, then return without healthy proof.
-    let mut index = ScanIndex::load(&proved_return.index_path).unwrap();
-    index.tombstone_claude_family_for_test(root);
-    index.save(&proved_return.index_path).unwrap();
+    // Remove it again, then return without healthy proof.
     std::fs::remove_file(&transcript).unwrap();
     let absent_again = pipeline.cycle(t0 + 1_800);
     assert!(absent_again.result.is_ok(), "{:?}", absent_again.result);
     assert!(!absent_again.index.files.contains_key(&key));
-    assert!(absent_again.index.claude_family_tombstoned_for_test(root));
     let api = pipeline
         .support
         .join("local-otel/claude-code-effort")
@@ -2252,9 +2237,6 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         "the move hold stands"
     );
     assert!(saved.get("claude_history_move_released").is_none());
-    // (a) The `e2` page settles the family's authority even with unhealthy
-    // proof: the tombstone clears (snapshots.rs fold).
-    assert!(!returned.index.claude_family_tombstoned_for_test(root));
 
     // (c) Release the hold the production way: an explicit `full` claim
     // clears the move marker for good. The proof is still unreadable, so its
@@ -2280,7 +2262,6 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         claimed.index.files[&key].effective_upload_body_witness_revision,
         0
     );
-    assert!(!claimed.index.claude_family_tombstoned_for_test(root));
 
     // Readable proof: the released body settles.
     write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
@@ -2291,7 +2272,6 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
         released.index.files[&key].effective_upload_body_witness_revision, settled_revision,
         "the hold released and the body settled"
     );
-    assert!(!released.index.claude_family_tombstoned_for_test(root));
     let offered = pipeline.server.offered();
     let new_offers = root_offers(&offered[offered_before..]);
     assert!(

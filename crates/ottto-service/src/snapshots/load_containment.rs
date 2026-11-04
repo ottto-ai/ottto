@@ -637,7 +637,7 @@ fn note_scan_index_quarantine_rebuild(
 /// the override keeps that state too. It decodes
 /// `lenient_decode::IDENTITY_CARRY_FIELDS` by each field's policy, refusing
 /// (source stays paused, index untouched, counted, alarmed) when any of them
-/// cannot be recovered (tombstone loss instead raises its fence), and otherwise
+/// cannot be recovered, and otherwise
 /// durably REPLACES the index with a
 /// generation-0 rebuild that carries them. A replacement scan that then
 /// fails reloads that carried state, never an empty graph. The damaged bytes
@@ -679,9 +679,6 @@ fn override_scan_index_rebuild_loop(
             .accepted_rebuild_pending_since_unix_seconds
             .get_or_insert(unix_seconds_at(now));
     }
-    // This replacement bypasses save_internal, but is still a writer of the
-    // marked tombstone format. Carry already raised its fence on any loss.
-    rebuilt.claude_retired_family_tombstones_initialized = true;
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
     let prior_stamp = fs::read(&stamp_path).ok();
@@ -763,9 +760,6 @@ fn override_scan_index_rebuild_loop(
     // Once replaced, this was an actual override (never a refused press), even
     // if the final directory sync reports an uncertain durability outcome.
     result?;
-    // This function also returns directly to Repair callers. Settle the
-    // tombstone decode here, before any first census or replay can save.
-    rebuilt.settle_claude_index_load();
     Ok(rebuilt)
 }
 
@@ -786,13 +780,6 @@ impl ScanIndex {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
-        // Retirement evidence gates re-entry even when the file graph needs
-        // rebuilding. Its decoder has already raised any uncertainty fence.
-        self.claude_retired_family_tombstones = carry.claude_retired_family_tombstones;
-        self.claude_retired_family_tombstones_initialized =
-            carry.claude_retired_family_tombstones_initialized;
-        self.claude_retired_family_tombstones_uncertain =
-            carry.claude_retired_family_tombstones_uncertain;
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             // Keep prior carried incidence, including history-held files whose
             // ordinary exact set is empty. Add only ORIGINAL accepted identities.

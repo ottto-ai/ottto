@@ -1006,7 +1006,7 @@ mod hydrate_parity {
     }
     fn typed_case(index: ScanIndex) -> ScanIndex {
         let bytes = serde_json::to_vec(&index).unwrap();
-        // Mapped tombstone codecs, like serde, reconstruct decoded evidence.
+        // Mapped codecs, like serde, reconstruct decoded evidence.
         let mapped = serde_json::from_slice(&bytes).unwrap();
         compare(&bytes, mapped)
     }
@@ -1029,9 +1029,9 @@ mod hydrate_parity {
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }
     }
-    /// [format] every hydrate runs deadline drop cutoff and tombstone rules.
+    /// [format] every hydrate runs deadline drop and cutoff rules.
     #[test]
-    fn every_hydrate_runs_deadline_drop_cutoff_and_tombstone_rules() {
+    fn every_hydrate_runs_deadline_drop_and_cutoff_rules() {
         let mut index = seed();
         let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
         quarantine.retry_after_unix_seconds = u64::MAX;
@@ -1055,36 +1055,6 @@ mod hydrate_parity {
         assert!(!actual.snapshot_activity_at.contains_key(&"c".repeat(64)));
         assert!(!actual.accepted_snapshot_fingerprints.contains("bad"));
         assert!(!actual.claude_history_gate_loaded);
-
-        let mut index = seed();
-        index.claude_retired_family_tombstones_initialized = true;
-        let actual = typed_case(index);
-        assert!(actual.claude_retired_family_tombstones_initialized);
-    }
-    /// [money] missing and damaged retirement evidence keep the v1 uncertainty and commitment.
-    #[test]
-    fn missing_and_damaged_retirement_evidence_keep_the_v1_uncertainty_and_commitment() {
-        for missing in [false, true] {
-            let mut index = seed();
-            index.claude_retired_family_tombstones_initialized = true;
-            let mut value = serde_json::to_value(index).unwrap();
-            if missing {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("claude_retired_family_tombstones");
-            } else {
-                value["claude_retired_family_tombstones"] =
-                    serde_json::json!({"invalid": "timestamp"});
-            }
-            let bytes = serde_json::to_vec(&value).unwrap();
-            // The importer already carries the original tombstone repair
-            // commitment. Hydration must settle without forgetting or doubling it.
-            let mapped = lenient_decode::read_bounded(&bytes).unwrap();
-            let actual = compare(&bytes, mapped);
-            assert!(actual.claude_retired_family_tombstones_uncertain);
-            assert_eq!(actual.decode_holds.v2_provenance().1, 1);
-        }
     }
     /// [format] v2 load rearms legacy terminal with the v1 pacing rule.
     #[test]
@@ -1625,8 +1595,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         Ok(())
     })
     .unwrap();
-    // Publication returns a public load, which settles the tombstone marker.
-    // Compare at that same boundary after rollback, including load settlement.
+    // Publication returns a public load. Compare at that same boundary after
+    // rollback, including load settlement.
     let restored = ScanIndex::load(&f.path).unwrap_or_else(|e| {
         panic!(
             "reload after FULL: {e:#}; cause={:?}",

@@ -108,13 +108,13 @@ macro_rules! scan_index_fields {
             claude_account_family_pending => Accounts (hook check_map) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1] own,
             claude_request_census => Census (hook check_field) ["file.census" => 1] own,
             retired_family_requests => Census (retired none) ["family.requests" => 1] side,
-            claude_retired_family_tombstones => Census (hook check_field) ["tombstone.claude_retired_family_tombstones" => 1] side,
+            retired_claude_retired_family_tombstones => Census (retired none) ["tombstone.claude_retired_family_tombstones" => 1] side,
             retired_claude_duplicate_request_owners => Census (retired none) ["v1_field.duplicate_owners" => 1] side,
             retired_claude_owned_start_census => Census (retired none) ["proof.owned_start" => 1] side,
             claude_request_census_shadow => Census (scalar check_field) ["v1_field.census_shadow" => 1] side,
             retired_claude_duplicate_request_witness_overflowed => Census (retired none) ["setting.claude_duplicate_request_witness_overflowed" => 1] side,
-            claude_retired_family_tombstones_initialized => Census (scalar check_field) ["setting.claude_retired_family_tombstones_initialized" => 1] side,
-            claude_retired_family_tombstones_uncertain => Census (scalar check_field) ["setting.claude_retired_family_tombstones_uncertain" => 1] side,
+            retired_claude_retired_family_tombstones_initialized => Census (retired none) ["setting.claude_retired_family_tombstones_initialized" => 1] side,
+            retired_claude_retired_family_tombstones_uncertain => Census (retired none) ["setting.claude_retired_family_tombstones_uncertain" => 1] side,
             persistence_root => Misc (runtime none) [] side,
             persistence_unavailable => Misc (runtime none) [] side,
             persistence_controls => Misc (runtime none) [] side,
@@ -314,6 +314,9 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
             | "claude_request_identity_contract_changed"
             | "claude_stale_family_carry"
             | "held_audit_progress"
+            | "claude_retired_family_tombstones"
+            | "claude_retired_family_tombstones_initialized"
+            | "claude_retired_family_tombstones_uncertain"
     ) {
         // TOMBSTONE: decode-and-drop, as the v1 decoder does.
         map.next_value::<serde::de::IgnoredAny>()?;
