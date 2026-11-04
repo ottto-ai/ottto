@@ -25,6 +25,18 @@ DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision")
 # fixture; the head has no record store to downgrade from (its Tail writer is
 # forward-only), so this line is accepted only from the base and never required.
 BASE_ONLY_DISK_FIXTURES = ("downgrade_then_reupgrade",)
+# Native fixtures every arm must emit (one VERIFIED receipt each).
+NATIVE_FIXTURES = frozenset({
+    "progressive_response", "duplicate_request_ids", "resolver_conflict",
+    "quiet_sidecar_growth", "side_owner", "side_without_owner",
+    "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
+    "codex_v2_sticky", "codex_legacy_acked_sticky",
+})
+# New native fixtures: the head must emit each one; the base may not have it
+# yet. A name the base does not emit is UNCOMPARED (the head's VERIFIED receipt
+# only, never a match or a diff). Once the base emits it, it is compared like
+# any other fixture and can be removed here.
+HEAD_ONLY_FIXTURES = ()
 
 
 # Base and head bodies must match exactly. The only accepted difference is a
@@ -465,6 +477,59 @@ def require_base_harness(base):
         raise RuntimeError("base compat: base predates the in-tree money_equivalence_tests harness")
 
 
+def native_coverage(arm, stdout):
+    """The arm's expected native fixtures; fail closed on any missing or extra line."""
+    verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", stdout, re.M)
+    head_only = set(HEAD_ONLY_FIXTURES)
+    if head_only & NATIVE_FIXTURES or len(head_only) != len(HEAD_ONLY_FIXTURES):
+        raise RuntimeError(f"head-only fixtures repeat or overlap native ones: {HEAD_ONLY_FIXTURES}")
+    # The head must emit every head-only fixture; the base may omit them.
+    expected = NATIVE_FIXTURES | (head_only & set(verified) if arm == "base" else head_only)
+    if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in stdout:
+        raise RuntimeError(f"incomplete native coverage: {verified}")
+    # Every disk line must be VERIFIED, once per fixture.
+    disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", stdout, re.M)
+    optional = BASE_ONLY_DISK_FIXTURES if arm == "base" else ()
+    if any(status != "VERIFIED" for _, status in disk) or len(disk) != len(set(disk)):
+        raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
+    disk = [(name, status) for name, status in disk if name not in optional]
+    if sorted(disk) != sorted((name, "VERIFIED") for name in DISK_FIXTURES):
+        raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
+    if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
+        raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
+    return expected
+
+
+def receipt_names(left, right, expected):
+    """(compared, uncompared) receipt names. Only a head-only fixture the base
+    does not emit is uncompared; any other missing or extra receipt fails."""
+    def listed(directory):
+        return sorted(p.name for p in directory.glob("*.json") if not p.name.endswith(".cross-build.json"))
+    names, head = listed(left), listed(right)
+    uncompared = sorted(set(head) - set(names))
+    if (len(head) != len(expected) or not set(names) <= set(head)
+            or not set(uncompared) <= {f"{name}.json" for name in HEAD_ONLY_FIXTURES}):
+        raise RuntimeError("missing or extra fixture receipts")
+    return names, uncompared
+
+
+def require_saved_digests(directory, name):
+    cross_name = Path(name).with_suffix(".cross-build.json")
+    for body_name in (Path(name), cross_name):
+        data = (directory / body_name).read_bytes()
+        digest = directory / body_name.with_suffix(".sha256")
+        if digest.read_text() != hashlib.sha256(data).hexdigest():
+            raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
+
+
+def verified_summary(names, uncompared, base_sha, head_sha, seconds):
+    head_only = (f"UNCOMPARED head-only (absent on base): {', '.join(uncompared)}. "
+                 if uncompared else "")
+    return (f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
+            f"base `{base_sha}`, head `{head_sha}`. {head_only}"
+            f"{seconds:.1f}s. Family vector/Pi remain ignored.\n")
+
+
 def main():
     started = time.monotonic()
     repo = Path.cwd()
@@ -533,6 +598,7 @@ def main():
         # Nothing is transplanted: each arm builds its own tree unchanged.
         require_base_scan_fixture(base)
         require_base_harness(base)
+        expected = {}
         for arm, tree in [("base", base), ("head", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
@@ -554,31 +620,21 @@ def main():
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
             result.check_returncode()
-            verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
-            expected = {
-                "progressive_response", "duplicate_request_ids", "resolver_conflict",
-                "quiet_sidecar_growth", "side_owner", "side_without_owner",
-                "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
-                "codex_v2_sticky", "codex_legacy_acked_sticky",
-            }
-            if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
-                raise RuntimeError(f"incomplete native coverage: {verified}")
-            # Every disk line must be VERIFIED, once per fixture: 10 + 2 receipts.
-            disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
-            optional = BASE_ONLY_DISK_FIXTURES if arm == "base" else ()
-            if any(status != "VERIFIED" for _, status in disk) or len(disk) != len(set(disk)):
-                raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
-            disk = [(name, status) for name, status in disk if name not in optional]
-            if sorted(disk) != sorted((name, "VERIFIED") for name in DISK_FIXTURES):
-                raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
-            if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
-                raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
+            expected[arm] = native_coverage(arm, result.stdout)
         left, right = receipts / "base", receipts / "head"
-        names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
-        if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
-            raise RuntimeError("missing or extra fixture receipts")
+        names, uncompared = receipt_names(left, right, expected["head"])
         failures = []
-        signed_lists = signed_money_lists(declarations, names)
+        signed_lists = signed_money_lists(declarations, names + uncompared)
+        for name in uncompared:
+            require_saved_digests(right, name)
+            print(f"MONEY_EQUIVALENCE_UNCOMPARED {name} head-only: the base does not emit it", flush=True)
+            signed = None if signed_lists is None else signed_lists[name]
+            if signed:
+                # Nothing is compared, so no signed path can be observed.
+                missing, extra = signed_mismatch([], signed)
+                print(f"MONEY_EQUIVALENCE_SIGNED {name} MISMATCH missing={json.dumps(missing)} "
+                      f"extra={json.dumps(extra)}", flush=True)
+                failures.append(name)
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
             if (left / inputs).read_bytes() != (right / inputs).read_bytes():
@@ -587,11 +643,7 @@ def main():
             # guarded physical-identity exclusion is compared across builds.
             cross_name = Path(name).with_suffix(".cross-build.json")
             for directory in (left, right):
-                for body_name in (Path(name), cross_name):
-                    data = (directory / body_name).read_bytes()
-                    digest = directory / body_name.with_suffix(".sha256")
-                    if digest.read_text() != hashlib.sha256(data).hexdigest():
-                        raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
+                require_saved_digests(directory, name)
             signed = None if signed_lists is None else signed_lists[name]
             diff = receipt_diff((left / cross_name).read_bytes(),
                                 (right / cross_name).read_bytes(), declarations, signed)
@@ -611,12 +663,12 @@ def main():
             raise RuntimeError("base/head decoded cross-build bodies differ: " + ", ".join(failures))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
+        if uncompared:
+            manifest["uncompared_head_only"] = uncompared
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
-            f.write(f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
-                    f"base `{base_sha}`, head `{head_sha}`. "
-                    f"{manifest['runtime_seconds']:.1f}s. Family vector/Pi remain ignored.\n")
+            f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 
