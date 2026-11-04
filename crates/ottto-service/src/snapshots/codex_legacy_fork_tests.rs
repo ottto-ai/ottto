@@ -105,6 +105,11 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     )
     .unwrap();
     let page = |scanner: &E2ScanFixture, prior: ScanIndex| {
+        let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            source,
+            Some(scanner.cache.as_ref()),
+            prior,
+        );
         other_page_with_slots(&c, scanner, source, prior, &slots, |_| {})
     };
     let child_totals = |scan: &SourceScanResult| {
