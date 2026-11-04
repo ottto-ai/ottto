@@ -268,12 +268,51 @@ fn claude_layout() -> String {
     ClaudeCompactionObservation::shape(&mut s);
     <(String, String, String)>::shape(&mut s);
     u64::shape(&mut s);
+    // These ignored Codex-only markers store no Claude bytes. Keep the
+    // Claude descriptor (and its pin) identical to main's shared shape.
+    s.text()
+        .replace(
+            "I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots;",
+            "",
+        )
+        .replace("I codex_sidecar_binding: Option<String>;", "")
+}
+
+/// The Codex head envelope, trailer, collection geometry, page elements and
+/// full-content prelude fact. An appended grown-array slot keeps this shape.
+fn codex_layout() -> String {
+    let mut s = Shape::default();
+    s.push("HeadIdentity{H binding;digest32;N capture;bool;H key_epoch;digest32;}");
+    crate::transcript_acquisition::DurableCertificate::shape(&mut s);
+    JsonlReadReport::shape(&mut s);
+    <(usize, usize, bool)>::shape(&mut s);
+    super::super::shape_fields(&mut s);
+    super::super::codex::shape_layout(&mut s);
     s.text().to_owned()
+}
+
+const CODEX_LAYOUT_SHA256: &str =
+    "241516630645f3bbc0b72232025c2b826b25663c4802bc3cc549d735db7eac8b";
+
+/// [format] Codex's persisted head, pages and prelude fact have one layout pin.
+#[test]
+fn the_codex_head_page_and_prelude_layout_is_pinned() {
+    let layout = codex_layout();
+    let digest: String = Sha256::digest(layout.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, CODEX_LAYOUT_SHA256,
+        "the Codex Tail layout changed; layout:\n{layout}"
+    );
+    assert!(layout.contains("G block_chars;[len];u64;"));
 }
 
 /// SHA-256 of `claude_layout()`. A change here is a layout change: decide
 /// whether old heads still decode (a `G` append does), or bump
 /// `Claude::REDUCTION_REVISION`, then update this pin.
+// Main's exact pin; the Claude descriptor omits only ignored Codex markers.
 const CLAUDE_LAYOUT_SHA256: &str =
     "292b38dad1f7aaaf7010d40285e1f68e5cb32418496c619707b32e1e6e0603d1";
 

@@ -825,6 +825,12 @@ fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
     priority["payload"]["service_tier"] = json!("priority");
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let page = |index: ScanIndex, observer: &Recorder| {
+        // Codex continues from its state database route.
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::Codex,
+            Some(cache.as_ref()),
+            index,
+        );
         let scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             std::slice::from_ref(&sessions),
@@ -3013,8 +3019,8 @@ fn codex_cursor_yield_drops_prefix_before_late_token_record() {
     });
 }
 
-/// A feed restart with the same warm RAM acquisition cache; no process restart
-/// or disk restore is exercised.
+/// A feed restart with the same warm acquisition owner, continuing from its
+/// Codex route; no process restart or disk restore is exercised.
 #[test]
 fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3038,6 +3044,12 @@ fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
     );
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let page = |index, feed: &Arc<crate::codex_prelude_footprint::CodexPreludeFeed>| {
+        // The warm owner continues from its Codex route.
+        let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            SnapshotSource::Codex,
+            Some(cache.as_ref()),
+            index,
+        );
         let scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             std::slice::from_ref(&sessions),

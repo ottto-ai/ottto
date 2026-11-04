@@ -30,7 +30,9 @@
 //! (`cache_policy_r0_regime_b_*`, fillers ranked two days back) are
 //! diagnostics, not acceptance: they print R0's probe and decision. A Claude
 //! tail proves its release with its measured X_out (M-a, without Q-PR15's
-//! guard); a Codex tail keeps `F_prev` and the guard. G3 is
+//! guard); every other source's tail keeps `F_prev` and the guard. A codec
+//! source keeps no RAM reduction copy. Scan-driven tails continue from their
+//! committed heads; native cache fixtures independently supply the peers. G3 is
 //! unchanged. The decision matrix, the counters and
 //! the visit-limited active pin evict-to-fit on a non-F tail (a comparison
 //! target), each with a shape-F control that releases nothing;
@@ -109,7 +111,12 @@ impl ScanFixture {
                 "native-tail-fixture.jsonl",
                 json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}}),
             ),
-            _ => unreachable!(),
+            SnapshotSource::Pi => (
+                dir.join("home/.pi/agent/sessions"),
+                "native-tail-fixture.jsonl",
+                json!({"type":"session", "version":3, "id":"native-tail-fixture",
+                    "timestamp":"2026-10-07T10:00:00Z", "cwd":"/synthetic/pi"}),
+            ),
         };
         fs::create_dir_all(&root).unwrap();
         let fixture = Self {
@@ -220,6 +227,8 @@ fn cached_scan(
     index: ScanIndex,
     cache: &Arc<sampled_scan::SharedCache>,
 ) -> OwnedSourceScan {
+    let index =
+        crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, Some(cache), index);
     OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -285,6 +294,11 @@ fn observed_scan(
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                     .collect();
                 index.record_accepted_snapshot_fingerprints(&accepted);
+                let index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+                    source,
+                    Some(cache),
+                    index,
+                );
                 return Observed {
                     index,
                     modes,
@@ -439,9 +453,9 @@ struct FullCache {
 }
 
 /// `older_tail` pins the tailed file's mtime two days back, below every
-/// filler's rank.
+/// filler's rank. The tailed file is Pi's: a codec source keeps no RAM copy.
 fn full_cache_with_retained_file(older_tail: bool) -> FullCache {
-    full_cache_in(SnapshotSource::Codex, older_tail, None)
+    full_cache_in(SnapshotSource::Pi, older_tail, None)
 }
 
 /// `full_cache_with_retained_file` for a `source` file, with the fillers'
@@ -462,14 +476,16 @@ fn full_cache_in(
     assert_eq!(full.modes, (1, 0, 0));
     assert_eq!(full.state_missing(), 1);
     assert!(
-        cache.retained_checkpoint(&tailed.key()).is_some(),
-        "precondition: the first read is retained"
+        crate::snapshots::tail_source::committed_sealed_offset(source, &full.index, &tailed.key())
+            == Some(fs::metadata(&tailed.path).unwrap().len()),
+        "precondition: the first read has a committed continuation"
     );
     let before_fill = optional_resident(&cache);
     insert_fillers(&cache, fillers_modified);
     assert!(
-        cache.retained_checkpoint(&tailed.key()).is_some(),
-        "precondition: the fill keeps the tailed entry"
+        crate::snapshots::tail_source::committed_sealed_offset(source, &full.index, &tailed.key())
+            == Some(fs::metadata(&tailed.path).unwrap().len()),
+        "precondition: the fill keeps the committed continuation"
     );
     let resident_before = optional_resident(&cache);
     assert!(
@@ -477,10 +493,19 @@ fn full_cache_in(
         "precondition: the cache plus the tailed entry fit the state budget"
     );
     if older_tail {
-        let tailed_rank = cache
-            .retained_checkpoint(&tailed.key())
+        let modified = fs::metadata(&tailed.path)
             .unwrap()
-            .modified_hint();
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        let tailed_rank = crate::transcript_cache::admission_rank(
+            (
+                modified.as_secs().try_into().unwrap(),
+                i64::from(modified.subsec_nanos()),
+            ),
+            crate::transcript_cache::admission_now(),
+        );
         let filler_rank = cache
             .retained_checkpoint(&filler_key(0))
             .unwrap()
@@ -525,13 +550,13 @@ fn append_padded_usage_at(tailed: &ScanFixture, id: usize) {
         "type": "synthetic-padding",
         "text": "x".repeat(TAIL_PADDING_BYTES),
     }));
-    tailed.append(&usage(SnapshotSource::Codex, 140 + id as u64, id, MODEL));
+    tailed.append(&usage(SnapshotSource::Pi, 140 + id as u64, id, MODEL));
 }
 
 /// `full_cache_with_retained_file`, then `append` to the file and read the
 /// append as a tail that meets a zero copy budget at a step start.
 fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBesideFullCache {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     let FullCache {
         cache,
         tailed,
@@ -556,9 +581,11 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
         (0, 1, 0),
         "precondition: the append reads as a tail"
     );
+    assert_eq!(counts.take_hit, 0, "a codec Tail borrows no RAM entry");
     assert_eq!(
-        counts.take_hit, 1,
-        "precondition: the tail borrows its entry"
+        crate::snapshots::tail_source::committed_sealed_offset(source, &tail.index, &tailed.key()),
+        Some(fs::metadata(&tailed.path).unwrap().len()),
+        "the Tail commits the complete append",
     );
     assert!(
         tail.tail_zero_budget_steps >= 1,
@@ -577,7 +604,7 @@ fn tail_beside_full_cache(older_tail: bool, append: fn(&ScanFixture)) -> TailBes
 
 /// G3, priority (design §5c G3; §3a rank; §2 L1).
 ///
-/// A Claude entry ranked older than everything else in the cache (mtime two
+/// A Pi entry ranked older than everything else in the cache (mtime two
 /// days back) is read as a tail beside four newer filler entries that fill
 /// the cache. Its appended long record meets a zero copy budget. That
 /// overflow is the tail's native line buffer; its borrowed state already fit
@@ -628,7 +655,7 @@ fn tail_growth_records() -> usize {
 /// The tailed file's append for test (ii): `tail_growth_records` ordinary
 /// responses, so the borrowed tail state itself grows.
 fn append_growth(tailed: &ScanFixture) {
-    tailed.append_usage(SnapshotSource::Codex, 1..1 + tail_growth_records());
+    tailed.append_usage(SnapshotSource::Pi, 1..1 + tail_growth_records());
 }
 
 /// Test (ii), corrected.
@@ -715,7 +742,7 @@ fn tail_active(full: &FullCache, older_tail: bool) -> OwnedSourceScan {
 /// `tail_active`, with the tailed file's mtime set to `modified` after the
 /// append.
 fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     full.tailed.append(&usage(source, 140, 1, MODEL));
     if let Some(modified) = modified {
         full.tailed.set_modified(modified);
@@ -899,7 +926,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
     if unexecuted("M1_hot_tail") {
         return;
     }
-    let source = SnapshotSource::Codex;
+    let source = SnapshotSource::Pi;
     let FullCache {
         cache,
         tailed,
@@ -907,7 +934,7 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
         resident_before,
         ..
     } = full_cache_with_retained_file(false);
-    let ((full_reads, tails, zero_budget_steps), counts) = observe(|| {
+    let ((full_reads, tails, zero_budget_steps, index), counts) = observe(|| {
         let mut index = index;
         let (mut full_reads, mut tails, mut zero_budget_steps) = (0, 0, 0);
         for pass in 0..HOT_PASSES {
@@ -918,10 +945,12 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
             zero_budget_steps += run.tail_zero_budget_steps;
             index = run.index;
         }
-        (full_reads, tails, zero_budget_steps)
+        (full_reads, tails, zero_budget_steps, index)
     });
     let fillers_after = fillers_resident(&cache);
-    let retained_after = cache.retained_checkpoint(&tailed.key()).is_some();
+    let retained_after =
+        crate::snapshots::tail_source::committed_sealed_offset(source, &index, &tailed.key())
+            == Some(fs::metadata(&tailed.path).unwrap().len());
     let receipt = format!(
         "state_bytes={POLICY_STATE_BYTES} resident_before={resident_before} passes={HOT_PASSES} full_reads={full_reads} tails={tails} tail_zero_budget_steps={zero_budget_steps} clear_other_active={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} fillers_after={fillers_after} tail_retained_after={retained_after}",
         counts.clear_other_active,
@@ -943,7 +972,10 @@ fn cache_policy_m1_hot_tail_beside_idle_entries_never_reads_full() {
         fillers_after + 2 >= FILLERS,
         "Path A: more than two older fillers lost; {receipt}"
     );
-    assert!(retained_after, "the hot file is not retained; {receipt}");
+    assert!(
+        retained_after,
+        "the hot file has no complete committed continuation; {receipt}"
+    );
 }
 
 /// The #654 exemption on the production path.
@@ -1413,66 +1445,6 @@ fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
     assert_exact_prefix_release(&run, "measured");
 }
 
-/// M-a T9, a failed gate mutates nothing: the file changes after the proof,
-/// so the stamp gate declines and the deferred release never runs.
-#[test]
-fn cache_policy_m_a_failed_gate_releases_nothing() {
-    if unexecuted("M_a_T9_gate") {
-        return;
-    }
-    let now = unix_now();
-    let tail_modified = now - 600;
-    let run = m_a_tail(
-        SnapshotSource::Codex,
-        now - OLD_SECONDS,
-        tail_modified,
-        &[],
-        sampled_scan::XOut::Bound(0),
-        Some(tail_modified + 7),
-    );
-    assert!(
-        matches!(
-            run.decisions.as_slice(),
-            [sampled_scan::test_hooks::Decision::Deferred { .. }]
-        ),
-        "precondition: the proof deferred a release; {}",
-        run.receipt()
-    );
-    assert_no_victims(&run, "failed stamp gate");
-}
-
-/// M-a T10, Codex's explicit residual: a Codex completion keeps
-/// `K = max(C, F_prev)` and the Q-PR15 guard whatever X_out says; M-a's
-/// proof never runs for it.
-#[test]
-fn cache_policy_m_a_codex_keeps_the_legacy_release() {
-    if unexecuted("M_a_T10") {
-        return;
-    }
-    let now = unix_now();
-    let run = m_a_tail(
-        SnapshotSource::Codex,
-        now - OLD_SECONDS,
-        now - 600,
-        &[],
-        sampled_scan::XOut::Refused,
-        None,
-    );
-    let receipt = run.receipt();
-    assert_eq!(run.probe.x_out, None, "no M-a proof; {receipt}");
-    assert!(
-        matches!(
-            run.decisions.as_slice(),
-            [sampled_scan::test_hooks::Decision::Deferred { .. }]
-        ),
-        "the legacy release is deferred; {receipt}"
-    );
-    assert!(
-        run.counts.copy_refusal_admission_evicted >= 1,
-        "and runs; {receipt}"
-    );
-}
-
 /// [regress] Same-size Full re-reads must not churn a full cache of idle
 /// residents: no eviction, copy refused, next page Full. A grown Full with
 /// X_out may release strictly older residents to admit its copy, then Tail
@@ -1610,12 +1582,21 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
                 grown.append(&usage(source, 182, 3, MODEL));
                 grown.set_modified(file_modified + 1);
                 let next = observed_scan(&grown, source, full.index, &cache);
-                if releases {
-                    assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is Tail");
-                } else {
-                    assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
-                    assert_eq!(next.state_missing(), 1, "{label}");
-                }
+                assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is Tail");
+                assert_eq!(
+                    next.state_missing(),
+                    0,
+                    "{label}: the committed head remains"
+                );
+                assert_eq!(
+                    crate::snapshots::tail_source::committed_sealed_offset(
+                        source,
+                        &next.index,
+                        &grown.key(),
+                    ),
+                    Some(fs::metadata(&grown.path).unwrap().len()),
+                    "{label}: the next append commits its complete continuation",
+                );
             }
         }
     }

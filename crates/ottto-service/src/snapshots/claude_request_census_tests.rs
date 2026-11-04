@@ -165,10 +165,7 @@ fn write_census_corpus(root: &Path) {
                 1,
                 10,
             ),
-            census_user_line(
-                "canary-over-line-cap",
-                &"x".repeat(16_777_216 + 1024),
-            ),
+            census_user_line("canary-over-line-cap", &"x".repeat(16_777_216 + 1024)),
         ],
     );
     // A provider-marked fork prefix is excluded from the child's ids.

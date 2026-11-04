@@ -43,7 +43,7 @@ fn lines(responses: usize, paired: usize, parent: Option<&str>) -> Vec<String> {
 }
 
 fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
-    parse_lines(SnapshotSource::Pi, apply_pi_line, lines)
+    parse_lines(SnapshotSource::Pi, apply_pi_line, lines, "session.jsonl")
 }
 
 fn identity() -> HeadIdentity {

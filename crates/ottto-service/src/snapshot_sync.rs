@@ -6491,7 +6491,7 @@ fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace:
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
 /// namespace (pure; a continuation page must use the same bytes, K5).
-fn cycle_sampled_scope(
+pub(crate) fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,
@@ -25013,6 +25013,10 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[cfg(test)]
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
+
+#[cfg(test)]
+#[path = "snapshot_sync/tail_ack_ledger.rs"]
+pub(crate) mod tail_ack_ledger;
 
 #[cfg(test)]
 #[path = "snapshot_sync/usage_decrease_hold_tests.rs"]

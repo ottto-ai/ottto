@@ -1512,12 +1512,14 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
 
 /// One sampled Claude page of `fixture` through `cache`: (index, modes).
 fn codec_page(
+    source: SnapshotSource,
     fixture: &ScanFixture,
     cache: &Arc<sampled_scan::SharedCache>,
     mut index: ScanIndex,
 ) -> (ScanIndex, (usize, usize, usize)) {
-    let source = SnapshotSource::ClaudeCode;
-    cache.bind_withheld(&mut index);
+    if source == SnapshotSource::ClaudeCode {
+        cache.bind_withheld(&mut index);
+    }
     let scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1543,95 +1545,139 @@ fn codec_page(
 fn an_unrouted_codec_source_keeps_no_ram_copy() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
-    let before = unrouted();
-    let ((index, modes), first) = observe(|| codec_page(&fixture, &cache, ScanIndex::default()));
-    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
-    assert_eq!(modes, (1, 0, 0), "first read");
-    assert_eq!(unrouted(), before, "a new file is no unrouted growth");
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let ((_, modes), next) = observe(|| codec_page(&fixture, &cache, index));
-    assert!(unrouted() > before, "the growth Full is counted by why");
-    assert_eq!(
-        first.insert_admitted, 0,
-        "no copy is admitted (modes {modes:?})"
-    );
-    assert_eq!(next.take_hit, 0, "no copy is taken (modes {modes:?})");
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
+        let before = unrouted();
+        let ((index, modes), first) =
+            observe(|| codec_page(source, &fixture, &cache, ScanIndex::default()));
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert_eq!(unrouted(), before, "a new file is no unrouted growth");
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let ((_, modes), next) = observe(|| codec_page(source, &fixture, &cache, index));
+        assert!(unrouted() > before, "the growth Full is counted by why");
+        assert_eq!(
+            first.insert_admitted, 0,
+            "no copy is admitted {source:?} (modes {modes:?})"
+        );
+        assert_eq!(
+            next.take_hit, 0,
+            "no copy is taken {source:?} (modes {modes:?})"
+        );
+    }
 }
 
 /// [regress] A codec source's route that cannot be read now (a poisoned
 /// session: `DbUnavailable`) is kept as an error, never read as "no route":
 /// the file is held for its next selection, unread, and RAM is no fallback
-/// (conformance B2). The page holds before it reaches the candidate, so the
-/// per-file `tail_db_loads{held}` count is printed, not asserted.
+/// (conformance B2). The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    use crate::snapshots::e2_pipeline_scan_fixture::{route_for_test, tail_counter_for_test};
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
-    let (index, modes) = codec_page(&fixture, &cache, routed);
-    assert_eq!(modes, (1, 0, 0), "first read");
-    assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
-    let key = local_index_key(&fixture.file.0);
-    let size = index.files[&key].size_bytes;
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    crate::snapshots::state_v2::poison_route_for_test(&index);
-    assert!(super::tail_source::tail_route(source, &index).is_err());
-    assert!(!super::tail_source::keeps_ram(source));
-    let held = tail_counter_for_test("tail_db_loads", "held");
-    let ((index, modes), lifecycle) = observe(|| codec_page(&fixture, &cache, index));
-    eprintln!(
-        "ROUTE_ERROR_HOLD held={} modes={modes:?}",
-        tail_counter_for_test("tail_db_loads", "held") - held
-    );
-    assert_eq!(modes, (0, 0, 0), "the held file is not read");
-    assert_eq!(index.files[&key].size_bytes, size, "the file stays owed");
-    assert_eq!(
-        (lifecycle.take_hit, lifecycle.insert_admitted),
-        (0, 0),
-        "RAM is no fallback"
-    );
+    use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
+        let (index, modes) = codec_page(source, &fixture, &cache, routed);
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
+        let key = local_index_key(&fixture.file.0);
+        let size = index.files[&key].size_bytes;
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        crate::snapshots::state_v2::poison_route_for_test(&index);
+        assert!(super::tail_source::tail_route(source, &index).is_err());
+        assert!(!super::tail_source::keeps_ram(source));
+        let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
+        assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");
+        assert_eq!(
+            index.files[&key].size_bytes, size,
+            "the file stays owed {source:?}"
+        );
+        assert_eq!(
+            (lifecycle.take_hit, lifecycle.insert_admitted),
+            (0, 0),
+            "RAM is no fallback {source:?}"
+        );
+    }
 }
 
+/// [money] An account-witness change, then a destination change, after a
+/// restart: each production namespace (`cycle_sampled_scope`) is new, and
+/// every source's head continues from Tail with no reconstruction (D168-3:
+/// account evidence is applied from stored facts and live evidence, never by
+/// a re-read). The body equals a cold Full under the new namespace, Codex's
+/// creator placement included. A new priority still replays for real.
 #[test]
 fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let namespace = |witness: u8, destination: &str| {
+        crate::snapshot_sync::cycle_sampled_scope(
+            &[witness; 32],
+            destination,
+            Path::new("/synthetic/scan-index.json"),
+            false,
+        )
+        .0
+    };
+    let (first, witness_changed, destination_changed) = (
+        namespace(1, "destination-a"),
+        namespace(2, "destination-a"),
+        namespace(2, "destination-b"),
+    );
+    assert!(first != witness_changed && witness_changed != destination_changed);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-        let (index, _, _) = production_scan(
+        let (mut index, _, _) = production_scan(
             &fixture,
             source,
             ScanIndex::default(),
             Some(cache.clone()),
-            "account-a",
+            &first,
         );
-        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
-        let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "account-b");
-        // Claude's head is bound by its destination route, not the account
-        // scope (D131/D134): it continues, with the same body.
-        assert_eq!(
-            modes,
-            if source == SnapshotSource::ClaudeCode {
-                (0, 1, 0)
-            } else {
-                (1, 0, 0)
-            }
-        );
-        let (_, full, _) =
-            production_scan(&fixture, source, ScanIndex::default(), None, "account-b");
-        assert_eq!(production_body(source, scan), production_body(source, full));
+        for (n, namespace) in [&witness_changed, &destination_changed]
+            .into_iter()
+            .enumerate()
+        {
+            #[cfg(unix)]
+            let reconstructions = || {
+                crate::snapshots::tail_source::counters::totals()
+                    .into_iter()
+                    .filter(|((name, _), _)| name.starts_with("tail_reconstruct"))
+                    .map(|(_, count)| count)
+                    .sum::<u64>()
+            };
+            #[cfg(unix)]
+            let before = reconstructions();
+            fixture
+                .file
+                .append(&usage(source, 140 + 20 * n as u64, 1 + n, "fixture-model"));
+            let (next, scan, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), namespace);
+            assert_eq!(modes, (0, 1, 0), "{source:?} continues from Tail ({n})");
+            #[cfg(unix)]
+            assert_eq!(
+                reconstructions(),
+                before,
+                "{source:?}: no reconstruction ({n})"
+            );
+            let (_, full, _) =
+                production_scan(&fixture, source, ScanIndex::default(), None, namespace);
+            assert_eq!(
+                production_body(source, scan),
+                production_body(source, full),
+                "{source:?} ({n})"
+            );
+            index = next;
+        }
     }
     let source = SnapshotSource::Codex;
     let fixture = ScanFixture::new(source);
@@ -1796,7 +1842,8 @@ fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
 /// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
 /// limit, with the sidecar census incomplete) owns no optimization state. Its
 /// copy refusal must not wipe an unrelated, independently bounded resident
-/// reduction, and must not insert one of its own.
+/// reduction, and must not insert one of its own. Both sources continue on
+/// their route; a codec source keeps no RAM resident to check.
 #[test]
 fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1817,7 +1864,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -1867,7 +1915,8 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
         assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
         assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "the unrelated reduction survives {source:?}"
         );
         assert!(
@@ -1956,7 +2005,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "mixed-files",
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "precondition: the unrelated reduction is resident {source:?}"
         );
         append_unretainable_rows(&large, source);
@@ -2008,7 +2058,8 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             "{source:?}"
         );
         assert!(
-            source == SnapshotSource::ClaudeCode || cache.retained_checkpoint(&small_key).is_some(),
+            !super::tail_source::keeps_ram(source)
+                || cache.retained_checkpoint(&small_key).is_some(),
             "{source:?}"
         );
         assert_eq!(
@@ -2024,12 +2075,13 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         active.aliases.push(candidate);
         let counts = release(&scan, measured);
         assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
+        // Only a source that keeps a RAM copy has a resident to release.
         assert_eq!(
             counts.clear_entries_released,
-            if source == SnapshotSource::ClaudeCode {
-                0
-            } else {
+            if super::tail_source::keeps_ram(source) {
                 1
+            } else {
+                0
             },
             "{source:?}"
         );
