@@ -346,9 +346,6 @@ impl Serialize for ScanIndex {
             ClaudeRequestCensusShadowState::is_empty
         );
         field!(held claude_usage_authority_quarantine);
-        field!(claude_retired_family_tombstones);
-        field!(claude_retired_family_tombstones_initialized);
-        field!(claude_retired_family_tombstones_uncertain, is_false);
         field!(claude_account_deferred_holds, BTreeMap::is_empty);
         field!(claude_request_identity_contract, Option::is_none);
         field!(claude_desktop_store_cursor, Option::is_none);
@@ -449,9 +446,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_request_census",
     "claude_request_census_shadow",
     "claude_usage_authority_quarantine",
-    "claude_retired_family_tombstones",
-    "claude_retired_family_tombstones_initialized",
-    "claude_retired_family_tombstones_uncertain",
+    "claude_retired_family_tombstones", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_retired_family_tombstones_initialized", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_retired_family_tombstones_uncertain", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_duplicate_request_owners", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_duplicate_request_witness_overflowed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_owned_start_census", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
@@ -558,15 +555,9 @@ fn header_field(name: &str) -> bool {
 /// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
 /// replay generations without which the rebuild would arm a replay the
 /// damaged index had completed (that replay clears carried state). Each uses
-/// the load's own field decoder; tombstone loss fences without refusing
-/// identity carry, and the accepted ledger keeps the load's rule
+/// the load's own field decoder, and the accepted ledger keeps the load's rule
 /// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
-    // These gate authority re-entry. Carry their own lenient, fail-closed
-    // decoding policy, including uncertainty after lost retirement evidence.
-    "claude_retired_family_tombstones",
-    "claude_retired_family_tombstones_initialized",
-    "claude_retired_family_tombstones_uncertain",
     "session_account_bindings",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
@@ -588,8 +579,6 @@ struct Counts {
     files: usize,
     families: usize,
     authority_repairs: usize,
-    // Decode-only provenance, never persisted or copied from an index.
-    tombstone_marker_intact: bool,
 }
 struct Decoder<R> {
     reader: R,
@@ -1076,7 +1065,6 @@ fn finish_decode(
     );
     if !map_only && index.persistence_available() {
         index.drop_unbound_claude_authority_records(stage);
-        settle_retired_family_decode(index);
     }
     if map_only
         && (!index.decode_holds.is_empty()
@@ -1366,15 +1354,7 @@ pub(super) fn read_identity_carry(
     };
     let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
-    // Repair drops the family witnesses, so its later downgrade check cannot
-    // recover evidence lost by a pre-bridge or damaged tombstone source.
-    // Loss never refuses Repair or withholds unrelated identity bindings.
-    let intact = decoder.counts.tombstone_marker_intact
-        && carry.claude_retired_family_tombstones.decoded
-        && !carry.claude_retired_family_tombstones.damaged;
-    carry.claude_retired_family_tombstones_uncertain |= !intact;
     carry.decode_holds = decoder.holds;
-    settle_retired_family_decode(&mut carry);
     if sampled_scan::codex_cursor::OpenStamp::capture(decoder.reader.get_ref())? != before {
         return Err(Error::Refused("input changed during decode"));
     }
@@ -1454,24 +1434,6 @@ fn migrate_carried_ack_debt(index: &mut ScanIndex) -> std::result::Result<(), Er
     Ok(())
 }
 
-fn settle_retired_family_decode(index: &mut ScanIndex) {
-    let initialized = index.claude_retired_family_tombstones_initialized;
-    if index.claude_retired_family_tombstones_initialized
-        && !index.claude_retired_family_tombstones.decoded
-    {
-        // Missing evidence under the marker must also make a stale CAS
-        // writer reload, just as a damaged-present map does below.
-        index
-            .decode_holds
-            .1
-            .add("claude_retired_family_tombstones", "", [0; 32]);
-    }
-    index.settle_claude_retired_family_tombstone_decode();
-    // Preserve a valid legacy marker at the raw codec boundary. Public load
-    // settlement and every save own initialization; repair here still raises
-    // uncertainty for damaged or missing retirement evidence.
-    index.claude_retired_family_tombstones_initialized = initialized;
-}
 impl<R: BufRead + Seek> Decoder<R> {
     fn ws(&mut self) -> std::result::Result<Option<u8>, Error> {
         loop {
@@ -1919,12 +1881,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
-                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
-                        with_claude_absence_counters(|counts| {
-                            counts.tombstone_decode_drops =
-                                counts.tombstone_decode_drops.saturating_add(1);
-                        });
-                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
@@ -1954,12 +1910,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             } else {
                                 self.history_scalar(value, Some(String::new()))?
                             };
-                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
-                                with_claude_absence_counters(|counts| {
-                                    counts.tombstone_decode_drops =
-                                        counts.tombstone_decode_drops.saturating_add(1);
-                                });
-                            } else {
+                            if !inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
                                 index.claude_desktop_store_inventory = inventory;
                             }
                         }
@@ -2059,7 +2010,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         | "claude_full_rearm_progress"
                         | "claude_request_identity_contract_changed"
                         | "claude_stale_family_carry"
-                        | "held_audit_progress" => {}
+                        | "held_audit_progress"
+                        | "claude_retired_family_tombstones"
+                        | "claude_retired_family_tombstones_initialized"
+                        | "claude_retired_family_tombstones_uncertain" => {}
                         "claude_request_census" => {
                             index.claude_request_census = self
                                 .census(value, "claude_request_census")?
@@ -2072,56 +2026,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine = self.authorities(value)?
-                        }
-                        "claude_retired_family_tombstones" => {
-                            index.claude_retired_family_tombstones = self
-                                .history_scalar(value, None::<ClaudeRetiredFamilyTombstones>)?
-                                .unwrap_or_else(|| {
-                                    with_claude_absence_counters(|counts| {
-                                        counts.tombstone_decode_drops =
-                                            counts.tombstone_decode_drops.saturating_add(1);
-                                    });
-                                    ClaudeRetiredFamilyTombstones {
-                                        decoded: true,
-                                        damaged: true,
-                                        ..Default::default()
-                                    }
-                                });
-                            if index.claude_retired_family_tombstones.damaged {
-                                let hash = self.hash_span(value)?;
-                                self.holds.1.add(name, "", hash);
-                            }
-                        }
-                        "claude_retired_family_tombstones_initialized"
-                        | "claude_retired_family_tombstones_uncertain" => {
-                            self.reader.seek(SeekFrom::Start(value.start))?;
-                            let boolean = matches!(self.ws()?, Some(b't' | b'f'));
-                            // Reuse #705's flag codec, including its drop count.
-                            #[derive(Deserialize)]
-                            #[serde(transparent)]
-                            struct Flag(
-                                #[serde(deserialize_with = "deserialize_fail_closed_flag")] bool,
-                            );
-                            let flag = self
-                                .history_scalar(value, None::<Flag>)?
-                                .map(|flag| flag.0)
-                                .unwrap_or_else(|| {
-                                    with_claude_absence_counters(|counts| {
-                                        counts.tombstone_decode_drops =
-                                            counts.tombstone_decode_drops.saturating_add(1);
-                                    });
-                                    true
-                                });
-                            if !boolean {
-                                let hash = self.hash_span(value)?;
-                                self.holds.1.add(name, "", hash);
-                            }
-                            if name == "claude_retired_family_tombstones_initialized" {
-                                self.counts.tombstone_marker_intact = boolean && flag;
-                                index.claude_retired_family_tombstones_initialized = flag;
-                            } else {
-                                index.claude_retired_family_tombstones_uncertain = flag;
-                            }
                         }
                         "claude_account_deferred_holds" => {
                             index.claude_account_deferred_holds = self.typed(value)?
