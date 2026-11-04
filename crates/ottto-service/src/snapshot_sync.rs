@@ -23705,7 +23705,7 @@ mod tests {
             }
             let index_path = root.join("boundary-index.json");
             let progress_path = root.join("boundary-progress.json");
-            let (baseline, mut working, mut progress) = Self::fresh_state(&root);
+            let (mut baseline, mut working, mut progress) = Self::fresh_state(&root);
             baseline.save(&index_path).unwrap();
             let mut items = Self::prepare(&root, &mut working, None).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
