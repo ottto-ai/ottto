@@ -17007,7 +17007,8 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
-        ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+        let progress =
+            ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         index.archive_pass.deferred.clear();
         let growth_active =
             source == SnapshotSource::ClaudeCode && sampled_audit::growth_active(index);
