@@ -1751,3 +1751,88 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
         }
     }
 }
+
+/// [money] H8. Past both old caps (65,537 records; one record holding one
+/// hash more than the old 2,097,152 cap), the census survives a v2 save and
+/// hydrate whole, and the restored graph's v1 bytes decode to it too. The
+/// synthetic keys have no index entry: held-new custody restores as well.
+#[test]
+fn no_cap_money_survives_v1_v2_restore() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    // The old caps: request hashes and records the census held.
+    const OLD_HASH_CAP: u64 = 2_097_152;
+    const OLD_RECORD_CAP: u64 = 65_536;
+    let fp = "a".repeat(64);
+    let mut index = fixture();
+    let before = index.claude_request_census.hash_total();
+    index.claude_request_census.insert(
+        "/synthetic/full.jsonl".into(),
+        Record::synthetic_for_test(&fp, 7, Shape::Exact, (0..=OLD_HASH_CAP).collect()),
+    );
+    for n in 0..OLD_RECORD_CAP {
+        index.claude_request_census.insert(
+            format!("/synthetic/s{n:05}.jsonl"),
+            Record::synthetic_for_test(&fp, 7, Shape::Exact, vec![OLD_HASH_CAP + 1 + n]),
+        );
+    }
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &index);
+    index.generation = 1;
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(restored.claude_request_census, index.claude_request_census);
+    assert_eq!(
+        restored.claude_request_census.hash_total(),
+        before + (OLD_HASH_CAP + 1 + OLD_RECORD_CAP) as usize
+    );
+    let v1: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+    assert_eq!(v1.claude_request_census, index.claude_request_census);
+}
+
+/// [format] H10. Transcript records as an older release wrote them (every
+/// field and shape, retired and over-budget included) decode through the v1
+/// index map, write back byte-identical, and hydrate from v2 rows to the
+/// same records: one record codec for both stores.
+#[test]
+fn transcript_codec_compatibility() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensus, CLAUDE_REQUEST_CENSUS_DERIVATION as V,
+    };
+    use base64::Engine as _;
+    let fp = "a".repeat(64);
+    let b = base64::engine::general_purpose::STANDARD.encode(
+        [1_u64, 5, u64::MAX]
+            .iter()
+            .flat_map(|hash| hash.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let rows = serde_json::json!({
+        "/synthetic/live.jsonl": {"v": V, "fp": fp, "w": 7, "s": "exact", "tw": true,
+            "u": true, "b": b, "bi": 1_700_000_000_u64, "bd": 5, "bn": 42, "ur": 3,
+            "ut": 900, "m": 1_700_000_200_u64},
+        "/synthetic/retired.jsonl": {"v": V, "fp": fp, "w": 7, "s": "exact", "r": 2, "m": 1},
+        "/synthetic/over.jsonl": {"v": V, "fp": fp, "w": 7, "s": "over_budget"},
+        "/synthetic/lossy.jsonl": {"v": V, "fp": fp, "w": 7, "s": "lossy", "u": true, "b": b},
+        "/synthetic/empty.jsonl": {"v": V, "fp": fp, "w": 7, "s": "empty"},
+    });
+    let v1: ClaudeRequestCensus =
+        serde_json::from_slice(&serde_json::to_vec(&rows).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&v1).unwrap(), rows);
+    let (_scratch, mut db) = Scratch::store();
+    let mut index = fixture();
+    for name in rows.as_object().unwrap().keys() {
+        let record = v1.get(name).expect("decoded").clone();
+        index.claude_request_census.insert(name.clone(), record);
+    }
+    commit_populate(&mut db, &index);
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    for name in rows.as_object().unwrap().keys() {
+        assert_eq!(
+            restored.claude_request_census.get(name),
+            v1.get(name),
+            "{name}"
+        );
+    }
+    assert_eq!(restored.claude_request_census, index.claude_request_census);
+}

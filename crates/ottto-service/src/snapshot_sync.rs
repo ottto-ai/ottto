@@ -1494,7 +1494,7 @@ fn cache_head_index_key(index_key: &str) -> String {
     )
 }
 
-fn cache_session_key(session: &str) -> String {
+pub(crate) fn cache_session_key(session: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(session.as_bytes()))
 }
@@ -6491,7 +6491,7 @@ fn cycle_replay_generation(source: SnapshotSource, upload_destination_namespace:
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
 /// namespace (pure; a continuation page must use the same bytes, K5).
-fn cycle_sampled_scope(
+pub(crate) fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,
     index_path: &Path,
@@ -7727,6 +7727,11 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Telemetry retention keeps the sessions this page names, read before any
+    // page filter drops a snapshot.
+    let telemetry_named = claude_scan_roots
+        .as_ref()
+        .map(|_| claude_evidence_session_ids(&scan_result.snapshots));
     let scan_agent_status_collection =
         scan_agent_status_collection.context("a continuation preparation reached its finish")?;
     let identity_item_cap = crate::snapshots::claude_request_identity::effective_item_cap(
@@ -8657,6 +8662,9 @@ fn finish_sync_source(
                 }
             }
         };
+    // Telemetry retention follows only a completed upload: a rejected,
+    // deferred, shed, disabled or failed page drops it even when it settles.
+    let upload_completed = matches!(upload_result, Ok(ResumableUploadResult::Completed));
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -9015,6 +9023,9 @@ fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
+        crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
+    });
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
@@ -9070,6 +9081,20 @@ fn finish_sync_source(
         &mut index,
         &index_path,
     );
+    if let Some(((roots, removed), named)) = claude_scan_roots
+        .as_deref()
+        .zip(telemetry_removed.as_ref())
+        .zip(telemetry_named.as_deref())
+        .filter(|_| upload_completed && upload_fully_settled)
+    {
+        crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
+            support_dir,
+            &index,
+            roots,
+            removed,
+            named,
+        );
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
@@ -9386,7 +9411,8 @@ fn prepare_upload_progress_for_cycle(
     )
 }
 
-/// Ordinary and continuation prepares bind both runtime witnesses together.
+/// Ordinary and continuation prepares bind both runtime witnesses together,
+/// and mirror the open head-CAS challenge sessions into the index.
 /// Neither retained body ACKs nor receipt candidates acquire new authority here.
 fn activate_source_upload_context(
     source: SnapshotSource,
@@ -9398,6 +9424,10 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
+    // A session that owes a head-CAS answer reads natively, never from Tail.
+    index.activate_head_conflict_sessions(
+        progress.head_conflict_challenges.keys().cloned().collect(),
+    );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
@@ -10059,8 +10089,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         "claude_code",
         "claude_local_evidence",
     );
-    let read_window =
+    let mut read_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
+    let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -10088,6 +10119,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    evidence_mem.sample(0);
     #[cfg(test)]
     E2_AFTER_API_ATTACH.with(|hook| {
         if let Some(after_attach) = hook.borrow_mut().take() {
@@ -10317,6 +10349,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        evidence_mem.note_root(
+            api_rows.as_ref().map_or(0, Vec::len) + trace_rows.as_ref().map_or(0, Vec::len),
+            keep,
+        );
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
         }
@@ -10333,9 +10369,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
+    evidence_mem.kept_rows = api_report.evidence.values().map(Vec::len).sum::<usize>()
+        + trace_report.evidence.values().map(Vec::len).sum::<usize>();
+    evidence_mem.legacy_owners = cross.legacy_request_owners.owner_count();
+    evidence_mem.sample(1);
     cross_window.time(|| cross.finish());
     drop(decode_window);
     drop(cross_window);
+    evidence_mem.sample(2);
+    read_window.set_evidence_mem(evidence_mem);
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
@@ -23064,6 +23106,10 @@ mod tests {
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }
+        #[cfg(unix)]
+        mod claude_telemetry_retention_tests {
+            include!("snapshot_sync/claude_telemetry_retention_tests.rs");
+        }
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
@@ -24967,6 +25013,10 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[cfg(test)]
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
+
+#[cfg(test)]
+#[path = "snapshot_sync/tail_ack_ledger.rs"]
+pub(crate) mod tail_ack_ledger;
 
 #[cfg(test)]
 #[path = "snapshot_sync/usage_decrease_hold_tests.rs"]

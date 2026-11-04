@@ -3,19 +3,13 @@
 //! diagnostic packet's
 //! refusal buckets. Its own block, apart from the shared appends above.
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle::{observe, observed, Counts};
-use crate::session_attribution::SessionAttributionContext;
+use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
 use crate::snapshots::cache_policy_tests::u3_identity;
 use sampled_jsonl::{classify_refusal, Bucket, Refusal, RefusalView};
-use sampled_scan::test_hooks::{self, Decision, Point, Probe};
 use sampled_scan::{ReleaseOutcome, RetainBudget};
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Duration;
 
 type Victims = Vec<(String, (i64, i64), usize)>;
-type Hook = Box<dyn FnMut()>;
-type OnActive = Box<dyn FnOnce(&OwnedSourceScan)>;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -33,7 +27,7 @@ fn scan_fixture(source: SnapshotSource, rows: usize, modified: SystemTime) -> Sc
     let root = match source {
         SnapshotSource::Codex => dir.join("home/.codex/sessions"),
         SnapshotSource::ClaudeCode => dir.join("home/.claude/projects"),
-        _ => unreachable!(),
+        SnapshotSource::Pi => dir.join("home/.pi/agent/sessions"),
     };
     fs::create_dir_all(&root).unwrap();
     let (name, header) = match source {
@@ -45,7 +39,11 @@ fn scan_fixture(source: SnapshotSource, rows: usize, modified: SystemTime) -> Sc
             "native-tail-fixture.jsonl",
             json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}}),
         ),
-        _ => unreachable!(),
+        SnapshotSource::Pi => (
+            "native-tail-fixture.jsonl",
+            json!({"type":"session", "version":3, "id":"native-tail-fixture",
+                "timestamp":"2026-10-07T10:00:00Z", "cwd":"/synthetic/pi"}),
+        ),
     };
     let fixture = ScanFixture {
         dir,
@@ -100,143 +98,24 @@ fn append_row(fixture: &ScanFixture, source: SnapshotSource) {
     ));
 }
 
-/// A line no parser reads as usage: the parsed snapshots do not change.
-fn append_ignored(fixture: &ScanFixture, _: SnapshotSource) {
-    fixture.file.append(&json!({"type":"ignored"}));
-}
-
-const OLDER: usize = 3;
-/// The incumbent's rows: enough state that `2K + max(A, ins_extra)` covers
-/// its own resident copy plus one older resident, so the calibrated budget
-/// never refuses a step without an active file (base `ClearNoActive`).
 const INCUMBENT_ROWS: usize = 48;
 
-/// How a world is built.
-#[derive(Clone, Copy)]
-struct Spec {
-    /// Strictly older residents, `older_rows` usage rows each.
-    older: usize,
-    older_rows: usize,
-    /// The incumbent's rows at its first (Full) read.
-    rows: usize,
-    /// The change its continued (Tail) read finds.
-    change: fn(&ScanFixture, SnapshotSource),
-    /// R0's insert term in place of the measured one (test seam).
-    ins_extra: Option<usize>,
-    /// Continue with an attribution context: a launch root and a launch
-    /// event for the Codex session.
-    attribution: bool,
-    /// T-R0b-hint (i): the older residents' mtimes are in the future (their
-    /// admitted hints are clipped to admission time), and the incumbent is
-    /// written and admitted after them; no newer resident.
-    fresh: bool,
-}
-const SPEC: Spec = Spec {
-    older: OLDER,
-    older_rows: 1,
-    rows: INCUMBENT_ROWS,
-    change: append_row,
-    ins_extra: None,
-    attribution: false,
-    fresh: false,
-};
-
-/// A launch root with one launch event for `CODEX_SESSION`, as
-/// `launch_demand_tests` builds it.
-struct LaunchHome(PathBuf);
-impl LaunchHome {
-    fn new() -> Self {
-        let home = std::env::temp_dir().join(format!(
-            "ottto-r0-launch-{:010}-{:010}",
-            std::process::id(),
-            SEQ.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
-        let raw = json!({"schema":"agent_launch.v1",
-            "controller_session_ref":"a9789dcf-1e4a-4a6e-8abd-f30094efb269",
-            "worker_session_ref":CODEX_SESSION, "relationship_kind":"launched",
-            "workflow_ref":null, "pr_ref":null, "launch_ts":"2026-09-20T10:00:00Z",
-            "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
-        .to_string();
-        let reduced = crate::launch_events::validate_event(&raw).unwrap();
-        let dir = home.join(".ottto/launch-events/processed");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(format!(
-                "{}.json",
-                crate::launch_events::event_digest(&reduced)
-            )),
-            raw,
-        )
-        .unwrap();
-        Self(home)
-    }
-    fn context(&self, source: SnapshotSource) -> SessionAttributionContext {
-        use base64::Engine;
-        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32]);
-        SessionAttributionContext::from_activity_hint(
-            source,
-            &self.0,
-            true,
-            Some(&key),
-            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-        )
-        .unwrap()
-    }
-}
-impl Drop for LaunchHome {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Strictly older residents (three by default), one newer one, and an
-/// incumbent whose retained copy the next scan continues as a Tail. Every
-/// resident has the same shape, so each frees the same bytes.
+/// Real routed Tail state beside explicitly admitted native cache fixtures.
+/// No source scan retains a RAM reduction now that every source has a codec.
 struct World {
-    source: SnapshotSource,
-    spec: Spec,
     cache: Arc<sampled_scan::SharedCache>,
-    older: Vec<ScanFixture>,
-    newer: Option<ScanFixture>,
     incumbent: ScanFixture,
     index: ScanIndex,
-    /// What the incumbent's first (Full) completion was granted (Q-PR13b).
-    first: Vec<Decision>,
-    attribution: Option<(Rc<SessionAttributionContext>, LaunchHome)>,
+    _residents: Vec<ScanFixture>,
 }
 impl World {
     fn new(source: SnapshotSource) -> Self {
-        Self::build(source, SPEC)
-    }
-    fn build(source: SnapshotSource, spec: Spec) -> Self {
         let base = SystemTime::now() - Duration::from_secs(3_600);
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let older_at = |i: u64| {
-            if spec.fresh {
-                SystemTime::now() + Duration::from_secs(86_400 + i)
-            } else {
-                base + Duration::from_secs(i)
-            }
-        };
-        let older = (0..spec.older as u64)
-            .map(|i| resident(source, &cache, spec.older_rows, older_at(i)))
+        let residents = (0..4)
+            .map(|i| resident(source, &cache, 1, base + Duration::from_secs(i)))
             .collect();
-        let newer =
-            (!spec.fresh).then(|| resident(source, &cache, 1, base + Duration::from_secs(2_000)));
-        if spec.fresh {
-            // Written after the residents' admission clocks.
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let incumbent = scan_fixture(
-            source,
-            spec.rows,
-            if spec.fresh {
-                SystemTime::now()
-            } else {
-                base + Duration::from_secs(1_000)
-            },
-        );
-        test_hooks::clear();
+        let incumbent = scan_fixture(source, INCUMBENT_ROWS, base + Duration::from_secs(1_000));
         let (index, _, _) = production_scan(
             &incumbent,
             source,
@@ -244,39 +123,39 @@ impl World {
             Some(cache.clone()),
             "mixed-files",
         );
-        let first = test_hooks::decisions();
-        test_hooks::clear();
-        assert!(
-            victims(&cache)
-                .iter()
-                .any(|(k, _, _)| *k == key(&incumbent)),
-            "precondition: the incumbent is resident {source:?}"
+        let index =
+            crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, Some(&cache), index);
+        assert_eq!(
+            crate::snapshots::tail_source::committed_sealed_offset(
+                source,
+                &index,
+                &key(&incumbent)
+            ),
+            Some(fs::metadata(&incumbent.file.0).unwrap().len()),
         );
-        (spec.change)(&incumbent, source);
-        set_modified(
-            &incumbent,
-            if spec.fresh {
-                SystemTime::now()
-            } else {
-                base + Duration::from_secs(1_001)
-            },
-        );
-        let attribution = spec.attribution.then(|| {
-            let home = LaunchHome::new();
-            (Rc::new(home.context(source)), home)
-        });
+        assert!(cache.retained_checkpoint(&key(&incumbent)).is_none());
+        append_row(&incumbent, source);
+        set_modified(&incumbent, base + Duration::from_secs(1_001));
         Self {
-            source,
-            spec,
             cache,
-            older,
-            newer,
             incumbent,
             index,
-            first,
-            attribution,
+            _residents: residents,
         }
     }
+}
+
+/// Route the real scanner; explicitly seeded peers exercise the cache engine.
+fn cached_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> OwnedSourceScan {
+    let index =
+        crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, Some(cache), index);
+    super::cached_scan(fixture, source, index, cache, setup)
 }
 
 fn resident(
@@ -286,221 +165,40 @@ fn resident(
     modified: SystemTime,
 ) -> ScanFixture {
     let fixture = scan_fixture(source, rows, modified);
-    production_scan(
-        &fixture,
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let (retained, mode, _, items) = acquire_items_with(
+        &fixture.file,
         source,
-        ScanIndex::default(),
-        Some(cache.clone()),
-        "mixed-files",
+        &CodexTitleMetadata::default(),
+        &scope,
+        None,
+        sampled_scan::now_seconds(),
+        true,
     );
+    assert!(matches!(mode, ReadMode::Full(_)));
+    let retained = retained.expect("a native cache fixture fits");
+    let finished = serde_json::to_vec(&items).unwrap();
+    let finalization = crate::heap_layout_bound::bound(
+        &finished,
+        crate::snapshots::cache_policy_tests::POLICY_STATE_BYTES,
+    )
+    .expect("bounded finished fixture bytes");
+    assert!(finalization > 0);
+    assert!(cache.insert_admitted(
+        key(&fixture),
+        sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: retained.checkpoint,
+            reduction: Some(retained.state),
+            released: None,
+            unsealed: false,
+        },
+        finalization,
+    ));
     assert!(
         cache.retained_checkpoint(&key(&fixture)).is_some(),
         "precondition: resident {source:?}"
     );
     fixture
-}
-
-/// What one continued scan of the incumbent did.
-struct Run {
-    probe: Probe,
-    decisions: Vec<Decision>,
-    buckets: Vec<Bucket>,
-    /// Residents before the scan, without the incumbent.
-    before: Victims,
-    /// Counts after revalidation, before `retain_reduction`: the step starts
-    /// and the completion budget, before any release.
-    before_retain: Option<Counts>,
-    /// Residents and counts when retention returned, before `finish`.
-    at_retain: Option<(Victims, Counts)>,
-    counts: Counts,
-    /// Census unreadable causes, by ordinal.
-    unreadable: Vec<usize>,
-    /// Failed `finish` error chains.
-    finish_errors: Vec<String>,
-}
-
-/// How a continued scan runs.
-#[derive(Default)]
-struct Opts {
-    hooks: Vec<(Point, Hook)>,
-    /// Called once, between the steps, when the active file first exists.
-    on_active: Option<OnActive>,
-}
-
-/// Steps `scan` to completion and returns its index.
-fn complete(
-    mut scan: OwnedSourceScan,
-    context: Option<&SessionAttributionContext>,
-    mut on_active: Option<OnActive>,
-) -> ScanIndex {
-    for _ in 0..10_000 {
-        if scan.active_file.is_some() {
-            if let Some(on_active) = on_active.take() {
-                on_active(&scan);
-            }
-        }
-        match scan.step(context) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { index, .. } => return index,
-        }
-    }
-    panic!("the scan did not complete");
-}
-
-/// Continues the incumbent as `opts` says. Hooks run in order after the
-/// recorder of `at_retain`.
-fn run(world: &mut World, opts: Opts) -> Run {
-    let Opts { hooks, on_active } = opts;
-    test_hooks::clear();
-    test_hooks::set_ins_extra(world.spec.ins_extra);
-    let before_retain = Rc::new(RefCell::new(None));
-    let seen_before = Rc::clone(&before_retain);
-    test_hooks::set(Point::BeforeRetain, move || {
-        *seen_before.borrow_mut() = Some(observed().unwrap());
-    });
-    let at_retain = Rc::new(RefCell::new(None));
-    let cache = Arc::clone(&world.cache);
-    let seen = Rc::clone(&at_retain);
-    test_hooks::set(Point::AfterRetain, move || {
-        *seen.borrow_mut() = Some((victims(&cache), observed().unwrap()));
-    });
-    for (point, hook) in hooks {
-        test_hooks::set(point, hook);
-    }
-    // The scan takes the incumbent's own copy first: it is never a victim.
-    let incumbent = key(&world.incumbent);
-    let before = victims(&world.cache)
-        .into_iter()
-        .filter(|(key, _, _)| *key != incumbent)
-        .collect();
-    let index = std::mem::take(&mut world.index);
-    let context = world
-        .attribution
-        .as_ref()
-        .map(|(context, _)| Rc::clone(context));
-    let scan = || {
-        complete(
-            cached_scan(&world.incumbent, world.source, index, &world.cache, |_| {}),
-            context.as_deref(),
-            on_active,
-        )
-    };
-    let (index, counts) = observe(scan);
-    world.index = index;
-    let run = Run {
-        probe: test_hooks::last_probe(),
-        decisions: test_hooks::decisions(),
-        buckets: test_hooks::buckets(),
-        before,
-        before_retain: before_retain.borrow_mut().take(),
-        at_retain: at_retain.borrow_mut().take(),
-        counts,
-        unreadable: test_hooks::unreadable(),
-        finish_errors: test_hooks::finish_errors(),
-    };
-    test_hooks::clear();
-    eprintln!(
-        "R0 {:?}: probe {:?}, decisions {:?}, buckets {:?}",
-        world.source, run.probe, run.decisions, run.buckets
-    );
-    run
-}
-
-/// T-R0a and Q-PR13b: with room, a Tail completion is granted its insert-aware
-/// budget, releases nothing, and is retained beside every resident; a Full
-/// singleton is granted an exact completion measure.
-#[test]
-fn r0_tail_with_room_is_granted_and_releases_nothing() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    {
-        let source = SnapshotSource::Codex;
-        let mut world = World::new(source);
-        assert!(
-            matches!(
-                world.first.as_slice(),
-                [Decision::Granted {
-                    budget,
-                    resident_measured: true,
-                    active_measured: true,
-                }] if *budget > 0
-            ),
-            "Q-PR13b: a Full singleton's exact completion budget {source:?}: {:?}",
-            world.first
-        );
-        let run = run(&mut world, Opts::default());
-        let probe = run.probe;
-        assert_eq!(probe.need, None, "{source:?}");
-        assert!(
-            probe.finalization_prev > 0,
-            "β: the Full insert's finalization charge reaches the Tail {source:?}"
-        );
-        assert_eq!(
-            probe.k,
-            probe.clone.map(|clone| clone.max(probe.finalization_prev)),
-            "K = max(C, F_prev) {source:?}"
-        );
-        assert_eq!(
-            probe.b_ins,
-            (probe.remaining - probe.a.max(probe.ins_extra)) / 2,
-            "{source:?}"
-        );
-        // #667: a granted copy is admitted against main's peak-reserved
-        // budget, `b_ins` less the decode peak (none for Codex).
-        let peak = probe.granted_peak.expect("granted peak");
-        if source == SnapshotSource::Codex {
-            assert_eq!(peak, 0);
-        }
-        assert_eq!(
-            run.decisions,
-            vec![Decision::Granted {
-                budget: probe.b_ins - peak,
-                resident_measured: true,
-                active_measured: true,
-            }],
-            "{source:?}"
-        );
-        let counts = run.counts;
-        assert_eq!(
-            (
-                counts.insert_entries_evicted,
-                counts.clear_other_active,
-                counts.clear_entries_released,
-                counts.retention_bound_refused,
-                counts.insert_admitted,
-            ),
-            (0, 0, 0, 0, 1),
-            "{source:?}"
-        );
-        let after = resident_keys(&world.cache);
-        for resident in world
-            .older
-            .iter()
-            .chain(world.newer.as_ref())
-            .chain([&world.incumbent])
-        {
-            assert!(after.contains(&key(resident)), "{source:?}");
-        }
-        assert!(run.buckets.is_empty(), "{source:?}");
-        // Nothing released before or at retention; no unreadable cause and
-        // no failed finish.
-        assert_eq!(
-            run.before_retain
-                .map(|counts| counts.copy_refusal_admission_evicted),
-            Some(0),
-            "{source:?}"
-        );
-        assert_eq!(
-            run.at_retain
-                .as_ref()
-                .map(|(_, counts)| counts.copy_refusal_admission_evicted),
-            Some(0),
-            "{source:?}"
-        );
-        assert!(run.unreadable.is_empty(), "{source:?}");
-        assert!(run.finish_errors.is_empty(), "{source:?}");
-    }
 }
 
 /// The retained lock is never relocked on one thread; a debug build
@@ -558,11 +256,12 @@ fn r0_blocking_measure_waits_for_the_retained_lock() {
 /// from the cursor reservation, and the next take carries it.
 #[test]
 fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
+    // Cache fixtures are admitted explicitly; real scans continue from heads.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let fixture = resident(
             source,
@@ -573,7 +272,7 @@ fn r0_insert_carries_its_finalization_charge_to_the_next_take() {
         let taken = cache.take(&key(&fixture)).expect("resident");
         assert!(
             taken.finalization_charge > 0,
-            "a production insert carries its finalization charge {source:?}"
+            "a fixture insert carries its measured finished-byte charge {source:?}"
         );
         cache.insert(
             key(&fixture),
@@ -716,47 +415,21 @@ fn packet_refusal_buckets_and_budget_variants() {
     ));
 }
 
-/// Why T-R0b-ins, -ins-band, -node and -node-band set `ins_extra` through
-/// the test seam: each needs `ins_extra` against `A` at a chosen size. On a
-/// minimal Tail (a confirmed-empty file plus one ignored line) the natural
-/// relation moved with #660/#667: CI 39897160806 measured `ins_extra > A`
-/// for both sources (Codex by under 1 KiB). It is recorded, not pinned.
-#[test]
-fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    {
-        let source = SnapshotSource::Codex;
-        let spec = Spec {
-            older: 1,
-            rows: 0,
-            change: append_ignored,
-            ..SPEC
-        };
-        let mut world = World::build(source, spec);
-        let probe = run(&mut world, Opts::default()).probe;
-        eprintln!(
-            "R0_INSERT_TERM source={source:?} a={} ins_extra={}",
-            probe.a, probe.ins_extra
-        );
-        assert!(probe.ins_extra > 0 && probe.a > 0, "{source:?}: {probe:?}");
-    }
-}
-
 /// T-R0d: every borrowed-state conjunct keeps a Tail off shape F, so its
 /// step-start refusal keeps `ClearOtherActive`, and its completion never
 /// reaches `tail_completion_budget` (the only source of `Deferred`, called
 /// only behind `releases_at_completion`). Aliases and receipts are
 /// in the guard matrix; the cursor and group conjuncts are in
-/// `codex_cursor_tests` and `group_job_tests`.
+/// `codex_cursor_tests` and `group_job_tests`. Codex's tier-join conjunct
+/// left with Codex's RAM reduction copy (a codec source keeps none).
 #[test]
 fn r0_non_f_shapes_keep_clear_other_active() {
+    // Cache fixtures are admitted explicitly; real scans continue from heads.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         let mut world = World::new(source);
         let index = std::mem::take(&mut world.index);
         let mut scan = step_until(
@@ -806,27 +479,6 @@ fn r0_non_f_shapes_keep_clear_other_active() {
         let active = scan.active_file.as_deref_mut().unwrap();
         active.sampling.as_mut().unwrap().mode = mode;
 
-        if source == SnapshotSource::Codex {
-            let active = scan.active_file.as_deref_mut().unwrap();
-            let replay = active.parser.accumulator.codex_tier_replay.take();
-            let mut joined = replay
-                .clone()
-                .unwrap_or_else(|| codex_file_join::TierReplay::new(None, false, String::new()));
-            joined.join = Some(Box::new(codex_file_join::StreamProof::new(
-                String::new(),
-                false,
-                vec![codex_file_join::MemberPlan::default()],
-            )));
-            active.parser.accumulator.codex_tier_replay = Some(joined);
-            assert!(!shape_f(&scan), "join");
-            assert_eq!(release(&mut scan).clear_other_active, 1, "join");
-            scan.active_file
-                .as_deref_mut()
-                .unwrap()
-                .parser
-                .accumulator
-                .codex_tier_replay = replay;
-        }
         assert!(shape_f(&scan), "restored {source:?}");
     }
 }
@@ -868,6 +520,7 @@ fn contended<T>(
 /// is free, never `ClearOtherActive`.
 #[test]
 fn r0_branches_a_and_d_release_as_base_under_contention() {
+    // Cache fixtures are admitted explicitly; real scans continue from heads.
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -880,7 +533,7 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
         )
     };
     {
-        let source = SnapshotSource::Codex;
+        let source = SnapshotSource::Pi;
         // A: a new file read Full beside one resident.
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let base = SystemTime::now() - Duration::from_secs(3_600);
@@ -948,56 +601,6 @@ fn r0_branches_a_and_d_release_as_base_under_contention() {
         assert_eq!(measured, None, "contention reads unmeasured {source:?}");
         assert_eq!(clears(&counts), (1, 1, 0, 0), "contended D {source:?}");
         assert!(!resident_keys(&cache).contains(&key(&other)), "{source:?}");
-    }
-}
-
-/// T-R0f: an unknown resident bound (a poisoned retained lock while a Tail
-/// is active). Shape F evicts nothing at step start or completion, and its
-/// own copy is refused (granted 0, residents unmeasured: bucket `Walk`; the
-/// step measure still walks the active, so it reads measured).
-/// An unsupported layout is not reachable here: every R0 test returns early
-/// without it, and a supported CI build always has it.
-#[test]
-fn r0_unknown_resident_evicts_nothing() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    {
-        let source = SnapshotSource::Codex;
-        let mut world = World::new(source);
-        let cache = Arc::clone(&world.cache);
-        let run = run(
-            &mut world,
-            Opts {
-                on_active: Some(
-                    Box::new(move |_: &OwnedSourceScan| cache.poison_retained()) as OnActive
-                ),
-                ..Opts::default()
-            },
-        );
-        assert_eq!(
-            run.decisions,
-            vec![Decision::Granted {
-                budget: 0,
-                resident_measured: false,
-                active_measured: true,
-            }],
-            "{source:?}"
-        );
-        assert_eq!(run.buckets, vec![Bucket::Walk], "{source:?}");
-        assert_eq!(
-            (
-                run.counts.insert_entries_evicted,
-                run.counts.copy_refusal_admission_evicted,
-                run.counts.copy_refusal_entries_evicted,
-                run.counts.clear_entries_released,
-                run.counts.retention_produced,
-                run.counts.insert_admitted,
-            ),
-            (0, 0, 0, 0, 0, 0),
-            "{source:?}"
-        );
-        assert_eq!(victims(&world.cache), run.before, "{source:?}");
     }
 }
 

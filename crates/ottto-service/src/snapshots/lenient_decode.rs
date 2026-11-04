@@ -763,7 +763,8 @@ impl NumberState {
 fn lexical_optional_span<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<Span, Error> {
     // Match CensusRead's complete field drain, including leading/trailing
     // whitespace. Defer grammar until resource classification is final: an
-    // early bad token must not quarantine later over-limit optional evidence.
+    // early bad token must not quarantine later over-depth optional evidence.
+    // The field's size is never a resource: nothing here buffers it.
     let start = reader.stream_position()?;
     let mut len = 0u64;
     let mut depth = 0usize;
@@ -776,7 +777,6 @@ fn lexical_optional_span<R: BufRead + Seek>(reader: &mut R) -> std::result::Resu
         }
         reader.consume(1);
         len += 1;
-        resource |= len > claude_request_census::MAX_RAW_BYTES as u64;
         if quoted {
             if escaped {
                 escaped = false;
@@ -2536,14 +2536,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
                         "claude_copy_removals" => {
-                            // Like the birth table: a damaged or over-budget
-                            // value decodes as none (copies decide afresh).
-                            let decoded = if !value.resource
-                                && value.len
-                                    <= (claude_request_money::copy_removals::MAX_BYTES as u64) / 3
-                                        * 4
-                                        + 64
-                            {
+                            // Like the birth table: a damaged value decodes
+                            // as none (copies decide afresh).
+                            let decoded = if !value.resource {
                                 self.typed::<claude_request_money::copy_removals::CopyRemovals>(
                                     value,
                                 )

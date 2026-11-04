@@ -304,9 +304,10 @@ fn baseline(source: SnapshotSource, rows: usize, pre: usize) -> Baseline {
     );
     let path = fixture.file.0.clone();
     let key = local_index_key(&path);
-    // Claude's baseline is its committed head, which seals the whole file.
+    // A codec source's baseline is its committed head, which seals the whole
+    // file; another source's is its retained copy.
     let sealed = len(&path);
-    if source != SnapshotSource::ClaudeCode {
+    if crate::snapshots::tail_source::keeps_ram(source) {
         let checkpoint = cache
             .retained_checkpoint(&key)
             .expect("precondition: the first Full retains a copy");

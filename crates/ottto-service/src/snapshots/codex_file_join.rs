@@ -277,6 +277,14 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
         .ok()
         .map(|metadata| metadata_witness(&metadata))
 }
+/// The session id the file's owning header names now: the lineage a stored
+/// Tail head continues (D131), read as the inventory reads it.
+#[cfg(unix)]
+pub(super) fn header_owner(candidate: &CandidateFile) -> Result<String> {
+    read_header_settled(candidate)
+        .0
+        .map(|(header, _)| header.owner)
+}
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
@@ -1204,9 +1212,8 @@ impl TierReplay {
 }
 crate::heap_layout_bound::fields!(AppliedTierReceipt; version, derivation, scope, records, prefix_digest, tiers);
 crate::heap_layout_bound::fields!(TierReplay; previous, digest, records, matched, tiers, scope, prefix_matched, invalid, join);
-/// Named group refusals (§i). The discriminant is the RAM counter slot of
-/// `codex_join_terminal_debt`. Every reason but `ProbeBudgetOrder` is
-/// terminal debt for the attempt (outcome R): the members are disclosed as
+/// Named group refusals (§i). Every reason is terminal debt for the attempt
+/// (outcome R): the members are disclosed as
 /// settleable residue, never as an unreadable file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum JoinRefusal {
@@ -1232,17 +1239,8 @@ pub(super) enum JoinRefusal {
     /// typically a compressed (`.zst`, not yet scanned) predecessor, or
     /// another owner's file named without `forked_from_id`.
     MissingPredecessor,
-    /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
-    /// chronological order because its probes exceeded their budget: the
-    /// order may be our own artifact, so it is strict, never
-    /// settleable or memoized.
-    ProbeBudgetOrder,
 }
-pub(super) const JOIN_REFUSALS: usize = 20;
 impl JoinRefusal {
-    pub(super) fn slot(self) -> usize {
-        self as usize
-    }
     /// Growth of the live member may cure these (§d.4). Every other reason,
     /// and any reason whose first failing member is sealed, is append-incurable.
     pub(super) fn append_curable(self) -> bool {

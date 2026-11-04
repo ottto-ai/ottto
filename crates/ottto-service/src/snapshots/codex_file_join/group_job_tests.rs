@@ -5,6 +5,7 @@ use super::super::tests::{
     counting_v2_unbound_fixture, fixture, legacy_index, member, replay_group, scan, usage,
 };
 use super::*;
+use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use crate::transcript_acquisition::Scope;
 use sampled_scan::codex_cursor::{with_test_limits, with_test_state_budget, Counters};
@@ -359,7 +360,6 @@ fn reread_group_never_starves_a_waiting_census_singleton() {
         assert_eq!(closed, Some(1), "{case}: {:?}", counters(&cache));
         if case == "fenced" {
             // Decided at admission: fenced, and no allowance taken from `c`.
-            assert_eq!(counters(&cache).groups_fenced, 1, "{:?}", counters(&cache));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -839,6 +839,21 @@ fn completions(cache: &SharedCache) -> u64 {
     counters.jobs_certified + counters.jobs_uncertified
 }
 
+fn group_replays() -> (u64, u64) {
+    use crate::snapshots::tail_source::counters::total;
+    (
+        total("tail_reconstruct", "group_replay"),
+        total("tail_reconstruct_bytes", "group_replay"),
+    )
+}
+
+fn corpus_bytes(root: &Path) -> u64 {
+    fs::read_dir(root.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum()
+}
+
 fn fingerprints(scan: &SourceScanResult) -> BTreeSet<String> {
     scan.snapshots
         .iter()
@@ -948,10 +963,6 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
     let (index, result) = sampled(&root, ScanIndex::default(), 10, &cache);
     let after = counters(&cache);
     assert_eq!(after.memo_records, 0, "{after:?}");
-    assert!(
-        after.join_terminal_debt.iter().all(|count| *count == 0),
-        "{after:?}"
-    );
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
@@ -965,23 +976,22 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
 fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
     let root = refused_fixture();
     let cache = Arc::new(SharedCache::default());
-    let overlap = JoinRefusal::Overlap.slot();
+    let before = group_replays();
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let first = counters(&cache);
-    assert_eq!(first.join_terminal_debt[overlap], 1, "{first:?}");
     assert_eq!(first.memo_records, 1, "{first:?}");
+    let refused = group_replays();
+    assert_eq!(refused.0, before.0 + 1, "one executed refusal");
+    assert!(refused.1 > before.1, "the first attempt read bytes");
     // The live member grows; an append cannot cure an overlap before it.
     append_rows(
         &root.join("sessions/b.jsonl"),
         &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
     );
-    let (index, again) = next_generation(&root, index, &cache, 1);
-    let after = counters(&cache);
-    assert_eq!(after.group_memo_hits, 1, "{after:?}");
-    assert_eq!(
-        after.join_terminal_debt[overlap], 1,
-        "a memo hit replays no byte: {after:?}"
-    );
+    let ((index, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    assert_eq!(bytes, 0, "a memo hit replays no byte despite live growth");
+    assert_eq!(group_replays(), refused, "no second replay or replay bytes");
+    assert_eq!(counters(&cache).memo_records, first.memo_records);
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "re-disclosed as settleable residue");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
@@ -1017,26 +1027,35 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
             ui(50, 350, "2026-10-01T10:02:30Z"),
         ],
     );
-    let unmatched = JoinRefusal::UiUnmatched.slot();
+
     let cache = Arc::new(SharedCache::default());
+    let before = group_replays();
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
-    assert_eq!(refused.join_terminal_debt[unmatched], 1, "{refused:?}");
     assert_eq!(refused.memo_records, 1, "recorded with an exact stamp");
+    let first = group_replays();
+    assert_eq!(first.0, before.0 + 1);
+    assert!(first.1 > before.1);
     // Unchanged: the next generation does not re-read the group.
-    let (index, _) = next_generation(&root, index, &cache, 1);
-    let unchanged = counters(&cache);
-    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
-    assert_eq!(unchanged.join_terminal_debt[unmatched], 1, "{unchanged:?}");
+    let ((index, unchanged), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    assert_eq!(bytes, 0, "the exact-stamp memo suppresses the read");
+    assert_eq!(group_replays(), first);
+    assert_eq!(counters(&cache).memo_records, refused.memo_records);
+    assert!(unchanged.snapshots.is_empty());
     // Any growth of the live member may cure it: one attempt.
     append_rows(
         &root.join("sessions/b.jsonl"),
         &[turn("55555555-aaaa-4aaa-8aaa-555555555555")],
     );
-    let _ = next_generation(&root, index, &cache, 2);
-    let grown = counters(&cache);
-    assert_eq!(grown.group_memo_hits, 1, "{grown:?}");
-    assert_eq!(grown.join_terminal_debt[unmatched], 2, "{grown:?}");
+    let ((_, grown), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 2));
+    assert!(bytes > 0, "growth must miss the exact-stamp memo");
+    assert_eq!(group_replays().0, first.0 + 1, "exactly one new attempt");
+    assert!(
+        group_replays().1 > first.1,
+        "the new replay records its bytes"
+    );
+    assert_eq!(counters(&cache).memo_records, refused.memo_records + 1);
+    assert!(grown.snapshots.is_empty(), "the unmatched UI still refuses");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1071,23 +1090,49 @@ fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
             ui(10, 410, "2026-10-01T10:03:30Z"),
         ],
     );
-    let gap = JoinRefusal::Gap.slot();
+
     let cache = Arc::new(SharedCache::default());
+    let before = group_replays();
     let (index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
     let refused = counters(&cache);
-    assert_eq!(refused.join_terminal_debt[gap], 1, "{refused:?}");
     assert_eq!(
         refused.memo_records, 1,
         "recorded although the reader stopped mid-stream: {refused:?}"
     );
-    let _ = next_generation(&root, index, &cache, 1);
-    let unchanged = counters(&cache);
-    assert_eq!(unchanged.group_memo_hits, 1, "{unchanged:?}");
-    // One replay only: the unpaged group's attempt count is its refusals.
-    assert_eq!(
-        unchanged.join_terminal_debt[gap], 1,
-        "not re-read: {unchanged:?}"
+    let first = group_replays();
+    assert_eq!(first.0, before.0 + 1, "one mid-stream refusal");
+    assert!(first.1 > before.1);
+    let ((_, unchanged), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    assert_eq!(bytes, 0, "the mid-stream gap is not re-read");
+    assert_eq!(group_replays(), first, "one replay only, bytes unchanged");
+    assert_eq!(counters(&cache).memo_records, refused.memo_records);
+    assert!(unchanged.snapshots.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A real D168 replay refuses inside its first member: the reconstruction
+/// counter records that attempt once and exactly the prefix its reader consumed.
+#[test]
+fn a_group_replay_counts_once_with_its_consumed_bytes() {
+    let root = temp_root("replay-count");
+    let mut rows = chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 3);
+    rows[3] = native(OWNER, "gap", 10, 50);
+    let expected = rows[..4]
+        .iter()
+        .map(|row| (serde_json::to_vec(row).unwrap().len() + 1) as u64)
+        .sum::<u64>();
+    write_rows(&root.join("sessions/a.jsonl"), &rows);
+    write_rows(
+        &root.join("sessions/b.jsonl"),
+        &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 30, 3),
     );
+    let before = group_replays();
+    let cache = Arc::new(SharedCache::default());
+    let ((_, scan), bytes) = observe_consumed(|| sampled(&root, ScanIndex::default(), 10, &cache));
+    assert_eq!(bytes, expected, "refuses before reading the remaining rows");
+    assert_eq!(group_replays(), (before.0 + 1, before.1 + expected));
+    assert_eq!(counters(&cache).memo_records, 1, "terminal group refusal");
+    assert!(scan.snapshots.is_empty());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1101,40 +1146,52 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
     with_test_limits(2048, 1024, 64, || {
         // The first pause (inside sealed member a) cannot fit the scaled
         // state budget: strict `JoinStateBound`, parked.
-        let (index, first) =
-            with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
+        let ((index, first), bytes) = observe_consumed(|| {
+            with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache))
+        });
+        assert!(bytes > 0 && bytes < corpus_bytes(&root), "one partial read");
         let bound = counters(&cache);
+        let replay = group_replays();
         assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
         assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(bound.groups_started, 1, "{bound:?}");
         assert!(first.snapshots.is_empty());
         assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
         // A new generation without a capacity or input change: no attempt.
-        let (index, _) = next_generation(&root, index, &cache, 1);
+        let ((index, _), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+        assert_eq!(bytes, 0, "never retried per generation");
+        assert_eq!(group_replays(), replay);
         let parked = counters(&cache);
         assert_eq!(parked.parked_hits, 1, "{parked:?}");
-        assert_eq!(
-            parked.groups_started, 1,
-            "never retried per generation (R2-H1)"
-        );
         // Growth of the live member keeps it parked.
         append_rows(
             &root.join("sessions/b.jsonl"),
             &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 2)[1..],
         );
-        let (index, _) = next_generation(&root, index, &cache, 2);
+        let ((index, _), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 2));
+        assert_eq!(bytes, 0, "live growth must leave the group parked");
+        assert_eq!(group_replays(), replay);
         let grown = counters(&cache);
         assert_eq!(grown.parked_hits, 2, "{grown:?}");
-        assert_eq!(grown.groups_started, 1, "{grown:?}");
         // A sealed member's change wakes it: one new attempt.
         append_rows(
             &root.join("sessions/a.jsonl"),
             &[turn("66666666-aaaa-4aaa-8aaa-666666666666")],
         );
-        let _ = next_generation(&root, index, &cache, 3);
+        let (_, bytes) = observe_consumed(|| {
+            let (index, _) = next_generation(&root, index, &cache, 3);
+            assert!(
+                cache.paused_group_position().is_some(),
+                "the sealed change wakes it"
+            );
+            pages_at(&root, index, &cache, "2026-10-06T23:03:00Z", || {
+                completions(&cache) > 0
+            })
+        });
+        assert_eq!(bytes, corpus_bytes(&root), "one new attempt after waking");
+        assert_eq!(group_replays().0, replay.0 + 1);
+        assert!(group_replays().1 > replay.1);
         let woken = counters(&cache);
         assert_eq!(woken.parked_hits, 2, "{woken:?}");
-        assert_eq!(woken.groups_started, 2, "{woken:?}");
     });
     fs::remove_dir_all(root).unwrap();
 }
@@ -1146,10 +1203,17 @@ fn new_continuation_during_job_invalidates_and_never_emits_as_singleton() {
     }
     let root = paged_corpus("rotation");
     let cache = Arc::new(SharedCache::default());
+    let replay = group_replays();
     let done = with_test_limits(2048, 1024, 64, || {
-        let (mut index, first, _) = pages(&root, ScanIndex::default(), &cache, || {
-            counters(&cache).jobs_paused > 0
+        let ((mut index, first, _), bytes) = observe_consumed(|| {
+            pages(&root, ScanIndex::default(), &cache, || {
+                counters(&cache).jobs_paused > 0
+            })
         });
+        assert!(
+            bytes > 0 && bytes < corpus_bytes(&root),
+            "one partial attempt"
+        );
         assert!(
             first.snapshots.is_empty(),
             "a paused group publishes nothing"
@@ -1161,7 +1225,9 @@ fn new_continuation_during_job_invalidates_and_never_emits_as_singleton() {
             &chain_rows(OWNER, "c", "2026-10-01T11:00:00Z", 600, 30),
         );
         index.traversal = None;
-        let (_, done, earlier) = pages(&root, index, &cache, || completions(&cache) > 0);
+        let ((_, done, earlier), bytes) =
+            observe_consumed(|| pages(&root, index, &cache, || completions(&cache) > 0));
+        assert_eq!(bytes, corpus_bytes(&root), "one restart with N+1 members");
         assert!(
             earlier.iter().all(|page| page.snapshots.is_empty()),
             "no member (the new one included) is emitted before the group"
@@ -1169,14 +1235,13 @@ fn new_continuation_during_job_invalidates_and_never_emits_as_singleton() {
         done
     });
     let after = counters(&cache);
-    assert!(
-        after.jobs_invalidated >= 1,
-        "invalidated at resume: {after:?}"
-    );
     assert_eq!(
-        after.groups_started, 2,
-        "one restart with N+1 members: {after:?}"
+        after.jobs_invalidated, 1,
+        "one invalidation at resume: {after:?}"
     );
+    // The invalidated partial job never completes; the replacement counts once.
+    assert_eq!(group_replays().0, replay.0 + 1);
+    assert!(group_replays().1 > replay.1);
     let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
     assert_eq!(unpaged.snapshots.len(), 3, "one alias per member");
     assert_eq!(fingerprints(&done), fingerprints(&unpaged));
@@ -1191,25 +1256,37 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
     let root = paged_corpus("growth");
     let (_, prefix) = scan(&root, ScanIndex::default(), 10);
     let cache = Arc::new(SharedCache::default());
-    let (first, second) = with_test_limits(2048, 1024, 64, || {
-        // Page until the paused job reads the live (last) member.
-        let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
-            cache.paused_group_position() == Some(1)
-        });
-        append_rows(
-            &root.join("sessions/b.jsonl"),
-            &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
-        );
-        let (mut index, first, earlier) = pages(&root, index, &cache, || completions(&cache) > 0);
-        assert!(earlier.iter().all(|page| page.snapshots.is_empty()));
-        // The appended tail stays pending; the next generation replaces
-        // the body.
-        index.traversal = None;
-        let (_, second, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            completions(&cache) > 1
-        });
-        (first, second)
+    let prefix_bytes = corpus_bytes(&root);
+    let replay = group_replays();
+    let ((first, second), bytes) = observe_consumed(|| {
+        with_test_limits(2048, 1024, 64, || {
+            // Page until the paused job reads the live (last) member.
+            let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+                cache.paused_group_position() == Some(1)
+            });
+            append_rows(
+                &root.join("sessions/b.jsonl"),
+                &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
+            );
+            let (mut index, first, earlier) =
+                pages(&root, index, &cache, || completions(&cache) > 0);
+            assert!(earlier.iter().all(|page| page.snapshots.is_empty()));
+            // The appended tail stays pending; the next generation replaces
+            // the body.
+            index.traversal = None;
+            let (_, second, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+                completions(&cache) > 1
+            });
+            (first, second)
+        })
     });
+    assert_eq!(
+        bytes,
+        prefix_bytes + corpus_bytes(&root),
+        "exactly two complete attempts"
+    );
+    assert_eq!(group_replays().0, replay.0 + 2);
+    assert!(group_replays().1 > replay.1);
     assert!(!first.snapshots.is_empty());
     assert_eq!(
         input_totals(&first),
@@ -1223,7 +1300,6 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
         input_totals(&full),
         "the replacing body counts the prefix once"
     );
-    assert_eq!(counters(&cache).groups_started, 2);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1243,9 +1319,12 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
         let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
         let cache = Arc::new(SharedCache::default());
         let done = with_test_limits(2048, 1024, 64, || {
-            let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
-                cache.paused_group_position() == Some(1)
+            let ((index, _, _), prefix_bytes) = observe_consumed(|| {
+                pages(&root, ScanIndex::default(), &cache, || {
+                    cache.paused_group_position() == Some(1)
+                })
             });
+            assert!(prefix_bytes > 0 && prefix_bytes < corpus_bytes(&root));
             let before = fs::metadata(&sealed).unwrap();
             if change == "chmod" {
                 let ctime = |m: &fs::Metadata| (m.ctime(), m.ctime_nsec());
@@ -1276,17 +1355,25 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
                     .unwrap();
                 assert_eq!(fs::metadata(&sealed).unwrap().len(), before.len());
             }
-            let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
+            let ((_, done, _), bytes) =
+                observe_consumed(|| pages(&root, index, &cache, || completions(&cache) > 0));
+            let expected = if change == "chmod" {
+                corpus_bytes(&root) - prefix_bytes
+            } else {
+                corpus_bytes(&root)
+            };
+            assert_eq!(
+                bytes, expected,
+                "{change}: resume unchanged, restart changed exactly once"
+            );
             done
         });
         let after = counters(&cache);
         if change == "chmod" {
             assert_eq!(after.jobs_invalidated, 0, "{change}: {after:?}");
-            assert_eq!(after.groups_started, 1, "{change}: {after:?}");
             assert_eq!(input_totals(&done), input_totals(&unpaged), "{change}");
         } else {
-            assert!(after.jobs_invalidated >= 1, "{change}: {after:?}");
-            assert_eq!(after.groups_started, 2, "{change}: {after:?}");
+            assert_eq!(after.jobs_invalidated, 1, "{change}: {after:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1320,7 +1407,12 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
             "F8 across a restart"
         );
         let after = Arc::new(SharedCache::default());
-        let (_, done, earlier) = pages(&root, index, &after, || completions(&after) > 0);
+        let replay = group_replays();
+        let ((_, done, earlier), bytes) =
+            observe_consumed(|| pages(&root, index, &after, || completions(&after) > 0));
+        assert_eq!(bytes, corpus_bytes(&root), "the group re-boots once");
+        assert_eq!(group_replays().0, replay.0 + 1);
+        assert!(group_replays().1 > replay.1);
         assert!(
             earlier.iter().all(|page| page
                 .snapshots
@@ -1328,11 +1420,7 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
                 .all(|snapshot| snapshot.source_session_id != OWNER)),
             "no body for the in-progress owner before its group completes"
         );
-        let counted = counters(&after);
-        assert_eq!(
-            counted.groups_started, 1,
-            "the group re-boots once: {counted:?}"
-        );
+
         assert_eq!(completions(&after), 1);
         assert_eq!(
             fingerprints(&done),
@@ -1346,7 +1434,7 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
 #[test]
 fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
     let root = refused_fixture();
-    let overlap = JoinRefusal::Overlap.slot();
+
     let cache = Arc::new(SharedCache::default());
     let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(first.census_complete, "{first:?}");
@@ -1371,7 +1459,6 @@ fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "{again:?}");
     assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    assert_eq!(counters(&restarted).join_terminal_debt[overlap], 1);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1527,6 +1614,7 @@ fn group_with_legacy_tee_is_byte_charged() {
         retained_finalization_charge: 0,
         retained_usage: None,
         reinsertion: Default::default(),
+        tier_prefix_replay: false,
     });
     let acquisition = active.parser.reader.acquisition.replace(plan);
     let replay = active.parser.accumulator.codex_tier_replay.take();
@@ -1688,32 +1776,40 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
     let mut live = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
     live.push(ui(20, 620, "2026-10-01T10:10:20Z"));
     write_rows(&root.join("sessions/b.jsonl"), &live);
-    let unmatched = JoinRefusal::UiUnmatched.slot();
+
     let cache = Arc::new(SharedCache::default());
-    let done = with_test_limits(2048, 1024, 64, || {
-        let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
-            cache.paused_group_position() == Some(1)
-        });
-        // The native lands past the live member's frozen extent.
-        append_rows(
-            &root.join("sessions/b.jsonl"),
-            &[native(OWNER, "b-30", 20, 620)],
-        );
-        let (mut index, _, _) = pages(&root, index, &cache, || {
-            counters(&cache).join_terminal_debt[unmatched] > 0
-        });
-        let refused = counters(&cache);
-        assert_eq!(refused.memo_records, 0, "{refused:?}");
-        index.traversal = None;
-        let (_, done, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            completions(&cache) > 0
-        });
-        done
+    let prefix_bytes = corpus_bytes(&root);
+    let replay = group_replays();
+    let (done, bytes) = observe_consumed(|| {
+        with_test_limits(2048, 1024, 64, || {
+            let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+                cache.paused_group_position() == Some(1)
+            });
+            // The native lands past the live member's frozen extent.
+            append_rows(
+                &root.join("sessions/b.jsonl"),
+                &[native(OWNER, "b-30", 20, 620)],
+            );
+            let (mut index, _, _) = pages(&root, index, &cache, || {
+                cache.paused_group_position().is_none()
+            });
+            let refused = counters(&cache);
+            assert_eq!(refused.memo_records, 0, "{refused:?}");
+            index.traversal = None;
+            let (_, done, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+                completions(&cache) > 0
+            });
+            done
+        })
     });
-    let after = counters(&cache);
-    assert_eq!(after.group_memo_hits, 0, "{after:?}");
-    assert_eq!(after.groups_started, 2, "one new attempt: {after:?}");
-    assert_eq!(after.join_terminal_debt[unmatched], 1, "{after:?}");
+    assert_eq!(
+        bytes,
+        prefix_bytes + corpus_bytes(&root),
+        "one refusal and one new attempt"
+    );
+    assert_eq!(group_replays().0, replay.0 + 2);
+    assert!(group_replays().1 > replay.1);
+
     let (_, full) = scan(&root, ScanIndex::default(), 10);
     assert_eq!(fingerprints(&done), fingerprints(&full), "a body accepted");
     fs::remove_dir_all(root).unwrap();
@@ -1754,10 +1850,12 @@ fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
         .get(&local_index_key(&live))
         .is_some_and(|entry| entry.has_unverified_source()));
     with_test_limits(2048, 1024, 64, || {
-        let (_, again) = next_generation(&root, index, &cache, 1);
+        let replay = group_replays();
+        let ((_, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+        assert_eq!(bytes, 0, "no re-read after genuine EOF");
+        assert_eq!(group_replays(), replay);
         assert!(again.snapshots.is_empty());
     });
-    assert_eq!(counters(&cache).groups_started, 1, "no re-read");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1797,12 +1895,6 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
         sampled(&root, ScanIndex::default(), 10, &cache)
     });
     let after = counters(&cache);
-    assert!(after.probe_bound >= 1, "{after:?}");
-    assert_eq!(
-        after.join_terminal_debt[JoinRefusal::ProbeBudgetOrder.slot()],
-        1,
-        "{after:?}"
-    );
     assert_eq!(after.memo_records, 0, "{after:?}");
     assert!(result.snapshots.is_empty());
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
@@ -1935,21 +2027,16 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
     let expected = other(&unpaged);
     assert_eq!(expected.0, 2, "one alias per member");
-    let order = JoinRefusal::ProbeBudgetOrder.slot();
+
     let cache = Arc::new(SharedCache::default());
     with_test_limits(8192, singleton, 64, || {
         let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
-        let shared = counters(&cache);
-        assert_eq!(shared.join_terminal_debt[order], 1, "{shared:?}");
+
         index.traversal = None;
         let (_, joined, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
             completions(&cache) == 1
         });
         let after = counters(&cache);
-        assert_eq!(
-            after.join_terminal_debt[order], 1,
-            "no second refusal: {after:?}"
-        );
         assert_eq!(after.parked_hits, 0, "{after:?}");
         assert_eq!(after.jobs_certified, 1, "{after:?}");
         assert_eq!(other(&joined), expected, "counted once, as unpaged");
@@ -1979,34 +2066,42 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
             counters(&cache).memo_records == 1
         });
         let recorded = counters(&cache);
-        assert_eq!(
-            recorded.join_terminal_debt[JoinRefusal::Corrupt.slot()],
-            1,
-            "{recorded:?}"
-        );
-        assert_eq!(recorded.groups_started, 1, "{recorded:?}");
+        let replay = group_replays();
         // A large singleton takes the slot and pauses in it.
         write_rows(
             &root.join("sessions/s.jsonl"),
             &chain_rows(OTHER, "s", "2026-10-01T11:00:00Z", 0, 30),
         );
-        let (mut index, _, _) = pages(&root, index, &cache, || {
-            counters(&cache).jobs_paused > recorded.jobs_paused
+        let ((mut index, _, _), prefix_bytes) = observe_consumed(|| {
+            pages(&root, index, &cache, || {
+                counters(&cache).jobs_paused > recorded.jobs_paused
+            })
         });
         let paused = counters(&cache);
         assert_eq!(completions(&cache), 0, "{paused:?}");
         // The next generation: the group's lookup runs while `s` holds it.
         index.traversal = None;
-        let _ = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
-            counters(&cache).group_memo_hits == 1 && completions(&cache) == 1
+        let (_, bytes) = observe_consumed(|| {
+            pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
+                completions(&cache) == 1
+            })
         });
+        assert_eq!(
+            group_replays(),
+            replay,
+            "no group job or group replay bytes"
+        );
+        assert_eq!(
+            prefix_bytes + bytes,
+            fs::metadata(root.join("sessions/s.jsonl")).unwrap().len(),
+            "only the singleton reads, once"
+        );
         let after = counters(&cache);
         assert_eq!(after.deferred, paused.deferred, "{after:?}");
         assert_eq!(
             after.deferred_rotation, paused.deferred_rotation,
             "{after:?}"
         );
-        assert_eq!(after.groups_started, 1, "no group job: {after:?}");
         assert_eq!(cache.rotation_waiters_for_test(), 0, "{after:?}");
     });
     fs::remove_dir_all(root).unwrap();
@@ -2472,10 +2567,18 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
         let root = paged_corpus("wake-content");
         let cache = Arc::new(SharedCache::default());
         with_test_limits(2048, 1024, 64, || {
-            let (index, _) =
-                with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
+            let ((index, _), first_bytes) = observe_consumed(|| {
+                with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache))
+            });
+            assert!(
+                first_bytes > 0 && first_bytes < corpus_bytes(&root),
+                "one partial attempt"
+            );
             assert_eq!(counters(&cache).jobs_state_bound, 1);
-            let (index, _) = next_generation(&root, index, &cache, 1);
+            let replay = group_replays();
+            let ((index, _), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+            assert_eq!(bytes, 0, "{change}: unchanged parked group never retries");
+            assert_eq!(group_replays(), replay);
             assert_eq!(counters(&cache).parked_hits, 1);
             let path = root.join(if change == "chmod_live" {
                 "sessions/b.jsonl"
@@ -2521,14 +2624,44 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                     assert_eq!(before.modified().unwrap(), after.modified().unwrap());
                 }
             }
-            let _ = next_generation(&root, index, &cache, 2);
+            let ((index, _), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 2));
             let after = counters(&cache);
             if change.starts_with("chmod") {
-                assert_eq!(after.groups_started, 1, "{change}: zero wakes: {after:?}");
                 assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
+                assert_eq!(bytes, 0, "{change}: zero wakes");
+                assert_eq!(group_replays(), replay);
+            } else if change == "poison_replace_sealed" {
+                // A poisoned retained-cache lock makes the resumed state
+                // unmeasurable: the one fresh attempt hits the state bound
+                // again instead of remaining paused or completing unpaged.
+                assert_eq!(after.parked_hits, 1, "{change}: must wake");
+                assert_eq!(after.jobs_state_bound, 2, "{change}: one new bound attempt");
+                assert!(
+                    bytes > 0 && bytes <= first_bytes,
+                    "{change}: at most one bounded partial-prefix read: {bytes}/{first_bytes}"
+                );
+                assert!(cache.paused_group_position().is_none());
+                assert_eq!(
+                    group_replays(),
+                    replay,
+                    "the partial attempt never completes"
+                );
             } else {
-                assert_eq!(after.groups_started, 2, "{change}: must wake: {after:?}");
                 assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
+                assert!(bytes > 0, "{change}: must wake");
+                assert!(cache.paused_group_position().is_some());
+                let (_, rest) = observe_consumed(|| {
+                    pages_at(&root, index, &cache, "2026-10-06T23:02:00Z", || {
+                        completions(&cache) > 0
+                    })
+                });
+                assert_eq!(
+                    bytes + rest,
+                    corpus_bytes(&root),
+                    "{change}: one new attempt"
+                );
+                assert_eq!(group_replays().0, replay.0 + 1, "{change}: one completion");
+                assert!(group_replays().1 > replay.1);
             }
         });
         fs::remove_dir_all(root).unwrap();

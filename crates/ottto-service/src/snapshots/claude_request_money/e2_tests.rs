@@ -826,7 +826,6 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     index_key: &local_index_key(&off_page),
                     source_file_fingerprint: &"a".repeat(64),
                     census_window_end: "2026-08-02T09:00:00Z",
-                    held_index_keys: &Default::default(),
                     complete: true,
                     lossy: false,
                     source_verified: true,
@@ -834,7 +833,6 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 1,
-                    accepted_recovery_member: false,
                 },
                 &[held],
             );
@@ -1214,7 +1212,7 @@ fn e2_diagnostic_fields_are_nonzero_only() {
             "copy_prefix_unproven_priced_requests":2,"copy_prefix_unproven_cost_micros":700})
     );
     assert_eq!(
-        serde_json::to_value(Counts::removal_store(3, 0)).unwrap(),
+        serde_json::to_value(Counts::removal_store(3)).unwrap(),
         json!({"copy_removal_stored":3})
     );
 }
@@ -4512,9 +4510,8 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
             .unwrap();
             let mut index =
                 crate::snapshots::publish_state_v2_for_test(&index, &index_path, progress);
-            assert!(crate::snapshots::sampled_audit::growth_retirement_excluded(
-                &index, &key
-            ));
+            assert!(crate::snapshots::sampled_audit::growth_active(&index));
+            assert!(index.v2().growth_retention.contains_key(&key));
             let debt = index.v2().growth_retention.clone();
             let replacement = root.join("replacement");
             fs::write(&replacement, b"{\"requestId\":\"new\"}\n").unwrap();

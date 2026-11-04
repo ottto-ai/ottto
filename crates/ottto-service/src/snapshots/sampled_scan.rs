@@ -564,9 +564,12 @@ pub(super) struct Active {
     /// guard compares it at completion.
     pub(super) retained_usage: Option<u64>,
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
+    /// This read is a protected-tier replay: a non-Full read found protected
+    /// tiers and re-reads the file from its start (D168 `tier_prefix_replay`).
+    pub(super) tier_prefix_replay: bool,
 }
 crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
-    retained_finalization_charge, retained_usage, reinsertion);
+    retained_finalization_charge, retained_usage, reinsertion, tier_prefix_replay);
 
 impl Context {
     #[inline(never)]
@@ -2108,10 +2111,6 @@ pub(super) mod test_hooks {
 
     pub(in crate::snapshots) fn record_bucket(bucket: super::sampled_jsonl::Bucket) {
         BUCKETS.with(|buckets| buckets.borrow_mut().push(bucket));
-    }
-
-    pub(in crate::snapshots) fn buckets() -> Vec<super::sampled_jsonl::Bucket> {
-        BUCKETS.with(|buckets| buckets.borrow().clone())
     }
 
     /// A census unreadable cause, by its `UnreadableCause` ordinal.

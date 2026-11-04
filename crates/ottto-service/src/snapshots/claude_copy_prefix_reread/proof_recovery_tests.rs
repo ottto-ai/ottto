@@ -316,7 +316,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         index.save(&chain.home.join("scan-index.json")).unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
         assert!(chain.prepare(&mut index).is_empty());
-        assert!(index.copy_prefix_recovery_scope.is_empty());
         let temp = chain.support.join("same-request.json");
         fs::write(&temp, serde_json::to_vec(&request).unwrap()).unwrap();
         fs::rename(temp, &request_path).unwrap();
@@ -332,7 +331,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         legacy.nonce = None;
         fs::write(&request_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(chain.prepare(&mut index).is_empty());
-        assert!(index.copy_prefix_recovery_scope.is_empty());
 
         let replacement = publish(&chain.home, &chain.support, true);
         assert_ne!(replacement.nonce, index.copy_prefix_last_accepted_nonce);
@@ -346,8 +344,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
         let key = local_index_key(path);
         let fingerprint = index.files[&key].source_file_fingerprint.clone();
         // A complete but non-Full itemless parse is identity-incomplete; the
-        // prepared recovery scope authorizes its revival.
-        let accepted_recovery_member = index.copy_prefix_recovery_scope.contains(path);
+        // re-parse rebuilds the retired record (no retirement carries over).
         census::record_claude_request_census(
             &mut index,
             census::ClaudeRequestCensusParse {
@@ -355,7 +352,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
                 index_key: &key,
                 source_file_fingerprint: &fingerprint,
                 census_window_end: SCAN_AT,
-                held_index_keys: &Default::default(),
                 complete: true,
                 lossy: false,
                 source_verified: false,
@@ -363,7 +359,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
                 itemless_request_hashes: vec![census::claude_request_hash("request-0")],
                 opened_birth: None,
                 modified_unix_seconds: rfc3339_unix_seconds("2026-06-15T00:00:00Z").unwrap(),
-                accepted_recovery_member,
             },
             &[],
         );
@@ -401,12 +396,10 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
         chain.prepare(&mut index);
         index.save(&chain.home.join("scan-index.json")).unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
-        assert!(index.copy_prefix_recovery_scope.is_empty());
         index = state_v2::money_test_support::roundtrip(
             &index,
             &chain.home.join("nonce.v2.sqlite.import"),
         );
-        assert!(index.copy_prefix_recovery_scope.is_empty());
         assert_eq!(
             chain.prepare(&mut index).len(),
             6,
