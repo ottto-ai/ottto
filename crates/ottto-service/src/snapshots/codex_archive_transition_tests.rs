@@ -939,9 +939,14 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     cold_plain
         .snapshots
         .retain(|item| item.source_session_id != MAIN);
+    let key = local_index_key(&compressed);
+    let mut plain_cold_index = cold_index.clone();
+    plain_cold_index.files.remove(&key);
+    let mut plain_working = working.clone();
+    plain_working.files.remove(&key);
     money_oracle::assert_equivalent(
-        &emitted(&cold_index, &cold_plain),
-        &emitted(&working, &refused),
+        &emitted(&plain_cold_index, &cold_plain),
+        &emitted(&plain_working, &refused),
     );
     let (index, posts) = working.checkpoint_with_captured_posts(&refused, &prior, "accept");
     assert_eq!(posts.len(), 1);
@@ -990,9 +995,13 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     cold_main
         .snapshots
         .retain(|item| item.source_session_id == MAIN);
+    let mut main_cold_index = cold_index.clone();
+    main_cold_index.files.retain(|path, _| *path == key);
+    let mut main_working = working.clone();
+    main_working.files.retain(|path, _| *path == key);
     money_oracle::assert_equivalent(
-        &emitted(&cold_index, &cold_main),
-        &emitted(&working, &funded),
+        &emitted(&main_cold_index, &cold_main),
+        &emitted(&main_working, &funded),
     );
     let (index, posts) = working.checkpoint_with_captured_posts(&funded, &before, "accept");
     assert_eq!(posts.len(), 1);
@@ -1067,6 +1076,18 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
     cold.snapshots.retain(|item| item.source_session_id == MAIN);
     let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
     assert_eq!(posts.len(), 1, "only the new plaintext usage publishes");
-    money_oracle::assert_equivalent(&emitted(&cold_index, &cold), &route(&index, &scan, posts));
+    assert_eq!(
+        serde_json::to_value(&index.files[&compressed_key]).unwrap(),
+        carried
+    );
+    let plain_key = local_index_key(&plain);
+    let mut cold_index = cold_index;
+    cold_index.files.retain(|path, _| *path == plain_key);
+    let mut published_index = index;
+    published_index.files.retain(|path, _| *path == plain_key);
+    money_oracle::assert_equivalent(
+        &emitted(&cold_index, &cold),
+        &route(&published_index, &scan, posts),
+    );
     drop(session);
 }
