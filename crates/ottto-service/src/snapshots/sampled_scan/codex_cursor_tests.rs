@@ -5836,7 +5836,7 @@ fn join_charge(owner: &str, members: &[CandidateFile]) -> usize {
 
 /// Boundary requests must use the least cursor state admission can reach.
 /// Real scan pages also warm optional header facts; those can yield before
-/// provenance or retained copies, and are not a mandatory floor.
+/// provenance, and are not a mandatory floor.
 /// Keep `cursor_resident` whole so no-eviction assertions still include them.
 fn cursor_without_header_facts(cache: &SharedCache) -> usize {
     let headers = cache

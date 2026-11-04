@@ -369,6 +369,13 @@ impl HeaderCache {
             .and_then(|()| header.heap_bound(&mut c))
             .map_or(usize::MAX, |()| c.bytes)
     }
+    /// The header facts' resident bytes (tests: the yieldable share).
+    #[cfg(test)]
+    pub(in crate::snapshots) fn optional_bytes(&self) -> Option<usize> {
+        crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
+            .checked_mul(self.entries.len())?
+            .checked_add(self.heap_bytes)
+    }
     pub(in crate::snapshots) fn charge(
         &self,
         c: &mut crate::heap_layout_bound::Counter,
