@@ -174,7 +174,11 @@ impl ScanIndex {
                     && codex_session_id_candidates_from_path(path)
                         .iter()
                         .any(|session| codex_protected_owner(session) == owner)
-                    && absent(path))
+                    && (absent(path)
+                        || codex_file_join::shadowed_compressed_path(
+                            path,
+                            &BTreeSet::from([to.clone()]),
+                        )))
                 .then(|| (from.clone(), root.to_path_buf(), owner.to_owned()))
             })
             .collect();
@@ -256,7 +260,12 @@ impl ScanIndex {
         // Bracket the metadata-only proof, including predecessor absence.
         let reopened = open_candidate_beneath_root(candidate)?;
         ensure!(
-            OpenStamp::capture(&reopened)?.content_stamp() == stamp && absent(old_path),
+            OpenStamp::capture(&reopened)?.content_stamp() == stamp
+                && (absent(old_path)
+                    || codex_file_join::shadowed_compressed_path(
+                        old_path,
+                        &BTreeSet::from([to.clone()])
+                    )),
             "codex_carry_changed"
         );
         ensure!(

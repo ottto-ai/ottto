@@ -99,8 +99,10 @@ impl<R: Read> BoundedDecoder<R> {
         #[cfg(test)]
         super::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
-        let mut context = DecoderContext::new(reserved.saturating_sub(BUFFER_BYTES))
-            .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;
+        let mut context =
+            DecoderContext::new(reserved.saturating_sub(BUFFER_BYTES)).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, CodexZstCause::AdmissionRefused)
+            })?;
         context
             .set_window_log(WINDOW_LOG)
             .map_err(|_| invalid("cannot bound compressed rollout window"))?;

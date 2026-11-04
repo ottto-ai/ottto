@@ -3088,7 +3088,6 @@ pub struct ScanIndex {
     claude_account_window_retention: account_pending_retention::Counts,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
-    #[serde(skip)]
     withheld_memo: withheld_account::Memo,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
@@ -3594,9 +3593,7 @@ pub struct ScanIndex {
         skip_serializing_if = "upload_context_receipt::ProofState::is_empty"
     )]
     pub(crate) upload_context_proof: upload_context_receipt::ProofState,
-    // Append persisted fields so every older positional slot stays stable.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    // Retired archive fields retain their frozen decode/catalogue slots.
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,

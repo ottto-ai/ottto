@@ -711,7 +711,9 @@ impl HeaderInventory {
                             candidate,
                         );
                     }
-                    self.pending.push_front(PathBuf::from(&key));
+                    // The ordinary queue owns the next attempt. Finish this
+                    // inventory as incomplete so paused readers can release credit.
+                    self.complete = false;
                     return false;
                 }
                 if let Some(cache) = cache {
@@ -2184,6 +2186,9 @@ pub(super) mod tests {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let mut inventory =
             HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
+        // Funding returns on an ordinary later attempt, not by spinning this
+        // inventory while a suspended reader still owns mandatory credit.
+        let mut inventory = HeaderInventory::new(&[sessions.clone()], &paths, Some(&directories));
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
         assert!(inventory.complete);
         assert_eq!(inventory.headers.len(), 1);
@@ -2191,9 +2196,10 @@ pub(super) mod tests {
         assert_eq!(inventory.owner_for_path(&compressed), None);
 
         let paths = BTreeSet::from([local_index_key(&compressed)]);
-        let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
+        let mut inventory = HeaderInventory::new(&[sessions.clone()], &paths, Some(&directories));
         assert!(!inventory.step_encoded(&metadata, None));
-        assert_eq!(inventory.pending, VecDeque::from([compressed.clone()]));
+        assert!(inventory.pending.is_empty());
+        assert!(!inventory.complete);
         assert!(inventory.headers.is_empty());
         assert!(inventory.refused.is_empty());
         assert_eq!(inventory.read_bytes, 0);
