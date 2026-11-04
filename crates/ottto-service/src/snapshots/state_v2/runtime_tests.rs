@@ -2,6 +2,7 @@
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 /// Release synthetic custody and its registry slot when a fixture is finished.
 pub(in crate::snapshots) fn erase_published(path: &Path) {

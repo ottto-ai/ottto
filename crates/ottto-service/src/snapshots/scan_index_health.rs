@@ -73,10 +73,7 @@ pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
                 | Hold::ForeignBinding
                 | Hold::FenceLost
                 | Hold::ReferenceDrift => Reason::ShardUnavailable,
-                Hold::MigrationFailed
-                | Hold::ReloadRequired
-                | Hold::SaveFull
-                | Hold::AckCustody => Reason::Retrying,
+                Hold::MigrationFailed | Hold::ReloadRequired | Hold::SaveFull => Reason::Retrying,
             });
         }
         if cause.to_string() == INTEGRITY_REPAIR {
