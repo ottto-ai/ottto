@@ -3706,6 +3706,8 @@ pub(super) mod tests {
         let mut previous =
             working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
         assert_eq!(previous.files.len(), 50);
+        // The same index with only its real receipts: below the former aggregate.
+        let below = previous.clone();
         let group =
             ["a", "b"].map(|name| local_index_key(&root.join(format!("sessions/{name}.jsonl"))));
         let full = full_receipt(
@@ -3735,19 +3737,38 @@ pub(super) mod tests {
         }
         fs::write(&path, text).unwrap();
         let (after, rescanned) = scan(&root, previous, 64);
+        let (below_after, below_rescanned) = scan(&root, below, 64);
         assert_eq!(rescanned.ownership_incomplete_file_count, 0);
-        assert!(
-            !rescanned.snapshots.is_empty(),
-            "the protected group is emitted"
-        );
+        assert!(rescanned.census_complete);
+        assert_eq!(rescanned.snapshots.len(), 2, "one alias per group member");
         assert!(rescanned
             .snapshots
             .iter()
-            .all(|item| item.source_session_id == owner));
-        assert!(after
-            .traversal
-            .as_ref()
-            .map_or(true, |traversal| traversal.residue.index_keys.is_empty()));
+            .all(|item| item.source_session_id == owner && item.input_tokens == 500));
+        // Exact tokens and body: identical to the run below the former aggregate.
+        assert_eq!(
+            rescanned
+                .snapshots
+                .iter()
+                .map(|item| serde_json::to_value(item).unwrap())
+                .collect::<Vec<_>>(),
+            below_rescanned
+                .snapshots
+                .iter()
+                .map(|item| serde_json::to_value(item).unwrap())
+                .collect::<Vec<_>>()
+        );
+        // A protected group defers traversal retirement to the capture
+        // boundary, so the traversal is still present, with no residue.
+        for index in [&after, &below_after] {
+            assert!(index
+                .traversal
+                .as_ref()
+                .expect("retirement waits for the capture boundary")
+                .residue
+                .index_keys
+                .is_empty());
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
