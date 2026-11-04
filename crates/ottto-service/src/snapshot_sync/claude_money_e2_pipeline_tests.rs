@@ -984,6 +984,10 @@ fn ready(
 ) -> Page {
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
+    deliver_page(p)
+}
+/// Upload `p`'s final bodies once and keep their exact ACKs (`delivered`).
+fn deliver_page(mut p: Page) -> Page {
     let mut send = twin(&p);
     send.finish();
     let mut progress = e2_progress();
@@ -2033,8 +2037,9 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
     });
 }
 
-/// [`ready`] under a cycle with the cache mode off: the production upload
-/// seam keeps no cache rows, so a retry copy is an ordinary owned body.
+/// [`ready`] under a cycle with the cache mode off: as in production, the
+/// upload seam drops the cache rows before delivery, so each ACK proves the
+/// body the page keeps and a retry copy is an ordinary owned body.
 fn ready_without_cache(
     corpus: &Corpus,
     scanner: &E2ScanFixture,
@@ -2042,11 +2047,12 @@ fn ready_without_cache(
     limit: usize,
     sampled: bool,
 ) -> Page {
-    let mut page = ready(corpus, scanner, index, limit, sampled);
+    let mut page = corpus.raw(scanner, index, limit, sampled, &[]);
+    page.enrich(corpus);
     for snapshot in &mut page.scan.snapshots {
         prepare_snapshot_cache_for_upload(snapshot, &e2_progress(), false, false, &BTreeSet::new());
     }
-    page
+    deliver_page(page)
 }
 
 fn retry_case(conflict: bool) {
