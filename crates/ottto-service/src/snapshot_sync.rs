@@ -22866,12 +22866,20 @@ mod tests {
         captured: Arc<Mutex<Vec<String>>>,
         hints: Vec<(u64, &'static str)>,
     ) -> String {
+        snapshot_status_server_with_hint_extras_and_batch(captured, hints, None)
+    }
+
+    fn snapshot_status_server_with_hint_extras_and_batch(
+        captured: Arc<Mutex<Vec<String>>>,
+        hints: Vec<(u64, &'static str)>,
+        batch: Option<Vec<SnapshotItem>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
             let receipt_count = hints.len();
             let mut hints = hints.into_iter();
-            for _ in 0..receipt_count * 3 {
+            for _ in 0..receipt_count * 3 + usize::from(batch.is_some()) {
                 let (mut stream, _) = listener.accept().expect("accept snapshot status request");
                 let request = read_complete_http_request(&mut stream);
                 let body = if request.contains("/telemetry/devices/") {
@@ -22881,6 +22889,21 @@ mod tests {
                         .push(request);
                     r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
                         .to_string()
+                } else if request.contains("/agent-session-snapshots/batches") {
+                    let items = batch.as_ref().expect("expected snapshot upload");
+                    let entities = items.iter().map(|item| {
+                        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                        serde_json::json!({"source_session_id":item.source_session_id,
+                            "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                            "body_witness_version":version,
+                            "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
+                    }).collect::<Vec<_>>();
+                    captured.lock().unwrap().push(request);
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                        "accepted_entities":entities})
+                    .to_string()
                 } else if request.contains("/activity-hints") {
                     let (hint, extra) = hints.next().expect("one hint per receipt");
                     format!(

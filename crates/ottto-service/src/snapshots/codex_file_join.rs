@@ -4382,15 +4382,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         while !inventory.step_cached(&CodexTitleMetadata::default(), Some(cache)) {}
         inventory
     }
-    fn assert_charge(cache: &HeaderCache) {
-        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-        let mut summary = Counter::new(usize::MAX);
-        cache.charge(&mut summary).unwrap();
-        let mut walked = Counter::new(usize::MAX);
-        cache.completed_heap_bound(&mut walked).unwrap();
-        assert_eq!(summary.bytes, walked.bytes);
-        assert!(summary.visits_for_test() < 10);
-    }
+
     fn paths(inventory: &HeaderInventory) -> BTreeSet<String> {
         inventory
             .headers

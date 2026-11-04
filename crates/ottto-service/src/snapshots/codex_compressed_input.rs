@@ -464,7 +464,7 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(decoder.context.allocation_refusals(), 1);
         let repeated = decoder.read(&mut [0; 1]).unwrap_err();
         for failure in [&error, &repeated] {
-            assert_eq!(failure.kind(), io::ErrorKind::Other);
+            assert_eq!(failure.kind(), io::ErrorKind::WouldBlock);
         }
 
         // A resource failure is retryable ordinary acquisition, never a
@@ -916,6 +916,7 @@ pub(in crate::snapshots) mod tests {
     /// [money] Native and archive placement preserve own creator evidence and
     /// an evidence gap; every row retains its resolved evidence and remainder.
     #[test]
+    #[serial_test::serial]
     #[serial_test::serial(source_cadences, source_manifests, client_report)]
     fn compressed_equals_plain_money_oracle() {
         archive_native_placement_preserves_resolved_evidence_and_untagged_remainder();

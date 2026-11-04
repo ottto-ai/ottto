@@ -27,7 +27,13 @@ impl ScanIndex {
         if route.is_none() {
             std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
         }
-        let mut progress = test_upload_progress();
+        let expected = test_upload_progress();
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &expected.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
         progress.context_receipt_candidates =
             index.file_upload_context_ack_candidates(&scan.snapshots);
         progress.save(&progress_path).unwrap();
@@ -117,7 +123,7 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         "retired policy has no live cause"
     );
     assert!(!causes.contains("unattributed"));
-    let root = crate::test_scratch::ScratchDir::new("archive-backfill-isolation");
+    let root = crate::test_scratch::ScratchDir::canonical("archive-backfill-isolation");
     let support = root.join("support");
     let secrets = root.join("secrets");
     std::fs::create_dir_all(&support).unwrap();
@@ -126,7 +132,11 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
     let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
     let _manifests = SourceManifestTestGuard::new();
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let url = snapshot_status_server(captured.clone());
+    let url = snapshot_status_server_with_hint_extras_and_batch(
+        captured.clone(),
+        vec![(30, "")],
+        Some(scan.snapshots.clone()),
+    );
     let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &url);
     let client = SnapshotApiClient::new(url);
     let device = LocalDeviceBinding {
@@ -144,7 +154,7 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
     let daemon = test_daemon("otm_test");
     let path = support.join("index.json");
     std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
-    let progress_path = support.join("progress.json");
+    let progress_path = snapshot_upload_progress_path(&path);
     let mut progress = SnapshotUploadProgress::new(
         destination.clone(),
         snapshot_quarantine_witness(SnapshotSource::Codex),
