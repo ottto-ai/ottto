@@ -213,7 +213,7 @@ fn bootstrap_cache_heads_with_budget(
                 |item| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |item| Some(item.source_session_id.as_str()),
-                |_| false,
+                |_| 0,
                 |_| None,
                 inplace_retry,
                 |items| upload(items, enforce_head_cas),
@@ -1346,6 +1346,20 @@ fn identity_cache_wire_reserve(
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
+}
+
+/// Request class of one main-upload body: 2 for a legacy reconciliation,
+/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
+/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
+/// for a whole request when one body carries a patch, so the packer never
+/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
+/// with a server head it never claimed.
+fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+    if legacy {
+        2
+    } else {
+        u8::from(snapshot.cache_observations.is_some())
+    }
 }
 
 /// Answer each owed head-CAS challenge on the outgoing body of its session.
@@ -8370,7 +8384,12 @@ fn finish_sync_source(
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
-            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            |snapshot| {
+                snapshot_upload_batch_class(
+                    snapshot,
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+                )
+            },
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
@@ -10838,7 +10857,7 @@ where
         fingerprint,
         body_witness,
         |_| None,
-        |_| false,
+        |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
         upload,
@@ -11296,9 +11315,9 @@ pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
 /// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
 /// group. A single body over the byte bound is its own group and meets the
 /// existing request preflight.
-fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+fn literal_family_groups(members: Vec<(usize, usize, u8)>) -> Vec<Vec<(usize, usize, u8)>> {
     let mut groups = Vec::new();
-    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut group = Vec::<(usize, usize, u8)>::new();
     let mut bytes = 2usize;
     for member in members {
         if !group.is_empty()
@@ -11349,7 +11368,7 @@ where
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
-    BatchClass: Fn(&T) -> bool,
+    BatchClass: Fn(&T) -> u8,
     LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -11464,9 +11483,11 @@ where
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so
     // without literal items (gate off) packing is the previous order.
-    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
-    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
-    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
+    // Each unit also carries its family key: the class of its family's first
+    // group, or its own class for a single body (see the class sort below).
+    let mut order = Vec::<(usize, usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<(usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, u8)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
         let item = (
             index,
@@ -11477,7 +11498,7 @@ where
             Some(root) => literal_families.entry(root).or_default().push(item),
             None => {
                 order.push(item);
-                unit_ends.push(order.len());
+                unit_ends.push((order.len(), item.2));
             }
         }
     }
@@ -11486,15 +11507,16 @@ where
             let member = session_id(&items[*index]);
             (member != Some(root), member)
         });
+        let family_key = members[0].2;
         for group in literal_family_groups(members) {
             order.extend(group);
-            unit_ends.push(order.len());
+            unit_ends.push((order.len(), family_key));
         }
     }
     let mut units = Vec::with_capacity(unit_ends.len());
     let mut start = 0;
-    for end in unit_ends {
-        units.push(order[start..end].to_vec());
+    for (end, family_key) in unit_ends {
+        units.push((order[start..end].to_vec(), family_key));
         start = end;
     }
     // Preserve the native census/family selection. At this transport boundary
@@ -11502,22 +11524,29 @@ where
     // body shares a request (and its retry latency) with context catch-up.
     let mut ordinary_units = Vec::new();
     let mut catchup_units = Vec::new();
-    for unit in units {
+    for (unit, family_key) in units {
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             progress
                 .context_resend
                 .is_catchup(fingerprint(&items[*index]))
         });
         if !ordinary.is_empty() {
-            ordinary_units.push(ordinary);
+            ordinary_units.push((ordinary, family_key));
         }
         if !catchup.is_empty() {
-            catchup_units.push(catchup);
+            catchup_units.push((catchup, family_key));
         }
     }
+    // A request declares head CAS when any body in it carries a cache patch,
+    // so every request is class-pure: an unpatched body never travels under
+    // another body's CAS contract. Stable-sort each lane by family key so
+    // single bodies form one run per class, each family's groups stay
+    // contiguous and root first, and a single-class page keeps its order.
+    ordinary_units.sort_by_key(|(_, family_key)| *family_key);
+    catchup_units.sort_by_key(|(_, family_key)| *family_key);
     let ordinary_entities = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .map(|(index, _, _)| fingerprint(&items[*index]))
         .collect::<BTreeSet<_>>();
     // A bootstrap invocation sees only its probes. It cannot send catch-up
@@ -11527,7 +11556,7 @@ where
         .ordinary_work_is_in(&ordinary_entities);
     let ordinary_bytes = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .fold(0usize, |sum, (_, bytes, _)| {
             sum.saturating_add(bytes.saturating_add(2))
         });
@@ -11540,11 +11569,11 @@ where
         .reserve_ordinary_bytes(ordinary_bytes);
     let mut unit_ends = Vec::new();
     order.clear();
-    for unit in ordinary_units {
+    for (unit, _) in ordinary_units {
         order.extend(unit);
         unit_ends.push((order.len(), false));
     }
-    for unit in catchup_units {
+    for (unit, _) in catchup_units {
         let start = order.len();
         for item in unit {
             if ordinary_in_this_call
@@ -18460,7 +18489,7 @@ mod tests {
             String::as_str,
             |item| item.clone(),
             |_| None,
-            |item| reconcile_class.contains(item),
+            |item| 2 * u8::from(reconcile_class.contains(item)),
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {

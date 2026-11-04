@@ -80,7 +80,7 @@ fn actual_batches(
         |item| item.fingerprint.as_str(),
         |item| item.fingerprint.clone(),
         |_| None,
-        |item| item.class,
+        |item| u8::from(item.class),
         |_| None,
         &mut InplaceRetryBudget::default(),
         |batch| {
@@ -251,7 +251,7 @@ fn snapshot_packing_count_serialization_failure_keeps_local_error_and_no_upload(
         |item| item.fingerprint.as_str(),
         |item| item.fingerprint.clone(),
         |_| None,
-        |_| false,
+        |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
         |_| {

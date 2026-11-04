@@ -1071,3 +1071,774 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     );
     assert!(index.head_conflict_owed(&key));
 }
+
+// Upload request split by cache-patch class. The client declares head CAS for
+// a whole request when one body carries a cache patch, so an unpatched body
+// sent beside a patched one used to travel under CAS with no base, conflict
+// with its server head, and owe a challenge it could never answer.
+
+use crate::snapshots::cache_observations::CacheObservations;
+
+fn fresh_progress() -> SnapshotUploadProgress {
+    SnapshotUploadProgress::new(
+        "a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+}
+
+fn complete_empty() -> CacheObservations {
+    CacheObservations {
+        schema_version: 1,
+        operations: Vec::new(),
+        coverage: "complete".into(),
+        omitted_observation_count: None,
+    }
+}
+
+/// The fixture body as session `name`, carrying `patch` (None: unpatched,
+/// as a birth- or cap-withheld body or an unproven Codex body is).
+fn body(name: &str, patch: Option<CacheObservations>) -> SnapshotItem {
+    let mut item = item();
+    item.source_session_id = name.into();
+    if patch.is_none() {
+        item.cache_observations_state = None;
+    }
+    item.cache_observations = patch;
+    item.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
+    item
+}
+
+/// A changed revision of `item` (new usage), same session and patch class.
+fn revised(item: &SnapshotItem, step: u64) -> SnapshotItem {
+    let mut item = item.clone();
+    item.avg_duration_ms = Some(item.avg_duration_ms.unwrap_or_default() + step);
+    item.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
+    item
+}
+
+/// The observed seed: an owed challenge, no saved base or cache state, and
+/// no answer attempt.
+fn owe(progress: &mut SnapshotUploadProgress, item: &SnapshotItem, challenge: String) {
+    progress.head_conflict_challenges.insert(
+        cache_session_key(&item.source_session_id),
+        HeadConflictChallenge {
+            challenge,
+            stale_revision_v2_hash: revision_v2(item),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+}
+
+fn sessions(wire: &Value) -> Vec<String> {
+    wire["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|body| body["source_session_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A backend-shaped head store for the daemon rows; real HTTP and Postgres
+/// admission is the backend's own receiver test. An ordinary request skips
+/// CAS. Under the head-CAS contract a changed body whose base is not the
+/// current head conflicts with a fresh challenge unless it answers the
+/// current one. An exact repeat is unchanged; a conflict stores nothing.
+#[derive(Clone, Default)]
+struct HeadStore {
+    /// session -> (head etag, stored body witness)
+    heads: BTreeMap<String, (String, String)>,
+    challenges: BTreeMap<String, String>,
+    minted: u64,
+    stored: Vec<String>,
+}
+
+impl HeadStore {
+    fn mint(&mut self) -> String {
+        self.minted += 1;
+        format!("{:064x}", 0x1000 + self.minted)
+    }
+
+    /// The server already holds an older body of `session`.
+    fn seed(&mut self, session: &str) -> String {
+        let head = self.mint();
+        self.heads
+            .insert(session.into(), (head.clone(), "older".into()));
+        head
+    }
+
+    fn post(&mut self, request: &SnapshotBatchRequest, wire: &Value) -> SnapshotBatchResponse {
+        let cas = wire["head_cas_contract"].is_string();
+        let mut ack = empty_ack();
+        for (item, sent) in request
+            .snapshots
+            .iter()
+            .zip(wire["snapshots"].as_array().unwrap())
+        {
+            let envelope = &sent["semantic_envelope"];
+            let witness = snapshot_upload_body_witness(item);
+            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+            let echo = SnapshotEntityRef {
+                body_witness_version: version,
+                body_witness_digest: version.map(|_| witness.clone()),
+                ..reference(item)
+            };
+            let session = item.source_session_id.clone();
+            if let Some((head, held)) = self.heads.get(&session).cloned() {
+                if held == witness {
+                    ack.accepted += 1;
+                    ack.unchanged_entities.push(SnapshotEntityRef {
+                        head_etag: cas.then_some(head),
+                        ..echo
+                    });
+                    continue;
+                }
+                let answer = envelope["conflict_head_challenge"].as_str();
+                let answered =
+                    answer.is_some() && answer == self.challenges.get(&session).map(String::as_str);
+                if cas && envelope["base_head_etag"].as_str() != Some(head.as_str()) && !answered {
+                    let challenge = self.mint();
+                    self.challenges.insert(session, challenge.clone());
+                    ack.conflict_entities.push(SnapshotEntityRef {
+                        head_challenge: Some(challenge),
+                        ..reference(item)
+                    });
+                    continue;
+                }
+            }
+            let head = self.mint();
+            self.heads.insert(session.clone(), (head.clone(), witness));
+            self.challenges.remove(&session);
+            self.stored.push(session);
+            ack.accepted += 1;
+            ack.accepted_entities.push(SnapshotEntityRef {
+                head_etag: cas.then_some(head),
+                ..echo
+            });
+        }
+        ack
+    }
+}
+
+/// One production-shaped main-upload page over several sessions: each saved
+/// base, owed answers, the batch `class`, the client's wire (head CAS when a
+/// body carries a patch, or for a legacy page), the normal ACK validator and
+/// conflict binding, and page settlement saved at each page boundary.
+fn page_with_class(
+    progress: &mut SnapshotUploadProgress,
+    items: &[SnapshotItem],
+    legacy: &BTreeSet<String>,
+    class: impl Fn(&SnapshotItem) -> u8,
+    mut server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Vec<Value>) {
+    let root = crate::test_scratch::ScratchDir::new("class-split-page");
+    let path = root.join("progress.json");
+    let mut durable = progress.clone();
+    durable.generation = 0;
+    durable.save(&path).unwrap();
+    progress.generation = durable.generation;
+    let mut items = items.to_vec();
+    for item in &mut items {
+        item.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&item.source_session_id))
+            .cloned();
+        progress
+            .active_quarantine_retries
+            .insert(item.snapshot_fingerprint.clone());
+    }
+    attach_head_conflict_answers(&mut items, progress, current_unix_seconds());
+    let mut wires = Vec::new();
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_literal_families(
+        &items,
+        SCOPE,
+        progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |item| Some(item.source_session_id.as_str()),
+        class,
+        |_| None,
+        &mut InplaceRetryBudget::default(),
+        |batch| {
+            let request = request(batch);
+            let reconcile = request
+                .snapshots
+                .iter()
+                .all(|item| legacy.contains(&item.snapshot_fingerprint));
+            let wire = if reconcile {
+                serde_json::to_value(request.wire_with_head_cas())?
+            } else {
+                serde_json::to_value(&request)?
+            };
+            wires.push(wire.clone());
+            let mut response = server(&request, &wire)?;
+            response.validate_entity_ack_with_head_cas(&request, reconcile)?;
+            response.bind_conflict_rescans(&request);
+            Ok(response)
+        },
+        |state| state.save(&path),
+    );
+    progress.active_quarantine_retries.clear();
+    (result, wires)
+}
+
+/// `page_with_class` under the production main-upload class.
+fn page(
+    progress: &mut SnapshotUploadProgress,
+    items: &[SnapshotItem],
+    legacy: &BTreeSet<String>,
+    server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Vec<Value>) {
+    page_with_class(
+        progress,
+        items,
+        legacy,
+        |item| snapshot_upload_batch_class(item, legacy.contains(&item.snapshot_fingerprint)),
+        server,
+    )
+}
+
+/// [money] M1 + R5 + E2: a mixed page (patched, admitted-empty and
+/// partial-empty patches; birth- and cap-withheld unpatched bodies; saved and
+/// missing bases; existing, missing and exact-repeat server heads). Only the
+/// patched request declares head CAS; the ordinary one carries no contract
+/// and no borrowed token, and each entity settles by its own ACK.
+#[test]
+fn mixed_page_sends_each_patch_class_in_its_own_request() {
+    let none = BTreeSet::new();
+    let mut store = HeadStore::default();
+    let mut progress = fresh_progress();
+    let patched = body("m1-patched", Some(item().cache_observations.unwrap()));
+    let empty = body("m1-admitted-empty", Some(complete_empty()));
+    let partial = body(
+        "m1-partial-empty",
+        Some(CacheObservations::partial(Some(2))),
+    );
+    let birth = body("m1-birth-withheld", None);
+    let cap = body("m1-cap-withheld", None);
+    let repeat = body("m1-exact-repeat", None);
+    // Saved bases equal the server heads. The birth-withheld session has a
+    // server head and no base (the observed population); the partial-empty
+    // session is new to the server; the repeat is already stored exactly.
+    for item in [&patched, &empty, &cap] {
+        let head = store.seed(&item.source_session_id);
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(&item.source_session_id), head);
+    }
+    store.seed(&birth.source_session_id);
+    let head = store.mint();
+    store.heads.insert(
+        repeat.source_session_id.clone(),
+        (head, snapshot_upload_body_witness(&repeat)),
+    );
+    let items = [
+        patched.clone(),
+        birth.clone(),
+        empty.clone(),
+        cap.clone(),
+        partial.clone(),
+        repeat.clone(),
+    ];
+    let bases = items
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                progress
+                    .accepted_cache_heads
+                    .get(&cache_session_key(&item.source_session_id))
+                    .cloned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    // Before the split: one patched sibling made the whole request CAS and
+    // the base-less unpatched body conflicted with a challenge.
+    let mut before = progress.clone();
+    let mut old_store = store.clone();
+    let (result, wires) = page_with_class(
+        &mut before,
+        &items,
+        &none,
+        |_| 0,
+        |request, wire| Ok(old_store.post(request, wire)),
+    );
+    assert_eq!(wires.len(), 1);
+    assert!(wires[0]["head_cas_contract"].is_string());
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert!(before
+        .head_conflict_challenges
+        .contains_key(&cache_session_key("m1-birth-withheld")));
+
+    let (result, wires) = page(&mut progress, &items, &none, |request, wire| {
+        Ok(store.post(request, wire))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(wires.len(), 2, "one request per class");
+    assert!(wires[0].get("head_cas_contract").is_none());
+    assert!(wires[1]["head_cas_contract"].is_string());
+    let mut ordinary = sessions(&wires[0]);
+    ordinary.sort();
+    assert_eq!(
+        ordinary,
+        ["m1-birth-withheld", "m1-cap-withheld", "m1-exact-repeat"]
+    );
+    let mut cas = sessions(&wires[1]);
+    cas.sort();
+    assert_eq!(cas, ["m1-admitted-empty", "m1-partial-empty", "m1-patched"]);
+    for (index, wire) in wires.iter().enumerate() {
+        for sent in wire["snapshots"].as_array().unwrap() {
+            let session = sent["source_session_id"].as_str().unwrap();
+            let item = items
+                .iter()
+                .find(|item| item.source_session_id == session)
+                .unwrap();
+            let envelope = &sent["semantic_envelope"];
+            assert!(envelope.get("conflict_head_challenge").is_none());
+            // Only the entity's own saved base, never a borrowed token.
+            assert_eq!(
+                envelope.get("base_head_etag").and_then(Value::as_str),
+                bases[session].as_deref(),
+                "{session}"
+            );
+            // [money] Exact cache event sets: the patch whole, or none.
+            assert_eq!(
+                sent.get("cache_observations")
+                    .filter(|value| !value.is_null()),
+                item.cache_observations
+                    .as_ref()
+                    .map(|patch| serde_json::to_value(patch).unwrap())
+                    .as_ref(),
+                "{session}"
+            );
+            assert_eq!(item.cache_observations.is_some(), index == 1, "{session}");
+        }
+    }
+    assert!(progress.head_conflict_challenges.is_empty(), "no conflict");
+    for item in &items {
+        assert_eq!(
+            progress
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint),
+            Some(&snapshot_upload_body_witness(item)),
+            "{}",
+            item.source_session_id
+        );
+    }
+    let mut stored = store.stored.clone();
+    stored.sort();
+    assert_eq!(
+        stored,
+        [
+            "m1-admitted-empty",
+            "m1-birth-withheld",
+            "m1-cap-withheld",
+            "m1-partial-empty",
+            "m1-patched"
+        ],
+        "the exact repeat is not stored again"
+    );
+    for item in [&patched, &empty, &partial] {
+        assert_eq!(
+            progress.accepted_cache_heads[&cache_session_key(&item.source_session_id)],
+            store.heads[&item.source_session_id].0
+        );
+    }
+    // R5: the ordinary ACK has no etag, so the cap-withheld session's saved
+    // token is dropped; a later patch for it re-bootstraps through a probe.
+    for item in [&birth, &cap, &repeat] {
+        assert!(!progress
+            .accepted_cache_heads
+            .contains_key(&cache_session_key(&item.source_session_id)));
+    }
+
+    // E2: a single-class page sends the same bytes as before the split.
+    let single = [
+        body("e2-patched", Some(item().cache_observations.unwrap())),
+        body("e2-admitted-empty", Some(complete_empty())),
+    ];
+    let (result, now) = page(&mut fresh_progress(), &single, &none, |request, wire| {
+        Ok(HeadStore::default().post(request, wire))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    let (result, previous) = page_with_class(
+        &mut fresh_progress(),
+        &single,
+        &none,
+        |_| 0,
+        |request, wire| Ok(HeadStore::default().post(request, wire)),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(now, previous);
+}
+
+/// [money] R1: the observed seed (challenge, no base or state, no attempt)
+/// with a no-patch offer beside a patched sibling. The owed session reads a
+/// native Full, goes out in an ordinary request, is accepted, and its exact
+/// ACK clears the challenge without an answer. A restart keeps it clear.
+#[test]
+fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
+    let none = BTreeSet::new();
+    let mut store = HeadStore::default();
+    let mut progress = fresh_progress();
+    let owed = body("r1-owed", None);
+    let sibling = body(
+        "r1-patched-sibling",
+        Some(item().cache_observations.unwrap()),
+    );
+    store.seed("r1-owed");
+    let head = store.seed("r1-patched-sibling");
+    progress
+        .accepted_cache_heads
+        .insert(cache_session_key("r1-patched-sibling"), head);
+    let key = cache_session_key("r1-owed");
+    owe(&mut progress, &owed, challenge(0xc));
+    assert!(
+        mirrored(&progress, &key),
+        "the owed session reads a native Full"
+    );
+
+    let (result, wires) = page(
+        &mut progress,
+        &[owed.clone(), sibling.clone()],
+        &none,
+        |request, wire| Ok(store.post(request, wire)),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(wires.len(), 2);
+    assert!(wires[0].get("head_cas_contract").is_none());
+    assert_eq!(sessions(&wires[0]), ["r1-owed"]);
+    let envelope = envelope(&wires[0]);
+    for field in [
+        "base_head_etag",
+        "conflict_head_challenge",
+        "rescan_from_revision_hash",
+        "forced_full_rescan",
+    ] {
+        assert!(envelope.get(field).is_none(), "{field}");
+    }
+    assert!(
+        progress.head_conflict_challenges.is_empty(),
+        "cleared by the accept, never answered"
+    );
+    assert_eq!(
+        progress.accepted_body_witnesses[&owed.snapshot_fingerprint],
+        snapshot_upload_body_witness(&owed),
+        "exact receipt"
+    );
+    assert!(!progress.accepted_cache_heads.contains_key(&key));
+    assert_eq!(store.stored, ["r1-owed", "r1-patched-sibling"]);
+    assert!(!mirrored(&progress, &key));
+
+    let root = crate::test_scratch::ScratchDir::new("class-split-restart");
+    let path = root.join("upload-progress.json");
+    progress.generation = 0;
+    progress.save(&path).unwrap();
+    let restarted = SnapshotUploadProgress::load(
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert!(restarted.head_conflict_challenges.is_empty());
+    assert_eq!(
+        restarted.accepted_body_witnesses,
+        progress.accepted_body_witnesses
+    );
+    assert!(!mirrored(&restarted, &key));
+}
+
+/// [money] R2: the same seed when the session regains a patch, including a
+/// partial-empty one. The existing ordinary bootstrap probe's ACK clears the
+/// challenge, its exact CAS repeat saves the head, and the patched main offer
+/// declares CAS with that base and carries its whole patch.
+#[test]
+fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
+    let none = BTreeSet::new();
+    for regained in [
+        item().cache_observations.unwrap(),
+        CacheObservations::partial(Some(2)),
+    ] {
+        let mut store = HeadStore::default();
+        let mut progress = fresh_progress();
+        let item = body("r2-owed", Some(regained.clone()));
+        let key = cache_session_key("r2-owed");
+        store.seed("r2-owed");
+        owe(&mut progress, &item, challenge(0xc));
+
+        let probes = vec![cache_head_probe(&item)];
+        let mut probe_wires = Vec::new();
+        let deferred = bootstrap_cache_heads(
+            &probes,
+            SCOPE,
+            &mut progress,
+            true,
+            |batch, enforce_head_cas| {
+                let request = request(batch);
+                let wire = if enforce_head_cas {
+                    serde_json::to_value(request.wire_with_head_cas())?
+                } else {
+                    serde_json::to_value(&request)?
+                };
+                probe_wires.push(wire.clone());
+                let mut response = store.post(&request, &wire);
+                response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+                response.bind_conflict_rescans(&request);
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(deferred, 0);
+        assert_eq!(probe_wires.len(), 2, "ordinary probe, then its CAS repeat");
+        assert!(probe_wires[0].get("head_cas_contract").is_none());
+        assert!(probe_wires[1]["head_cas_contract"].is_string());
+        assert!(progress.head_conflict_challenges.is_empty());
+        let head = progress.accepted_cache_heads[&key].clone();
+        assert_eq!(head, store.heads["r2-owed"].0);
+
+        let mut items = vec![item.clone()];
+        assert_eq!(
+            apply_bootstrapped_cache_heads(&mut items, &progress).unwrap(),
+            0
+        );
+        assert_eq!(
+            items[0].cache_base_head_etag.as_deref(),
+            Some(head.as_str())
+        );
+        let (result, wires) = page(&mut progress, &items, &none, |request, wire| {
+            Ok(store.post(request, wire))
+        });
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(wires.len(), 1);
+        assert!(wires[0]["head_cas_contract"].is_string());
+        let sent = &wires[0]["snapshots"][0];
+        assert_eq!(sent["semantic_envelope"]["base_head_etag"], head);
+        assert!(sent["semantic_envelope"]
+            .get("conflict_head_challenge")
+            .is_none());
+        assert_eq!(
+            sent["cache_observations"],
+            serde_json::to_value(&regained).unwrap(),
+            "no accepted cache rows lost"
+        );
+        assert_eq!(
+            progress.accepted_cache_heads[&key],
+            store.heads["r2-owed"].0
+        );
+        assert!(progress.head_conflict_challenges.is_empty());
+    }
+}
+
+/// [money] R3: a lost ACK keeps the debt; the replay is an exact repeat
+/// (unchanged, no second store); a repeat pass sends no POST; a fresh
+/// challenge from a later CAS conflict is recorded and cleared again by the
+/// next ordinary accept.
+#[test]
+fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
+    let none = BTreeSet::new();
+    let mut store = HeadStore::default();
+    let mut progress = fresh_progress();
+    let owed = body("r3-owed", None);
+    let key = cache_session_key("r3-owed");
+    store.seed("r3-owed");
+    owe(&mut progress, &owed, challenge(0xc));
+
+    let (lost, _) = page(&mut progress, &[owed.clone()], &none, |request, wire| {
+        store.post(request, wire);
+        Err(anyhow!("synthetic lost reply"))
+    });
+    assert!(lost.is_err());
+    assert!(progress.head_conflict_challenges.contains_key(&key));
+    assert!(!progress
+        .accepted_body_witnesses
+        .contains_key(&owed.snapshot_fingerprint));
+
+    let (result, _) = page(&mut progress, &[owed.clone()], &none, |request, wire| {
+        Ok(store.post(request, wire))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(progress.head_conflict_challenges.is_empty());
+    assert_eq!(store.stored, ["r3-owed"], "no double credit");
+
+    let (result, wires) = page(&mut progress, &[owed.clone()], &none, |_, _| {
+        panic!("a settled body sends no POST")
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(wires.is_empty());
+
+    // A later patched revision under a stale saved base conflicts under CAS.
+    let mut patched = revised(&owed, 1);
+    patched.cache_observations = item().cache_observations;
+    patched.cache_observations_state = item().cache_observations_state;
+    patched.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &patched);
+    progress
+        .accepted_cache_heads
+        .insert(key.clone(), stale_head());
+    let (result, wires) = page(&mut progress, &[patched], &none, |request, wire| {
+        Ok(store.post(request, wire))
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert!(wires[0]["head_cas_contract"].is_string());
+    assert_eq!(
+        progress.head_conflict_challenges[&key].challenge,
+        store.challenges["r3-owed"]
+    );
+    // The next unpatched revision goes ordinary, is accepted, and clears it.
+    let next = revised(&owed, 2);
+    let (result, wires) = page(&mut progress, &[next], &none, |request, wire| {
+        Ok(store.post(request, wire))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(wires[0].get("head_cas_contract").is_none());
+    assert!(progress.head_conflict_challenges.is_empty());
+    assert!(!progress.accepted_cache_heads.contains_key(&key));
+    assert_eq!(store.stored, ["r3-owed", "r3-owed"]);
+}
+
+/// [money] R4: fence outcomes for the owed session's ordinary body. A covered
+/// older or other authority downgrade is a permanent rejection: the
+/// challenge clears and the body is held with no receipt. Mixed usage is
+/// retryable: the challenge stays and the page is Deferred. A dominated
+/// re-offer is unchanged with a basis: the challenge clears, the body is
+/// held, no receipt. No saved head is created or lowered.
+#[test]
+fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
+    let none = BTreeSet::new();
+    for (outcome, permanent) in [
+        ("accepted_log_stale_older_upload", Some(true)),
+        ("usage_accounting_authority_downgrade", Some(true)),
+        ("accepted_log_stale_older_mixed", Some(false)),
+        ("dominated_by_head", None),
+    ] {
+        let mut progress = fresh_progress();
+        let owed = body("r4-owed", None);
+        let key = cache_session_key("r4-owed");
+        owe(&mut progress, &owed, challenge(0xc));
+        let (result, wires) = page(&mut progress, &[owed.clone()], &none, |request, _| {
+            let item = &request.snapshots[0];
+            let mut ack = empty_ack();
+            match permanent {
+                Some(permanent) => {
+                    ack.rejected_entities
+                        .push(crate::snapshot_client::SnapshotEntityRejection {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            permanent,
+                            reason: outcome.into(),
+                            detail: String::new(),
+                        });
+                }
+                None => {
+                    let version =
+                        crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                    ack.accepted = 1;
+                    ack.unchanged_entities.push(SnapshotEntityRef {
+                        body_witness_version: version,
+                        body_witness_digest: version.map(|_| snapshot_upload_body_witness(item)),
+                        unchanged_basis: Some(outcome.into()),
+                        ..reference(item)
+                    });
+                }
+            }
+            Ok(ack)
+        });
+        assert!(wires[0].get("head_cas_contract").is_none(), "{outcome}");
+        let result = result.unwrap();
+        let retryable = permanent == Some(false);
+        assert_eq!(
+            progress.head_conflict_challenges.contains_key(&key),
+            retryable,
+            "{outcome}"
+        );
+        if retryable {
+            assert!(
+                matches!(result, ResumableUploadResult::Deferred { .. }),
+                "{outcome}: {result:?}"
+            );
+            assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 0);
+        }
+        assert!(
+            progress.accepted_body_witnesses.is_empty(),
+            "{outcome}: no receipt"
+        );
+        assert!(
+            progress
+                .quarantined_fingerprints
+                .contains_key(&owed.snapshot_fingerprint),
+            "{outcome}: held"
+        );
+        assert!(progress.accepted_cache_heads.is_empty(), "{outcome}");
+    }
+}
+
+/// [money] N1: negative controls. A legacy reconciliation stays CAS and alone
+/// in its request. A route that enforces CAS on every request refuses the
+/// base-less changed body with a plain conflict: the debt stays and no
+/// answer is sent (the trigger for an answer-gate change, not this one).
+#[test]
+fn legacy_stays_isolated_and_a_mandatory_route_keeps_the_debt() {
+    let mut store = HeadStore::default();
+    let mut progress = fresh_progress();
+    let legacy_item = body("n1-legacy", None);
+    let ordinary = body("n1-ordinary", None);
+    let patched = body("n1-patched", Some(item().cache_observations.unwrap()));
+    for item in [&legacy_item, &patched] {
+        let head = store.seed(&item.source_session_id);
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(&item.source_session_id), head);
+    }
+    let legacy = BTreeSet::from([legacy_item.snapshot_fingerprint.clone()]);
+    let (result, wires) = page(
+        &mut progress,
+        &[legacy_item, ordinary, patched],
+        &legacy,
+        |request, wire| Ok(store.post(request, wire)),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    let shape = wires
+        .iter()
+        .map(|wire| (wire["head_cas_contract"].is_string(), sessions(wire)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            (false, vec!["n1-ordinary".to_owned()]),
+            (true, vec!["n1-patched".to_owned()]),
+            (true, vec!["n1-legacy".to_owned()]),
+        ]
+    );
+
+    let mut progress = fresh_progress();
+    let owed = body("n1-mandatory", None);
+    let key = cache_session_key("n1-mandatory");
+    owe(&mut progress, &owed, challenge(0xc));
+    let (result, wires) = page(&mut progress, &[owed], &BTreeSet::new(), |request, _| {
+        let mut ack = empty_ack();
+        ack.conflict_entities.push(reference(&request.snapshots[0]));
+        Ok(ack)
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert!(wires[0].get("head_cas_contract").is_none());
+    assert!(envelope(&wires[0]).get("conflict_head_challenge").is_none());
+    let record = &progress.head_conflict_challenges[&key];
+    assert_eq!(record.challenge, challenge(0xc), "the debt stays");
+    assert_eq!(record.answer_attempts, 0);
+}

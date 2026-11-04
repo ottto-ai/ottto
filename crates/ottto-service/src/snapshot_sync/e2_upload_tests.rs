@@ -8,8 +8,9 @@ struct FamilyItem {
     payload: String,
     #[serde(skip)]
     root: Option<String>,
+    /// Main-upload batch class: 0 ordinary, 1 cache-patched, 2 legacy.
     #[serde(skip)]
-    class: bool,
+    class: u8,
 }
 
 fn family_member(root: &str, agent: Option<usize>, payload: usize) -> FamilyItem {
@@ -22,7 +23,7 @@ fn family_member(root: &str, agent: Option<usize>, payload: usize) -> FamilyItem
         session,
         payload: "x".repeat(payload),
         root: Some(root.to_owned()),
-        class: false,
+        class: 0,
     }
 }
 
@@ -32,7 +33,7 @@ fn plain_item(ordinal: u64) -> FamilyItem {
         session: format!("plain-{ordinal}"),
         payload: String::new(),
         root: None,
-        class: false,
+        class: 0,
     }
 }
 
@@ -324,7 +325,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |item| Some(item.source_session_id.as_str()),
-            |_| false,
+            |_| 0,
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut InplaceRetryBudget::default(),
             |batch| {
@@ -374,4 +375,331 @@ fn sole_login_hint_token_is_ignored() {
             "provider_workspace_hash": "d".repeat(64),
         })
     );
+}
+
+/// The client declares head CAS for a whole request when one body in it
+/// carries a cache patch. A synthetic server with that rule: under CAS, an
+/// unpatched body of a session the server already holds conflicts.
+fn cas_server(
+    batch: &[FamilyItem],
+    held: &BTreeSet<String>,
+    seen: &mut Vec<(u8, Vec<String>)>,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let class = batch[0].class;
+    assert!(
+        batch.iter().all(|item| item.class == class),
+        "a request is class-pure"
+    );
+    seen.push((
+        class,
+        batch.iter().map(|item| item.session.clone()).collect(),
+    ));
+    let cas = batch.iter().any(|item| item.class != 0);
+    let (conflicted, accepted): (Vec<&FamilyItem>, Vec<&FamilyItem>) = batch
+        .iter()
+        .partition(|item| cas && item.class == 0 && held.contains(&item.session));
+    let ids = |items: Vec<&FamilyItem>| {
+        items
+            .into_iter()
+            .map(|item| item.fingerprint.clone())
+            .collect::<Vec<_>>()
+    };
+    Ok(entity_ack_batch(&ids(accepted), &[], &ids(conflicted)))
+}
+
+fn with_class(mut item: FamilyItem, class: u8) -> FamilyItem {
+    item.class = class;
+    item
+}
+
+/// [money] M2: a literal family whose root and members differ in patch class
+/// (patched root with unpatched members, and the reverse) is cut into
+/// class-pure groups that stay contiguous and root first. Each group settles
+/// by its own ACKs, and no unpatched member is sent under CAS.
+#[test]
+fn e2_mixed_class_family_is_class_pure_root_first_in_both_directions() {
+    for root_class in [1u8, 0] {
+        let member_class = 1 - root_class;
+        let mut family = family("root-m", 4, 0);
+        family[0].class = root_class;
+        family[2].class = member_class;
+        family[3].class = member_class;
+        let mut items = vec![
+            with_class(plain_item(1), 1),
+            with_class(plain_item(2), 0),
+            with_class(plain_item(3), 1),
+        ];
+        items.extend(family.iter().cloned());
+        // Every session already has a server head: CAS on an unpatched,
+        // base-less body would conflict.
+        let held = items.iter().map(|item| item.session.clone()).collect();
+        let mut seen = Vec::new();
+        let mut progress = test_upload_progress();
+        let (result, batches) = upload_families(&items, &mut progress, |batch| {
+            cas_server(batch, &held, &mut seen)
+        });
+        assert_eq!(
+            result.unwrap(),
+            ResumableUploadResult::Completed,
+            "root class {root_class}"
+        );
+        for item in &items {
+            assert!(
+                progress.accepted_fingerprints.contains(&item.fingerprint),
+                "{}",
+                item.session
+            );
+        }
+        // Family groups: contiguous, root first, members in session order.
+        let flat = batches.concat();
+        let first = flat.iter().position(|s| s == "root-m").unwrap();
+        assert_eq!(
+            flat[first..first + 4],
+            family
+                .iter()
+                .map(|item| item.session.clone())
+                .collect::<Vec<_>>()[..],
+            "family contiguous and root first"
+        );
+        // The family's own groups follow its root's class run; singles are
+        // grouped by class, ordinary first.
+        let classes = seen.iter().map(|(class, _)| *class).collect::<Vec<_>>();
+        let expected = if root_class == 1 {
+            vec![0, 1, 0]
+        } else {
+            vec![0, 1]
+        };
+        assert_eq!(classes, expected, "root class {root_class}: {seen:?}");
+        let single_runs = seen
+            .iter()
+            .filter(|(_, sessions)| sessions.iter().any(|s| s.starts_with("plain-")))
+            .count();
+        assert_eq!(single_runs, 2, "one run per class for single bodies");
+    }
+}
+
+/// [money] Before the split, one patched sibling made the whole request CAS
+/// and the unpatched, base-less siblings conflicted. The same page under the
+/// production class now sends two class-pure requests and conflicts nothing.
+#[test]
+fn e2_mixed_page_no_longer_sends_unpatched_bodies_under_cas() {
+    let items = vec![
+        with_class(plain_item(1), 1),
+        with_class(plain_item(2), 0),
+        with_class(plain_item(3), 0),
+    ];
+    let held = items
+        .iter()
+        .map(|item| item.session.clone())
+        .collect::<BTreeSet<_>>();
+    // The previous single class: one CAS request; unpatched bodies conflict.
+    let mut accepted = 0;
+    let mut progress = test_upload_progress();
+    let result = upload_resumable_batches_with_literal_families(
+        &items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.fingerprint.as_str(),
+        |item| item.fingerprint.clone(),
+        |item| Some(item.session.as_str()),
+        |_| 0,
+        |_| None,
+        &mut InplaceRetryBudget::default(),
+        |batch| {
+            let cas = batch.iter().any(|item| item.class != 0);
+            let (conflicted, accepted): (Vec<_>, Vec<_>) = batch
+                .iter()
+                .partition(|item| cas && item.class == 0 && held.contains(&item.session));
+            let ids = |items: Vec<&FamilyItem>| {
+                items
+                    .into_iter()
+                    .map(|item| item.fingerprint.clone())
+                    .collect::<Vec<_>>()
+            };
+            Ok(entity_ack_batch(&ids(accepted), &[], &ids(conflicted)))
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 2 }
+    );
+    // The production class: no conflicts.
+    let mut seen = Vec::new();
+    let mut progress = test_upload_progress();
+    let (result, batches) = upload_families(&items, &mut progress, |batch| {
+        cas_server(batch, &held, &mut seen)
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(
+        batches,
+        vec![
+            vec!["plain-2".to_owned(), "plain-3".to_owned()],
+            vec!["plain-1".to_owned()]
+        ]
+    );
+}
+
+/// E2: a single-class page (Pi, an all-patched page, or all ordinary) is
+/// packed exactly as before the class split: same requests, same order.
+#[test]
+fn e2_single_class_pages_keep_the_previous_batches() {
+    for class in [0u8, 1, 2] {
+        let mut items = (0..60).rev().map(plain_item).collect::<Vec<_>>();
+        items.extend(family("root-s", 5, 0));
+        items.extend(family("root-t", 3, 0));
+        for item in &mut items {
+            item.class = class;
+        }
+        let (result, batches) = upload_families(&items, &mut test_upload_progress(), accept_all);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let mut previous = Vec::new();
+        let mut accepted = 0;
+        upload_resumable_batches_with_literal_families(
+            &items,
+            &unique_poison_scope(),
+            &mut test_upload_progress(),
+            &mut accepted,
+            |item| item.fingerprint.as_str(),
+            |item| item.fingerprint.clone(),
+            |item| Some(item.session.as_str()),
+            |_| 0,
+            |item| item.root.as_deref(),
+            &mut InplaceRetryBudget::default(),
+            |batch| {
+                previous.push(
+                    batch
+                        .iter()
+                        .map(|item| item.session.clone())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(batches, previous, "class {class}");
+    }
+}
+
+/// [money] R3x: the first class request checkpoints; the second is unsent,
+/// loses its ACK after the server stored it, or its checkpoint save fails.
+/// After a restart from the saved ledger only unsettled bodies are re-sent;
+/// a replay of a stored body is an exact repeat (unchanged), so nothing is
+/// stored or credited twice. Both class orders: ordinary before patched, and
+/// patched before legacy.
+#[test]
+fn e2_class_request_lost_after_a_checkpoint_resends_only_unsettled_bodies() {
+    for (first, second) in [(0u8, 1u8), (1, 2)] {
+        for (lost, save_fails) in [(second, false), (first, false), (second, true)] {
+            let items = vec![
+                with_class(plain_item(1), second),
+                with_class(plain_item(2), first),
+                with_class(plain_item(3), second),
+                with_class(plain_item(4), first),
+            ];
+            let root = crate::test_scratch::ScratchDir::new("e2-class-lost");
+            let path = root.join("progress.json");
+            let mut progress = test_upload_progress();
+            progress.save(&path).unwrap();
+            // The server stores each new body once; a stored body is unchanged.
+            let stored = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
+            let serve = |batch: &[FamilyItem]| {
+                let mut stored = stored.borrow_mut();
+                let (mut accepted, mut unchanged) = (Vec::new(), Vec::new());
+                for item in batch {
+                    if stored.contains_key(&item.fingerprint) {
+                        unchanged.push(item.fingerprint.clone());
+                    } else {
+                        stored.insert(item.fingerprint.clone(), 1);
+                        accepted.push(item.fingerprint.clone());
+                    }
+                }
+                entity_ack_batch(&accepted, &unchanged, &[])
+            };
+            let mut accepted = 0;
+            let mut sent = Vec::new();
+            let result = upload_resumable_batches_with_literal_families(
+                &items,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |item| item.fingerprint.as_str(),
+                |item| item.fingerprint.clone(),
+                |item| Some(item.session.as_str()),
+                |item| item.class,
+                |_| None,
+                &mut InplaceRetryBudget::default(),
+                |batch| {
+                    sent.push(batch[0].class);
+                    let response = serve(&batch);
+                    if batch[0].class == lost && !save_fails {
+                        return Err(anyhow!("synthetic lost reply"));
+                    }
+                    Ok(response)
+                },
+                |state| {
+                    let saving_lost = items
+                        .iter()
+                        .filter(|item| item.class == lost)
+                        .all(|item| state.accepted_fingerprints.contains(&item.fingerprint));
+                    if save_fails && saving_lost {
+                        return Err(anyhow!("synthetic save failure"));
+                    }
+                    state.save(&path)
+                },
+            );
+            let case = format!("{first}->{second} lost {lost} save_fails {save_fails}");
+            assert!(result.is_err(), "{case}");
+            let expected_sent = if lost == first {
+                vec![first]
+            } else {
+                vec![first, second]
+            };
+            assert_eq!(sent, expected_sent, "{case}: lower class first");
+            let mut restarted = SnapshotUploadProgress::load(
+                &path,
+                &format!("{:064x}", 99),
+                snapshot_quarantine_witness(SnapshotSource::Codex),
+            )
+            .unwrap();
+            for item in &items {
+                assert_eq!(
+                    restarted.accepted_fingerprints.contains(&item.fingerprint),
+                    lost == second && item.class == first,
+                    "{case}: {}",
+                    item.session
+                );
+            }
+            let mut resent = Vec::new();
+            let (result, _) = upload_families(&items, &mut restarted, |batch| {
+                resent.extend(batch.iter().map(|item| item.session.clone()));
+                Ok(serve(batch))
+            });
+            assert_eq!(result.unwrap(), ResumableUploadResult::Completed, "{case}");
+            let mut expected = items
+                .iter()
+                .filter(|item| lost == first || item.class == second)
+                .map(|item| item.session.clone())
+                .collect::<Vec<_>>();
+            expected.sort();
+            resent.sort();
+            assert_eq!(resent, expected, "{case}: only unsettled bodies, once");
+            assert!(
+                stored.borrow().values().all(|count| *count == 1),
+                "{case}: no body stored twice"
+            );
+            assert_eq!(stored.borrow().len(), items.len(), "{case}");
+            for item in &items {
+                assert!(restarted.accepted_fingerprints.contains(&item.fingerprint));
+            }
+            // A repeat pass sends no POST.
+            let (result, batches) = upload_families(&items, &mut restarted, |_| {
+                panic!("a settled page sends no POST")
+            });
+            assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+            assert!(batches.is_empty());
+        }
+    }
 }

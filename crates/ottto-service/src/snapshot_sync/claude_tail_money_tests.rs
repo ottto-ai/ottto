@@ -2526,6 +2526,178 @@ fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
     assert_eq!(answer.map(|(c, _)| c), Some(challenge.to_owned()));
 }
 
+/// A second Claude session with no `forkedFrom` proof, so its body carries
+/// no cache patch beside the forked ROOT's patched body.
+const UNPATCHED: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+/// One route's upload of its page under the saved cache ledger, with the
+/// observed post-ACK placement ledger.
+fn mixed_route(
+    page: &Page,
+    progress: &SnapshotUploadProgress,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let sent = under_cas(&page.scan.snapshots, progress);
+    let mut progress = progress.clone();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let (status, batches, _) = upload(&sent, &mut progress, ack);
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let mut result = crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
+        mode,
+        SnapshotSource::ClaudeCode,
+        batches,
+        &sent,
+    );
+    result.modes = page.modes;
+    result.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            sent.iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    result
+}
+
+/// [money] E1 + E1p: a mixed page (a patched forked session beside an
+/// unpatched one that switches organization mid-session, plus a side call)
+/// emits equal bodies, totals and
+/// account/organization placement, including the actual post-ACK ledger, on
+/// the warm Tail, the cold Full and the restored owner. Every route sends one
+/// class-pure request per patch class.
+#[test]
+fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("mixed_class_page");
+        let root = forked_root(&mut c);
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
+        let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
+        input_clock(&other);
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        c.evidence_for(UNPATCHED, &[api_for(UNPATCHED, "u1", 7, 70)], &[]);
+        let disk = Disk::new(&c);
+        let warm = E2ScanFixture::capturing_identity();
+        disk.begin(&warm, SnapshotSource::ClaudeCode);
+        let mut progress = e2_progress();
+
+        let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        first.finish();
+        let sent = under_cas(&first.scan.snapshots, &progress);
+        assert!(sent
+            .iter()
+            .any(|item| item.source_session_id == ROOT && item.cache_observations.is_some()));
+        assert!(sent
+            .iter()
+            .any(|item| item.source_session_id == UNPATCHED && item.cache_observations.is_none()));
+        let (result, wire, _) = upload(&sent, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(wire.len(), 2, "one request per patch class");
+        settle_index_after_upload(&mut first.index, &first.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+        assert_eq!(
+            progress.accepted_cache_heads.get(&cache_session_key(ROOT)),
+            Some(&"e".repeat(64))
+        );
+        assert!(!progress
+            .accepted_cache_heads
+            .contains_key(&cache_session_key(UNPATCHED)));
+
+        // Both sessions grow; the unpatched one switches organization, and a
+        // side call with no transcript owner arrives.
+        append(&root, &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20));
+        let switch = json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        append(
+            &other,
+            &(switch + &marker(org_b) + &line(UNPATCHED, "u2", "2026-08-02T07:00:30Z", 9)),
+        );
+        input_clock(&root);
+        input_clock(&other);
+        c.evidence(
+            &[
+                api("r1", 10, 100),
+                api("r2", 20, 200),
+                api("mixed-side", 5, 50),
+            ],
+            &[],
+        );
+        c.evidence_for(
+            UNPATCHED,
+            &[
+                api_for(UNPATCHED, "u1", 7, 70),
+                api_for(UNPATCHED, "u2", 9, 90),
+            ],
+            &[],
+        );
+        let restart = E2ScanFixture::capturing_identity();
+        disk.begin(&restart, SnapshotSource::ClaudeCode);
+        let cold = E2ScanFixture::capturing_identity();
+        let restarted = c.raw(&restart, prior.clone(), 100, true, &[]);
+        let mut pages = [
+            c.raw(&warm, prior.clone(), 100, true, &[]),
+            c.raw(&cold, prior, 100, true, &[]),
+            restarted,
+        ];
+        assert_eq!(
+            pages[1].modes.1 + pages[1].modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        finish_claude_pages(&c, &mut pages);
+        let [tail, full, disk_page] = &pages;
+        let routes = [
+            mixed_route(tail, &progress, Mode::Ram),
+            mixed_route(full, &progress, Mode::ColdFull),
+            mixed_route(disk_page, &progress, Mode::DiskRestore),
+        ];
+        for route in &routes {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        money_oracle::assert_equivalent(&routes[1], &routes[0]);
+        money_oracle::assert_equivalent(&routes[1], &routes[2]);
+        money_oracle::assert_no_smaller_reemit(ROOT, &routes[1], &routes[0], &routes[1], false);
+        // Two organizations on the unpatched session: placement is not vacuous.
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
+        assert!(
+            other_body.contains(&a) && other_body.contains(&b),
+            "two organizations"
+        );
+        println!("MIXED_CLASS_PAGE_ORACLE VERIFIED arms=ram_tail,cold_full,restored_tail requests_per_route=2");
+    });
+}
+
 /// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS
 /// conflict with a challenge is recorded on a production-shaped Claude body.
 /// While the answer is owed (the ledger's challenge mirrored into the scan
