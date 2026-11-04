@@ -146,7 +146,8 @@ macro_rules! scan_index_fields {
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,
-            claude_folder_login_ledger => Misc (misc check_field Map) ["v1_field.claude_folder_login_ledger" => 5] side,
+            // An earlier store's row stays accepted and is never read or written.
+            retired_claude_folder_login_ledger => Misc (retired none) ["v1_field.claude_folder_login_ledger" => 5] side,
             tail_discovery => Misc (misc check_field Field) ["scan_state.tail_discovery" => 5] side,
         }
     };
@@ -265,7 +266,9 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     scan_index_fields!(each check);
     if matches!(
         field,
-        "upload_context_fingerprint" | "claude_desktop_census_witness"
+        "upload_context_fingerprint"
+            | "claude_desktop_census_witness"
+            | "claude_folder_login_ledger"
     ) {
         // TOMBSTONE: decode-and-drop, as the v1 decoder does.
         map.next_value::<serde::de::IgnoredAny>()?;

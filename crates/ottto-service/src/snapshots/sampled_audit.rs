@@ -2120,7 +2120,6 @@ pub(super) fn defer_growth_read(
 /// audit retirement and delivery ACKs do not settle source growth.
 pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
     if growth_active(index) {
-        let _ = state_v2::save_read_completed(index, key);
         let generation = index.generation;
         let v2 = index.v2_mut();
         if let Some(state) = v2.growth_retention.get_mut(key) {
@@ -2336,8 +2335,7 @@ pub(super) fn expired_growth_claims(
         })
         .collect();
     if !due.is_empty() {
-        let counts = serde_json::json!({"keys": due.len(), "oldest_expired_secs": oldest});
-        crate::local_resource_diagnostics::traversal_point("hold_wake", source.api_slug(), &counts);
+        crate::local_resource_diagnostics::hold_wake(source.api_slug(), due.len() as u64, oldest);
     }
     due
 }
@@ -2425,13 +2423,9 @@ pub(super) fn growth_read_admitted_at(
         return true;
     }
     let key = local_index_key(&candidate.path);
-    let oversize = match state_v2::save_oversize_active(index) {
-        Ok(held) => held,
-        Err(_) => return false,
-    };
     // A stale graph must not erase committed growth debt and bypass pacing.
     // Authenticate even rewrite Fulls before consulting working-page debt.
-    if index.v2().persistence_v2.is_some() && (oversize || matches!(mode, ReadMode::Full(_))) {
+    if index.v2().persistence_v2.is_some() && matches!(mode, ReadMode::Full(_)) {
         let valid = (|| -> Result<()> {
             let path = &index
                 .v2()
@@ -2448,8 +2442,7 @@ pub(super) fn growth_read_admitted_at(
         }
     }
     let held = index.decode_holds.contains("growth_retention", &key);
-    if !oversize
-        && !held
+    if !held
         && !index
             .v2()
             .growth_retention
@@ -2458,25 +2451,16 @@ pub(super) fn growth_read_admitted_at(
     {
         return true;
     }
-    if oversize
-        || matches!(
-            mode,
-            ReadMode::Full(
-                FullReason::StateMissing
-                    | FullReason::InvalidCheckpoint
-                    | FullReason::UnsupportedIdentity
-            )
+    if matches!(
+        mode,
+        ReadMode::Full(
+            FullReason::StateMissing
+                | FullReason::InvalidCheckpoint
+                | FullReason::UnsupportedIdentity
         )
-    {
+    ) {
         return match claim_growth_full(index, &key, now) {
-            Ok(admitted) => {
-                if oversize && admitted {
-                    crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
-                        "save_oversize_growth_full": 1
-                    }));
-                }
-                admitted
-            }
+            Ok(admitted) => admitted,
             Err(_) => {
                 if index.v2().persistence_v2.is_some() {
                     state_v2::growth_claim_refused("publication");

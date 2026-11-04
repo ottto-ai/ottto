@@ -15,6 +15,7 @@ use crate::transcript_acquisition::DurableCertificate;
 pub(in crate::snapshots) mod claude;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
+pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
@@ -28,7 +29,11 @@ macro_rules! with_codec {
                 type $s = claude::Claude;
                 $arm
             }
-            SnapshotSource::Codex | SnapshotSource::Pi => $none,
+            SnapshotSource::Pi => {
+                type $s = pi::Pi;
+                $arm
+            }
+            SnapshotSource::Codex => $none,
         }
     };
 }
@@ -334,12 +339,21 @@ pub(in crate::snapshots) trait TailSource {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse>;
     /// A `Log` collection's elements, in its full encode's (sorted) order.
-    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String>;
+    /// A codec without a `Log` collection keeps the defaults.
+    fn log_keys(_acc: &SnapshotAccumulator, _collection: Collection) -> Vec<&String> {
+        Vec::new()
+    }
     /// One `Log` page holding `keys`, in this order.
-    fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse>;
+    fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        page_bytes(keys.iter(), |key, e| key.put(e))
+    }
     /// A stored `Log` page's elements, in stored order.
-    fn log_page_keys(collection: Collection, bytes: &[u8])
-        -> Result<Vec<String>, ReconstructCause>;
+    fn log_page_keys(
+        _collection: Collection,
+        _bytes: &[u8],
+    ) -> Result<Vec<String>, ReconstructCause> {
+        Err(ReconstructCause::Corrupt)
+    }
     /// Every page of `collection`, by position.
     fn encode_pages(
         acc: &SnapshotAccumulator,
@@ -362,16 +376,22 @@ pub(in crate::snapshots) trait TailSource {
     fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
     /// The epoch of the key every keyed field this codec stores is made
     /// under; `None` without a key. A head from another key is never reused.
-    fn key_epoch() -> Option<[u8; 32]>;
+    fn key_epoch() -> Option<[u8; 32]> {
+        None
+    }
     /// Installs the live inputs of this read into a validated stored state,
     /// before the load publishes it as reused. `live` is the read's fresh
     /// accumulator, configured before any line (traces, parent ledgers and
     /// proof, sidecar projection, counting rule); a load never parses with it.
+    /// By default a source's live inputs join at finish, never into the
+    /// stored state.
     fn install_live(
-        stored: &mut SnapshotAccumulator,
-        fresh: &CandidateFile,
-        live: &SnapshotAccumulator,
-    ) -> Result<(), LiveLoadError>;
+        _stored: &mut SnapshotAccumulator,
+        _fresh: &CandidateFile,
+        _live: &SnapshotAccumulator,
+    ) -> Result<(), LiveLoadError> {
+        Ok(())
+    }
 
     /// After every page: each declared collection's stored geometry and
     /// element count against the decoded state, then the source's facts.
@@ -404,18 +424,6 @@ pub(in crate::snapshots) trait TailSource {
     }
 }
 
-/// One exactly sized value: the field walk counts, then writes.
-fn encode(put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>) -> Result<Vec<u8>, Refuse> {
-    let mut count = Enc::count(usize::MAX);
-    put(&mut count)?;
-    let len = count.counted();
-    let mut out = Vec::with_capacity(len);
-    let mut writer = Enc::writer(&mut out, len);
-    put(&mut writer)?;
-    writer.finish_written()?;
-    Ok(out)
-}
-
 /// The head envelope every codec writes: the identity, the checkpoint
 /// certificate, the read report and the three reduction scalars, then the
 /// codec's `lead`, the shared head-field walk and the codec's `trailer`.
@@ -433,7 +441,7 @@ fn encode_envelope(
         view.positive_recognized_usage_count,
         view.positive_usage_evidence,
     );
-    encode(|e| {
+    Enc::count_write(usize::MAX, |e| {
         e.with_moved_field("OpeningCall.files", |e| {
             id.put(e)?;
             certificate.put(e)?;
@@ -493,7 +501,7 @@ fn page_bytes<'a, T: 'a>(
     items: impl ExactSizeIterator<Item = &'a T> + Clone,
     put: impl Fn(&T, &mut Enc<'_>) -> Result<(), Refuse>,
 ) -> Result<Vec<u8>, Refuse> {
-    encode(|e| {
+    Enc::count_write(usize::MAX, |e| {
         e.varint(items.len() as u64)?;
         items.clone().try_for_each(|item| put(item, e))
     })
@@ -693,7 +701,12 @@ fn fact_pages(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> 
     FACTS
         .into_iter()
         .filter(|fact| fact.present(acc))
-        .map(|fact| Ok((fact as u64, encode(|e| fact.put(acc, e))?)))
+        .map(|fact| {
+            Ok((
+                fact as u64,
+                Enc::count_write(usize::MAX, |e| fact.put(acc, e))?,
+            ))
+        })
         .collect()
 }
 

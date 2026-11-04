@@ -4213,7 +4213,6 @@ fn collect_claude_status(
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
-    note_claude_folder_owner(&ClaudeConfigDirSlot::Default, &local, None);
     let mut login_state = local.state;
     let default_live = local.live_login();
     // "Keep my Claude accounts signed in": the default login gets the same
@@ -5986,8 +5985,6 @@ fn collect_registered_claude_slot_step(
         Ok(expected) => expected,
         Err(status) => {
             claude_oauth_end_slot_run(slot_id);
-            // Another account here is exactly what the folder ledger records.
-            note_refused_claude_slot(descriptor);
             return ClaudeSlotCollectionStep::PreGateRefused(status);
         }
     };
@@ -6000,13 +5997,6 @@ fn collect_registered_claude_slot_step(
     let local = network_enabled
         .then(|| read_registered_claude_slot_locally(descriptor))
         .flatten();
-    if let (Some(local), Some(binding), Some(slot)) = (
-        local.as_ref(),
-        expected_binding.as_ref(),
-        claude_config_slot_for_descriptor(descriptor),
-    ) {
-        note_claude_folder_owner(&slot, local, Some(binding));
-    }
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
@@ -6665,91 +6655,6 @@ fn claude_owner_call_allowed() -> bool {
     !claude_oauth_usage_network_disabled()
         && !claude_pass_saved_only()
         && !claude_background_read_withheld()
-}
-
-/// Reports one folder's login to the recorded-login ledger, in memory. Reads no
-/// extra file. At most one profile call per token on the default folder, only
-/// while the capability is on and the folder can still qualify, never a login
-/// change, and under the same background gates as every other Claude read.
-fn note_claude_folder_owner(
-    slot: &ClaudeConfigDirSlot,
-    local: &ClaudeSlotLocalRead,
-    registered: Option<&ClaudeSlotAccountBinding>,
-) {
-    use crate::claude_status_coverage as coverage;
-    use crate::snapshots::claude_folder_login as folder;
-    let config_dir = slot
-        .config_dir()
-        .map_or_else(|| home_dir().join(".claude"), PathBuf::from);
-    let home = folder::folder_key(&config_dir);
-    let strong = |account: &Option<ClaudeCliOauthAccount>| {
-        account
-            .as_ref()
-            .and_then(claude_strong_oauth_identity_hashes)
-    };
-    let cached = strong(&local.initial_oauth_account)
-        .filter(|pair| strong(&local.final_oauth_account).as_ref() == Some(pair));
-    let email = cached
-        .as_ref()
-        .and(local.final_oauth_account.as_ref())
-        .and_then(|account| account.email_address.as_deref())
-        .filter(|email| !email.trim().is_empty());
-    let report = match registered {
-        Some(binding) => {
-            let pair = (
-                binding.account_identifier_hash.clone(),
-                binding.organization_identifier_hash.clone(),
-            );
-            coverage::OwnerReport {
-                slot: true,
-                other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
-                pair: cached.is_some().then_some(pair),
-                proven: None,
-                email: None,
-            }
-        }
-        None => {
-            let token = match &local.credential {
-                ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
-                _ => None,
-            };
-            let may_call = coverage::proof_wanted(&home)
-                && matches!(local.state, ClaudeLocalLoginState::AccessValid)
-                && claude_owner_call_allowed();
-            coverage::OwnerReport {
-                slot: false,
-                pair: cached,
-                proven: token
-                    .and_then(|token| claude_token_owner::proven_owner(token, may_call))
-                    .map(|owner| (owner.account_hash, owner.organization_hash)),
-                email: None,
-                other_account: false,
-            }
-        }
-    };
-    coverage::observe_with_email(home, report, email);
-}
-
-/// A refused slot: only another strong account in it reaches the ledger. An
-/// unreadable login or approval proves nothing.
-fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
-    use crate::claude_status_coverage as coverage;
-    use crate::snapshots::claude_folder_login as folder;
-    if !claude_slot_login_unapproved(descriptor) || claude_slot_local_login(descriptor).is_none() {
-        return;
-    }
-    if let Some(config_dir) = claude_config_slot_for_descriptor(descriptor)
-        .and_then(|slot| slot.config_dir().map(PathBuf::from))
-    {
-        coverage::observe(
-            folder::folder_key(&config_dir),
-            coverage::OwnerReport {
-                slot: true,
-                other_account: true,
-                ..coverage::OwnerReport::default()
-            },
-        );
-    }
 }
 
 fn read_registered_claude_slot_locally(
@@ -15223,7 +15128,8 @@ fn percent_quota_status(used_percent: u8) -> AgentQuotaWindowStatus {
 }
 
 fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("pi") && !home_path(".pi").exists() {
+    if !executable_exists("pi") && !home_path(".pi").exists() && !pi_agent_dir(&home_dir()).exists()
+    {
         return not_installed_snapshot(SourceKind::Pi, "pi", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(
@@ -15262,7 +15168,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "pi_agent_settings_detected",
             AgentDiagnosticSeverity::Info,
-            "Pi model route read from ~/.pi/agent/settings.json.",
+            "Pi model route read from Pi's agent settings.json.",
         ));
     }
     snapshot.quota_windows = vec![unsupported_quota_window("usage")];
@@ -15274,7 +15180,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
     snapshot.capabilities = vec![
         supported_capability(
             "model_list",
-            "Collected from ~/.pi/agent/settings.json enabledModels, falling back to pi --list-models.",
+            "Collected from Pi's agent settings.json enabledModels, falling back to pi --list-models.",
         ),
         unsupported_capability(
             "account_plan",
@@ -18681,17 +18587,6 @@ fn parse_pi_token_count(value: &str) -> Option<u64> {
         .map(|value| (value * multiplier).round() as u64)
 }
 
-fn pi_billing_channel(provider: &str) -> &str {
-    match provider {
-        "openai-codex" | "anthropic" | "github-copilot" => "subscription",
-        "amazon-bedrock" => "amazon_bedrock",
-        "google-vertex" => "google_vertex",
-        "azure-openai-responses" => "azure_openai",
-        "cloudflare-ai-gateway" | "cloudflare-workers-ai" | "vercel-ai-gateway" => "gateway",
-        _ => "direct_api",
-    }
-}
-
 fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification {
     let provider = normalize_pi_provider(provider);
     let model_key = model.to_ascii_lowercase();
@@ -18758,9 +18653,7 @@ fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification
             gateway_classification("cloudflare", &model_key)
         }
         "openrouter" => gateway_classification("openrouter", &model_key),
-        "vercel-ai-gateway" | "vercel_ai_gateway" => {
-            gateway_classification("vercel_ai_gateway", &model_key)
-        }
+        "vercel-ai-gateway" => gateway_classification("vercel_ai_gateway", &model_key),
         "github-copilot" => PiRouteClassification {
             model_provider: infer_pi_model_provider_from_model(&model_key),
             billing_provider: Some("github".to_string()),
@@ -18782,7 +18675,7 @@ fn pi_route_classification(provider: &str, model: &str) -> PiRouteClassification
         other => PiRouteClassification {
             model_provider: infer_pi_model_provider_from_model(&model_key),
             billing_provider: Some(other.to_string()),
-            billing_channel: Some(pi_billing_channel(other).to_string()),
+            billing_channel: Some("direct_api".to_string()),
             auth_mode: Some("api_key".to_string()),
             gateway_provider: None,
             subscription_product: None,
@@ -18972,25 +18865,36 @@ fn read_pi_agent_settings() -> Option<Value> {
         .map(strip_secret_json)
 }
 
-fn pi_agent_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("PI_CODING_AGENT_DIR") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            if let Some(relative) = trimmed.strip_prefix("~/") {
-                return home_path(relative);
-            }
-            return PathBuf::from(trimmed);
-        }
+/// Pi's agent directory, resolved as Pi itself does: a non-empty
+/// `PI_CODING_AGENT_DIR`, taken as written (no trim) with a leading `~`
+/// expanded against `home`, else `~/.pi/agent`. The scanner, the status
+/// reader and the Verify census all use this one rule.
+pub(crate) fn pi_agent_dir(home: &Path) -> PathBuf {
+    pi_agent_dir_from(home, std::env::var_os("PI_CODING_AGENT_DIR"))
+}
+
+/// Where Pi writes its sessions: `sessions` under its agent directory.
+pub(crate) fn pi_sessions_dir(home: &Path) -> PathBuf {
+    pi_agent_dir(home).join("sessions")
+}
+
+fn pi_agent_dir_from(home: &Path, value: Option<std::ffi::OsString>) -> PathBuf {
+    match value.filter(|value| !value.is_empty()).map(PathBuf::from) {
+        Some(dir) => match dir.strip_prefix("~") {
+            Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+            Ok(rest) => home.join(rest),
+            Err(_) => dir,
+        },
+        None => home.join(".pi").join("agent"),
     }
-    home_path(".pi/agent")
 }
 
 fn pi_agent_auth_path() -> PathBuf {
-    pi_agent_dir().join("auth.json")
+    pi_agent_dir(&home_dir()).join("auth.json")
 }
 
 fn pi_agent_settings_path() -> PathBuf {
-    pi_agent_dir().join("settings.json")
+    pi_agent_dir(&home_dir()).join("settings.json")
 }
 
 fn pi_auth_entry<'a>(auth: &'a Value, provider: &str) -> Option<&'a Value> {
@@ -32641,8 +32545,32 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
     }
 
+    /// [behaviour] Pi's agent directory as Pi resolves it: an empty or unset
+    /// override is the default, the value is taken as written (no trim), and
+    /// a leading `~` is the home directory.
+    #[test]
+    fn pi_agent_dir_follows_pis_own_override_rule() {
+        let home = Path::new("/home/user");
+        let dir = |value: Option<&str>| pi_agent_dir_from(home, value.map(Into::into));
+        assert_eq!(dir(None), home.join(".pi/agent"));
+        assert_eq!(dir(Some("")), home.join(".pi/agent"));
+        assert_eq!(dir(Some("/abs/pi")), PathBuf::from("/abs/pi"));
+        assert_eq!(dir(Some(" /abs/pi ")), PathBuf::from(" /abs/pi "));
+        assert_eq!(dir(Some("~")), home.to_path_buf());
+        assert_eq!(dir(Some("~/alt/pi")), home.join("alt/pi"));
+        assert_eq!(dir(Some("~alt")), PathBuf::from("~alt"));
+        assert_eq!(dir(Some("rel/pi")), PathBuf::from("rel/pi"));
+    }
+
+    /// [behaviour] Every named platform keeps its route; an unnamed provider
+    /// is a direct API key route billed by that provider.
     #[test]
     fn pi_route_classifier_maps_supported_platforms() {
+        let other = pi_route_classification("Mistral", "mistral-large");
+        assert_eq!(other.billing_channel.as_deref(), Some("direct_api"));
+        assert_eq!(other.billing_provider.as_deref(), Some("mistral"));
+        assert_eq!(other.auth_mode.as_deref(), Some("api_key"));
+
         let openai = pi_route_classification("openai", "gpt-5.4-mini");
         assert_eq!(openai.source_category.as_deref(), Some("openai_api_key"));
         assert_eq!(openai.auth_mode.as_deref(), Some("api_key"));

@@ -1595,7 +1595,7 @@ fn staged_quiet_retirement_commits_only_with_its_second_save() {
 }
 
 /// [behaviour] Without a registered pass nothing can settle a second save, so
-/// the caller retires directly; a forgotten source starts over.
+/// the caller retires directly.
 #[test]
 fn quiet_stage_needs_a_registered_pass() {
     let source = SnapshotSource::Codex;
@@ -1605,9 +1605,6 @@ fn quiet_stage_needs_a_registered_pass() {
     cache.quiet_begin_pass(source, Path::new("index.json"), &Scope("a".into()), true);
     assert!(cache.quiet_registered(source));
     assert!(cache.quiet_stage(source, "key", "body", true));
-    cache.quiet_forget_source(source);
-    assert!(!cache.quiet_registered(source));
-    assert!(!cache.quiet_stage(source, "key", "body", true));
 }
 
 /// [behaviour] Secure absence retires audit debt; account holds require a second spaced probe.
@@ -2081,7 +2078,10 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
 
 /// [regress] Due audits must not count as content changes or re-stage retired debt.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
 fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
     let _clock = Clock::at(START);
     let source = SnapshotSource::Pi;

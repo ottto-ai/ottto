@@ -30,10 +30,11 @@ gh workflow run ci.yml --ref <branch> -f money_equivalence=true
 `money_equivalence_base=<ref-or-sha>` overrides the comparison ref. Empty resolves
 the branch's open PR base (or main without a PR); ambiguous bases fail. The job
 records exact source SHAs and uploads `money-equivalence-receipts` for 14 days.
-One standard macOS runner executes two builds, with a 55-minute ceiling and no
+One standard Linux runner (ubuntu-24.04, moved from macos-15 after a same-head
+macOS/Linux pair matched) executes two builds, with a 30-minute ceiling and no
 matrix, automatic retries or cache writes. Other CI jobs are skipped for this
 dispatch. Ordinary PR/push validation keeps its existing checks and gains no
-additional macOS job. Cancel/disable this dispatch job to roll back its cost.
+additional job. Cancel/disable this dispatch job to roll back its cost.
 The workflow is public; organizational budgets and runner pins are unchanged.
 
 Active fixtures, one test each:

@@ -614,7 +614,6 @@ mod ops_tests {
             }
             drop(loaded);
         }
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -649,7 +648,6 @@ mod ops_tests {
             .as_u64()
             .is_some_and(|rows| rows >= 13));
         drop(index);
-        super::super::erase_tree(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

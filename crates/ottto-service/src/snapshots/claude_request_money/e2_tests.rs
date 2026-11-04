@@ -23,6 +23,16 @@ fn at(seconds: i64) -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
 }
+/// A clock `seconds` after `COPY_PROOF_FROM`: a same-session copy whose own
+/// turns start there takes the page proof.
+fn after_proof_cutoff(seconds: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(COPY_PROOF_FROM) * 1_000_000 + i128::from(seconds) * 1_000_000_000,
+    )
+    .unwrap()
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap()
+}
 pub(super) fn line(id: &str, clock: &str, input: u64) -> Value {
     json!({"type":"assistant","version":"2.1.309","sessionId":ROOT,"timestamp":clock,
         "requestId":id,"message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
@@ -60,6 +70,28 @@ pub(super) fn parse(
     index: &ScanIndex,
     lines: &[Value],
 ) -> SnapshotItem {
+    let mut items = read_items(path, birth, index, lines);
+    // The page's copy decision, as the scan runs it; `publish` decides again
+    // over the whole page, where a parsed witness proves its own requests.
+    decide_page_copies(&mut items, index, None);
+    items.remove(0)
+}
+/// Parse without the copy decision: a held copy reaches the page undecided,
+/// as on a page that reads it beside its earlier twin.
+fn parse_undecided(
+    path: &Path,
+    birth: Option<i128>,
+    index: &ScanIndex,
+    lines: &[Value],
+) -> SnapshotItem {
+    read_items(path, birth, index, lines).remove(0)
+}
+fn read_items(
+    path: &Path,
+    birth: Option<i128>,
+    index: &ScanIndex,
+    lines: &[Value],
+) -> Vec<SnapshotItem> {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     let opened = fs::File::open(path).and_then(|file| file.metadata()).ok();
     a.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
@@ -76,11 +108,7 @@ pub(super) fn parse(
         path,
         twins: &Default::default(),
     }));
-    let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
-    // The page's copy decision, as the scan runs it; `publish` decides again
-    // over the whole page, where a parsed witness proves its own requests.
-    decide_page_copies(&mut items, index, None);
-    items.remove(0)
+    a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None)
 }
 /// Parse, then record the read like the scan does (birth + indexed path).
 fn parse_and_remember(
@@ -93,6 +121,47 @@ fn parse_and_remember(
     remember_birth(index, path, item.claude_money.as_deref().unwrap());
     index.files.insert(local_index_key(path), entry());
     item
+}
+/// Another session whose earlier main file in a copy's folder holds the
+/// copied requests (`hold_in_folder`).
+const HOLDER: &str = "c0000000-0000-4000-8000-00000000000c";
+/// The request-id proof of a copied MAIN prefix: an earlier main file of
+/// another session in `copy`'s own folder, accepted, whose current census
+/// holds `ids`.
+fn hold_in_folder(index: &mut ScanIndex, copy: &Path, ids: &[&str]) {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    let holder = copy.parent().unwrap().join(format!("{HOLDER}.jsonl"));
+    fs::write(&holder, b"fixture\n").unwrap();
+    let key = local_index_key(&holder);
+    let fingerprint = "a".repeat(64);
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(json!({"size_bytes":8,"modified_unix_seconds":1,
+            "source_file_fingerprint":fingerprint}))
+        .unwrap(),
+    );
+    // Born an hour before T0: earlier than every copy here.
+    index
+        .claude_money_birth_store
+        .record_observation(HOLDER, &key, t0() - 3_600_000_000_000);
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes.dedup();
+    index.claude_request_census_mut_for_test().insert_for_test(
+        &key,
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &fingerprint,
+            1,
+            ClaudeRequestCensusShape::Exact,
+            hashes,
+        ),
+    );
+    crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(index, &key);
 }
 fn restart(index: &ScanIndex) -> ScanIndex {
     serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
@@ -400,6 +469,8 @@ fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
     }
 }
 
+/// [money] A copied request both path twins carry attaches its telemetry row
+/// once, and the page counts it once.
 #[test]
 fn e2_path_twins_attach_the_row_once() {
     // Publication runs with the gate on, so the parse does too: dark
@@ -414,11 +485,13 @@ fn e2_path_twins_attach_the_row_once() {
             &mut index,
             &[(&first, t0()), (&copy, t0() + 60_000_000_000)],
         );
-        let twin = parse(
+        // Own turns after the page proof's cutoff: the page that reads both
+        // twins removes the copied request the earlier one holds.
+        let twin = parse_undecided(
             &copy,
             Some(t0() + 60_000_000_000),
             &index,
-            &[line("r", &at(1), 10), line("o", &at(61), 20)],
+            &[line("r", &at(1), 10), line("o", &after_proof_cutoff(1), 20)],
         );
         assert_eq!(fold(&twin).entity.removed_requests, 1, "the copy is held");
         for order in [vec![own.clone(), twin.clone()], vec![twin, own]] {
@@ -510,6 +583,8 @@ fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
     };
 }
 
+/// [money] A proven move keeps its cutoff across a restart, and a later copy
+/// of the moved file, read beside it, counts each copied request once.
 #[test]
 fn e2_move_then_copy_across_restart_counts_each_request_once() {
     // Publication runs with the gate on, so the parse does too: dark
@@ -538,12 +613,14 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
         );
         assert_eq!(fold(&b_moved).birth(), Some(t0()));
         let mut index = restart(&index);
-        // Copy of the live B: its history is held, its own line counts.
+        // Copy of the live B: its history is held, its own line counts. Its
+        // own turn starts after the page proof's cutoff, so the page that
+        // reads it beside B removes the history B holds.
         let copied = [
             moved[0].clone(),
             moved[1].clone(),
             moved[2].clone(),
-            line("h4", &at(130), 8),
+            line("h4", &after_proof_cutoff(10), 8),
         ];
         for _pass in 0..2 {
             stage_twins(
@@ -551,8 +628,14 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
                 &[(&b, t0() + 60_000_000_000), (&c, t0() + 120_000_000_000)],
             );
             let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
-            let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &copied);
-            assert_eq!(fold(&c_item).entity.removed_requests, 3);
+            let c_item = parse_undecided(&c, Some(t0() + 120_000_000_000), &index, &copied);
+            remember_birth(&mut index, &c, fold(&c_item));
+            index.files.insert(local_index_key(&c), entry());
+            assert_eq!(
+                fold(&c_item).entity.removed_requests,
+                3,
+                "held for the page"
+            );
             let got = publish(vec![b_item, c_item], None, TelemetryRead::Loaded, &index);
             assert_eq!(got.len(), 1);
             assert_eq!((got[0].request_count, got[0].input_tokens), (4, 15));
@@ -563,8 +646,11 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
     }
 }
 
+/// [money] Restored all-pre-birth same-session twins have no request-id
+/// proof: both count, disclosed, in every birth order, and either path alone
+/// counts the same.
 #[test]
-fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
+fn e2_restored_prebirth_twins_both_count_disclosed() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -583,30 +669,25 @@ fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
             stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
             let xs = parse(&x, Some(x_birth), &index, &history);
             let ys = parse(&y, Some(y_birth), &index, &history);
-            let skipped = [&xs, &ys]
-                .iter()
-                .filter(|item| fold(item).entity.removed_requests == 2)
-                .count();
-            assert_eq!(skipped, 1, "births {x_birth} {y_birth}");
-            let got = publish(
-                vec![xs.clone(), ys.clone()],
-                None,
-                TelemetryRead::Loaded,
-                &index,
-            );
+            for item in [&xs, &ys] {
+                let case = format!("births {x_birth} {y_birth}");
+                assert_eq!(fold(item).entity.removed_requests, 0, "{case}");
+                assert_eq!(fold(item).entity.totals().1, 2, "{case}");
+                assert!(fold(item).disclosed > 0, "{case}");
+            }
+            let got = publish(vec![xs, ys], None, TelemetryRead::Loaded, &index);
             assert_eq!(
-                (got[0].request_count, got[0].removed_request_count),
-                (2, Some(2))
+                (
+                    got[0].request_count,
+                    got[0].input_tokens,
+                    got[0].removed_request_count
+                ),
+                (4, 6, Some(0))
             );
-            // The surviving original is deleted: the held copy counts again.
-            let (kept, held) = if fold(&xs).entity.removed_requests == 0 {
-                (&x, (&y, y_birth))
-            } else {
-                (&y, (&x, x_birth))
-            };
-            fs::remove_file(kept).unwrap();
+            // One path deleted: the other counts the same alone.
+            fs::remove_file(&x).unwrap();
             stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
-            let alone = parse(held.0, Some(held.1), &index, &history);
+            let alone = parse(&y, Some(y_birth), &index, &history);
             assert_eq!(fold(&alone).entity.removed_requests, 0);
             assert_eq!(fold(&alone).entity.totals().1, 2);
             cleanup(&[&x, &y]);
@@ -614,41 +695,16 @@ fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
     }
 }
 
-#[test]
-fn e2_writer_certificate_refuses_mixed_versions_in_either_order() {
-    let p = root_file("writers");
-    let index = ScanIndex::default();
-    let copy = |version| versioned(line("c", &at(-100), 10), version);
-    for (copy_version, first, second, certified) in [
-        ("2.1.309", "2.1.309", "2.1.309", true),
-        ("2.0.0", "2.1.310", "2.1.310", true),
-        ("2.1.309", "2.1.309", "99.0.0", false),
-        ("2.1.309", "99.0.0", "2.1.309", false),
-        ("2.1.309", "2.1.309", "2.1.310", false),
-        ("2.1.309", "2.1.310", "2.1.309", false),
-    ] {
-        let lines = [
-            copy(copy_version),
-            versioned(line("o1", &at(1), 20), first),
-            versioned(line("o2", &at(2), 30), second),
-        ];
-        let got = parse(&p, Some(t0()), &index, &lines);
-        let f = fold(&got);
-        let case = format!("{copy_version} {first} {second}");
-        assert_eq!(f.entity.removed_requests, u64::from(certified), "{case}");
-        assert_eq!(f.entity.totals().1, 3 - u64::from(certified), "{case}");
-        assert_eq!(f.disclosed, u64::from(!certified), "{case}");
-    }
-    cleanup(&[&p]);
-}
-
+/// [money] A copied request another session's earlier file in the folder
+/// holds is removed with its exact usage.
 #[test]
 fn e2_exact_removal_totals() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
         let p = root_file("removal");
-        let index = ScanIndex::default();
+        let mut index = ScanIndex::default();
+        hold_in_folder(&mut index, &p, &["c"]);
         let mut copy = line("c", &at(-100), 10);
         copy["message"]["usage"]["output_tokens"] = json!(4);
         copy["message"]["usage"]["cache_read_input_tokens"] = json!(7);
@@ -1337,15 +1393,16 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
             opened.birth = u64::try_from(*birth).unwrap();
             opened
         });
-        let size = index.files.get(&key).map_or(0, |e| e.size_bytes);
         index
             .claude_money_birth_store
-            .stage_opened(&member, &key, opened, size);
+            .stage_opened(&member, &key, opened);
     }
 }
 
+/// [money] First-ever restored all-pre-birth root twins (no earlier read, no
+/// restart) both count, disclosed, in either order.
 #[test]
-fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
+fn e2_first_ever_restored_root_twins_both_count_disclosed() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1370,19 +1427,20 @@ fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
                 .collect::<Vec<_>>();
             assert_eq!(
                 items.iter().map(|i| fold(i).entity.totals().1).sum::<u64>(),
-                2
+                4
             );
             assert_eq!(
                 items
                     .iter()
                     .map(|i| fold(i).entity.removed_requests)
                     .sum::<u64>(),
-                2
+                0
             );
+            assert!(items.iter().all(|i| fold(i).disclosed > 0));
             let got = publish(items, None, TelemetryRead::Loaded, &index);
             assert_eq!(got.len(), 1);
-            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 3));
-            assert_eq!(got[0].removed_request_count, Some(2));
+            assert_eq!((got[0].request_count, got[0].input_tokens), (4, 6));
+            assert_eq!(got[0].removed_request_count, Some(0));
             cleanup(&[&early, &later]);
         }
     }
@@ -1396,8 +1454,11 @@ fn agent_file(name: &str) -> PathBuf {
     path
 }
 
+/// [money] A later subagent path twin's copied lines have no request-id
+/// proof: they count on both paths, disclosed, in both orders; the earliest
+/// subagent counts fully and discloses nothing.
 #[test]
-fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
+fn e2_subagent_twins_identical_and_overlapping_count_on_both_paths_disclosed() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1430,25 +1491,22 @@ fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
                     2,
                     "earliest subagent counts fully"
                 );
-                assert_eq!(fold(&second).entity.removed_requests, 2);
+                assert_eq!(fold(&first).disclosed, 0);
+                assert_eq!(fold(&second).entity.removed_requests, 0);
+                assert_eq!(fold(&second).entity.totals().1, 2 + u64::from(overlap));
+                assert!(
+                    fold(&second).disclosed > 0,
+                    "the copied lines are disclosed"
+                );
                 let mut items = vec![first, second];
                 if reverse {
                     items.reverse();
                 }
-                let got = publish(
-                    items,
-                    Some(&sidecar(&[row("a", 1, 10), row("b", 2, 20)])),
-                    TelemetryRead::Loaded,
-                    &index,
-                );
+                let got = publish(items, None, TelemetryRead::Loaded, &index);
                 assert_eq!(got.len(), 1);
-                assert_eq!(got[0].request_count, 2 + u64::from(overlap));
-                assert_eq!(got[0].input_tokens, if overlap { 60 } else { 30 });
-                assert_eq!(got[0].removed_request_count, Some(2));
-                assert_eq!(
-                    got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-                    Some("0.0002")
-                );
+                assert_eq!(got[0].request_count, 4 + u64::from(overlap));
+                assert_eq!(got[0].input_tokens, if overlap { 90 } else { 60 });
+                assert_eq!(got[0].removed_request_count, Some(0));
                 fs::remove_dir_all(early.ancestors().nth(3).unwrap()).unwrap();
                 fs::remove_dir_all(later.ancestors().nth(3).unwrap()).unwrap();
             }
@@ -1456,6 +1514,8 @@ fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
     }
 }
 
+/// [money] A same-session copy whose earlier path was recreated or truncated
+/// has no request-id proof: its copied request counts, disclosed.
 #[test]
 fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
     // Publication runs with the gate on, so the parse does too: dark
@@ -1513,7 +1573,7 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
                     .collect::<String>(),
             )
             .unwrap();
-            let mut index = restart(&index); // generation/extent evidence survives restart
+            let mut index = restart(&index);
             stage_twins(
                 &mut index,
                 &[
@@ -1548,8 +1608,10 @@ fn without_version(mut value: Value) -> Value {
     value
 }
 
+/// [money] A resumed prefix no other session's file holds counts, disclosed,
+/// whatever its own lines carry (a version or a timestamp missing, in any order).
 #[test]
-fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
+fn e2_resumed_prefix_without_holder_counts_disclosed_in_every_own_order() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -1585,8 +1647,10 @@ fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
     }
 }
 
+/// [money] An all-pre-birth same-session twin no other session's file holds
+/// counts, disclosed, whatever its response version.
 #[test]
-fn e2_all_prebirth_twins_require_known_response_writers() {
+fn e2_all_prebirth_twin_without_holder_counts_disclosed() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -2288,11 +2352,14 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
     };
 }
 
+/// [behaviour] A removed copy leaves only the evidence of the account its
+/// counted request uses.
 #[test]
 fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
     {
         let path = root_file("identity-copy");
-        let index = ScanIndex::default();
+        let mut index = ScanIndex::default();
+        hold_in_folder(&mut index, &path, &["copied"]);
         let item = tag_owned(
             vec![parse(
                 &path,
@@ -2629,22 +2696,26 @@ fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
     };
 }
 
+/// [behaviour] The inherited-org counter leaves out removed copies and
+/// counts copies that count after all (no holder).
 #[test]
 fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
     {
         let path = root_file("identity-count-copy");
-        let index = ScanIndex::default();
         for restore in [false, true] {
-            let version = if restore { "unknown" } else { "2.1.309" };
+            let mut index = ScanIndex::default();
+            if !restore {
+                hold_in_folder(&mut index, &path, &["prefix", "inherited-copy"]);
+            }
             let item = parse(
                 &path,
                 Some(t0() + 100_000_000_000),
                 &index,
                 &[
                     org_marker(ORG_A),
-                    versioned(line("prefix", &at(1), 1), version),
-                    versioned(line("inherited-copy", &at(2), 1), version),
-                    versioned(line("own", &at(101), 1), version),
+                    line("prefix", &at(1), 1),
+                    line("inherited-copy", &at(2), 1),
+                    line("own", &at(101), 1),
                 ],
             );
             assert_eq!(
@@ -2977,13 +3048,16 @@ fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_resta
     };
 }
 
+/// [behaviour] Markers of a removed /branch or /resume prefix never name the
+/// account of the copy's own requests.
 #[test]
 fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
     {
         for operation in ["/branch", "/resume"] {
             for fresh_marker in [false, true] {
                 let path = root_file("identity-prefix-marker");
-                let index = ScanIndex::default();
+                let mut index = ScanIndex::default();
+                hold_in_folder(&mut index, &path, &["copied"]);
                 let mut old_marker = org_marker(ORG_A);
                 old_marker["timestamp"] = json!(at(1));
                 let mut lines = vec![old_marker, line("copied", &at(2), 10)];
@@ -3322,6 +3396,8 @@ fn e2_identity_three_contradictory_start_twins_preserve_own_orgs_deterministical
     };
 }
 
+/// [behaviour] A removed prefix's marker never chooses the starting account
+/// of the root, its subagent or a side call.
 #[test]
 fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
     {
@@ -3333,7 +3409,8 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
             .join("subagents/agent-abc.jsonl");
         fs::create_dir_all(agent.parent().unwrap()).unwrap();
         fs::write(&agent, b"fixture\n").unwrap();
-        let index = ScanIndex::default();
+        let mut index = ScanIndex::default();
+        hold_in_folder(&mut index, &path, &["copied"]);
         let mut old = org_marker(ORG_A);
         old["timestamp"] = json!(at(1));
         let mut own = org_marker(ORG_B);
@@ -3398,12 +3475,15 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
     };
 }
 
+/// [behaviour] Past the marker cap, a removed prefix's marker is no starting
+/// witness: the copy's own request takes no org.
 #[test]
 fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-marker-overflow");
-            let index = ScanIndex::default();
+            let mut index = ScanIndex::default();
+            hold_in_folder(&mut index, &path, &["copied"]);
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
             accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
             accumulator
@@ -3476,6 +3556,7 @@ fn org_amounts(item: &SnapshotItem) -> BTreeMap<String, (u64, u64)> {
     amounts
 }
 
+/// [behaviour] A restored timed prefix that counts keeps every org it counts.
 #[test]
 fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
     {
@@ -3494,11 +3575,8 @@ fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
                 line("b", &at(4), 20),
             ];
             if partial {
-                // A partial restore has no allowlisted writer certificate.
-                lines.push(versioned(
-                    line("restored-own", &at(101), 30),
-                    "unknown-writer",
-                ));
+                // A partial restore: no other session's file holds its prefix.
+                lines.push(line("restored-own", &at(101), 30));
             }
             let parsed = parse(&path, Some(t0() + 100_000_000_000), &index, &lines);
             assert_eq!(fold(&parsed).entity.removed_requests, 0);
@@ -3517,6 +3595,8 @@ fn e2_identity_restored_timed_prefix_keeps_every_counted_org() {
     };
 }
 
+/// [behaviour] A copy whose prefix its earlier path twin on the page holds
+/// (the page proof) excludes that prefix without lending the original's org.
 #[test]
 fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
     {
@@ -3544,7 +3624,8 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
                 own["timestamp"] = json!(at(1));
                 lines.push(own);
             }
-            lines.push(line("branch-own", &at(101), 20));
+            // Own turns after the page proof's cutoff.
+            lines.push(line("branch-own", &after_proof_cutoff(1), 20));
             // Give the copy its own login. An unbound same-session path twin
             // legitimately inherits A from the original at page settlement;
             // that cannot distinguish session fallback from prefix leakage.
@@ -3566,7 +3647,7 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
             let item = accumulator
                 .into_items(&copy, "2026-08-02T09:00:00Z", "fixture".into(), None)
                 .remove(0);
-            assert_eq!(fold(&item).entity.removed_requests, 1);
+            assert_eq!(fold(&item).entity.removed_requests, 1, "held for the page");
             assert_eq!(
                 org_amounts(
                     &tag_owned(vec![item.clone(), original_item.clone()], &index).remove(0)
@@ -3693,12 +3774,15 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
     };
 }
 
+/// [money] The holder decision's account rebuild keeps the later marker's
+/// boundary and the telemetry cost attached before it.
 #[test]
 fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-boundary");
-            let index = ScanIndex::default();
+            let mut index = ScanIndex::default();
+            hold_in_folder(&mut index, &path, &["copy"]);
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
             accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
             accumulator
@@ -3722,6 +3806,8 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
             }));
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+            // As the scan runs it: the page's copy decision before telemetry attaches.
+            decide_page_copies(&mut items, &index, None);
             let read = sidecar(&[
                 row("unmarked-own", 1, 20),
                 row("b", 2, 30),
@@ -3929,8 +4015,10 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
     cleanup(&[&p]);
 }
 
+/// [money] Of two equal-birth subagent path twins the (birth, location)
+/// order names exactly one copy; its copied lines count, disclosed.
 #[test]
-fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
+fn e2_equal_birth_subagent_twins_count_both_paths_in_both_orders() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     {
@@ -3951,25 +4039,70 @@ fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
                 .iter()
                 .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
                 .collect::<Vec<_>>();
+            assert!(items.iter().all(|i| fold(i).entity.removed_requests == 0));
             assert_eq!(
-                items
-                    .iter()
-                    .map(|i| fold(i).entity.removed_requests)
-                    .collect::<BTreeSet<_>>(),
-                BTreeSet::from([0, 2]),
+                items.iter().filter(|i| fold(i).disclosed > 0).count(),
+                1,
                 "the (birth, location) order names exactly one copy"
             );
             let got = publish(items, None, TelemetryRead::Loaded, &index);
             assert_eq!(got.len(), 1);
-            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
-            assert_eq!(got[0].removed_request_count, Some(2));
+            assert_eq!((got[0].request_count, got[0].input_tokens), (4, 60));
+            assert_eq!(got[0].removed_request_count, Some(0));
             remove_agent_scratch(&[&early, &later]);
         }
     }
 }
 
-/// [money] Redundant prefixes publish the deduplicated body and placement;
-/// diverged absent twins retain their hold and co-read release.
+/// [money] The observed shape of a same-session copy: a later path in another
+/// folder copies the prefix of a settled earlier path, its first own turn
+/// before the copy proof cutoff, written by an unlisted version. No holder
+/// can prove that prefix, so it counts, flagged. Off the page the earlier
+/// path is a redundant twin and the copy is sent alone, each request once;
+/// read on one page the two paths sum, as before this change.
+#[test]
+fn e2_settled_twin_in_another_folder_keeps_its_earlier_outcome() {
+    let earlier = root_file("settled-twin-earlier");
+    let copy = root_file("settled-twin-copy");
+    let unlisted = |value: Value| versioned(value, "2.1.222");
+    let history = vec![unlisted(line("a", &at(1), 10))];
+    let mut resumed = history.clone();
+    resumed.push(unlisted(line("b", &at(101), 20)));
+    for (path, lines) in [(&earlier, &history), (&copy, &resumed)] {
+        let text = lines.iter().map(|line| line.to_string() + "\n");
+        fs::write(path, text.collect::<String>()).unwrap();
+    }
+    let mut index = ScanIndex::default();
+    index.files.insert(local_index_key(&earlier), entry());
+    index.files.insert(local_index_key(&copy), entry());
+    let birth = t0() + 100_000_000_000;
+    stage_twins(&mut index, &[(&earlier, t0()), (&copy, birth)]);
+    // (earlier path on the page, published requests, sent as redundant)
+    for (co_paged, requests, redundant) in [(false, 2, 1), (true, 3, 0)] {
+        let case = format!("co-paged {co_paged}");
+        let item = parse(&copy, Some(birth), &index, &resumed);
+        assert_eq!(fold(&item).entity.removed_requests, 0, "{case}");
+        assert_eq!(fold(&item).entity.totals().1, 2, "{case}");
+        assert!(fold(&item).disclosed > 0, "{case}: flagged");
+        let mut page = vec![item];
+        if co_paged {
+            page.insert(0, parse(&earlier, Some(t0()), &index, &history));
+        }
+        take_diag();
+        let got = publish(page, None, TelemetryRead::Loaded, &index);
+        let diag = take_diag();
+        assert_eq!(got.len(), 1, "{case}: one body");
+        assert_eq!(got[0].request_count, requests, "{case}");
+        let count = |key: &str| diag.get(key).copied().unwrap_or(0);
+        assert_eq!(count("held_absent_twin"), 0, "{case}: never held");
+        assert_eq!(count("twin_redundant"), redundant, "{case}");
+    }
+    cleanup(&[&earlier, &copy]);
+}
+
+/// [money] A redundant all-copy path twin off the page leaves the original's
+/// body and placement; diverged absent twins retain their hold and co-read
+/// release.
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
     // Publication runs with the gate on, so the parse does too: dark
@@ -3999,17 +4132,19 @@ fn e2_absent_subagent_twin_holds_its_session() {
         write(&shorter_path, &prefix);
         index.files.insert(local_index_key(&longer), entry());
         index.files.insert(local_index_key(&shorter_path), entry());
-        // Production stages live birth witnesses before parsing either twin.
-        // Without that proof the prefix counts as unproven, so a co-read sums it twice.
         stage_twins(
             &mut index,
             &[(&longer, t0()), (&shorter_path, t0() + 60_000_000_000)],
         );
-        let original = parse(&longer, Some(t0()), &index, &full);
+        // An all-copy same-session twin has no request-id proof: read on a
+        // page, its prefix counts again, disclosed.
         let copy = parse(&shorter_path, Some(t0() + 60_000_000_000), &index, &prefix);
-        assert_eq!(fold(&copy).entity.totals().1, 0);
-        assert_eq!(fold(&copy).entity.removed_requests, 1);
-        let expected = tag_owned(vec![original, copy], &index);
+        assert_eq!(fold(&copy).entity.totals().1, 1);
+        assert_eq!(fold(&copy).entity.removed_requests, 0);
+        assert!(fold(&copy).disclosed > 0);
+        // Off the page, the redundant copy leaves the original's body.
+        let original = parse(&longer, Some(t0()), &index, &full);
+        let expected = tag_owned(vec![original], &index);
         assert_eq!(
             (expected[0].request_count, expected[0].input_tokens),
             (2, 30)
@@ -4063,8 +4198,8 @@ fn e2_absent_subagent_twin_holds_its_session() {
                     .claude_request_census_mut_for_test()
                     .insert_for_test(&key, record);
             }
-            // An older, uncertified writer produced the observed longer copy
-            // at the later-born path. Its own session requests still count.
+            // The observed longer copy at the later-born path: no other
+            // session's file holds its requests, so they still count.
             let mut case_full = full.clone();
             let birth = if proof == 4 {
                 for value in &mut case_full {
@@ -4221,34 +4356,6 @@ fn e2_absent_subagent_twin_holds_its_session() {
         cleanup(&[&root_early, &root_later]);
         remove_agent_scratch(&[&early, &later]);
     }
-}
-
-#[test]
-fn e2_moved_copy_partial_branch_certifies_writers_from_the_effective_cutoff() {
-    let p = root_file("moved-writer");
-    let opened = fs::metadata(&p).ok();
-    let physical = t0() + 120_000_000_000;
-    for (moved, own_version, certified) in [
-        // Moved by copy: its own run lies between the effective cutoff and
-        // the physical birth, by one known writer other than the prefix's.
-        (true, "2.1.310", true),
-        // The same run seen from the physical birth has no own line.
-        (false, "2.1.310", false),
-        // An unknown own writer never certifies.
-        (true, "2.0.99", false),
-    ] {
-        let mut birth = ClaudeFileBirth::observe(&p, opened.as_ref());
-        birth.set_birth_for_test(physical);
-        let mut birth = birth.with_minimum(moved.then(t0));
-        birth.observe_response_writer(Some("2.1.309"), Some(&at(-100)));
-        birth.observe_response_writer(Some(own_version), Some(&at(10)));
-        assert_eq!(
-            birth.writer_certified(Some(1)),
-            certified,
-            "moved={moved} own={own_version}"
-        );
-    }
-    cleanup(&[&p]);
 }
 
 #[test]

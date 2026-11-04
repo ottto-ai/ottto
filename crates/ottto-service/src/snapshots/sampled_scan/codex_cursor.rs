@@ -4541,21 +4541,6 @@ impl SharedCache {
         }))
     }
 
-    /// A Codex copy about to be erased: its paused job and suspended proof, with
-    /// their open readers, and header facts. The caller holds the sync cycle
-    /// lock, so no lease is active.
-    pub(crate) fn forget_codex_jobs(&self) {
-        // The paused job drops after the lock: its reader and credit may settle on drop.
-        drop(self.with_cursor(|cursor| {
-            retire_holder(cursor);
-            cursor.slot_key = None;
-            cursor.slot_members.clear();
-            cursor.slot_charge = 0;
-            cursor.headers.clear();
-            std::mem::replace(&mut cursor.slot, Slot::Empty)
-        }));
-    }
-
     pub(in crate::snapshots) fn cursor_slot_free(&self) -> bool {
         self.with_cursor(|cursor| matches!(cursor.slot, Slot::Empty))
             .unwrap_or(false)
@@ -6860,7 +6845,6 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         index.extend_codex_blocked_attribution(&index_key, blocked);
     }
     targets.pending_finalization.push(PendingIndexFinalization {
-        stored_reuse: None,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index
@@ -6928,7 +6912,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
 #[path = "codex_cursor_tests.rs"]
 pub(in crate::snapshots) mod tests;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod header_admission_tests {
     use super::*;
     fn populated() -> (PathBuf, Arc<SharedCache>, String) {

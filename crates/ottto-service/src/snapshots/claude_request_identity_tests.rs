@@ -178,7 +178,6 @@ fn typed_item(value: &Value) -> SnapshotItem {
                     identity_basis: opt_string(entry, "identity_basis").unwrap(),
                     provider_workspace_hash: opt_string(entry, "provider_workspace_hash"),
                     account_source: None,
-                    sole_login_witness: None,
                 })
                 .collect()
         })
@@ -1009,10 +1008,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         terminal_unix_seconds: at,
         event_clock_complete: true,
         marker,
-        desktop: false,
         scan_unix_seconds: Some(1_000_000),
-        email_precedes: false,
-        recorded_login: None,
         duplicated_elsewhere: false,
     }
 }
@@ -1176,7 +1172,6 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
     let classify = |request_id: &str, source_session_id: &str| {
         let mut request = facts(request_id, Some(999_000), MarkerVerdict::Trusted(&org));
         request.source_session_id = source_session_id;
-        request.desktop = true;
         identity::classify(&evidence, &request)
     };
     let refused = RequestIdentity::Refused;
@@ -4691,99 +4686,3 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
-
-fn recorded_folder() -> crate::snapshots::claude_folder_login::QualifiedFolder {
-    crate::snapshots::claude_folder_login::QualifiedFolder {
-        login: "a".repeat(64),
-        org: "d".repeat(64),
-        witness: crate::snapshots::SoleLoginWitness {
-            v: 1,
-            kind: "folder".to_string(),
-            folder: "0a1b2c3d".to_string(),
-            covered_from: "2026-08-02T07:00:00Z".to_string(),
-        },
-    }
-}
-
-/// Only an unchanged recorded email and a trusted marker of the folder's own
-/// org, both before the request, name it. Anything less keeps today's answer.
-#[test]
-fn recorded_login_needs_the_request_own_email_and_org() {
-    let (api, trace) = reports(Vec::new(), Vec::new());
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new());
-    let folder = recorded_folder();
-    let at = Some(900_000);
-    let org = folder.org.clone();
-    let named = RequestIdentity::Tagged(AuthorityKey {
-        login: Some(folder.login.clone()),
-        org: Some(folder.org.clone()),
-        basis: identity::TRANSCRIPT_RECORDED_LOGIN,
-        account_source: None,
-    });
-    let org_only = |org: &str| {
-        RequestIdentity::Tagged(AuthorityKey {
-            login: None,
-            org: Some(org.to_string()),
-            basis: identity::TRANSCRIPT_ORG,
-            account_source: None,
-        })
-    };
-    let stamped = |marker| RequestFacts {
-        recorded_login: Some(&folder),
-        email_precedes: true,
-        ..facts("req_own", at, marker)
-    };
-    assert_eq!(
-        identity::classify(&evidence, &stamped(MarkerVerdict::Trusted(&org))),
-        named
-    );
-    assert_eq!(
-        identity::classify(&evidence, &stamped(MarkerVerdict::None)),
-        RequestIdentity::Missing,
-        "no recorded org before the request: no own evidence"
-    );
-    let before_email = RequestFacts {
-        email_precedes: false,
-        ..stamped(MarkerVerdict::Trusted(&org))
-    };
-    assert_eq!(identity::classify(&evidence, &before_email), org_only(&org));
-    let desktop = RequestFacts {
-        desktop: true,
-        ..stamped(MarkerVerdict::Trusted(&org))
-    };
-    assert_eq!(
-        identity::classify(&evidence, &desktop),
-        org_only(&org),
-        "Desktop stays pair-only"
-    );
-    let other = "e".repeat(64);
-    assert_ne!(
-        identity::classify(&evidence, &stamped(MarkerVerdict::Trusted(&other))),
-        named,
-        "another org is never given this login"
-    );
-    assert_eq!(
-        identity::classify(&evidence, &stamped(MarkerVerdict::Overflow)),
-        RequestIdentity::Refused(Refusal::MarkerOverflow)
-    );
-    assert_eq!(
-        identity::classify(&evidence, &stamped(MarkerVerdict::BadOrg)),
-        RequestIdentity::Refused(Refusal::ContradictoryOrg)
-    );
-    assert_eq!(
-        identity::classify(
-            &evidence,
-            &facts("req_fork", at, MarkerVerdict::Trusted(&org))
-        ),
-        org_only(&org),
-        "a file the folder did not stamp keeps today's answer"
-    );
-    let duplicated = RequestFacts {
-        duplicated_elsewhere: true,
-        ..stamped(MarkerVerdict::Trusted(&org))
-    };
-    assert_eq!(
-        identity::classify(&evidence, &duplicated),
-        RequestIdentity::Refused(Refusal::ConflictingDuplicate)
-    );
-}

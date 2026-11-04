@@ -1,5 +1,7 @@
+use crate::snapshots::SnapshotSource;
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::sync::Mutex;
 
 pub(crate) struct SessionHash(Option<[u8; 4]>);
 
@@ -14,12 +16,7 @@ impl SessionHash {
 impl fmt::Display for SessionHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Some(bytes) => {
-                for byte in bytes {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                Ok(())
-            }
+            Some(bytes) => fmt::Display::fmt(&crate::hex::LowerHex(&bytes), formatter),
             None => formatter.write_str("unavailable"),
         }
     }
@@ -57,6 +54,25 @@ where
         return SessionHash(None);
     };
     SessionHash::of(id)
+}
+
+/// Per-source on-change log gate: stores `line` in `source`'s slot and returns
+/// the previous line when it differs (`Some(None)` on the first line since
+/// start), or `None` when unchanged so the caller stays quiet. A poisoned lock
+/// logs every time instead of panicking.
+pub(super) fn changed<T: PartialEq>(
+    lines: &Mutex<[Option<T>; 3]>,
+    source: SnapshotSource,
+    line: T,
+) -> Option<Option<T>> {
+    let Ok(mut lines) = lines.lock() else {
+        return Some(None);
+    };
+    let slot = &mut lines[source.slot()];
+    if slot.as_ref() == Some(&line) {
+        return None;
+    }
+    Some(slot.replace(line))
 }
 
 #[cfg(test)]
@@ -105,5 +121,41 @@ mod tests {
             rejected_session_hash(&items, &[0], "fp", &|item| item.0, &|_| None).to_string(),
             "unavailable"
         );
+    }
+
+    #[test]
+    fn collector_status_code_logs_once_per_change() {
+        let lines = Mutex::new([None, None, None]);
+        let code = |slug: &str| (true, Some(slug.to_string()));
+        let source = SnapshotSource::Codex;
+        assert_eq!(changed(&lines, source, code("server_error")), Some(None));
+        assert_eq!(changed(&lines, source, code("server_error")), None);
+        assert_eq!(
+            changed(&lines, source, code("backend_validation_error")),
+            Some(Some(code("server_error")))
+        );
+        assert!(changed(&lines, source, (true, None)).is_some());
+        assert!(changed(&lines, source, (false, None)).is_some());
+        assert_eq!(changed(&lines, source, (false, None)), None);
+    }
+
+    #[test]
+    fn collector_status_code_logs_per_source() {
+        let lines = Mutex::new([None, None, None]);
+        let line = (true, Some("server_error".to_string()));
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            assert_eq!(changed(&lines, source, line.clone()), Some(None));
+        }
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            assert_eq!(changed(&lines, source, line.clone()), None);
+        }
     }
 }

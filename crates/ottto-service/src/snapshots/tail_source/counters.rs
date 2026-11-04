@@ -44,8 +44,8 @@ pub(in crate::snapshots) fn add(
 }
 
 /// One executed D168 replay on the reconstruction counters, with the bytes
-/// the replay read. A replay is no failure after a head: it raises no alarm
-/// and opens no window. Its bytes are also in the page's
+/// the replay read. A replay is no failure after a head: it is not in
+/// `tail_reconstruct_after_head`. Its bytes are also in the page's
 /// `completed_full_native_bytes`, as every Full's.
 #[expect(dead_code, reason = "Codex's codec (S2b) counts its replays")]
 pub(in crate::snapshots) fn replay(
@@ -56,24 +56,6 @@ pub(in crate::snapshots) fn replay(
     let label = cause.label();
     bump(source, "tail_reconstruct", label);
     add(source, "tail_reconstruct_bytes", label, bytes);
-}
-
-/// Per source, at most once per 24 h while reconstructions after a head
-/// persist. RAM only: a restart alarms again.
-pub(in crate::snapshots) fn restart_full_alarm_due(source: SnapshotSource) -> bool {
-    const EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-    static LAST: std::sync::Mutex<BTreeMap<&'static str, std::time::Instant>> =
-        std::sync::Mutex::new(BTreeMap::new());
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = std::time::Instant::now();
-    if last
-        .get(source.api_slug())
-        .is_some_and(|at| now.duration_since(*at) < EVERY)
-    {
-        return false;
-    }
-    last.insert(source.api_slug(), now);
-    true
 }
 
 /// `source`'s line on this page, when anything of it counted since the last.

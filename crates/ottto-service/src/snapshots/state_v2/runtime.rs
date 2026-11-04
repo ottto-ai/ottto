@@ -20,8 +20,6 @@ pub(crate) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
-    SaveCeiling,
-    SaveOversize,
     SaveFull,
     ReferenceDrift,
     AckCustody,
@@ -34,8 +32,6 @@ impl std::fmt::Display for Hold {
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
             Self::MigrationFailed => "state_v2_migration_failed",
-            Self::SaveCeiling => "state_v2_save_ceiling",
-            Self::SaveOversize => "state_v2_save_oversize",
             Self::SaveFull => "state_v2_sqlite_full",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
@@ -105,8 +101,6 @@ impl Hold {
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
-        } else if Self::ceiling_cause(&error).is_some() {
-            Self::SaveCeiling
         } else if error
             .chain()
             .any(|e| e.to_string() == "state_v2_foreign_binding")
@@ -131,15 +125,6 @@ impl Hold {
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
     }
-    /// Content-free cause of refused save pressure. Logical value admission
-    /// still holds as `SaveCeiling`; aggregate charged work only alarms.
-    fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
-        error.chain().find_map(|e| match e.to_string().as_str() {
-            "state_v2_save_ceiling" => Some("charged_work"),
-            "state_v2_value_admission" => Some("value_admission"),
-            _ => None,
-        })
-    }
 }
 struct RouteState {
     pace: Pace,
@@ -153,9 +138,6 @@ struct RouteState {
     page_limit: usize,
     requested_page: usize,
     save_hold: Option<Hold>,
-    // Page-one pressure names the last admitted file, never upload authority.
-    last_read: Option<(String, u64)>,
-    save_retry_completed: bool,
     pass_written_start: Option<u64>,
     // Live ACK custody exceeded the companion bound: no collection before this.
     custody_retry_at: Option<Instant>,
@@ -188,14 +170,8 @@ impl RouteState {
         if claim_only {
             return;
         }
-        // A cursor-only save after a paced skip cannot resolve the held file.
-        if self.save_hold == Some(Hold::SaveOversize) && !self.save_retry_completed {
-            return;
-        }
         self.save_hold = None;
         self.report_hold();
-        self.last_read = None;
-        self.save_retry_completed = false;
         if over_target {
             self.reduce_page();
         } else {
@@ -226,8 +202,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     page_limit: 250,
                     requested_page: 250,
                     save_hold: None,
-                    last_read: None,
-                    save_retry_completed: false,
                     pass_written_start: None,
                     custody_retry_at: None,
                     tail: Default::default(),
@@ -564,7 +538,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             let generation = import::import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
-                db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
+                db_id: crate::hex::encode(&random),
                 binding,
                 fence_generation: generation,
             };
@@ -637,7 +611,7 @@ pub(in super::super) fn save_locked(
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let runtime = index.v2().persistence_v2.clone();
     let expected = claim_generation.unwrap_or(index.generation);
-    let result = with_save_session(path, runtime, expected, claim_only, |state, session, id| {
+    let result = with_save_session(path, runtime, expected, |state, session, id| {
         let previous = match state.save_digests.take() {
             Some(previous) => previous,
             None => {
@@ -690,18 +664,16 @@ pub(in super::super) fn save_locked(
 }
 /// Custody shared by both v2 writes: fence and session checks, then a stale
 /// graph is refused before any write without invalidating the healthy
-/// session. A failed write keeps its pressure hold and reopens the session.
+/// session. A failed write keeps a disk-full hold and reopens the session.
 /// `None`: no runtime and no published store.
 fn with_save_session<T>(
     path: &Path,
     runtime: Option<Arc<Runtime>>,
     expected: u64,
-    claim_only: bool,
     write: impl FnOnce(&mut RouteState, &mut Session, Identity) -> Result<T>,
 ) -> Result<Option<T>> {
     let binding = binding_for(path)?;
     let mut stale_graph = false;
-    let mut ceiling = None;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = runtime else {
@@ -724,11 +696,7 @@ fn with_save_session<T>(
             stale_graph = true;
             bail!(Hold::ReloadRequired);
         }
-        let written = write(state, session, identity);
-        if let Err(error) = &written {
-            ceiling = Hold::ceiling_cause(error).map(|c| (c, session.db.refused_save_bytes()));
-        }
-        written.map(Some)
+        write(state, session, identity).map(Some)
     }));
     if let Err(error) = &result {
         if stale_graph {
@@ -736,27 +704,7 @@ fn with_save_session<T>(
         }
         with_state(path, |state| {
             state.save_digests = None;
-            state.save_retry_completed = false;
-            if let (Some(Hold::SaveCeiling), Some((cause, bytes))) =
-                (error.downcast_ref::<Hold>(), ceiling)
-            {
-                // A save-pressure hold is never silent: alarm with its fixed cause.
-                telemetry::event("save_ceiling_alarm", &bytes);
-                telemetry::event("save_ceiling_cause", &cause);
-            }
-            if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
-                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
-            {
-                state.save_hold = Some(if state.page_limit == 1 {
-                    telemetry::event("save_oversize_alarm", &1);
-                    Hold::SaveOversize
-                } else {
-                    state.reduce_page();
-                    Hold::SaveCeiling
-                });
-            } else if state.save_hold != Some(Hold::SaveOversize)
-                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull))
-            {
+            if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull)) {
                 state.save_hold = Some(Hold::SaveFull);
             }
             if let Some(runtime) = &state.current {
@@ -827,7 +775,7 @@ pub(in super::super) fn claim_growth_locked(
     let runtime = index.v2().persistence_v2.clone();
     ensure!(runtime.is_some(), Hold::ReloadRequired);
     let _save_window = telemetry::Window::begin("save");
-    with_save_session(path, runtime, expected, true, |state, session, id| {
+    with_save_session(path, runtime, expected, |state, session, id| {
         recovered_write(path, None, &id, session, |session| {
             #[cfg(test)]
             if tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take) {
@@ -1047,60 +995,6 @@ pub(in super::super) fn ack_custody_held(path: &Path) -> bool {
     state.lock().is_ok_and(|state| state.custody_held())
 }
 
-pub(in super::super) fn save_oversize_active(index: &ScanIndex) -> Result<bool> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(false);
-    };
-    with_state(&path, |state| {
-        Ok(state.save_hold == Some(Hold::SaveOversize))
-    })
-}
-
-/// Native completion can make a recovery delta safe without advancing an
-/// unACKed file entry. The subsequent successful normal save clears the hold.
-pub(in super::super) fn save_read_completed(index: &ScanIndex, key: &str) -> Result<()> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(());
-    };
-    with_state(&path, |state| {
-        if state.save_hold == Some(Hold::SaveOversize)
-            && state
-                .last_read
-                .as_ref()
-                .is_some_and(|(held, _)| held == key)
-        {
-            state.save_retry_completed = true;
-        }
-        Ok(())
-    })
-}
-
-/// Gate before transcript samples/reads. Keep the source fence: upload recovery
-/// and accepted progress are source-owned, so a per-file bypass is unsafe here.
-/// Only the page-one file may retry; growth_read_admitted then requires the
-/// existing durable growth Full claim before admitting its payload.
-pub(in super::super) fn save_read_admitted(index: &ScanIndex, key: &str, now: u64) -> Result<bool> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(true);
-    };
-    with_state(&path, |state| {
-        if state.save_hold == Some(Hold::SaveOversize)
-            && !state.last_read.as_ref().is_some_and(|(held, last)| {
-                held == key
-                    && now >= last.saturating_add(super::super::sampled_audit::GROWTH_FULL_INTERVAL)
-            })
-        {
-            // Unknown key means the delta was not a single file acquisition.
-            return Ok(false);
-        }
-        if state.page_limit == 1 {
-            state.last_read = Some((key.to_owned(), now));
-            state.save_retry_completed = false;
-        }
-        Ok(true)
-    })
-}
-
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
     let Some(_) = &index.v2().persistence_v2 else {
         return requested;
@@ -1244,6 +1138,7 @@ fn erasure_inventory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn invalidate_locked(path: &Path) -> Result<()> {
     with_state(path, |state| {
         state.latched = true;
@@ -1261,13 +1156,6 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         Ok(())
     })
 }
-/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
-/// handles first; its established cleanup owner performs all file deletion.
-#[cfg(target_os = "macos")]
-pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
-    close_tree(support, false)
-}
-
 /// The retired restart-record directory beside a scan index.
 pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
     index_path.with_extension("durable-tail")
@@ -1276,143 +1164,21 @@ pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
 /// Removes that directory, never following a link, and syncs its parent.
 /// `Ok(false)`: nothing was there.
 pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
-    match fs::symlink_metadata(records) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
-        Ok(_) => fs::remove_file(records)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let removed = fence::remove_artifact(records)?;
+    if removed {
+        super::super::sync_checkpoint_parent(records)?;
     }
-    super::super::sync_checkpoint_parent(records)?;
-    Ok(true)
-}
-
-/// Explicit erasure only. Close the shared session before unlinking all
-/// artifacts, and invalidate clones before releasing CheckpointLock.
-pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
-    invalidate_locked(path)?;
-    if let Some(runtime) = index.and_then(|i| i.v2().persistence_v2.as_ref()) {
-        runtime
-            .session
-            .lock()
-            .map_err(|_| Hold::DbUnavailable)?
-            .take();
-    }
-    for (suffix, _, _) in fence::ARTIFACTS {
-        fence::remove_artifact(&fence::sibling(path, suffix))?;
-    }
-    super::ack::erase_failed_imports(path)?;
-    super::super::sync_checkpoint_parent(path)?;
-    remove_retired_record_dir(&retired_record_dir(path))?;
-    super::super::sync_checkpoint_parent(path)?;
-    // Retain the invalidated route's custody latch: erased artifacts must not
-    // let this process resume v1 or re-create v2 without an explicit new lineage.
-    Ok(())
-}
-
-/// Close/erase only live runtimes already owned by this process. The caller's
-/// existing whole-tree removal owns legacy files and unregistered artifacts;
-/// discovering those files here would register routes for files no source reads.
-pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
-    close_tree(support, true)?;
-    telemetry::event("source_erasure_confirmed", &1);
-    Ok(())
-}
-
-/// Unlinks one source's local copy in every namespace. `indexes` are the only
-/// routed paths; `family` (their shared file stem) also covers progress, locks,
-/// legacy and policy-scoped indexes and temps. An error leaves `complete` uncalled,
-/// so the caller's marker stays pending and the next cycle repeats this sweep.
-pub(crate) fn erase_source(
-    indexes: &[PathBuf],
-    family: &str,
-    others: &[PathBuf],
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    for path in indexes {
-        {
-            // Erasure must not depend on decoding the files it removes.
-            let _owner =
-                super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
-            crate::snapshot_sync::with_state_v2_progress_lock(path, |_| erase_locked(path, None))?;
-        }
-        // Lock files go only after their flocks are released.
-        let parent = path.parent().context("source_erasure_parent")?;
-        for entry in fs::read_dir(parent)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let rest = name.to_str().and_then(|name| name.strip_prefix(family));
-            let owned = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']));
-            if owned {
-                fence::remove_artifact(&entry.path())?;
-            }
-        }
-        super::super::sync_checkpoint_parent(path)?;
-    }
-    for path in others {
-        fence::remove_artifact(path)?;
-        super::super::sync_checkpoint_parent(path)?;
-    }
-    // All clones are closed; a dropped latch gives reconnect a fresh lineage.
-    let mut routes = states().lock().map_err(|_| Hold::DbUnavailable)?;
-    for path in indexes {
-        routes.remove(path);
-    }
-    drop(routes);
-    complete()?;
-    telemetry::event("source_erasure_confirmed", &indexes.len());
-    Ok(())
-}
-
-/// Account removal: every Tail row of the route at `path`, of any file and
-/// kind, debt included, in one Tail-only commit; then a TRUNCATE checkpoint,
-/// so no removed value stays in the WAL (`secure_delete` zeroes freed pages).
-/// Graph, index and census rows stay. Live sessions close first, as erasure's
-/// do; the next load reopens the store. `Ok(false)`: no store at `path`.
-pub(crate) fn erase_tail_rows(path: &Path) -> Result<bool> {
-    let Some(binding) = binding(path) else {
-        return Ok(false);
-    };
-    if !fence::exists(&fence::sibling(path, ".v2.sqlite"))? {
-        return Ok(false);
-    }
-    let _owner = super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
-    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
-        with_state(path, |state| {
-            let Some((identity, db_path)) = fence::reconcile(path, &binding, state.latched)? else {
-                return Ok(false);
-            };
-            state.latched = true;
-            state.save_digests = None;
-            state.tail = Default::default();
-            let current = state.current.take();
-            let live = state.runtimes.drain(..).filter_map(|r| r.upgrade());
-            for runtime in live.chain(current) {
-                runtime
-                    .session
-                    .lock()
-                    .map_err(|_| Hold::DbUnavailable)?
-                    .take();
-            }
-            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
-            let expected = db.stamp()?.0;
-            super::ack::ProgressRecovery::recover_route_locked(&identity, expected, path, owner)?;
-            let every = tail::TailStage::erase_every();
-            tail::commit_exit(&mut db, &identity, expected, &every)?;
-            let checkpoint = db.checkpoint(CheckpointMode::IdleReclaim);
-            ensure!(
-                checkpoint.state == CheckpointState::Complete,
-                Hold::DbUnavailable
-            );
-            Ok(true)
-        })
-    })
+    Ok(removed)
 }
 
 pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
     telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
-fn close_tree(support: &Path, erase: bool) -> Result<()> {
+/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
+/// handles first; its established cleanup owner performs all file deletion.
+#[cfg(any(test, target_os = "macos"))]
+pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
     let routes: Vec<_> = states()
         .lock()
@@ -1443,11 +1209,7 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
         }
         if path.parent().is_some_and(Path::is_dir) {
             let _lock = super::super::CheckpointLock::acquire(&path)?;
-            if erase {
-                erase_locked(&path, None)?;
-            } else {
-                invalidate_locked(&path)?;
-            }
+            invalidate_locked(&path)?;
         } else {
             invalidate_locked(&path)?;
         }
@@ -1682,6 +1444,7 @@ mod tests;
 #[cfg(test)]
 pub(in super::super) use tests::{
     delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
+    with_session_db,
 };
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.

@@ -17,20 +17,16 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
-pub(crate) use runtime::{
-    erase_source, erase_tail_rows, remove_retired_record_dir, retired_record_dir,
-    source_erasure_alarm,
-};
+pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
 #[cfg(target_os = "macos")]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, erase_tree, guard_containment_locked, guard_external,
-    guard_local, idle, load_locked, load_usage, published, recovery_save_guard, runtime_path,
-    save_locked, save_oversize_active, save_read_admitted, save_read_completed, settle_usage,
-    visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
+    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
+    idle, load_locked, load_usage, published, recovery_save_guard, runtime_path, save_locked,
+    settle_usage, visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
 };
 mod catalogue;
 mod codec;
@@ -367,24 +363,23 @@ fn value_target(key: &RowKey) -> u64 {
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
-        // Measured on a copy of a real state store (245,006 values): only these two
-        // whole fields exceed 1 MiB (traversal 4.8 MB, birth_store 1.5 MB).
-        // Bound logical JSON on both admission and decompression, before chunks.
+        // The two whole fields that exceed 1 MiB on real stores share the
+        // value bound, so a large row commits instead of refusing its save.
         RowKey::Record { kind, .. }
             if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
         {
-            16 * 1024 * 1024
+            VALUE_BYTES
         }
         RowKey::RequestSet(_) => VALUE_BYTES,
         _ => MUTABLE_VALUE_BYTES,
     }
 }
 /// Admission and decode bound, moved together so a row this build commits
-/// also decodes on it: the physical row limit for mutable rows, else the target.
+/// also decodes on it.
 fn value_cap(key: &RowKey) -> u64 {
-    match value_target(key) {
-        MUTABLE_VALUE_BYTES => VALUE_BYTES,
-        target => target,
+    match key {
+        RowKey::Meta(_) => CONTROL_BYTES,
+        _ => VALUE_BYTES,
     }
 }
 fn admit_key(key: &RowKey) -> Result<()> {
