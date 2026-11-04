@@ -29150,7 +29150,10 @@ thread_local! {
 
 /// `result` itself outside tests. A test fault sees each listed entry's read
 /// (`false`) and type read (`true`) of `directory` and fails it with `true`.
-#[cfg_attr(not(test), allow(unused_variables))]
+#[cfg_attr(
+    not(test),
+    allow(unused_variables, reason = "only a test fault reads them")
+)]
 fn directory_read_fault<T>(
     directory: &Path,
     type_read: bool,
