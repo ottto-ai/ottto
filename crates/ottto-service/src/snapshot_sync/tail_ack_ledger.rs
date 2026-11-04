@@ -57,10 +57,14 @@ impl AckLedger {
 
     /// This exact body has a durable ACK.
     pub(crate) fn settled(&self, item: &SnapshotItem) -> bool {
-        self.progress.contains_body(
-            &item.snapshot_fingerprint,
-            &crate::snapshots::snapshot_upload_body_witness(item),
-        )
+        self.progress
+            .accepted_fingerprints
+            .contains(&item.snapshot_fingerprint)
+            && self
+                .progress
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint)
+                == Some(&crate::snapshots::snapshot_upload_body_witness(item))
     }
 
     pub(crate) fn posts(&self) -> usize {

@@ -199,7 +199,7 @@ fn acquire_items_with(
             None,
         )
         .unwrap();
-    assert_eq!(parsed.complete(), complete);
+    assert_eq!(parsed.progress_complete(), complete);
     let mut items = parsed.snapshots;
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     (retained, mode, guards, items)
@@ -548,7 +548,7 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert!(parsed.progress_complete());
     let mut items = parsed.snapshots;
     apply_upload_policy(
         SnapshotSource::ClaudeCode,

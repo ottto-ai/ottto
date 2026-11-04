@@ -513,10 +513,10 @@ fn census_records_bind_each_parse_to_its_revision_and_shape() {
             "a recorded entry and its record name the same revision: {key}"
         );
     }
-    // A residue parse records nothing in `files`, yet its record replaces
-    // any older one and holds the ids it saw.
+    // A mixed parse admits valid siblings and retains a loss-shaped census
+    // record holding every id it saw.
     let residue = census_key(&index, &root, "canary-invalid-fork.jsonl");
-    assert!(!index.files.contains_key(&residue));
+    assert!(index.files.contains_key(&residue));
     let record = index
         .claude_request_census_for_test()
         .get(&residue)
@@ -615,18 +615,22 @@ fn census_residue_reparse_never_keeps_the_old_record() {
 
     let second = census_scan(&root, &mut index, SECOND_WINDOW);
     assert_ne!(second.census_window_end, first.census_window_end);
-    // The entry keeps the old revision (residue is never recorded) ...
-    assert_eq!(
+    // Valid siblings advance the entry, while the census remains loss-shaped.
+    assert_ne!(
         index.files[&copier].source_file_fingerprint,
         old_fingerprint
     );
-    // ... but the record is the new parse's, bound to its candidate.
+    // The record is bound to the same newly admitted candidate.
     let record = index
         .claude_request_census_for_test()
         .get(&copier)
         .expect("residue record");
     assert_ne!(record, &old_record);
     assert_ne!(record.fingerprint_hex_for_test(), old_fingerprint);
+    assert_eq!(
+        record.fingerprint_hex_for_test(),
+        index.files[&copier].source_file_fingerprint
+    );
     assert_eq!(record.window_for_test(), census_window(&second));
     assert_eq!(record.shape_for_test(), ClaudeRequestCensusShape::Lossy);
     assert!(record

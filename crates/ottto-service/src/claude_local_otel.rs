@@ -1551,26 +1551,6 @@ pub(crate) fn fail_telemetry_unlink_for_test(n: u32) {
     FAIL_TELEMETRY_UNLINK.with(|slot| slot.set(n));
 }
 
-/// Counter label for a root whose sidecars do not pair: how many members are
-/// oversized and how many unreadable, by metadata only. A missing one is neither.
-pub(crate) fn claude_sidecar_pair_faults(support_dir: &Path, session_id: &str) -> (u64, u64) {
-    let mut faults = (0, 0);
-    for path in [
-        evidence_path(support_dir, session_id),
-        trace_evidence_path(support_dir, session_id),
-    ] {
-        match fs::metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.is_file() && metadata.len() >= MAX_EVIDENCE_FILE_BYTES => {
-                faults.0 += 1;
-            }
-            Ok(metadata) if metadata.is_file() => {}
-            _ => faults.1 += 1,
-        }
-    }
-    faults
-}
-
 pub fn claude_trace_ownership_sidecar_fingerprint(support_dir: &Path, session_id: &str) -> String {
     sidecar_fingerprint(
         trace_evidence_path(support_dir, session_id),

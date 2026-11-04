@@ -167,7 +167,6 @@ impl Corpus {
             modes,
             disposition: Default::default(),
             released: Default::default(),
-            unhealthy: Default::default(),
             stats: Default::default(),
             delivered: None,
             upload_policy: SnapshotUploadPolicy::default(),
@@ -198,8 +197,6 @@ struct Page {
     modes: (usize, usize, usize),
     disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
     released: e2::pipeline_test_observer::Released,
-    /// #947: requests the last enrichment left Unknown for an unhealthy root.
-    unhealthy: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     stats: ClaudeLocalEvidenceStats,
     /// Exact ACKs of this page's final bodies, when `ready` delivered them:
     /// `finish` then earns the file receipts as the service finish does.
@@ -261,7 +258,6 @@ impl Page {
             accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
         }
         self.released = released;
-        self.unhealthy = stats.unhealthy_root_no_fallback_requests;
         self.stats = stats;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
@@ -732,7 +728,6 @@ fn twin(p: &Page) -> Page {
         modes: p.modes,
         disposition: p.disposition.clone(),
         released: p.released,
-        unhealthy: p.unhealthy,
         stats: p.stats.clone(),
         // A twin is an undelivered copy: only `ready`'s original earns receipts.
         delivered: None,
@@ -853,7 +848,9 @@ fn upload_under(
         |s| s.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |s| Some(s.source_session_id.as_str()),
-        |_| false,
+        // The production main-upload class: patched and unpatched bodies
+        // never share a request.
+        |s| snapshot_upload_batch_class(s, false),
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
@@ -4916,9 +4913,10 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert!(
-                page.unhealthy.incomplete > 0,
-                "#947's unhealthy-root branch ran"
+            assert_eq!(
+                body(&page, COPY).and_then(|copy| copy.telemetry_owned_complete),
+                Some(false),
+                "#947: the half pair leaves the root unproven"
             );
             assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
             assert_eq!(
@@ -5247,10 +5245,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert!(
-                page.unhealthy.incomplete > 0,
-                "#947's unhealthy-root branch ran"
-            );
+            // #947: the half pair leaves the root's evidence unavailable.
             assert_eq!(
                 identity_count(&counts, "copy_derived_skipped_evidence_unavailable"),
                 1

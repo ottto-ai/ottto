@@ -255,9 +255,11 @@ fn only_the_native_verdict_stages() {
     let mut route = route();
     let (rejected, mut late) = route.complete("a.jsonl", &lines(3), None, |_| {});
     let (accepted, native) = route.complete("b.jsonl", &lines(3), None, |_| {});
-    assert!(finish_loss_free(&late) && finish_loss_free(&native));
+    assert!(
+        late.as_ref().unwrap().progress_complete() && native.as_ref().unwrap().progress_complete()
+    );
     // Positive usage that yielded no entity is found only at finalization.
-    late.as_mut().unwrap().zero_snapshot_usage_evidence = true;
+    late.as_mut().unwrap().ownership_incomplete_file_count = 1;
     let (a, b) = (rejected.key.clone(), accepted.key.clone());
     rejected.publish(&late);
     accepted.publish(&native);
@@ -334,7 +336,7 @@ fn a_finish_field_at_pre_sets_only_its_file_aside() {
         acc.account_identifier_hash = Some("a".repeat(64));
     });
     let (sibling, native) = route.complete("b.jsonl", &lines(3), None, |_| {});
-    assert!(finish_loss_free(&odd_native));
+    assert!(odd_native.as_ref().unwrap().progress_complete());
     let (a, b) = (odd.key.clone(), sibling.key.clone());
     odd.publish(&odd_native);
     sibling.publish(&native);

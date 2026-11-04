@@ -11,7 +11,7 @@ use crate::backfill::{
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
     update_backfill_state,
 };
-use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
+use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics};
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
 };
@@ -213,7 +213,7 @@ fn bootstrap_cache_heads_with_budget(
                 |item| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |item| Some(item.source_session_id.as_str()),
-                |_| false,
+                |_| 0,
                 |_| None,
                 inplace_retry,
                 |items| upload(items, enforce_head_cas),
@@ -1327,6 +1327,20 @@ fn identity_cache_wire_reserve(
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
+}
+
+/// Request class of one main-upload body: 2 for a legacy reconciliation,
+/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
+/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
+/// for a whole request when one body carries a patch, so the packer never
+/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
+/// with a server head it never claimed.
+fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+    if legacy {
+        2
+    } else {
+        u8::from(crate::snapshot_client::declares_head_cas(snapshot))
+    }
 }
 
 /// Answer each owed head-CAS challenge on the outgoing body of its session.
@@ -4043,8 +4057,6 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     census_status: crate::snapshots::CensusStatus,
-    cap_counts: crate::local_resource_diagnostics::CapCounts,
-    local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
     backfill_file_limit: u64,
     discovered_file_count: u64,
@@ -4177,8 +4189,6 @@ impl SyncCounts {
             scanned_session_count: scan_result.scanned_session_count as u64,
             semantic_noop_count: scan_result.semantic_noop_count as u64,
             census_complete: scan_result.census_complete,
-            cap_counts: scan_result.cap_counts,
-            local_codex_diagnostics: scan_result.local_codex_diagnostics,
             symlink_rejected_count: scan_result.symlink_rejected_count as u64,
             unreadable_path_count: scan_result.unreadable_path_count as u64,
             oversized_file_count: scan_result.oversized_file_count as u64,
@@ -4187,14 +4197,10 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result
-                .ownership_incomplete_file_count
-                .saturating_add(scan_result.archive_owed_count)
-                as u64,
-            causes: scan_result.causes.summary_with_archive(
-                scan_result.ownership_incomplete_file_count,
-                scan_result.archive_owed_count,
-            ),
+            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -5947,17 +5953,7 @@ impl SourcePreparation {
         let state = self.scan.take().expect("active source preparation");
         match state.step_fallible(self.attribution_context.as_ref()) {
             Err(reason) => SourcePreparationStep::Refused(self, reason),
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("read reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -6723,13 +6719,14 @@ fn prepare_sync_source_inner(
         &mut watcher_hints.list_all,
         request_identity_capture,
         &copy_prefix_scope,
+        Some((daemon.transcript_cache.as_ref(), &sampled_scope)),
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
     .with_codex_versions(daemon.codex_versions.clone());
     // A walk already running keeps the request: the first pass after it lists.
     crate::snapshot_watcher::defer_listing(source, watcher_hints.list_all);
-    scan.rehome_withheld_baseline(&mut committed_index);
+    scan.rehome_withheld_baseline(&mut committed_index)?;
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -7149,14 +7146,8 @@ fn capture_codex_recovery_evidence(
     progress_path: &Path,
     validate_authority: impl Fn() -> Result<()>,
 ) {
-    let (mut captured, changed, held) =
+    let (mut captured, changed) =
         index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
-    scan_result.hold_codex_groups(
-        index,
-        committed_index,
-        &held,
-        "recovery capture exceeds retained evidence cap",
-    );
     if !changed.is_empty() {
         let protected = scan_result
             .snapshots
@@ -7893,7 +7884,12 @@ fn finish_sync_source(
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
-            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            |snapshot| {
+                snapshot_upload_batch_class(
+                    snapshot,
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+                )
+            },
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
@@ -8011,19 +8007,6 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    if !index.archives.is_empty() {
-        index.settle_archive_outcome(|fp| {
-            upload_progress
-                .accepted_body_witnesses
-                .get(fp)
-                .filter(|_| {
-                    !upload_progress
-                        .context_resend
-                        .requires_resend(fp, &upload_progress.accepted_body_contexts)
-                })
-                .map(String::as_str)
-        });
-    }
     // Shed and upload-error partial checkpoint: save wholly settled files,
     // then release adopted ACK capacity against the full scan's references
     // (#778 R2-2). A failed save is logged and yields `None`; a failed
@@ -8161,7 +8144,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8182,7 +8164,6 @@ fn finish_sync_source(
                         message: "backend shed the snapshot upload; honouring backoff",
                     },
                 },
-                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -8191,7 +8172,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8208,7 +8188,6 @@ fn finish_sync_source(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
                     ),
                 },
-                scan_result.codex_counting_v2.as_deref(),
             )?;
             return Ok(());
         }
@@ -8350,7 +8329,6 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
-                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8365,7 +8343,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                     state,
                 },
-                scan_result.codex_counting_v2.as_deref(),
             );
             return Err(error.context(context));
         }
@@ -8613,7 +8590,6 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
-            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -8628,7 +8604,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                 state,
             },
-            scan_result.codex_counting_v2.as_deref(),
         );
         if !resolved_permanent_rejections {
             return Err(snapshot_entity_deferred(count));
@@ -8641,7 +8616,6 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
-            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -8656,7 +8630,6 @@ fn finish_sync_source(
                     .with_snapshot_terminal_counts(&index),
                 state: CollectorState::Success,
             },
-            scan_result.codex_counting_v2.as_deref(),
         )?;
     }
     Ok(())
@@ -8830,10 +8803,6 @@ pub struct ClaudeLocalEvidenceStats {
     /// Strict trace reads dropped as grown or replaced; absent while empty.
     #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
     pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
-    /// Requests placed Unknown because this page discarded their strict trace:
-    /// `unhealthy_root_no_fallback_requests.discarded`, kept for #932 readers.
-    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
-    pub trace_discard_no_fallback_requests: u64,
     /// Items whose upload this page deferred because it discarded their
     /// family's strict trace read.
     #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
@@ -8851,12 +8820,6 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
-    /// `e2` requests left Unknown because their family's strict read failed;
-    /// absent from the line while empty.
-    #[serde(
-        skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
-    )]
-    pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     /// Request-census shadow of a complete Claude terminal scan; absent
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9062,15 +9025,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
-    // The strongest cause per unhealthy root, for its no-fallback counter.
-    let mut unhealthy_reasons = BTreeMap::new();
-    let mut note_unhealthy =
-        |root: &str, reason: crate::snapshots::claude_request_identity::UnhealthyRootReason| {
-            unhealthy_reasons
-                .entry(root.to_owned())
-                .and_modify(|known| *known = reason.min(*known))
-                .or_insert(reason);
-        };
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
@@ -9094,10 +9048,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
                     .is_some_and(|read| !read.complete)
             {
                 identity_unhealthy_roots.insert(session_id.clone());
-                note_unhealthy(
-                    session_id,
-                    crate::snapshots::claude_request_identity::UnhealthyRootReason::Incomplete,
-                );
             }
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired
@@ -9105,14 +9055,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
                 && (builds_evidence || request_owned(session_id))
             {
                 identity_unhealthy_roots.insert(session_id.clone());
-                let (oversized, unreadable) =
-                    crate::claude_local_otel::claude_sidecar_pair_faults(support_dir, session_id);
-                note_unhealthy(
-                    session_id,
-                    crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
-                        oversized, unreadable, 0,
-                    ),
-                );
             }
             paired
         })
@@ -9184,28 +9126,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
                 }
             }
             if builds_evidence || request_owned(&root_session_id) {
-                use crate::snapshots::claude_request_identity::UnhealthyRootReason;
-                let api_reason = (!api.health.is_complete()).then(|| {
-                    UnhealthyRootReason::of(
-                        api.health.oversized_files,
-                        api.health.unreadable_lines,
-                        api.health.malformed_lines,
-                    )
-                });
-                let trace_reason = (!trace.is_complete()).then(|| {
-                    if trace.rows_discarded.is_empty() {
-                        UnhealthyRootReason::of(
-                            trace.oversized_files,
-                            trace.unreadable_lines,
-                            trace.malformed_lines,
-                        )
-                    } else {
-                        UnhealthyRootReason::Discarded
-                    }
-                });
-                if let Some(reason) = api_reason.into_iter().chain(trace_reason).min() {
-                    note_unhealthy(&root_session_id, reason);
-                }
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -9315,7 +9235,7 @@ fn apply_claude_local_evidence_to_scan_with_retained(
             None => evidence.with_cross_root(&cross),
         };
         evidence
-            .with_unhealthy_reasons(unhealthy_reasons)
+            .with_trace_discarded_roots(trace_discarded_roots)
             .with_native_originals(&originals)
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
@@ -9333,13 +9253,10 @@ fn apply_claude_local_evidence_to_scan_with_retained(
     );
     drop(whole_corpus);
     if let Some(evidence) = &identity_evidence {
-        let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
+        crate::snapshots::claude_request_identity::reconcile_request_accounts(
             &mut scan_result.snapshots,
             evidence,
         );
-        // #932's scalar stays, equal to its reason in the map.
-        stats.trace_discard_no_fallback_requests = no_fallback.discarded;
-        stats.unhealthy_root_no_fallback_requests = no_fallback;
     }
 
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
@@ -9874,7 +9791,7 @@ where
         fingerprint,
         body_witness,
         |_| None,
-        |_| false,
+        |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
         upload,
@@ -10332,9 +10249,9 @@ pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
 /// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
 /// group. A single body over the byte bound is its own group and meets the
 /// existing request preflight.
-fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+fn literal_family_groups(members: Vec<(usize, usize, u8)>) -> Vec<Vec<(usize, usize, u8)>> {
     let mut groups = Vec::new();
-    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut group = Vec::<(usize, usize, u8)>::new();
     let mut bytes = 2usize;
     for member in members {
         if !group.is_empty()
@@ -10385,7 +10302,7 @@ where
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
-    BatchClass: Fn(&T) -> bool,
+    BatchClass: Fn(&T) -> u8,
     LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -10500,9 +10417,11 @@ where
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so
     // without literal items (gate off) packing is the previous order.
-    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
-    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
-    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
+    // Each unit also carries its family key: the class of its family's first
+    // group, or its own class for a single body (see the class sort below).
+    let mut order = Vec::<(usize, usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<(usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, u8)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
         let item = (
             index,
@@ -10513,7 +10432,7 @@ where
             Some(root) => literal_families.entry(root).or_default().push(item),
             None => {
                 order.push(item);
-                unit_ends.push(order.len());
+                unit_ends.push((order.len(), item.2));
             }
         }
     }
@@ -10522,15 +10441,16 @@ where
             let member = session_id(&items[*index]);
             (member != Some(root), member)
         });
+        let family_key = members[0].2;
         for group in literal_family_groups(members) {
             order.extend(group);
-            unit_ends.push(order.len());
+            unit_ends.push((order.len(), family_key));
         }
     }
     let mut units = Vec::with_capacity(unit_ends.len());
     let mut start = 0;
-    for end in unit_ends {
-        units.push(order[start..end].to_vec());
+    for (end, family_key) in unit_ends {
+        units.push((order[start..end].to_vec(), family_key));
         start = end;
     }
     // Preserve the native census/family selection. At this transport boundary
@@ -10538,22 +10458,29 @@ where
     // body shares a request (and its retry latency) with context catch-up.
     let mut ordinary_units = Vec::new();
     let mut catchup_units = Vec::new();
-    for unit in units {
+    for (unit, family_key) in units {
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             progress
                 .context_resend
                 .is_catchup(fingerprint(&items[*index]))
         });
         if !ordinary.is_empty() {
-            ordinary_units.push(ordinary);
+            ordinary_units.push((ordinary, family_key));
         }
         if !catchup.is_empty() {
-            catchup_units.push(catchup);
+            catchup_units.push((catchup, family_key));
         }
     }
+    // A request declares head CAS when any body in it carries a cache patch,
+    // so every request is class-pure: an unpatched body never travels under
+    // another body's CAS contract. Stable-sort each lane by family key so
+    // single bodies form one run per class, each family's groups stay
+    // contiguous and root first, and a single-class page keeps its order.
+    ordinary_units.sort_by_key(|(_, family_key)| *family_key);
+    catchup_units.sort_by_key(|(_, family_key)| *family_key);
     let ordinary_entities = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .map(|(index, _, _)| fingerprint(&items[*index]))
         .collect::<BTreeSet<_>>();
     // A bootstrap invocation sees only its probes. It cannot send catch-up
@@ -10563,7 +10490,7 @@ where
         .ordinary_work_is_in(&ordinary_entities);
     let ordinary_bytes = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .fold(0usize, |sum, (_, bytes, _)| {
             sum.saturating_add(bytes.saturating_add(2))
         });
@@ -10576,11 +10503,11 @@ where
         .reserve_ordinary_bytes(ordinary_bytes);
     let mut unit_ends = Vec::new();
     order.clear();
-    for unit in ordinary_units {
+    for (unit, _) in ordinary_units {
         order.extend(unit);
         unit_ends.push((order.len(), false));
     }
-    for unit in catchup_units {
+    for (unit, _) in catchup_units {
         let start = order.len();
         for item in unit {
             if ordinary_in_this_call
@@ -10970,8 +10897,7 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 
 /// Build the terminal collector receipt for a completed cycle.
 ///
-/// Split from the send so the live path can journal the exact typed receipt it
-/// is about to POST, and so tests can assert against that same payload —
+/// Split from the send so tests can assert against the exact typed payload —
 /// including its declared `report_kind` — rather than a hand-rolled lookalike.
 fn collector_status_request(
     destination_namespace: &str,
@@ -11246,105 +11172,13 @@ fn refresh_terminal_manifest(
     Ok(())
 }
 
-fn terminal_status_journal_path(
-    support_dir: &Path,
-    destination_namespace: &str,
-    source: SnapshotSource,
-) -> PathBuf {
-    support_dir
-        .join("snapshots")
-        .join("destinations")
-        .join(destination_namespace)
-        .join(format!("{}-terminal-status-v1.json", source.api_slug()))
-}
-
-#[cfg(test)]
-fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
-    save_terminal_status_journal_with_diagnostics(path, request, None, None, Default::default())
-}
-
-fn save_terminal_status_journal_with_diagnostics(
-    path: &Path,
-    request: &SnapshotStatusRequest,
-    diagnostic: Option<&CodexScanDiagnostics>,
-    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
-    cap_counts: crate::local_resource_diagnostics::CapCounts,
-) -> Result<()> {
-    #[derive(Serialize)]
-    struct LocalJournal<'a> {
-        #[serde(flatten)]
-        receipt: &'a SnapshotStatusRequest,
-        #[serde(skip_serializing_if = "crate::local_resource_diagnostics::CapCounts::is_empty")]
-        local_cap_counts: crate::local_resource_diagnostics::CapCounts,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        local_codex_diagnostics: Option<&'a CodexScanDiagnostics>,
-        /// Borrowed from the scan result; absent when no configured counting
-        /// parse finished, never written as zero.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        local_codex_counting_v2: Option<&'a codex_scan_diagnostics::CountingV2Receipts>,
-    }
-    // One latest receipt already has stricter retention than the four-record
-    // ceiling. Enforce the extension's byte cap before touching its journal.
-    let diagnostic = diagnostic.filter(|diagnostic| {
-        serde_json::to_vec_pretty(diagnostic)
-            .is_ok_and(|bytes| bytes.len() <= MAX_LOCAL_DIAGNOSTIC_BYTES)
-    });
-    let journal = LocalJournal {
-        local_cap_counts: cap_counts,
-        receipt: request,
-        local_codex_diagnostics: diagnostic,
-        local_codex_counting_v2: codex_counting_v2,
-    };
-    if request.last_scan_finished_at.is_none() {
-        return Err(anyhow!("terminal status journal requires a finished scan"));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("create terminal status journal directory")?;
-    }
-    let _lock = SnapshotProgressLock::acquire(path)?;
-    let temp_path = unique_progress_sibling(path, "tmp");
-    let mut file = std::fs::File::create(&temp_path).context("create terminal status journal")?;
-    let result = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut file, &journal)
-            .context("write terminal status journal")?;
-        file.sync_all().context("sync terminal status journal")?;
-        std::fs::rename(&temp_path, path).context("replace terminal status journal")?;
-        sync_progress_parent(path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-#[cfg(test)]
-fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequest>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("read terminal status journal"),
-    };
-    let request: SnapshotStatusRequest =
-        serde_json::from_slice(&bytes).context("parse terminal status journal")?;
-    if request.schema_version != SNAPSHOT_STATUS_SCHEMA_VERSION
-        || request.last_scan_started_at.is_none()
-        || request.last_scan_finished_at.is_none()
-    {
-        return Err(anyhow!("terminal status journal is not a terminal receipt"));
-    }
-    Ok(Some(request))
-}
-
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
-    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
-    codex_counting_v2: Option<&codex_scan_diagnostics::CountingV2Receipts>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     // This is the single terminal report boundary. Every terminal outcome
@@ -11372,36 +11206,11 @@ fn report_status_with_fresh_relay_token(
     // Keep non-blocking cooldown debt beside the terminal census counters on
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
-    let diagnostic = status.counts.local_codex_diagnostics;
-    let cap_counts = status.counts.cap_counts;
     let request = collector_status_request(
         &destination_namespace,
         status,
         census_residue_status_admitted,
     )?;
-    let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
-    // Commit the exact typed receipt before it can reach the backend. A later
-    // cycle-start or heartbeat therefore repeats one coherent scan result
-    // instead of combining a fresh start/default counters with an old error.
-    //
-    // The ordering holds on the success path, but it is best-effort: the
-    // journal is a local diagnostic artifact with no production reader, so a
-    // full disk or an unwritable support dir must not suppress the terminal
-    // report itself. Remote truth never waits on local disk; the failure is
-    // disclosed on the daemon's error log instead.
-    if let Err(error) = save_terminal_status_journal_with_diagnostics(
-        &journal_path,
-        &request,
-        diagnostic.as_ref(),
-        codex_counting_v2,
-        cap_counts,
-    ) {
-        eprintln!(
-            "local snapshot terminal status journal write failed for {}: {}",
-            source.api_slug(),
-            safe_error(&error)
-        );
-    }
     client.report_status(&relay_token, &request)?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -11443,11 +11252,9 @@ fn withdraw_and_report_policy_stop(
         client,
         device,
         device_secret,
-        support_dir,
         source,
         TerminalManifestSource::Withdraw,
         status,
-        None,
     )
 }
 
@@ -11473,8 +11280,8 @@ fn withdraw_and_report_policy_stop(
 /// That absence is also why this body must stay byte-identical to the shape the
 /// backend classifies as a check-in (`last_scan_finished_at is None && enabled
 /// && last_error_code is None && next_retry_at is None && consecutive_failures
-/// == 0`). Replaying the journaled terminal receipt here — the local journal
-/// `report_status_with_fresh_relay_token` writes — would silently retire
+/// == 0`). Replaying the terminal receipt
+/// `report_status_with_fresh_relay_token` posts here would silently retire
 /// check-in receipts, make the cycle-start in-progress marker dead code, flip
 /// manifest preservation to invalidation on every heartbeat while an error is
 /// retained, and put a `scan_status` payload behind a `checkin` declaration.
@@ -12391,6 +12198,7 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{
     archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress,
+    codex_transition_cold_batches,
 };
 
 #[cfg(test)]
@@ -15986,6 +15794,11 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
+    mod class_split_tests {
+        use super::*;
+        include!("snapshot_sync/class_split_tests.rs");
+    }
+
     #[derive(Clone, Serialize)]
     struct SizedUploadItem {
         fingerprint: String,
@@ -17616,7 +17429,7 @@ mod tests {
             String::as_str,
             |item| item.clone(),
             |_| None,
-            |item| reconcile_class.contains(item),
+            |item| 2 * u8::from(reconcile_class.contains(item)),
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
@@ -18985,7 +18798,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -18995,7 +18807,6 @@ mod tests {
                 counts: SyncCounts::for_policy(30),
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report status with fresh relay token");
 
@@ -19084,7 +18895,6 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
-            test_terminal_status_support_dir(),
             source,
             manifest_source,
             CollectorStatus {
@@ -19094,7 +18904,6 @@ mod tests {
                 counts,
                 state,
             },
-            None,
         )
         .expect("terminal receipt");
         let requests = captured.lock().expect("captured requests").clone();
@@ -19172,11 +18981,10 @@ mod tests {
     }
 
     /// A liveness beat may only repeat evidence the backend has already
-    /// accepted. A durable terminal journal now exists (ottto#393), but no
-    /// beat reads it — `report_checkin_status` has no path to it — so a beat
-    /// replays nothing at all: every scan-result field is literally absent,
-    /// zero, or false, and the only carried witness is the cached manifest
-    /// from the last completed terminal report.
+    /// accepted. `report_checkin_status` has no path to the last terminal
+    /// receipt, so a beat replays nothing at all: every scan-result field is
+    /// literally absent, zero, or false, and the only carried witness is the
+    /// cached manifest from the last completed terminal report.
     #[test]
     #[serial(source_manifests)]
     fn a_liveness_beat_discloses_nothing_the_backend_has_not_accepted() {
@@ -20314,7 +20122,6 @@ mod tests {
             &client,
             &device,
             "synthetic-secret",
-            support,
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -20324,7 +20131,6 @@ mod tests {
                 counts: SyncCounts::from_scan_result(&scan, 0, 30),
                 state: CollectorState::Success,
             },
-            scan.codex_counting_v2.as_deref(),
         )
         .unwrap();
         let requests = captured.lock().unwrap();
@@ -20359,112 +20165,7 @@ mod tests {
 
     #[test]
     #[serial(source_manifests)]
-    fn codex_local_diagnostics_stay_in_latest_journal_and_off_the_wire() {
-        let _guard = SourceManifestTestGuard::new();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
-            captured.clone(),
-            vec![30, 30],
-        ));
-        let device = LocalDeviceBinding {
-            device_id: "device_test".into(),
-            machine_id: Some("otm_test".into()),
-            sources: vec!["codex".into()],
-        };
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        let path = terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            &destination,
-            SnapshotSource::Codex,
-        );
-        // Only the first scan executed configured counting.
-        let receipts = codex_scan_diagnostics::CountingV2Receipts {
-            v2_sessions: 1,
-            tombstone_evictions_v2_only: 2,
-            tombstone_evictions_pre_cutover_legacy: 3,
-            tombstone_evictions_not_provably_pre_cutover_legacy: 4,
-            legacy_to_v2_after_tombstone_eviction: 5,
-            tombstone_count: 1024,
-            tombstone_cap: 1024,
-            ..Default::default()
-        };
-        for generation in [1, 2] {
-            let cap_counts = crate::local_resource_diagnostics::CapCounts {
-                bootstrap_overflow_events: u64::from(generation == 1),
-                ..Default::default()
-            };
-            let counts = SyncCounts {
-                cap_counts,
-                local_codex_diagnostics: Some(CodexScanDiagnostics {
-                    version: 1,
-                    generation,
-                    ..Default::default()
-                }),
-                ..SyncCounts::for_policy(30)
-            };
-            report_status_with_fresh_relay_token(
-                &client,
-                &device,
-                "device-secret",
-                test_terminal_status_support_dir(),
-                SnapshotSource::Codex,
-                TerminalManifestSource::Withdraw,
-                CollectorStatus {
-                    source: SnapshotSource::Codex,
-                    machine_id: "otm_test",
-                    scan_started_at: "2026-09-01T07:44:00Z",
-                    counts,
-                    state: CollectorState::Success,
-                },
-                (generation == 1).then_some(&receipts),
-            )
-            .unwrap();
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
-            assert_eq!(
-                journal.get("local_cap_counts"),
-                (generation == 1)
-                    .then(|| serde_json::to_value(cap_counts).unwrap())
-                    .as_ref()
-            );
-            if generation == 1 {
-                assert_eq!(
-                    journal["local_codex_counting_v2"],
-                    serde_json::to_value(receipts).unwrap()
-                );
-            } else {
-                assert!(
-                    journal.get("local_codex_counting_v2").is_none(),
-                    "a scan without executed counting is absent, not zero"
-                );
-            }
-            let requests = captured.lock().unwrap();
-            let terminal = http_request_json(requests.last().unwrap());
-            assert!(terminal.get("local_codex_diagnostics").is_none());
-            assert!(terminal.get("local_codex_counting_v2").is_none());
-            assert_eq!(
-                serde_json::to_value(load_terminal_status_journal(&path).unwrap().unwrap())
-                    .unwrap(),
-                terminal
-            );
-        }
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with("terminal-status-v1.json"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    #[serial(source_manifests)]
-    fn terminal_receipt_is_journaled_before_post_and_liveness_stays_liveness() {
+    fn terminal_receipt_is_posted_and_liveness_stays_liveness() {
         let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
@@ -20487,7 +20188,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -20497,9 +20197,8 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
-        .expect("persist and emit terminal loss receipt");
+        .expect("emit terminal loss receipt");
         report_checkin_status_with_fresh_relay_token(
             &client,
             &device,
@@ -20519,22 +20218,6 @@ mod tests {
         assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
         assert!(terminal["last_scan_finished_at"].is_string());
 
-        // The durable journal holds exactly the body that was committed before
-        // the POST: one coherent scan result - timestamps, counters, cap state
-        // and error all from the same `SourceScanResult`.
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        let journal = load_terminal_status_journal(&terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            &destination,
-            SnapshotSource::Codex,
-        ))
-        .expect("read journal")
-        .expect("journal exists");
-        assert_eq!(
-            serde_json::to_value(journal).expect("journal JSON"),
-            terminal
-        );
-
         // The liveness beat that follows it is NOT the terminal body. Its wire
         // shape is exactly what the backend classifies as a check-in receipt,
         // so the terminal report stays the single source of scan truth.
@@ -20550,140 +20233,6 @@ mod tests {
         assert_eq!(checkin["last_scan_started_at"], "2026-09-01T08:12:28Z");
         assert_eq!(checkin["last_recognized_usage_drop_count"], 0);
         assert_eq!(checkin["last_dropped_usage_record_count"], 0);
-    }
-
-    /// The journal is a local diagnostic artifact with no production reader, so
-    /// it must never gate remote truth. An unwritable support dir - a full or
-    /// read-only disk in the field - has to log and continue, with the terminal
-    /// receipt reaching the backend carrying exactly the same counters.
-    #[test]
-    #[serial(source_manifests)]
-    fn terminal_receipt_is_posted_when_the_journal_write_fails() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
-            captured.clone(),
-            vec![30],
-        ));
-        let device = LocalDeviceBinding {
-            device_id: "device_test".to_string(),
-            machine_id: Some("otm_test".to_string()),
-            sources: vec!["codex".to_string()],
-        };
-
-        // Inject the write failure without a test-only seam: the journal's
-        // parent chain runs through a regular file, so `create_dir_all` fails
-        // exactly as it would on an unwritable support directory.
-        let support_dir = test_terminal_status_support_dir().join("blocked-support-dir");
-        std::fs::create_dir_all(test_terminal_status_support_dir())
-            .expect("create terminal status test root");
-        std::fs::write(&support_dir, b"not a directory").expect("block the support dir");
-
-        let mut counts = SyncCounts::for_policy(30);
-        counts.scan_cap_hit = false;
-        counts.census_complete = true;
-        counts.local_codex_diagnostics = Some(CodexScanDiagnostics {
-            version: 1,
-            ..Default::default()
-        });
-        counts.recognized_usage_drop_count = 1_105;
-        counts.dropped_usage_record_count = 1_105;
-        counts.ownership_incomplete_file_count = 1;
-
-        report_status_with_fresh_relay_token(
-            &client,
-            &device,
-            "device-secret",
-            &support_dir,
-            SnapshotSource::Codex,
-            TerminalManifestSource::Withdraw,
-            CollectorStatus {
-                source: SnapshotSource::Codex,
-                machine_id: "otm_test",
-                scan_started_at: "2026-09-01T07:44:00Z",
-                counts,
-                state: CollectorState::Success,
-            },
-            None,
-        )
-        .expect("a failed local journal write must not suppress the terminal report");
-
-        let requests = captured.lock().expect("captured requests").clone();
-        let terminal = http_request_json(&requests[1]);
-        assert_eq!(terminal["last_recognized_usage_drop_count"], 1_105);
-        assert_eq!(terminal["last_dropped_usage_record_count"], 1_105);
-        assert_eq!(terminal["last_ownership_incomplete_file_count"], 1);
-        assert_eq!(terminal["last_error_code"], "parse_error");
-        assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
-        assert!(terminal["last_scan_finished_at"].is_string());
-        assert_eq!(terminal["last_scan_cap_hit"], false);
-
-        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
-        assert!(
-            !terminal_status_journal_path(&support_dir, &destination, SnapshotSource::Codex)
-                .exists(),
-            "the journal genuinely failed to write; the POST proceeded anyway"
-        );
-    }
-
-    /// The journal persists the exact typed `SnapshotStatusRequest` that is
-    /// about to go on the wire, so the declared `report_kind` has to survive
-    /// the disk round trip like every other field. Without `Deserialize` on
-    /// `SnapshotStatusReportKind` the journal would not compile at all; with a
-    /// `skip`/`default` escape hatch it would silently reload as some other
-    /// kind and a replayed receipt would lie about what it is. This asserts the
-    /// reloaded receipt is byte-for-byte the one that was committed.
-    #[test]
-    #[serial(source_manifests)]
-    fn the_journaled_receipt_reloads_with_its_declared_report_kind() {
-        let _source_manifests = SourceManifestTestGuard::new();
-        let mut counts = SyncCounts::for_policy(30);
-        counts.census_complete = true;
-        counts.recognized_usage_drop_count = 7;
-        counts.dropped_usage_record_count = 7;
-        let request = collector_status_request(
-            "destination",
-            CollectorStatus {
-                source: SnapshotSource::Codex,
-                machine_id: "otm_test",
-                scan_started_at: "2026-09-01T07:44:00Z",
-                counts,
-                state: CollectorState::Error {
-                    code: "scan_error",
-                    message: "local snapshot scan failed",
-                },
-            },
-            false,
-        )
-        .expect("terminal receipt");
-        assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
-
-        let path = terminal_status_journal_path(
-            test_terminal_status_support_dir(),
-            "destination",
-            SnapshotSource::Codex,
-        );
-        save_terminal_status_journal(&path, &request).expect("journal the terminal receipt");
-        let reloaded = load_terminal_status_journal(&path)
-            .expect("read journal")
-            .expect("journal exists");
-
-        // The declaration itself survives...
-        assert_eq!(reloaded.report_kind, SnapshotStatusReportKind::ScanStatus);
-        // ...as the snake_case wire token, not a re-derived guess...
-        let reloaded_json = serde_json::to_value(&reloaded).expect("reloaded JSON");
-        assert_eq!(reloaded_json["report_kind"], "scan_status");
-        // ...and the whole receipt is unchanged by the round trip, so a replay
-        // could never post a body that differs from the one committed.
-        assert_eq!(
-            reloaded_json,
-            serde_json::to_value(&request).expect("committed JSON")
-        );
-        // A journaled scan result stays a scan result on the egress guard: it
-        // can never re-enter the wire wearing a check-in declaration.
-        reloaded
-            .validate_declared_report_kind()
-            .expect("a journaled scan status is truthfully declared");
     }
 
     #[test]
@@ -20771,7 +20320,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -20781,7 +20329,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report terminal status");
         let requests = captured.lock().expect("captured requests").clone();
@@ -20879,7 +20426,6 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
-                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -20889,7 +20435,6 @@ mod tests {
                     counts,
                     state,
                 },
-                None,
             )
             .expect("report terminal manifest withdrawal");
             let request = captured.lock().expect("captured requests")[1].clone();
@@ -21110,7 +20655,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21120,7 +20664,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("report terminal with refreshed policy");
 
@@ -21164,7 +20707,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21174,7 +20716,6 @@ mod tests {
                 counts,
                 state: CollectorState::Success,
             },
-            None,
         )
         .expect("zero-width terminal tombstone");
         assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_none());
@@ -21490,14 +21031,27 @@ mod tests {
         captured: Arc<Mutex<Vec<String>>>,
         hints: Vec<(u64, &'static str)>,
     ) -> String {
+        snapshot_status_server_with_hint_extras_and_batch(captured, hints, None)
+    }
+
+    fn snapshot_status_server_with_hint_extras_and_batch(
+        captured: Arc<Mutex<Vec<String>>>,
+        hints: Vec<(u64, &'static str)>,
+        batch: Option<Vec<SnapshotItem>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
             let receipt_count = hints.len();
             let mut hints = hints.into_iter();
-            for _ in 0..receipt_count * 3 {
+            let mut ordinary_requests = receipt_count * 3;
+            loop {
                 let (mut stream, _) = listener.accept().expect("accept snapshot status request");
                 let request = read_complete_http_request(&mut stream);
+                // A batch fixture exercises ordinary uploads and fresh relay
+                // acquisition too; its terminal status ends the conversation.
+                let terminal = batch.is_some()
+                    && request.starts_with("POST /api/v1/agent-session-snapshots/status ");
                 let body = if request.contains("/telemetry/devices/") {
                     captured
                         .lock()
@@ -21505,6 +21059,21 @@ mod tests {
                         .push(request);
                     r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
                         .to_string()
+                } else if request.contains("/agent-session-snapshots/batches") {
+                    let items = batch.as_ref().expect("expected snapshot upload");
+                    let entities = items.iter().map(|item| {
+                        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                        serde_json::json!({"source_session_id":item.source_session_id,
+                            "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                            "body_witness_version":version,
+                            "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
+                    }).collect::<Vec<_>>();
+                    captured.lock().unwrap().push(request);
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                        "accepted_entities":entities})
+                    .to_string()
                 } else if request.contains("/activity-hints") {
                     let (hint, extra) = hints.next().expect("one hint per receipt");
                     format!(
@@ -21525,6 +21094,15 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write snapshot status response");
+                if terminal {
+                    break;
+                }
+                if batch.is_none() {
+                    ordinary_requests -= 1;
+                    if ordinary_requests == 0 {
+                        break;
+                    }
+                }
             }
         });
         format!("http://{address}")
@@ -23763,47 +23341,3 @@ mod head_conflict_released_progress_fixture;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
 crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
-
-/// Continuation's platform gates for archive work: the native signals unless
-/// a caller injects its own. A pass and its continuation pages share them.
-#[derive(Clone)]
-pub(crate) struct ArchiveGates(
-    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
-);
-impl Default for ArchiveGates {
-    fn default() -> Self {
-        Self::new(None::<continuation::MacPlatformSignals>)
-    }
-}
-impl std::fmt::Debug for ArchiveGates {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ArchiveGates")
-    }
-}
-impl ArchiveGates {
-    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
-        Self(gates.map(|g| {
-            std::sync::Arc::new(Mutex::new(g))
-                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
-        }))
-    }
-    /// Continuation's power policy: only `Allowed` permits archive work;
-    /// `Refused` and `Unknown` deny.
-    pub(crate) fn power_ready(&self) -> bool {
-        let Some(gates) = self.0.as_ref() else {
-            return continuation::PlatformGates::power(
-                &mut continuation::MacPlatformSignals::default(),
-            ) == continuation::PlatformState::Allowed;
-        };
-        gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .power()
-            == continuation::PlatformState::Allowed
-    }
-}
-
-/// Share continuation's work threshold with archive admission.
-pub(crate) fn archive_work_ready(micros: u64) -> bool {
-    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
-}

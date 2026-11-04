@@ -95,6 +95,14 @@ pub(in crate::snapshots) fn reuses_stored(
             | CandidateParseReason::UnknownOutcome,
         ) => true,
         Some(CandidateParseReason::ActivityOrQuarantineRetry) if grew => true,
+        // Same-generation loss is cumulative in the saved head. Its certificate
+        // still refuses a replaced object; shrink never enters this arm.
+        Some(CandidateParseReason::TerminalDisposition) if grew => index
+            .terminal_jsonl_dispositions
+            .get(key)
+            .is_some_and(|disposition| {
+                disposition.parser_generation == JSONL_TERMINAL_DISPOSITION_GENERATION
+            }),
         Some(CandidateParseReason::NewFile) => held_new,
         Some(reason) => late_evidence(reason) && !set_aside(index, key),
     }
@@ -385,7 +393,7 @@ fn stored<S: TailSource>(
     });
     if pages.is_err() {
         return Err(match failed {
-            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible)) => {
+            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible(_))) => {
                 Miss::FutureFact
             }
             Some((_, cause)) => Miss::Reconstruct(cause),

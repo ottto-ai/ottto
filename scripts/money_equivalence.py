@@ -64,7 +64,7 @@ _MONEY_DIFF_SCHEMA = {key: {} for key in (
     "request_count", "cost_usd", "input_cost_usd", "output_cost_usd",
     "cache_read_cost_usd", "cache_creation_cost_usd",
 )}
-# Wire records: snapshots.rs::{SnapshotModelUsage, SnapshotIdentityPart,
+# Wire records: snapshots/wire.rs::{SnapshotModelUsage, SnapshotIdentityPart,
 # SessionAccountEvidence, SnapshotRequestEvidence, SnapshotCost}. Empty child
 # schemas intentionally keep all entries of selector/data maps redacted.
 _IDENTITY_PART_DIFF_SCHEMA = dict(_MONEY_DIFF_SCHEMA, account_identifier_hash={}, evidence_ref={})

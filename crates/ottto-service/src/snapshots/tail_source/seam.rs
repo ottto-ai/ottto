@@ -118,7 +118,11 @@ impl PendingTail {
         let Some(encoded) = self.encoded else {
             return false; // PRE never ran: the read failed before it.
         };
-        if self.unsealed || !finish_loss_free(native) {
+        if self.unsealed
+            || !native
+                .as_ref()
+                .is_ok_and(ParsedJsonlFile::progress_complete)
+        {
             super::counters::bump(self.source, "tail_publish", "dropped");
             return false;
         }
@@ -349,3 +353,7 @@ pub(in crate::snapshots::tail_source) mod tests;
 #[cfg(test)]
 #[path = "transition_tests.rs"]
 mod transition_tests;
+
+#[cfg(test)]
+#[path = "../bad_record_tests.rs"]
+mod bad_record_tests;

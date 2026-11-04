@@ -247,40 +247,9 @@ pub(crate) enum Refusal {
     InvalidEvidence,
     ContradictoryOrg,
     BadClock,
-    MarkerOverflow,
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
-}
-
-/// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
-/// label only; declaration order is precedence when several causes apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum UnhealthyRootReason {
-    /// The strict trace read was discarded (it grew or was replaced mid-read).
-    /// The family is also withheld (`e2::hold_trace_discarded`).
-    Discarded,
-    Oversized,
-    Unreadable,
-    Malformed,
-    /// A missing pair member, failed permissive read, invalid or missing
-    /// request ids, or conflicting ids.
-    Incomplete,
-}
-
-impl UnhealthyRootReason {
-    /// The strongest cause among one read's health counters.
-    pub(crate) fn of(oversized: u64, unreadable: u64, malformed: u64) -> Self {
-        if oversized > 0 {
-            Self::Oversized
-        } else if unreadable > 0 {
-            Self::Unreadable
-        } else if malformed > 0 {
-            Self::Malformed
-        } else {
-            Self::Incomplete
-        }
-    }
 }
 
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
@@ -2843,9 +2812,6 @@ fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence])
 
 // --- Transcript organization markers (cached accumulator state) -------------
 
-/// Most markers one file may carry before transcript bases switch off for it.
-pub(crate) const MAX_ORG_MARKERS_PER_FILE: usize = 64;
-
 /// 2026-11-05T00:00:00Z (UTC ms). A request whose own provider time is at or
 /// after it follows the latest valid org line; an earlier request keeps the
 /// terminal trust it had, so a cold read equals a stored one.
@@ -2876,16 +2842,100 @@ pub(crate) struct OrgMarker {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
-    starting_marker: Option<OrgMarker>,
-    overflowed: bool,
+    starting_marker: RetiredStartingMarker,
+    overflowed: RetiredOverflow,
     context_digest: Option<String>,
     context_changed: bool,
-    /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one. Without a
-    /// key, the second is the first later sentence or the first after a marker:
-    /// it could not be compared, so it counts as different.
+    /// Response position of the first non-blank `session_context` email.
     context_position: Option<u64>,
-    context_flip_position: Option<u64>,
+    context_flip_position: RetiredContextFlipPosition,
+}
+
+/// Retired: the starting marker earlier builds stored beside the entries (it
+/// copied the first one). Decoded and dropped, written as `None`, so a stored
+/// head keeps its layout and still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredStartingMarker;
+
+/// Retired: the marker-count flag earlier builds stored. A head that set it had
+/// dropped its markers, so it does not decode and the file reads cold. Written
+/// as `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredOverflow;
+
+/// Retired: the position of the first later `session_context` naming a
+/// different email, which earlier builds stored. Nothing reads it, so it is
+/// decoded and dropped, written as `None`, and a stored head still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredContextFlipPosition;
+
+impl crate::durable_tail_codec::Durable for RetiredStartingMarker {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<OrgMarker>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
+impl crate::durable_tail_codec::Durable for RetiredOverflow {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&false, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        if <bool as crate::durable_tail_codec::Durable>::take(d)? {
+            return Err(crate::durable_tail_codec::Corrupt);
+        }
+        Ok(Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        Self::take(d).map(|_| ())
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <bool as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
+impl crate::durable_tail_codec::Durable for RetiredContextFlipPosition {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<u64>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<u64> as crate::durable_tail_codec::Durable>::shape(s);
+    }
 }
 
 /// The hashed organization of a `credential_org` attachment; `None` when blank
@@ -2921,23 +2971,13 @@ pub(crate) fn note_marker_line(
             let state = markers.get_or_insert_with(Box::default);
             match accepted::session_context_digest(&text) {
                 // No key, no field: a sentence that cannot be compared explains
-                // no organization change and ends any earlier email.
-                None => {
-                    state.context_digest = None;
-                    if state.context_position.is_some() || !state.entries.is_empty() {
-                        state.context_flip_position.get_or_insert(response_position);
-                    }
-                }
+                // no organization change.
+                None => state.context_digest = None,
                 // An earlier email with no digest (no key then, or scrubbed on a
                 // key change) cannot be compared: this sentence is a fresh
-                // baseline. It explains no organization change and ends that email.
+                // baseline. It explains no organization change.
                 Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
                     let compared = state.context_digest.is_some();
-                    if (compared || state.context_position.is_some())
-                        && state.context_flip_position.is_none()
-                    {
-                        state.context_flip_position = Some(response_position);
-                    }
                     state.context_changed =
                         compared || (state.context_position.is_none() && !state.entries.is_empty());
                     state.context_digest = Some(digest);
@@ -2951,14 +2991,6 @@ pub(crate) fn note_marker_line(
         Some("credential_org") => {
             let org = marker_org_hash(attachment);
             let state = markers.get_or_insert_with(Box::default);
-            if state.overflowed {
-                return;
-            }
-            if state.entries.len() == MAX_ORG_MARKERS_PER_FILE {
-                state.overflowed = true;
-                state.entries = Vec::new();
-                return;
-            }
             let terminal_trusted = match state.entries.last() {
                 None => true,
                 Some(previous) => {
@@ -2966,15 +2998,11 @@ pub(crate) fn note_marker_line(
                 }
             };
             state.context_changed = false;
-            let marker = OrgMarker {
+            state.entries.push(OrgMarker {
                 position: response_position,
                 org,
                 terminal_trusted,
-            };
-            if state.starting_marker.is_none() {
-                state.starting_marker = Some(marker.clone());
-            }
-            state.entries.push(marker);
+            });
         }
         _ => {}
     }
@@ -2993,7 +3021,6 @@ pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
 pub(crate) enum MarkerVerdict<'m> {
     None,
     Trusted(&'m str),
-    Overflow,
     UntrustedFlip,
     BadOrg,
 }
@@ -3004,10 +3031,8 @@ impl OrgMarkers {
     pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries
             .iter()
-            .chain(&self.starting_marker)
             .map(|marker| marker.position)
             .chain(self.context_position)
-            .chain(self.context_flip_position)
     }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
@@ -3018,7 +3043,6 @@ impl OrgMarkers {
         self.context_changed = false;
         if self.context_position.is_none() {
             self.context_position = Some(0);
-            self.context_flip_position = Some(0);
         }
         with_context_digest_scrubs(|counter| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3029,9 +3053,6 @@ impl OrgMarkers {
     /// `latest` (Desktop, or a request from `ACCOUNT_RULE_FROM`) trusts any
     /// valid org line; otherwise an unexplained flip is refused.
     pub(crate) fn verdict(&self, sequence: u64, latest: bool) -> MarkerVerdict<'_> {
-        if self.overflowed {
-            return MarkerVerdict::Overflow;
-        }
         let Some(marker) = self
             .entries
             .iter()
@@ -3049,7 +3070,7 @@ impl OrgMarkers {
 }
 
 // `e2` consumes this compact, native-sequence-ordered placement before any
-// requests aggregate. Marker state is bounded independently of request count.
+// requests aggregate.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 /// A counted request's grain slot (live key, origin), the account a copied
 /// marker lent it, and whether this pass positively read its own evidence.
@@ -3329,31 +3350,6 @@ pub(crate) fn request_accounts(
     };
     // Only `e2` can exclude a request. Marker timestamps never decide identity.
     let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
-    if markers.overflowed {
-        if let Some(marker) = markers
-            .starting_marker
-            .as_ref()
-            .filter(own_marker)
-            .filter(|marker| marker.position <= first)
-        {
-            if let Some(org) = marker.org.as_deref() {
-                accounts.starting = Some(Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                    account_source: None,
-                }));
-                accounts.runs.push(AccountRun {
-                    position: marker.position,
-                    account: accounts.starting.clone(),
-                    copied: None,
-                    split: false,
-                });
-            }
-        }
-    }
-    accounts.fallback = accounts.starting.clone();
-    accounts.conflict = markers.overflowed;
     // Positions where one request carries two different orgs (R3-N2).
     let mut contradicted = Vec::new();
     // A refused org line still governing at `trust_from` starts a run there
@@ -3408,18 +3404,16 @@ pub(crate) fn request_accounts(
     }
     // Derive the first own request's start from the accepted own stream,
     // preserving the first observation of a conflicting same-position pair.
-    if !markers.overflowed {
-        if let Some(key) = accounts
-            .runs
-            .iter()
-            .rev()
-            .filter(|run| run.position <= first)
-            .find_map(|run| run.account.as_ref())
-        {
-            accounts.starting = Some(key.clone());
-        }
-        accounts.fallback = accounts.starting.clone();
+    if let Some(key) = accounts
+        .runs
+        .iter()
+        .rev()
+        .filter(|run| run.position <= first)
+        .find_map(|run| run.account.as_ref())
+    {
+        accounts.starting = Some(key.clone());
     }
+    accounts.fallback = accounts.starting.clone();
     // R3-N2 (QUOTA): a later request carrying two different orgs is never
     // guessed: it goes to the starting (or bound) account, counted as a
     // conflict above. A pair at the session start is the start itself.
@@ -3545,7 +3539,6 @@ impl RequestAccounts {
             let org = markers
                 .entries
                 .iter()
-                .chain(&markers.starting_marker)
                 .filter_map(|marker| marker.org.as_ref().map(String::capacity))
                 .max()
                 .unwrap_or(0);
@@ -3648,13 +3641,9 @@ impl RequestAccounts {
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
-/// requests stay Unknown, counted per reason in the returned totals.
-pub(crate) fn reconcile_request_accounts(
-    items: &mut [SnapshotItem],
-    evidence: &ScanEvidence<'_>,
-) -> super::ClaudeUnhealthyRootNoFallbackCounts {
+/// requests stay Unknown.
+pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
     use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
-    let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -3675,19 +3664,10 @@ pub(crate) fn reconcile_request_accounts(
             // evidence for requests whose own proof could not be read: collapse
             // the partitions in place so tokens, costs, side calls and id-less
             // shares survive with no account. Durable bindings are untouched.
-            let reason = evidence.unhealthy_reason(root);
-            no_fallback.add(
-                reason,
-                fold.entity
-                    .grains
-                    .values()
-                    .map(|grain| grain.requests)
-                    .fold(0_u64, u64::saturating_add),
-            );
             fold.entity.repartition(None);
             accounts.unhealthy_no_fallback = true;
             // A discard keeps #932's hold: nothing to admit.
-            accounts.unhealthy_cleared_account = (reason != UnhealthyRootReason::Discarded)
+            accounts.unhealthy_cleared_account = (!evidence.trace_discarded_roots.contains(root))
                 .then(|| super::exact_session_account_hash(item))
                 .flatten();
             accounts.starting = None;
@@ -3943,7 +3923,6 @@ pub(crate) fn reconcile_request_accounts(
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
-    no_fallback
 }
 
 /// The account this page cleared from `item` for
@@ -4243,9 +4222,9 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
-    /// Why each unhealthy root failed, for its no-fallback counter only.
-    /// A root missing here counts as `Incomplete`.
-    unhealthy_reasons: BTreeMap<String, UnhealthyRootReason>,
+    /// Unhealthy roots whose strict trace read this pass discarded (it grew
+    /// or was replaced mid-read); #932's hold withholds their family.
+    trace_discarded_roots: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the
     /// verdict, and a passing row's login is its `account_identifier_hash`.
@@ -4381,19 +4360,9 @@ impl<'a> ScanEvidence<'a> {
         })
     }
 
-    pub(crate) fn with_unhealthy_reasons(
-        mut self,
-        reasons: BTreeMap<String, UnhealthyRootReason>,
-    ) -> Self {
-        self.unhealthy_reasons = reasons;
+    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.trace_discarded_roots = roots;
         self
-    }
-
-    fn unhealthy_reason(&self, root: &str) -> UnhealthyRootReason {
-        self.unhealthy_reasons
-            .get(root)
-            .copied()
-            .unwrap_or(UnhealthyRootReason::Incomplete)
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
@@ -4728,7 +4697,6 @@ pub(super) fn owner_is_foreign(
 fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
         MarkerVerdict::None => return None,
-        MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
         MarkerVerdict::UntrustedFlip => return Some(IdentityRef::Refused(Refusal::UntrustedFlip)),
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
@@ -5475,14 +5443,15 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
     D entries: Vec<OrgMarker>,
-    D starting_marker: Option<OrgMarker>,
-    N overflowed: bool,
+    D starting_marker: RetiredStartingMarker,
+    N overflowed: RetiredOverflow,
     H context_digest: Option<String>,
     N context_changed: bool,
     N context_position: Option<u64>,
-    N context_flip_position: Option<u64>,
+    N context_flip_position: RetiredContextFlipPosition,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
+crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow, RetiredContextFlipPosition);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
     N position: u64,
     U org: Option<String>,

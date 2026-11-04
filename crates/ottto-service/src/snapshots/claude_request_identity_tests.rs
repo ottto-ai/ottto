@@ -1107,7 +1107,6 @@ fn classify_follows_the_session_rulings() {
         })
     );
     for (verdict, refusal) in [
-        (MarkerVerdict::Overflow, Refusal::MarkerOverflow),
         (MarkerVerdict::UntrustedFlip, Refusal::UntrustedFlip),
         (MarkerVerdict::BadOrg, Refusal::ContradictoryOrg),
     ] {
@@ -1258,18 +1257,50 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
     identity::note_marker_line(&mut bad, &marker("not-a-uuid"), 0);
     assert_eq!(bad.unwrap().verdict(0, false), MarkerVerdict::BadOrg);
     let mut many = None;
-    for position in 0..=identity::MAX_ORG_MARKERS_PER_FILE as u64 {
+    for position in 0..64 {
         identity::note_marker_line(&mut many, &marker(ORG_1), position);
     }
+    identity::note_marker_line(&mut many, &marker(ORG_2), 64);
     let many = many.unwrap();
-    assert_eq!(many.verdict(0, false), MarkerVerdict::Overflow);
-    if crate::heap_layout_bound::layout_supported() {
+    assert_eq!(many.positions().count(), 65, "every marker is kept");
+    assert_eq!(
+        many.verdict(63, false),
+        MarkerVerdict::Trusted(&org_hash(ORG_1))
+    );
+    assert_eq!(
+        many.verdict(64, true),
+        MarkerVerdict::Trusted(&org_hash(ORG_2))
+    );
+}
+
+/// A stored head from a build that dropped a file's markers past a count does
+/// not load, so that file reads cold; any other stored head still loads, and a
+/// stored retired flip position is dropped.
+#[test]
+fn stored_markers_load_unless_an_earlier_build_dropped_them() {
+    use crate::durable_tail_codec::{Dec, Durable, Enc, HDigest};
+    let stored = |dropped: bool, flip: Option<u64>| {
+        Enc::count_write(1 << 10, |e| {
+            Vec::<identity::OrgMarker>::new().put(e)?;
+            None::<identity::OrgMarker>.put(e)?;
+            dropped.put(e)?;
+            None::<String>.put_h(e, "OrgMarkers.context_digest")?;
+            false.put(e)?;
+            None::<u64>.put(e)?;
+            flip.put(e)
+        })
+        .unwrap()
+    };
+    for flip in [None, Some(7)] {
+        let bytes = stored(false, flip);
+        let mut d = Dec::new(&bytes);
         assert_eq!(
-            crate::heap_layout_bound::completed_bound(&many, usize::MAX).map(|bytes| bytes < 4096),
-            Some(true),
-            "overflow releases entries"
+            identity::OrgMarkers::take(&mut d),
+            Ok(identity::OrgMarkers::default())
         );
+        assert_eq!(d.finish(), Ok(()));
     }
+    assert!(identity::OrgMarkers::take(&mut Dec::new(&stored(true, None))).is_err());
 }
 
 #[test]
