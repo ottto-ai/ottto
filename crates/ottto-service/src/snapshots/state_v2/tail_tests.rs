@@ -1,12 +1,12 @@
 //! The Tail store over the real route: published fixtures, real saves and the
 //! real exit guard. Claude and Codex share every path here; none is per source.
 use super::super::tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
-    Observation, Representation, SetAsideCause, Shape, StagedFile, TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, Observation,
+    Representation, SetAsideCause, Shape, StagedFile, TailHead,
 };
 use super::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail,
-    set_aside_tail, stage_tail, tail_head_keys, tail_set_aside,
+    erase_tail, load_head, load_revisions, load_tail, observe_tail, retire_tail, set_aside_tail,
+    stage_tail, tail_head_keys, tail_set_aside,
 };
 use super::tests::{load_with, save_with, save_with_mode, with_session_db, Fixture, G};
 use super::*;
@@ -860,9 +860,10 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
 
 /// [behaviour] Debt outlives its reduction: observations never clear the marker;
 /// reset merges committed debt; retire keeps it under a metadata-only head that
-/// never loads pages; disposal leaves nothing. A future envelope holds.
+/// never loads pages; settling every revision leaves no head. A future envelope
+/// holds.
 #[test]
-fn debt_survives_reset_and_retire_until_disposed() {
+fn debt_survives_reset_and_retire_until_settled() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();
@@ -942,10 +943,14 @@ fn debt_survives_reset_and_retire_until_disposed() {
         "settled and overwritten debt purge"
     );
 
-    dispose_tail(&f.path, FILE, Disposition::Settled).unwrap();
+    let mut settle_all = observation(&[]);
+    settle_all.resolved.extend([1, 2]);
+    observe_tail(&f.path, FILE, settle_all).unwrap();
     save_with(&f.path, &mut index).unwrap();
-    assert_eq!(all_tail_rows(&index, FILE), 0, "no reduction, no debt");
-    assert!(tail_set_aside(&index, FILE).unwrap().is_none(), "disposed");
+    assert!(
+        load_head(&index, FILE, REVISION).unwrap().is_none(),
+        "no reduction, no debt"
+    );
 
     // An unknown revision id fails this file alone: set aside, nothing written.
     let mut unknown = observation(&[]);
@@ -1081,16 +1086,13 @@ fn inventory_facts_need_no_reduction_and_old_envelope_has_none() {
     assert_eq!(head.body, b"head");
     assert_eq!(head.common.inventory.as_ref(), Some(&facts));
 
-    // Retiring keeps them under kept debt; absence and plain retirement end them.
+    // Retiring keeps them under kept debt; plain retirement ends them.
     retire_tail(&f.path, [FILE.to_string(), SIBLING.to_string()]).unwrap();
     save_with(&f.path, &mut index).unwrap();
     assert_eq!(all_tail_rows(&index, FILE), 0, "no debt");
     let head = load_head(&index, SIBLING, REVISION).unwrap().unwrap();
     assert!(head.metadata_only);
     assert_eq!(head.common.inventory.as_ref(), Some(&facts));
-    dispose_tail(&f.path, SIBLING, Disposition::Absence).unwrap();
-    save_with(&f.path, &mut index).unwrap();
-    assert_eq!(all_tail_rows(&index, SIBLING), 0, "absent");
 }
 
 /// [behaviour] Scope erasure is not a reset: every row and the marker go, and

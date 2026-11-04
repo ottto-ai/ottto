@@ -321,9 +321,7 @@ pub(super) fn save_graph(
                 bail!(Hold::ReloadRequired)
             }
             DurableCommitOutcome::Ambiguous => bail!(Hold::ReloadRequired),
-            DurableCommitOutcome::NotPublished => {
-                bail!(store.save_failure().unwrap_or(Hold::ReloadRequired))
-            }
+            DurableCommitOutcome::NotPublished => bail!(refused(store)),
         }
     })();
     if result.is_ok() {
@@ -338,6 +336,29 @@ pub(super) fn save_graph(
     }
     span.emit(store, next.generation);
     result
+}
+/// A commit that published nothing keeps G and reports why.
+fn refused(store: &sqlite::Sqlite) -> Hold {
+    store.save_failure().unwrap_or(Hold::ReloadRequired)
+}
+/// The span and result of a write committed from `expected`: `Ok` only for the
+/// exact commit of `next`. The `Txn` is already consumed, so this reads the
+/// store only after its commit returned.
+pub(super) fn commit_next(
+    store: &sqlite::Sqlite,
+    mut span: SaveSpan,
+    outcome: DurableCommitOutcome,
+    expected: u64,
+    next: u64,
+) -> Result<()> {
+    span.outcome(&outcome);
+    let published = outcome != DurableCommitOutcome::NotPublished;
+    span.emit(store, if published { next } else { expected });
+    match outcome {
+        DurableCommitOutcome::Committed(generation) if generation == next => Ok(()),
+        DurableCommitOutcome::NotPublished => bail!(refused(store)),
+        _ => bail!(Hold::ReloadRequired),
+    }
 }
 /// One `save_span` per write attempt: duration, commit outcome ("error"
 /// before any commit), resulting generation and rows put or removed.
