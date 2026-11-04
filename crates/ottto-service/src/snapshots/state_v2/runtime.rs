@@ -341,33 +341,23 @@ fn load_with_custody(
                     if let Some(stamp) = stamp
                         .filter(|stamp| session.identity == identity && session.stamp == *stamp)
                     {
-                        super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
-                        telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
-                        telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
-                        #[cfg(test)]
-                        if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
-                        {
-                            let stamps = sqlite::delete_row_elsewhere_for_test(&session.db, &key);
-                            tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
-                        }
-                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         // The image read must be the stamp this session holds:
                         // after a commit from elsewhere neither its baseline
                         // nor its lineage is adopted; reopen below.
-                        if session.db.stamp()? == stamp {
-                            // Digest the exact persisted image: a save then
-                            // also persists whatever normalization changes.
-                            let digests = kinds::baseline(&index, &mut cx)?;
-                            telemetry::hydrate_checkpoint(
-                                "hydrate_after_baseline",
-                                digests.rows.len(),
-                                Some(&cx),
-                            );
-                            normalize_hydrated(&mut index, binding.source)?;
-                            state.save_digests = Some(digests);
+                        let image = hydrate_image(
+                            &mut session.db,
+                            &identity,
+                            stamp,
+                            path,
+                            binding.source,
+                            |index, db| {
+                                ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                                Ok((db.stamp()? == stamp).then_some(stamp))
+                            },
+                        )?;
+                        if let Some((mut index, mut cx, digests, _)) = image {
                             // Same session and stamp: rollovers its commits
                             // wrote stay committed for graphs that outlive
                             // this load.
@@ -375,11 +365,7 @@ fn load_with_custody(
                                 cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                             }
                             session.cx = cx;
-                            telemetry::hydrate_checkpoint(
-                                "hydrate_exit",
-                                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
-                                Some(&session.cx),
-                            );
+                            adopt(state, digests, &session.cx);
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
                             state.report_hold();
                             telemetry::event("route", &"v2");
@@ -396,24 +382,22 @@ fn load_with_custody(
             let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
-            super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
-                .context("state_v2_open_recover")?;
-            telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
-            let (mut index, mut cx) =
-                import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
-            telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
-            let stamp = db.stamp().context("state_v2_open_stamp")?;
-            ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-            let digests = kinds::baseline(&index, &mut cx)?;
-            telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
-            normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
+            let image = hydrate_image(
+                &mut db,
+                &identity,
+                stamp,
+                path,
+                binding.source,
+                |index, db| {
+                    let stamp = db.stamp().context("state_v2_open_stamp")?;
+                    ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                    Ok(Some(stamp))
+                },
+            )?;
+            // The reopen check always passes; a stale image fails above.
+            let (mut index, cx, digests, stamp) = image.ok_or(Hold::DbUnavailable)?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
-            state.save_digests = Some(digests);
-            telemetry::hydrate_checkpoint(
-                "hydrate_exit",
-                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
-                Some(&cx),
-            );
+            adopt(state, digests, &cx);
             index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
             register(state, &index)?;
             state.report_hold();
@@ -476,6 +460,46 @@ fn load_with_custody(
         })?;
     }
     result
+}
+/// A hydrated graph, its context and baseline, and the stamp they were read at.
+type Image = (ScanIndex, KindCx, kinds::Baseline, (u64, u64));
+/// One hydrate of the durable image: ACK progress recovery before decode,
+/// then the caller's freshness check, then the baseline before
+/// normalization. `fresh` returns the stamp the image belongs to; `None`
+/// means the image is stale and nothing from it may be adopted.
+fn hydrate_image(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    stamp: (u64, u64),
+    path: &Path,
+    source: super::super::scan_index_persistence::Source,
+    fresh: impl FnOnce(&ScanIndex, &sqlite::Sqlite) -> Result<Option<(u64, u64)>>,
+) -> Result<Option<Image>> {
+    super::ack::ProgressRecovery::recover_route(identity, stamp.0, path)
+        .context("state_v2_open_recover")?;
+    telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
+    let (mut index, mut cx) = import::hydrate_context(db).context("state_v2_open_hydrate")?;
+    telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
+    #[cfg(test)]
+    if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take) {
+        let stamps = sqlite::delete_row_elsewhere_for_test(db, &key);
+        tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
+    }
+    let Some(stamp) = fresh(&index, &*db)? else {
+        return Ok(None);
+    };
+    // Digest the exact persisted image: a save then also persists whatever
+    // normalization changes.
+    let digests = kinds::baseline(&index, &mut cx)?;
+    telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
+    normalize_hydrated(&mut index, source).context("state_v2_open_normalize")?;
+    Ok(Some((index, cx, digests, stamp)))
+}
+
+/// The hydrated baseline becomes the next save's baseline.
+fn adopt(state: &mut RouteState, digests: kinds::Baseline, cx: &KindCx) {
+    telemetry::hydrate_checkpoint("hydrate_exit", digests.rows.len(), Some(cx));
+    state.save_digests = Some(digests);
 }
 fn normalize_hydrated(
     index: &mut ScanIndex,
@@ -815,7 +839,7 @@ fn growth_claim_txn(
         ensure!(baseline.generation == expected, Hold::ReloadRequired);
     }
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
-    let mut span = kinds::SaveSpan::begin(db);
+    let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
     let mut tx = db.begin(TxnMode::Write)?;
     let mut old = mapper::Digests::new();
@@ -840,27 +864,17 @@ fn growth_claim_txn(
     let digests = writer.finish()?;
     // COMMIT re-checks the generation control against G inside this write.
     let outcome = tx.commit(expected, next);
-    span.outcome(&outcome);
-    let refused = outcome == DurableCommitOutcome::NotPublished;
-    span.emit(db, if refused { expected } else { next });
-    match outcome {
-        DurableCommitOutcome::Committed(generation) if generation == next => {
-            if let Some(baseline) = baseline {
-                // A reclaimed member can return with identical bytes; its old
-                // digest would skip recreating it. Replace manifest and members.
-                baseline.rows.retain(
-                    |key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND),
-                );
-                baseline.rows.extend(digests);
-                baseline.generation = next;
-            }
-            Ok((true, rows))
-        }
-        DurableCommitOutcome::NotPublished => {
-            bail!(db.save_failure().unwrap_or(Hold::ReloadRequired))
-        }
-        _ => bail!(Hold::ReloadRequired),
+    kinds::commit_next(db, span, outcome, expected, next)?;
+    if let Some(baseline) = baseline {
+        // A reclaimed member can return with identical bytes; its old digest
+        // would skip recreating it. Replace manifest and members.
+        baseline
+            .rows
+            .retain(|key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND));
+        baseline.rows.extend(digests);
+        baseline.generation = next;
     }
+    Ok((true, rows))
 }
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, published(path)?)? {

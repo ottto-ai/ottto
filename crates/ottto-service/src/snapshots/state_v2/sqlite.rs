@@ -1834,5 +1834,3 @@ impl Sqlite {
         Ok(generation)
     }
 }
-
-impl Sqlite {}
