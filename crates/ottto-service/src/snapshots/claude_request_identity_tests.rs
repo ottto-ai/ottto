@@ -1008,7 +1008,6 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         terminal_unix_seconds: at,
         event_clock_complete: true,
         marker,
-        scan_unix_seconds: Some(1_000_000),
         duplicated_elsewhere: false,
     }
 }
@@ -1080,30 +1079,12 @@ fn classify_follows_the_session_rulings() {
         RequestIdentity::Refused(Refusal::BadClock)
     );
 
-    // No telemetry row: pending only for this request's own young clock with
-    // a witnessed healthy writer; otherwise missing and open to transcript
-    // evidence. Production has no qualified writer witness, so a young
-    // missing request is missing there.
+    // No telemetry row: missing and open to transcript evidence, however
+    // young the request's own clock.
     assert_eq!(
         identity::classify(
             &evidence,
             &facts("req_new", Some(999_900), MarkerVerdict::None)
-        ),
-        RequestIdentity::Missing
-    );
-    let witnessed =
-        ScanEvidence::new(&api, &trace, BTreeSet::new()).with_pending_writer_witnesses(root_set());
-    assert_eq!(
-        identity::classify(
-            &witnessed,
-            &facts("req_new", Some(999_900), MarkerVerdict::None)
-        ),
-        RequestIdentity::Refused(Refusal::Pending)
-    );
-    assert_eq!(
-        identity::classify(
-            &witnessed,
-            &facts("req_old", Some(999_000), MarkerVerdict::None)
         ),
         RequestIdentity::Missing
     );
@@ -4190,7 +4171,7 @@ fn a_newer_unidentified_request_clears_the_current_account() {
             Some("max"),
             HOUR_11,
             9,
-            RequestIdentity::Refused(Refusal::Pending),
+            RequestIdentity::Refused(Refusal::IncompleteEvidence),
             Some("2026-09-01T11:00:00Z"),
         ),
     ]);
@@ -4428,8 +4409,8 @@ fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
 }
 
 /// Transcript-marker tags withdraw from the display exactly as from the wire:
-/// an org-only newest request is unidentified, and login-only telemetry loses
-/// a marker org.
+/// an org-only newest request is unidentified, and login-only telemetry keeps
+/// its login.
 #[test]
 fn withdrawn_transcript_tags_withdraw_from_the_display() {
     let (item, display) = displayed(&[
@@ -4437,7 +4418,7 @@ fn withdrawn_transcript_tags_withdraw_from_the_display() {
             Some("max"),
             HOUR_10,
             1,
-            login_org('a', Some('d'), identity::TELEMETRY_LOGIN),
+            login_org('a', None, identity::TELEMETRY_LOGIN),
             Some("2026-09-01T10:01:00Z"),
         ),
         display_request(

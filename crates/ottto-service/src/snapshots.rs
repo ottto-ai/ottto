@@ -16266,9 +16266,8 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     event_clock_complete: bool,
     desktop_request: bool,
     effective_input_context: u64,
-    /// Page-local `e2` outcomes; neither is persisted or sent.
+    /// Page-local `e2` outcome; neither persisted nor sent.
     telemetry_attached: bool,
-    e2_inherited: Option<bool>,
 }
 
 /// Why a retained Claude response has no resolution.
@@ -19850,7 +19849,6 @@ impl SnapshotAccumulator {
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
                         telemetry_attached: false,
-                        e2_inherited: None,
                         usage: response.usage.clone(),
                         model: response.model.clone(),
                         selector,
@@ -46993,14 +46991,10 @@ impl ScanIndex {
         }));
         self.claude_reemission_exclusions = exclusions;
 
-        let mut families = BTreeSet::new();
-        let mut files = 0;
         let mut unlisted = Vec::new();
         for key in self.files.keys() {
             if self.claude_family_listed(key) {
-                if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
-                    families.insert(member.root);
-                    files += 1;
+                if claude_index_path_member_ref(Path::new(key)).is_some() {
                     let location = claude_money_birth_store::location_key(key);
                     let marks = self.claude_money_birth_store.money_marks(location);
                     self.claude_money_birth_store
@@ -47024,13 +47018,10 @@ impl ScanIndex {
         // already reached revision 3 before it was listed. Clear it in
         // the same save as re-owing, so the existing history gate owns
         // the single paced read and retries remain owed.
-        let family_count = families.len() as u64;
-        drop(families);
         for (key, marks) in unlisted {
             self.re_owe_effective_upload_body_witness_revision(&key, 2);
             self.claude_money_birth_store.set_money_marks(&key, marks);
         }
-        claude_request_identity::record_listed_legacy_counts(family_count, files);
 
         if let Some(cause) = self.claude_reemission_exclusions.missing_cause() {
             crate::local_resource_diagnostics::claude_reemission_list_missing(cause.as_str());
@@ -82590,7 +82581,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
 crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);

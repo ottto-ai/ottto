@@ -207,7 +207,7 @@ fn retained_marker_defers_when_the_transcript_no_longer_proves_the_row() {
     retained_ack(&mut state, &first, &[]);
     for lost in [
         RequestIdentity::Missing,
-        RequestIdentity::Refused(Refusal::Pending),
+        RequestIdentity::Refused(Refusal::IncompleteEvidence),
     ] {
         let mut changed = proof.clone();
         for contribution in &mut changed[..3] {
@@ -224,7 +224,7 @@ fn retained_marker_defers_when_the_transcript_no_longer_proves_the_row() {
     // A never-proved row without proof stays on today's untagged rule.
     let mut never = proof.clone();
     for contribution in &mut never[..3] {
-        contribution.identity = RequestIdentity::Refused(Refusal::Pending);
+        contribution.identity = RequestIdentity::Refused(Refusal::IncompleteEvidence);
     }
     let mut unproved = original.clone();
     let empty = retained_state();

@@ -778,7 +778,6 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
         let (root, sub) = (fold(&items[0]), fold(&items[1]));
         assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
         assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
-        assert_eq!((root.side_requests, sub.side_requests), (1, 1));
         assert_eq!(root.side.input, 50);
         assert_eq!(sub.side.input, 40);
         let got = publish(items, None, TelemetryRead::Loaded, &index);
@@ -850,11 +849,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
         // Without the holder the held row is an untraced root fallback too.
         let side = if holder { 1 } else { 2 };
         let root = fold(&items[0]);
-        assert_eq!(
-            (root.side_requests, root.root_fallbacks),
-            (side, side),
-            "holder={holder}"
-        );
+        assert_eq!(root.root_fallbacks, side, "holder={holder}");
         assert_eq!(requests(&items[0], REPORTED), side, "holder={holder}");
         let total = root.entity.totals().1;
         assert_eq!(total, 1 + side, "holder={holder}");
@@ -906,11 +901,7 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             assert_eq!(unresolved.contains(ROOT), held, "{queued:?}");
             assert_eq!(root.entity.held, held, "{queued:?}");
             assert_eq!(root.telemetry.side_calls_done, !held, "{queued:?}");
-            assert_eq!(
-                (root.side_requests, root.root_fallbacks),
-                if held { (0, 0) } else { (1, 1) },
-                "{queued:?}"
-            );
+            assert_eq!(root.root_fallbacks, if held { 0 } else { 1 }, "{queued:?}");
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
     };
@@ -1815,7 +1806,6 @@ fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identical
             serde_json::to_vec(&run()).unwrap()
         );
         assert!(fold(&item).accounts.as_ref().unwrap().mixed);
-        assert_eq!(fold(&item).accounts.as_ref().unwrap().inherited, 2);
         let mut admissions = crate::snapshots::claude_request_accounts::MixedUploads::default();
         admissions.admit_request_identity(&item);
         assert!(
@@ -2620,86 +2610,10 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
     };
 }
 
+/// [behaviour] Held copies leave the fold; copies that count after all (no
+/// holder) stay.
 #[test]
-fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
-    {
-        let a = root_file("identity-count-a");
-        let b = root_file("identity-count-b");
-        let index = ScanIndex::default();
-        let one = parse(
-            &a,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first", &at(1), 1),
-                line("shared", &at(2), 1),
-            ],
-        );
-        let two = parse(
-            &b,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first", &at(1), 1),
-                line("shared", &at(2), 1),
-                line("new", &at(3), 1),
-            ],
-        );
-        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
-            let counts =
-                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                    .unwrap();
-            assert_eq!(counts, json!({"claude_inherited_org_requests":2}));
-        }
-        cleanup(&[&a, &b]);
-    };
-}
-
-#[test]
-fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
-    {
-        let a = root_file("identity-count-disjoint-a");
-        let b = root_file("identity-count-disjoint-b");
-        let index = ScanIndex::default();
-        let one = parse(
-            &a,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first-a", &at(1), 1),
-                line("a-one", &at(2), 1),
-                line("a-two", &at(3), 1),
-            ],
-        );
-        let two = parse(
-            &b,
-            Some(t0()),
-            &index,
-            &[
-                org_marker(ORG_A),
-                line("first-b", &at(1), 1),
-                line("b-one", &at(2), 1),
-                line("b-two", &at(3), 1),
-            ],
-        );
-        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
-            assert_eq!(
-                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                    .unwrap(),
-                json!({"claude_inherited_org_requests":4})
-            );
-        }
-        cleanup(&[&a, &b]);
-    };
-}
-
-/// [behaviour] The inherited-org counter leaves out removed copies and
-/// counts copies that count after all (no holder).
-#[test]
-fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
+fn e2_identity_held_copies_leave_and_counted_copies_stay() {
     {
         let path = root_file("identity-count-copy");
         for restore in [false, true] {
@@ -2721,13 +2635,6 @@ fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copie
             assert_eq!(
                 fold(&item).entity.removed_requests,
                 if restore { 0 } else { 2 }
-            );
-            let counts =
-                serde_json::to_value(claude_request_identity::page_identity_counts(&[item]))
-                    .unwrap();
-            assert_eq!(
-                counts,
-                json!({"claude_inherited_org_requests":if restore { 2 } else { 1 }})
             );
         }
         cleanup(&[&path]);
@@ -2975,11 +2882,9 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 claude_request_identity::inherit_root_accounts(&mut items, true);
-                let counts =
-                    serde_json::to_value(claude_request_identity::page_identity_counts(&items))
-                        .unwrap();
-                assert!(counts.get("claude_identity_conflict_fallbacks").is_none());
-                assert_eq!(counts["claude_inherited_org_requests"], 1);
+                assert!(items
+                    .iter()
+                    .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 let item = tag_owned(items, &index).remove(0);
                 assert_eq!((item.request_count, item.input_tokens), (2, 30));
                 assert_eq!(item.request_evidence.len(), 1);
@@ -3995,13 +3900,8 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
         )
     });
     assert_eq!(unresolved, BTreeSet::from([ROOT.to_owned()]));
-    assert_eq!(
-        fold(&items[0]).side_requests,
-        0,
-        "never counted on a deadline"
-    );
     assert!(!fold(&items[0]).telemetry.side_calls_done);
-    // The next page's walk completes and counts the side call once.
+    // The next page's walk completes and resolves the side call.
     let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
     attach_page(&mut items, &read);
     let unresolved = side_calls_page(
@@ -4011,7 +3911,6 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
         &index,
     );
     assert!(unresolved.is_empty());
-    assert_eq!(fold(&items[0]).side_requests, 1);
     cleanup(&[&p]);
 }
 
