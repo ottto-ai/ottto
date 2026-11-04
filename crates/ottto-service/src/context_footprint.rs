@@ -306,6 +306,10 @@ fn harvest_source(
 ) -> Result<ContextHarvestOutcome> {
     let relay_token =
         client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode)?;
+    // Each upload mints its own token just before it posts, as the Codex path
+    // does: the probes take tens of seconds, and another minter on this device
+    // can rebind its machine id in that gap.
+    let mint = || client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode);
     let identity = destination_identity(device, machine_id, api_base_url);
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
@@ -317,7 +321,7 @@ fn harvest_source(
             let _ = fs::remove_file(&marker);
             return harvest_recent_workspaces(
                 client,
-                &relay_token,
+                &mint,
                 support_dir,
                 &identity,
                 home,
@@ -335,7 +339,7 @@ fn harvest_source(
 
     harvest_recent_workspaces(
         client,
-        &relay_token,
+        &mint,
         support_dir,
         &identity,
         home,
@@ -364,7 +368,7 @@ fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn harvest_recent_workspaces(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     home: &Path,
@@ -413,7 +417,7 @@ fn harvest_recent_workspaces(
             Ok(mut request) => {
                 match upload_if_changed(
                     client,
-                    relay_token,
+                    mint_relay_token,
                     support_dir,
                     identity,
                     &mut request,
@@ -1551,7 +1555,7 @@ struct FootprintCacheEntry {
 
 pub(crate) fn upload_if_changed(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     request: &mut ContextFootprintIngestRequest,
@@ -1571,7 +1575,8 @@ pub(crate) fn upload_if_changed(
     }
     let payload = serde_json::to_value(request)
         .map_err(|error| anyhow!("encode context footprint: {error}"))?;
-    client.upload_context_footprint(relay_token, &payload)?;
+    let relay_token = mint_relay_token()?;
+    client.upload_context_footprint(&relay_token, &payload)?;
     write_json_atomic(
         &path,
         &FootprintCacheEntry {
