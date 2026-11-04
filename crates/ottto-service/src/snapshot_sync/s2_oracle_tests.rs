@@ -225,7 +225,7 @@ fn append_after_restart_and_eviction_preserves_placement() {
 #[test]
 fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
     with_e2(|| {
-        let (c, _) = placement_corpus("s2-identity-deferred-retry");
+        let (c, root_path) = placement_corpus("s2-identity-deferred-retry");
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
@@ -353,6 +353,33 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         let answered = page(&c, owed, 100, true);
         assert!(answered.modes.0 > 0, "the owed answer reads a native Full");
         money_oracle::assert_equivalent(&cold, &result(&answered, Mode::ColdFull));
+
+        // The answer is accepted and the challenge clears, so the next
+        // prepare mirrors none. The next pass continues the session's files
+        // from the Tail: the root's growth and its subagent member's growth
+        // (the member the family pull brings in) read no Full and miss no
+        // stored head.
+        let mut cleared = commit(&session, answered);
+        cleared.activate_head_conflict_sessions(BTreeSet::new());
+        append(
+            &root_path,
+            &line(ROOT, "after-clear", "2026-08-02T07:05:00Z", 6),
+        );
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "after-clear-agent", "2026-08-02T07:05:00Z", 3),
+        );
+        let misses = || {
+            crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test(
+                "tail_db_loads",
+                "miss",
+            )
+        };
+        let before = misses();
+        let next = page(&c, cleared, 100, true);
+        assert_eq!(misses() - before, 0, "no stored-head miss after the clear");
+        assert_eq!(next.modes.0, 0, "no Full after the clear, members included");
+        assert!(next.modes.1 > 0, "the growth reads Tail");
     });
 }
 
@@ -543,15 +570,19 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         let loss_fingerprint = loss_body.snapshot_fingerprint.clone();
         let loss_witness = snapshot_upload_body_witness(loss_body);
         let mut progress = e2_progress();
+        // Patched and unpatched bodies may travel in separate requests; only
+        // the request holding the other entity carries the refusal.
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
             let mut response = ack(items)?;
             // Preserve the existing partial outcome while exactly ACKing
             // the loss-bearing root and leaving its other entity owed.
-            let other = response
+            let Some(other) = response
                 .accepted_entities
                 .iter()
                 .position(|entity| entity.source_session_id != ROOT)
-                .unwrap();
+            else {
+                return Ok(response);
+            };
             let mut refused = response.accepted_entities.remove(other);
             response.accepted -= 1;
             // Cache rows put the request under head-CAS: the refusal then
