@@ -758,6 +758,103 @@ fn legacy_owed_held_archive_older_than_first_read_window_is_counted() {
     assert!(index.files.contains_key(&key));
 }
 
+/// [regress] 0.1.219 left a never-read archived rollout as a metadata-only
+/// head owing the whole archive, unread. Its ordinary counted Full and exact
+/// ACK settle that debt: the file leaves the outstanding set, counts once
+/// (equivalent to a cold run), keeps no metadata-only head, and the next pass
+/// reads nothing.
+#[test]
+fn archive_whole_unread_debt_settles_after_one_counted_full() {
+    use crate::snapshots::g7_debt::tests as g7;
+    const CONTEXT: &str = "g7-archive-whole-context";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
+    let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
+    fs::write(&compressed, &encoded).unwrap();
+    File::options()
+        .write(true)
+        .open(&compressed)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600))
+        .unwrap();
+    let (cold_index, cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    let expected = emitted(&cold_index, &cold);
+    assert_eq!(expected.snapshots.len(), 1);
+
+    let (session, mut prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let key = local_index_key(&compressed);
+    g7::seed_archive_whole_unread(&prior, &compressed);
+    prior.save(session.path()).unwrap();
+    let mut prior = ScanIndex::load(session.path()).unwrap();
+    let head = state_v2::load_head(&prior, &key, u32::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(
+        head.common.representation,
+        state_v2::Representation::Archive
+    );
+    prior.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let owed = g7::walk(SnapshotSource::Codex, &c.roots(), &mut prior)["debt"].clone();
+    assert_eq!(owed["outstanding_files"], 1);
+    assert_eq!(owed["unread_bytes"], encoded.len() as u64);
+    assert_eq!(owed["over_6h_files"], 1);
+    prior.traversal = None;
+
+    let (working, read, _, consumed, logs) = page(
+        &c,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    assert!(consumed > 0);
+    assert!(
+        full_decodes(&logs) > 0,
+        "the archive takes an ordinary counted Full"
+    );
+    let (mut index, posts) = working.checkpoint_with_captured_posts(&read, &prior, "accept");
+    let read_route = route(&index, &read, posts);
+    money_oracle::assert_equivalent(&expected, &read_route);
+
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let (mut index, _) = assert_quiet(&c, index, &read_route);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+    assert_eq!(settled["outstanding_files"], 0);
+    assert_eq!(settled["unread_bytes"], 0);
+    assert_eq!(settled["over_6h_files"], 0);
+    index.save(session.path()).unwrap();
+    let mut index = ScanIndex::load(session.path()).unwrap();
+    if let Some(head) = state_v2::load_head(&index, &key, u32::MAX).unwrap() {
+        assert!(!head.metadata_only, "a remaining head bears the reduction");
+        assert_eq!(head.common.representation, state_v2::Representation::Tail);
+        assert_eq!(head.common.debt, Default::default());
+        let mut revisions = 0;
+        state_v2::load_revisions(&index, &key, &head, |_, _| {
+            revisions += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(revisions, 0);
+    }
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index);
+    assert_eq!(after["debt"]["outstanding_files"], 0);
+    assert_eq!(after["debt"]["over_6h_files"], 0);
+    drop(session);
+}
+
 /// [regress] The ordinary first-seen predicate excludes never-seen old input
 /// equally for both encodings, while unrelated placed money still emits.
 #[test]
