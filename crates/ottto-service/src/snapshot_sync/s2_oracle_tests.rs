@@ -728,16 +728,16 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
         );
         // Same-generation growth continues the saved head despite its loss.
         assert_eq!(replay.modes, (0, 1, 0));
-        assert_eq!(replay.scan.malformed_json_line_count, 1);
-        assert_eq!(
-            replay.scan.malformed_json_line_count,
-            cold_page.scan.malformed_json_line_count
-        );
         let dispositions = |page: &Page| {
             serde_json::to_value(&page.index).unwrap()["terminal_jsonl_dispositions"].clone()
         };
         let cold_loss = dispositions(&cold_page);
-        assert!(!cold_loss.as_object().unwrap().is_empty());
+        let losses = cold_loss.as_object().unwrap();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(
+            losses.values().next().unwrap()["loss"]["malformed_json_line_count"],
+            1
+        );
         assert_eq!(dispositions(&replay), cold_loss);
         assert_eq!(
             replay

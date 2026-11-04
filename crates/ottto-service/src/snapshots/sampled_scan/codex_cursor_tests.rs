@@ -325,9 +325,8 @@ fn overlong_envelope_row() -> Vec<u8> {
     .into_bytes()
 }
 
-/// A withheld final record applied at a genuine EOF matches a
-/// read without an extent applying its trailing line, for a valid, a
-/// malformed and larger record.
+/// Valid final JSON keeps EOF admission; invalid unterminated bytes stay
+/// pending without loss on both cursor and compatibility routes.
 #[test]
 fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     for last in [
@@ -348,16 +347,17 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
                 reader.step(|value| seen.push(value.clone())).unwrap(),
                 JsonlReaderStep::Complete(_)
             ) {}
+            if serde_json::from_slice::<Value>(&last).is_err() {
+                assert!(reader.sealed_fragment());
+                assert!(!reader.apply_sealed_fragment(|value| seen.push(value.clone())));
+                assert!(reader.sealed_fragment());
+                assert_eq!(seen.len(), 2);
+                assert_eq!(reader.report.malformed_json_line_count, 0);
+                assert_eq!(reader.report.invalid_utf8_line_count, 0);
+                return (seen, reader.report);
+            }
             if cursor {
                 assert!(reader.sealed_fragment());
-                if serde_json::from_slice::<Value>(&last).is_err() {
-                    assert!(!reader.apply_sealed_fragment(|value| seen.push(value.clone())));
-                    assert!(reader.sealed_fragment());
-                    assert_eq!(seen.len(), 2);
-                    assert_eq!(reader.report.malformed_json_line_count, 0);
-                    assert_eq!(reader.report.invalid_utf8_line_count, 0);
-                    return (seen, reader.report);
-                }
                 assert!(reader.apply_sealed_fragment(|value| seen.push(value.clone())));
                 assert!(!reader.sealed_fragment());
                 assert!(reader.buf.is_empty());
@@ -365,12 +365,7 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
             }
             (seen, reader.report)
         };
-        if serde_json::from_slice::<Value>(&last).is_ok() {
-            assert_eq!(read(true), read(false));
-        } else {
-            assert_eq!(read(true).0.len(), 2);
-            assert_eq!(read(false).1.malformed_json_line_count, 1);
-        }
+        assert_eq!(read(true), read(false));
     }
 }
 
@@ -2257,7 +2252,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
 /// read, so later pages skip it, also past the audit interval. No copy is
 /// kept: the applied record lies past the certified prefix `[0, s)`, so
 /// every such job is non-retainable and converges through the index alone.
-/// A malformed record is reported as a line loss.
+/// An invalid unterminated record stays pending with no line loss on either route.
 #[test]
 fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2289,8 +2284,8 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
                 malformed_lines += scan.malformed_json_line_count;
-                // A lossy (malformed) job ends uncertified, like main's
-                // lossy full read.
+                // Complete the certified prefix without applying a pending
+                // invalid suffix, or count the valid EOF record once.
                 if counter(&cache, |c| c.jobs_certified + c.jobs_uncertified) == 1 {
                     completed = Some(scan);
                     break;
@@ -2307,9 +2302,9 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 assert_eq!(counter(&cache, |c| c.eof_record_applied), 0);
                 assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1);
                 assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
-                assert!(
-                    unpaged.malformed_json_line_count > 0,
-                    "compatibility reader reports it"
+                assert_eq!(
+                    unpaged.malformed_json_line_count, 0,
+                    "compatibility reader also keeps the suffix pending"
                 );
                 assert_eq!(
                     malformed_lines, 0,
