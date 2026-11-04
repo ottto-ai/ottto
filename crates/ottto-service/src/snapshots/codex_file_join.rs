@@ -2213,7 +2213,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert!(parsed.complete());
+        assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].input_tokens, 300);
         assert_eq!(parsed.report.parsed_json_line_count, 6);
@@ -2584,7 +2584,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-        assert!(parsed.complete());
+        assert!(parsed.progress_complete());
         let item = &parsed.snapshots[0];
         assert_eq!(item.input_tokens, 500);
         let priority = item
@@ -3973,7 +3973,7 @@ pub(super) mod tests {
                 None,
             )
             .unwrap();
-            assert!(parsed.complete());
+            assert!(parsed.progress_complete());
             let fingerprints = parsed
                 .snapshots
                 .iter()

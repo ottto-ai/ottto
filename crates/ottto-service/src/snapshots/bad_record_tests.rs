@@ -137,7 +137,7 @@ fn stored<S: SourceFixture>(route: &Route, path: &Path) -> (OwnedJsonlParser, Ta
         panic!("committed loss is progress, never reconstruction");
     };
     let mode = p
-        .prepare_acquisition(Some(*taken), &scope(), None, NOW)
+        .prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
         .unwrap();
     (p, base, mode)
 }
@@ -246,7 +246,7 @@ fn regression<S: SourceFixture>() {
     };
     let mut ram = parser::<S>(&path);
     assert_eq!(
-        ram.prepare_acquisition(Some(taken), &scope(), None, NOW)
+        ram.prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
             .unwrap(),
         ReadMode::Unchanged
     );
@@ -612,7 +612,7 @@ fn admission<S: SourceFixture>() {
     write(&path, &rows);
     let at = "2026-12-20T00:00:00Z";
     let now = rfc3339_unix_seconds(at).unwrap();
-    let set_age = |days| {
+    let set_age = |days: u64| {
         File::options()
             .write(true)
             .open(&path)

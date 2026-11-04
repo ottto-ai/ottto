@@ -716,7 +716,7 @@ impl NativePhase {
                 .checked_add(usize::from(residue))?
                 .checked_add(usize::from(observed_insert))?
                 .checked_add(usize::from(
-                    parsed.complete() && parsed.snapshots.is_empty(),
+                    parsed.progress_complete() && parsed.snapshots.is_empty(),
                 ))?;
             settlement::restore_tree_insert_peak::<String, ()>(
                 path_set_entries.checked_add(1)?,

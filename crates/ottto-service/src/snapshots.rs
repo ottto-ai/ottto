@@ -30797,9 +30797,7 @@ fn apply_physical_line(
     codex_zst_refusal_tests::jsonl_parse_attempted();
     let decoded = match jsonl_line_text(buf) {
         JsonlLineText::Blank => Ok(None),
-        JsonlLineText::Text(line) => serde_json::from_str::<Value>(line)
-            .map(Some)
-            .map_err(|_| false),
+        JsonlLineText::Text(line) => serde_json::from_str(line).map(Some).map_err(|_| false),
         JsonlLineText::InvalidUtf8 => Err(true),
     };
     // Unchanged EOF proves no growth, not that a paused writer finished JSON.
@@ -61762,7 +61760,6 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        use std::io::Write as _;
         writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
             json!({"timestamp":"2026-08-02T10:00:03Z","sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "type":"assistant","requestId":"req_healthy","message":{"id":"msg_healthy",
@@ -61805,7 +61802,6 @@ mod tests {
             ),
         )
         .expect("write fixture");
-        use std::io::Write as _;
         writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
             json!({"timestamp":"2026-08-02T10:00:03Z","sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "type":"assistant","requestId":"req_healthy","message":{"id":"msg_healthy",
@@ -63880,7 +63876,7 @@ mod tests {
         }
         fs::write(&path, format!("{prefix}{lost_request}\n{suffix}")).unwrap();
         let clean = parse_codex_test(&path);
-        assert!(clean.complete());
+        assert!(clean.progress_complete());
         let mut prior_item = clean.snapshots[0].clone();
         prepare_cache_observations(&mut prior_item, None);
         let prior = prior_item.cache_observations_state.unwrap();

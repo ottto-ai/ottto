@@ -579,7 +579,7 @@ fn duplicate_origin_stub_replayed_first_does_not_change_live_context() {
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert!(parsed.progress_complete());
     assert_eq!(parsed.snapshots.len(), 1);
     assert_eq!(parsed.snapshots[0].input_tokens, 100);
     assert!(
