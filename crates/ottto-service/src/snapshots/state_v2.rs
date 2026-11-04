@@ -39,8 +39,6 @@ pub(super) fn terminal_loss_for_test(bytes: &[u8]) -> super::TerminalJsonlDispos
 mod ignored;
 mod interning;
 mod kinds;
-#[cfg(test)]
-pub(super) use kinds::tests::compact_reopened_for_test;
 mod kinds_accounts;
 mod kinds_census;
 mod kinds_files;

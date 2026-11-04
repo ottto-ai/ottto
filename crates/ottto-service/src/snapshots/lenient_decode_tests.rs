@@ -126,16 +126,6 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
             serde_json::json!({"proof_correction": {"owed_member_ids": {"unknown": true}}, "disposition": "unproven_terminal"}),
         ),
         (
-            "claude_account_family_pending",
-            "family".into(),
-            serde_json::json!({"invalid": "false"}),
-        ),
-        (
-            "claude_account_family_witnesses",
-            "family".into(),
-            serde_json::json!({"members": 17}),
-        ),
-        (
             "claude_usage_family_witnesses",
             "family".into(),
             serde_json::json!({"legacy_owners": [17]}),
@@ -998,18 +988,11 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
             cloned.decode_held_codex_owners().collect::<Vec<_>>(),
             vec![valid.then_some(owner.as_str())]
         );
-        assert!(cloned.decode_holds_codex_owner("held-owner"));
-        assert_eq!(cloned.decode_holds_codex_owner("unrelated-owner"), !valid);
         cloned.save(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(
             restarted.decode_held_codex_owners().collect::<Vec<_>>(),
             vec![valid.then_some(owner.as_str())]
-        );
-        assert!(restarted.decode_holds_codex_owner("held-owner"));
-        assert_eq!(
-            restarted.decode_holds_codex_owner("unrelated-owner"),
-            !valid
         );
         assert_eq!(
             raw_slot(&fs::read(&path).unwrap(), "files", key),
@@ -1560,12 +1543,20 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                         "reread_guard"
                             | "upload_context_fingerprint"
                             | "claude_desktop_census_witness"
+                            | "codex_state_only_snapshot_fingerprints"
+                            | "codex_state_only_blocked_session_ids"
+                            | "codex_state_only_blocked_by_file"
+                            | "codex_state_only_blocked_unattributed"
+                            | "codex_state_only_blocked_legacy"
+                            | "codex_state_only_blocked_attributed"
                             | "claude_desktop_store_inventory"
                             | "claude_folder_login_ledger"
                             | "context_curve_capability_enabled"
                             | "context_curve_replay_epoch"
                             | "completed_context_curve_replay_generation"
                             | "claude_usage_family_pending"
+                            | "claude_account_family_witnesses"
+                            | "claude_account_family_pending"
                             | "claude_duplicate_request_owners"
                             | "claude_duplicate_request_witness_overflowed"
                             | "claude_owned_start_census"
@@ -1619,6 +1610,59 @@ fn retired_desktop_census_witness_decodes_and_drops() {
             assert!(decoded.decode_holds.is_empty(), "{field}");
             assert_eq!(serde_json::to_value(&decoded).unwrap(), current, "{field}");
         }
+    }
+}
+
+/// [format] An older index holding the retired Codex state-only fields and the
+/// residue witness's blocked leaf still loads on every decoder; each is dropped
+/// and never written again.
+#[test]
+fn retired_codex_state_only_fields_decode_and_drop() {
+    let mut current = serde_json::to_value(fixture()).unwrap();
+    current["scan_residue_witness"] =
+        serde_json::json!({"census_window_end": "2026-10-22T00:00:00Z", "index_keys": ["file"]});
+    let current =
+        serde_json::to_value(serde_json::from_value::<ScanIndex>(current).unwrap()).unwrap();
+    let mut older = current.clone();
+    for (field, value) in [
+        (
+            "codex_state_only_snapshot_fingerprints",
+            serde_json::json!({"session": "a".repeat(64)}),
+        ),
+        (
+            "codex_state_only_blocked_session_ids",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_by_file",
+            serde_json::json!({"file": ["session"]}),
+        ),
+        (
+            "codex_state_only_blocked_unattributed",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_legacy",
+            serde_json::json!(["session"]),
+        ),
+        (
+            "codex_state_only_blocked_attributed",
+            serde_json::json!(true),
+        ),
+    ] {
+        assert!(current.get(field).is_none(), "{field} is never written");
+        older[field] = value;
+    }
+    older["scan_residue_witness"]["codex_state_only_blocked_session_ids"] =
+        serde_json::json!(["session"]);
+    let bytes = serde_json::to_vec(&older).unwrap();
+    let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+    let streaming =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+    for decoded in [native, streaming, bounded] {
+        assert!(decoded.decode_holds.is_empty());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
     }
 }
 
@@ -1931,22 +1975,19 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 // A prior, valid native family witness exists on disk before
                 // corruption. The real scan supplies its member revision;
                 // this fixture does not construct a hold or infer authority.
-                index.claude_account_family_witnesses.insert(
+                index.claude_usage_family_witnesses.insert(
                     session.into(),
-                    ClaudeAccountFamilyWitness {
-                        account_identifier_hash: "a".repeat(64),
-                        evidence_request_count: 1,
-                        members: BTreeMap::from([(
-                            session.into(),
-                            index.files[&key].modified_unix_seconds,
-                        )]),
-                        member_request_id_fingerprints: BTreeMap::new(),
-                    },
+                    serde_json::from_value(serde_json::json!({
+                        "evidence_fingerprint": "e".repeat(64),
+                        "member_request_id_fingerprints": {session: "f".repeat(64)},
+                        "assigned_request_id_fingerprints": {},
+                    }))
+                    .unwrap(),
                 );
             }
             index.save(&path).unwrap();
             let (field, held_key) = if family_slot {
-                ("claude_account_family_witnesses", session.to_owned())
+                ("claude_usage_family_witnesses", session.to_owned())
             } else {
                 ("files", key.clone())
             };
@@ -2243,25 +2284,14 @@ fn whole_index_damage(kind: &str) -> Vec<u8> {
                 serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
             serde_json::to_vec(&value).unwrap()
         }
-        "collision" => {
-            let mut index = fixture();
-            let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-            index
-                .codex_state_only_snapshot_fingerprints
-                .insert(key.to_string(), "lower".to_string());
-            index
-                .codex_state_only_snapshot_fingerprints
-                .insert(key.to_ascii_uppercase(), "upper".to_string());
-            serde_json::to_vec(&index).unwrap()
-        }
         _ => panic!("unknown synthetic damage"),
     }
 }
 
 #[test]
 fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
-    for previous in ["budget", "syntax", "collision"] {
-        for current in ["budget", "syntax", "collision"] {
+    for previous in ["budget", "syntax"] {
+        for current in ["budget", "syntax"] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
             let path = scratch.join("index.json");
             let previous_bytes = whole_index_damage(previous);
@@ -2322,7 +2352,7 @@ fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
 fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
     let now = SystemTime::now();
     let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    for current in ["budget", "syntax", "collision"] {
+    for current in ["budget", "syntax"] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-load-cooldown-time");
         let path = scratch.join("index.json");
         let bytes = whole_index_damage(current);
@@ -2535,145 +2565,129 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
     let session = item.source_session_id.clone();
     let owner_key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
     let source = SnapshotSource::ClaudeCode;
-    for damage_kind in ["budget", "collision"] {
-        let context = damage_kind.to_string();
-        reset_override_state_for_restart();
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
-        let path = scratch.join("index.json");
-        let support = scratch.join("support");
-        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
-        // The first incident is the pre-existing gated rebuild.
-        fs::write(&path, b"{").unwrap();
-        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    let context = "budget";
+    reset_override_state_for_restart();
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
+    let path = scratch.join("index.json");
+    let support = scratch.join("support");
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+    // The first incident is the pre-existing gated rebuild.
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
 
-        let seed = override_identity_seed(&session);
-        let damage = match damage_kind {
-            "budget" => struct_order_budget_damage(&seed, ""),
-            _ => {
-                let mut seed = seed.clone();
-                let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-                seed.codex_state_only_snapshot_fingerprints
-                    .insert(key.to_string(), "lower".to_string());
-                seed.codex_state_only_snapshot_fingerprints
-                    .insert(key.to_ascii_uppercase(), "upper".to_string());
-                serde_json::to_vec(&seed).unwrap()
-            }
-        };
-        fs::write(&path, &damage).unwrap();
-        let error = load().unwrap_err();
-        assert!(
-            error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
-            "{context}: {error:#}"
-        );
-        assert_eq!(fs::read(&path).unwrap(), damage, "{context}");
+    let seed = override_identity_seed(&session);
+    let damage = struct_order_budget_damage(&seed, "");
+    fs::write(&path, &damage).unwrap();
+    let error = load().unwrap_err();
+    assert!(
+        error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+        "{context}: {error:#}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), damage, "{context}");
 
-        assert_eq!(
-            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-            ScanIndexRebuildOverride::Armed
-        );
-        let overrides = scan_index_rebuild_manual_override_count();
-        let before = scan_index_containment_lines_for_test().len();
-        let (rebuilt, origin) = load().unwrap();
-        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{context}");
-        assert!(rebuilt.files.is_empty(), "{context}");
-        assert_eq!(rebuilt.generation, 0, "{context}");
-        assert_identity_carried(&rebuilt, &seed, &context);
-        assert_eq!(scan_index_rebuild_manual_override_count(), overrides + 1);
-        assert!(
-            scan_index_containment_lines_for_test()[before..]
-                .iter()
-                .any(|line| line.contains("override=user_repair")
-                    && line.contains("identity=carried"))
-        );
-        // The damaged bytes are the override witness.
-        let witness = fs::read_dir(scratch.as_ref())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("index.corrupt.override.")
-            })
-            .unwrap();
-        assert_eq!(fs::read(&witness).unwrap(), damage, "{context}");
-        assert!(scan_index_override_stamp_path(&support, source).exists());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    let overrides = scan_index_rebuild_manual_override_count();
+    let before = scan_index_containment_lines_for_test().len();
+    let (rebuilt, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{context}");
+    assert!(rebuilt.files.is_empty(), "{context}");
+    assert_eq!(rebuilt.generation, 0, "{context}");
+    assert_identity_carried(&rebuilt, &seed, context);
+    assert_eq!(scan_index_rebuild_manual_override_count(), overrides + 1);
+    assert!(scan_index_containment_lines_for_test()[before..]
+        .iter()
+        .any(|line| line.contains("override=user_repair") && line.contains("identity=carried")));
+    // The damaged bytes are the override witness.
+    let witness = fs::read_dir(scratch.as_ref())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index.corrupt.override.")
+        })
+        .unwrap();
+    assert_eq!(fs::read(&witness).unwrap(), damage, "{context}");
+    assert!(scan_index_override_stamp_path(&support, source).exists());
 
-        // Post-override failure: the replacement cycle dies before any save.
-        // The next load reads the carried rebuild, still fresh (generation 0,
-        // no files), never an empty identity graph.
-        drop(rebuilt);
-        let (mut reloaded, origin) = load().unwrap();
-        assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{context}");
-        assert_eq!(reloaded.generation, 0, "{context}");
-        assert!(reloaded.files.is_empty(), "{context}");
-        assert!(!scan_index_rebuild_paused(source));
-        assert_identity_carried(&reloaded, &seed, &context);
+    // Post-override failure: the replacement cycle dies before any save.
+    // The next load reads the carried rebuild, still fresh (generation 0,
+    // no files), never an empty identity graph.
+    drop(rebuilt);
+    let (mut reloaded, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{context}");
+    assert_eq!(reloaded.generation, 0, "{context}");
+    assert!(reloaded.files.is_empty(), "{context}");
+    assert!(!scan_index_rebuild_paused(source));
+    assert_identity_carried(&reloaded, &seed, context);
 
-        // Post-override evidence: conflicting exact creator B defers and
-        // never replaces the retained owner A.
-        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
-        let deferred = reloaded.bind_session_accounts(
+    // Post-override evidence: conflicting exact creator B defers and
+    // never replaces the retained owner A.
+    set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
+    let deferred = reloaded.bind_session_accounts(
+        SnapshotSource::ClaudeCode,
+        "machine-a",
+        &mut [item.clone()],
+        &[],
+    );
+    assert!(deferred.contains(&session), "{context}");
+    assert_eq!(
+        reloaded.session_account_bindings[&owner_key].account_identifier_hash,
+        OVERRIDE_OWNER_A
+    );
+
+    // A replacement page records acknowledgements and checkpoints a
+    // partial commit: the carried ones have no file incidence yet and
+    // are kept until a census re-derives it.
+    assert!(reloaded.accepted_incidence_pending_census, "{context}");
+    reloaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    let partial =
+        reloaded.committable_subset(&reloaded.clone(), &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(
+        partial.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+        "{context}"
+    );
+    assert!(partial.accepted_incidence_pending_census, "{context}");
+
+    // A settled upload saves; a stale writer's CAS then fails. A stays.
+    let mut stale = reloaded.clone();
+    reloaded.save(&path).unwrap();
+    assert!(stale.save(&path).is_err(), "{context}");
+    let mut restarted = load().unwrap().0;
+    assert_eq!(restarted.generation, 1, "{context}");
+    assert_identity_carried(&restarted, &seed, context);
+    assert!(restarted
+        .bind_session_accounts(
             SnapshotSource::ClaudeCode,
             "machine-a",
             &mut [item.clone()],
-            &[],
-        );
-        assert!(deferred.contains(&session), "{context}");
-        assert_eq!(
-            reloaded.session_account_bindings[&owner_key].account_identifier_hash,
-            OVERRIDE_OWNER_A
-        );
-
-        // A replacement page records acknowledgements and checkpoints a
-        // partial commit: the carried ones have no file incidence yet and
-        // are kept until a census re-derives it.
-        assert!(reloaded.accepted_incidence_pending_census, "{context}");
-        reloaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-        let partial =
-            reloaded.committable_subset(&reloaded.clone(), &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(
-            partial.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
-            "{context}"
-        );
-        assert!(partial.accepted_incidence_pending_census, "{context}");
-
-        // A settled upload saves; a stale writer's CAS then fails. A stays.
-        let mut stale = reloaded.clone();
-        reloaded.save(&path).unwrap();
-        assert!(stale.save(&path).is_err(), "{context}");
-        let mut restarted = load().unwrap().0;
-        assert_eq!(restarted.generation, 1, "{context}");
-        assert_identity_carried(&restarted, &seed, &context);
-        assert!(restarted
-            .bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine-a",
-                &mut [item.clone()],
-                &[]
-            )
-            .contains(&session));
-        assert_eq!(
-            restarted.session_account_bindings[&owner_key].account_identifier_hash,
-            OVERRIDE_OWNER_A
-        );
-        // Only reconstructing each carried file retires its debt; census alone
-        // proves neither reconstruction nor the release of history-held files.
-        assert!(restarted.accepted_incidence_pending_census, "{context}");
-        assert!(
-            !restarted.accepted_rebuild_incidence.is_empty(),
-            "{context}"
-        );
-        assert_eq!(
-            seed.file_snapshot_fingerprints,
-            restarted.accepted_rebuild_incidence
-        );
-        restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-        assert_eq!(
-            restarted.accepted_snapshot_fingerprints,
-            seed.accepted_snapshot_fingerprints
-        );
-    }
+            &[]
+        )
+        .contains(&session));
+    assert_eq!(
+        restarted.session_account_bindings[&owner_key].account_identifier_hash,
+        OVERRIDE_OWNER_A
+    );
+    // Only reconstructing each carried file retires its debt; census alone
+    // proves neither reconstruction nor the release of history-held files.
+    assert!(restarted.accepted_incidence_pending_census, "{context}");
+    assert!(
+        !restarted.accepted_rebuild_incidence.is_empty(),
+        "{context}"
+    );
+    assert_eq!(
+        seed.file_snapshot_fingerprints,
+        restarted.accepted_rebuild_incidence
+    );
+    restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    assert_eq!(
+        restarted.accepted_snapshot_fingerprints,
+        seed.accepted_snapshot_fingerprints
+    );
 }
 
 #[test]
@@ -3169,7 +3183,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     let original_carry = rebuilt.accepted_rebuild_incidence.clone();
     rebuilt.save(&path).unwrap();
     let mut value = serde_json::to_value(&rebuilt).unwrap();
-    value["claude_account_family_witnesses"] =
+    value["claude_usage_family_witnesses"] =
         serde_json::json!({session: {"members": [false], "opaque": "future"}});
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let mut held = ScanIndex::load(&path).unwrap();
@@ -3204,7 +3218,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     // A compatible repair understands/removes the bad witness; the missing
     // derived file entry now forces actual reconstruction on a healthy pass.
     let mut repaired = serde_json::to_value(&restarted).unwrap();
-    repaired["claude_account_family_witnesses"] = serde_json::json!({});
+    repaired["claude_usage_family_witnesses"] = serde_json::json!({});
     fs::write(&path, serde_json::to_vec(&repaired).unwrap()).unwrap();
     let mut healthy = ScanIndex::load(&path).unwrap();
     let release = scan(&mut healthy, "2026-10-22T00:02:00Z");
@@ -3524,12 +3538,12 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "terminal_jsonl_dispositions",
             "known_configured_scan_roots",
             "legacy_unresolved_root_file_witnesses",
-            "codex_state_only_snapshot_fingerprints",
-            "codex_state_only_blocked_session_ids",
-            "codex_state_only_blocked_by_file",
-            "codex_state_only_blocked_unattributed",
-            "codex_state_only_blocked_legacy",
-            "codex_state_only_blocked_attributed",
+            "codex_state_only_snapshot_fingerprints", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_session_ids", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_by_file", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_unattributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_legacy", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+            "codex_state_only_blocked_attributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "codex_parent_ownership_refs",
             "codex_parent_ownership_ledgers",
             "codex_parent_side_requests",

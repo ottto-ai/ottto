@@ -90,7 +90,7 @@ fn commit_with_progress(
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    (session.save_reload(&mut page.index).0, progress)
+    (session.save_reload(&mut page.index), progress)
 }
 
 fn accepted(result: &mut RouteResult, items: &[SnapshotItem]) {
@@ -279,7 +279,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         );
         seed.index
             .retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-        let mut prior = session.save_reload(&mut seed.index).0;
+        let mut prior = session.save_reload(&mut seed.index);
         prior.activate_quarantine_witness_for_test(SOURCE);
 
         let mut cold_page = page(&c, ScanIndex::default(), 100, false);

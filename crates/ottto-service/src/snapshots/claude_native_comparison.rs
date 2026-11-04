@@ -549,8 +549,7 @@ impl NativePhase {
             let entry = index.files.get(path)?; // target is an exact existing Skip member
                                                 // Codex-only branches have different metadata ownership. They are
                                                 // never eligible targets and cannot borrow this Claude prepayment.
-            if !parsed.state_only_blocked_session_ids.is_empty()
-                || parsed.codex_parent_session_ref.is_some()
+            if parsed.codex_parent_session_ref.is_some()
                 // Unchanged refusal: any parse that saw a source session id.
                 || parsed.source_session_id_seen
             {

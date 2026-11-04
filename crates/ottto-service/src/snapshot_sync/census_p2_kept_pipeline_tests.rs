@@ -1126,10 +1126,10 @@ fn same_context_restart_rearms_no_file() {
 }
 
 /// An index written by an older release still carries the retired per-family
-/// pending evidence and per-file owed bits. Decoding drops both and changes no
-/// file entry. With that index on disk, the next traversal after a restart
-/// wakes no root, including a root whose only debt was that pending evidence,
-/// and its save purges both.
+/// pending evidence, account windows and account proofs, and per-file owed
+/// bits. Decoding drops all of them and changes no file entry. With that index
+/// on disk, the next traversal after a restart wakes no root, including a root
+/// whose only debt was that retired state, and its save purges it.
 #[test]
 #[serial(source_manifests)]
 fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
@@ -1137,11 +1137,41 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let mut fixture = PipelineFixture::new("census-p2-upgrade-owed");
     fixture.baseline();
     let index = ScanIndex::load(&fixture.index_path).expect("load the baseline index");
-    let legacy = crate::snapshots::sampled_scan::transition_fixture::legacy_pending_store(&index);
+    let mut legacy =
+        crate::snapshots::sampled_scan::transition_fixture::legacy_pending_store(&index);
     let pending = legacy["claude_usage_family_pending"]
         .as_object()
-        .expect("the legacy store carries pending evidence");
+        .expect("the legacy store carries pending evidence")
+        .clone();
     assert_eq!(pending.len(), PIPELINE_SESSIONS.len());
+    // The same release stored each family's account windows and account
+    // proof under names this build keeps only as decode-and-drop tombstones.
+    const RETIRED: [&str; 3] = [
+        "claude_usage_family_pending",
+        "claude_account_family_pending",
+        "claude_account_family_witnesses",
+    ];
+    let (mut windows, mut proofs) = (serde_json::Map::new(), serde_json::Map::new());
+    for root in pending.keys() {
+        let window = |end: &str, account: &str| {
+            serde_json::json!({"census_window_end": end, "account_identifier_hash": account,
+                "evidence_request_count": 1, "members": {root.as_str(): 1}, "invalid": false})
+        };
+        windows.insert(
+            root.clone(),
+            serde_json::json!({"w": "2026-08-02T08:00:00Z", "a": "a".repeat(64), "e": 1,
+                "i": false, "members": {root.as_str(): 1},
+                "previous_windows": [window("2026-08-01T08:00:00Z", &"b".repeat(64))]}),
+        );
+        proofs.insert(
+            root.clone(),
+            serde_json::json!({"account_identifier_hash": "a".repeat(64),
+                "evidence_request_count": 1, "members": {root.as_str(): 1},
+                "member_request_id_fingerprints": {root.as_str(): "c".repeat(64)}}),
+        );
+    }
+    legacy["claude_account_family_pending"] = windows.into();
+    legacy["claude_account_family_witnesses"] = proofs.into();
     let files = legacy["files"]
         .as_object()
         .expect("the index encodes its file entries");
@@ -1150,13 +1180,12 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let decoded: ScanIndex =
         serde_json::from_value(legacy.clone()).expect("an older release's index decodes");
     let reencoded = serde_json::to_value(&decoded).expect("re-encode the decoded index");
-    assert!(
-        matches!(
-            reencoded.get("claude_usage_family_pending"),
-            None | Some(serde_json::Value::Null)
-        ),
-        "the retired pending evidence is dropped"
-    );
+    for field in RETIRED {
+        assert!(
+            matches!(reencoded.get(field), None | Some(serde_json::Value::Null)),
+            "{field}: the retired state is dropped"
+        );
+    }
     assert_eq!(decoded.files.len(), index.files.len());
     for (key, entry) in index.files.iter() {
         let upgraded = serde_json::to_value(&decoded.files[key]).unwrap();
@@ -1173,13 +1202,12 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read the saved index"))
             .expect("decode the saved index");
-    assert!(
-        matches!(
-            saved.get("claude_usage_family_pending"),
-            None | Some(serde_json::Value::Null)
-        ),
-        "the next save purges the retired pending evidence"
-    );
+    for field in RETIRED {
+        assert!(
+            matches!(saved.get(field), None | Some(serde_json::Value::Null)),
+            "{field}: the next save purges the retired state"
+        );
+    }
     for (key, entry) in saved["files"]
         .as_object()
         .expect("the saved index encodes its file entries")

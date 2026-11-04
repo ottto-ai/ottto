@@ -75,12 +75,7 @@ pub(crate) fn routed_for_test(
     {
         return index;
     }
-    let prior = if on.is_some() {
-        state_v2::money_test_support::resident(&index)
-    } else {
-        index
-    };
-    let (path, cold) = publish_route(&prior, dir);
+    let (path, cold) = publish_route(&index, dir);
     let others = own.take().map_or_else(Vec::new, |route| {
         let mut others = route.others;
         others.push(route.path);
@@ -185,7 +180,7 @@ fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     (path, cold)
 }
 
-/// A restart of `index` as its own install: its resident graph published on
+/// A restart of `index` as its own install: its graph published on
 /// a new route, so another install's commits from the same prior never stale
 /// it. An unrouted index is returned as is.
 pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
@@ -193,7 +188,7 @@ pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
         return index.clone();
     }
     // A restart from disk: runtime-only fields are gone, as through a file.
-    publish_route(&state_v2::money_test_support::resident(index), dir).1
+    publish_route(index, dir).1
 }
 
 /// This thread's process total of the Tail counter `name{label}`, summed over
@@ -269,14 +264,9 @@ fn head_certificate<S: tail_source::TailSource>(
     Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
 }
 
-/// A routed graph read back resident, for byte comparisons; an unrouted one
-/// as is.
+/// The graph compared byte for byte, routed or not.
 pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
-    if route_of(index).is_some() {
-        state_v2::money_test_support::resident(index)
-    } else {
-        index.clone()
-    }
+    index.clone()
 }
 
 /// A scan fixture's page continues from its owner's route; with no cache it
@@ -295,7 +285,7 @@ pub(crate) fn route_for_test(
         if !fixture_route {
             return index;
         }
-        let mut copy = state_v2::money_test_support::resident(&index);
+        let mut copy = index.clone();
         copy.v2_mut().persistence_v2 = None;
         carry_runtime(&index, &mut copy);
         return copy;
@@ -365,7 +355,7 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
         return index.save(path).unwrap();
     };
     save_on_route(index, &route).unwrap();
-    let mut copy = state_v2::money_test_support::resident(index);
+    let mut copy = index.clone();
     copy.v2_mut().persistence_v2 = None;
     // A fresh copy each save: its generation is the route's, not this file's.
     let _ = fs::remove_file(path);

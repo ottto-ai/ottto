@@ -3035,10 +3035,6 @@ pub(super) mod tests {
         let (index, first) = scan(&root, ScanIndex::default(), 2);
         assert!(first.snapshots.is_empty());
         assert!(!first.census_complete);
-        // Outcome R: the refused owner stays blocked as settleable residue.
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
         let (_, next) = scan(&root, index, 2);
         assert_eq!(next.snapshots.len(), 1);
         assert_eq!(next.snapshots[0].source_session_id, healthy);
@@ -3485,57 +3481,6 @@ pub(super) mod tests {
             recovered.files[&priced_key].codex_applied_tier_receipt,
             previous.files[&priced_key].codex_applied_tier_receipt
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn protected_owner_blocks_state_only_replacement_without_claiming_other_owners() {
-        let root = native_join_fixture_root(true);
-        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
-        result.finish_codex_capture_boundary(&mut index);
-        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
-        let mut metadata = CodexTitleMetadata::default();
-        for id in [owner, healthy] {
-            metadata.state_threads.insert(
-                id.to_owned(),
-                CodexStateThread {
-                    tokens_used: 300,
-                    ..CodexStateThread::default()
-                },
-            );
-        }
-        let mut items = Vec::new();
-        assert_eq!(
-            append_codex_state_only_snapshots(
-                &mut items,
-                &metadata,
-                "2026-10-06T23:00:00Z",
-                &mut index,
-                &BTreeSet::new()
-            ),
-            (1, 0)
-        );
-        assert_eq!(items[0].source_session_id, healthy);
-        // Malformed/future owner metadata cannot reset the surrounding index
-        // and expose a previously protected owner to the fallback.
-        let mut value = serde_json::to_value(&index).unwrap();
-        let key = local_index_key(&root.join("sessions/b.jsonl"));
-        value["files"][&key]["codex_protected_owner"] = json!({"future": true});
-        let mut malformed: ScanIndex = serde_json::from_value(value).unwrap();
-        assert_eq!(malformed.files.len(), index.files.len());
-        let mut items = Vec::new();
-        assert_eq!(
-            append_codex_state_only_snapshots(
-                &mut items,
-                &metadata,
-                "2026-10-06T23:00:00Z",
-                &mut malformed,
-                &BTreeSet::new()
-            ),
-            (0, 0)
-        );
-        assert!(items.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

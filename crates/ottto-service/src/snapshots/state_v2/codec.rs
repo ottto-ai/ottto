@@ -160,10 +160,12 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         // 0.1.215 writes it every source cycle; #1287 retired it.
         &[&["direction"]]
     } else if row == type_name::<Option<crate::snapshots::ScanTraversalCheckpoint>>() {
-        // 0.1.208-0.1.215 stored each while nonzero; #1290 retired them.
+        // 0.1.208-0.1.215 stored each while nonzero; #1290 retired them. The
+        // residue's blocked ids went with the Codex state-only fallback.
         &[
             &["counts", "listing_owed_pace_evicted"],
             &["counts", "caps", "inventory_hold_keys_discarded"],
+            &["residue", "blocked_session_ids"],
             &["codex_parent_resolution_retry_required"],
             &["counts", "parent_unresolvable"],
             &["counts", "caps", "boundary_overflow_events"],
@@ -172,6 +174,9 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         ]
     } else if row == type_name::<crate::snapshots::TerminalJsonlDisposition>() {
         &[&["loss", "over_line_cap_count"]]
+    } else if row == type_name::<Option<crate::snapshots::ScanResidueWitness>>() {
+        // Retired with the Codex state-only fallback.
+        &[&["codex_state_only_blocked_session_ids"]]
     } else if row == type_name::<crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>>() {
         // An older store marks a file whose census evidence was owed; that
         // census is retired, so the bit is dropped.
@@ -518,6 +523,38 @@ mod tests {
         row["future_unknown"] = 1.into();
         assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
     }
+    /// [behaviour] Rows an older build wrote with the residue blocked ids the
+    /// Codex state-only fallback kept load, re-encode without them (an emptied
+    /// residue is omitted), and seed the stored bytes for the next save.
+    #[test]
+    fn retired_state_only_residue_leaves_load_and_reencode_without_them() {
+        use crate::snapshots::{
+            ScanResidueWitness as Witness, ScanTraversalCheckpoint as Checkpoint,
+        };
+        let current = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["residue"] = serde_json::json!({"blocked_session_ids": ["session-a"]});
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Option<Checkpoint>>(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(seed, old);
+        let witness = Some(Witness {
+            census_window_end: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
+        });
+        let mut row = serde_json::to_value(&witness).unwrap();
+        row["codex_state_only_blocked_session_ids"] = serde_json::json!(["session-a"]);
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Option<Witness>>(&old).unwrap();
+        assert_eq!(loaded, witness);
+        assert_eq!(seed, old);
+        row["future_unknown"] = 1.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        assert!(exact_json::<Option<Witness>>(&old).is_err());
+    }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
@@ -596,28 +633,19 @@ pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned +
 #[cfg(test)]
 mod alias_tests {
     use super::*;
-    /// [format] inventory accepts consumed account container aliases but refuses hidden keys.
+    /// [format] inventory decodes and drops both retired family account
+    /// fields, whatever an earlier writer stored, and still refuses hidden keys.
     #[test]
-    fn inventory_accepts_consumed_account_container_aliases_but_refuses_hidden_keys() {
-        for (version, field, value) in [
-            (
-                "claude_account_request_set:v2",
-                "member_requests",
-                serde_json::json!({"m":format!("AAAAAAAAAAE:{}","a".repeat(64))}),
-            ),
-            (
-                "",
-                "member_request_id_hashes",
-                serde_json::json!({"m":["a".repeat(64)]}),
-            ),
+    fn inventory_drops_retired_account_fields_but_refuses_hidden_keys() {
+        let pending = serde_json::json!({"v":"claude_account_request_set:v2","w":"A","members":{"m":1},
+            "member_requests":{"m":format!("AAAAAAAAAAE:{}","a".repeat(64))}});
+        for field in [
+            "claude_account_family_pending",
+            "claude_account_family_witnesses",
         ] {
-            let mut pending = serde_json::json!({"v":version,"w":"A","a":"b".repeat(64),"e":1,"i":false,"members":{"m":1}});
-            pending[field] = value;
-            let raw = serde_json::to_vec(
-                &serde_json::json!({"files":{},"claude_account_family_pending":{"f":pending}}),
-            )
-            .unwrap();
-            assert_eq!(inventory(raw.as_slice()), Ok(()));
+            let raw =
+                serde_json::to_vec(&serde_json::json!({"files":{}, field:{"f":pending}})).unwrap();
+            assert_eq!(inventory(raw.as_slice()), Ok(()), "{field}");
         }
         assert!(
             strict_json::<ScanIndex>(br#"{"files":{},"traversal":{"future_owed":true}}"#).is_err()
@@ -643,8 +671,17 @@ mod alias_tests {
         });
         let mut pace = traversal.clone();
         pace["counts"]["listing_owed_pace_evicted"] = 2.into();
-        let mut hold = traversal;
+        let mut hold = traversal.clone();
         hold["counts"]["caps"] = serde_json::json!({"inventory_hold_keys_discarded": 3});
+        let mut residue = traversal;
+        residue["residue"] = serde_json::json!({
+            "index_keys": ["/tmp/rollout-a.jsonl"], "blocked_session_ids": ["session-a"]
+        });
+        let witness = serde_json::json!({
+            "census_window_end": "2026-01-01T00:00:00Z", "ownership_incomplete_file_count": 0,
+            "zero_snapshot_usage_evidence_count": 0, "dropped_usage_record_count": 0,
+            "codex_state_only_blocked_session_ids": ["session-a"]
+        });
         let proof = serde_json::json!({"direction": {
             "policy": [true, true, false, false, false], "context": "c".repeat(64),
             "previous_context": null, "last_change_mask": 0
@@ -653,6 +690,8 @@ mod alias_tests {
             ("upload_context_proof", proof, ""),
             ("traversal", pace, "/counts"),
             ("traversal", hold, "/counts/caps"),
+            ("traversal", residue, "/residue"),
+            ("scan_residue_witness", witness, ""),
             ("traversal", legacy_fork, "/counts/caps"),
         ] {
             let mut root = serde_json::json!({"files": {}});
@@ -681,5 +720,22 @@ mod alias_tests {
         ] {
             assert_eq!(inventory(raw), Ok(()));
         }
+    }
+
+    /// [format] An older index holding the six retired Codex state-only
+    /// fields still passes the import inventory; each slot decodes and drops.
+    #[test]
+    fn inventory_accepts_the_retired_codex_state_only_fields() {
+        let root = serde_json::json!({
+            "files": {},
+            "codex_state_only_snapshot_fingerprints": {"session-a": "a".repeat(64)},
+            "codex_state_only_blocked_session_ids": ["session-a"],
+            "codex_state_only_blocked_by_file": {"/tmp/rollout-a.jsonl": ["session-a"]},
+            "codex_state_only_blocked_unattributed": ["session-b"],
+            "codex_state_only_blocked_legacy": ["session-c"],
+            "codex_state_only_blocked_attributed": true
+        });
+        let raw = serde_json::to_vec(&root).unwrap();
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
     }
 }
