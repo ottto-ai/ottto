@@ -139,13 +139,12 @@ fn admitted_file_ships_cache_rows_for_its_own_requests_only() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [money] The strict owned-start arm takes the same copy filter. A fork
-/// marker proves the owned start; the copied prefix the parser keeps
-/// (unmarked, days before the file's birth) has a break of its own. Only
-/// the own suffix ships rows; without the filter the prefix break would
-/// ship too.
+/// [money] A forkedFrom start is admitted by the file birth rule and takes
+/// the same copy filter. The copied prefix the parser keeps (unmarked, days
+/// before the file's birth) has a break of its own. Only the own suffix
+/// ships rows; without the filter the prefix break would ship too.
 #[test]
-fn strict_owned_start_ships_cache_rows_for_its_own_suffix_only() {
+fn forked_from_start_ships_cache_rows_for_its_own_suffix_only() {
     let dir = temp_dir("claude-cache-gate-strict-owned");
     let now = OffsetDateTime::now_utc();
     let forked = cached(ROOT, "req_f0", &stamp(now, COPIED - 10), 90_000).replacen(
@@ -170,8 +169,11 @@ fn strict_owned_start_ships_cache_rows_for_its_own_suffix_only() {
     let mut index = indexed(&[&path]);
     let disposition = fold(&mut items, &no_reports(), &mut index);
     let item = items.remove(0);
-    assert_eq!(disposition.posture_admission(ROOT), Some("strict"));
-    assert_eq!(item.claude_file_birth_verdict(), None);
+    assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
+    assert_eq!(
+        item.claude_file_birth_verdict(),
+        Some(ClaudeFileBirthVerdict::Admitted)
+    );
     assert_eq!(affected(&item), ["req_a2"]);
     assert!(
         named(&item).iter().all(|id| id.starts_with("req_a")),
