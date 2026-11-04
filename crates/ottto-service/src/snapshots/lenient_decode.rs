@@ -29,7 +29,6 @@ pub(super) struct Holds(
     RepairProvenance,
     BTreeSet<[u8; 32]>, // held file family roots; fixed-size metadata per hold
     BTreeSet<[u8; 32]>, // known protected owners; no reverse file scan
-    bool,               // any held file has unknown ownership
 );
 // Fixed-size multiset commitment to negative records repaired/dropped at the
 // persistence boundary. Neither corpus size nor Clone adds retained allocations.
@@ -175,7 +174,6 @@ impl Holds {
             self.0 = BTreeMap::new();
             self.2 = BTreeSet::new();
             self.3 = BTreeSet::new();
-            self.4 = false;
             return;
         }
         let files = self.0.get("files");
@@ -191,10 +189,6 @@ impl Holds {
             .flat_map(|slots| slots.values())
             .filter_map(|raw| raw.owner().map(repair_key))
             .collect();
-        self.4 = files
-            .into_iter()
-            .flat_map(|slots| slots.values())
-            .any(|raw| raw.owner().is_none());
     }
     #[cfg(test)]
     pub(super) fn provenance_receipt(&self) -> (usize, u64, u128) {
@@ -328,12 +322,6 @@ impl Serialize for ScanIndex {
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
         field!(legacy_unresolved_root_file_witnesses, BTreeSet::is_empty);
-        field!(codex_state_only_snapshot_fingerprints, BTreeMap::is_empty);
-        field!(codex_state_only_blocked_session_ids, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_by_file, BTreeMap::is_empty);
-        field!(codex_state_only_blocked_unattributed, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_legacy, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_attributed, std::ops::Not::not);
         field!(claude_desktop_title_files, BTreeMap::is_empty);
         field!(held claude_usage_family_witnesses);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
@@ -417,12 +405,12 @@ pub(super) const FIELDS: &[&str] = &[
     "terminal_jsonl_dispositions",
     "known_configured_scan_roots",
     "legacy_unresolved_root_file_witnesses",
-    "codex_state_only_snapshot_fingerprints",
-    "codex_state_only_blocked_session_ids",
-    "codex_state_only_blocked_by_file",
-    "codex_state_only_blocked_unattributed",
-    "codex_state_only_blocked_legacy",
-    "codex_state_only_blocked_attributed",
+    "codex_state_only_snapshot_fingerprints", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_session_ids", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_by_file", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_unattributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_legacy", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_attributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "codex_parent_ownership_refs",
     "codex_parent_ownership_ledgers",
     "codex_parent_side_requests",
@@ -1942,24 +1930,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "legacy_unresolved_root_file_witnesses" => {
                             index.legacy_unresolved_root_file_witnesses = self.typed(value)?
                         }
-                        "codex_state_only_snapshot_fingerprints" => {
-                            index.codex_state_only_snapshot_fingerprints = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_session_ids" => {
-                            index.codex_state_only_blocked_session_ids = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_by_file" => {
-                            index.codex_state_only_blocked_by_file = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_unattributed" => {
-                            index.codex_state_only_blocked_unattributed = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_legacy" => {
-                            index.codex_state_only_blocked_legacy = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_attributed" => {
-                            index.codex_state_only_blocked_attributed = self.typed(value)?
-                        }
+                        "codex_state_only_snapshot_fingerprints"
+                        | "codex_state_only_blocked_session_ids"
+                        | "codex_state_only_blocked_by_file"
+                        | "codex_state_only_blocked_unattributed"
+                        | "codex_state_only_blocked_legacy"
+                        | "codex_state_only_blocked_attributed" => {} // TOMBSTONE: decode-and-drop.
                         "codex_parent_ownership_refs"
                         | "codex_parent_ownership_ledgers"
                         | "codex_parent_side_requests"
@@ -2451,12 +2427,7 @@ impl ScanIndex {
                 !self.file_snapshot_fingerprints.contains_key(*key) && !self.decode_holds_file(key)
             })
             .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
-        let state = self
-            .codex_state_only_snapshot_fingerprints
-            .iter()
-            .filter(|(id, _)| !self.decode_holds_codex_owner(id))
-            .map(|(_, fingerprint)| fingerprint.as_str());
-        exact.chain(legacy).chain(state)
+        exact.chain(legacy)
     }
     pub(super) fn decode_holds_indexed_entity(&self, key: &str, fingerprint: &str) -> bool {
         self.decode_holds_file(key) || self.decode_holds_entity(fingerprint)
@@ -2468,13 +2439,6 @@ impl ScanIndex {
             .into_iter()
             .flat_map(|slots| slots.values())
             .map(|raw| raw.owner())
-    }
-    pub(super) fn decode_holds_codex_owner(&self, id: &str) -> bool {
-        self.decode_holds.4
-            || self
-                .decode_holds
-                .3
-                .contains(&repair_key(&codex_protected_owner(id)))
     }
     pub(super) fn preserve_decode_held_files(
         &mut self,
@@ -2533,11 +2497,6 @@ impl ScanIndex {
                 .contains(&repair_key(&codex_protected_owner(&item.source_session_id)))
         {
             return true;
-        }
-        if source == SnapshotSource::Codex && item.source_file_fingerprint.is_none() {
-            // An opaque file may have lost the only logical-owner disclosure.
-            // Preserve the state-only domain fence until protected history is understood.
-            return self.decode_holds_codex_owner(&item.source_session_id);
         }
         false
     }

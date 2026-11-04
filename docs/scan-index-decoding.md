@@ -13,8 +13,7 @@ it introduces no automatic release. A held file without exact incidence keeps
 its prior membership UNKNOWN. Acceptance pruning, including partial commits, retains existing ACKs while
 that uncertainty exists, and legacy reconciliation neither reopens ACKs nor seals
 until incidence is known. This creates no acceptance or manifest membership;
-an explicit exact empty set remains known empty. An opaque Codex file with unknown ownership
-also fences state-only publication, since its lost owner cannot safely be named.
+an explicit exact empty set remains known empty.
 
 Hold admission checks lexically delimited keys before String allocation and
 charges their original wire bytes, values and per-slot bookkeeping before

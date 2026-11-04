@@ -42,7 +42,6 @@
   "last_census_residue_settled": true,
   "last_census_residue_index_key_count": 1,
   "last_census_residue_archived_rollout_count": 1,
-  "last_census_residue_blocked_session_count": 1,
   "last_census_pending_file_count": 0,
   "consecutive_failures": 0,
   "next_retry_at": null,

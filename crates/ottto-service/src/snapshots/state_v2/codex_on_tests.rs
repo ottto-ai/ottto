@@ -88,18 +88,6 @@ fn codex_fixture() -> ScanIndex {
     let mut value = serde_json::to_value(&index).unwrap();
     for (field, replacement) in [
         (
-            "codex_state_only_snapshot_fingerprints",
-            json!({"session":"value"}),
-        ),
-        ("codex_state_only_blocked_session_ids", json!(["member"])),
-        (
-            "codex_state_only_blocked_by_file",
-            json!({"file":["session"]}),
-        ),
-        ("codex_state_only_blocked_unattributed", json!(["member"])),
-        ("codex_state_only_blocked_legacy", json!(["member"])),
-        ("codex_state_only_blocked_attributed", json!(true)),
-        (
             "codex_counting_tombstones",
             json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}}),
         ),
@@ -169,7 +157,7 @@ fn source_rows_import_hydrate_and_save_like_v1() {
         .iter()
         .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired(kind))
         .collect::<Vec<_>>();
-    assert_eq!(codex.len(), 8, "persisted Codex kinds");
+    assert_eq!(codex.len(), 2, "persisted Codex kinds");
     for (kind, field, introduced) in codex {
         assert_eq!(*introduced, 1, "{kind}: no layout bump for Codex-ON");
         assert_ne!(

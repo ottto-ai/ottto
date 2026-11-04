@@ -26,12 +26,6 @@ macro_rules! scan_index_fields {
             generation => Misc (control check_field) [] side,
             known_configured_scan_roots => Misc (misc check_field Set) ["v1_field.known_configured_scan_roots" => 1] side,
             legacy_unresolved_root_file_witnesses => Misc (misc check_field Set) ["v1_field.legacy_unresolved_root_file_witnesses" => 1] side,
-            codex_state_only_snapshot_fingerprints => Misc (misc check_field Map) ["v1_field.codex_state_only_snapshot_fingerprints" => 1] side,
-            codex_state_only_blocked_session_ids => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_session_ids" => 1] side,
-            codex_state_only_blocked_by_file => Misc (misc check_field Map) ["v1_field.codex_state_only_blocked_by_file" => 1] side,
-            codex_state_only_blocked_unattributed => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
-            codex_state_only_blocked_legacy => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
-            codex_state_only_blocked_attributed => Misc (misc check_field Field) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
             codex_parent_ownership_refs => Misc (retired none) ["v1_field.codex_parent_ownership_refs" => 1] side,
             codex_parent_ownership_ledgers => Misc (retired none) ["v1_field.codex_parent_ownership_ledgers" => 1] side,
             codex_parent_side_requests => Misc (retired none) ["v1_field.codex_parent_side_requests" => 1] side,
@@ -141,6 +135,13 @@ macro_rules! scan_index_fields {
             retired_completed_context_curve_replay_generation => Misc (retired none) [] side,
             // Retired: an earlier store's rows are accepted on load and purged by the next save.
             retired_claude_desktop_census_witness => Misc (retired none) ["v1_field.claude_desktop_census_witness" => 1] side,
+            // An earlier store's rows stay accepted and are never read or written.
+            retired_codex_state_only_snapshot_fingerprints => Misc (retired none) ["v1_field.codex_state_only_snapshot_fingerprints" => 1] side,
+            retired_codex_state_only_blocked_session_ids => Misc (retired none) ["v1_field.codex_state_only_blocked_session_ids" => 1] side,
+            retired_codex_state_only_blocked_by_file => Misc (retired none) ["v1_field.codex_state_only_blocked_by_file" => 1] side,
+            retired_codex_state_only_blocked_unattributed => Misc (retired none) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
+            retired_codex_state_only_blocked_legacy => Misc (retired none) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
+            retired_codex_state_only_blocked_attributed => Misc (retired none) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
             codex_counting_evictions => Misc (runtime none) [] side,
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
@@ -289,6 +290,12 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
         field,
         "upload_context_fingerprint"
             | "claude_desktop_census_witness"
+            | "codex_state_only_snapshot_fingerprints"
+            | "codex_state_only_blocked_session_ids"
+            | "codex_state_only_blocked_by_file"
+            | "codex_state_only_blocked_unattributed"
+            | "codex_state_only_blocked_legacy"
+            | "codex_state_only_blocked_attributed"
             | "claude_folder_login_ledger"
             | "claude_usage_family_pending"
             | "claude_account_family_witnesses"

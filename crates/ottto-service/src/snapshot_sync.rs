@@ -4131,7 +4131,6 @@ struct SyncCounts {
     /// Residue witness cardinalities, counts only.
     census_residue_index_key_count: u64,
     census_residue_archived_rollout_count: u64,
-    census_residue_blocked_session_count: u64,
     uploaded_count: u64,
 }
 
@@ -4266,8 +4265,6 @@ impl SyncCounts {
             terminal_over_line_cap_count: scan_result.terminal_over_line_cap_count as u64,
             census_residue_index_key_count: scan_result.census_residue_index_key_count as u64,
             census_residue_archived_rollout_count: scan_result.census_residue_archived_rollout_count
-                as u64,
-            census_residue_blocked_session_count: scan_result.census_residue_blocked_session_count
                 as u64,
             uploaded_count,
         }
@@ -12101,9 +12098,6 @@ fn collector_status_request(
         last_census_residue_archived_rollout_count: status
             .counts
             .census_residue_archived_rollout_count,
-        last_census_residue_blocked_session_count: status
-            .counts
-            .census_residue_blocked_session_count,
         last_census_pending_file_count: Some(status.counts.skipped_file_count_due_to_limit),
         last_census_block_cause: block_cause,
         consecutive_failures,
@@ -12512,7 +12506,6 @@ fn report_checkin_status(
         last_census_residue_settled: false,
         last_census_residue_index_key_count: 0,
         last_census_residue_archived_rollout_count: 0,
-        last_census_residue_blocked_session_count: 0,
         last_census_pending_file_count: None,
         last_census_block_cause: None,
         consecutive_failures: 0,
@@ -20516,7 +20509,6 @@ mod tests {
         counts.terminal_dropped_usage_record_count = 1_105;
         counts.census_residue_index_key_count = 1;
         counts.census_residue_archived_rollout_count = 1;
-        counts.census_residue_blocked_session_count = 1;
         counts
     }
 
@@ -20678,9 +20670,11 @@ mod tests {
         assert_eq!(receipt["last_census_residue_settled"], true);
         assert_eq!(receipt["last_census_residue_index_key_count"], 1);
         assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
-        assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
+        assert!(receipt
+            .get("last_census_residue_blocked_session_count")
+            .is_none());
         // Counts only. The backend refuses a path-shaped message outright,
-        // and the witness's index keys and session ids never leave the index.
+        // and the witness's index keys never leave the index.
         let message = receipt["last_error_message"].as_str().expect("message");
         for fragment in [
             "/",
@@ -21019,7 +21013,6 @@ mod tests {
             assert_eq!(receipt["last_terminal_dropped_usage_record_count"], 1_105);
             assert_eq!(receipt["last_census_residue_index_key_count"], 1);
             assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
-            assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
         }
     }
 
@@ -21673,9 +21666,10 @@ mod tests {
 
         let mut index =
             ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-1".to_string(), "a".repeat(64));
+        index.file_snapshot_fingerprints.insert(
+            "/tmp/rollout-session-1.jsonl".to_string(),
+            BTreeSet::from(["a".repeat(64)]),
+        );
         index
             .snapshot_activity_at
             .insert("a".repeat(64), Some("2099-12-31T12:00:00Z".to_string()));

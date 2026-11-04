@@ -1014,6 +1014,103 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
     }
 }
 
+/// [format] A previous-release store holding the six retired Codex state-only
+/// rows and both residue leaves (witness populated) loads at the current
+/// layout; its next save writes neither leaf and removes the retired rows,
+/// and the reopened store hydrates the same model.
+#[test]
+fn retired_state_only_kinds_and_leaves_load_inert() {
+    let retired = [
+        (
+            "v1_field.codex_state_only_snapshot_fingerprints",
+            serde_json::json!({ "session-a": "a".repeat(64) }),
+        ),
+        (
+            "v1_field.codex_state_only_blocked_session_ids",
+            serde_json::json!(["session-a"]),
+        ),
+        (
+            "v1_field.codex_state_only_blocked_by_file",
+            serde_json::json!({ "/tmp/rollout-a.jsonl": ["session-a"] }),
+        ),
+        (
+            "v1_field.codex_state_only_blocked_unattributed",
+            serde_json::json!(["session-b"]),
+        ),
+        (
+            "v1_field.codex_state_only_blocked_legacy",
+            serde_json::json!(["session-c"]),
+        ),
+        (
+            "v1_field.codex_state_only_blocked_attributed",
+            serde_json::json!(true),
+        ),
+    ];
+    let traversal = mapper::key("scan_state.traversal", "", 0).unwrap();
+    let witness = mapper::key("scan_state.scan_residue_witness", "", 0).unwrap();
+    let (scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for (kind, row) in &retired {
+        assert_eq!(catalogue::introduced(kind).unwrap(), 1, "{kind}");
+        mapper::put(&mut tx, &mapper::key(kind, "", 0).unwrap(), row).unwrap();
+    }
+    let mut row = shipped_traversal(|_| {});
+    row["residue"] = serde_json::json!({ "blocked_session_ids": ["session-a"] });
+    mapper::put(&mut tx, &traversal, &row).unwrap();
+    let row = serde_json::json!({
+        "census_window_end": "2026-01-01T00:00:00Z", "ownership_incomplete_file_count": 1,
+        "zero_snapshot_usage_evidence_count": 0, "dropped_usage_record_count": 0,
+        "codex_state_only_blocked_session_ids": ["session-a"]
+    });
+    mapper::put(&mut tx, &witness, &row).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.finish_import().unwrap();
+    let reopen = || {
+        let mut db =
+            sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+        db.path_extractor(private_paths);
+        db.reference_extractor(references);
+        db
+    };
+    let mut db = reopen();
+    let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+    assert_eq!(
+        restored
+            .scan_residue_witness
+            .as_ref()
+            .map(|w| w.ownership_incomplete_file_count),
+        Some(1)
+    );
+    let baseline = baseline(&restored, &mut cx).unwrap();
+    super::save_graph(&mut db, &identity, baseline, &mut restored, &mut cx).unwrap();
+    drop(db);
+    let mut db = reopen();
+    let (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.layout, catalogue::LAYOUT);
+    assert_eq!(
+        serde_json::to_vec(&reopened).unwrap(),
+        serde_json::to_vec(&restored).unwrap()
+    );
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for (key, leaf) in [
+        (&traversal, "/residue/blocked_session_ids"),
+        (&witness, "/codex_state_only_blocked_session_ids"),
+    ] {
+        let header = tx.get(key).unwrap().expect("the row stays");
+        let stored = mapper::bytes(&mut tx, &header).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&codec::expand(&stored, value_cap(key)).unwrap()).unwrap();
+        assert!(json.pointer(leaf).is_none(), "{leaf} kept after save");
+    }
+    for (kind, _) in &retired {
+        let key = mapper::key(kind, "", 0).unwrap();
+        assert!(tx.get(&key).unwrap().is_none(), "{kind} retired on save");
+    }
+}
+
 /// [format] Old -> new -> old -> new: the shipped member layout is accepted,
 /// an older reader HOLDs after ordinary saves retire
 /// the old contents without changing unrelated money or request custody.
