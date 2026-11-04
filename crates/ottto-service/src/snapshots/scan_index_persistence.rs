@@ -50,6 +50,7 @@ pub(crate) enum Source {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Field {
+    /// A retired slot, as `UsagePending`.
     AccountPending,
     /// A slot whose field is retired: an older file's map is still read and
     /// validated, and the decoder drops its records.

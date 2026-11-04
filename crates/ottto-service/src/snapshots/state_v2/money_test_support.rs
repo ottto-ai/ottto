@@ -1,7 +1,6 @@
 //! Test-only bridge from emitted-body fixtures to the composed semantic mapper.
 //! Publication is deliberately not simulated: this proves row custody, while
 //! the import fixtures separately exercise the production publication route.
-use super::super::account_pending_retention::ArchivedWindows;
 use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -58,13 +57,12 @@ pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
 }
 
 /// Condition b's v2 store. Its graphs load as a live pass loads them, on a
-/// live session with cold archives; resident views are read back for
-/// comparisons only.
+/// live session.
 pub(crate) struct ColdStore {
     session: ColdSession,
 }
 impl ColdStore {
-    /// (store, its cold graph, the same graph read back resident).
+    /// (store, its session graph, the same graph read back from the import).
     pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> (Self, ScanIndex, ScanIndex) {
         // Feed v1 bytes through its decoder, rather than smuggling runtime
         // state into the oracle. Leases and in-process flags are not custody.
@@ -88,15 +86,9 @@ impl ColdStore {
         (Self { session }, cold, restored)
     }
 
-    /// Roll every account family inside `page` (scanned from this store's
-    /// graph), save it through the production route and reload: (cold graph,
-    /// resident view).
-    pub(crate) fn roll_save_reload(
-        &mut self,
-        page: &mut ScanIndex,
-        end: &str,
-    ) -> (ScanIndex, ScanIndex) {
-        roll_account_families(page, end);
+    /// Save `page` (scanned from this store's graph) through the production
+    /// route and reload it.
+    pub(crate) fn save_reload(&mut self, page: &mut ScanIndex) -> ScanIndex {
         self.session.save_reload(page)
     }
 }
@@ -129,12 +121,10 @@ impl ColdSession {
         &self.path
     }
     /// Save `page` (descended from this custody's graph) through the
-    /// production route and reload it: (cold graph, resident view).
-    pub(crate) fn save_reload(&self, page: &mut ScanIndex) -> (ScanIndex, ScanIndex) {
+    /// production route and reload it.
+    pub(crate) fn save_reload(&self, page: &mut ScanIndex) -> ScanIndex {
         page.save(&self.path).unwrap();
-        let cold = ScanIndex::load(&self.path).unwrap();
-        let view = resident(&cold);
-        (cold, view)
+        ScanIndex::load(&self.path).unwrap()
     }
     /// Whether this pass's claim-only growth save moved the store past
     /// `index`, the working graph a page still saves from.
@@ -147,32 +137,6 @@ impl Drop for ColdSession {
     fn drop(&mut self) {
         erase_published(&self.path);
     }
-}
-
-/// A session graph with its cold archives read back resident, for
-/// comparisons.
-pub(crate) fn resident(index: &ScanIndex) -> ScanIndex {
-    runtime::materialized(index)
-}
-
-/// Every account family's current window rolls to `end`, as a scan rollover
-/// with strict runs would: resident archives apply the endpoint rule, cold
-/// ones queue it.
-pub(crate) fn roll_account_families(index: &mut ScanIndex, end: &str) {
-    for family in index.claude_account_family_pending.values_mut() {
-        let mut current = family.current.clone();
-        current.census_window_end = end.into();
-        let old = std::mem::replace(&mut family.current, current);
-        family.archive(old, true);
-    }
-}
-
-/// Whether some account family's archive loaded cold.
-pub(crate) fn has_cold_archive(index: &ScanIndex) -> bool {
-    index
-        .claude_account_family_pending
-        .values()
-        .any(|family| matches!(family.previous_windows, ArchivedWindows::Cold(_)))
 }
 
 /// Compare each selected page with the graph the full-clone saver received.
@@ -214,13 +178,9 @@ pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIn
     hydrate_resident(&mut db)
 }
 
-/// The production hydrate with cold archives read back resident, for graph
-/// comparisons.
+/// The production hydrate, for graph comparisons.
 pub(super) fn hydrate_resident(db: &mut sqlite::Sqlite) -> ScanIndex {
-    let mut index = import::hydrate_context(db).unwrap().0;
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    kinds_accounts::materialize(&mut tx, &mut index).unwrap();
-    index
+    import::hydrate_context(db).unwrap().0
 }
 
 /// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt

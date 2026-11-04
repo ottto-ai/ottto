@@ -1037,24 +1037,13 @@ impl Probe {
     fn observation(&self) -> Observation {
         Observation::between(wall_us(self.started), self.process, process_sample())
     }
-    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
-        self.collection_with_account_pending(source, counts, None);
-    }
-    pub(crate) fn collection_with_account_pending(
-        &self,
-        source: &str,
-        counts: CollectionCounts,
-        pending: Option<ClaudeAccountRetainedPending>,
-    ) {
         #[derive(Serialize)]
         struct Counts {
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             collection: CollectionCounts,
-            #[serde(flatten)]
-            pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
@@ -1147,7 +1136,6 @@ impl Probe {
             },
             refusal_exposure: self.refusal_exposure,
             collection: counts,
-            pending,
             identity: if claude {
                 crate::snapshots::claude_request_identity::take_identity_counts()
             } else {
@@ -1192,16 +1180,6 @@ impl Probe {
     }
 }
 
-/// All retained account-pending families, including held/incomplete families;
-/// a conservative local-only gauge, never an authority or eviction decision.
-#[derive(Debug, Serialize)]
-pub(crate) struct ClaudeAccountRetainedPending {
-    pub(crate) claude_account_retained_pending_families: usize,
-    /// Pretty JSON bytes of the retained field, including its field wrapper.
-    pub(crate) claude_account_retained_pending_bytes: u64,
-    #[serde(flatten)]
-    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
-}
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(
@@ -2922,7 +2900,7 @@ mod tests {
     fn claude_page_events_use_existing_carriers_without_source_leakage() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
+            claude_reread::restored(true, false, false);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -2937,7 +2915,7 @@ mod tests {
             );
             // Another source's page: its retained-cache events and nothing else.
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
+            claude_reread::restored(true, false, false);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -2958,7 +2936,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["source"], "claude_code");
         assert_eq!(
-            rows[0]["counts"]["claude_reread"]["account_reproof_cleared"],
+            rows[0]["counts"]["claude_reread"]["restored_empty_sibling"],
             1
         );
         assert_eq!(

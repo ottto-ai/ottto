@@ -100,6 +100,25 @@ switches. Per-source code is limited to the root layout, the file reader and red
 rules that really differ: copied-prefix deduplication for Claude, cumulative deltas for Codex and
 forks for Pi. Source capabilities are table fields, not `== Source::Claude` checks in shared code.
 
+## Module map: snapshots/ (target; migration in progress)
+
+`snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
+the target, not an enforced layout; today most code still sits in `snapshots.rs`.
+
+- `snapshots.rs`: the facade (at most 400 lines): module declarations, re-exports and the entry
+  points other modules call.
+- `sources/{claude,codex,pi}/`: per-source code only, as described above.
+- Shared stages: `wire/`, `discovery/`, `scan/`, `scan_index/`, `session_facts/`, `usage/` and
+  `upload/`.
+- Existing subtrees that stay as they are: `state_v2/` and `tail_source/`.
+- `tests/`: tests that span stages; test data under `tests/fixtures/`.
+
+Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte;
+only visibility, `use`/`mod` lines, path literals and wrappers change) and
+`scripts/check_test_id_map.py` (every test keeps its ID or has a row in
+`scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
+`scripts/check_source_layout.py` reports how far the tree is from the target.
+
 ## Never drop data
 
 - A size, count or time limit may pace, defer or spill work, with a counted warning or alarm. It

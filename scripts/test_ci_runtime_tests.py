@@ -258,6 +258,59 @@ class RetryTests(unittest.TestCase):
             'tool-3': ['--workspace', '--bin', 'tool'],
         })
 
+    def test_a_file_under_a_tests_directory_is_named_with_its_owner(self):
+        cases = {
+            'crates/c/src/snapshots/tests/upload.rs': 'snapshots::tests::upload',
+            'crates/c/src/snapshots/tests/sources/claude.rs': 'snapshots::tests::sources::claude',
+            'crates/c/src/snapshots/tests/sources/mod.rs': 'snapshots::tests::sources',
+            'crates/c/src/tests/upload.rs': 'tests::upload',
+            # Unchanged: a `tests` module file, other stems, integration-test targets.
+            'crates/c/src/snapshots/tests.rs': 'snapshots::tests',
+            'crates/c/src/snapshots/tests/mod.rs': 'snapshots::tests',
+            'crates/c/src/snapshots/upload_tests.rs': 'upload_tests',
+            'crates/c/src/snapshots/sampled_scan/mod.rs': 'sampled_scan',
+            'crates/c/tests/upload.rs': 'upload',
+            'crates/c/tests/support/upload.rs': 'upload',
+        }
+        self.assertEqual({path: runner.module_name(Path(path)) for path in cases}, cases)
+
+    def test_a_generic_topic_stem_under_tests_does_not_widen_never_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'c' / 'src' / 'snapshots' / 'tests').mkdir(parents=True)
+            (root / 'c' / 'src' / 'snapshots' / 'tests' / 'upload.rs').write_text('money_oracle::assert_held();\n')
+            modules = runner.oracle_modules(root)
+        self.assertEqual(modules, {'snapshots::tests::upload'})
+        self.assertTrue(runner.never_retry('snapshots::tests::upload::x', set(), modules))
+        self.assertFalse(runner.never_retry('relay::upload::x', set(), modules))
+        self.assertFalse(runner.never_retry('snapshots::upload::tests::x', set(), modules))
+
+    def test_folders_above_the_crates_root_do_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'src' / 'checkout' / 'crates'
+            (root / 'c' / 'tests' / 'support').mkdir(parents=True)
+            (root / 'c' / 'tests' / 'support' / 'ledger.rs').write_text('money_oracle::assert_held();\n')
+            self.assertEqual(runner.oracle_modules(root), {'ledger'})
+
+    def test_owner_qualified_names_keep_every_current_never_retry_decision(self):
+        def old_module_name(path):
+            if path.stem in ('mod', 'lib', 'main'):
+                path = path.parent
+            return f'{path.parent.name}::tests' if path.stem == 'tests' else path.stem
+
+        source = SCRIPT.parent.parent / 'crates'
+        relative = [path.relative_to(source) for path in source.rglob('*.rs')]
+        changed = {path.as_posix(): runner.module_name(path) for path in relative
+                   if runner.module_name(path) != old_module_name(path)}
+        # Only files under a src/**/tests/ directory get a new name, and none of them use the money oracle.
+        self.assertTrue(changed)
+        self.assertTrue(all('/src/' in path and '/tests/' in path for path in changed), changed)
+        self.assertFalse([path for path in changed if 'money_oracle' in (source / path).read_text()])
+        new = runner.oracle_modules(source)
+        with mock.patch.object(runner, 'module_name', old_module_name):
+            old = runner.oracle_modules(source)
+        self.assertEqual(new, old)
+
     def test_modules_that_use_the_money_oracle_are_never_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -594,28 +594,19 @@ pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned +
 #[cfg(test)]
 mod alias_tests {
     use super::*;
-    /// [format] inventory accepts consumed account container aliases but refuses hidden keys.
+    /// [format] inventory decodes and drops both retired family account
+    /// fields, whatever an earlier writer stored, and still refuses hidden keys.
     #[test]
-    fn inventory_accepts_consumed_account_container_aliases_but_refuses_hidden_keys() {
-        for (version, field, value) in [
-            (
-                "claude_account_request_set:v2",
-                "member_requests",
-                serde_json::json!({"m":format!("AAAAAAAAAAE:{}","a".repeat(64))}),
-            ),
-            (
-                "",
-                "member_request_id_hashes",
-                serde_json::json!({"m":["a".repeat(64)]}),
-            ),
+    fn inventory_drops_retired_account_fields_but_refuses_hidden_keys() {
+        let pending = serde_json::json!({"v":"claude_account_request_set:v2","w":"A","members":{"m":1},
+            "member_requests":{"m":format!("AAAAAAAAAAE:{}","a".repeat(64))}});
+        for field in [
+            "claude_account_family_pending",
+            "claude_account_family_witnesses",
         ] {
-            let mut pending = serde_json::json!({"v":version,"w":"A","a":"b".repeat(64),"e":1,"i":false,"members":{"m":1}});
-            pending[field] = value;
-            let raw = serde_json::to_vec(
-                &serde_json::json!({"files":{},"claude_account_family_pending":{"f":pending}}),
-            )
-            .unwrap();
-            assert_eq!(inventory(raw.as_slice()), Ok(()));
+            let raw =
+                serde_json::to_vec(&serde_json::json!({"files":{}, field:{"f":pending}})).unwrap();
+            assert_eq!(inventory(raw.as_slice()), Ok(()), "{field}");
         }
         assert!(
             strict_json::<ScanIndex>(br#"{"files":{},"traversal":{"future_owed":true}}"#).is_err()

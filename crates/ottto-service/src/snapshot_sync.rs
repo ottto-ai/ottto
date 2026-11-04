@@ -9904,7 +9904,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         fallback.withhold(scan_result);
     }
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
-    let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
     let originals = scan_result
@@ -9955,13 +9954,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 &mut scan_result.snapshots,
                 &evidence,
             );
-            let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
                 &mut scan_result.snapshots,
                 &evidence.evidence,
                 index,
-                census_complete,
-                &census_window_end,
             );
             api_read = evidence;
         }

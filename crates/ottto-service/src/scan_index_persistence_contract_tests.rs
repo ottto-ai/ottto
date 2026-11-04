@@ -6,9 +6,9 @@ use serde_json::Value;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf};
-// Sharded maps whose field is live. The usage map is still read and
-// validated, but its field is retired: decode drops it.
-const MOVED: [&str; 2] = ["claude_account_family_pending", "claude_request_census"];
+// Sharded maps whose field is live. The usage and account maps are still
+// read and validated, but their fields are retired: decode drops them.
+const MOVED: [&str; 1] = ["claude_request_census"];
 struct Scratch(crate::test_scratch::ScratchDir);
 impl Scratch {
     fn new() -> Self {

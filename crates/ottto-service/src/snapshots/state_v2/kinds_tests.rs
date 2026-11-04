@@ -1,6 +1,5 @@
 //! Integration fixtures; compiled locally, executed only in later CI.
 use super::*;
-use crate::snapshots::account_pending_retention::ArchivedWindows;
 use std::collections::BTreeSet;
 
 fn save_graph(
@@ -574,252 +573,6 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
     save_graph(&mut db, &identity, &previous, &mut working, &mut cx).unwrap();
     assert_persisted(&mut db, &working);
 }
-/// One accounts-only view, as CAS custody loads it (`Some`) or a full load does.
-fn accounts_view(tx: &mut dyn Transaction, roots: Option<&BTreeSet<String>>) -> Result<ScanIndex> {
-    let mut view = ScanIndex::default();
-    kinds_accounts::hydrate_filtered(tx, &mut view, &mut KindCx::default(), roots)?;
-    if roots.is_none() {
-        kinds_accounts::materialize(tx, &mut view)?;
-    }
-    Ok(view)
-}
-/// [money] filtered hydrate equals those families of a full hydrate and refuses the same damage.
-#[test]
-fn filtered_account_hydrate_equals_full_for_requested_families_only() {
-    const WITH_WINDOWS: &str = "synthetic-family";
-    const WITH_ABSENT: &str = "synthetic-absent";
-    const MANY_WINDOWS: &str = "synthetic-many";
-    // Sorts straight after a requested family, and extends its key.
-    const EXTENDED: &str = "synthetic-family2";
-    const UNREQUESTED: &str = "synthetic-unrequested";
-    const MISSING: &str = "synthetic-missing";
-    // Published, so a rolled-back damage transaction leaves the store usable.
-    let (_scratch, mut db) = Scratch::live_store();
-    let mut index = fixture();
-    let family = index.claude_account_family_pending[WITH_WINDOWS].clone();
-    assert!(!family.previous_windows.resident().is_empty());
-    let mut absent = family.clone();
-    absent.confirmed_absent_members.insert("gone-member".into());
-    let pending = &mut index.claude_account_family_pending;
-    pending.insert(WITH_ABSENT.into(), absent);
-    let mut many = family.clone();
-    many.previous_windows = ArchivedWindows::Resident(vec![family.current.clone(); 8]);
-    pending.insert(MANY_WINDOWS.into(), many);
-    pending.insert(EXTENDED.into(), family.clone());
-    pending.insert(UNREQUESTED.into(), family);
-    commit_populate(&mut db, &index);
-    let roots: BTreeSet<String> = [WITH_WINDOWS, WITH_ABSENT, MANY_WINDOWS, MISSING]
-        .map(str::to_owned)
-        .into();
-
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let mut expected = accounts_view(&mut tx, None).unwrap();
-    assert!(expected
-        .claude_account_family_pending
-        .contains_key(UNREQUESTED));
-    expected
-        .claude_account_family_pending
-        .retain(|family, _| roots.contains(family));
-    let subset = accounts_view(&mut tx, Some(&roots)).unwrap();
-    assert_eq!(subset.claude_account_family_pending.len(), 3);
-    assert_eq!(
-        subset.claude_account_family_pending[MANY_WINDOWS]
-            .previous_windows
-            .resident()
-            .len(),
-        8
-    );
-    assert!(!subset.claude_account_family_pending.contains_key(MISSING));
-    assert_eq!(
-        serde_json::to_vec(&subset).unwrap(),
-        serde_json::to_vec(&expected).unwrap()
-    );
-    let control = mapper::key("account.current", WITH_WINDOWS, 1).unwrap();
-    let h = tx.get(&control).unwrap().unwrap();
-    let (_, _, ids): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
-    drop(tx);
-    let key = mapper::key;
-
-    // Same refusal as the full scan: undecodable (`Some`), removed (`None`),
-    // and an orphan or misplaced row that no control lists.
-    let window = key("account_window", WITH_WINDOWS, ids[0]).unwrap();
-    let absent = key("account.absent_members", WITH_ABSENT, 1).unwrap();
-    for (row, damage) in [
-        (control.clone(), Some("undecodable")),
-        (window.clone(), Some("undecodable")),
-        (absent.clone(), Some("undecodable")),
-        (window, None),
-        (absent, None),
-        (
-            key("account_window", WITH_WINDOWS, 0).unwrap(),
-            Some("orphan"),
-        ),
-        (
-            key("account_window", WITH_ABSENT, 9_999).unwrap(),
-            Some("orphan"),
-        ),
-        (
-            // Past the first page of this family's rows.
-            key("account_window", MANY_WINDOWS, 9_999).unwrap(),
-            Some("orphan"),
-        ),
-        (
-            key("account.absent_members", MISSING, 1).unwrap(),
-            Some("orphan"),
-        ),
-        (
-            key("account.absent_members", WITH_ABSENT, 2).unwrap(),
-            Some("orphan"),
-        ),
-        (
-            key("account.current", WITH_ABSENT, 2).unwrap(),
-            Some("orphan"),
-        ),
-    ] {
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        match damage {
-            Some(value) => drop(mapper::put(&mut tx, &row, value).unwrap()),
-            None => assert!(tx.delete(&row).unwrap()),
-        }
-        let full = accounts_view(&mut tx, None).err().map(|e| format!("{e:#}"));
-        let filtered = accounts_view(&mut tx, Some(&roots))
-            .err()
-            .map(|e| format!("{e:#}"));
-        assert!(full.is_some(), "{row:?}");
-        assert_eq!(filtered, full, "{row:?}");
-        drop(tx);
-    }
-
-    // A removed control still refuses, by its orphaned rows. Only the full
-    // scan can see the manifest count.
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    assert!(tx.delete(&control).unwrap());
-    let full = accounts_view(&mut tx, None).err().unwrap();
-    assert_eq!(full.to_string(), "accounts_missing_family");
-    let filtered = accounts_view(&mut tx, Some(&roots)).err().unwrap();
-    assert_eq!(filtered.to_string(), "accounts_orphan_window");
-    drop(tx);
-
-    // Damage outside the requested families is the full load's to refuse: a
-    // filtered read never touches it.
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    let other = key("account.current", UNREQUESTED, 1).unwrap();
-    mapper::put(&mut tx, &other, "undecodable").unwrap();
-    assert!(accounts_view(&mut tx, None).is_err());
-    assert_eq!(
-        serde_json::to_vec(&accounts_view(&mut tx, Some(&roots)).unwrap()).unwrap(),
-        serde_json::to_vec(&expected).unwrap()
-    );
-    drop(tx);
-
-    // Nor does it validate the headers of the adjacent family, the next rows
-    // in every kind. This damage stays: nothing below may need a clean store.
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let windows = RecordKind::parse("account_window").unwrap();
-    let page = tx
-        .scan_record_key(&windows, EXTENDED.as_bytes(), None, 1)
-        .unwrap();
-    drop(tx);
-    for row in [
-        key("account.current", EXTENDED, 1).unwrap(),
-        page[0].key.clone(),
-        key("account.absent_members", EXTENDED, 1).unwrap(),
-    ] {
-        sqlite::corrupt_row_header_for_test(&db, &row);
-    }
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(accounts_view(&mut tx, None).is_err());
-    assert_eq!(
-        serde_json::to_vec(&accounts_view(&mut tx, Some(&roots)).unwrap()).unwrap(),
-        serde_json::to_vec(&expected).unwrap()
-    );
-}
-/// [behaviour] rows lost out of band at an equal generation are refused or rewritten, never Absent.
-#[test]
-fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
-    const FAMILY: &str = "synthetic-family";
-    for (lost_account, dirty) in [(true, false), (true, true), (false, false), (false, true)] {
-        let (_scratch, mut db) = Scratch::live_store();
-        let mut index = fixture();
-        // Its authority row makes the CAS merge request this family.
-        index.insert_retry_pending_claude_authority_for_test(FAMILY);
-        commit_populate(&mut db, &index);
-        let (previous, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-        let committed = baseline(&previous, &mut cx).unwrap();
-        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-
-        let mut lost = vec![mapper::key("refusal.authority", FAMILY, 1).unwrap()];
-        if lost_account {
-            let control = mapper::key("account.current", FAMILY, 1).unwrap();
-            let mut tx = db.begin(TxnMode::Read).unwrap();
-            let h = tx.get(&control).unwrap().unwrap();
-            let (_, _, ids): (Option<u64>, u64, Vec<u64>) =
-                mapper::read(&mut tx, &h, None).unwrap();
-            drop(tx);
-            lost = ids
-                .iter()
-                .map(|id| mapper::key("account_window", FAMILY, *id).unwrap())
-                .collect();
-            lost.push(mapper::key("account.absent_members", FAMILY, 1).unwrap());
-            lost.push(control);
-        }
-        for row in &lost {
-            sqlite::delete_row_for_test(&db, row);
-        }
-
-        let mut next = previous.clone();
-        if dirty && lost_account {
-            let family = next.claude_account_family_pending.get_mut(FAMILY).unwrap();
-            family.current.census_window_end = "2026-10-31T00:00:00Z".into();
-        } else if dirty {
-            let authority = next
-                .claude_usage_authority_quarantine
-                .get_mut(FAMILY)
-                .unwrap();
-            authority.retry_after_unix_seconds -= 1;
-        }
-        // Claim-only skips window retirement, so a clean family stays clean.
-        let saved = import::save(&mut db, &identity, committed, &mut next, &mut cx, true)
-            .err()
-            .map(|error| error.to_string());
-        let generation = db.read_control::<u64>("generation").unwrap();
-        let reload = |db: &mut sqlite::Sqlite| {
-            hydrate(db, Scratch::binding())
-                .err()
-                .map(|error| error.to_string())
-        };
-        match (lost_account, dirty) {
-            // Unchanged rows match their baseline digests, so the save writes
-            // neither them nor the manifest, which still counts them.
-            (true, false) => {
-                assert_eq!(saved, None);
-                assert_eq!(generation, Some(2));
-                assert_eq!(reload(&mut db).unwrap(), "accounts_missing_family");
-            }
-            (false, false) => {
-                assert_eq!(saved, None);
-                assert_eq!(generation, Some(2));
-                assert_eq!(reload(&mut db).unwrap(), "state_v2_missing_member");
-            }
-            // A changed family needs its control, whose absence refuses the save.
-            (true, true) => {
-                assert_eq!(saved.unwrap(), "accounts_window_inventory");
-                assert_eq!(generation, Some(1));
-                assert_eq!(reload(&mut db).unwrap(), "accounts_missing_family");
-            }
-            // A changed map row is written whole from RAM: the loss is healed.
-            (false, true) => {
-                assert_eq!(saved, None);
-                assert_eq!(generation, Some(2));
-                assert_eq!(
-                    next.claude_account_family_pending,
-                    previous.claude_account_family_pending
-                );
-                assert_persisted(&mut db, &next);
-            }
-        }
-    }
-}
 /// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
 fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
@@ -923,7 +676,6 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
         let mut next = current.clone();
         next.historical_replay_generation = Some("never-committed".into());
         next.files.clear();
-        next.claude_account_family_pending.clear();
         next.accepted_snapshot_fingerprints.insert("f".repeat(64));
         if after_commit {
             FAIL_DIGEST_PROMOTION.with(|fail| fail.set(true));
@@ -959,216 +711,6 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
     }
 }
 
-/// Exercise the real cold mapper transaction before retirement can remove a
-/// positive fixture. Reopen the SQLite store, then materialize for comparisons.
-pub(in crate::snapshots) fn compact_reopened_for_test(
-    index: &ScanIndex,
-) -> (ScanIndex, serde_json::Value) {
-    let (scratch, mut db) = Scratch::live_store();
-    commit_populate(&mut db, index);
-    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (mut cold, mut cx) = import::hydrate_context(&mut db).unwrap();
-    let previous = baseline(&cold, &mut cx).unwrap();
-    cx.compact_allowance = Some(128);
-    cold.generation += 1;
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    delta(previous, &cold, &mut tx, &mut cx).unwrap();
-    assert_eq!(
-        tx.commit(cold.generation - 1, cold.generation),
-        DurableCommitOutcome::Committed(cold.generation)
-    );
-    let counts = serde_json::to_value(&cx.compaction.counts).unwrap();
-    db.validate_references().unwrap();
-    drop(db);
-    let mut db =
-        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
-    let restored = hydrate(&mut db, Scratch::binding()).unwrap().0;
-    (restored, counts)
-}
-
-/// [money] Whole-family work can exceed the allowance, but a save stops before
-/// the next family. Rollback grants no progress; restart rediscovers the rest.
-#[test]
-#[serial_test::serial]
-fn cold_compaction_commits_whole_families_and_resumes_after_restart() {
-    let (scratch, mut db) = Scratch::live_store();
-    let mut original = fixture();
-    let pending = original
-        .claude_account_family_pending
-        .get_mut("synthetic-family")
-        .unwrap();
-    pending.current.census_complete = false;
-    pending.current.census_window_end = "2026-08-02T07:20:00Z".into();
-    *pending.previous_windows.resident_mut() = (0..163)
-        .map(|n| {
-            let mut w = pending.current.clone();
-            w.census_window_end = format!("2026-08-02T07:{:02}:{:02}Z", n / 60, n % 60);
-            w
-        })
-        .collect();
-    let second = pending.clone();
-    original
-        .claude_account_family_pending
-        .insert("z-family".into(), second);
-    commit_populate(&mut db, &original);
-    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
-    let previous = baseline(&graph, &mut cx).unwrap();
-    let before = previous.rows.clone();
-    let positions = |db: &mut sqlite::Sqlite, family: &str| {
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        let h = tx
-            .get(&mapper::key("account.current", family, 1).unwrap())
-            .unwrap()
-            .unwrap();
-        mapper::read::<(Option<u64>, u64, Vec<u64>)>(&mut tx, &h, None).unwrap()
-    };
-    let inventory = positions(&mut db, "synthetic-family");
-    let counters = telemetry::latest_for_test("account_windows_compacted");
-    sqlite::fence_commit_writing(&db, "generation");
-    assert!(import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).is_err());
-    assert_eq!(
-        graph.claude_account_family_pending["synthetic-family"]
-            .previous_windows
-            .uncollapsed(),
-        162
-    );
-    assert_eq!(
-        telemetry::latest_for_test("account_windows_compacted"),
-        counters
-    );
-    assert_eq!(positions(&mut db, "synthetic-family"), inventory);
-    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
-    let previous = baseline(&graph, &mut cx).unwrap();
-    import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(
-        (
-            cx.compaction.counts.windows_removed,
-            cx.compaction.counts.families_done
-        ),
-        (162, 1)
-    );
-    assert_eq!(
-        graph.claude_account_family_pending["synthetic-family"]
-            .previous_windows
-            .uncollapsed(),
-        0
-    );
-    assert_eq!(
-        graph.claude_account_family_pending["z-family"]
-            .previous_windows
-            .uncollapsed(),
-        162
-    );
-    assert_eq!(
-        positions(&mut db, "synthetic-family"),
-        (inventory.0, inventory.1, vec![163, 164])
-    );
-    db.validate_references().unwrap();
-    db.validate_parts().unwrap();
-    drop(db);
-    let mut db =
-        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
-    db.path_extractor(private_paths);
-    db.reference_extractor(references);
-    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
-    assert_eq!(
-        graph.claude_account_family_pending["synthetic-family"]
-            .previous_windows
-            .uncollapsed(),
-        0
-    );
-    let previous = baseline(&graph, &mut cx).unwrap();
-    let final_rows =
-        import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(
-        (
-            cx.compaction.counts.windows_removed,
-            cx.compaction.counts.families_done
-        ),
-        (162, 1)
-    );
-    assert_eq!(
-        positions(&mut db, "z-family"),
-        (inventory.0, inventory.1, vec![163, 164])
-    );
-    // Every surviving logical row, including both currents and unrelated rows,
-    // retains its exact commitment; only redundant archive keys disappeared.
-    for (key, digest) in &final_rows.rows {
-        assert_eq!(before.get(key), Some(digest), "{key:?}");
-    }
-    let attempts = db.save_row_attempts();
-    import::save(&mut db, &identity, final_rows, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(db.save_row_attempts().1, attempts.1);
-    assert_eq!(
-        (
-            cx.compaction.counts.windows_removed,
-            cx.compaction.counts.families_done
-        ),
-        (0, 0)
-    );
-    db.validate_references().unwrap();
-    db.validate_parts().unwrap();
-    let restored = hydrate(&mut db, Scratch::binding()).unwrap().0;
-    for (root, family) in &restored.claude_account_family_pending {
-        assert_eq!(
-            family.current,
-            original.claude_account_family_pending[root].current
-        );
-        assert!(
-            family.history_summary()
-                == original.claude_account_family_pending[root].history_summary()
-        );
-        assert_eq!(family.previous_windows.resident().len(), 1);
-    }
-}
-
-/// [money] A family the checked summary refuses keeps every row and is
-/// settled for the session, so it cannot hold the allowance on every save.
-#[test]
-#[serial_test::serial]
-fn cold_compaction_settles_a_refused_family_for_the_session() {
-    let (_scratch, mut db) = Scratch::live_store();
-    let mut original = fixture();
-    let pending = original
-        .claude_account_family_pending
-        .get_mut("synthetic-family")
-        .unwrap();
-    pending.current.census_complete = false;
-    pending.current.census_window_end = "2026-08-02T07:20:00Z".into();
-    // Equal evidence, but the last boundary is not before the current's.
-    *pending.previous_windows.resident_mut() = ["07:00", "07:01", "07:20"]
-        .map(|at| {
-            let mut w = pending.current.clone();
-            w.census_window_end = format!("2026-08-02T{at}:00Z");
-            w
-        })
-        .into();
-    commit_populate(&mut db, &original);
-    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
-    let (mut graph, mut cx) = import::hydrate_context(&mut db).unwrap();
-    let uncollapsed = |graph: &ScanIndex| {
-        graph.claude_account_family_pending["synthetic-family"]
-            .previous_windows
-            .uncollapsed()
-    };
-    assert_eq!(uncollapsed(&graph), 2);
-    let previous = baseline(&graph, &mut cx).unwrap();
-    let before = previous.rows.clone();
-    let saved = import::save(&mut db, &identity, previous, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(
-        (
-            cx.compaction.counts.families_refused,
-            cx.compaction.counts.windows_removed
-        ),
-        (1, 0)
-    );
-    assert_eq!(saved.rows, before);
-    assert_eq!(uncollapsed(&graph), 0);
-    import::save(&mut db, &identity, saved, &mut graph, &mut cx, false).unwrap();
-    assert_eq!(cx.compaction.counts.families_refused, 0);
-}
-
 /// [format] stale generation or future writer refuses before saving.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
@@ -1192,252 +734,6 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
     }
 }
 
-/// One strict rollover step (no raw holds): archive current under a new
-/// boundary, or remove all.
-fn roll(index: &mut ScanIndex, boundary: &str) {
-    if boundary == "gone" {
-        index.claude_account_family_pending.clear();
-        return;
-    }
-    if index.claude_account_family_pending.is_empty() {
-        index.claude_account_family_pending = fixture().claude_account_family_pending;
-    }
-    let p = index
-        .claude_account_family_pending
-        .get_mut("synthetic-family")
-        .unwrap();
-    if p.census_window_end != boundary {
-        let old = p.current.clone();
-        p.current.census_window_end = boundary.into();
-        p.archive(old, true);
-    }
-}
-/// [money] window ids are monotonic across a b a and complete family removal.
-/// Cold arm: the production v2 graph keeps its archive in the store and
-/// queues each rollover; its summary equals the stored windows' and its save
-/// leaves the same decoded rows as the resident save.
-#[test]
-fn window_ids_are_monotonic_across_a_b_a_and_complete_family_removal() {
-    let (_scratch, mut db) = Scratch::store();
-    let (_cold_scratch, mut cold_db) = Scratch::store();
-    let mut prev = fixture();
-    prev.files.clear();
-    commit_populate(&mut db, &prev);
-    commit_populate(&mut cold_db, &prev);
-    prev.generation = 1;
-    let mut prior_id = 0;
-    for boundary in ["A", "B", "A", "gone", "A"] {
-        let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-        let (mut cold, mut cold_cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-        drop(tx);
-        let (stored, _) = hydrate(&mut cold_db, Scratch::binding()).unwrap();
-        for (root, family) in &cold.claude_account_family_pending {
-            let resident = &stored.claude_account_family_pending[root];
-            assert!(
-                family.history_summary() == resident.history_summary(),
-                "{root}"
-            );
-            assert_eq!(family.has_history(), resident.has_history(), "{root}");
-            if resident.has_history() {
-                assert!(matches!(family.previous_windows, ArchivedWindows::Cold(_)));
-            }
-        }
-        let cold_baseline = baseline(&cold, &mut cold_cx).unwrap();
-        // Seed mode keeps every stored cold row in the baseline.
-        for (root, window) in &cold_baseline.windows {
-            for id in &window.ids {
-                let key = mapper::key("account_window", root, *id).unwrap();
-                assert!(cold_baseline.rows.contains_key(&key), "{root} {id}");
-            }
-        }
-        cold.generation += 1;
-        roll(&mut cold, boundary);
-        let mut tx = cold_db.begin(TxnMode::Write).unwrap();
-        delta(cold_baseline, &cold, &mut tx, &mut cold_cx).unwrap();
-        let outcome = tx.commit(cold.generation - 1, cold.generation);
-        assert_eq!(outcome, DurableCommitOutcome::Committed(cold.generation));
-
-        let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-        let mut next = prev.clone();
-        next.generation += 1;
-        roll(&mut next, boundary);
-        let baseline = baseline(&prev, &mut cx).unwrap();
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        delta(baseline, &next, &mut tx, &mut cx).unwrap();
-        let key = mapper::key("account.current", "synthetic-family", 1).unwrap();
-        let h = tx.get(&key).unwrap().unwrap();
-        let (id, high, _): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
-        if let Some(id) = id {
-            assert!(id > prior_id);
-            assert!(high > id);
-            prior_id = id;
-        }
-        let outcome = tx.commit(prev.generation, next.generation);
-        assert_eq!(outcome, DurableCommitOutcome::Committed(next.generation));
-        let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
-        assert_eq!(
-            serde_json::to_vec(&restored).unwrap(),
-            serde_json::to_vec(&next).unwrap()
-        );
-        let (cold_restored, _) = hydrate(&mut cold_db, Scratch::binding()).unwrap();
-        assert_eq!(
-            serde_json::to_vec(&cold_restored).unwrap(),
-            serde_json::to_vec(&next).unwrap(),
-            "cold {boundary}"
-        );
-        prev = next;
-    }
-}
-
-/// [money] A cold archive replays the run rule over its last stored row to
-/// the rows a resident save writes, replaced windows included. A stored tail that no longer matches the baseline is Unknown:
-/// the save refuses, counted, and removes nothing. A stale base with no
-/// shared rollover refuses as a lineage miss, counted separately.
-#[test]
-fn cold_archive_replays_endpoints_like_resident_and_refuses_unknown_rows() {
-    const FAMILY: &str = "synthetic-family";
-    let at = |minute: u32| format!("2026-08-02T07:{minute:02}:00Z");
-    let mut index = fixture();
-    index.files.clear();
-    let p = index.claude_account_family_pending.get_mut(FAMILY).unwrap();
-    let mut window = p.current.clone();
-    *p.previous_windows.resident_mut() = (0..3)
-        .map(|minute| {
-            window.census_window_end = at(minute);
-            window.clone()
-        })
-        .collect();
-    p.current.census_window_end = at(3);
-    let (_resident_scratch, mut resident_db) = Scratch::store();
-    let (_cold_scratch, mut cold_db) = Scratch::live_store();
-    commit_populate(&mut resident_db, &index);
-    commit_populate(&mut cold_db, &index);
-    let mut saved = Vec::new();
-    for (db, cold) in [(&mut resident_db, false), (&mut cold_db, true)] {
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-        if !cold {
-            kinds_accounts::materialize(&mut tx, &mut graph).unwrap();
-        }
-        drop(tx);
-        let archive = &graph.claude_account_family_pending[FAMILY].previous_windows;
-        assert_eq!(matches!(archive, ArchivedWindows::Cold(_)), cold);
-        let previous = baseline(&graph, &mut cx).unwrap();
-        graph.generation += 1;
-        // Equal evidence at increasing boundaries: each rollover replaces the
-        // stored last window.
-        roll(&mut graph, &at(4));
-        roll(&mut graph, &at(5));
-        let mut tx = db.begin(TxnMode::Write).unwrap();
-        delta(previous, &graph, &mut tx, &mut cx).unwrap();
-        // The save counts the store-only rollovers it replays: both replace.
-        let replayed = if cold { (2, 0) } else { (0, 0) };
-        assert_eq!((cx.archived.replaced, cx.archived.pushed), replayed);
-        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-        let restored = hydrate(db, Scratch::binding()).unwrap().0;
-        let archive = restored.claude_account_family_pending[FAMILY]
-            .previous_windows
-            .resident();
-        let ends: Vec<_> = archive
-            .iter()
-            .map(|w| w.census_window_end.clone())
-            .collect();
-        assert_eq!(ends, [at(0), at(1), at(4)]);
-        saved.push(serde_json::to_vec(&restored).unwrap());
-    }
-    assert_eq!(saved[0], saved[1]);
-
-    let count = |name: &str| {
-        telemetry::latest_for_test(name)
-            .and_then(|count| count.as_u64())
-            .unwrap_or(0)
-    };
-    // Both queued replay and compaction refuse a row changed under baseline.
-    for compact in [false, true] {
-        let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-        let (mut graph, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-        drop(tx);
-        let previous = baseline(&graph, &mut cx).unwrap();
-        graph.generation += 1;
-        cx.compact_allowance = compact.then_some(128);
-        if !compact {
-            roll(&mut graph, &at(6));
-        }
-        let mut tx = cold_db.begin(TxnMode::Write).unwrap();
-        let control = mapper::key("account.current", FAMILY, 1).unwrap();
-        let h = tx.get(&control).unwrap().unwrap();
-        let (_, _, ids): (Option<u64>, u64, Vec<u64>) = mapper::read(&mut tx, &h, None).unwrap();
-        let key = mapper::key("account_window", FAMILY, ids[ids.len() - 2]).unwrap();
-        let mut changed = graph.claude_account_family_pending[FAMILY].current.clone();
-        changed.evidence_request_count += 1;
-        mapper::put(&mut tx, &key, &changed).unwrap();
-        let before = count("cold_row_unknown");
-        let error = delta(previous, &graph, &mut tx, &mut cx).err().unwrap();
-        assert!(format!("{error:#}").contains("state_v2_cold_row_unknown"));
-        assert!(count("cold_row_unknown") > before);
-        assert_eq!(cx.compaction.counts.windows_removed, 0);
-        assert_eq!(cx.compaction.counts.families_done, 0);
-        drop(tx);
-        let restored = hydrate(&mut cold_db, Scratch::binding()).unwrap().0;
-        assert_eq!(serde_json::to_vec(&restored).unwrap(), saved[1]);
-    }
-
-    // Lineage miss: a graph whose base predates a commit it shares no
-    // rollover with refuses, counted apart from row damage.
-    let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-    let (mut stale, mut cx) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-    drop(tx);
-    let previous = baseline(&stale, &mut cx).unwrap();
-    stale.generation += 1;
-    roll(&mut stale, &at(7));
-    let mut tx = cold_db.begin(TxnMode::Write).unwrap();
-    delta(previous, &stale, &mut tx, &mut cx).unwrap();
-    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
-    let mut tx = cold_db.begin(TxnMode::Read).unwrap();
-    let (current, mut fresh) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-    drop(tx);
-    let previous = baseline(&current, &mut fresh).unwrap();
-    roll(&mut stale, &at(8));
-    let before = count("cold_lineage_miss");
-    let mut tx = cold_db.begin(TxnMode::Write).unwrap();
-    let error = delta(previous, &stale, &mut tx, &mut fresh).err().unwrap();
-    assert!(format!("{error:#}").contains("state_v2_cold_lineage_miss"));
-    assert!(count("cold_lineage_miss") > before);
-}
-
-/// [behaviour] A complete hydrate keeps one summary per archive: 1 or 200
-/// archived windows with the same members leave the same account heap.
-#[test]
-fn cold_archive_heap_does_not_grow_with_history() {
-    let heap = |windows: u32| {
-        let (_scratch, mut db) = Scratch::store();
-        let mut index = fixture();
-        index.files.clear();
-        let p = index
-            .claude_account_family_pending
-            .get_mut("synthetic-family")
-            .unwrap();
-        let mut window = p.current.clone();
-        *p.previous_windows.resident_mut() = (0..windows)
-            .map(|n| {
-                window.census_window_end = format!("2026-08-01T{:02}:{:02}:00Z", n / 60, n % 60);
-                window.clone()
-            })
-            .collect();
-        commit_populate(&mut db, &index);
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        let (hydrated, _) = hydrate_txn(&mut tx, Scratch::binding()).unwrap();
-        let archive = &hydrated.claude_account_family_pending["synthetic-family"].previous_windows;
-        assert!(matches!(archive, ArchivedWindows::Cold(_)));
-        crate::heap_layout_bound::completed_bound(
-            &hydrated.claude_account_family_pending,
-            usize::MAX,
-        )
-        .unwrap()
-    };
-    assert_eq!(heap(1), heap(200));
-}
-
 /// [money] a refused COMMIT preserves unsettled custody through subsequent independent saves.
 #[test]
 fn refused_commit_preserves_owed_custody_through_independent_saves() {
@@ -1459,7 +755,6 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     next.snapshot_activity_at
         .insert("unpublished".into(), Some("2026-10-31T00:00:00Z".into()));
     next.accepted_rebuild_incidence.clear();
-    next.claude_account_family_pending.clear();
     next.upload_ack_retirement_handoff = Some(super::super::super::UploadAckRetirementHandoff {
         destination_namespace_hash: Scratch::binding().namespace_hash,
         committed_generation: next.generation,
@@ -1496,10 +791,6 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
     assert_eq!(
         reopened.accepted_rebuild_incidence,
         prev.accepted_rebuild_incidence
-    );
-    assert_eq!(
-        serde_json::to_value(&reopened.claude_account_family_pending).unwrap(),
-        serde_json::to_value(&prev.claude_account_family_pending).unwrap()
     );
     assert!(reopened.upload_ack_retirement_handoff.is_none());
     let mut advanced = reopened.clone();
@@ -1948,7 +1239,9 @@ pub(in crate::snapshots::state_v2) fn with_co_owned_witness(mut index: ScanIndex
 /// the next generation. Every store gets each retired kind's manifest or
 /// scalar row. `members` adds usage families (one sharing its request set
 /// with `with_co_owned_witness`, one stored in chunks) and their census
-/// counts. Returns the seeded keys.
+/// counts, and account families: two windows of one family sharing one
+/// request set, a window stored in chunks holding its own, and a family's
+/// current, absent-member and proof rows. Returns the seeded keys.
 pub(in crate::snapshots::state_v2) fn seed_retired_rows(
     db: &mut sqlite::Sqlite,
     members: bool,
@@ -1971,6 +1264,8 @@ pub(in crate::snapshots::state_v2) fn seed_retired_rows(
         }
         let count: u64 = match *kind {
             "usage.pending" | "family.requests" if members => 2,
+            "account_window" if members => 3,
+            "account.current" | "account.absent_members" | "proof.account" if members => 1,
             _ => 0,
         };
         put(&mut tx, mapper::key(kind, "", 0).unwrap(), count.into());
@@ -2008,6 +1303,50 @@ pub(in crate::snapshots::state_v2) fn seed_retired_rows(
         );
         put(&mut tx, key("family.requests", CO_OWNER, 1), 1_u64.into());
         put(&mut tx, key("family.requests", CHUNKED, 1), 1_u64.into());
+        let window = |set: &str, members: u64| {
+            let members: serde_json::Map<_, _> = (0..members)
+                .map(|i| {
+                    let member = format!("{:x}", sha2::Sha256::digest((i + 1000).to_le_bytes()));
+                    (member, 1.into())
+                })
+                .collect();
+            serde_json::json!({"account_identifier_hash": "a".repeat(64),
+                "census_window_end": "2026-10-29T00:00:00Z", "complete": true,
+                "evidence_request_count": 1, "invalid": false, "members": members,
+                "r": {"synthetic-file": set}, "v": "claude_account_request_set:v2"})
+        };
+        put(
+            &mut tx,
+            key("account_window", CO_OWNER, 1),
+            window("co-owned", 1),
+        );
+        put(
+            &mut tx,
+            key("account_window", CO_OWNER, 2),
+            window("co-owned", 1),
+        );
+        put(
+            &mut tx,
+            key("account_window", CHUNKED, 1),
+            window("exclusive", 64),
+        );
+        put(
+            &mut tx,
+            key("account.current", CO_OWNER, 1),
+            serde_json::json!([2, 3, [1, 2]]),
+        );
+        put(
+            &mut tx,
+            key("account.absent_members", CO_OWNER, 1),
+            serde_json::json!(["synthetic-absent"]),
+        );
+        put(
+            &mut tx,
+            key("proof.account", CO_OWNER, 1),
+            serde_json::json!({"account_identifier_hash": "a".repeat(64),
+                "evidence_request_count": 1, "members": {"synthetic-file": 1},
+                "member_request_id_fingerprints": {"synthetic-file": "b".repeat(64)}}),
+        );
     }
     let next = generation + 1;
     assert_eq!(
@@ -2061,12 +1400,14 @@ fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
 
 /// [money] A request set that a retired usage row and a live `proof.usage`
 /// row both reference survives the purge with one reference less; the set
-/// only the retired row held is released.
+/// only the retired row held is released. An account set two retired windows
+/// share is released once both go, as is a chunked window's own set. A
+/// second save brings none of them back.
 #[test]
 fn retired_purge_keeps_co_owned_request_set() {
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &with_co_owned_witness(fixture()));
-    seed_retired_rows(&mut db, true);
+    let keys = seed_retired_rows(&mut db, true);
     let live = mapper::key("proof.usage", CO_OWNER, 1).unwrap();
     let retired = mapper::key("usage.pending", CO_OWNER, 1).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -2081,6 +1422,24 @@ fn retired_purge_keeps_co_owned_request_set() {
     let only = referenced_sets(&mut tx, &mapper::key("usage.pending", CHUNKED, 1).unwrap());
     assert_eq!(only.len(), 1);
     assert_eq!(set_refs(&mut tx, &only[0]), Some(1));
+    let windows = [1, 2].map(|n| mapper::key("account_window", CO_OWNER, n).unwrap());
+    let account = referenced_sets(&mut tx, &windows[0]);
+    assert_eq!(account.len(), 1);
+    assert_eq!(
+        referenced_sets(&mut tx, &windows[1]),
+        account,
+        "two windows, one set"
+    );
+    assert_eq!(set_refs(&mut tx, &account[0]), Some(2));
+    let chunked = mapper::key("account_window", CHUNKED, 1).unwrap();
+    assert!(
+        tx.get(&chunked).unwrap().unwrap().parts > 0,
+        "stored in chunks"
+    );
+    let exclusive = referenced_sets(&mut tx, &chunked);
+    assert_eq!(exclusive.len(), 1);
+    assert_ne!(exclusive, account);
+    assert_eq!(set_refs(&mut tx, &exclusive[0]), Some(1));
     drop(tx);
     purge(&mut db, Scratch::binding()).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -2088,6 +1447,20 @@ fn retired_purge_keeps_co_owned_request_set() {
     assert_eq!(referenced_sets(&mut tx, &live), shared);
     assert_eq!(set_refs(&mut tx, &shared[0]), Some(1));
     assert_eq!(set_refs(&mut tx, &only[0]), None);
+    assert_eq!(set_refs(&mut tx, &account[0]), None);
+    assert_eq!(set_refs(&mut tx, &exclusive[0]), None);
+    drop(tx);
+    assert_eq!(present(&mut db, &keys), 0);
+    db.validate_references().unwrap();
+    // The next save finds nothing retired and writes none of it back.
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(cx.retired.is_empty());
+    purge(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(present(&mut db, &keys), 0);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for set in [&only[0], &account[0], &exclusive[0]] {
+        assert_eq!(set_refs(&mut tx, set), None);
+    }
     drop(tx);
     db.validate_references().unwrap();
     let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
@@ -2125,27 +1498,34 @@ fn interrupted_purge_save_keeps_rows() {
     db.validate_references().unwrap();
 }
 
-/// [format] A raw hold of the retired usage-pending field, as an earlier
-/// release left it with its hold metadata, still loads. The metadata entry is
-/// dropped, so no hold custody or file state comes back from it, and the next
-/// save removes the row and rewrites the metadata without the field.
+/// [format] Raw holds of the retired usage-pending and family account
+/// fields, as an earlier release left them with their hold metadata, still
+/// load. The metadata entries are dropped, so no hold custody or file state
+/// comes back from them, and the next save removes the rows and rewrites the
+/// metadata without the fields.
 #[test]
-fn retired_raw_usage_hold_loads_and_is_purged_by_the_next_save() {
+fn retired_raw_holds_load_and_are_purged_by_the_next_save() {
+    const FIELDS: [&str; 3] = [
+        "claude_usage_family_pending",
+        "claude_account_family_pending",
+        "claude_account_family_witnesses",
+    ];
     let (_scratch, mut db) = Scratch::live_store();
     let index = fixture();
     commit_populate(&mut db, &index);
-    let hold = mapper::key("raw_hold.claude_usage_family_pending", CHUNKED, 0).unwrap();
+    let holds = FIELDS.map(|field| mapper::key(&format!("raw_hold.{field}"), CHUNKED, 0).unwrap());
     let metadata = mapper::key("v1_field.repair_provenance", "", 0).unwrap();
     let mut tx = db.begin(TxnMode::Write).unwrap();
-    mapper::put(&mut tx, &hold, &serde_json::json!({"invalid": "held"})).unwrap();
     let h = tx.get(&metadata).unwrap().unwrap();
     let mut value: serde_json::Value = mapper::read(&mut tx, &h, None).unwrap();
-    value["entries"]["claude_usage_family_pending"] =
-        serde_json::json!({CHUNKED: {"owner": null, "charge": 64}});
+    for (field, hold) in FIELDS.iter().zip(&holds) {
+        mapper::put(&mut tx, hold, &serde_json::json!({"invalid": "held"})).unwrap();
+        value["entries"][*field] = serde_json::json!({CHUNKED: {"owner": null, "charge": 64}});
+    }
     mapper::put(&mut tx, &metadata, &value).unwrap();
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     let (restored, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.retired, BTreeSet::from([hold.clone()]));
+    assert_eq!(cx.retired, BTreeSet::from(holds.clone()));
     assert!(
         restored.decode_holds.same_as(&index.decode_holds),
         "no hold custody"
@@ -2157,12 +1537,14 @@ fn retired_raw_usage_hold_loads_and_is_purged_by_the_next_save() {
     );
     purge(&mut db, Scratch::binding()).unwrap();
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&hold).unwrap().is_none());
+    for hold in &holds {
+        assert!(tx.get(hold).unwrap().is_none());
+    }
     let h = tx.get(&metadata).unwrap().unwrap();
     let value: serde_json::Value = mapper::read(&mut tx, &h, None).unwrap();
-    assert!(value["entries"]
-        .get("claude_usage_family_pending")
-        .is_none());
+    for field in FIELDS {
+        assert!(value["entries"].get(field).is_none(), "{field}");
+    }
     drop(tx);
     let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert!(cx.retired.is_empty());

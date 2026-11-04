@@ -231,6 +231,45 @@ check_self_export_matches_tree() {
   bash scripts/public_repo_manifest.sh --compare dist/public-export/ottto/PUBLIC_EXPORT_MANIFEST.json
 }
 
+# The move checks compare the change with its base: the first parent of the
+# pull-request merge commit in GitHub Actions, else the merge-base with
+# origin/main. They fail only for a pull request whose description has a line
+# starting with `Move-only:` (passed in MOVE_ONLY_PR_BODY); otherwise they report
+# and pass. Without a base (a staged checkout) they are skipped.
+move_check_base() {
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    git rev-parse -q --verify 'HEAD^1' || true
+  else
+    git merge-base origin/main HEAD 2>/dev/null || true
+  fi
+}
+
+move_check() {
+  local script="$1"
+  local base
+  base="$(move_check_base)"
+  if [[ -z "$base" ]]; then
+    echo "public-surface-ci: no base commit; skipping $script"
+    return 0
+  fi
+  if grep -q '^Move-only:' <<< "${MOVE_ONLY_PR_BODY:-}"; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD --report
+  fi
+}
+
+# Report only for now; later changes pass --enforce <rule,...>.
+source_layout_report() {
+  local base
+  base="$(move_check_base)"
+  if [[ -n "$base" ]]; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --base "$base"
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py
+  fi
+}
+
 run_step P "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
 run_step P "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
@@ -240,6 +279,12 @@ run_step P "test runtime test split" env PYTHONDONTWRITEBYTECODE=1 python3 scrip
 run_step P "test flaky test report" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_flaky_tests.py
 run_step P "test PR merge guard" bash scripts/test_pr_merge_when_mac_green.sh
 run_step P "test Mac batch helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_mac_batch.py
+run_step P "test move ledger check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_move_ledger.py
+run_step P "test test-ID map check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_test_id_map.py
+run_step P "test source layout check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_source_layout.py
+run_step P "check that a move-only change only moves items" move_check scripts/check_move_ledger.py
+run_step P "check test IDs and never-retry decisions" move_check scripts/check_test_id_map.py
+run_step P "report the snapshots source layout" source_layout_report
 
 run_step P "test public export check" bash scripts/test_public_repo_export_check.sh
 run_step P "run public export check" bash scripts/public_repo_export_check.sh
