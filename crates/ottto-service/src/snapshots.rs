@@ -12719,7 +12719,9 @@ impl SnapshotAccumulator {
                     .checked_add(".jsonl".len())?
                     .checked_mul(8)?,
                 _ => 0,
-            });
+            })
+            // The fold's own copy of that name.
+            .checked_add(self.claude_fork_parent.as_deref().map_or(0, str::len))?;
         claude_request_money::e2::FileFold::finish_heap_bound(
             &claude_request_money::e2::FoldShape {
                 responses: keys.responses,

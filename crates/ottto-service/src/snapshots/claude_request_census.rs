@@ -559,27 +559,29 @@ impl ClaudeRequestCensus {
     }
 
     /// `e2` copy decisions, once per folder per page: every MAIN transcript
-    /// record (never a subagent) directly in `folder` (an index key) holding
-    /// some of the sorted unique `wanted` hashes, with its key, session and
-    /// the hashes it holds. The caller decides whether the record proves
-    /// anything (current revision, other session, earlier birth). The same
-    /// walk as `family_transcript_holders`, over the folder's key range only.
-    /// None when `deadline` passes: the caller cannot decide.
+    /// record (never a subagent) directly in `folder` (an index key; None:
+    /// every folder) holding some of the sorted unique `wanted` hashes, with
+    /// its key, session and the hashes it holds. The caller decides whether
+    /// the record proves anything (current revision, other session, earlier
+    /// birth). The same walk as `family_transcript_holders`, over the folder's
+    /// key range only. None when `deadline` passes: the caller cannot decide.
     pub(crate) fn main_transcript_holders<'a>(
         &'a self,
-        folder: &str,
+        folder: Option<&str>,
         wanted: &[u64],
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut visit: impl FnMut(&'a str, &'a str, &'a ClaudeRequestCensusRecord, &[u64]),
     ) -> Option<()> {
         if wanted.is_empty() {
             return Some(());
         }
         #[cfg(test)]
-        if walk_deadline_forced(MAIN_WALK) {
+        if deadline.is_some() && walk_deadline_forced(MAIN_WALK) {
             return None;
         }
-        let prefix = format!("{folder}{}", std::path::MAIN_SEPARATOR);
+        let prefix = folder
+            .map(|folder| format!("{folder}{}", std::path::MAIN_SEPARATOR))
+            .unwrap_or_default();
         let children = self
             .records
             .range::<str, _>((
@@ -588,10 +590,11 @@ impl ClaudeRequestCensus {
             ))
             .take_while(|(key, _)| key.starts_with(&prefix))
             .filter(|(key, record)| {
-                !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR) && !record.is_birth_stub()
+                (folder.is_none() || !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR))
+                    && !record.is_birth_stub()
             });
         let mut hits = Vec::new();
-        Self::walk_transcript_holders(children, Some(deadline), |key, member, record| {
+        Self::walk_transcript_holders(children, deadline, |key, member, record| {
             if member.subagent_stem.is_some() {
                 return;
             }

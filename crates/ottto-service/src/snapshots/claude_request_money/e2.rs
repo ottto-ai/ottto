@@ -413,6 +413,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         telemetry,
         accounts,
         prefix: _,
+        fork_parent,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -431,6 +432,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
+    *fork_parent = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -931,8 +933,11 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
+    /// The one session this file's `fork-context-ref` line names, whatever
+    /// copy route the page takes: the page's evidence scope reads its pair.
+    fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1160,6 +1165,7 @@ impl FileFold {
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
+            fork_parent: None,
         };
         fold.spend(started);
         fold
@@ -1234,6 +1240,10 @@ impl FileFold {
                 .contains(&super::super::claude_request_census::claude_request_hash(
                     request_id,
                 ))
+    }
+
+    pub(crate) fn fork_parent(&self) -> Option<&str> {
+        self.fork_parent.as_deref()
     }
 
     pub(crate) fn is_skipped(&self, sequence: u64) -> bool {
@@ -1388,7 +1398,10 @@ impl FileFold {
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
-        self.decide_native(context, markers, fork_parent);
+        self.fork_parent = fork_parent
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned);
+        self.decide_native(context, markers);
         if self.proof.is_none() {
             self.proof = context
                 .and_then(|context| {
@@ -1407,7 +1420,6 @@ impl FileFold {
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
-        fork_parent: Option<&str>,
     ) {
         if self.money_birth.uncertain_root() {
             self.disclose("uncertain_birth", self.responses); // counted, disclosed
@@ -1427,11 +1439,9 @@ impl FileFold {
         }
         if let Some(context) = context.filter(|context| self.cross_session_candidate(context)) {
             // The named original is a sibling file of the same project.
-            let parent = fork_parent
-                .filter(|parent| !parent.is_empty())
-                .map(|parent| {
-                    local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
-                });
+            let parent = self.fork_parent.as_deref().map(|parent| {
+                local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
+            });
             let folder = context
                 .path
                 .parent()
@@ -2651,9 +2661,9 @@ fn decide_holders(
         let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
         union.dedup();
         let walked = index.claude_request_census.main_transcript_holders(
-            &folder,
+            Some(folder.as_str()),
             &union,
-            deadline,
+            Some(deadline),
             |key, root, record, hits| {
                 // Per holder record, each at most once and only when another
                 // session wants one of its ids: evidence, then (birth, location).
