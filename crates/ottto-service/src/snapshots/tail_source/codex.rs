@@ -15,14 +15,14 @@
 //! settings, agent label, prelude), so content never re-derives. Live fields come from this read's inputs through `install_live`;
 //! foreign and finish-only fields stay empty at the seam.
 use super::{
-    capability_hour, changed_files, decode_envelope, encode_envelope, fact_count, fact_pages,
-    fixed_pages, hour_pages, read_fact_page, read_hour_page, read_page, slot_start, CollectionSpec,
-    DecodedHead, HeadIdentity, LiveLoadError, ReconstructCause, TailSource, SESSION_FACTS,
+    decode_envelope, encode_envelope, fixed_pages, hour, hour_pages, read_hour_page, read_page,
+    read_shared_page, shared_elements, shared_pages, slot, slot_start, CollectionSpec, DecodedHead,
+    HeadIdentity, LiveLoadError, ReconstructCause, TailSource, CHANGED_FILES, SESSION_FACTS,
 };
 use crate::durable_tail_codec::{durable_struct, Durable, HDigest, Refuse};
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
 use crate::snapshots::sampled_scan::codex_cursor::{priority_decisions, PriorityDecisions};
-use crate::snapshots::state_v2::{Collection, Shape as PageShape};
+use crate::snapshots::state_v2::Collection;
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
@@ -32,25 +32,6 @@ const SIGNATURES_G: u32 = 256;
 const REQUESTS_G: u32 = 64;
 const COMPACTIONS_G: u32 = 64;
 const SLOTS_FIELD: &str = "SnapshotAccumulator.codex_dictionary_slots";
-
-const fn slot(collection: Collection, g: u32) -> CollectionSpec {
-    CollectionSpec {
-        collection,
-        shape: PageShape::Slot,
-        g,
-        required: true,
-        private: false,
-    }
-}
-const fn hour(collection: Collection) -> CollectionSpec {
-    CollectionSpec {
-        collection,
-        shape: PageShape::Hour,
-        g: 0,
-        required: true,
-        private: false,
-    }
-}
 
 const COLLECTIONS: [CollectionSpec; 11] = [
     slot(Collection::CodexActiveTurns, DICTIONARY_G),
@@ -62,13 +43,7 @@ const COLLECTIONS: [CollectionSpec; 11] = [
     slot(Collection::Compactions, COMPACTIONS_G),
     hour(Collection::UsageHours),
     hour(Collection::CapabilityHours),
-    CollectionSpec {
-        collection: Collection::ChangedFiles,
-        shape: PageShape::Log,
-        g: changed_files::G,
-        required: true,
-        private: false,
-    },
+    CHANGED_FILES,
     SESSION_FACTS,
 ];
 
@@ -202,10 +177,7 @@ impl TailSource for Codex {
             Collection::Requests => acc.cache_requests.len(),
             Collection::Compactions => acc.compaction_timestamps.len(),
             Collection::UsageHours => acc.usage_buckets.len(),
-            Collection::CapabilityHours => acc.activity_capability_buckets.len(),
-            Collection::ChangedFiles => acc.activity_changed_file_hashes.len(),
-            Collection::SessionFacts => fact_count(acc),
-            _ => 0,
+            _ => shared_elements(acc, collection),
         }) as u64
     }
 
@@ -254,24 +226,6 @@ impl TailSource for Codex {
         ]
         .into_iter()
         .find_map(|(field, set)| set.then_some(field))
-    }
-
-    fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
-        match collection {
-            Collection::ChangedFiles => changed_files::keys(acc),
-            _ => Vec::new(),
-        }
-    }
-
-    fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        changed_files::page(keys)
-    }
-
-    fn log_page_keys(
-        _collection: Collection,
-        bytes: &[u8],
-    ) -> Result<Vec<String>, ReconstructCause> {
-        changed_files::page_keys(bytes)
     }
 
     fn encode_head(
@@ -361,12 +315,7 @@ impl TailSource for Codex {
                 fixed_pages(&acc.compaction_timestamps, COMPACTIONS_G, |at, e| at.put(e))
             }
             Collection::UsageHours => hour_pages(&acc.usage_buckets, String::as_str),
-            Collection::CapabilityHours => {
-                hour_pages(&acc.activity_capability_buckets, capability_hour)
-            }
-            Collection::ChangedFiles => changed_files::encode(acc),
-            Collection::SessionFacts => fact_pages(acc),
-            _ => Ok(Vec::new()),
+            _ => shared_pages::<Self>(acc, collection),
         }
     }
 
@@ -499,20 +448,8 @@ impl TailSource for Codex {
             Collection::UsageHours => {
                 read_hour_page(page, bytes, &mut into.usage_buckets, String::as_str)
             }
-            Collection::CapabilityHours => read_hour_page(
-                page,
-                bytes,
-                &mut into.activity_capability_buckets,
-                capability_hour,
-            ),
-            Collection::ChangedFiles => changed_files::decode(bytes, into),
-            Collection::SessionFacts => read_fact_page(page, bytes, into),
-            _ => Err(ReconstructCause::Corrupt),
+            _ => read_shared_page(collection, page, bytes, into),
         }
-    }
-
-    fn facts(_acc: &SnapshotAccumulator) -> Result<(), ReconstructCause> {
-        Ok(())
     }
 
     /// The stored state continues only under this read's inputs, and each

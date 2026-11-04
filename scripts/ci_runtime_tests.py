@@ -79,7 +79,6 @@ SERVICE_LIB = ["-p", "ottto-service", "--lib"]
 # module whose file calls the money oracle is added at startup (oracle_modules).
 NEVER_RETRY_MODULES = frozenset({
     "authority_proof_correction_pipeline_tests",
-    "census_convergence_pipeline_tests",
     "claude_census_money_invariant_tests",
     "claude_money_e2_pipeline_tests",
     "claude_request_identity_window_tests",
@@ -193,18 +192,38 @@ def require_passed(names: list[str], lines: list[str]) -> list[str]:
     return [f"{name}: did not pass ({results.get(name, 'not run')})" for name in names if results.get(name) != "ok"]
 
 
+PATH_MOD = re.compile(r'#\[path\s*=\s*"([^"]+)"\](?:\s*#\[[^\]]*\])*\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
+
+
+def module_name(path: Path) -> str:
+    """The module a .rs file defines, qualified when its own name is generic."""
+    if path.stem in ("mod", "lib", "main"):
+        path = path.parent
+    # A bare `tests` would match nearly every test; keep its parent.
+    return f"{path.parent.name}::tests" if path.stem == "tests" else path.stem
+
+
 def oracle_modules(root: Path) -> set[str]:
-    """Module names of the .rs files under `root` that use the money oracle."""
-    found = set()
-    for path in root.rglob("*.rs"):
-        if "money_oracle" in path.read_text(encoding="utf-8", errors="replace"):
-            found.add(path.parent.name if path.stem in ("mod", "lib", "main") else path.stem)
+    """Module names of the .rs files under `root` that use the money oracle,
+    including the name a `#[path = "..."] mod <name>;` loads such a file as."""
+    texts = {path.resolve(): path.read_text(encoding="utf-8", errors="replace") for path in root.rglob("*.rs")}
+    money = {path for path, text in texts.items() if "money_oracle" in text}
+    found = {module_name(path) for path in money}
+    for path, text in texts.items():
+        for target, name in PATH_MOD.findall(text):
+            if (path.parent / target).resolve() in money:
+                found.add(f"{module_name(path)}::{name}")
     return found
 
 
 def never_retry(name: str, required: set[str], modules: frozenset[str] | set[str] = NEVER_RETRY_MODULES) -> bool:
     segments = name.split("::")
-    return name in required or any(seg in modules or "money" in seg for seg in segments)
+
+    def names(module: str) -> bool:
+        part = module.split("::")
+        return any(segments[i:i + len(part)] == part for i in range(len(segments)))
+
+    return name in required or any("money" in seg for seg in segments) or any(names(m) for m in modules)
 
 
 def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str]]:

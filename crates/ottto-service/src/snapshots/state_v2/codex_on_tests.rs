@@ -173,7 +173,7 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     let filled = serde_json::to_value(codex_fixture()).unwrap();
     let codex = catalogue::LAYOUTS
         .iter()
-        .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired_kind(kind))
+        .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired(kind))
         .collect::<Vec<_>>();
     assert_eq!(codex.len(), 8, "persisted Codex kinds");
     for (kind, field, introduced) in codex {

@@ -32,7 +32,7 @@ unknown counters cannot supply an unexpected-loss baseline.
 The optional `cache_observations` patch uses bounded upsert/retract operations.
 Gate materializes the cumulative current set, so corrections and retractions
 produce self-contained downstream evidence. V1 permits 64 operations and
-128 KiB per patch; cumulative state permits 128 rows and 128 KiB. Overflow
+128 KiB per patch; cumulative state permits 512 rows and 640 KiB. Overflow
 reports partial coverage and omitted counts while preserving accepted evidence;
 it does not silently evict rows or introduce another uploader.
 

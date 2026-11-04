@@ -6546,35 +6546,6 @@ fn confirmed_empty_claude_family_members(
         .collect()
 }
 
-/// Family roots whose files Claude telemetry retention keeps: account-pending
-/// families that still owe identity, and witnessed families with their
-/// legacy owners.
-fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
-    index
-        .claude_account_family_pending
-        .iter()
-        .filter(|(_, pending)| {
-            pending.invalid
-                || pending.has_history()
-                || pending
-                    .member_requests
-                    .values()
-                    .any(|requests| requests.identity_revision.is_none())
-        })
-        .map(|(root, _)| root)
-        .chain(index.claude_usage_family_witnesses.keys())
-        .chain(
-            index
-                .claude_usage_family_witnesses
-                .values()
-                .flat_map(|witness| witness.legacy_owner_roots.iter()),
-        )
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
     claude_snapshot_family_root_ref(item).to_owned()
 }
@@ -18729,7 +18700,7 @@ impl OwnedSourceScan {
                         if tail_source::has_codec(source) {
                             let replay = if let Some(group) = active.group.as_deref() {
                                 Some((
-                                    tail_source::ReconstructCause::GroupReplay,
+                                    tail_source::counters::Replay::Group,
                                     group
                                         .consumed_before
                                         .saturating_add(active.parser.reader.consumed_bytes()),
@@ -18740,7 +18711,7 @@ impl OwnedSourceScan {
                                     .as_ref()
                                     .is_some_and(|acquisition| acquisition.tier_prefix_replay)
                                     .then_some((
-                                        tail_source::ReconstructCause::TierPrefixReplay,
+                                        tail_source::counters::Replay::TierPrefix,
                                         plan.metrics().native_bytes,
                                     ))
                             };
@@ -19632,8 +19603,8 @@ impl OwnedSourceScan {
                         twins: history_upgrade.twin_groups(),
                     }),
                 };
-                // This Claude completion's Tail write: encoded at PRE into a
-                // local buffer, published only on the native finish's verdict.
+                // This completion's Tail write: encoded at PRE into a local
+                // buffer, published only on the native finish's verdict.
                 #[cfg(unix)]
                 let tail_base = parser.take_tail_base();
                 #[cfg(unix)]
@@ -19642,7 +19613,7 @@ impl OwnedSourceScan {
                     .zip(file_sampling.as_ref())
                     .filter(|_| sampling.is_some() && !comparison_target)
                     .and_then(|(completed, active)| {
-                        // `None` off a Tail route or without a codec.
+                        // `None` off a Tail route.
                         tail_source::pending(
                             source,
                             index,
@@ -25960,7 +25931,7 @@ fn cache_state_within_limits(state: &Value) -> bool {
         rows.len() <= cache_observations::MAX_ROWS
             && rows.iter().all(|row| row["status"] != "retracted")
     }) && crate::canonical_json::canonicalize(state)
-        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_WIRE_BYTES)
+        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_STATE_BYTES)
 }
 
 /// One session's cache wire, shared by every source. A replayed request is
@@ -65889,7 +65860,7 @@ pub(crate) mod cache_adapter_tests {
             "schema_version":1,
             "detector_revision":"v1",
             "canonicalization":crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
-            "caps":{"operations":cache_observations::MAX_OPERATIONS,"wire_bytes":cache_observations::MAX_WIRE_BYTES,"canonical_rows":128,"canonical_bytes":128*1024},
+            "caps":{"operations":cache_observations::MAX_OPERATIONS,"wire_bytes":cache_observations::MAX_PATCH_BYTES,"canonical_rows":cache_observations::MAX_ROWS,"canonical_bytes":cache_observations::MAX_STATE_BYTES},
             "duration_policy":"nonnegative_whole_seconds_floor",
             "head_cas_contract":SNAPSHOT_HEAD_CAS_CONTRACT,
             "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
