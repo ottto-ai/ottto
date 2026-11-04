@@ -5725,6 +5725,12 @@ fn claude_index_file_body_accepted(
             })
 }
 
+// Coverage requires a non-quarantined body ACK, not a refusal checkpoint.
+fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
+    codex_counting_version::proven_owner(entry).is_some()
+        && claude_index_file_body_accepted(index, key, entry)
+}
+
 /// Whether the accepted ledger is current and not being rebuilt by the
 /// legacy settlement reconciliation.
 fn claude_accepted_ledger_is_current(index: &ScanIndex) -> bool {

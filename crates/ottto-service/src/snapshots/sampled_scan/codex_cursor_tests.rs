@@ -7990,10 +7990,10 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
             counters(&cache)
         );
         set_modified(std::time::SystemTime::now());
-        let (index, settled, n) = home.settle(index, &cache, 4);
+        let (_, settled, n) = home.settle(index, &cache, 4);
         assert_eq!(parent_causes(&settled), [0; PARENT_UNRESOLVABLE_CAUSES]);
-        let (oracle_index, oracle) = home.oracle(n);
-        assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+        let (_, oracle) = home.oracle(n);
+        assert_eq!(census(&settled), census(&oracle));
     }
 }
 
