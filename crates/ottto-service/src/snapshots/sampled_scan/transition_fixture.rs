@@ -518,13 +518,13 @@ pub(crate) mod money_oracle {
     }
 
     #[cfg(test)]
-    mod placement_tests {
+    pub(crate) mod placement_tests {
         use super::*;
         use crate::snapshots::claude_request_identity::{AcceptedBuckets, COLLECTOR};
 
         // Synthetic emitted requests in time order: A, switch to B, side call
         // under B, then an evidence gap. Independent weights expose any move.
-        fn placement_fixture() -> RouteResult {
+        pub(crate) fn placement_fixture() -> RouteResult {
             let evidence = json!([
                 {"identity_basis":"telemetry_login", "provider_workspace_hash":"c".repeat(64)},
                 {"identity_basis":"telemetry_login", "provider_workspace_hash":"d".repeat(64)}
