@@ -2876,12 +2876,9 @@ pub(crate) struct OrgMarkers {
     overflowed: RetiredOverflow,
     context_digest: Option<String>,
     context_changed: bool,
-    /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one. Without a
-    /// key, the second is the first later sentence or the first after a marker:
-    /// it could not be compared, so it counts as different.
+    /// Response position of the first non-blank `session_context` email.
     context_position: Option<u64>,
-    context_flip_position: Option<u64>,
+    context_flip_position: RetiredContextFlipPosition,
 }
 
 /// Retired: the starting marker earlier builds stored beside the entries (it
@@ -2895,6 +2892,12 @@ pub(crate) struct RetiredStartingMarker;
 /// as `false`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetiredOverflow;
+
+/// Retired: the position of the first later `session_context` naming a
+/// different email, which earlier builds stored. Nothing reads it, so it is
+/// decoded and dropped, written as `None`, and a stored head still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredContextFlipPosition;
 
 impl crate::durable_tail_codec::Durable for RetiredStartingMarker {
     fn put(
@@ -2943,6 +2946,28 @@ impl crate::durable_tail_codec::Durable for RetiredOverflow {
     }
 }
 
+impl crate::durable_tail_codec::Durable for RetiredContextFlipPosition {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<u64>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<u64> as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
 /// The hashed organization of a `credential_org` attachment; `None` when blank
 /// or malformed.
 fn marker_org_hash(attachment: &Value) -> Option<String> {
@@ -2976,23 +3001,13 @@ pub(crate) fn note_marker_line(
             let state = markers.get_or_insert_with(Box::default);
             match accepted::session_context_digest(&text) {
                 // No key, no field: a sentence that cannot be compared explains
-                // no organization change and ends any earlier email.
-                None => {
-                    state.context_digest = None;
-                    if state.context_position.is_some() || !state.entries.is_empty() {
-                        state.context_flip_position.get_or_insert(response_position);
-                    }
-                }
+                // no organization change.
+                None => state.context_digest = None,
                 // An earlier email with no digest (no key then, or scrubbed on a
                 // key change) cannot be compared: this sentence is a fresh
-                // baseline. It explains no organization change and ends that email.
+                // baseline. It explains no organization change.
                 Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
                     let compared = state.context_digest.is_some();
-                    if (compared || state.context_position.is_some())
-                        && state.context_flip_position.is_none()
-                    {
-                        state.context_flip_position = Some(response_position);
-                    }
                     state.context_changed =
                         compared || (state.context_position.is_none() && !state.entries.is_empty());
                     state.context_digest = Some(digest);
@@ -3048,7 +3063,6 @@ impl OrgMarkers {
             .iter()
             .map(|marker| marker.position)
             .chain(self.context_position)
-            .chain(self.context_flip_position)
     }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
@@ -3059,7 +3073,6 @@ impl OrgMarkers {
         self.context_changed = false;
         if self.context_position.is_none() {
             self.context_position = Some(0);
-            self.context_flip_position = Some(0);
         }
         with_context_digest_scrubs(|counter| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5489,10 +5502,10 @@ crate::durable_tail_codec::durable_struct!(OrgMarkers {
     H context_digest: Option<String>,
     N context_changed: bool,
     N context_position: Option<u64>,
-    N context_flip_position: Option<u64>,
+    N context_flip_position: RetiredContextFlipPosition,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
-crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow);
+crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow, RetiredContextFlipPosition);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
     N position: u64,
     U org: Option<String>,
