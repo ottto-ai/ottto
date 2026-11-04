@@ -5582,7 +5582,7 @@ mod header_admission_tests {
             Some(&fixture.directories),
         );
         let cache = Arc::new(SharedCache::default());
-        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(&cache)) {}
+        while !inventory.step_encoded(&CodexTitleMetadata::default(), Some(&cache)) {}
         let key = paths.first().unwrap().clone();
         assert!(cache
             .with_cursor(|cursor| cursor.headers.get(&key))

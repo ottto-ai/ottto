@@ -180,9 +180,6 @@ fn read_header_bytes(
     cache: Option<&Arc<sampled_scan::SharedCache>>,
     read_work: &mut usize,
 ) -> Result<(Vec<u8>, String, usize, FileStamp)> {
-    if cache.is_none() {
-        refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
-    }
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -300,6 +297,7 @@ pub(super) fn header_owner(candidate: &CandidateFile) -> Result<String> {
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
+    refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
     read_header_bytes(candidate, None, &mut 0)
         .map(|(bytes, _, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
@@ -4362,7 +4360,11 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert_eq!(second.bytes_avoided, first.read_bytes);
         READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         assert_eq!(facts(&first), facts(&second));
-        let cold = page(&root, &paths, &sampled_scan::SharedCache::default());
+        let cold = page(
+            &root,
+            &paths,
+            &Arc::new(sampled_scan::SharedCache::default()),
+        );
         assert_eq!(facts(&cold), facts(&second));
         assert_eq!(cold.read_bytes, first.read_bytes);
         READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));

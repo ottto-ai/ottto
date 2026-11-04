@@ -6912,7 +6912,7 @@ fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
             .iter()
             .map(|header| local_index_key(&header.candidate.path))
             .collect();
-        let cache = SharedCache::default();
+        let cache = Arc::new(SharedCache::default());
         let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
         assert!(first.complete);
         let before = cache
@@ -6974,7 +6974,7 @@ pub(in crate::snapshots) fn zero_context(
 
 /// Optional header bytes with a precise measured charge. Uses the real
 /// header decoder; only the cache key's allocation supplies synthetic pressure.
-fn header_pressure(cache: &SharedCache, bytes: usize) -> usize {
+fn header_pressure(cache: &Arc<SharedCache>, bytes: usize) -> usize {
     let (root, fixture) = codex_file_join::tests::fixture();
     let paths = fixture
         .headers
