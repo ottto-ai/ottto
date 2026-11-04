@@ -2846,6 +2846,18 @@ fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence])
 /// Most markers one file may carry before transcript bases switch off for it.
 pub(crate) const MAX_ORG_MARKERS_PER_FILE: usize = 64;
 
+/// 2026-11-05T00:00:00Z (UTC ms). A request whose own provider time is at or
+/// after it follows the latest valid org line; an earlier request keeps the
+/// terminal trust it had, so a cold read equals a stored one.
+pub(crate) const ACCOUNT_RULE_FROM: i64 = 1_793_836_800_000;
+
+/// A provider time (UTC s) at or after `ACCOUNT_RULE_FROM`.
+pub(crate) fn from_account_rule(unix_seconds: Option<u64>) -> bool {
+    unix_seconds
+        .and_then(|at| i64::try_from(at).ok())
+        .is_some_and(|at| at.saturating_mul(1_000) >= ACCOUNT_RULE_FROM)
+}
+
 /// One `credential_org` marker, positioned by the response sequence at its line:
 /// a response with sequence `s` follows it iff `s >= position`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3013,21 +3025,10 @@ impl OrgMarkers {
         });
     }
 
-    /// Without a key: a sentence that could not be compared came at or before
-    /// the marker governing `sequence`, so its flip might have been explained.
-    fn flip_unexplained_for_no_key(&self, sequence: u64) -> bool {
-        !accepted::session_context_key_bound()
-            && self.context_flip_position.is_some_and(|sentence| {
-                self.entries
-                    .iter()
-                    .rev()
-                    .find(|marker| marker.position <= sequence)
-                    .is_some_and(|marker| sentence <= marker.position)
-            })
-    }
-
     /// The marker governing the response with `sequence`, by line order only.
-    pub(crate) fn verdict(&self, sequence: u64, desktop: bool) -> MarkerVerdict<'_> {
+    /// `latest` (Desktop, or a request from `ACCOUNT_RULE_FROM`) trusts any
+    /// valid org line; otherwise an unexplained flip is refused.
+    pub(crate) fn verdict(&self, sequence: u64, latest: bool) -> MarkerVerdict<'_> {
         if self.overflowed {
             return MarkerVerdict::Overflow;
         }
@@ -3041,7 +3042,7 @@ impl OrgMarkers {
         };
         match &marker.org {
             None => MarkerVerdict::BadOrg,
-            Some(_) if !desktop && !marker.terminal_trusted => MarkerVerdict::UntrustedFlip,
+            Some(_) if !latest && !marker.terminal_trusted => MarkerVerdict::UntrustedFlip,
             Some(org) => MarkerVerdict::Trusted(org),
         }
     }
@@ -3069,8 +3070,11 @@ struct AccountRun {
     /// First nonzero usage following this marker: its response position and
     /// `e2` copy status. Zero-usage responses may separate it from the marker.
     copied: Option<(u64, bool)>,
+    /// Starts at `trust_from` with the org of a refused earlier line: never an
+    /// own marker position.
+    split: bool,
 }
-crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
+crate::heap_layout_bound::fields!(AccountRun; position, account, copied, split);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestAccounts {
@@ -3083,6 +3087,9 @@ pub(crate) struct RequestAccounts {
     pub(crate) conflict: bool,
     pub(crate) subagent: bool,
     first_retained: Option<u64>,
+    /// First response sequence whose provider time is from `ACCOUNT_RULE_FROM`;
+    /// org lines govern from it as on Desktop. Kept for native-copy rebuilds.
+    trust_from: Option<u64>,
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
@@ -3101,7 +3108,7 @@ pub(crate) struct RequestAccounts {
     carried: CarryCounts,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis, account_source);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, first_retained, trust_from, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
 
 /// The carry rule's verdicts for one transcript.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3283,12 +3290,15 @@ impl Carry<'_> {
 /// One account policy for `e2`. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
 /// Subagents are assigned their root's starting account at page finalization.
+/// From `trust_from` every valid org line governs (rule 8: the request's own
+/// time); earlier requests keep the terminal trust rule.
 pub(crate) fn request_accounts(
     markers: Option<&OrgMarkers>,
     bound: Option<&str>,
     first_sequence: Option<u64>,
     subagent: bool,
     excluded: &[u64],
+    trust_from: Option<u64>,
 ) -> RequestAccounts {
     let bound = bound.filter(|hash| wire_login_is_valid(hash)).map(|login| {
         Arc::new(AuthorityKey {
@@ -3303,6 +3313,7 @@ pub(crate) fn request_accounts(
         fallback: bound.clone(),
         bound,
         subagent,
+        trust_from,
         ..Default::default()
     };
     if subagent {
@@ -3324,7 +3335,7 @@ pub(crate) fn request_accounts(
             .filter(own_marker)
             .filter(|marker| marker.position <= first)
         {
-            if let Some(org) = marker.org.as_deref().filter(|_| marker.terminal_trusted) {
+            if let Some(org) = marker.org.as_deref() {
                 accounts.starting = Some(Arc::new(AuthorityKey {
                     login: None,
                     org: Some(org.to_owned()),
@@ -3335,6 +3346,7 @@ pub(crate) fn request_accounts(
                     position: marker.position,
                     account: accounts.starting.clone(),
                     copied: None,
+                    split: false,
                 });
             }
         }
@@ -3343,9 +3355,18 @@ pub(crate) fn request_accounts(
     accounts.conflict = markers.overflowed;
     // Positions where one request carries two different orgs (R3-N2).
     let mut contradicted = Vec::new();
+    // A refused org line still governing at `trust_from` starts a run there
+    // with its org; a real line at `trust_from` needs none (no R3-N2).
+    let mut refused: Option<&str> = None;
     for marker in markers.entries.iter().filter(own_marker) {
+        if let Some(from) = trust_from.filter(|from| marker.position >= *from) {
+            if let Some(org) = refused.take().filter(|_| marker.position > from) {
+                push_org_run(&mut accounts, from, org, true);
+            }
+        }
         let Some(org) = marker.org.as_deref().filter(|_| {
             marker.terminal_trusted
+                || trust_from.is_some_and(|from| marker.position >= from)
                 || accounts
                     .runs
                     .iter()
@@ -3354,6 +3375,7 @@ pub(crate) fn request_accounts(
                     .map_or(true, |key| key.org.as_deref() == marker.org.as_deref())
         }) else {
             accounts.conflict = true;
+            refused = marker.org.as_deref();
             if accounts
                 .runs
                 .last()
@@ -3363,10 +3385,12 @@ pub(crate) fn request_accounts(
                     position: marker.position,
                     account: None,
                     copied: None,
+                    split: false,
                 });
             }
             continue;
         };
+        refused = None;
         if let Some(previous) = accounts.runs.last() {
             if previous.position == marker.position {
                 if previous.account.as_ref().and_then(|key| key.org.as_deref()) != Some(org) {
@@ -3376,32 +3400,10 @@ pub(crate) fn request_accounts(
                 continue;
             }
         }
-        let key = accounts
-            .starting
-            .as_ref()
-            .filter(|key| key.org.as_deref() == Some(org))
-            .cloned()
-            .or_else(|| {
-                accounts.runs.iter().find_map(|run| {
-                    run.account
-                        .as_ref()
-                        .filter(|key| key.org.as_deref() == Some(org))
-                        .cloned()
-                })
-            })
-            .unwrap_or_else(|| {
-                Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                    account_source: None,
-                })
-            });
-        accounts.runs.push(AccountRun {
-            position: marker.position,
-            account: Some(key),
-            copied: None,
-        });
+        push_org_run(&mut accounts, marker.position, org, false);
+    }
+    if let Some((from, org)) = trust_from.zip(refused) {
+        push_org_run(&mut accounts, from, org, true);
     }
     // Derive the first own request's start from the accepted own stream,
     // preserving the first observation of a conflicting same-position pair.
@@ -3442,6 +3444,37 @@ pub(crate) fn request_accounts(
     // Keep bounded runs through native copy adjudication so the first
     // retained request can establish the real start even under a conflict.
     accounts
+}
+
+/// A run for `org` at `position`, sharing the start's or an earlier run's key.
+fn push_org_run(accounts: &mut RequestAccounts, position: u64, org: &str, split: bool) {
+    let key = accounts
+        .starting
+        .as_ref()
+        .filter(|key| key.org.as_deref() == Some(org))
+        .cloned()
+        .or_else(|| {
+            accounts.runs.iter().find_map(|run| {
+                run.account
+                    .as_ref()
+                    .filter(|key| key.org.as_deref() == Some(org))
+                    .cloned()
+            })
+        })
+        .unwrap_or_else(|| {
+            Arc::new(AuthorityKey {
+                login: None,
+                org: Some(org.to_owned()),
+                basis: TRANSCRIPT_ORG,
+                account_source: None,
+            })
+        });
+    accounts.runs.push(AccountRun {
+        position,
+        account: Some(key),
+        copied: None,
+        split,
+    });
 }
 
 impl RequestAccounts {
@@ -3563,6 +3596,7 @@ impl RequestAccounts {
                 self.first_retained,
                 false,
                 &excluded,
+                self.trust_from,
             );
             own.first_retained = self.first_retained;
             *self = own;
@@ -3602,6 +3636,7 @@ impl RequestAccounts {
             first_retained.or(self.first_retained),
             false,
             &excluded,
+            self.trust_from,
         );
         own.first_retained = first_retained.or(self.first_retained);
         Some(own)
@@ -3787,7 +3822,7 @@ pub(crate) fn reconcile_request_accounts(
                 .iter()
                 .rev()
                 .find(|run| run.account.is_some());
-            let own_marker = marker.filter(|run| run.position == sequence);
+            let own_marker = marker.filter(|run| run.position == sequence && !run.split);
             // Absence of a paired trace is not a contradiction of an own org.
             // Keep the existing strong-org guards; only genuinely conflicting
             // telemetry is disclosed, never used to relocate an own org run.
@@ -4098,17 +4133,10 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
     }
 }
 
-crate::local_resource_diagnostics::process_static!(fn with_no_key_flip_refusals:
-    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
-
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "budget::Counts::is_empty")]
     identity_cap: budget::Counts,
-    /// Requests refused as an organization flip with no attribution key to
-    /// compare the sentence before it. At most what a key would have explained.
-    #[serde(skip_serializing_if = "is_zero")]
-    claude_no_key_flip_refusals: u64,
     /// Retained Claude parses scrubbed on an attribution key change.
     #[serde(skip_serializing_if = "is_zero")]
     claude_context_digest_scrubs: u64,
@@ -4120,9 +4148,6 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
     IdentityCounts {
         identity_cap: budget::take_counts(),
         claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
-            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
-        }),
-        claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
             counter.swap(0, std::sync::atomic::Ordering::Relaxed)
         }),
     }
@@ -4788,6 +4813,9 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             return;
         }
         let (sequence, event_clock_complete) = request.occurrence.unzip();
+        let terminal_unix_seconds = request
+            .occurrence
+            .and_then(|_| rfc3339_unix_seconds(request.timestamp));
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -4797,27 +4825,17 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             // record which; as in the legacy account path they cannot qualify. The trace span start
             // is event-origin but no existing rule qualifies it, and transcript
             // clocks are not theirs to borrow.
-            terminal_unix_seconds: request
-                .occurrence
-                .and_then(|_| rfc3339_unix_seconds(request.timestamp)),
+            terminal_unix_seconds,
             event_clock_complete: event_clock_complete.unwrap_or(false),
             marker: match (item.claude_org_markers.as_deref(), sequence) {
-                (Some(markers), Some(sequence)) => markers.verdict(sequence, self.desktop),
+                (Some(markers), Some(sequence)) => markers.verdict(
+                    sequence,
+                    self.desktop || from_account_rule(terminal_unix_seconds),
+                ),
                 _ => MarkerVerdict::None,
             },
         };
         let identity = classify_ref(self.evidence, &facts);
-        if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
-            && item
-                .claude_org_markers
-                .as_deref()
-                .zip(sequence)
-                .is_some_and(|(markers, at)| markers.flip_unexplained_for_no_key(at))
-        {
-            with_no_key_flip_refusals(|counter| {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            });
-        }
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
@@ -5191,17 +5209,21 @@ fn request_occurrence_facts<'a>(
         .as_ref()
         .and_then(|origin| origin.entrypoint.as_deref())
         == Some("claude-desktop");
+    let terminal_unix_seconds = rfc3339_unix_seconds(timestamp);
     Some(RequestFacts {
         root,
         source_session_id: &item.source_session_id,
         request_id,
-        terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
+        terminal_unix_seconds,
         event_clock_complete: occurrence.event_clock_complete,
         marker: item
             .claude_org_markers
             .as_deref()
             .map_or(MarkerVerdict::None, |markers| {
-                markers.verdict(occurrence.sequence, desktop)
+                markers.verdict(
+                    occurrence.sequence,
+                    desktop || from_account_rule(terminal_unix_seconds),
+                )
             }),
     })
 }
@@ -5288,11 +5310,6 @@ fn tag_item(
             )
             .any(|row| !local_subscription(row))
         {
-            return None;
-        }
-        // Single-account markerless bodies keep their established account-path wire
-        // shape. The account owner already tagged their final usage uniformly.
-        if keeps_markerless_account(item) {
             return None;
         }
         let mut grouping = request_owned_grouping(item)?;
@@ -5440,6 +5457,9 @@ crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_ha
 
 #[cfg(test)]
 mod context_digest_tests;
+
+#[cfg(test)]
+mod org_line_tests;
 
 #[cfg(test)]
 mod request_owned_contract_tests {

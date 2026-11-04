@@ -372,10 +372,6 @@ pub(crate) fn bind_test_session_context_key(key: Option<[u8; 32]>) {
     });
 }
 
-pub(super) fn session_context_key_bound() -> bool {
-    with_session_context_key(|bound| matches!(bound, Some(Some(_))))
-}
-
 fn truncated(digest: [u8; 32]) -> [u8; 16] {
     digest[..16].try_into().expect("16-byte prefix")
 }

@@ -13602,15 +13602,6 @@ impl SnapshotAccumulator {
                 self.fallback_bucket_timestamp(None),
             )
         });
-        if let Some(money) = money.as_mut() {
-            money.set_identity(
-                self.claude_org_markers.as_deref(),
-                self.account_identifier_hash.as_deref(),
-                self.source_session_id.as_deref(),
-                money_context.as_ref(),
-                responses.first().map(|response| response.sequence),
-            );
-        }
         crate::local_resource_diagnostics::claude_record_counts(
             self.claude_response_record_count,
             responses
@@ -13620,13 +13611,42 @@ impl SnapshotAccumulator {
                 .unwrap_or(0),
             CLAUDE_RECORDS_PER_FILE_ALARM,
         );
+        let first_sequence = responses.first().map(|response| response.sequence);
+        // Resolve the sorted book first: org lines govern from the first
+        // response whose provider time is from `ACCOUNT_RULE_FROM`.
+        let responses = responses
+            .into_iter()
+            .map(|response| response.resolve_classified(&selectors))
+            .collect::<Vec<_>>();
+        if let Some(money) = money.as_mut() {
+            let trust_from = responses
+                .iter()
+                .flatten()
+                .find(|response| {
+                    claude_request_identity::from_account_rule(
+                        response
+                            .terminal_timestamp
+                            .as_deref()
+                            .and_then(rfc3339_unix_seconds),
+                    )
+                })
+                .map(|response| response.sequence);
+            money.set_identity(
+                self.claude_org_markers.as_deref(),
+                self.account_identifier_hash.as_deref(),
+                self.source_session_id.as_deref(),
+                money_context.as_ref(),
+                first_sequence,
+                trust_from,
+            );
+        }
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         // The previous resolved response's end when it ended a turn (no tool
         // use); `None` after a tool use or an unresolved response. A response
         // whose prompt follows it starts a turn: the time between is idle.
         let mut turn_end: Option<String> = None;
         for response in responses {
-            let mut response = match response.resolve_classified(&selectors) {
+            let mut response = match response {
                 Ok(response) => response,
                 // With the `e2` gate on, a resolver conflict is counted
                 // and disclosed on the body (resolver_conflict_count) and the

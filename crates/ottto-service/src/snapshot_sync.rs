@@ -22692,6 +22692,10 @@ mod tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }
         #[cfg(unix)]
+        mod claude_org_line_money_tests {
+            include!("snapshot_sync/claude_org_line_money_tests.rs");
+        }
+        #[cfg(unix)]
         mod claude_telemetry_retention_tests {
             include!("snapshot_sync/claude_telemetry_retention_tests.rs");
         }
