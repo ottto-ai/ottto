@@ -268,8 +268,14 @@ class RetryTests(unittest.TestCase):
             (root / 'b').mkdir()
             (root / 'b' / 'owed').mkdir()
             (root / 'b' / 'owed' / 'tests.rs').write_text('money_oracle::assert_held();\n')
+            (root / 'b' / 'cursor.rs').write_text(
+                '#[cfg(test)]\n#[path = "cursor_tests.rs"]\npub(in crate::b) mod tests;\n')
+            (root / 'b' / 'cursor_tests.rs').write_text('money_oracle::assert_held();\n')
+            (root / 'c' / 'tests').mkdir(parents=True)
+            (root / 'c' / 'tests' / 'mod.rs').write_text('money_oracle::assert_held();\n')
             modules = runner.oracle_modules(root)
-        self.assertEqual(modules, {'route_tests', 'a', 'owed::tests'})
+        self.assertEqual(modules, {'route_tests', 'a', 'owed::tests', 'cursor_tests', 'cursor::tests', 'c::tests'})
+        self.assertTrue(runner.never_retry('b::cursor::tests::x', set(), modules))
         self.assertTrue(runner.never_retry('s::route_tests::x', set(), modules))
         self.assertFalse(runner.never_retry('s::plain_tests::x', set(), modules))
         self.assertTrue(runner.never_retry('b::owed::tests::x', set(), modules))
@@ -277,7 +283,11 @@ class RetryTests(unittest.TestCase):
         self.assertFalse(runner.never_retry('relay::legacy::tests::x', set(), modules))
         self.assertFalse(runner.never_retry('owed::other::tests::x', set(), modules))
         source = SCRIPT.parent.parent / 'crates'
-        self.assertIn('copy_prefix_route_tests', runner.oracle_modules(source))
+        real = runner.NEVER_RETRY_MODULES | runner.oracle_modules(source)
+        self.assertIn('copy_prefix_route_tests', real)
+        self.assertNotIn('tests', real)
+        self.assertTrue(runner.never_retry('snapshots::sampled_scan::codex_cursor::tests::x', set(), real))
+        self.assertTrue(runner.never_retry('snapshot_sync::stale_owed::tests::x', set(), real))
 
     def test_retry_passes_kills_on_timeout_and_reports(self):
         lock = threading.Lock()
