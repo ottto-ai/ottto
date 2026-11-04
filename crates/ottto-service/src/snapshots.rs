@@ -1341,7 +1341,7 @@ pub(crate) use wire::content_hash::{
 pub(crate) use wire::{
     declares_usage_decrease_hold_ack, ACCOUNT_SOURCE_CONTRACT,
     CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
-    MAX_SESSION_ARTIFACT_VALUE_CHARS,
+    CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS, MAX_SESSION_ARTIFACT_VALUE_CHARS,
 };
 pub use wire::{
     AccountSource, ClaudeRemovedUsage, CopyUnprovenCounts, SessionAccountEvidence, SessionArtifact,

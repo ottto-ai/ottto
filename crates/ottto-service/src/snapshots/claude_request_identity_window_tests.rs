@@ -2679,7 +2679,8 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     assert!(uploadable.is_empty());
 
     // The same last resort covers non-byte caps: no second strip/hold policy.
-    let (mut key_item, mut key_proof) = sticky_session(6);
+    // Three new keys per hour: one more hour than the key cap holds.
+    let (mut key_item, mut key_proof) = sticky_session(identity::MAX_AUTHORITY_KEYS / 3 + 1);
     sticky_receiver_totals(&mut key_item);
     for (index, contribution) in key_proof.iter_mut().enumerate() {
         contribution.identity = RequestIdentity::Tagged(AuthorityKey {

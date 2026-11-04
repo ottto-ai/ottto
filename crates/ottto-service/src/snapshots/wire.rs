@@ -659,6 +659,10 @@ pub(crate) const CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS: &str = "multiple_acc
 /// billed request, so the account stays unproven.
 pub(crate) const CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE: &str =
     "incomplete_request_evidence";
+/// Request evidence names more accounts than one item may carry
+/// (`MAX_AUTHORITY_KEYS` / `MAX_EVIDENCE_ENTRIES`), so the session is held
+/// and not uploaded. Local only, like the other reasons.
+pub(crate) const CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS: &str = "too_many_accounts";
 
 /// Cumulative usage removed from this entity's evidence, in wire counters.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
