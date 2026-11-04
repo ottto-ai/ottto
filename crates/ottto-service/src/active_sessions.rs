@@ -31,7 +31,6 @@ use crate::snapshots::{
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
 const WATERMARK_RETENTION_DAYS: i64 = 90;
-const MAX_WATERMARKS: usize = 5_000;
 const MAX_ACTIVE_SESSIONS: usize = 100;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -170,22 +169,6 @@ fn reconcile_with_registrations(
             .map(|timestamp| timestamp >= watermark_cutoff)
             .unwrap_or(false)
     });
-    if cache.watermarks.len() > MAX_WATERMARKS {
-        let mut newest = cache
-            .watermarks
-            .iter()
-            .map(|(session_id, timestamp)| (timestamp.clone(), session_id.clone()))
-            .collect::<Vec<_>>();
-        newest.sort_by(|left, right| right.cmp(left));
-        newest.truncate(MAX_WATERMARKS);
-        let keep = newest
-            .into_iter()
-            .map(|(_, session_id)| session_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        cache
-            .watermarks
-            .retain(|session_id, _| keep.contains(session_id));
-    }
 
     let changed_session_count = changed.len() as u64;
     let mut sessions = changed.into_values().collect::<Vec<_>>();
@@ -1483,6 +1466,36 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
+    }
+
+    #[test]
+    fn watermarks_expire_by_age_only() {
+        let dir = temp_dir("watermark-age");
+        let path = active_session_cache_path(&dir, SnapshotSource::ClaudeCode);
+        let mut cache = ActiveSessionCache::default();
+        for index in 0..5_001 {
+            cache.watermarks.insert(
+                format!("recent-{index}"),
+                "2026-07-01T00:00:00Z".to_string(),
+            );
+        }
+        cache
+            .watermarks
+            .insert("expired".to_string(), "2026-04-01T00:00:00Z".to_string());
+        write_cache(&path, &cache).unwrap();
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            None,
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        let cache = read_cache(&path);
+        assert_eq!(cache.watermarks.len(), 5_001);
+        assert!(!cache.watermarks.contains_key("expired"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

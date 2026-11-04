@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,7 +22,6 @@ pub(crate) enum Hold {
     ReloadRequired,
     SaveFull,
     ReferenceDrift,
-    AckCustody,
 }
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,7 +35,6 @@ impl std::fmt::Display for Hold {
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
-            Self::AckCustody => "state_v2_ack_custody_hold",
         })
     }
 }
@@ -139,19 +137,12 @@ struct RouteState {
     requested_page: usize,
     save_hold: Option<Hold>,
     pass_written_start: Option<u64>,
-    // Live ACK custody exceeded the companion bound: no collection before this.
-    custody_retry_at: Option<Instant>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
 }
 impl RouteState {
-    fn custody_held(&self) -> bool {
-        self.custody_retry_at.is_some_and(|at| Instant::now() < at)
-    }
     fn report_hold(&self) {
-        if self.custody_held() {
-            telemetry::event("hold", &Hold::AckCustody);
-        } else if let Some(hold) = self.save_hold {
+        if let Some(hold) = self.save_hold {
             telemetry::event("hold", &hold);
         } else {
             telemetry::event("hold", &"none");
@@ -203,7 +194,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     requested_page: 250,
                     save_hold: None,
                     pass_written_start: None,
-                    custody_retry_at: None,
                     tail: Default::default(),
                 }))
             })
@@ -341,33 +331,23 @@ fn load_with_custody(
                     if let Some(stamp) = stamp
                         .filter(|stamp| session.identity == identity && session.stamp == *stamp)
                     {
-                        super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
-                        telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
                         // Reuse the connection, but hydrate the durable graph each pass.
                         let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-                        let (mut index, mut cx) = import::hydrate_context(&mut session.db)?;
-                        telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
-                        #[cfg(test)]
-                        if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take)
-                        {
-                            let stamps = sqlite::delete_row_elsewhere_for_test(&session.db, &key);
-                            tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
-                        }
-                        ensure!(index.generation == stamp.0, Hold::DbUnavailable);
                         // The image read must be the stamp this session holds:
                         // after a commit from elsewhere neither its baseline
                         // nor its lineage is adopted; reopen below.
-                        if session.db.stamp()? == stamp {
-                            // Digest the exact persisted image: a save then
-                            // also persists whatever normalization changes.
-                            let digests = kinds::baseline(&index, &mut cx)?;
-                            telemetry::hydrate_checkpoint(
-                                "hydrate_after_baseline",
-                                digests.rows.len(),
-                                Some(&cx),
-                            );
-                            normalize_hydrated(&mut index, binding.source)?;
-                            state.save_digests = Some(digests);
+                        let image = hydrate_image(
+                            &mut session.db,
+                            &identity,
+                            stamp,
+                            path,
+                            binding.source,
+                            |index, db| {
+                                ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                                Ok((db.stamp()? == stamp).then_some(stamp))
+                            },
+                        )?;
+                        if let Some((mut index, mut cx, digests, _)) = image {
                             // Same session and stamp: rollovers its commits
                             // wrote stay committed for graphs that outlive
                             // this load.
@@ -375,11 +355,7 @@ fn load_with_custody(
                                 cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                             }
                             session.cx = cx;
-                            telemetry::hydrate_checkpoint(
-                                "hydrate_exit",
-                                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
-                                Some(&session.cx),
-                            );
+                            adopt(state, digests, &session.cx);
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
                             state.report_hold();
                             telemetry::event("route", &"v2");
@@ -396,24 +372,22 @@ fn load_with_custody(
             let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
             let stamp = db.stamp().context("state_v2_open_stamp")?;
-            super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)
-                .context("state_v2_open_recover")?;
-            telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
-            let (mut index, mut cx) =
-                import::hydrate_context(&mut db).context("state_v2_open_hydrate")?;
-            telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
-            let stamp = db.stamp().context("state_v2_open_stamp")?;
-            ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-            let digests = kinds::baseline(&index, &mut cx)?;
-            telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
-            normalize_hydrated(&mut index, binding.source).context("state_v2_open_normalize")?;
+            let image = hydrate_image(
+                &mut db,
+                &identity,
+                stamp,
+                path,
+                binding.source,
+                |index, db| {
+                    let stamp = db.stamp().context("state_v2_open_stamp")?;
+                    ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                    Ok(Some(stamp))
+                },
+            )?;
+            // The reopen check always passes; a stale image fails above.
+            let (mut index, cx, digests, stamp) = image.ok_or(Hold::DbUnavailable)?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
-            state.save_digests = Some(digests);
-            telemetry::hydrate_checkpoint(
-                "hydrate_exit",
-                state.save_digests.as_ref().map_or(0, |d| d.rows.len()),
-                Some(&cx),
-            );
+            adopt(state, digests, &cx);
             index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
             register(state, &index)?;
             state.report_hold();
@@ -476,6 +450,46 @@ fn load_with_custody(
         })?;
     }
     result
+}
+/// A hydrated graph, its context and baseline, and the stamp they were read at.
+type Image = (ScanIndex, KindCx, kinds::Baseline, (u64, u64));
+/// One hydrate of the durable image: ACK progress recovery before decode,
+/// then the caller's freshness check, then the baseline before
+/// normalization. `fresh` returns the stamp the image belongs to; `None`
+/// means the image is stale and nothing from it may be adopted.
+fn hydrate_image(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    stamp: (u64, u64),
+    path: &Path,
+    source: super::super::scan_index_persistence::Source,
+    fresh: impl FnOnce(&ScanIndex, &sqlite::Sqlite) -> Result<Option<(u64, u64)>>,
+) -> Result<Option<Image>> {
+    super::ack::ProgressRecovery::recover_route(identity, stamp.0, path)
+        .context("state_v2_open_recover")?;
+    telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
+    let (mut index, mut cx) = import::hydrate_context(db).context("state_v2_open_hydrate")?;
+    telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
+    #[cfg(test)]
+    if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take) {
+        let stamps = sqlite::delete_row_elsewhere_for_test(db, &key);
+        tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
+    }
+    let Some(stamp) = fresh(&index, &*db)? else {
+        return Ok(None);
+    };
+    // Digest the exact persisted image: a save then also persists whatever
+    // normalization changes.
+    let digests = kinds::baseline(&index, &mut cx)?;
+    telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
+    normalize_hydrated(&mut index, source).context("state_v2_open_normalize")?;
+    Ok(Some((index, cx, digests, stamp)))
+}
+
+/// The hydrated baseline becomes the next save's baseline.
+fn adopt(state: &mut RouteState, digests: kinds::Baseline, cx: &KindCx) {
+    telemetry::hydrate_checkpoint("hydrate_exit", digests.rows.len(), Some(cx));
+    state.save_digests = Some(digests);
 }
 fn normalize_hydrated(
     index: &mut ScanIndex,
@@ -815,7 +829,7 @@ fn growth_claim_txn(
         ensure!(baseline.generation == expected, Hold::ReloadRequired);
     }
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
-    let mut span = kinds::SaveSpan::begin(db);
+    let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
     let mut tx = db.begin(TxnMode::Write)?;
     let mut old = mapper::Digests::new();
@@ -840,27 +854,17 @@ fn growth_claim_txn(
     let digests = writer.finish()?;
     // COMMIT re-checks the generation control against G inside this write.
     let outcome = tx.commit(expected, next);
-    span.outcome(&outcome);
-    let refused = outcome == DurableCommitOutcome::NotPublished;
-    span.emit(db, if refused { expected } else { next });
-    match outcome {
-        DurableCommitOutcome::Committed(generation) if generation == next => {
-            if let Some(baseline) = baseline {
-                // A reclaimed member can return with identical bytes; its old
-                // digest would skip recreating it. Replace manifest and members.
-                baseline.rows.retain(
-                    |key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND),
-                );
-                baseline.rows.extend(digests);
-                baseline.generation = next;
-            }
-            Ok((true, rows))
-        }
-        DurableCommitOutcome::NotPublished => {
-            bail!(db.save_failure().unwrap_or(Hold::ReloadRequired))
-        }
-        _ => bail!(Hold::ReloadRequired),
+    kinds::commit_next(db, span, outcome, expected, next)?;
+    if let Some(baseline) = baseline {
+        // A reclaimed member can return with identical bytes; its old digest
+        // would skip recreating it. Replace manifest and members.
+        baseline
+            .rows
+            .retain(|key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND));
+        baseline.rows.extend(digests);
+        baseline.generation = next;
     }
+    Ok((true, rows))
 }
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, published(path)?)? {
@@ -964,35 +968,6 @@ pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf
     Ok(Some(
         guard.as_ref().ok_or(Hold::ReloadRequired)?.path.clone(),
     ))
-}
-
-/// Live custody alone exceeds the companion bound. Pace collection at the
-/// growth-full interval: one parse/admission retry per interval, no POST in
-/// between, and owed debt stays in the unchanged index/progress.
-pub(in super::super) fn hold_ack_custody(path: &Path) {
-    let retry_at =
-        Instant::now() + Duration::from_secs(super::super::sampled_audit::GROWTH_FULL_INTERVAL);
-    if with_state(path, |state| {
-        state.custody_retry_at = Some(retry_at);
-        Ok(())
-    })
-    .is_ok()
-    {
-        telemetry::event("hold", &Hold::AckCustody);
-        telemetry::count("ack_custody_hold_alarm", 1);
-    }
-}
-
-/// Existing routes only: an admission probe never adds a registry slot.
-pub(in super::super) fn ack_custody_held(path: &Path) -> bool {
-    let Some(state) = states()
-        .lock()
-        .ok()
-        .and_then(|states| states.get(path).cloned())
-    else {
-        return false;
-    };
-    state.lock().is_ok_and(|state| state.custody_held())
 }
 
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
@@ -1257,195 +1232,11 @@ fn read_txn_at<R>(
     f(&mut tx, stamp)
 }
 
-/// Cold usage pending: load the families a page names before it
-/// accumulates, each stored row read in one short read transaction and
-/// matching its head (a patched head's flag applied). A missing, changed or
-/// unreadable row, or a store this graph does not hold, is Unknown and the
-/// caller refuses its whole decision. Counted. Nothing installs unless every
-/// wanted row was read.
-pub(in super::super) fn load_usage(
-    index: &mut ScanIndex,
-    roots: &std::collections::BTreeSet<String>,
-) -> Result<()> {
-    let usage = &index.claude_usage_family_pending;
-    let Some(cold) = usage.cold() else {
-        return Ok(());
-    };
-    let unread = usage.unloaded(roots.iter().map(String::as_str));
-    if unread.is_empty() {
-        return Ok(());
-    }
-    let read = read_txn(index, |tx| {
-        let mut read = Vec::with_capacity(unread.len());
-        for root in unread {
-            let (value, digest) =
-                cold.head_row(&root, mapper::read_row(tx, "usage.pending", &root)?)?;
-            read.push((root, value, digest));
-        }
-        Ok(read)
-    });
-    let (read, _) = match read {
-        Ok(read) => read,
-        Err(error) => {
-            telemetry::count("usage_pending_unknown", 1);
-            return Err(error);
-        }
-    };
-    let Some(cold) = index.claude_usage_family_pending.cold_mut() else {
-        return Ok(());
-    };
-    for (root, value, digest) in read {
-        cold.install(root, value, digest)?;
-    }
-    Ok(())
-}
-
-/// One slice of an ordered usage visit stops before the next family once it
-/// has visited `families`, or once the families it decoded measure `bytes`
-/// of heap. It always visits at least one family, so a family over `bytes`
-/// runs alone in its slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in super::super) struct SliceBudget {
-    pub(in super::super) families: usize,
-    pub(in super::super) bytes: usize,
-}
-impl SliceBudget {
-    /// The whole visit in one slice.
-    pub(in super::super) const WHOLE: Self = Self {
-        families: usize::MAX,
-        bytes: usize::MAX,
-    };
-}
-
-/// What every slice of one sliced visit, and its commit, must find equal:
-/// the store stamp the slice read under (`None`: a resident graph, nothing
-/// stored) and the family count. Each stored row is checked against its head
-/// as it is read, and the caller's visited total must equal `families`.
-/// Any difference refuses the whole decision; nothing is partial.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in super::super) struct UsageToken {
-    pub(in super::super) stamp: Option<(u64, u64)>,
-    pub(in super::super) families: usize,
-}
-
-/// How a slice ended. `last_root`: resume after it; `None`: no family is left.
-/// `decoded_bytes`: heap of the stored rows this slice decoded, measured on
-/// each decoded value (loaded values are not decoded and count none). A
-/// layout the bound cannot measure counts as `usize::MAX`, so its family
-/// ends the slice.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(in super::super) struct SliceEnd {
-    pub(in super::super) last_root: Option<String>,
-    pub(in super::super) visited: usize,
-    pub(in super::super) decoded_bytes: usize,
-    pub(in super::super) token: UsageToken,
-}
-
-/// Usage-pending families in ascending root order, from the first root after
-/// `after`, one slice under `budget`: every family (`None`) or the named ones
-/// (`Some`). Each is the graph's loaded value at its root position, else its
-/// stored row, which must match its head (a patched head's flag applied).
-/// Keeps nothing and installs nothing; one short read transaction per slice,
-/// over one ascending range of rows for a whole visit, keyed for a targeted
-/// one. Unknown, counted: a row unlike its head, a head without a row, or a store
-/// this graph does not hold.
-pub(in super::super) fn visit_usage_ordered(
-    index: &ScanIndex,
-    roots: Option<&std::collections::BTreeSet<String>>,
-    after: Option<&str>,
-    budget: SliceBudget,
-    f: &mut dyn FnMut(&str, &super::super::ClaudeUsageFamilyPending),
-) -> Result<SliceEnd> {
-    use super::super::usage_pending::{Unknown, UsageView};
-    let usage = &index.claude_usage_family_pending;
-    let families = usage.len();
-    let mut end = SliceEnd::default();
-    let mut slice = |mut tx: Option<&mut dyn Transaction>| -> Result<()> {
-        // A stored whole visit reads its rows over one ascending range per
-        // slice; a targeted one reads only its named keys.
-        let limit = budget.families.saturating_add(1).min(128);
-        let mut range = match (roots, &tx) {
-            (None, Some(_)) => Some(mapper::KeyRows::new("usage.pending", after, limit)?),
-            _ => None,
-        };
-        let views: Box<dyn Iterator<Item = (&String, UsageView<'_>)> + '_> = match roots {
-            None => usage.views_after(after),
-            Some(roots) => {
-                use std::ops::Bound;
-                let from = after.map_or(Bound::Unbounded, Bound::Excluded);
-                Box::new(
-                    roots
-                        .range::<str, _>((from, Bound::Unbounded))
-                        .filter_map(|root| Some((root, usage.view(root)?))),
-                )
-            }
-        };
-        let mut views = views.peekable();
-        while let Some((root, view)) = views.next() {
-            match view {
-                UsageView::Full(family) => f(root, family),
-                UsageView::Head(_) => {
-                    let tx = tx.as_deref_mut().ok_or(Unknown)?;
-                    let row = match range.as_mut() {
-                        Some(range) => range
-                            .row(tx, root)?
-                            .map(|h| mapper::read_digest(tx, &h))
-                            .transpose()?,
-                        None => mapper::read_row(tx, "usage.pending", root)?,
-                    };
-                    let cold = usage.cold().ok_or(Unknown)?;
-                    let (family, _) = cold.head_row(root, row)?;
-                    let bytes = crate::heap_layout_bound::completed_bound(&family, usize::MAX)
-                        .unwrap_or(usize::MAX);
-                    f(root, &family);
-                    end.decoded_bytes = end.decoded_bytes.saturating_add(bytes);
-                }
-            }
-            end.visited += 1;
-            if views.peek().is_some()
-                && (end.visited >= budget.families || end.decoded_bytes >= budget.bytes)
-            {
-                end.last_root = Some(root.clone());
-                break;
-            }
-        }
-        Ok(())
-    };
-    let result = match usage.cold() {
-        None => slice(None).map(|()| None),
-        Some(_) => read_txn(index, |tx| slice(Some(tx))).map(|((), stamp)| Some(stamp)),
-    };
-    match result {
-        Ok(stamp) => {
-            end.token = UsageToken { stamp, families };
-            Ok(end)
-        }
-        Err(error) => {
-            telemetry::count("usage_pending_unknown", 1);
-            Err(error)
-        }
-    }
-}
-
-/// End a decision that loaded cold usage families: values unchanged since
-/// their row was read return to heads, except the `keep` families.
-pub(in super::super) fn settle_usage(
-    index: &mut ScanIndex,
-    keep: &std::collections::BTreeSet<String>,
-) {
-    if let Some(cold) = index.claude_usage_family_pending.cold_mut() {
-        cold.settle(keep, |family| mapper::digest(family).ok());
-    }
-}
-
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::{
-    delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
-    with_session_db,
-};
+pub(in super::super) use tests::{erase_published, materialized, with_session_db};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]

@@ -25,8 +25,7 @@ pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
-    idle, load_locked, load_usage, published, recovery_save_guard, runtime_path, save_locked,
-    settle_usage, visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
+    idle, load_locked, published, recovery_save_guard, runtime_path, save_locked,
 };
 mod catalogue;
 mod codec;
@@ -50,8 +49,8 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    dispose_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
-    retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
+    erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails, retire_tail,
+    set_aside_tail, stage_tail, tail_head_keys, tail_route_path, tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
@@ -59,9 +58,8 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
     reason = "the acquisition cutover consumes these staged types"
 )]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, Disposition, InventoryFacts,
-    NoUploadRequired, Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile,
-    TailHead,
+    Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, NoUploadRequired,
+    Observation, Representation, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's

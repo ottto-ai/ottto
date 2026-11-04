@@ -2,9 +2,7 @@
 //! A source the store serves adds a row here, never a second test body.
 use super::*;
 use crate::snapshots::scan_index_persistence::Source;
-use crate::snapshots::{
-    CodexParentProofOwed, CodexParentProofState, LoadOrigin, OwedOrigin, SnapshotSource,
-};
+use crate::snapshots::{LoadOrigin, SnapshotSource};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -27,7 +25,8 @@ const PI_EMPTY: &str =
 
 /// Pi has no Pi-only kind (its fork ledger lives in the durable tail record):
 /// every shared file-owned and accepted kind non-default, with each optional
-/// entry field present once, one owed file and one confirmed-empty file.
+/// entry field present once, one file not yet fingerprinted and one
+/// confirmed-empty file.
 fn pi_fixture() -> ScanIndex {
     let receipt = json!({
         "context_fingerprint": "1".repeat(64),
@@ -57,7 +56,6 @@ fn pi_fixture() -> ScanIndex {
                 "modified_unix_seconds": 1_793_088_000_u64,
                 "source_file_fingerprint": "",
                 "last_snapshot_fingerprint": null,
-                "evidence_owed": true,
             },
         },
         "terminal_jsonl_dispositions": {
@@ -87,47 +85,8 @@ fn codex_fixture() -> ScanIndex {
         .file_snapshot_fingerprints
         .insert(key.into(), BTreeSet::from([fingerprint.clone()]));
     index.accepted_snapshot_fingerprints.insert(fingerprint);
-    let owed = CodexParentProofOwed::new(
-        "parent".into(),
-        1,
-        crate::snapshots::CAUSE_NO_EVIDENCE,
-        OwedOrigin::Lineage,
-    );
-    index
-        .codex_parent_prefix_proofs
-        .insert("child".into(), CodexParentProofState::Owed(owed));
-    let stamp = json!({"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]});
-    let seal = json!({"stamp":stamp,"scope":crate::snapshots::codex_parent_side_scope().0,
-        "sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),
-        "verified_unix_seconds":1,"sealed_unix_seconds":1});
     let mut value = serde_json::to_value(&index).unwrap();
     for (field, replacement) in [
-        ("codex_parent_ownership_refs", json!(["member"])),
-        (
-            "codex_parent_ownership_ledgers",
-            json!({"parent":{"signatures":["signature"],"scan_complete":true}}),
-        ),
-        (
-            "codex_parent_side_requests",
-            json!({"parent":{"dev_ino":[1,2],"needed_extent":1,"state":{"kind":"live"},
-                "state_extent":1,"state_ctime":[1,0],"attempt_extent":1,"attempt_ctime":[1,0],
-                "attempts":1,"not_before_unix_seconds":1}}),
-        ),
-        (
-            "codex_parent_side",
-            json!({"parent":{"verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,
-                "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
-                "seal":seal}}),
-        ),
-        ("codex_parent_side_generation", json!(1)),
-        ("codex_parent_proof_wrap_epoch", json!(1)),
-        ("codex_parent_proof_cursor", json!("child")),
-        ("codex_parent_side_cursor", json!("parent")),
-        ("codex_parent_proof_seq", json!(1)),
-        (
-            "codex_proof_index_incarnation",
-            json!("0123456789abcdef0123456789abcdef"),
-        ),
         (
             "codex_counting_tombstones",
             json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}}),
@@ -171,7 +130,7 @@ impl Drop for Route {
 
 /// Serialized graph with cold rows read back from the session store.
 fn view(index: &ScanIndex) -> serde_json::Value {
-    let cold = index.claude_usage_family_pending.cold().is_some();
+    let cold = money_test_support::has_cold_archive(index);
     serde_json::to_value(if cold {
         money_test_support::resident(index)
     } else {
@@ -189,7 +148,6 @@ fn assert_same(expected: &ScanIndex, actual: &ScanIndex) {
 }
 fn page(mut index: ScanIndex) -> ScanIndex {
     index.accepted_snapshot_fingerprints.insert("f".repeat(64));
-    index.codex_parent_side_generation += 1;
     index
 }
 
@@ -203,9 +161,9 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     let filled = serde_json::to_value(codex_fixture()).unwrap();
     let codex = catalogue::LAYOUTS
         .iter()
-        .filter(|(_, field, _)| field.starts_with("codex_"))
+        .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired(kind))
         .collect::<Vec<_>>();
-    assert_eq!(codex.len(), 13, "persisted Codex kinds");
+    assert_eq!(codex.len(), 2, "persisted Codex kinds");
     for (kind, field, introduced) in codex {
         assert_eq!(*introduced, 1, "{kind}: no layout bump for Codex-ON");
         assert_ne!(
@@ -239,12 +197,11 @@ fn source_rows_import_hydrate_and_save_like_v1() {
     }
 }
 
-/// [behaviour] A state v2 reload whose store holds no incarnation mints a
-/// fresh RAM nonce each time, though its fence is unchanged; the path's
-/// first-load flag and seq high-water still come from the memo.
+/// [behaviour] The per-path first-load marker survives v2 reloads without
+/// retaining a proof incarnation or sequence high-water.
 #[test]
-fn v2_reload_without_a_persisted_incarnation_mints_fresh_and_keeps_high_water() {
-    let scratch = crate::test_scratch::ScratchDir::canonical("codex-on-d62");
+fn v2_reload_keeps_per_path_first_load_membership() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("codex-first-load");
     let (custody, published) = money_test_support::ColdSession::publish(
         Source::Codex,
         &ScanIndex::default(),
@@ -252,28 +209,107 @@ fn v2_reload_without_a_persisted_incarnation_mints_fresh_and_keeps_high_water() 
     );
     let path = custody.path();
     assert!(state_v2_growth_retention_active(&published));
-    assert!(published.codex_proof_index_incarnation.is_empty());
-    crate::snapshots::raise_codex_proof_seq_high_water(&published.codex_proof_index_minted, 7);
-    let mut nonces = BTreeSet::from([published.codex_proof_index_minted.clone()]);
+    ScanIndex::default().note_first_index_load(path);
     for _ in 0..2 {
-        let (mut index, origin) = ScanIndex::load_inner_with_support(
+        let (index, origin) = ScanIndex::load_inner_with_support(
             path,
             Some(SnapshotSource::Codex),
             None,
             SystemTime::now(),
         )
         .unwrap();
-        assert!(matches!(origin, LoadOrigin::Loaded(_)));
+        assert!(matches!(origin, LoadOrigin::Loaded));
         assert!(state_v2_growth_retention_active(&index));
         assert!(
-            !index.mint_or_reuse_codex_proof_incarnation(path, origin),
+            !index.note_first_index_load(path),
             "not the path's first load"
         );
-        assert_eq!(index.codex_parent_proof_seq, 7, "the path's high-water");
-        assert!(index.codex_proof_index_incarnation.is_empty());
+    }
+}
+
+/// [format] A previous release's store holds rows of every retired kind:
+/// Claude's with usage members (a request set shared with a live row, a value
+/// stored in chunks) and a raw usage hold, Codex's and Pi's manifest-only.
+/// One hydrate and save removes them all, releases their request sets and
+/// chunks, and leaves every live row as it was; a reopen finds none.
+#[test]
+fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
+    use kinds::tests::{referenced_sets, set_refs};
+    const LIVE: [&str; 4] = [
+        "accepted.entity",
+        "refusal.authority",
+        "proof.usage",
+        "file.census",
+    ];
+    let live = |db: &mut sqlite::Sqlite| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut headers = Vec::new();
+        for kind in LIVE {
+            mapper::rows(&mut tx, kind, |_, h| {
+                headers.push(h);
+                Ok(())
+            })
+            .unwrap();
+        }
+        headers
+    };
+    for (source, build) in fixtures() {
+        let claude = source == Source::Claude;
+        let scratch = crate::test_scratch::ScratchDir::canonical("retired-purge");
+        let path = scratch.join("state.v2.sqlite.import");
+        let index = if claude {
+            kinds::tests::with_co_owned_witness(build())
+        } else {
+            build()
+        };
+        let mut db = money_test_support::populate(source, &path, &index, BTreeMap::new());
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let retired = kinds::tests::seed_retired_rows(&mut db, claude);
+        let before = live(&mut db);
         assert!(
-            nonces.insert(index.codex_proof_index_minted.clone()),
-            "a fresh RAM nonce"
+            !claude || before.len() > LIVE.len(),
+            "Claude holds live members"
         );
+        // Each usage row's request sets, with their counts before the purge.
+        let mut sets = Vec::new();
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for key in retired.iter().filter(|key| {
+                matches!(key, RowKey::Record { kind, position: 1, .. } if kind.name() == "usage.pending")
+            }) {
+                let h = tx.get(key).unwrap().unwrap();
+                if key == &mapper::key("usage.pending", kinds::tests::CHUNKED, 1).unwrap() {
+                    assert!(h.parts > 0, "{source:?}: stored in chunks");
+                }
+                for set in referenced_sets(&mut tx, key) {
+                    let refs = set_refs(&mut tx, &set).unwrap();
+                    sets.push((set, refs));
+                }
+            }
+        }
+        assert_eq!(sets.len(), if claude { 2 } else { 0 }, "{source:?}");
+        kinds::tests::purge(&mut db, money_test_support::binding(source)).unwrap();
+        drop(db);
+        let mut db = sqlite::Sqlite::open(&path, &identity).unwrap();
+        let (_, cx) = kinds::hydrate(&mut db, money_test_support::binding(source)).unwrap();
+        assert!(cx.retired.is_empty(), "{source:?}");
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for key in &retired {
+                assert!(tx.get(key).unwrap().is_none(), "{source:?}: {key:?}");
+            }
+            for (set, refs) in &sets {
+                // One reference less: a set only the retired row held is released.
+                let after = set_refs(&mut tx, set);
+                assert_eq!(after, refs.checked_sub(1).filter(|n| *n > 0), "{source:?}");
+            }
+        }
+        assert!(
+            sets.iter().any(|(_, refs)| *refs == 2) == claude,
+            "{source:?}"
+        );
+        assert_eq!(live(&mut db), before, "{source:?}: live rows untouched");
+        db.audit_headers().unwrap();
+        db.validate_references().unwrap();
     }
 }

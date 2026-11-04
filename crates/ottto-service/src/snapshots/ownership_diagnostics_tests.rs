@@ -1,5 +1,7 @@
 use super::*;
 
+const RETIRED_SLOT: usize = 2;
+
 fn conserved(counts: &Counts, total: usize) {
     let (c, [unknown, _, _]) = counts.summary(total);
     assert_eq!(
@@ -29,7 +31,7 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
     let started = rfc3339_unix_seconds(&traversal.census_window_end).unwrap();
     let counts = &mut traversal.counts;
     counts.causes = counts.causes.page(Some(started));
-    counts.causes.add(PARENT, 2);
+    counts.causes.add(RETIRED_SLOT, 2);
     counts.ownership_incomplete_file_count = 2;
     let marker = counts.causes.summary(2).1[1];
     index.save(&path).unwrap();
@@ -38,7 +40,7 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
     let restored_start = rfc3339_unix_seconds(&traversal.census_window_end).unwrap();
     assert_eq!(restored_start as usize, marker);
     let counts = &mut traversal.counts;
-    assert_eq!(counts.causes.summary(2).0[PARENT], 2);
+    assert_eq!(counts.causes.summary(2).0[RETIRED_SLOT], 2);
     assert_eq!(counts.causes.summary(2).1, [0; 3]);
     let mut page = counts.causes.page(Some(restored_start));
     assert_eq!(
@@ -46,10 +48,10 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
         marker,
         "routine reload retains the traversal start marker"
     );
-    page.add(PARENT, 1);
+    page.add(RETIRED_SLOT, 1);
     counts.causes.merge(&page);
     counts.ownership_incomplete_file_count += 1;
-    assert_eq!(counts.causes.summary(3).0[PARENT], 3);
+    assert_eq!(counts.causes.summary(3).0[RETIRED_SLOT], 3);
     conserved(&counts.causes, 3);
     restored.traversal = None;
     ensure_bounded_traversal(

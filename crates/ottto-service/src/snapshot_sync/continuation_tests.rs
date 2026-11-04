@@ -808,7 +808,7 @@ fn test_latch() -> &'static AtomicBool {
 #[test]
 fn a_worker_panic_under_any_cache_lock_latches_and_fails_closed() {
     use crate::snapshots::sampled_scan::TestLock;
-    for lock in [TestLock::Cursor, TestLock::Retained, TestLock::Side] {
+    for lock in [TestLock::Cursor, TestLock::Retained] {
         let cache = Arc::new(SharedCache::default());
         let dir = std::env::temp_dir();
         let mut port = CodexContinuation::new(&cache, &dir, &dir);
@@ -836,9 +836,6 @@ fn a_worker_panic_under_any_cache_lock_latches_and_fails_closed() {
                     .ready(&CodexCursorTicket::unready_for_test()));
             }
             TestLock::Retained => assert!(cache.lock_poisoned_for_test(lock)),
-            // The side ledger recovers by clearing (a process start for
-            // pacing) on its next use: the cursor-side W9 control.
-            TestLock::Side => assert!(cache.lock_poisoned_for_test(lock)),
         }
     }
 }

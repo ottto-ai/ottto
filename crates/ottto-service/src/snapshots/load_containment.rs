@@ -763,9 +763,9 @@ fn override_scan_index_rebuild_loop(
     // Once replaced, this was an actual override (never a refused press), even
     // if the final directory sync reports an uncertain durability outcome.
     result?;
-    // This function also returns directly to Repair callers. Establish the
-    // fresh-load memo here, before any first census or replay can advance it.
-    rebuilt.settle_claude_index_load(path, ScanIndexLoadOrigin::Quarantined);
+    // This function also returns directly to Repair callers. Settle the
+    // tombstone decode here, before any first census or replay can save.
+    rebuilt.settle_claude_index_load();
     Ok(rebuilt)
 }
 
@@ -773,14 +773,11 @@ impl ScanIndex {
     /// What an override rebuild keeps from the damaged index
     /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, each field's decoder). Bindings
     /// stay authoritative, so conflicting creator evidence defers; held and
-    /// deferred families stay held; duplicate ownership and owned-start /
-    /// stale-carry posture stay fail-closed. The contract token is kept and
-    /// its latch set: nothing proves the rebuilt graph ran under it. Accepted
+    /// deferred families stay held. The contract token is kept. Accepted
     /// acknowledgements and their upload-context stamps carry only from a
     /// current ledger, so an unproven one re-offers rather than suppresses. The replay generations carry so the
     /// replacement cycle replays only what the damaged index still owed; a
-    /// spurious replay would clear the carried acknowledgements and
-    /// owned-start census. Files, traversal and the Codex ownership ledgers
+    /// spurious replay would clear the carried acknowledgements. Files, traversal and the Codex ownership ledgers
     /// (the collision-bearing fields) are rebuilt by scan.
     fn carry_identity_from(
         &mut self,
@@ -789,7 +786,6 @@ impl ScanIndex {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
-        self.claude_request_identity_contract_changed = true;
         // Retirement evidence gates re-entry even when the file graph needs
         // rebuilding. Its decoder has already raised any uncertainty fence.
         self.claude_retired_family_tombstones = carry.claude_retired_family_tombstones;
@@ -797,11 +793,6 @@ impl ScanIndex {
             carry.claude_retired_family_tombstones_initialized;
         self.claude_retired_family_tombstones_uncertain =
             carry.claude_retired_family_tombstones_uncertain;
-        self.claude_owned_start_census = carry.claude_owned_start_census;
-        self.claude_stale_family_carry = carry.claude_stale_family_carry;
-        self.claude_duplicate_request_owners = carry.claude_duplicate_request_owners;
-        self.claude_duplicate_request_witness_overflowed =
-            carry.claude_duplicate_request_witness_overflowed;
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             // Keep prior carried incidence, including history-held files whose
             // ordinary exact set is empty. Add only ORIGINAL accepted identities.

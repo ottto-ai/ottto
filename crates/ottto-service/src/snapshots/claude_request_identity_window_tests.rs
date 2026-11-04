@@ -1206,7 +1206,7 @@ fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open
             Some("pro"),
             at,
             1,
-            RequestIdentity::Refused(Refusal::Pending),
+            RequestIdentity::Refused(Refusal::IncompleteEvidence),
             Some(at),
         ));
     }

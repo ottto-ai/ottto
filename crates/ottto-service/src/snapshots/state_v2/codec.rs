@@ -166,10 +166,19 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
             &["counts", "listing_owed_pace_evicted"],
             &["counts", "caps", "inventory_hold_keys_discarded"],
             &["residue", "blocked_session_ids"],
+            &["codex_parent_resolution_retry_required"],
+            &["counts", "parent_unresolvable"],
+            &["counts", "caps", "boundary_overflow_events"],
+            &["counts", "caps", "parent_signature_clear_events"],
+            &["counts", "caps", "parent_ref_refusals"],
         ]
     } else if row == type_name::<Option<crate::snapshots::ScanResidueWitness>>() {
         // Retired with the Codex state-only fallback.
         &[&["codex_state_only_blocked_session_ids"]]
+    } else if row == type_name::<crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>>() {
+        // An older store marks a file whose census evidence was owed; that
+        // census is retired, so the bit is dropped.
+        &[&["evidence_owed"]]
     } else {
         &[]
     }
@@ -482,11 +491,35 @@ mod tests {
         assert_eq!(reencoded, serde_json::to_vec(&current).unwrap());
         assert_eq!(seed, old);
         assert!(strict_json::<Option<Checkpoint>>(&old).is_ok());
-        row["counts"]["caps"]["parent_ref_refusals"] = 5.into();
+        row["counts"]["caps"]["price_trace_row_limit_hits"] = 5.into();
         let old = serde_json::to_vec(&row).unwrap();
         let (loaded, _) = exact_json::<Option<Checkpoint>>(&old).unwrap();
         let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
-        assert_eq!(caps, &serde_json::json!({"parent_ref_refusals": 5}));
+        assert_eq!(caps, &serde_json::json!({"price_trace_row_limit_hits": 5}));
+    }
+    /// [format] A file.progress row an older build stored with the retired
+    /// `evidence_owed` bit loads without it and seeds the stored bytes, so the
+    /// next save rewrites the row; v1 import admits it too. An unknown sibling
+    /// still refuses.
+    #[test]
+    fn retired_evidence_owed_loads_and_reencodes_without_it() {
+        type Row = crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>;
+        let current: Row =
+            crate::snapshots::tests::manifest_index_entry(Some(&"a".repeat(64))).into();
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["evidence_owed"] = true.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Row>(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(seed, old);
+        let root = serde_json::json!({"files": {"/synthetic/owed.jsonl": row}});
+        let raw = serde_json::to_vec(&root).unwrap();
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
+        row["future_unknown"] = 1.into();
+        assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
     }
     /// [behaviour] Rows an older build wrote with the residue blocked ids the
     /// Codex state-only fallback kept load, re-encode without them (an emptied
@@ -558,13 +591,6 @@ pub(super) fn check_field<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned
         .map(|_| ())
         .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))
 }
-/// Usage pending keeps the v1 record-map check; only its RAM shape differs.
-pub(super) fn check_usage<'de, A: serde::de::MapAccess<'de>>(
-    map: &mut A,
-    _: &super::super::usage_pending::UsagePending,
-) -> std::result::Result<(), A::Error> {
-    check_map(map, &super::super::usage_pending::Families::new())
-}
 pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned + Serialize>(
     map: &mut A,
     _: &std::collections::BTreeMap<String, T>,
@@ -628,10 +654,9 @@ mod alias_tests {
             .unwrap();
             assert_eq!(inventory(raw.as_slice()), Ok(()));
         }
-        assert!(strict_json::<ScanIndex>(
-            br#"{"files":{},"claude_full_rearm_progress":{"future_owed":true}}"#
-        )
-        .is_err());
+        assert!(
+            strict_json::<ScanIndex>(br#"{"files":{},"traversal":{"future_owed":true}}"#).is_err()
+        );
     }
 
     /// [format] v1 import inventory admits each leaf a shipped writer stored
@@ -642,6 +667,15 @@ mod alias_tests {
             crate::snapshots::claude_family_census_shadow_tests::traversal(),
         ))
         .unwrap();
+        let mut legacy_fork = traversal.clone();
+        legacy_fork["codex_parent_resolution_retry_required"] = true.into();
+        legacy_fork["counts"]["parent_unresolvable"] =
+            serde_json::json!({"counts": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]});
+        legacy_fork["counts"]["caps"] = serde_json::json!({
+            "boundary_overflow_events": 1,
+            "parent_signature_clear_events": 2,
+            "parent_ref_refusals": 3
+        });
         let mut pace = traversal.clone();
         pace["counts"]["listing_owed_pace_evicted"] = 2.into();
         let mut hold = traversal.clone();
@@ -665,6 +699,7 @@ mod alias_tests {
             ("traversal", hold, "/counts/caps"),
             ("traversal", residue, "/residue"),
             ("scan_residue_witness", witness, ""),
+            ("traversal", legacy_fork, "/counts/caps"),
         ] {
             let mut root = serde_json::json!({"files": {}});
             root[field] = value;

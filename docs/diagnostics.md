@@ -80,7 +80,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
-| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure or live ACK-custody hold remains visible after hydration. This is current posture, not an occurrence counter. |
+| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure hold remains visible after hydration. This is current posture, not an occurrence counter. |
 | `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without an interrupt deadline; a slow scan never holds collection. |
 | `db_unavailable_cause` | Latest v2 storage-hold cause: `at` = outermost static `state_v2_*` code, `cause` = innermost static code, `io_<ErrorKind>` or `sqlite_<extended code>`. Never messages, paths, keys or values. |
 | `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
@@ -133,7 +133,7 @@ Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, follo
 by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
 
 Source health uses `index_retrying` and "local index busy, retrying" for typed
-reload, migration, save-pressure and ACK-custody holds. These do not increment
+reload, migration and save-pressure holds. These do not increment
 repair-required counters or recommend repair. Unsupported formats require an
 update. `DbUnavailable` retains `index_shard_unavailable` repair advice for every
 cause; explicit integrity repair, lost fences, foreign bindings and reference
@@ -306,8 +306,7 @@ no authority and do not imply a continuation page ran. No raw ticket means no
 mint decision; authority/lifetime refusals remain outside these five outcomes.
 
 The inventory check performs at most one `lstat` per carried rollout path
-(up to 32,768), stopping on the first mismatch. It includes ledger parents and
-the held file. Any changed rollout holds continuation, so active Codex sessions
+(up to 32,768), stopping on the first mismatch. It includes the held file. Any changed rollout holds continuation, so active Codex sessions
 usually leave it idle. Additions wait for the ordinary census; an EOF park that
 cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
 keeping the prior body rather than emitting a zero replacement.
@@ -398,20 +397,20 @@ calling these measurements installed evidence.
 
 ### Tail Counters
 
-Claude's continuation state lives in the state database. Its counters ride a
-`durable_tail_alarm` record (schema 2 additive, source label) on any page where
-one changed; each source with a Tail codec (today Claude only) has its own
-record and keys. Each is `[since the last record, process total]`, counts only;
+Each source's continuation state (Claude Code, Codex and Pi) lives in the state
+database. Its counters ride a `durable_tail_alarm` record (schema 2 additive,
+source label) on any page where one changed; each source has its own record and
+keys. Each is `[since the last record, process total]`, counts only;
 they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
 | `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is not in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`, and the Codex replays `group_replay` (a group read from its first member) and `tier_prefix_replay` (a file with a protected receipt read from its start). `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action and a replay is no load outcome: neither is in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
-| `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
+| `tail_bootstrap_full{no_head,metadata_only,new_file,unrouted}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), a new file, or an indexed file with no database route (v1, a paused import, no support dir), whose growth reads Full. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
 | `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
@@ -563,8 +562,8 @@ written. Counts saturate at `u64::MAX`.
 
 `counts.line_delivery` is keyed by the fixed name of the page's one registered
 line observer, for example `{"footprint": {...}}`. The observer receives the
-physical lines the page's primary reads already consumed; proof, parent, side,
-group, native-comparison and one-shot reads deliver nothing. All values are
+physical lines the page's primary reads already consumed; group,
+native-comparison and one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
 
 - `lines`: newline-complete physical lines delivered, including blank,
@@ -579,8 +578,7 @@ page events, not gauges, and are never summed across observers:
 
 **Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
 one shared exemption from the discovery window, used by every age gate: the
-Claude/Pi walk, candidate revalidation and open, the Codex roster and
-`codex_parent_outside_window`. A key owed by a registered source stays
+Claude/Pi walk, candidate revalidation and open, and the Codex roster. A key owed by a registered source stays
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
@@ -624,7 +622,7 @@ registered, and count decisions rather than distinct files or bytes.
 exceeds its committed indexed `size_bytes`, using metadata already available at
 the age gate. Grown since committed: retention ends when the growth is committed
 (`size_bytes` catches up). Untouched and truncated files gain no exemption. This
-covers the walk, candidate/open rechecks, Codex roster and opened parent.
+covers the walk, candidate/open rechecks and Codex roster.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by
 source on the #799 page line, drained per page and omitted at zero. It counts
 one event per gate check, even if another retention source also matches; a file
@@ -1542,10 +1540,10 @@ The digest is RAM-only authority and is never emitted in diagnostic records.
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include
-`counts.full_causes.restore_outcome.miss.<class>` for Codex and Pi: saturating
-u64 counts, scoped to that page, of files with no retained reduction, by the
-class below. Claude keeps no reduction in RAM, so its loads are counted by
-`tail_db_loads` instead.
+`counts.full_causes.restore_outcome.miss.<class>` for every source: saturating
+u64 counts, scoped to that page, of files read with neither a retained
+reduction nor a Tail load, by the class below. A Tail load's outcome is counted
+by `tail_db_loads` instead.
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.
@@ -1681,12 +1679,12 @@ sessions, decoded bytes or money. No path or session id is included.
 | Cause | Unsupported boundary |
 | --- | --- |
 | `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
-| `CompressedProofParentUnsupported` | Proof parent reader |
-| `CompressedProofChildUnsupported` | Proof child reader |
-| `CompressedParentSideUnsupported` | Parent side acquisition |
+| `CompressedProofParentUnsupported` | Retired proof parent reader; not emitted by current builds |
+| `CompressedProofChildUnsupported` | Retired proof child reader; not emitted by current builds |
+| `CompressedParentSideUnsupported` | Retired parent side acquisition; not emitted by current builds |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Parent rollout is compressed and cannot supply ledger evidence, or the shared ownership parser held an ordinary archive fork after Full decoding without proven parent-prefix evidence |
+| `CompressedParentLedgerUnbound` | Retired parent-ledger hold; not emitted by current builds. A compressed legacy user fork counts best effort like a plain one |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
@@ -1699,7 +1697,7 @@ legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
 retained → cursor before taking the durable Stores leaf lock. It keeps a
-fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
+fixed admission floor (one 8 MiB primary entry) free
 for primary Tail reads and never charges retained bytes twice. When free room is
 short and the claim can fit beside the whole cursor state, it reclaims optional
 header facts, then releases retained copies, counted in
@@ -1756,8 +1754,7 @@ Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.
 An indexed Pi file that changes without an available RAM reduction reads Full under the shared `state_missing`
-planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
-fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
+planner reason in `sampled_acquisition.page_events.full_reasons`.
 A Pi usage ledger has no key cap and is never truncated.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
@@ -1792,7 +1789,7 @@ scalar remain separate from S and the bucket partition.
 | --- | --- |
 | 1. `inventory_hold` | Compound A1/group-preparation refusal: group member count. Incomplete-inventory remaining-singleton clear: remaining candidate count. |
 | 2. `other_group_receipt_legacy` | Strict group member count; one per terminal member disclosure or failed tier replay candidate; receipt-cap alias members (minimum one); incomplete joined-replacement alias members; distinct affected keys per legacy-hold invocation. |
-| 3. `parent_unresolvable` | One per held parsed rollout with an exact parent cause, including Absent, DeferredRef and DeferredRestart. |
+| 3. `parent_unresolvable` | Retired: no current build increments it, because no rollout is held for its parent. The slot stays for decode compatibility and reads zero. |
 | 4. `created_thread_proof` | One per held parsed rollout in the native-created-thread-only path, including failed parentless A2 conjuncts, after parent precedence. |
 | 5. `protected_absent` | Newly missing protected path index keys excluded by the existing traversal residue set. |
 | 6. `other_parser` | One per remaining ownership-incomplete parsed rollout. |

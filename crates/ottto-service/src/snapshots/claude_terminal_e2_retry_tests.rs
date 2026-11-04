@@ -25,7 +25,7 @@ fn pre_e2_terminal_retries_once_and_matches_cold_full() {
     let api = Default::default();
     let trace = Default::default();
     let fold = |index: &mut ScanIndex, items: &mut [SnapshotItem]| {
-        fold_authority(items, &api, &trace, index, false, at)
+        fold_authority(items, &api, &trace, index)
     };
     let roots = [root];
     let scan = |index, sampled| {

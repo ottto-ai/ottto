@@ -285,17 +285,9 @@ fn wire_row_key(row: &Value) -> Option<RowKey> {
         subscription_product: text("subscription_product"),
     })
 }
-fn basis_token(basis: &str) -> Option<&'static str> {
-    match basis {
-        TELEMETRY => Some(TELEMETRY),
-        TELEMETRY_LOGIN => Some(TELEMETRY_LOGIN),
-        TRANSCRIPT_RECORDED_LOGIN => Some(TRANSCRIPT_RECORDED_LOGIN),
-        LEGACY_TRANSCRIPT_SOLE_LOGIN => Some(LEGACY_TRANSCRIPT_SOLE_LOGIN),
-        TRANSCRIPT_ORG => Some(TRANSCRIPT_ORG),
-        _ => None,
-    }
-}
-/// A carried or recorded-login share: placement, never proof of its row.
+/// A carried or recorded-login share: placement, never proof of its row. The
+/// stored-JSON boundary twin of `AuthorityKey::placement_only`, stricter: any
+/// present `account_source` (even null) counts.
 fn placement_only_entry(entry: &Value) -> bool {
     entry.get("account_source").is_some()
         || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
@@ -921,7 +913,7 @@ impl AcceptedBuckets {
     }
     /// The session's entry, refreshed as the last ACK; a full ledger evicts
     /// its least recently ACKed session (#909 LRU).
-    fn session_entry(&mut self, session: &str, report: bool) -> Option<&mut AcceptedSession> {
+    fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
         let fingerprint_key = self.1.as_ref()?;
         let key = session_key(fingerprint_key, session);
         let last_ack = self
@@ -939,12 +931,10 @@ impl AcceptedBuckets {
                 .map(|(key, _)| key.clone())
                 .expect("full ledger");
             self.0.remove(&oldest);
-            if report {
-                super::budget::record(&super::budget::Counts {
-                    accepted_state_evicted: 1,
-                    ..Default::default()
-                });
-            }
+            super::budget::record(&super::budget::Counts {
+                accepted_state_evicted: 1,
+                ..Default::default()
+            });
         }
         let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
             key_epoch: key_epoch(fingerprint_key),
@@ -1026,7 +1016,7 @@ impl AcceptedBuckets {
         // `record` normally settled (and LRU-refreshed) this ACK's session;
         // refreshing again would only churn persisted bytes.
         if self.session_mut(session).is_none() {
-            self.session_entry(session, true);
+            self.session_entry(session);
         }
         let Some(entry) = self.session_mut(session) else {
             return;
@@ -1137,13 +1127,6 @@ impl AcceptedBuckets {
     /// Record only the body actually stored. A stripped ACK preserves prior
     /// fingerprints while the bucket is present; fingerprints never restore tags.
     pub(crate) fn record(&mut self, body: &Value) {
-        self.record_with_diagnostics(body, true);
-    }
-    /// Pre-upload custody sizing must not report hypothetical evictions.
-    pub(crate) fn preview_record(&mut self, body: &Value) {
-        self.record_with_diagnostics(body, false);
-    }
-    fn record_with_diagnostics(&mut self, body: &Value, report: bool) {
         if self.1.is_none() {
             return;
         }
@@ -1161,9 +1144,7 @@ impl AcceptedBuckets {
         }
         let item_cap = self.4;
         let limit = max_shares(item_cap);
-        let entry = self
-            .session_entry(session, report)
-            .expect("bound fingerprint key");
+        let entry = self.session_entry(session).expect("bound fingerprint key");
         let mut shares = if item_cap > MAX_ITEM_BYTES {
             entry.shares_after(body, entry.shares.iter().cloned())
         } else {

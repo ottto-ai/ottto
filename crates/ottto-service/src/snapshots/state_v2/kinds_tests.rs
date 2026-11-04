@@ -202,10 +202,10 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
 }
 
 /// [format] An earlier store's retired `setting.upload_context_fingerprint`
-/// row (layout 1) is accepted and never read: it survives open, save and
-/// reopen, and no source-wide context reaches the model.
+/// row (layout 1) is accepted and never read: hydrate names its key, the next
+/// save removes it, and no source-wide context reaches the model.
 #[test]
-fn retired_upload_context_row_is_kept_through_open_save_and_reopen() {
+fn retired_upload_context_row_is_purged_by_the_next_save() {
     let row = mapper::key("setting.upload_context_fingerprint", "", 0).unwrap();
     let (scratch, mut db) = Scratch::store();
     commit_populate(&mut db, &fixture());
@@ -225,19 +225,21 @@ fn retired_upload_context_row_is_kept_through_open_save_and_reopen() {
     let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(cx.layout, catalogue::LAYOUT);
     assert!(restored.active_upload_context_fingerprint.is_none());
+    assert!(cx.retired.contains(&row));
     let baseline = baseline(&restored, &mut cx).unwrap();
     super::save_graph(&mut db, &identity, baseline, &mut restored, &mut cx).unwrap();
     {
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        assert!(tx.get(&row).unwrap().is_some(), "the save keeps the row");
+        assert!(tx.get(&row).unwrap().is_none(), "the save removes the row");
     }
     drop(db);
     let mut db = reopen();
     let (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
     assert_eq!(cx.layout, catalogue::LAYOUT);
     assert!(reopened.active_upload_context_fingerprint.is_none());
+    assert!(cx.retired.is_empty());
     let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&row).unwrap().is_some(), "still kept after reopen");
+    assert!(tx.get(&row).unwrap().is_none(), "still absent after reopen");
 }
 
 /// [format] A store that never had the retired row opens at the current
@@ -258,7 +260,8 @@ fn store_without_the_retired_upload_context_row_opens_at_the_current_layout() {
 /// [format] An earlier store's retired rows (layout 1's
 /// `v1_field.claude_desktop_census_witness`, layout 5's
 /// `v1_field.claude_folder_login_ledger` member) are still accepted kinds: the
-/// store hydrates, keeps each row and reads nothing from it.
+/// store hydrates without reading them, and each row stays until a save names
+/// it for removal.
 #[test]
 fn retired_desktop_census_witness_row_still_hydrates() {
     let witness = serde_json::json!({
@@ -287,6 +290,7 @@ fn retired_desktop_census_witness_row_still_hydrates() {
         assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
         let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
         assert_eq!(cx.layout, catalogue::LAYOUT, "{kind}");
+        assert!(cx.retired.contains(&row), "{kind}");
         let mut tx = db.begin(TxnMode::Read).unwrap();
         assert!(tx.get(&row).unwrap().is_some(), "{kind}");
     }
@@ -330,25 +334,8 @@ fn all_groups_share_one_snapshot_and_roundtrip_real_v1_without_losing_context_or
     // Account hydration must not replace the common context and discard MISC
     // inventory or the source binding while hydrating its own graph.
     assert_eq!(cx.binding, Some(Scratch::binding()));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let mut after = None;
-    let mut owners = 0;
-    loop {
-        let page = tx
-            .scan_kind(
-                &RecordKind::parse("family.requests").unwrap(),
-                after.as_ref(),
-                128,
-            )
-            .unwrap();
-        if page.is_empty() {
-            break;
-        }
-        owners += page.len();
-        after = page.last().map(|h| h.key.clone());
-    }
-    let expected = 1 + index.claude_usage_family_pending.len();
-    assert_eq!(owners, expected);
+    // A current writer never stores a retired kind.
+    assert!(cx.retired.is_empty());
 }
 
 /// [format] incomplete census group cannot escape as a partially hydrated graph.
@@ -620,13 +607,6 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
     pending.insert(MANY_WINDOWS.into(), many);
     pending.insert(EXTENDED.into(), family.clone());
     pending.insert(UNREQUESTED.into(), family);
-    let usage = index.claude_usage_family_pending[WITH_WINDOWS].clone();
-    index
-        .claude_usage_family_pending
-        .insert(EXTENDED.into(), usage.clone());
-    index
-        .claude_usage_family_pending
-        .insert(UNREQUESTED.into(), usage);
     commit_populate(&mut db, &index);
     let roots: BTreeSet<String> = [WITH_WINDOWS, WITH_ABSENT, MANY_WINDOWS, MISSING]
         .map(str::to_owned)
@@ -640,9 +620,6 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
     expected
         .claude_account_family_pending
         .retain(|family, _| roots.contains(family));
-    expected
-        .claude_usage_family_pending
-        .retain(|family, _| roots.contains(family));
     let subset = accounts_view(&mut tx, Some(&roots)).unwrap();
     assert_eq!(subset.claude_account_family_pending.len(), 3);
     assert_eq!(
@@ -652,7 +629,6 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
             .len(),
         8
     );
-    assert_eq!(subset.claude_usage_family_pending.len(), 1);
     assert!(!subset.claude_account_family_pending.contains_key(MISSING));
     assert_eq!(
         serde_json::to_vec(&subset).unwrap(),
@@ -672,10 +648,6 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
         (control.clone(), Some("undecodable")),
         (window.clone(), Some("undecodable")),
         (absent.clone(), Some("undecodable")),
-        (
-            key("usage.pending", WITH_WINDOWS, 1).unwrap(),
-            Some("undecodable"),
-        ),
         (window, None),
         (absent, None),
         (
@@ -752,7 +724,6 @@ fn filtered_account_hydrate_equals_full_for_requested_families_only() {
         key("account.current", EXTENDED, 1).unwrap(),
         page[0].key.clone(),
         key("account.absent_members", EXTENDED, 1).unwrap(),
-        key("usage.pending", EXTENDED, 1).unwrap(),
     ] {
         sqlite::corrupt_row_header_for_test(&db, &row);
     }
@@ -777,7 +748,7 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
         let committed = baseline(&previous, &mut cx).unwrap();
         let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
 
-        let mut lost = vec![mapper::key("usage.pending", FAMILY, 1).unwrap()];
+        let mut lost = vec![mapper::key("refusal.authority", FAMILY, 1).unwrap()];
         if lost_account {
             let control = mapper::key("account.current", FAMILY, 1).unwrap();
             let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -801,7 +772,11 @@ fn out_of_band_family_row_loss_is_refused_or_rewritten_never_silently_absent() {
             let family = next.claude_account_family_pending.get_mut(FAMILY).unwrap();
             family.current.census_window_end = "2026-10-31T00:00:00Z".into();
         } else if dirty {
-            next.insert_claude_usage_family_pending_for_test(FAMILY, "2026-10-31T00:00:00Z");
+            let authority = next
+                .claude_usage_authority_quarantine
+                .get_mut(FAMILY)
+                .unwrap();
+            authority.retry_after_unix_seconds -= 1;
         }
         // Claim-only skips window retirement, so a clean family stays clean.
         let saved = import::save(&mut db, &identity, committed, &mut next, &mut cx, true)
@@ -1485,10 +1460,6 @@ fn refused_commit_preserves_owed_custody_through_independent_saves() {
         .insert("unpublished".into(), Some("2026-10-31T00:00:00Z".into()));
     next.accepted_rebuild_incidence.clear();
     next.claude_account_family_pending.clear();
-    next.claude_owned_start_census.insert("unpublished-session".into(), serde_json::from_value(serde_json::json!({
-        "marker_source_file_fingerprint":"unpublished", "verified_source_file_fingerprint":"unpublished",
-        "emitted_source_file_fingerprint":"unpublished"
-    })).unwrap());
     next.upload_ack_retirement_handoff = Some(super::super::super::UploadAckRetirementHandoff {
         destination_namespace_hash: Scratch::binding().namespace_hash,
         committed_generation: next.generation,
@@ -1849,6 +1820,119 @@ fn retired_state_only_kinds_and_leaves_load_inert() {
     }
 }
 
+/// [format] Old -> new -> old -> new: the shipped member layout is accepted,
+/// an older reader HOLDs after ordinary saves retire
+/// the old contents without changing unrelated money or request custody.
+#[test]
+fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
+    use mapper::Members::{Field, Map, Set};
+    use serde_json::json;
+    let rows = [
+        (
+            "codex_parent_ownership_refs",
+            Set,
+            json!(["parent"]),
+            json!([]),
+        ),
+        (
+            "codex_parent_ownership_ledgers",
+            Map,
+            json!({"parent":{"signatures":["signature"],"scan_complete":true}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_side_requests",
+            Map,
+            json!({"parent":{"dev_ino":[1,2],"needed_extent":1,"state":{"kind":"live"},"state_extent":1,"state_ctime":[1,0],"attempt_extent":1,"attempt_ctime":[1,0],"attempts":1,"not_before_unix_seconds":1}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_side",
+            Map,
+            json!({"parent":{"verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,"parsed":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},"seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},"scope":"retired","sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+            json!({}),
+        ),
+        ("codex_parent_side_generation", Field, json!(7), json!(0)),
+        ("codex_parent_proof_wrap_epoch", Field, json!(2), json!(0)),
+        (
+            "codex_parent_prefix_proofs",
+            Map,
+            json!({"child":{"state":"owed","parent":"parent","seq":9,"cause":255,"origin":"lineage","wake":{"kind":"due"},"outcome":0,"attempts":0,"not_before_unix_seconds":0}}),
+            json!({}),
+        ),
+        (
+            "codex_parent_proof_cursor",
+            Field,
+            json!("child"),
+            json!(null),
+        ),
+        (
+            "codex_parent_side_cursor",
+            Field,
+            json!("parent"),
+            json!(null),
+        ),
+        ("codex_parent_proof_seq", Field, json!(9), json!(0)),
+        (
+            "codex_proof_index_incarnation",
+            Field,
+            json!("0123456789abcdef0123456789abcdef"),
+            json!(""),
+        ),
+    ];
+    let (scratch, mut db) = Scratch::store();
+    let original = fixture();
+    commit_populate(&mut db, &original);
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    db.finish_import().unwrap();
+    let mut db =
+        sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
+    for round in 0..2 {
+        // The old writer's existing split-field representation.
+        let generation: u64 = db.read_control("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let mut old = mapper::Rows {
+            tx: Some(&mut tx),
+            ..Default::default()
+        };
+        for (field, mode, value, _) in &rows {
+            mapper::field_write(&mut old, &format!("v1_field.{field}"), value, *mode).unwrap();
+        }
+        old.finish().unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+        let (mut upgraded, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        let mut expected = original.clone();
+        expected.generation = upgraded.generation;
+        assert_persisted(&mut db, &expected);
+        let before = baseline(&upgraded, &mut cx).unwrap();
+        super::save_graph(&mut db, &identity, before, &mut upgraded, &mut cx).unwrap();
+        expected.generation = upgraded.generation;
+        assert_persisted(&mut db, &expected);
+        // D59: a previous reader HOLDs when its required root is absent.
+        // A later old writer can restore its original rows before the next upgrade.
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for (field, mode, _, empty) in &rows {
+            let kind = format!("v1_field.{field}");
+            assert!(
+                mapper::field_read::<serde_json::Value>(&mut tx, &kind, *mode, None, || empty
+                    .clone())
+                .is_err(),
+                "round {round}: old reader must HOLD {field}"
+            );
+            let mut count = 0;
+            mapper::rows(&mut tx, &kind, |_, _| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(count, 0, "retired kind is unwritten");
+        }
+    }
+}
+
 /// [money] H8. Past both old caps (65,537 records; one record holding one
 /// hash more than the old 2,097,152 cap), the census survives a v2 save and
 /// hydrate whole, and the restored graph's v1 bytes decode to it too. The
@@ -1932,4 +2016,278 @@ fn transcript_codec_compatibility() {
         );
     }
     assert_eq!(restored.claude_request_census, index.claude_request_census);
+}
+
+/// The family whose retired usage row shares a request set with its live
+/// `proof.usage` witness.
+const CO_OWNER: &str = "synthetic-co-owner";
+/// The family whose retired usage row is large enough to be stored in chunks.
+pub(in crate::snapshots::state_v2) const CHUNKED: &str = "synthetic-chunked";
+fn co_owned_hash() -> String {
+    "c".repeat(64)
+}
+/// `index` with a live `proof.usage` witness whose excluded hashes are the
+/// request set a seeded retired usage row also holds, and a live authority row.
+pub(in crate::snapshots::state_v2) fn with_co_owned_witness(mut index: ScanIndex) -> ScanIndex {
+    let witness = serde_json::json!({
+        "evidence_fingerprint": "e".repeat(64),
+        "member_request_id_fingerprints": {CO_OWNER: "f".repeat(64)},
+        "assigned_request_id_fingerprints": {},
+        "legacy_excluded_request_id_hashes": {CO_OWNER: [co_owned_hash()]},
+    });
+    index
+        .claude_usage_family_witnesses
+        .insert(CO_OWNER.into(), serde_json::from_value(witness).unwrap());
+    index.insert_retry_pending_claude_authority_for_test("synthetic-authority");
+    index
+}
+/// Rows of every retired kind as a previous release left them, committed at
+/// the next generation. Every store gets each retired kind's manifest or
+/// scalar row. `members` adds usage families (one sharing its request set
+/// with `with_co_owned_witness`, one stored in chunks) and their census
+/// counts. Returns the seeded keys.
+pub(in crate::snapshots::state_v2) fn seed_retired_rows(
+    db: &mut sqlite::Sqlite,
+    members: bool,
+) -> BTreeSet<RowKey> {
+    use sha2::Digest;
+    let generation: u64 = db.read_control("generation").unwrap().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let mut keys = BTreeSet::new();
+    let mut put = |tx: &mut dyn Transaction, key: RowKey, value: serde_json::Value| {
+        mapper::put(tx, &key, &value).unwrap();
+        keys.insert(key);
+    };
+    for (kind, _) in catalogue::OWNED
+        .iter()
+        .filter(|(k, _)| catalogue::retired(k))
+    {
+        // A raw hold has no manifest; its own test seeds one with its metadata.
+        if kind.starts_with("raw_hold.") {
+            continue;
+        }
+        let count: u64 = match *kind {
+            "usage.pending" | "family.requests" if members => 2,
+            _ => 0,
+        };
+        put(&mut tx, mapper::key(kind, "", 0).unwrap(), count.into());
+    }
+    if members {
+        let family = |hash: String, occurrences: u64| {
+            let occurrences: serde_json::Map<_, _> = (0..occurrences)
+                .map(|i| {
+                    let request = format!("{:x}", sha2::Sha256::digest(i.to_le_bytes()));
+                    let usage = serde_json::json!({"sequence": i, "input_tokens": i,
+                        "output_tokens": 1, "cache_read_tokens": 0, "cache_creation_5m_tokens": 0,
+                        "cache_creation_1h_tokens": 0, "reasoning_output_tokens": 0,
+                        "model": null, "speed_mode": null, "reasoning_effort": null});
+                    (request, usage)
+                })
+                .collect();
+            serde_json::json!({
+                "census_window_end": "2026-10-29T00:00:00Z",
+                "member_request_id_hashes": {"synthetic-file": [hash]},
+                "member_occurrences": {"synthetic-file": occurrences},
+                "invalid": false,
+            })
+        };
+        let key =
+            |kind: &str, root: &str, position: u64| mapper::key(kind, root, position).unwrap();
+        put(
+            &mut tx,
+            key("usage.pending", CO_OWNER, 1),
+            family(co_owned_hash(), 1),
+        );
+        put(
+            &mut tx,
+            key("usage.pending", CHUNKED, 1),
+            family("d".repeat(64), 64),
+        );
+        put(&mut tx, key("family.requests", CO_OWNER, 1), 1_u64.into());
+        put(&mut tx, key("family.requests", CHUNKED, 1), 1_u64.into());
+    }
+    let next = generation + 1;
+    assert_eq!(
+        tx.commit(generation, next),
+        DurableCommitOutcome::Committed(next)
+    );
+    keys
+}
+/// Hydrate and save the hydrated graph unchanged, as a load and its first
+/// save do: the save removes the retired rows that hydrate named.
+pub(in crate::snapshots::state_v2) fn purge(
+    db: &mut sqlite::Sqlite,
+    binding: super::super::super::scan_index_persistence::Binding,
+) -> Result<()> {
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut index, mut cx) = hydrate(db, binding)?;
+    let previous = baseline(&index, &mut cx)?;
+    super::save_graph(db, &identity, previous, &mut index, &mut cx).map(|_| ())
+}
+/// The request sets a stored row references.
+pub(in crate::snapshots::state_v2) fn referenced_sets(
+    tx: &mut dyn Transaction,
+    key: &RowKey,
+) -> Vec<RowKey> {
+    let h = tx.get(key).unwrap().unwrap();
+    let raw = mapper::bytes(tx, &h).unwrap();
+    let mut sets = Vec::new();
+    mapper::references(&h, &codec::Bytes(&raw), &mut |set| {
+        sets.push(set.clone());
+        Ok(())
+    })
+    .unwrap();
+    sets
+}
+/// A request set's reference count; `None` once it is released.
+pub(in crate::snapshots::state_v2) fn set_refs(
+    tx: &mut dyn Transaction,
+    set: &RowKey,
+) -> Option<u64> {
+    tx.get(set).unwrap().map(|h| match h.fixed {
+        Fixed::RequestSet { refs, .. } => refs,
+        Fixed::None => panic!("{set:?} has no reference count"),
+    })
+}
+fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    keys.iter()
+        .filter(|key| tx.get(key).unwrap().is_some())
+        .count()
+}
+
+/// [money] A request set that a retired usage row and a live `proof.usage`
+/// row both reference survives the purge with one reference less; the set
+/// only the retired row held is released.
+#[test]
+fn retired_purge_keeps_co_owned_request_set() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &with_co_owned_witness(fixture()));
+    seed_retired_rows(&mut db, true);
+    let live = mapper::key("proof.usage", CO_OWNER, 1).unwrap();
+    let retired = mapper::key("usage.pending", CO_OWNER, 1).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let shared = referenced_sets(&mut tx, &live);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(
+        referenced_sets(&mut tx, &retired),
+        shared,
+        "one set, two owners"
+    );
+    assert_eq!(set_refs(&mut tx, &shared[0]), Some(2));
+    let only = referenced_sets(&mut tx, &mapper::key("usage.pending", CHUNKED, 1).unwrap());
+    assert_eq!(only.len(), 1);
+    assert_eq!(set_refs(&mut tx, &only[0]), Some(1));
+    drop(tx);
+    purge(&mut db, Scratch::binding()).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&retired).unwrap().is_none());
+    assert_eq!(referenced_sets(&mut tx, &live), shared);
+    assert_eq!(set_refs(&mut tx, &shared[0]), Some(1));
+    assert_eq!(set_refs(&mut tx, &only[0]), None);
+    drop(tx);
+    db.validate_references().unwrap();
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.claude_usage_family_witnesses).unwrap(),
+        serde_json::to_value(&with_co_owned_witness(fixture()).claude_usage_family_witnesses)
+            .unwrap()
+    );
+}
+
+/// [money] A save that fails to commit leaves every retired row (and the
+/// sets they hold) for the next hydrate, which names them again; the next
+/// good save removes them.
+#[test]
+fn interrupted_purge_save_keeps_rows() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &with_co_owned_witness(fixture()));
+    let keys = seed_retired_rows(&mut db, true);
+    assert_eq!(present(&mut db, &keys), keys.len());
+    sqlite::fence_commit_writing(&db, "generation");
+    let error = purge(&mut db, Scratch::binding()).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    assert_eq!(
+        present(&mut db, &keys),
+        keys.len(),
+        "a failed save keeps them"
+    );
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.retired, keys);
+    purge(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(present(&mut db, &keys), 0);
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(cx.retired.is_empty());
+    db.audit_headers().unwrap();
+    db.validate_references().unwrap();
+}
+
+/// [format] A raw hold of the retired usage-pending field, as an earlier
+/// release left it with its hold metadata, still loads. The metadata entry is
+/// dropped, so no hold custody or file state comes back from it, and the next
+/// save removes the row and rewrites the metadata without the field.
+#[test]
+fn retired_raw_usage_hold_loads_and_is_purged_by_the_next_save() {
+    let (_scratch, mut db) = Scratch::live_store();
+    let index = fixture();
+    commit_populate(&mut db, &index);
+    let hold = mapper::key("raw_hold.claude_usage_family_pending", CHUNKED, 0).unwrap();
+    let metadata = mapper::key("v1_field.repair_provenance", "", 0).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    mapper::put(&mut tx, &hold, &serde_json::json!({"invalid": "held"})).unwrap();
+    let h = tx.get(&metadata).unwrap().unwrap();
+    let mut value: serde_json::Value = mapper::read(&mut tx, &h, None).unwrap();
+    value["entries"]["claude_usage_family_pending"] =
+        serde_json::json!({CHUNKED: {"owner": null, "charge": 64}});
+    mapper::put(&mut tx, &metadata, &value).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let (restored, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.retired, BTreeSet::from([hold.clone()]));
+    assert!(
+        restored.decode_holds.same_as(&index.decode_holds),
+        "no hold custody"
+    );
+    assert_eq!(
+        serde_json::to_value(&restored.files).unwrap(),
+        serde_json::to_value(&index.files).unwrap(),
+        "no file is re-armed for a re-read"
+    );
+    purge(&mut db, Scratch::binding()).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&hold).unwrap().is_none());
+    let h = tx.get(&metadata).unwrap().unwrap();
+    let value: serde_json::Value = mapper::read(&mut tx, &h, None).unwrap();
+    assert!(value["entries"]
+        .get("claude_usage_family_pending")
+        .is_none());
+    drop(tx);
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(cx.retired.is_empty());
+    db.audit_headers().unwrap();
+}
+
+/// [format] Hydrate visits a retired row's header only: a value no codec
+/// can read does not fail the load, and the row is still named for removal.
+#[test]
+fn corrupt_retired_row_does_not_fail_load() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let rows = [
+        mapper::key("usage.pending", "synthetic-corrupt", 1).unwrap(),
+        mapper::key("proof.owned_start", "", 0).unwrap(),
+    ];
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for key in &rows {
+        tx.put(RowInput {
+            key,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: b"\xff not a stored value",
+        })
+        .unwrap();
+    }
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let (restored, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(restored.generation, 2);
+    assert_eq!(cx.retired, BTreeSet::from(rows));
 }

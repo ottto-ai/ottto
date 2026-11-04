@@ -35,7 +35,7 @@ impl AckFixture {
             index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         }
         // Public synthetic identity fixtures only. Preserve bindings, the current
-        // scanner token and its latch across the crash/uploader/settlement seam.
+        // scanner token across the crash/uploader/settlement seam.
         let mut value = serde_json::to_value(&index).unwrap();
         value["session_account_bindings"] = serde_json::json!({"a".repeat(64): {
             "account_identifier_hash":"8".repeat(64), "workspace_identifier_hash":"9".repeat(64)}});
@@ -102,7 +102,6 @@ impl AckFixture {
         for field in [
             "session_account_bindings",
             "claude_request_identity_contract",
-            "claude_request_identity_contract_changed",
         ] {
             assert_eq!(value[field], self.identity[field], "{field}");
         }
@@ -1829,7 +1828,6 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
             held_fingerprints: held.clone(),
             account_deferred_fingerprints: BTreeSet::new(),
             progress_blocking: true,
-            held_family_roots: None,
         };
         // Finish captures the references before any selection.
         let referenced = progress.ack_retirement_scan_references(&previous, &working);
@@ -1845,7 +1843,6 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &progress,
                 &holds,
                 other == "rejected",
-                None,
             ),
         };
         assert!(!settlement.fully_settled, "{outcome}");

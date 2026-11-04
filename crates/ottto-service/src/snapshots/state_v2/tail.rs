@@ -248,24 +248,6 @@ impl Observation {
                 .map_or(0, |facts| facts.owner.len() as u64)
     }
 }
-/// An authorised final disposition of a file's whole debt: recorded (counted),
-/// and never reported as an ACK.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no production caller stages a disposition yet")
-)]
-pub(in crate::snapshots) enum Disposition {
-    /// A complete census proved the file absent.
-    Absence,
-    /// Policy settled the remaining debt.
-    Settled,
-}
-#[derive(Default)]
-struct Debt {
-    disposal: Option<Disposition>,
-    observation: Option<Observation>,
-}
 enum Entry {
     File(StagedFile),
     Failed(SetAsideCause),
@@ -275,7 +257,7 @@ enum Entry {
 #[derive(Default)]
 pub(super) struct TailStage {
     files: BTreeMap<Vec<u8>, Entry>,
-    debt: BTreeMap<Vec<u8>, Debt>,
+    debt: BTreeMap<Vec<u8>, Observation>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
     peak_bytes: u64,
@@ -309,20 +291,7 @@ impl TailStage {
     /// A later observation of the key replaces the staged one: each is its
     /// owner's whole delta from the committed rows.
     fn replace_observation(&mut self, key: &str, observation: Observation) {
-        self.debt
-            .entry(key.as_bytes().to_vec())
-            .or_default()
-            .observation = Some(observation);
-    }
-    /// Staged observations of the key are superseded; later ones apply after.
-    pub(super) fn dispose(&mut self, key: &str, disposition: Disposition) {
-        self.debt.insert(
-            key.as_bytes().to_vec(),
-            Debt {
-                disposal: Some(disposition),
-                observation: None,
-            },
-        );
+        self.debt.insert(key.as_bytes().to_vec(), observation);
     }
     /// Erasure of the key's whole scope; anything staged for it goes. `true`:
     /// newly erased while it held unaccepted revisions, committed or staged;
@@ -333,7 +302,7 @@ impl TailStage {
         committed: (bool, Option<u64>),
     ) -> (bool, Option<u64>) {
         let key = key.as_bytes().to_vec();
-        let observation = self.debt.remove(&key).and_then(|debt| debt.observation);
+        let observation = self.debt.remove(&key);
         let staged_debt = observation
             .as_ref()
             .is_some_and(|observation| !observation.added.is_empty());
@@ -387,7 +356,6 @@ impl TailStage {
         let debt = self
             .debt
             .values()
-            .filter_map(|debt| debt.observation.as_ref())
             .fold(0, |sum, observation| sum + observation.bytes());
         self.files.values().fold(debt, |sum, entry| match entry {
             Entry::File(file) => sum + file.bytes(),
@@ -970,11 +938,9 @@ struct Applied {
     set_aside: u64,
     rolled_back: u64,
     retired: u64,
-    /// Retired or reset without a disposition, keeping debt in a metadata head.
+    /// Retired or reset, keeping debt in a metadata head.
     kept_debt: u64,
     revisions_added: u64,
-    disposed_absence: u64,
-    disposed_settled: u64,
     erased: u64,
 }
 impl Applied {
@@ -985,8 +951,6 @@ impl Applied {
         self.dirty_pages += one.dirty_pages;
         self.old_page_touches += one.old_page_touches;
         self.revisions_added += one.revisions_added;
-        self.disposed_absence += one.disposed_absence;
-        self.disposed_settled += one.disposed_settled;
     }
 }
 fn member(table: &mut MembershipTable, collection: Collection) -> Result<&mut Membership> {
@@ -1055,13 +1019,12 @@ fn observe(
 }
 /// Replace one file's reduction and apply its debt changes, adjusting membership
 /// from row headers alone: no other page is read. A head with no reduction, debt
-/// or inventory goes. Only a reduction replacement or a disposal clears
-/// the set-aside marker.
+/// or inventory goes. Only a reduction replacement clears the set-aside marker.
 fn write_file(
     tx: &mut dyn Transaction,
     file: &[u8],
     staged: Option<&StagedFile>,
-    debt: Option<&Debt>,
+    debt: Option<&Observation>,
 ) -> Result<Applied> {
     let reset = staged.is_some_and(|staged| staged.change == Change::Reset);
     let (mut revision, mut table, mut common, mut reduction) = if reset {
@@ -1143,25 +1106,7 @@ fn write_file(
         reduction = Some(staged.head.clone());
         common.representation = Representation::Tail;
     }
-    let disposal = debt.and_then(|debt| debt.disposal);
-    if let Some(disposition) = disposal {
-        for header in revision_rows(tx, file)? {
-            let id = position(&header)?;
-            purge(tx, vec![header])?;
-            delete_fragments(tx, file, Collection::Revisions.owner(), id, 0)?;
-        }
-        table.remove(&Collection::Revisions);
-        common.debt = DebtSummary::default();
-        match disposition {
-            // The file is gone, so its header facts are too.
-            Disposition::Absence => {
-                common.inventory = None;
-                applied.disposed_absence += 1;
-            }
-            Disposition::Settled => applied.disposed_settled += 1,
-        }
-    }
-    if let Some(observation) = debt.and_then(|debt| debt.observation.as_ref()) {
+    if let Some(observation) = debt {
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
     }
     // No longer a Tail file: the reduction and its pages go, the debt stays.
@@ -1170,7 +1115,7 @@ fn write_file(
         table.retain(|collection, _| *collection == Collection::Revisions);
         delete_rows(tx, file, true)?;
     }
-    if (staged.is_some() && reduction.is_some()) || disposal.is_some() {
+    if staged.is_some() && reduction.is_some() {
         tx.delete(&set_aside_key(file)?)?;
     }
     if table
@@ -1208,9 +1153,9 @@ fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, Members
     }
     Ok((revision, table, common))
 }
-/// Retirement or progress removal without a disposition: the reduction goes;
-/// unresolved revisions stay under one metadata-only head. `true`: debt kept, and
-/// the set-aside marker with it, since this is neither replacement nor disposal.
+/// Retirement or progress removal: the reduction goes; unresolved revisions
+/// stay under one metadata-only head. `true`: debt kept, and the set-aside
+/// marker with it, since this is no replacement.
 fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
     let (revision, table, common) = committed_debt(tx, file)?;
     let keep = !table.is_empty();
@@ -1386,7 +1331,7 @@ pub(super) fn commit_exit(
     stage: &TailStage,
 ) -> Result<()> {
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
-    let mut span = kinds::SaveSpan::begin(db);
+    let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
     let mut tx = db.begin(TxnMode::Write)?;
     // Only the layout before Tail, and only up to Tail's: an older store still
@@ -1410,22 +1355,12 @@ pub(super) fn commit_exit(
         &[],
     )?;
     let outcome = tx.commit(expected, next);
-    span.outcome(&outcome);
-    let published = outcome != DurableCommitOutcome::NotPublished;
-    span.emit(db, if published { next } else { expected });
-    match outcome {
-        DurableCommitOutcome::Committed(generation) if generation == next => {
-            #[cfg(test)]
-            if kinds::FAIL_DIGEST_PROMOTION.with(|fail| fail.replace(false)) {
-                bail!(Hold::ReloadRequired);
-            }
-            Ok(())
-        }
-        DurableCommitOutcome::NotPublished => {
-            bail!(db.save_failure().unwrap_or(Hold::ReloadRequired))
-        }
-        _ => bail!(Hold::ReloadRequired),
+    kinds::commit_next(db, span, outcome, expected, next)?;
+    #[cfg(test)]
+    if kinds::FAIL_DIGEST_PROMOTION.with(|fail| fail.replace(false)) {
+        bail!(Hold::ReloadRequired);
     }
+    Ok(())
 }
 
 #[cfg(test)]

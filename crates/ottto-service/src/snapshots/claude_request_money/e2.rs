@@ -410,7 +410,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         responses: _,
         root_fallbacks: _,
         side: _,
-        side_requests: _,
         telemetry,
         accounts,
         prefix: _,
@@ -928,13 +927,12 @@ pub(crate) struct FileFold {
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
-    pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1159,7 +1157,6 @@ impl FileFold {
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
-            side_requests: 0,
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
@@ -1456,9 +1453,6 @@ impl FileFold {
             self.entity.absorb_grains(&copy);
         }
         self.restore_idless();
-        if let Some(accounts) = self.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
         self.entity.removed = Default::default();
         self.entity.removed_requests = 0;
         self.skipped.clear();
@@ -2291,7 +2285,7 @@ fn scan_evidence(
     let settled = index
         .files
         .get(key)
-        .filter(|entry| record.proves_current(entry.observed_fingerprint()));
+        .filter(|entry| record.proves_current(entry.source_file_fingerprint.as_str()));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
     if let Some(metadata) = &metadata {
         let now = metadata
@@ -2447,19 +2441,19 @@ fn twin_page_held(
     order: (i128, LocationKey),
 ) -> BTreeSet<u64> {
     let item = &items[at];
-    let earlier = page_folds
-        .get(item.source_session_id.as_str())
-        .into_iter()
-        .flatten()
-        .filter(|&&other| {
+    let earlier = earlier_holders(
+        items,
+        page_folds
+            .get(item.source_session_id.as_str())
+            .map_or(&[][..], Vec::as_slice),
+        &order,
+        |other| {
             items[other]
                 .claude_money
                 .as_deref()
                 .and_then(FileFold::copy_order)
-                .is_some_and(|earlier| earlier < order)
-        })
-        .map(|&other| &items[other].claude_usage_request_ids)
-        .collect::<Vec<_>>();
+        },
+    );
     if earlier.is_empty() || !twin_copy_born_from_cutoff(item, &earlier) {
         return BTreeSet::new();
     }
@@ -2469,18 +2463,43 @@ fn twin_page_held(
         .collect()
 }
 
-/// The copy's birth from its lines alone: the time of its first response
-/// no earlier twin holds (its first own turn). Never a file system birth,
-/// which a copy, rewrite or restore resets, so cold and stored reads agree.
+/// The request ids of the files in `group` that come before `at` in the
+/// caller's `order`; a file without a place in that order holds nothing.
+pub(in crate::snapshots) fn earlier_holders<'a, K: Ord>(
+    items: &'a [SnapshotItem],
+    group: &[usize],
+    at: &K,
+    order: impl Fn(usize) -> Option<K>,
+) -> Vec<&'a BTreeSet<String>> {
+    group
+        .iter()
+        .filter(|&&other| order(other).is_some_and(|key| key < *at))
+        .map(|&other| &items[other].claude_usage_request_ids)
+        .collect()
+}
+
 /// An unknown time keeps today's decision.
 fn twin_copy_born_from_cutoff(item: &SnapshotItem, earlier: &[&BTreeSet<String>]) -> bool {
+    first_own_turn_at(item, 0, earlier).is_some_and(from_copy_proof_cutoff)
+}
+
+/// The copy's birth from its lines alone: the time of its first response at
+/// or after sequence `from` that no earlier twin holds (its first own turn).
+/// Never a file system birth, which a copy, rewrite or restore resets, so
+/// cold and stored reads agree.
+pub(in crate::snapshots) fn first_own_turn_at(
+    item: &SnapshotItem,
+    from: u64,
+    earlier: &[&BTreeSet<String>],
+) -> Option<i128> {
     item.claude_usage_occurrences
         .iter()
-        .filter(|(id, _)| !earlier.iter().any(|ids| ids.contains(*id)))
+        .filter(|(id, occurrence)| {
+            occurrence.sequence >= from && !earlier.iter().any(|ids| ids.contains(*id))
+        })
         .min_by_key(|(_, occurrence)| occurrence.sequence)
         .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
         .and_then(rfc3339_unix_nanos)
-        .is_some_and(from_copy_proof_cutoff)
 }
 
 /// One census walk per folder for every copied main file of the page. A
@@ -3024,12 +3043,6 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
     }
     fold.restore_idless();
     fold.proof = None;
-    if fold.copied == 0 {
-        // Every copy counts after all: their inherited-marker tally too.
-        if let Some(accounts) = fold.accounts.as_deref_mut() {
-            accounts.restore_copies();
-        }
-    }
     if !holder_proof {
         fold.absorb_prefix_inherited(false);
     }
@@ -3794,7 +3807,6 @@ pub(crate) fn side_calls_page(
                 )
             });
             fold.side.add(&tokens);
-            fold.side_requests += 1;
             if fallback {
                 fold.root_fallbacks += 1;
             }
@@ -3994,7 +4006,6 @@ pub(crate) fn finish_page(
         .unwrap_or_default();
 
     claude_request_identity::inherit_root_accounts(items, true);
-    claude_request_identity::record_page_identity_counts(items);
 
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<String, Session>::new();
@@ -4309,7 +4320,7 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         if let Some(record) = index.claude_request_census.get(key).filter(|record| {
             !record.request_hashes().is_empty()
                 && index.files.get(key).is_some_and(|entry| {
-                    record.current_for(entry.observed_fingerprint())
+                    record.current_for(entry.source_file_fingerprint.as_str())
                         && entry.same_listing_stamp_as(&metadata)
                 })
         }) {

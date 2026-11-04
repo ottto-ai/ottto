@@ -95,18 +95,8 @@ fn account_window_collapse_replays_real_retirement_and_holds() {
                 .len(),
             1
         );
-        assert_eq!(
-            claude_pending_family_session_ids(&before),
-            claude_pending_family_session_ids(&after),
-            "scheduling {blocker}"
-        );
-        // [money] Cold arm: the v2 summary schedules and retires alike.
+        // [money] Cold arm: the v2 summary retires alike.
         let cold_before = cold(before.clone());
-        assert_eq!(
-            claude_pending_family_session_ids(&cold_before),
-            claude_pending_family_session_ids(&before),
-            "cold scheduling {blocker}"
-        );
         let cold_decision = retention_decision(cold_before, &root);
         let expected = retention_decision(before, &root);
         assert_eq!(expected.0, blocker != "none", "nonvacuous {blocker}");
@@ -198,7 +188,7 @@ fn account_window_runs_preserve_a_b_a_and_revision_only_changes() {
 
 /// [money] A v1 or resident history with the former rule's second endpoints
 /// and census-completion flips collapses to each run's newest window, with
-/// the same summary, scheduling and retirement as the uncollapsed history,
+/// the same summary and retirement as the uncollapsed history,
 /// resident and cold. The completion flag of an archived window splits no
 /// run. An account change only in older windows still retires; an
 /// unconfirmed member only in them still holds.
@@ -250,11 +240,6 @@ fn account_window_collapse_keeps_each_runs_newest_across_completion_flips() {
             pending.history_summary()
                 == before.claude_account_family_pending[&root].history_summary(),
             "{change}"
-        );
-        assert_eq!(
-            claude_pending_family_session_ids(&before),
-            claude_pending_family_session_ids(&after),
-            "scheduling {change}"
         );
         let expected = retention_decision(before.clone(), &root);
         assert_eq!(expected.0, change == "absent", "nonvacuous {change}");
@@ -492,25 +477,15 @@ fn account_window_opaque_holds_preserve_history_and_its_save_budget() {
 }
 
 /// Everything account placement reads from a family's archived windows:
-/// the sessions scheduled for evidence reads (`has_history`), then the
-/// save's retirement (`history_summary`), its witnesses, the sessions
-/// scheduled afterwards and the family's surviving current window.
-type Placement = (
-    Vec<String>,
-    bool,
-    serde_json::Value,
-    Vec<String>,
-    Option<serde_json::Value>,
-);
+/// the save's retirement (`history_summary`), its witnesses and the family's
+/// surviving current window.
+type Placement = (bool, serde_json::Value, Option<serde_json::Value>);
 fn placement(mut index: ScanIndex, root: &str) -> Placement {
-    let scheduled = claude_pending_family_session_ids(&index);
     index.retire_committed_claude_account_pending_windows();
     let pending = index.claude_account_family_pending.get(root);
     (
-        scheduled,
         pending.is_some(),
         serde_json::to_value(&index.claude_account_family_witnesses).unwrap(),
-        claude_pending_family_session_ids(&index),
         pending.map(|pending| serde_json::to_value(&pending.current).unwrap()),
     )
 }
@@ -644,7 +619,7 @@ fn account_window_placement_parity_with_two_endpoint_retention() {
             &newest
         );
         let expected = placement(legacy.clone(), &root);
-        assert_eq!(!expected.1, retires, "nonvacuous {history}");
+        assert_eq!(!expected.0, retires, "nonvacuous {history}");
         for (arm, index) in [
             ("v2 compacted reopened", reopened),
             ("new rolled", new_rolled.clone()),

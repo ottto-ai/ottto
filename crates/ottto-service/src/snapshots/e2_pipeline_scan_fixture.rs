@@ -155,8 +155,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
     into.head_conflict_sessions = from.head_conflict_sessions.clone();
-    into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
-    into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
     into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
@@ -281,17 +279,13 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     }
 }
 
-/// A scan fixture's page of a source with a Tail codec continues from its
-/// owner's route; with no cache it reads a fixture route unrouted. Other
-/// sources are left alone.
+/// A scan fixture's page continues from its owner's route; with no cache it
+/// reads a fixture route unrouted.
 pub(crate) fn route_for_test(
-    source: SnapshotSource,
+    _source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    if !tail_source::has_codec(source) {
-        return index;
-    }
     let Some(cache) = cache else {
         // A scan with no cache to own a route is the cold oracle: it reads a
         // fixture route's graph unrouted, as before Claude kept its Tail there,
@@ -309,6 +303,32 @@ pub(crate) fn route_for_test(
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     routed_for_test(cache, index, &dir)
+}
+
+/// The saved, already-indexed walk used by a quiet restart. Like the
+/// discovery-growth fixture, it keeps the roster across the restart; only
+/// unchanged members already represented by the committed index are drained.
+pub(crate) fn retain_indexed_walk_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    collected_at: &str,
+    backfill_window_days: u64,
+) {
+    ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    advance_bounded_directory_traversal(source, index, backfill_window_days, None);
+    let walk = index.traversal.as_ref().expect("indexed walk");
+    assert!(walk.pending_directories.is_empty(), "the walk is complete");
+    for candidate in &walk.pending_candidates {
+        let metadata = std::fs::symlink_metadata(&candidate.path).unwrap();
+        let entry = &index.files[&local_index_key(&candidate.path)];
+        assert!(entry.same_listing_stamp_as(&metadata));
+        assert!(!entry.source_file_fingerprint.is_empty());
+        // A retained walk keeps a sampled prefix until its audit deadline;
+        // listing_unchanged would reject even that not-yet-due obligation.
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+    }
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
 }
 
 /// The time a fixture's next visit is taken to come after its last. The
@@ -775,7 +795,6 @@ pub(super) fn parse_ordinary_with_metadata(
         path,
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
-        None,
         None,
         None,
     )?;

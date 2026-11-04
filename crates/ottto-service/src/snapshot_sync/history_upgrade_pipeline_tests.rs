@@ -372,17 +372,12 @@ impl HistoryFixture {
             index
         };
         let settlement = if cycle.shed_upload {
-            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false, None)
+            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
         } else {
             match cycle.upload {
-                PipelineUpload::ServerDeferred => settle_checkpointed_upload(
-                    index,
-                    &committed_index,
-                    &progress,
-                    &holds,
-                    false,
-                    None,
-                ),
+                PipelineUpload::ServerDeferred => {
+                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                }
                 _ => settle_completed_upload(index, &committed_index, &progress, &holds),
             }
         };
@@ -770,12 +765,11 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
-        // A retained owner and a true contract latch beside budget damage.
+        // A retained owner and a prior contract beside budget damage.
         let mut value = saved(&fixture);
         value["session_account_bindings"] =
             serde_json::json!({ owner_key.clone(): {"account_identifier_hash": owner} });
         value["claude_request_identity_contract"] = serde_json::json!("prior-contract");
-        value["claude_request_identity_contract_changed"] = serde_json::json!(true);
         std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
             .expect("seed prior identity");
         fixture.exceed_decode_hold_budget();
@@ -2786,7 +2780,7 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
 }
 
 #[test]
-fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fence() {
+fn e2_production_contract_and_revision_share_one_paced_reread() {
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
     let fixture = HistoryFixture::new("e2-contract-one-paced-pass");
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -2797,11 +2791,6 @@ fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fenc
             ..HISTORY_REVISION_2
         },
     );
-    let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-    saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
-    saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] = serde_json::json!(1785711600u64);
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     with_e2_history(&fixture, || {
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         with_cycle_contract_for_test(E2_GROUPING, || {
@@ -2826,8 +2815,7 @@ fn e2_production_contract_and_revision_share_one_paced_reread_behind_closed_fenc
                     if hour == 14 {
                         assert_eq!(
                             page.index.claude_request_identity_contract_for_test(),
-                            (Some(E2_GROUPING), false),
-                            "latch clears"
+                            Some(E2_GROUPING)
                         );
                         assert_eq!(page.scan.scanned_file_count, 0, "no second rearm");
                     }
@@ -2989,9 +2977,6 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
         let mut saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
         saved["claude_request_identity_contract"] = serde_json::json!("");
-        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
-        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
-            serde_json::json!(1785711600u64);
         std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
         let witnesses = |index: &ScanIndex| {
             index
@@ -3032,7 +3017,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
                     if hour == 14 {
                         assert_eq!(
                             page.index.claude_request_identity_contract_for_test(),
-                            (Some(E2_GROUPING), false)
+                            Some(E2_GROUPING)
                         );
                     }
                 }

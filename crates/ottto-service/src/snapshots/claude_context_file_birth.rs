@@ -304,7 +304,7 @@ impl ClaudeFileBirth {
         let ClaudeBirthScope::Root(birth) = self.scope else {
             return None;
         };
-        Some(at? < birth.checked_sub(slack)?)
+        before_birth(at?, birth, slack)
     }
 
     pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
@@ -348,11 +348,6 @@ impl ClaudeFileBirth {
         (self.opened.birth != 0)
             .then_some(i128::from(self.opened.birth))
             .or_else(|| self.birth_nanos())
-    }
-
-    /// Read through the Claude transcript parser.
-    pub(super) fn observed(&self) -> bool {
-        self.scope != ClaudeBirthScope::NotObserved
     }
 
     fn root_with_birth(&self) -> bool {
@@ -481,6 +476,61 @@ pub(super) fn apply_own_context_scalars(
     counts.id_less_response_after_compaction_count = counts
         .id_less_response_after_compaction_count
         .saturating_add(id_less.after);
+}
+
+/// Cache rows only: each item's content birth, the provider time of its
+/// first own response (`e2::first_own_turn_at`). That response is at or after
+/// the first one this rule counts as own, and no earlier file of the same
+/// family on the page holds its request id: a subagent copy's prefix stays
+/// with the file it was copied from. Earlier means an earlier first
+/// response, then the lower session id: content only, so cold, Tail and
+/// restored reads agree. `None` when no own response has a readable time.
+pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
+    use super::claude_request_money::e2::{earlier_holders, first_own_turn_at};
+    let order = items
+        .iter()
+        .map(|item| {
+            (
+                first_own_turn_at(item, 0, &[]),
+                item.source_session_id.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut families = BTreeMap::<&str, Vec<usize>>::new();
+    for (at, item) in items.iter().enumerate() {
+        families
+            .entry(claude_snapshot_family_root_ref(item))
+            .or_default()
+            .push(at);
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let earlier = earlier_holders(
+                items,
+                &families[claude_snapshot_family_root_ref(item)],
+                &order[at],
+                |other| Some(order[other]),
+            );
+            first_own_turn_at(item, item.claude_file_birth.first_own_sequence?, &earlier)
+        })
+        .collect()
+}
+
+/// A cache request is the file's own unless its provider time is more than
+/// the copy slack before the content birth. An unreadable time is kept, so
+/// the wire makes the session partial instead of dropping it.
+pub(super) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
+    rfc3339_unix_nanos(occurred_at).map_or(true, |at| {
+        before_birth(at, birth, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) != Some(true)
+    })
+}
+
+/// Whether `at` is more than `slack` before `birth`; `None` when that bound
+/// does not fit.
+fn before_birth(at: i128, birth: i128, slack: i128) -> Option<bool> {
+    Some(at < birth.checked_sub(slack)?)
 }
 
 /// When the session's first own request ended (`first_own_request_at`): only for
@@ -892,8 +942,6 @@ pub(super) fn remembered_tripwire() -> std::sync::MutexGuard<'static, ClaudeReme
 pub struct ClaudeContextBasisCounts {
     /// Responses and compaction boundaries tagged as copied by file birth.
     pub tagged_record_count: u64,
-    /// Scalars from a provider-proven start (the strict rule).
-    pub proof_basis_session_count: usize,
     /// Scalars admitted by the file birth rule.
     pub file_birth_rule_session_count: usize,
     /// File-birth admissions whose every kept request telemetry assigned to
@@ -922,34 +970,24 @@ impl ClaudeContextBasisCounts {
         if partially {
             self.partially_pre_birth_session_count += 1;
         }
-        let counter = match outcome {
-            ContextBasisOutcome::Proof => &mut self.proof_basis_session_count,
-            ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) => {
-                if confirmed {
-                    self.telemetry_confirmed_session_count += 1;
-                }
-                if remembered {
-                    self.withheld_tripwire_remembered_session_count += 1;
-                }
-                match verdict {
-                    ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
-                    ClaudeFileBirthVerdict::UnknownBirth => {
-                        &mut self.withheld_unknown_birth_session_count
-                    }
-                    ClaudeFileBirthVerdict::UntimedRecord => {
-                        &mut self.withheld_untimed_record_session_count
-                    }
-                    ClaudeFileBirthVerdict::AllCopied => {
-                        &mut self.withheld_all_copied_session_count
-                    }
-                    ClaudeFileBirthVerdict::MultiFile => {
-                        &mut self.withheld_multi_file_session_count
-                    }
-                    ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
-                    ClaudeFileBirthVerdict::EvidenceBound => {
-                        &mut self.withheld_evidence_bound_session_count
-                    }
-                }
+        let ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) = outcome;
+        if confirmed {
+            self.telemetry_confirmed_session_count += 1;
+        }
+        if remembered {
+            self.withheld_tripwire_remembered_session_count += 1;
+        }
+        let counter = match verdict {
+            ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
+            ClaudeFileBirthVerdict::UnknownBirth => &mut self.withheld_unknown_birth_session_count,
+            ClaudeFileBirthVerdict::UntimedRecord => {
+                &mut self.withheld_untimed_record_session_count
+            }
+            ClaudeFileBirthVerdict::AllCopied => &mut self.withheld_all_copied_session_count,
+            ClaudeFileBirthVerdict::MultiFile => &mut self.withheld_multi_file_session_count,
+            ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
+            ClaudeFileBirthVerdict::EvidenceBound => {
+                &mut self.withheld_evidence_bound_session_count
             }
         };
         *counter += 1;
@@ -958,7 +996,6 @@ impl ClaudeContextBasisCounts {
 
 #[derive(Debug, Clone, Copy)]
 enum ContextBasisOutcome {
-    Proof,
     /// Verdict, telemetry confirmed, tripwire remembered from an earlier fold.
     FileBirth(ClaudeFileBirthVerdict, bool, bool),
 }
@@ -1006,8 +1043,7 @@ impl ClaudeContextFileBirthCounts {
         let tagged = birth
             .tagged_responses
             .saturating_add(birth.tagged_boundaries(&item.claude_context_curve_boundaries));
-        let partially = matches!(outcome, ContextBasisOutcome::FileBirth(..))
-            && birth.partially_pre_birth(&item.claude_context_curve_boundaries);
+        let partially = birth.partially_pre_birth(&item.claude_context_curve_boundaries);
         self.total.record(outcome, tagged, partially);
         let version = item
             .session_start
@@ -1031,10 +1067,6 @@ impl ClaudeContextFileBirthCounts {
             .entry(key.to_string())
             .or_default()
             .record(outcome, tagged, partially);
-    }
-
-    pub(super) fn record_proof(&mut self, item: &SnapshotItem) {
-        self.record(item, ContextBasisOutcome::Proof);
     }
 
     /// Count one body the fold left without the v1 contract (R9).

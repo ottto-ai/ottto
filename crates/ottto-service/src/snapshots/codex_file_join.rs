@@ -2002,7 +2002,7 @@ pub(super) mod tests {
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
-            ledgers: None,
+
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
@@ -3916,7 +3916,6 @@ pub(super) mod tests {
                 None,
                 traces.clone(),
                 None,
-                None,
             )
             .unwrap();
             assert!(parsed.complete());
@@ -3989,7 +3988,7 @@ pub(super) mod tests {
             .into_job(JobInputs {
                 metadata: &metadata,
                 traces: None,
-                ledgers: None,
+
                 index: &previous,
             })
             .unwrap();

@@ -651,18 +651,13 @@ fn read_fixture(name: &str) -> String {
 }
 /// Owned kinds no sample field writes: opaque v1 holds and retired kinds.
 fn unwritten(kind: &str) -> bool {
-    kind.starts_with("raw_hold.")
+    catalogue::retired(kind)
+        || kind.starts_with("raw_hold.")
         || matches!(
             kind,
             "setting.upload_context_fingerprint"
                 | "v1_field.claude_desktop_census_witness"
                 | "v1_field.claude_folder_login_ledger"
-                | "v1_field.codex_state_only_snapshot_fingerprints"
-                | "v1_field.codex_state_only_blocked_session_ids"
-                | "v1_field.codex_state_only_blocked_by_file"
-                | "v1_field.codex_state_only_blocked_unattributed"
-                | "v1_field.codex_state_only_blocked_legacy"
-                | "v1_field.codex_state_only_blocked_attributed"
         )
 }
 
@@ -711,90 +706,13 @@ fn sample() -> ScanIndex {
 fn g(given: Given) -> Given {
     given
 }
-fn tagged(mut value: Json, tag: &str, name: &str) -> Result<Json, DeError> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| de::Error::custom("tagged payload"))?;
-    object.insert(tag.to_owned(), name.into());
-    Ok(value)
-}
 /// Values for readers a type cannot drive: internally tagged enums, readers
 /// that decode any JSON and keep a default on failure, and binary encodings.
 fn given() -> Vec<(&'static str, Vec<Given>)> {
     use crate::local_resource_diagnostics::CapCounts;
     use crate::snapshots::codex_file_join::AppliedTierReceipt;
-    use crate::snapshots::evidence_owed::EvidenceContract;
-    use crate::snapshots::{
-        ClaudeStaleFamilyCarryOrigin, CodexParentPrefixProof, CodexParentProofOwed, WakeStamp,
-    };
-    fn wake(kind: &str, s: &mut Synth) -> Result<Json, DeError> {
-        let (parent, child) = (s.json::<WakeStamp>()?, s.json::<WakeStamp>()?);
-        Ok(json!({"kind": kind, "parent": parent, "child": child}))
-    }
     vec![
-        (
-            "codex_parent_side_requests/*/state",
-            vec![
-                g(|_| Ok(json!({"kind": "live"}))),
-                g(|_| Ok(json!({"kind": "evicted"}))),
-                g(|_| Ok(json!({"kind": "short", "covered": 1}))),
-                g(|_| Ok(json!({"kind": "lossy"}))),
-                g(|_| Ok(json!({"kind": "unsealed"}))),
-            ],
-        ),
-        (
-            "codex_parent_side/*/verdict",
-            vec![
-                g(|_| Ok(json!({"kind": "settled"}))),
-                g(|_| Ok(json!({"kind": "held", "lineage": true, "cause": 1}))),
-            ],
-        ),
-        (
-            "codex_parent_prefix_proofs/*",
-            vec![
-                g(|s| tagged(s.json::<CodexParentPrefixProof>()?, "state", "proven")),
-                g(|s| tagged(s.json::<CodexParentProofOwed>()?, "state", "owed")),
-            ],
-        ),
-        (
-            "codex_parent_prefix_proofs/*/wake",
-            vec![
-                g(|_| Ok(json!({"kind": "due"}))),
-                g(|s| wake("parent_changed", s)),
-                g(|s| wake("child_changed", s)),
-                g(|s| wake("rewritten", s)),
-                g(|s| {
-                    let (matches, child) = (s.string(), s.json::<WakeStamp>()?);
-                    Ok(json!({"kind": "census", "matches": matches, "child": child}))
-                }),
-                g(|s| {
-                    let (key, entry) = (s.string(), s.string());
-                    Ok(
-                        json!({"kind": "parent_held", "parent_key": key, "generation": 1,
-                        "parent_entry": entry, "parent": s.json::<WakeStamp>()?,
-                        "lineage": true, "needed_extent": 1}),
-                    )
-                }),
-                g(|_| Ok(json!({"kind": "backoff"}))),
-            ],
-        ),
         ("traversal/counts/caps", vec![g(|s| s.json::<CapCounts>())]),
-        (
-            "claude_stale_family_carry/origin",
-            vec![g(|s| s.json::<ClaudeStaleFamilyCarryOrigin>())],
-        ),
-        (
-            "claude_usage_family_pending/*/identity_contract",
-            vec![g(|s| s.json::<EvidenceContract>())],
-        ),
-        (
-            "claude_usage_family_pending/*/contract_unproven",
-            vec![g(|_| Ok(json!(true)))],
-        ),
-        (
-            "claude_usage_family_pending/*/idless_revision",
-            vec![g(|_| Ok(Json::Array(vec![json!(1); 32])))],
-        ),
         (
             "traversal/counts/unreadable_causes/samples",
             vec![g(|_| {

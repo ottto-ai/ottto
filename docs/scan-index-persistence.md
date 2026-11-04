@@ -514,19 +514,8 @@ creates no retirement authority. Delivery is not claimed to be exactly once.
 
 Missing/unbound receipts, identity mismatches, source rollback, corrupted receipts
 and unexpected progress bytes hold the source without quarantine/reset. Counts-only
-`ack_recovery_hold` and `ack_receipt_reconciled` events expose refusal/replay. Receipt
-encoding is capped at 64 MiB. Before each POST, conservative admission reserves
-the current progress plus the page's possible ACK, identity, cache, head and refusal
-additions. Serialized progress must fit `(64 MiB - 16 KiB) / 6` (about 10.66 MiB),
-allowing worst-case JSON escaping and receipt controls. Exhaustion is counted as
-`ack_recovery_hold{size_before_upload}` and requests local ACK settlement before any
-remote write; it never evicts accepted shares. Admission then prunes the cache
-evidence (state and head) of settled sessions, those with no pending head obligation
-and not in the page, counted as `ack_custody_pruned`; a pruned session that reopens
-takes the ordinary missing-head bootstrap. If live custody alone still exceeds the
-bound, nothing changes and the route holds (`hold{ack_custody}`): no collection or
-POST until one retry per `GROWTH_FULL_INTERVAL` (6 h); owed debt stays in the
-unchanged index and progress. Empty v2
+`ack_recovery_hold` and `ack_receipt_reconciled` events expose refusal/replay.
+Receipts carry exact progress bytes of any size; no pre-POST size admission. Empty v2
 progress remains durable so a missing ledger cannot silently reopen old work.
 
 Before publication, the import owner must seal the proved original progress bytes
