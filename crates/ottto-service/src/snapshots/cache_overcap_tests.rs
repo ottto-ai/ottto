@@ -74,6 +74,11 @@ fn upload(requests: &[OwnedRequest], prior: Option<&Value>) -> (CacheObservation
     (wire, item.cache_observations_state.unwrap())
 }
 
+/// The accepted state a session with `breaks` breaks settles to.
+pub(crate) fn settled_state(breaks: usize) -> Value {
+    settle(&session("", breaks), None)
+}
+
 /// Upload passes until the accepted state stops changing.
 fn settle(requests: &[OwnedRequest], mut prior: Option<Value>) -> Value {
     loop {

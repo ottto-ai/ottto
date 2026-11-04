@@ -15656,6 +15656,45 @@ mod tests {
         );
     }
 
+    /// [regress] The progress loader once capped accepted cache states at
+    /// 128 rows / 128 KiB, so a larger accepted state quarantined the whole
+    /// progress file on restart.
+    #[test]
+    fn accepted_cache_state_past_old_caps_survives_progress_restart() {
+        let state = crate::snapshots::cache_overcap_tests::settled_state(200);
+        assert_eq!(state["observations"].as_array().unwrap().len(), 200);
+        assert!(serde_json::to_vec(&state).unwrap().len() > 128 * 1024);
+        let mut progress = test_upload_progress();
+        let key = cache_session_key("s");
+        progress
+            .accepted_cache_states
+            .insert(key.clone(), state.clone());
+        let root = test_dir("cache-state-restart");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("progress.json");
+        progress.save(&path).unwrap();
+        let namespace = progress.destination_namespace_hash.clone();
+        let witness = progress.active_quarantine_witness.clone().unwrap();
+        let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+        assert_eq!(restored.accepted_cache_states.get(&key), Some(&state));
+        let quarantined = std::fs::read_dir(&root)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("corrupt")
+            })
+            .count();
+        assert_eq!(
+            quarantined, 0,
+            "nothing quarantined beside the progress file"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cache_event_ack_restart_correction_and_missing_proof() {
         let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
