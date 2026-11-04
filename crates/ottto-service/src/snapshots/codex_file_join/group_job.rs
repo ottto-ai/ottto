@@ -383,6 +383,18 @@ impl GroupBoot {
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
+        // Group plans and the live-prefix certificate still use physical
+        // extents/end_byte_offset. Decoded offsets cannot satisfy those facts.
+        // Refuse before identification/probing can sample compressed bytes.
+        if refuse_compressed_codex(
+            Some(&self.group.members[self.identified].path),
+            None,
+            CodexZstCause::GroupReadUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
         if let Some(events) = launch_events {

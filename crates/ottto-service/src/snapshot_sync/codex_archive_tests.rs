@@ -1,77 +1,114 @@
 use super::*;
 
 pub(crate) fn archive_upload_checkpoint(
-    mut index: ScanIndex,
+    index: ScanIndex,
     scan: &SourceScanResult,
     previous: &ScanIndex,
     outcome: &str,
 ) -> ScanIndex {
-    let root = crate::test_scratch::ScratchDir::new("archive-upload-checkpoint");
-    let index_path = root.join("index.json");
-    let progress_path = root.join("progress.json");
-    std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
-    let mut progress = test_upload_progress();
-    progress.save(&progress_path).unwrap();
-    if outcome != "partial" {
-        let result = upload_resumable_batches_with_body_witness(
-            &scan.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut 0,
-            |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |items| {
-                if outcome == "shed" {
-                    Err(anyhow::Error::new(UploadShed {
-                        status: 503,
-                        retry_after: None,
-                        code: None,
-                    }))
-                } else {
-                    ack_retention_tests::exact_ack(items)
-                }
-            },
-            |state| state.save(&progress_path),
-        )
-        .unwrap();
-        if outcome == "shed" {
-            assert!(matches!(result, ResumableUploadResult::Shed { .. }));
-        } else {
-            assert_eq!(result, ResumableUploadResult::Completed);
+    index
+        .checkpoint_with_captured_posts(scan, previous, outcome)
+        .0
+}
+
+impl ScanIndex {
+    pub(crate) fn checkpoint_with_captured_posts(
+        self,
+        scan: &SourceScanResult,
+        previous: &ScanIndex,
+        outcome: &str,
+    ) -> (ScanIndex, Vec<Vec<u8>>) {
+        let mut index = self;
+        let mut posts = Vec::new();
+        let root = crate::test_scratch::ScratchDir::new("archive-upload-checkpoint");
+        let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
+        let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
+        let progress_path = root.join("progress.json");
+        if route.is_none() {
+            std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
         }
+        let mut progress = test_upload_progress();
+        progress.save(&progress_path).unwrap();
+        if outcome != "partial" {
+            let result = upload_resumable_batches_with_body_witness(
+                &scan.snapshots,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut 0,
+                |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |items| {
+                    let mut request = crate::snapshots::tests::valid_v6_batch_request();
+                    request.source = SnapshotSource::Codex.api_slug().into();
+                    request.snapshots = items.to_vec();
+                    posts.push(serde_json::to_vec(&request).unwrap());
+                    if outcome == "shed" {
+                        Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: None,
+                            code: None,
+                        }))
+                    } else {
+                        ack_retention_tests::exact_ack(items)
+                    }
+                },
+                |state| state.save(&progress_path),
+            )
+            .unwrap();
+            if outcome == "shed" {
+                assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+            } else {
+                assert_eq!(result, ResumableUploadResult::Completed);
+            }
+        }
+        index.generation = previous.generation;
+        if outcome == "accept" {
+            index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        }
+        if outcome == "wrong-body" {
+            for witness in progress.accepted_body_witnesses.values_mut() {
+                *witness = "0".repeat(64);
+            }
+            progress.save(&progress_path).unwrap();
+        }
+        let checkpoint = checkpoint_partial_snapshot_index(
+            &index,
+            previous,
+            &progress,
+            &scan.snapshots,
+            Some(scan),
+            &BTreeSet::new(),
+            &index_path,
+            &progress_path,
+            || {
+                if outcome == "wrong-destination" {
+                    anyhow::bail!("synthetic destination changed before checkpoint");
+                }
+                Ok(())
+            },
+        );
+        if outcome == "wrong-destination" {
+            assert!(checkpoint.is_err());
+        } else {
+            checkpoint.unwrap();
+        }
+        (ScanIndex::load(&index_path).unwrap(), posts)
     }
-    index.generation = previous.generation;
-    if outcome == "accept" {
-        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        index.settle_archive_outcome(|fp| {
-            progress.accepted_body_witnesses.get(fp).map(String::as_str)
-        });
-    }
-    checkpoint_partial_snapshot_index(
-        &index,
-        previous,
-        &progress,
-        &scan.snapshots,
-        Some(scan),
-        &BTreeSet::new(),
-        &index_path,
-        &progress_path,
-        || Ok(()),
-    )
-    .unwrap();
-    ScanIndex::load(&index_path).unwrap()
 }
 pub(crate) fn assert_archive_debt_preserves_replay_progress(
     mut index: ScanIndex,
     scan: SourceScanResult,
-    expected_markers: usize,
+    expected_files: usize,
 ) {
     assert!(scan.census_complete);
     let counts = SyncCounts::from_scan_result(&scan, 0, 7);
     assert!(counts.has_disclosed_loss());
     assert_eq!(counts.disclosed_loss(), DisclosedLoss::Unsettled);
     let causes = crate::snapshots::ownership_diagnostics::line(counts.causes);
-    assert!(causes.contains("archive_owed"));
+    assert!(
+        !causes.contains("archive_owed"),
+        "retired policy has no live cause"
+    );
     assert!(!causes.contains("unattributed"));
     let root = crate::test_scratch::ScratchDir::new("archive-backfill-isolation");
     let support = root.join("support");
@@ -154,10 +191,11 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
     );
     assert!(cached_source_manifest(&destination, SnapshotSource::Codex).is_some());
     index = ScanIndex::load(&path).unwrap();
-    match serde_json::to_value(&index).unwrap().get("archives") {
-        Some(markers) => assert_eq!(markers.as_object().unwrap().len(), expected_markers),
-        None => assert_eq!(expected_markers, 0, "empty archive map is omitted"),
-    }
+    assert!(serde_json::to_value(&index)
+        .unwrap()
+        .get("archives")
+        .is_none());
+    assert_eq!(index.files.len(), expected_files);
     let fp = "a".repeat(64);
     let mut progress =
         SnapshotUploadProgress::load(&progress_path, &destination, test_quarantine_witness())

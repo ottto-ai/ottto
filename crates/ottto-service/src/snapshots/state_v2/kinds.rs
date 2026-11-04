@@ -207,14 +207,31 @@ pub(super) fn delta(
     cx.archived = Archived::default();
     cx.compaction = Default::default();
     let result = (|| {
+        ensure!(
+            cx.tail
+                .iter()
+                .flat_map(|stage| stage.carries())
+                .all(|(to, carry)| !next.files.contains_key(&carry.from)
+                    && std::str::from_utf8(to).is_ok_and(|to| next.files.contains_key(to))),
+            "state_v2_tail_carry_graph"
+        );
+        let carry_files: std::collections::BTreeSet<_> = cx
+            .tail
+            .iter()
+            .flat_map(|stage| stage.carries())
+            .flat_map(|(to, carry)| [to.clone(), carry.from.as_bytes().to_vec()])
+            .collect();
         let mut rows = mapper::Rows {
             tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
+            carry_aliases: (!carry_files.is_empty()).then(Vec::new),
+            carry_files: carry_files.clone(),
             // A staged file's own graph rows commit or roll back with its Tail.
             closures: cx
                 .tail
                 .iter()
                 .flat_map(|stage| stage.staged())
+                .chain(carry_files.iter())
                 .map(|file| (file.clone(), Vec::new()))
                 .collect(),
             ..Default::default()
@@ -261,6 +278,22 @@ pub(super) fn save_graph(
             Hold::ForeignBinding
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
+        // The ordinary CAS merge can have restored a predecessor's recent
+        // growth claim. Move its claim to the already rekeyed custody before
+        // enumeration, without replacing the destination's richer state.
+        for (to, carry) in pending.tail.iter().flat_map(|stage| stage.carries()) {
+            if let Some(claim) = next.v2_mut().growth_retention.remove(&carry.from) {
+                let to = std::str::from_utf8(to)?.to_owned();
+                next.v2_mut()
+                    .growth_retention
+                    .entry(to.clone())
+                    .or_insert_with(|| claim.clone());
+                super::super::sampled_audit::merge_growth_claims(
+                    &mut next.v2_mut().growth_retention,
+                    &BTreeMap::from([(to, claim)]),
+                );
+            }
+        }
         super::super::lenient_decode::check_held_output(next)?;
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;

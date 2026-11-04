@@ -1,39 +1,20 @@
 use super::*;
 
-/// [money] Re-listing uses archive stamps and custody after native-entry retirement;
-/// unchanged debt is paced, settlement stays quiet, growth queues, and size debt stays isolated.
+/// [money] Re-listing uses ordinary read/receipt evidence for compressed files;
+/// ordinary owed pacing, quiet settlement and growth discovery stay encoding independent.
 #[test]
 fn archive_relisting_preserves_custody_and_owed_pacing() {
-    use crate::local_resource_diagnostics::CodexZstCause;
-    use codex_compressed_input::{ArchiveDisposition, ArchiveEvidence};
-    for disposition in [
-        ArchiveDisposition::Acquired,
-        ArchiveDisposition::Empty,
-        ArchiveDisposition::Pending,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::HeaderInvalid,
-            quiet: true,
-        },
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::CorrectionUnapplied,
-            quiet: true,
-        },
-    ] {
+    for owed in [false, true] {
         let f = Fixture::new();
         let mut index = kept_generation(&f, SnapshotSource::Codex, false);
         let path = f.root.join("archive.jsonl.zst");
         fs::write(&path, b"synthetic").unwrap();
         let key = local_index_key(&path);
-        let mut archive = ArchiveEvidence::from_metadata(fs::metadata(&path).unwrap()).unwrap();
-        archive.owner = Some("synthetic".into());
-        archive.disposition = disposition;
-        archive.work.as_mut().unwrap().decoded = true;
-        let owed = archive.owed_cause().is_some();
-        index.archives.insert(key.clone(), archive);
-        // Settled archive custody wins even over a re-armed ordinary entry.
-        // Owed archives have no native entry after reconciliation retires it.
+        index
+            .files
+            .insert(key.clone(), crate::snapshots::g7_debt::tests::entry(&path));
         if !owed {
-            index.files.insert(key.clone(), ScanIndexEntry::default());
+            crate::snapshots::g7_debt::tests::accept(SnapshotSource::Codex, &mut index, &path);
         }
         index
             .traversal

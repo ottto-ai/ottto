@@ -462,14 +462,6 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
     }
 }
 
-pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
-    traversal_point(
-        "codex_zst_held",
-        "codex",
-        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
-    );
-}
-
 /// Sidecar read attempts and actual input bytes since the last Claude page.
 /// Repeated reads count again; missing/refused files add nothing. No identities.
 /// Absent scalars are zero, keeping quiet pages lean on the shared carrier.

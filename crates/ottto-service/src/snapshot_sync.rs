@@ -4284,14 +4284,10 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result
-                .ownership_incomplete_file_count
-                .saturating_add(scan_result.archive_owed_count)
-                as u64,
-            causes: scan_result.causes.summary_with_archive(
-                scan_result.ownership_incomplete_file_count,
-                scan_result.archive_owed_count,
-            ),
+            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -6324,17 +6320,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("read reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -8566,19 +8552,6 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    if !index.archives.is_empty() {
-        index.settle_archive_outcome(|fp| {
-            upload_progress
-                .accepted_body_witnesses
-                .get(fp)
-                .filter(|_| {
-                    !upload_progress
-                        .context_resend
-                        .requires_resend(fp, &upload_progress.accepted_body_contexts)
-                })
-                .map(String::as_str)
-        });
-    }
     // Shed and upload-error partial checkpoint: save wholly settled files,
     // then release adopted ACK capacity against the full scan's references
     // (#778 R2-2). A failed save is logged and yields `None`; a failed
@@ -25007,47 +24980,3 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
-
-/// Continuation's platform gates for archive work: the native signals unless
-/// a caller injects its own. A pass and its continuation pages share them.
-#[derive(Clone)]
-pub(crate) struct ArchiveGates(
-    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
-);
-impl Default for ArchiveGates {
-    fn default() -> Self {
-        Self::new(None::<continuation::MacPlatformSignals>)
-    }
-}
-impl std::fmt::Debug for ArchiveGates {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ArchiveGates")
-    }
-}
-impl ArchiveGates {
-    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
-        Self(gates.map(|g| {
-            std::sync::Arc::new(Mutex::new(g))
-                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
-        }))
-    }
-    /// Continuation's power policy: only `Allowed` permits archive work;
-    /// `Refused` and `Unknown` deny.
-    pub(crate) fn power_ready(&self) -> bool {
-        let Some(gates) = self.0.as_ref() else {
-            return continuation::PlatformGates::power(
-                &mut continuation::MacPlatformSignals::default(),
-            ) == continuation::PlatformState::Allowed;
-        };
-        gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .power()
-            == continuation::PlatformState::Allowed
-    }
-}
-
-/// Share continuation's work threshold with archive admission.
-pub(crate) fn archive_work_ready(micros: u64) -> bool {
-    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
-}

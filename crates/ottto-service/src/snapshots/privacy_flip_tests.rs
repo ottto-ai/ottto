@@ -392,21 +392,16 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         let delivery = f.index.active_upload_context_fingerprint.clone().unwrap();
         // The previous binary wrote every value under the delivery context.
         assert_eq!(f.adopt().files, 1);
-        for (name, context) in [
-            ("synthetic-archive", delivery.clone()),
-            ("other-archive", "another-delivery-context".to_owned()),
-        ] {
-            f.index.archives.insert(
-                name.into(),
-                codex_compressed_input::ArchiveEvidence {
-                    context: Some(context),
-                    owner: None,
-                    stamp: None,
-                    disposition: codex_compressed_input::ArchiveDisposition::Acquired,
-                    work: None,
-                },
-            );
-        }
+        let mut legacy_wire = serde_json::to_value(&f.index).unwrap();
+        legacy_wire["archives"] = json!({
+            "synthetic-archive": {"context": delivery, "disposition": "Acquired"},
+            "other-archive": {"context": "another-delivery-context", "disposition": "Acquired"}
+        });
+        f.index = serde_json::from_value(legacy_wire).unwrap();
+        assert!(serde_json::to_value(&f.index)
+            .unwrap()
+            .get("archives")
+            .is_none());
         let tier_receipt = || {
             serde_json::from_value::<codex_file_join::AppliedTierReceipt>(json!({
                 "version": 1, "derivation": "synthetic", "scope": "another-delivery-context",
@@ -463,16 +458,10 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         f.index.claude_stale_family_carry.origin = None;
 
         f.flip(all(false));
-        for name in ["synthetic-archive", "other-archive"] {
-            assert!(
-                matches!(
-                    f.index.archives[name].disposition,
-                    codex_compressed_input::ArchiveDisposition::Acquired
-                ),
-                "{source:?}/{name}: no correction is held"
-            );
-        }
-        f.index.archives.clear();
+        assert!(serde_json::to_value(&f.index)
+            .unwrap()
+            .get("archives")
+            .is_none());
         let entry = f.index.files.get_mut(&key).unwrap();
         for receipt in [
             entry.codex_captured_tier_receipt.take(),

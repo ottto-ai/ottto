@@ -6,6 +6,9 @@ use codex_compressed_input::{compressed_input_credit, is_compressed_codex_rollou
 thread_local! {
     static ACTIVITY: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
+pub(in crate::snapshots) fn activity() -> (usize, usize) {
+    ACTIVITY.with(std::cell::Cell::get)
+}
 pub(super) fn decoder_constructed() {
     ACTIVITY.with(|counts| {
         let (d, p) = counts.get();
@@ -60,8 +63,7 @@ fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
             .map(|row| row["counts"]["codex_zst_refused"].clone())
             .collect::<Vec<_>>()
     };
-    let mut index = ScanIndex::default();
-    let (_, rows) = capture(|| index.disclose_archive_debt());
+    let (_, rows) = capture(crate::local_resource_diagnostics::codex_zst_refused_flush);
     assert_eq!(flushed(&rows), Vec::<Value>::new(), "nothing refused yet");
     let (_, rows) = capture(|| {
         for _ in 0..3 {
@@ -69,7 +71,7 @@ fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
         }
         codex_zst_refused(CodexZstCause::HeaderUnfunded);
         // No line per refusal: only the pass reports.
-        index.disclose_archive_debt();
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
     });
     assert_eq!(
         flushed(&rows),
@@ -78,12 +80,12 @@ fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
             "CompressedHeaderUnfunded": 1,
         })]
     );
-    let (_, rows) = capture(|| index.disclose_archive_debt());
+    let (_, rows) = capture(|| crate::local_resource_diagnostics::codex_zst_refused_flush());
     assert_eq!(flushed(&rows), Vec::<Value>::new(), "unchanged pass");
     let (_, rows) = capture(|| {
         codex_zst_refused(CodexZstCause::AdmissionRefused);
-        index.disclose_archive_debt();
-        index.disclose_archive_debt();
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
     });
     assert_eq!(
         flushed(&rows),

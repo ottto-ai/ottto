@@ -4,7 +4,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -3265,7 +3265,6 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     ignore = "needs validated heap layout"
 )]
 fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
-    use codex_compressed_input::HeaderRead;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3313,15 +3312,7 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.power = true;
-    let header = archive_header_pass(&mut index, &archive, &cache);
-    assert!(matches!(header, HeaderRead::Validated(_)));
-    // Selection is under test, not the Full. Refuse archive work on every
-    // platform: on a macOS runner with mains power the selected archive's
-    // Full is reserved, and only the collector's reservation save, which
-    // this page loop does not run, releases the next page's inventory.
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(NoArchivePower));
-    index.archive_pass.power = false;
+    assert!(archive_header_pass(&mut index, &archive, &cache).is_ok());
     // Only census members stay queued; SESSION returns through its hint, and
     // the re-read and the archive are queued after the control turns.
     let reread = fixture.file(REREAD);
@@ -3470,18 +3461,6 @@ fn published_scan(
     finish_published(selected_page(fixture, cache, index, collected_at, hints))
 }
 
-/// Platform gates that refuse archive work, as off mains power.
-struct NoArchivePower;
-impl crate::snapshot_sync::continuation::PlatformGates for NoArchivePower {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Refused
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
-}
-
 /// Step `scan` to completion and apply the collector's upload policy.
 fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     let (index, scan, _) = finish_saving_reservations(scan);
@@ -3514,18 +3493,10 @@ fn finish_saving_reservations_within(
     max_steps: usize,
     phase: impl FnOnce() -> String,
 ) -> (ScanIndex, SourceScanResult, usize) {
-    let mut committed = scan.index.clone();
-    let checkpoint = Temp::new("reservation", b"");
-    fs::remove_file(&checkpoint.0).unwrap();
-    let mut saved = 0;
+    let saved = 0;
     for _ in 0..max_steps {
         match scan.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                saved += usize::from(next.index.archive_pass.dirty);
-                next.persist_archive_reservation(&mut committed, &checkpoint.0)
-                    .unwrap();
-                scan = next;
-            }
+            OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
@@ -3551,18 +3522,6 @@ fn finish_saving_reservations_within(
         "a Codex page did not complete within {max_steps} steps: {}",
         phase()
     );
-}
-
-/// Archive power as on a Mac on AC power; Linux reports it unknown.
-struct PoweredArchiveGates;
-impl crate::snapshot_sync::continuation::PlatformGates for PoweredArchiveGates {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
 }
 
 /// [regress] 0.1.215 queue: with archive power allowed (macOS), a page whose
@@ -3606,7 +3565,6 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(PoweredArchiveGates));
     fixture.append(SESSION, &token_line(5));
     let page = selected_page(
         &fixture,
@@ -3615,9 +3573,13 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         &collected_at(1),
         &[fixture.file(SESSION)],
     );
-    let (index, _, saved) = finish_saving_reservations(page);
-    assert!(saved > 0, "the archive queued no reservation");
-    assert!(index.archives.contains_key(&local_index_key(&archive)));
+    let (index, scan, saved) = finish_saving_reservations(page);
+    assert_eq!(saved, 0, "ordinary decoding needs no reservation save");
+    assert!(index.files.contains_key(&local_index_key(&archive)));
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|s| s.source_session_id == ARCHIVE));
 }
 
 /// Write a one-turn rollout in a day directory below the fixture root.
@@ -9323,28 +9285,17 @@ fn decoder_eviction_keeps_join_state() {
     });
 }
 
-/// One pass's header attempt on an owed archive, through the production read.
+/// The ordinary funded encoding opener, with the existing header recognition bound.
 fn archive_header_pass(
-    index: &mut ScanIndex,
+    _index: &mut ScanIndex,
     path: &Path,
     cache: &Arc<SharedCache>,
-) -> codex_compressed_input::HeaderRead {
-    let archive = index
-        .archives
-        .entry(local_index_key(path))
-        .or_insert_with(|| {
-            codex_compressed_input::ArchiveEvidence::from_metadata(
-                fs::symlink_metadata(path).unwrap(),
-            )
-            .unwrap()
-        });
-    archive.work.get_or_insert_with(Box::default).reservation =
-        codex_compressed_input::ArchiveReservation::HeaderReady;
-    let mut candidate = codex_zst_refusal_tests::candidate(path);
-    candidate.size_bytes = fs::metadata(path).unwrap().len();
-    index
-        .inventory_archive_header(&candidate, Some(cache))
-        .unwrap()
+) -> std::io::Result<String> {
+    let mut input = OpenedInput::encoded(File::open(path)?, path, Some(cache))?.header_only();
+    let mut header = String::new();
+    let result = input.read_line(&mut header).map(|_| header);
+    input.close();
+    result
 }
 
 fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
@@ -9372,7 +9323,6 @@ fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
     ignore = "needs validated heap layout"
 )]
 fn a_refused_archive_decoder_recovers_on_the_next_pass() {
-    use codex_compressed_input::HeaderRead;
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9381,35 +9331,18 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
     with_test_limits(2048, 8192, 64, || {
         let (cache, key) = warm_decoder_cache();
         let (root, paths) = owed_archives("decoder-next-pass", 1);
-        let archive_key = local_index_key(&paths[0]);
         let mut index = ScanIndex::default();
-        index.archive_pass.power = true;
         let budget = decoder_least_budget(&cache);
         let refused = with_test_state_budget(budget - 1, || {
             archive_header_pass(&mut index, &paths[0], &cache)
         });
-        assert!(matches!(refused, HeaderRead::Deferred));
-        assert_eq!(
-            index.archives[&archive_key].owed_cause(),
-            Some(CodexZstCause::AdmissionRefused)
-        );
-        assert!(index.archives[&archive_key].header().is_none());
-        let spent = |index: &ScanIndex| {
-            index.archives[&archive_key]
-                .work
-                .as_ref()
-                .unwrap()
-                .header_attempts
-        };
-        assert_eq!(spent(&index), 0);
+        assert_eq!(refused.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         assert!(cache.retained_checkpoint(&key).is_some());
-        index.disclose_archive_debt();
         let recovered = with_test_state_budget(budget, || {
             archive_header_pass(&mut index, &paths[0], &cache)
-        });
-        assert!(matches!(recovered, HeaderRead::Validated(_)));
-        assert!(index.archives[&archive_key].header().is_some());
-        assert_eq!(spent(&index), 1);
+        })
+        .unwrap();
+        assert!(recovered.contains("compressed-fixture"));
         assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     });
@@ -9426,7 +9359,6 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
 )]
 fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
     use crate::local_resource_diagnostics::capture;
-    use codex_compressed_input::HeaderRead;
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9437,7 +9369,6 @@ fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
         let copies = cache.retained().unwrap().entry_count();
         let (root, paths) = owed_archives("decoder-near-full", 3);
         let mut index = ScanIndex::default();
-        index.archive_pass.power = true;
         // One byte short of the old free-room bar without any header facts:
         // headers alone cannot make the room, only a retained copy can.
         let budget = decoder_least_budget(&cache) + retained_floor(&cache)
@@ -9448,16 +9379,16 @@ fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
             with_test_state_budget(budget, || {
                 for path in &paths {
                     let read = archive_header_pass(&mut index, path, &cache);
-                    assert!(matches!(read, HeaderRead::Validated(_)));
+                    assert!(read.unwrap().contains("compressed-fixture"));
                     assert_eq!(cache.cursor_reserved(), 0);
                 }
             });
-            index.disclose_archive_debt();
+            crate::local_resource_diagnostics::codex_zst_refused_flush();
         });
         assert!(cache.retained().unwrap().entry_count() < copies);
         assert_eq!(
             rows.iter()
-                .filter(|row| row["stage"] == "codex_zst_inventory")
+                .filter(|row| row["stage"] == "codex_zst_input")
                 .count(),
             paths.len()
         );

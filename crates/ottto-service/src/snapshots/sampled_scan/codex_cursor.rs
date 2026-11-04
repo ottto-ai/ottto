@@ -231,55 +231,6 @@ pub(in crate::snapshots) enum StartRefusal {
     Unstartable,
 }
 
-/// Archive catch-up pacing for one ordinary page and its continuation
-/// pages: RAM-only on `ScanIndex`, carried by the continuation inputs, never
-/// durable authority. A refusal never resets it; byte pages and continuation
-/// wall-work bound admission of the next archive.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ArchivePass {
-    pub(crate) started: bool,
-    pub(crate) work: u64,
-    pub(crate) power: bool,
-    /// Continuation's platform gates; a pass and its pages share them.
-    pub(crate) gates: crate::snapshot_sync::ArchiveGates,
-    pub(crate) dirty: bool,
-    pub(crate) prepared: bool,
-    pub(crate) headers_prepared: bool,
-    pub(crate) deferred: std::collections::BTreeSet<String>,
-}
-crate::heap_layout_bound::split_fields!(ArchivePass;
-    inline: [started, work, power, dirty, prepared, headers_prepared];
-    heap: [deferred]; shared: [gates]);
-
-impl ArchivePass {
-    /// A new ordinary pass: fresh counters and the prepare-time power gate;
-    /// the cached-archive walk position and the gates carry over.
-    pub(crate) fn prepare(&mut self) {
-        let Self {
-            started,
-            work,
-            power,
-            gates,
-            ..
-        } = self;
-        (*started, *work) = (false, 0);
-        *power = gates.power_ready();
-    }
-
-    /// Archive work may start now: prepare-time and live power, the pass's
-    /// wall work (continuation's contention threshold), and `remaining`
-    /// page bytes.
-    pub(crate) fn ready(&self, remaining: u64) -> bool {
-        self.power && remaining > 0 && crate::snapshot_sync::archive_work_ready(self.work)
-    }
-}
-
-impl PageBudget {
-    pub(in crate::snapshots) fn archive_ready(&self, pass: &ArchivePass) -> bool {
-        pass.ready(self.singleton_remaining(Limits::current()))
-    }
-}
-
 impl PageBudget {
     /// A page whose start enqueued `hints` watcher hints as next-generation
     /// evidence (G1).
@@ -5647,7 +5598,7 @@ mod header_admission_tests {
             .flatten()
             .unwrap();
         let mut refused = false;
-        for number in 0..codex_file_join::MAX_HEADER_FILES {
+        for number in 0..32_768 {
             let key = format!("header-{number}");
             cache.refresh_header(key.clone(), Some(facts.clone()));
             if cache
@@ -5687,7 +5638,7 @@ mod header_admission_tests {
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
                 // Model a resident graph that became full after caching headers.
-                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                for number in 0..32_768 {
                     cursor
                         .headers
                         .refresh(format!("header-{number}"), Some(facts.clone()));
@@ -5712,7 +5663,7 @@ mod header_admission_tests {
         cache
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
-                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                for number in 0..32_768 {
                     cursor
                         .headers
                         .refresh(format!("header-{number}"), Some(facts.clone()));

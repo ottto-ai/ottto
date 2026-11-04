@@ -91,14 +91,16 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
 }
 
 /// [regress] A v1 original holding Codex archive custody imports: presence keeps
-/// the pre-archive inventory, the rows carry both fields and hydrate equal.
+/// the pre-archive inventory while retired fields decode and drop without rows.
 #[test]
 fn import_carries_archive_custody_from_a_v1_original() {
-    let mut archives = BTreeMap::new();
-    archives.insert(
-        "/synthetic/archived/a.jsonl.zst".to_string(),
-        crate::snapshots::codex_compressed_input::ArchiveEvidence::unknown(),
-    );
+    let archives = serde_json::json!({
+        "/synthetic/archived/a.jsonl.zst": {
+            "context": null, "owner": null, "stamp": null,
+            "disposition": {"Held": {"cause": "CompressedAdmissionRefused", "quiet": false}},
+            "work": {"attempts": 1}
+        }
+    });
     let c = Corpus::new();
     let value = serde_json::json!({
         "schema_version": 2, "generation": 0, "upload_context_fingerprint": null,
@@ -112,7 +114,10 @@ fn import_carries_archive_custody_from_a_v1_original() {
         .presence
         .contains_key("archive_deferred_alarm_count"));
     let index = ScanIndex::load(&c.path).unwrap();
-    assert_eq!(index.archives.len(), 1);
+    assert!(serde_json::to_value(&index)
+        .unwrap()
+        .get("archives")
+        .is_none());
     let mut db =
         sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
     db.path_extractor(kinds::private_paths);
@@ -130,12 +135,22 @@ fn import_carries_archive_custody_from_a_v1_original() {
     db.control("generation", &index.generation).unwrap();
     import_graph(&mut db, &index, Some(&original)).unwrap();
     let presence: BTreeMap<String, bool> = db.read_control("field_presence").unwrap().unwrap();
-    assert_eq!(presence.get("archives"), Some(&true));
-    assert_eq!(presence.get("archive_deferred_alarm_count"), Some(&true));
+    assert!(!presence.contains_key("archives"));
+    assert!(!presence.contains_key("archive_deferred_alarm_count"));
     let (restored, _) = hydrate_context(&mut db).unwrap();
-    assert_eq!(
-        serde_json::to_value(&restored.archives).unwrap(),
-        serde_json::to_value(&index.archives).unwrap()
-    );
-    assert_eq!(restored.archive_deferred_alarm_count, 2);
+    assert!(serde_json::to_value(&restored)
+        .unwrap()
+        .get("archives")
+        .is_none());
+    assert!(serde_json::to_value(&restored)
+        .unwrap()
+        .get("archive_deferred_alarm_count")
+        .is_none());
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for kind in ["v1_field.archives", "v1_field.archive_deferred_alarm_count"] {
+        assert!(tx
+            .scan_kind(&RecordKind::parse(kind).unwrap(), None, 1)
+            .unwrap()
+            .is_empty());
+    }
 }

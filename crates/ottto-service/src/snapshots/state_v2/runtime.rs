@@ -636,6 +636,10 @@ pub(in super::super) fn save_locked(
     let runtime = index.v2().persistence_v2.clone();
     let expected = claim_generation.unwrap_or(index.generation);
     let result = with_save_session(path, runtime, expected, |state, session, id| {
+        ensure!(
+            !claim_only || state.tail.carries().next().is_none(),
+            Hold::ReloadRequired
+        );
         let previous = match state.save_digests.take() {
             Some(previous) => previous,
             None => {

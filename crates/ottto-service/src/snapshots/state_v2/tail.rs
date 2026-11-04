@@ -256,13 +256,70 @@ enum Entry {
 /// so subset graphs and clones can neither drop nor duplicate it.
 #[derive(Default)]
 pub(super) struct TailStage {
+    carries: BTreeMap<Vec<u8>, PathCarry>,
     files: BTreeMap<Vec<u8>, Entry>,
     debt: BTreeMap<Vec<u8>, Observation>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
     peak_bytes: u64,
 }
+/// A proven representation/path move. Only its route binding and physical
+/// inventory change; the logical certificate, membership and debt do not.
+#[derive(Clone)]
+pub(in crate::snapshots) struct PathCarry {
+    pub(in crate::snapshots) from: String,
+    pub(in crate::snapshots) scan_root: std::path::PathBuf,
+    pub(in crate::snapshots) head: Vec<u8>,
+    pub(in crate::snapshots) inventory: InventoryFacts,
+}
 impl TailStage {
+    pub(super) fn carry(&mut self, to: &str, carry: PathCarry) -> Result<()> {
+        let from = carry.from.as_bytes();
+        let to = to.as_bytes().to_vec();
+        ensure!(
+            from != to
+                && !self.carries.contains_key(from)
+                && !self.carries.contains_key(&to)
+                && !self
+                    .carries
+                    .values()
+                    .any(|prior| prior.from.as_bytes() == from)
+                && !(self.debt.contains_key(from) && self.debt.contains_key(&to))
+                && !self.files.contains_key(from)
+                && !self.files.contains_key(&to)
+                && !self.retire.contains(from)
+                && !self.retire.contains(&to)
+                && !self.erase.contains(from)
+                && !self.erase.contains(&to),
+            "state_v2_tail_carry_conflict"
+        );
+        if let Some(debt) = self.debt.remove(from) {
+            self.debt.insert(to.clone(), debt);
+        }
+        if let Some(debt) = self.debt.get_mut(&to) {
+            debt.inventory = Some(carry.inventory.clone());
+        }
+        self.carries.insert(to, carry);
+        self.report();
+        Ok(())
+    }
+    pub(super) fn carries(&self) -> impl Iterator<Item = (&Vec<u8>, &PathCarry)> {
+        self.carries.iter()
+    }
+    pub(super) fn carry_for(&self, key: &str) -> Option<&PathCarry> {
+        self.carries.get(key.as_bytes())
+    }
+    pub(super) fn inventory(&mut self, key: &str, common: Common, facts: InventoryFacts) {
+        self.debt
+            .entry(key.as_bytes().to_vec())
+            .or_insert_with(|| Observation {
+                representation: common.representation,
+                summary: common.debt,
+                ..Default::default()
+            })
+            .inventory = Some(facts);
+        self.report();
+    }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     #[cfg(test)]
     pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
@@ -272,7 +329,8 @@ impl TailStage {
         }
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.carries.is_empty()
+            && self.files.is_empty()
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
@@ -290,8 +348,19 @@ impl TailStage {
     }
     /// A later observation of the key replaces the staged one: each is its
     /// owner's whole delta from the committed rows.
-    fn replace_observation(&mut self, key: &str, observation: Observation) {
-        self.debt.insert(key.as_bytes().to_vec(), observation);
+    fn replace_observation(&mut self, key: &str, mut observation: Observation) {
+        let key = key.as_bytes().to_vec();
+        // None keeps facts, including facts staged by this pass's ordinary
+        // header opener or path carry before its debt observation arrives.
+        observation.inventory = observation
+            .inventory
+            .or_else(|| {
+                self.debt
+                    .get(&key)
+                    .and_then(|prior| prior.inventory.clone())
+            })
+            .or_else(|| self.carries.get(&key).map(|carry| carry.inventory.clone()));
+        self.debt.insert(key, observation);
     }
     /// Erasure of the key's whole scope; anything staged for it goes. `true`:
     /// newly erased while it held unaccepted revisions, committed or staged;
@@ -356,14 +425,24 @@ impl TailStage {
         let debt = self
             .debt
             .values()
-            .fold(0, |sum, observation| sum + observation.bytes());
+            .fold(0, |sum, observation| sum + observation.bytes())
+            + self
+                .carries
+                .values()
+                .map(|carry| {
+                    carry.head.len() as u64
+                        + carry.from.len() as u64
+                        + carry.inventory.owner.len() as u64
+                        + carry.scan_root.as_os_str().len() as u64
+                })
+                .sum::<u64>();
         self.files.values().fold(debt, |sum, entry| match entry {
             Entry::File(file) => sum + file.bytes(),
             Entry::Failed(_) => sum,
         })
     }
     pub(super) fn files(&self) -> usize {
-        self.files.len() + self.debt.len()
+        self.files.len() + self.debt.len() + self.carries.len()
     }
     fn report(&mut self) {
         let bytes = self.bytes();
@@ -1220,6 +1299,122 @@ pub(super) fn removed_files(old: &mapper::Digests) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+/// Copy the stored representation byte-for-byte under a new physical key.
+/// The value digest is path independent; put recomputes the row checksum.
+fn move_row(tx: &mut dyn Transaction, old: &Header, new: RowKey) -> Result<()> {
+    ensure!(tx.get(&new)?.is_none(), "state_v2_tail_carry_conflict");
+    let mut value = Vec::with_capacity(old.len as usize);
+    tx.read_value(old, &mut value)?;
+    tx.put(RowInput {
+        key: &new,
+        fixed: &old.fixed,
+        value_version: old.value_version,
+        value: &value,
+    })?;
+    tx.delete(&old.key)?;
+    Ok(())
+}
+fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<()> {
+    let from = carry.from.as_bytes();
+    let mut head = read_head(tx, from)?.context("state_v2_tail_carry_missing")?;
+    ensure!(
+        tx.get(&row(HEAD, to, 0)?)?.is_none(),
+        "state_v2_tail_carry_conflict"
+    );
+    for collection in Collection::ALL {
+        mapper::visit_key(
+            tx,
+            &RecordKind::parse(collection.kind())?,
+            from,
+            HEADER_PAGE,
+            |tx, old| {
+                let new = row(collection.kind(), to, position(&old)?)?;
+                move_row(tx, &old, new)
+            },
+        )?;
+    }
+    let digest = frag_file(from);
+    let kind = RecordKind::parse(FRAG)?;
+    let mut after = row(FRAG, &digest, 0)?;
+    loop {
+        let found = tx.scan_kind(&kind, Some(&after), HEADER_PAGE)?;
+        let own: Vec<_> = found
+            .into_iter()
+            .take_while(|h| {
+                matches!(&h.key,
+            RowKey::Record { key_bytes, .. } if key_bytes.starts_with(&digest))
+            })
+            .collect();
+        let Some(last) = own.last() else {
+            break;
+        };
+        after = last.key.clone();
+        for old in own {
+            let RowKey::Record {
+                key_bytes,
+                position,
+                ..
+            } = &old.key
+            else {
+                unreachable!()
+            };
+            let mut key = frag_file(to).to_vec();
+            key.extend_from_slice(&key_bytes[digest.len()..]);
+            move_row(tx, &old, row(FRAG, &key, *position)?)?;
+        }
+    }
+    if let Some(marker) = tx.get(&set_aside_key(from)?)? {
+        move_row(tx, &marker, set_aside_key(to)?)?;
+    }
+    head.common.inventory = Some(carry.inventory.clone());
+    // A metadata-only head stays metadata-only; a reduction remains Tail.
+    let reduction = head.reduction.as_ref().map(|_| carry.head.as_slice());
+    let value = encode_head(head.revision, &head.table, &head.common, reduction)?;
+    write_value(tx, to, HEAD_OWNER, 0, &row(HEAD, to, 0)?, &value)?;
+    tx.delete(&row(HEAD, from, 0)?)?;
+    Ok(())
+}
+/// Shared alias rows may name more than one move, so all pairs in a save share
+/// their one isolation unit. Unpaired files retain their original boundaries.
+fn apply_carries(
+    rows: &mut mapper::Rows<'_>,
+    stage: &TailStage,
+    applied: &mut Applied,
+) -> Result<()> {
+    let mut closure = rows.take_carry_aliases()?;
+    for (to, carry) in stage.carries() {
+        closure.extend(rows.take_closure(carry.from.as_bytes())?);
+        closure.extend(rows.take_closure(to)?);
+    }
+    let result = rows.tx()?.isolated(&mut |tx| {
+        write_closure(tx, &closure)?;
+        for (to, carry) in stage.carries() {
+            move_tail(tx, to, carry)?;
+            let staged = match stage.files.get(to) {
+                Some(Entry::File(file)) => Some(file),
+                _ => None,
+            };
+            let debt = stage.debt.get(to);
+            // No debt write means no replacement and no marker clearing.
+            if staged.is_some() || debt.is_some() {
+                write_file(tx, to, staged, debt)?;
+            }
+            if let Some(Entry::Failed(cause)) = stage.files.get(to) {
+                mark_set_aside(tx, to, *cause)?;
+            }
+        }
+        Ok(())
+    })?;
+    if result.is_err() {
+        rows.revert(closure);
+        applied.rolled_back += 1;
+        for (_, carry) in stage.carries() {
+            mark_set_aside(rows.tx()?, carry.from.as_bytes(), SetAsideCause::Row)?;
+            applied.set_aside += 1;
+        }
+    }
+    Ok(())
+}
 fn write_closure(tx: &mut dyn Transaction, closure: &[mapper::ClosureRow]) -> Result<()> {
     for row in closure {
         match &row.value {
@@ -1241,9 +1436,18 @@ pub(super) fn apply(
     removed: &[Vec<u8>],
 ) -> Result<bool> {
     let mut applied = Applied::default();
+    let paired: BTreeSet<Vec<u8>> = stage
+        .into_iter()
+        .flat_map(|stage| stage.carries())
+        .flat_map(|(to, carry)| [to.clone(), carry.from.as_bytes().to_vec()])
+        .collect();
+    if !paired.is_empty() {
+        apply_carries(rows, stage.expect("paired stage"), &mut applied)?;
+    }
     let keys: BTreeSet<&Vec<u8>> = stage
         .into_iter()
         .flat_map(|stage| stage.files.keys().chain(stage.debt.keys()))
+        .filter(|key| !paired.contains(*key))
         .collect();
     for file in keys {
         let entry = stage.and_then(|stage| stage.files.get(file));
@@ -1291,7 +1495,11 @@ pub(super) fn apply(
     }
     let tx = rows.tx()?;
     let authorised = stage.into_iter().flat_map(|stage| &stage.retire);
-    for file in removed.iter().chain(authorised) {
+    for file in removed
+        .iter()
+        .chain(authorised)
+        .filter(|file| !paired.contains(*file))
+    {
         // F4: a head this build cannot read is set aside, never retired.
         let mut kept = false;
         let result = tx.isolated(&mut |tx| {
@@ -1311,7 +1519,11 @@ pub(super) fn apply(
         applied.retired += 1;
     }
     // Scope erasure is not a reset: debt goes too, and nothing vetoes it.
-    for file in stage.into_iter().flat_map(|stage| &stage.erase) {
+    for file in stage
+        .into_iter()
+        .flat_map(|stage| &stage.erase)
+        .filter(|file| !paired.contains(*file))
+    {
         delete_rows(tx, file, false)?;
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
@@ -1330,6 +1542,8 @@ pub(super) fn commit_exit(
     expected: u64,
     stage: &TailStage,
 ) -> Result<()> {
+    // A graph-free exit cannot publish a path move's Tail half.
+    ensure!(stage.carries.is_empty(), Hold::ReloadRequired);
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;

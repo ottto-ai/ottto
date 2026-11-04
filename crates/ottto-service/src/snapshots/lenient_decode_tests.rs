@@ -4260,7 +4260,9 @@ fn scan_index_full_positional_field_order_is_pinned() {
 fn retired_codex_field(field: &str) -> bool {
     matches!(
         field,
-        "codex_parent_ownership_refs"
+        "archives"
+            | "archive_deferred_alarm_count"
+            | "codex_parent_ownership_refs"
             | "codex_parent_ownership_ledgers"
             | "codex_parent_side_requests"
             | "codex_parent_side"
