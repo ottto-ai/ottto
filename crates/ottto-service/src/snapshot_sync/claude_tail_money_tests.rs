@@ -754,7 +754,12 @@ fn other_page_unrouted(
     prior: ScanIndex,
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
     let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, None, prior);
-    other_page_with_slots(c, scanner, source, prior, &[], |_| {})
+    let page = other_page_with_slots(c, scanner, source, prior, &[], |_| {});
+    assert!(
+        crate::snapshots::e2_pipeline_scan_fixture::route_of(&page.0).is_none(),
+        "a downgrade fixture must stage no Tail on a route",
+    );
+    page
 }
 
 /// [`other_page_observing_raw`], binding accounts with these registered Codex
@@ -767,13 +772,6 @@ fn other_page_with_slots(
     slots: &[(String, String, usize)],
     before_finalize: impl FnOnce(&[SnapshotItem]),
 ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    // A source with a Tail codec (Codex) continues from its owner's route,
-    // as `Corpus::raw` does for Claude; Pi keeps its RAM path.
-    let prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
-        source,
-        Some(scanner.cache.as_ref()),
-        prior,
-    );
     let (mut index, mut scan, modes) = scanner.scan_other(
         source,
         std::slice::from_ref(&c.root),
