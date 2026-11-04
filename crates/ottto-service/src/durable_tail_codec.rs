@@ -30,11 +30,6 @@
 //! record's allowlist digest, so any change to a class, field or type refuses
 //! old records.
 
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the verify walk and the shape run only in tests")
-)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 

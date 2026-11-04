@@ -218,13 +218,6 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// explicit action (a key rotation), not a failure. Attribution toggled
     /// on or off is no rotation (`HeadIdentity::check`).
     KeyEpoch,
-    /// A Codex group read from its first member (D168): a counted replay,
-    /// never a load outcome or a failure after a head.
-    GroupReplay,
-    /// A file with a protected Codex receipt read from its start, so the
-    /// receipt's prefix is reproduced (D168): a counted replay, never a load
-    /// outcome or a failure after a head.
-    TierPrefixReplay,
 }
 impl ReconstructCause {
     pub(in crate::snapshots) fn label(self) -> &'static str {
@@ -234,8 +227,6 @@ impl ReconstructCause {
             Self::Incomplete => "incomplete",
             Self::Identity => "identity",
             Self::KeyEpoch => "key_epoch",
-            Self::GroupReplay => "group_replay",
-            Self::TierPrefixReplay => "tier_prefix_replay",
         }
     }
 }
@@ -371,20 +362,21 @@ pub(in crate::snapshots) trait TailSource {
         id: &HeadIdentity,
     ) -> Result<Vec<u8>, Refuse>;
     /// A `Log` collection's elements, in its full encode's (sorted) order.
-    /// A codec without a `Log` collection keeps the defaults.
-    fn log_keys(_acc: &SnapshotAccumulator, _collection: Collection) -> Vec<&String> {
-        Vec::new()
+    /// The defaults are the shared changed-file log; a codec with another
+    /// `Log` overrides them for it.
+    fn log_keys(acc: &SnapshotAccumulator, _collection: Collection) -> Vec<&String> {
+        changed_files::keys(acc)
     }
     /// One `Log` page holding `keys`, in this order.
     fn log_page(_collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
-        page_bytes(keys.iter(), |key, e| key.put(e))
+        changed_files::page(keys)
     }
     /// A stored `Log` page's elements, in stored order.
     fn log_page_keys(
         _collection: Collection,
-        _bytes: &[u8],
+        bytes: &[u8],
     ) -> Result<Vec<String>, ReconstructCause> {
-        Err(ReconstructCause::Corrupt)
+        changed_files::page_keys(bytes)
     }
     /// Every page of `collection`, by position.
     fn encode_pages(
@@ -404,8 +396,11 @@ pub(in crate::snapshots) trait TailSource {
         bytes: &[u8],
         into: &mut SnapshotAccumulator,
     ) -> Result<(), ReconstructCause>;
-    /// Facts the decoded state must satisfy beyond its counts.
-    fn facts(acc: &SnapshotAccumulator) -> Result<(), ReconstructCause>;
+    /// Facts the decoded state must satisfy beyond its counts; none by
+    /// default.
+    fn facts(_acc: &SnapshotAccumulator) -> Result<(), ReconstructCause> {
+        Ok(())
+    }
     /// The epoch of the key every keyed field this codec stores is made
     /// under; `None` without a key. A head from another key is never reused.
     fn key_epoch() -> Option<[u8; 32]> {
@@ -622,13 +617,6 @@ mod changed_files {
         })?;
         Ok(keys)
     }
-    pub(super) fn encode(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
-        keys(acc)
-            .chunks(G as usize)
-            .enumerate()
-            .map(|(n, keys)| Ok((n as u64, page(keys)?)))
-            .collect()
-    }
     pub(super) fn decode(
         bytes: &[u8],
         into: &mut SnapshotAccumulator,
@@ -641,6 +629,20 @@ mod changed_files {
             }
         })
     }
+}
+
+/// Every page of `S`'s `Log` `collection` from its first: its keys in order,
+/// `g` per page.
+fn full_log_pages<S: TailSource>(
+    acc: &SnapshotAccumulator,
+    collection: Collection,
+    g: u32,
+) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+    S::log_keys(acc, collection)
+        .chunks(g as usize)
+        .enumerate()
+        .map(|(page, keys)| Ok((page as u64, S::log_page(collection, keys)?)))
+        .collect()
 }
 
 /// A capability bucket's start: the first part of its key.
@@ -666,6 +668,29 @@ fn read_hour_page<K: Durable + Ord, V: Durable>(
     })
 }
 
+/// A required collection without private strings, of `shape`.
+const fn spec(collection: Collection, shape: PageShape, g: u32) -> CollectionSpec {
+    CollectionSpec {
+        collection,
+        shape,
+        g,
+        required: true,
+        private: false,
+    }
+}
+const fn slot(collection: Collection, g: u32) -> CollectionSpec {
+    spec(collection, PageShape::Slot, g)
+}
+const fn hour(collection: Collection) -> CollectionSpec {
+    spec(collection, PageShape::Hour, 0)
+}
+const fn log(collection: Collection, g: u32) -> CollectionSpec {
+    spec(collection, PageShape::Log, g)
+}
+
+/// The hashed changed-file log.
+const CHANGED_FILES: CollectionSpec = log(Collection::ChangedFiles, changed_files::G);
+
 /// The session facts collection every codec stores: content the head never
 /// carries, one fact per page at its kind's position.
 const SESSION_FACTS: CollectionSpec = CollectionSpec {
@@ -675,6 +700,50 @@ const SESSION_FACTS: CollectionSpec = CollectionSpec {
     required: true,
     private: true,
 };
+
+/// The collections several codecs store, one arm each: the changed files,
+/// the capability hours and the session facts. A codec's `elements`,
+/// `encode_pages` and `decode_page` match their own collections and fall
+/// through to these.
+fn shared_elements(acc: &SnapshotAccumulator, collection: Collection) -> usize {
+    match collection {
+        Collection::ChangedFiles => acc.activity_changed_file_hashes.len(),
+        Collection::CapabilityHours => acc.activity_capability_buckets.len(),
+        Collection::SessionFacts => fact_count(acc),
+        _ => 0,
+    }
+}
+fn shared_pages<S: TailSource>(
+    acc: &SnapshotAccumulator,
+    collection: Collection,
+) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+    match collection {
+        Collection::ChangedFiles => full_log_pages::<S>(acc, collection, changed_files::G),
+        Collection::CapabilityHours => {
+            hour_pages(&acc.activity_capability_buckets, capability_hour)
+        }
+        Collection::SessionFacts => fact_pages(acc),
+        _ => Ok(Vec::new()),
+    }
+}
+fn read_shared_page(
+    collection: Collection,
+    page: u64,
+    bytes: &[u8],
+    into: &mut SnapshotAccumulator,
+) -> Result<(), ReconstructCause> {
+    match collection {
+        Collection::ChangedFiles => changed_files::decode(bytes, into),
+        Collection::CapabilityHours => read_hour_page(
+            page,
+            bytes,
+            &mut into.activity_capability_buckets,
+            capability_hour,
+        ),
+        Collection::SessionFacts => read_fact_page(page, bytes, into),
+        _ => Err(ReconstructCause::Corrupt),
+    }
+}
 
 /// The session facts (D168-1): content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
