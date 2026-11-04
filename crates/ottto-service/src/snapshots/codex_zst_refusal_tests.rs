@@ -136,16 +136,6 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
             reopen_for_replay(SnapshotSource::Codex, &member, &OpenedInput::plain(file())).is_err()
         );
     });
-    assert_refused(CodexZstCause::ParentSideUnsupported, || {
-        assert!(check_parent_side_input(&member, None).is_err());
-        assert!(check_parent_side_input(&member, Some(&OpenedInput::plain(file()))).is_err());
-    });
-    assert_refused(CodexZstCause::ProofParentUnsupported, || {
-        assert!(CodexProofReader::parent("fixture".into(), path.clone(), file(), 1).is_err());
-    });
-    assert_refused(CodexZstCause::ProofChildUnsupported, || {
-        assert!(CodexProofReader::child("fixture".into(), path.clone(), file()).is_err());
-    });
     assert_refused(CodexZstCause::HeaderUnfunded, || {
         assert!(codex_file_join::header_reduction_witness(&member).is_err());
     });
@@ -168,22 +158,6 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     assert!(inventory.complete);
     assert!(inventory.refused.is_empty());
     assert_eq!(ACTIVITY.with(std::cell::Cell::get), before);
-    let paths = BTreeSet::from([local_index_key(&path)]);
-    let roots = [root.clone()];
-    let census = CodexParentCensus::new(&roots, &paths);
-    assert_refused(CodexZstCause::ParentLedgerUnbound, || {
-        assert!(codex_parent_open_match_witnessed(
-            census,
-            CodexCensusMatch::One(paths.first().unwrap())
-        )
-        .is_err());
-        assert!(codex_parent_open_match_retained(
-            census,
-            CodexCensusMatch::One(paths.first().unwrap()),
-            &sampled_scan::SharedCache::default()
-        )
-        .is_err());
-    });
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -222,7 +196,6 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
         &path,
         SnapshotSource::Codex,
         apply_codex_line,
-        None,
         None,
         None,
     )

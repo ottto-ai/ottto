@@ -280,7 +280,7 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
     let mut fork = header(POST);
     fork["payload"]["forked_from_id"] = json!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
     // The selector alone ignores forked_from_id; history_base is its explicit
-    // continuation fence. Ownership must first admit a header to reach it.
+    // continuation fence. Legacy user forks admit that header through AllLocal.
     assert_eq!(
         codex_counting_version::decide(&fork, AckEvidence::None, CUTOVER),
         CountingVersion::V2
@@ -289,13 +289,20 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
     codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
     apply_codex_line(&fork, &mut accumulator);
     assert!(
-        !accumulator.codex_counting_v2(),
-        "an unresolved fork header is withheld by ownership"
+        accumulator.codex_counting_v2(),
+        "a legacy user fork counts its available child records through AllLocal"
     );
     fork["payload"]["history_base"] = json!({"id":"parent"});
     assert_eq!(
         codex_counting_version::decide(&fork, AckEvidence::V2Marked, CUTOVER),
         CountingVersion::Legacy
+    );
+    let mut paginated = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut paginated, AckEvidence::None, Some(CUTOVER));
+    apply_codex_line(&fork, &mut paginated);
+    assert!(
+        !paginated.codex_counting_v2(),
+        "history_base keeps its native selection"
     );
 }
 

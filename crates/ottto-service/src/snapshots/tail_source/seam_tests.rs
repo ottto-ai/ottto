@@ -5,7 +5,6 @@
 //! restates only each collection's open page.
 use super::super::claude::{tests::lines, Claude};
 use super::*;
-use crate::snapshots::sampled_jsonl::SideCertificate;
 use crate::snapshots::sampled_scan::transition_fixture::native_cold as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::state_v2::money_test_support::ColdSession;
@@ -188,11 +187,14 @@ impl Route {
         at_pre: impl FnOnce(&mut SnapshotAccumulator),
         scope: &Scope,
     ) -> (PendingTail, Result<ParsedJsonlFile>) {
-        let SideCertificate::Certified { completed, .. } =
-            parser.certify_without_retention(scope, NOW).unwrap()
-        else {
-            panic!("a clean fixture is certified");
-        };
+        let completed = parser
+            .retain_reduction(
+                scope,
+                NOW,
+                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
+            )
+            .unwrap()
+            .expect("a clean fixture is certified");
         at_pre(&mut parser.accumulator);
         let mut tail = PendingTail {
             source: S::SOURCE,

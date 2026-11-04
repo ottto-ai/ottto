@@ -77,10 +77,10 @@ fn same_size_new_owner_rereads_and_changes_group_key() {
 /// Only owning headers are primed: neither arm has retained transcript state.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn header_cache_production_wake_output_equivalence_join_parent_counting() {
+fn header_cache_production_wake_output_equivalence_join_fork_counting() {
     let (root, group_keys) = tests::counting_v2_fixture();
-    // Acquire the real parent ledger before introducing the fork and joined
-    // members. A fresh fork intentionally needs a later parent-prepass wake.
+    // Index the parent before the legacy user fork and the joined members
+    // arrive.
     let group_files = group_keys
         .iter()
         .map(|key| {
@@ -101,7 +101,6 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
     };
     let first_usage = usage("2026-08-02T08:00:02Z", 100, 100);
     let mut prior = ScanIndex::default();
-    assert!(prior.record_codex_parent_ref(parent));
     for (id, rows) in [
         (
             parent,
@@ -140,18 +139,14 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             let (mut index, mut scan) = tests::scan(&root, prior, 100);
             finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
             scan.finish_codex_capture_boundary(&mut index);
-            assert!(index.codex_parent_ownership_ledgers[parent].scan_complete);
-            assert!(!index.codex_parent_ownership_ledgers[parent]
-                .signatures
-                .is_empty());
             prior = index;
         }
     }
     for (key, bytes) in group_files {
         fs::write(key, bytes).unwrap();
     }
-    // Between the August fork and October join: exercise Legacy parent
-    // ownership and a non-empty V2 group in the same production scan.
+    // Between the August fork and October join: exercise a legacy user fork
+    // and a non-empty V2 group in the same production scan.
     let _cutover = codex_counting_version::TestCutover::set(1_790_000_000_000);
     let paths = fs::read_dir(root.join("sessions"))
         .unwrap()
@@ -218,15 +213,12 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
                         .collect::<Vec<_>>();
                     assert_eq!(joined.len(), 2, "both physical joined aliases emit");
                     assert!(joined.iter().all(|item| item.input_tokens == 300));
-                    assert!(index.codex_parent_ownership_refs.contains(parent));
-                    assert!(index.codex_parent_ownership_ledgers[parent].scan_complete);
-                    assert!(!index.codex_parent_ownership_ledgers[parent]
-                        .signatures
-                        .is_empty());
+                    // Best effort: the legacy fork counts its copied parent
+                    // prefix (100) and its own suffix (15).
                     assert!(scan
                         .snapshots
                         .iter()
-                        .any(|item| item.source_session_id == child && item.input_tokens == 15));
+                        .any(|item| item.source_session_id == child && item.input_tokens == 115));
                     index.bind_session_accounts(
                         SnapshotSource::Codex,
                         "header-output-machine",
@@ -253,8 +245,6 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
                     validate_snapshot_batch_request(&request).unwrap();
                     let body = serde_json::to_vec(&request).unwrap();
                     let evidence = serde_json::to_vec(&json!({
-                        "parent_refs":index.codex_parent_ownership_refs,
-                        "parent_ledgers":index.codex_parent_ownership_ledgers,
                         "counting":counting,
                         "join_members":group_keys.iter().map(|key| &index.files[key].codex_joined_member_set).collect::<Vec<_>>(),
                     })).unwrap();
@@ -270,7 +260,7 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
     assert_eq!(Sha256::digest(&cached_body), Sha256::digest(&uncached_body));
     assert_eq!(
         cached_evidence, uncached_evidence,
-        "join, parent and counting evidence"
+        "join and counting evidence"
     );
     fs::remove_dir_all(root).unwrap();
 }

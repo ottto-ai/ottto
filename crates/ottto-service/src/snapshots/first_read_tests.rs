@@ -62,7 +62,7 @@ fn has_head(index: &ScanIndex, path: &Path) -> bool {
 
 /// [behaviour] Every admission site applies the bound to a never-read file
 /// only, to the second, for both encodings: the walk (where G7 starts no
-/// debt), a watcher hint, the Codex roster and an opened Codex parent. Read
+/// debt), a watcher hint and the Codex roster. Read
 /// evidence keeps the walk window: an indexed file stays observed (never
 /// pruned) and an archive with a body witness is listed; a Held archive
 /// without one is not. A file already queued still opens, and a skipped file
@@ -136,18 +136,6 @@ fn first_read_bound_admits_only_files_with_read_evidence() {
             "{store:?}: hint"
         );
         if codex {
-            let parent_outside = |path: &Path| {
-                codex_parent_outside_window(
-                    &f.index,
-                    path,
-                    &File::open(path).unwrap(),
-                    Some(now),
-                    BACKFILL_WINDOW_DAYS,
-                )
-            };
-            assert!(parent_outside(&old));
-            assert!(!parent_outside(&young));
-            assert!(!parent_outside(&indexed));
             // A rollout that appears after the walk meets the same bound.
             std::thread::sleep(Duration::from_millis(50));
             let (late_old, late_young) = (f.file("late-61.jsonl", 10), f.file("late-59.jsonl", 10));

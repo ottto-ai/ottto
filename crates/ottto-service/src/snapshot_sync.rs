@@ -6886,12 +6886,6 @@ fn prepare_sync_source_inner(
         &upload_progress_path,
     )?;
     upload_progress.configure_ack_capacity(&index);
-    // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
-    // and eager hydrate run against the index exactly as loaded, namespaced
-    // by this index file. They touch only side requests and side records.
-    let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
-        crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
-    });
     // Absent, quarantined or undecodable: every file would come back new. The
     // load origin decides it; an empty saved index counts too.
     let claude_index_loaded_fresh = load_origin.is_fresh(&index);
@@ -7019,16 +7013,10 @@ fn prepare_sync_source_inner(
         .intersection(&legacy_reconciliation_pending)
         .cloned()
         .collect::<BTreeSet<_>>();
-    // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
-    // scan is built.
-    let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
-        &mut index,
-        backfill_pending,
-        replay_generation.clone(),
-        source,
-        &daemon.transcript_cache,
-        &index_path,
-    );
+    // Under this pass's sync lock, before the scan is built. Every source
+    // replays when one is pending; true when it reset the index.
+    let replay_dropped_entries =
+        backfill_pending && index.prepare_historical_replay(replay_generation.clone());
     if let Some(prior_history) = prior_claude_history {
         note_claude_history_cutoff_for_cycle(
             &mut index,
@@ -7139,7 +7127,6 @@ fn prepare_sync_source_inner(
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
-    .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
     scan.rehome_withheld_baseline(&mut committed_index);
     if source == SnapshotSource::ClaudeCode {
@@ -7489,10 +7476,6 @@ fn prepare_continuation_source(
     if claim_needed {
         return Ok(Err(ContinuationRefusal::UploadClaim));
     }
-    // C14, on the index exactly as loaded, as the ordinary prepare runs it,
-    // except that the outage gate is read, never reset (C-1).
-    let codex_side_pass =
-        crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
@@ -7545,7 +7528,6 @@ fn prepare_continuation_source(
     .with_continuation_deadline(deadline)
     .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
     .with_launch_events(home)
-    .with_codex_side_pass(Some(codex_side_pass))
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
@@ -7645,36 +7627,6 @@ pub(crate) fn snapshot_batch_request(
         snapshots,
         upload_policy,
         client_report,
-    }
-}
-
-/// Codex only: read immediately before the call that
-/// assembles and writes the selected save; no side writer runs in between.
-fn codex_side_save_mark(
-    daemon: &LocalDaemon,
-    source: SnapshotSource,
-    index_path: &Path,
-) -> Option<crate::snapshots::CodexSideSaveMark> {
-    (source == SnapshotSource::Codex)
-        .then(|| crate::snapshots::codex_side_save_mark(&daemon.transcript_cache, index_path))
-}
-
-/// U1a-2a (C15): this pass's side-ledger entries up to `mark` are now on
-/// disk (a full save, or a partial checkpoint that carries every side
-/// field). `Ok` arms only.
-fn note_codex_side_saved(
-    daemon: &LocalDaemon,
-    index_path: &Path,
-    full: bool,
-    mark: Option<crate::snapshots::CodexSideSaveMark>,
-) {
-    if let Some(mark) = mark {
-        crate::snapshots::note_codex_side_pass_saved(
-            &daemon.transcript_cache,
-            index_path,
-            full,
-            mark,
-        );
     }
 }
 
@@ -8613,7 +8565,6 @@ fn finish_sync_source(
     // release fails the pass.
     let mut partial_checkpoint =
         |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {
-            let side_mark = codex_side_save_mark(daemon, source, &index_path);
             match checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
@@ -8641,7 +8592,6 @@ fn finish_sync_source(
                 std::mem::take(&mut claude_proof_body_drains),
             ) {
                 Ok(committable) => {
-                    note_codex_side_saved(daemon, &index_path, false, side_mark);
                     upload_progress.release_acks_after_partial_index_save_with_scan(
                         &upload_progress_path,
                         &committed_index,
@@ -9059,7 +9009,6 @@ fn finish_sync_source(
     index.finish_legacy_settlement_reconciliation();
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
-    let side_mark = codex_side_save_mark(daemon, source, &index_path);
     save_index_and_publish_manifest(
         &mut index,
         &index_path,
@@ -9072,7 +9021,6 @@ fn finish_sync_source(
     scan_result.report_discovery_growth_after_save(&index);
     context_rearm_counts.emit(source);
     index.emit_upload_context_owed(source);
-    note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
     crate::snapshots::after_source_save(
         &daemon.transcript_cache,
@@ -21777,7 +21725,7 @@ mod tests {
         };
         for generation in [1, 2] {
             let cap_counts = crate::local_resource_diagnostics::CapCounts {
-                boundary_overflow_events: u64::from(generation == 1),
+                bootstrap_overflow_events: u64::from(generation == 1),
                 ..Default::default()
             };
             let counts = SyncCounts {

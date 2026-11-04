@@ -625,16 +625,8 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_compaction_unlinked_parent_count: _, // I
             terminal_line_loss_count: _,                // I
             state_only_blocked_session_ids: _,          // M (Codex only; empty on Claude)
+            source_session_id_seen: _,                  // I (source session presence)
             codex_parent_session_ref: _,                // M (Codex only)
-            codex_parent_ledger_identity_used: _,       // M (Codex only)
-            codex_parent_resolution_pending: _,         // I
-            codex_parent_ownership_ledger: _,           // M (Codex only)
-            codex_parent_unresolvable: _,               // I
-            codex_parent_ledger_unusable: _,            // I
-            codex_parent_ledger_consulted: _,           // I
-            codex_parent_prefix_decided: _,             // I
-            codex_parent_proof_used: _,                 // M (Codex only)
-            codex_parent_proof_refusal: _,              // M (Codex only)
         } = file;
     };
     let _item = |item: SnapshotItem| {

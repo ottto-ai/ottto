@@ -991,7 +991,7 @@ pub(crate) mod native_cold {
         file: std::fs::File,
         apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     ) -> OwnedJsonlParser {
-        OwnedJsonlParser::new(file, path, source, apply, None, None, None).unwrap()
+        OwnedJsonlParser::new(file, path, source, apply, None, None).unwrap()
     }
     pub(in crate::snapshots) fn finish_record(
         parser: &mut OwnedJsonlParser,
@@ -1003,12 +1003,15 @@ pub(crate) mod native_cold {
     ) {
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
-        let checkpoint = match parser.certify_without_retention(scope, now).unwrap() {
-            crate::snapshots::sampled_jsonl::SideCertificate::Certified { completed, .. } => {
-                completed.checkpoint
-            }
-            _ => panic!("a clean native fixture is certified"),
-        };
+        let checkpoint = parser
+            .retain_reduction(
+                scope,
+                now,
+                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
+            )
+            .unwrap()
+            .expect("a clean native fixture is certified")
+            .checkpoint;
         (reduction, checkpoint)
     }
 }

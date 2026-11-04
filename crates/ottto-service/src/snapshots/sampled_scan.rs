@@ -20,7 +20,6 @@ pub(super) mod codex_cursor;
 pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
 mod retired_records;
-pub(super) mod side_ledger;
 #[cfg(all(test, unix))]
 pub(crate) mod transition_fixture;
 
@@ -87,13 +86,12 @@ impl Drop for BlockingResidentMeasure {
     }
 }
 
-/// Stage 1 K8, tests only: one of [`SharedCache`]'s three locks.
+/// Stage 1 K8, tests only: one of [`SharedCache`]'s two locks.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestLock {
     Cursor,
     Retained,
-    Side,
 }
 
 // RAM-only per-key cap pacing; unify with P2's shared paced_full at integration.
@@ -155,10 +153,6 @@ pub(crate) struct SharedCache {
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
     cursor: Mutex<codex_cursor::CursorState>,
-    /// Codex parent side-request pacing (U1a-2a), process lifetime. A leaf
-    /// lock (retained, then cursor, then side; nothing is locked under it).
-    /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
-    side: Mutex<side_ledger::SideLedger>,
     /// Quiet retirements of the current passes, and the retired record
     /// directory's failed-removal ages. A leaf lock, never held while taking
     /// another. Outside the state budget: pass-scoped, never walked.
@@ -176,7 +170,6 @@ impl Default for SharedCache {
             inner: Mutex::new(TranscriptCache::with_byte_limit(state_bytes())),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
-            side: Mutex::new(side_ledger::SideLedger::default()),
             #[cfg(unix)]
             quiet: Mutex::default(),
             #[cfg(test)]
@@ -206,11 +199,7 @@ impl HeapLayoutBound for SharedCache {
             self.inner.heap_bound(c)?;
             self.cursor.heap_bound(c)?;
         }
-        // Never `side`'s lock: a busy lock would read as unbounded and zero
-        // every copy budget. The ledger's whole heap is this proved constant;
-        // its inline tables are inside `size_of::<SharedCache>()`, which the
-        // caller's `bound` (or `Arc`) charges once (size test).
-        c.add(side_ledger::SIDE_LEDGER_BYTES.checked_add(self.root_reservation())?)
+        c.add(self.root_reservation())
     }
 }
 #[cfg(test)]
@@ -292,10 +281,8 @@ impl SharedCache {
     /// poisoned, the cursor state is unbounded or poisoned, or even an empty
     /// cache would not fit. Evicted copies drop under the retained lock, as
     /// `clear` drops them; no guard or credit drops there, so nothing relocks.
-    /// The cursor state is main's, without a suspended proof;
-    /// where the fit is reachable, that proof is retired first, under these
-    /// same locks, if the copies overflow beside it, so its bytes count
-    /// toward the fit before any copy is evicted (`release_room_for_main`).
+    /// Optional headers yield only where the fit is reachable, before any
+    /// retained copy is evicted (`release_room_for_main`).
     pub(super) fn release_to_fit(&self, pinned: usize) -> bool {
         let Ok(mut retained) = self.retained() else {
             return false;
@@ -310,7 +297,7 @@ impl SharedCache {
     }
     /// Path A: `release_to_fit`, evicting only retained copies ranked
     /// strictly below `rank`, and only where evicting them makes room;
-    /// otherwise nothing, the suspended proof included
+    /// otherwise nothing, the optional headers included
     /// (`TranscriptCache::release_older_until`, `older_release_fits`).
     pub(super) fn release_older_to_fit(&self, pinned: usize, rank: (i64, i64)) -> bool {
         let Ok(mut retained) = self.retained() else {
@@ -324,7 +311,7 @@ impl SharedCache {
         retained.release_older_until(limit, rank)
     }
     /// M-a: `release_older_to_fit` through the same `release_room_for_main`
-    /// (the proof retired first), evicting at most `max_victims` entries
+    /// (optional headers reclaimed first), evicting at most `max_victims` entries
     /// (`TranscriptCache::release_older_until_at_most`), fit-or-nothing.
     pub(super) fn release_older_prefix_to_fit(
         &self,
@@ -402,10 +389,6 @@ impl SharedCache {
                 let _held = self.retained();
                 panic!("W9: panic under the retained lock (test)");
             }
-            TestLock::Side => {
-                let _held = self.side_ledger();
-                panic!("W9: panic under the side-ledger lock (test)");
-            }
         }
     }
     /// Stage 1 K8, tests only: whether `lock` is poisoned now.
@@ -414,7 +397,6 @@ impl SharedCache {
         match lock {
             TestLock::Cursor => self.cursor.is_poisoned(),
             TestLock::Retained => self.inner.is_poisoned(),
-            TestLock::Side => self.side.is_poisoned(),
         }
     }
     /// Poison the retained lock from another thread (tests only).
@@ -471,9 +453,7 @@ impl SharedCache {
         let live_bytes = taken.finalization_charge;
         let reserved =
             self.retained_reservation(&cache, &key, taken, live_bytes, taken.modified_hint);
-        let result = cache.insert_taken_reserving(key, incoming, reserved);
-        self.drop_suspended_proof_if_over(&cache, live_bytes);
-        result
+        cache.insert_taken_reserving(key, incoming, reserved)
     }
     // Refusal returns the original inline graph; boxing adds an unfunded allocation.
     #[allow(
@@ -782,8 +762,7 @@ pub(super) fn releases_at_completion(active: &OwnedActiveFile, index: &ScanIndex
                     .files
                     .get(&sampling.key)
                     .is_some_and(|entry| active.candidate.size_bytes > entry.size_bytes)
-        }) && active.side_origin.is_none()
-            && sampled_singleton(active))
+        }) && sampled_singleton(active))
 }
 
 /// One file on its own plan: no comparison, cursor job, group, alias, receipt
@@ -846,7 +825,7 @@ impl StepMeasure {
     /// walk; a field would edit unrelated test literals). `None`:
     /// unknown. Read only beside this walk's own non-zero budget, which
     /// implies a known room, where that budget is allocated against
-    /// (`retire_proof_beside_copy`).
+    /// (`retire_headers_beside_copy`).
     pub(super) fn room(&self) -> Option<usize> {
         let remaining = state_bytes().checked_sub(self.resident?)?;
         match (self.active, self.used) {
@@ -1072,16 +1051,14 @@ fn context_overhead(context: &Context) -> Option<usize> {
         completion_overdue_seconds: _,
         admission,
     } = context;
-    // The shared cache's `Arc` payload charge, and the side ledger's fixed
-    // charge, which `heap_bound` adds lock-free outside the two locked states
-    // (U1a-2a ss-4, F4b). Stage 1: less the inline pace table, which every
+    // The shared cache's `Arc` payload charge, including its root reservation.
+    // Stage 1: less the inline pace table, which every
     // caller adds again through the cursor state (`state_for_main` or
     // `cursor_resident`), so it is counted once (condition 4).
     let shared = size_of::<SharedCache>()
         .checked_sub(size_of::<codex_cursor::PaceTable>())?
         .checked_add(align_of::<SharedCache>())?
         .checked_add(2 * size_of::<usize>())?
-        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?
         .checked_add(context.cache.root_reservation())?;
     size_of::<Context>()
         .checked_add(shared)?
@@ -1112,7 +1089,7 @@ pub(super) fn context_overhead_covers(context: &Context) -> bool {
 
 /// A completing cursor job's exact copy budget, with the same
 /// refusal release the step start applies to an ordinary file, and the
-/// walk it came from (for `retire_proof_beside_copy`).
+/// walk it came from (for `retire_headers_beside_copy`).
 pub(super) fn completion_copy_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
@@ -1126,19 +1103,19 @@ pub(super) fn completion_copy_budget(
 
 /// Main's copy budget funds two shares at once, a retained copy and finish/output
 /// (`ClaudeResponses::finish_copy_budget`), so before main allocates
-/// against `budget` (its completion's clone and finish), a suspended proof
-/// larger than what both shares leave of `step`'s room is retired:
-/// `proof + copy + finish/output <= room`, the room main's view
-/// (`bound_for_main`) measured without the proof. Both clones admit a copy
+/// against `budget` (its completion's clone and finish), optional headers
+/// larger than what both shares leave of `step`'s room are reclaimed:
+/// `headers + copy + finish/output <= room`, the room main's view
+/// (`bound_for_main`) measured without optional headers. Both clones admit a copy
 /// only within `min(budget, ENTRY_BYTES)` before they allocate it
 /// (`retain_reduction`'s `retention_bound`, `retain_sealed_prefix`'s
 /// `admitted`), so the copy's share is `min(budget, ENTRY_BYTES)`. The
 /// caller passes 0 where its completion cannot retain a copy. Where no copy
 /// can be allocated (`budget == 0`, which an unknown room always gives)
-/// nothing is retired: no proof drops on unavailable inputs. Non-allocating
+/// nothing is retired: no header reclamation on unavailable inputs. Non-allocating
 /// steps never call this, and Path A (`admit_tail_copy`) clones nothing
 /// at its zero-budget step.
-pub(super) fn retire_proof_beside_copy(
+pub(super) fn retire_headers_beside_copy(
     sampling: Option<&Context>,
     budget: usize,
     step: StepMeasure,
@@ -1151,13 +1128,13 @@ pub(super) fn retire_proof_beside_copy(
     };
     context
         .cache
-        .retire_proof_over_room(room.saturating_sub(copy_shares(budget)));
+        .retire_headers_over_room(room.saturating_sub(copy_shares(budget)));
     #[cfg(test)]
     COPY_RETIRE_PROBE.with(|probe| {
         let whole = crate::heap_layout_bound::bound(context, state_bytes());
         let main = codex_cursor::bound_for_main(context, state_bytes());
         probe.set(Some(CopyRetireProbe {
-            proof: whole
+            headers: whole
                 .zip(main)
                 .and_then(|(whole, main)| whole.checked_sub(main)),
             resident: step.resident,
@@ -1173,14 +1150,14 @@ fn copy_shares(budget: usize) -> usize {
     budget.saturating_add(budget.min(ENTRY_BYTES))
 }
 
-/// Tests only: what `retire_proof_beside_copy` saw right after its retire.
+/// Tests only: what `retire_headers_beside_copy` saw right after its retire.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CopyRetireProbe {
-    /// The suspended proof's charge left beside the copy (`bound(context)`
+    /// The optional headers' charge left beside the copy (`bound(context)`
     /// less main's view, measured together, so main's own growth since the
     /// walk cancels).
-    pub(super) proof: Option<usize>,
+    pub(super) headers: Option<usize>,
     /// The walk's main-view resident, its active charge and the budget.
     pub(super) resident: Option<usize>,
     pub(super) used: usize,
@@ -1188,14 +1165,14 @@ pub(super) struct CopyRetireProbe {
 }
 #[cfg(test)]
 impl CopyRetireProbe {
-    /// At the clone: the walk's resident + the proof + the active + both
+    /// At the clone: the walk's resident + the headers + the active + both
     /// shares (`copy_shares`) fit `state_bytes()`.
     pub(super) fn fits(&self) -> bool {
         self.resident
-            .zip(self.proof)
-            .and_then(|(resident, proof)| {
+            .zip(self.headers)
+            .and_then(|(resident, headers)| {
                 resident
-                    .checked_add(proof)?
+                    .checked_add(headers)?
                     .checked_add(self.used)?
                     .checked_add(copy_shares(self.budget))
             })
@@ -1205,7 +1182,7 @@ impl CopyRetireProbe {
 
 #[cfg(test)]
 thread_local! {
-    /// Tests only: the last `retire_proof_beside_copy` on this thread.
+    /// Tests only: the last `retire_headers_beside_copy` on this thread.
     static COPY_RETIRE_PROBE: std::cell::Cell<Option<CopyRetireProbe>> =
         const { std::cell::Cell::new(None) };
 }
@@ -1234,11 +1211,9 @@ pub(super) fn copy_budget_step(
     let Some(context) = sampling else {
         return (0, StepMeasure::default());
     };
-    // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
-    // optional proof work never shrinks a copy budget. It is no allocation
-    // authority either: the walk's `room` goes with the budget, and where
-    // main allocates against it the proof is retired first
-    // (`retire_proof_beside_copy`, fix round 2 DB1).
+    // Main's view omits optional headers. The walk grants no allocation
+    // authority: its room goes with the budget, and headers yield before
+    // main allocates against it (`retire_headers_beside_copy`).
     let resident = codex_cursor::bound_for_main(context, state_bytes());
     let remaining = resident.and_then(|resident| state_bytes().checked_sub(resident));
     let Some(active) = active else {
@@ -1482,8 +1457,8 @@ pub(super) enum ReleaseOutcome {
 pub(super) struct DeferredRelease {
     cache: Arc<SharedCache>,
     /// What must fit beside the retained copies after the release, besides
-    /// main's cursor state: the context's own charge (the side ledger's
-    /// fixed charge once, `context_overhead`), the copy's clone and
+    /// main's cursor state: the context's own charge (`context_overhead`),
+    /// the copy's clone and
     /// finish/output (`2K`) and `max(A, ins_extra)`. With main's cursor
     /// state measured at the release, the retained copies' limit is
     /// `state_bytes() - cursor - pinned`, the completion's `R - need`
@@ -1505,8 +1480,8 @@ pub(super) struct DeferredRelease {
 }
 impl DeferredRelease {
     /// Release through the one mechanism (`SharedCache::release_older_to_fit`):
-    /// under the retained and cursor locks, a suspended proof
-    /// is retired first where the fit is reachable, then the shortest
+    /// under the retained and cursor locks, optional headers
+    /// are reclaimed first where the fit is reachable, then the shortest
     /// victim-order prefix ranked strictly below `rank` is evicted
     /// (`Release::CopyAdmission`), fit-or-nothing. Already fitting evicts
     /// nothing. A poisoned lock or an unmeasurable cache (classified first,
@@ -1569,7 +1544,7 @@ pub(super) fn tail_completion_budget(
     active: &mut OwnedActiveFile,
 ) -> (RetainBudget, StepMeasure, Option<ReleaseProof>) {
     // 1. Measure, waiting on the locks, in main's view (`copy_budget_step`
-    // walks `bound_for_main`): a suspended proof never inflates `need`.
+    // walks `bound_for_main`): optional headers never inflate `need`.
     let (budget, step) = {
         let _blocking = BlockingResidentMeasure::enter();
         copy_budget_step(sampling, Some(&mut *active), true)
@@ -1687,12 +1662,12 @@ pub(super) fn tail_completion_budget(
 }
 
 /// What a releasing completion owns for its release decision (M-a, S-a):
-/// everything `prove_release` needs after main's proof retirement and decode
+/// everything `prove_release` needs after main's header reclamation and decode
 /// peak reservation, measured once in `tail_completion_budget`. Inline only.
 pub(super) struct ReleaseProof {
     cache: Arc<SharedCache>,
     /// The completion walk's room (`state_bytes()` less main's resident view),
-    /// before the proof retirement: the legacy path's figure.
+    /// before header reclamation: the legacy path's figure.
     remaining: usize,
     /// `max(A, ins_extra)`: the active charge and the insert's slot are
     /// never held at once.
@@ -1735,8 +1710,8 @@ pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<u
     bound().map_or(XOut::Refused, XOut::Bound)
 }
 
-/// M-a's release proof at the retention site (S-a): after main's proof
-/// retirement (`retire_proof_beside_copy`) and #667's peak reservation.
+/// M-a's release proof at the retention site (S-a): after main's header
+/// reclamation (`retire_headers_beside_copy`) and #667's peak reservation.
 /// `granted` is main's peak-reserved budget, admitted when nothing is
 /// released. Without a proof (`proof` absent) this is `reserve_peak`.
 ///
@@ -1823,7 +1798,7 @@ fn legacy_release(
     }
     // What must fit beside the retained copies after the release:
     // `R - need = state_bytes() - cursor - pinned`, with the context's own
-    // charge (the side ledger once) in `pinned` (`DeferredRelease::pinned`).
+    // charge in `pinned` (`DeferredRelease::pinned`).
     let Some(pinned) = context_overhead(context)
         .and_then(|overhead| overhead.checked_add(share.checked_mul(2)?))
         .and_then(|pinned| pinned.checked_add(proof.floor))
@@ -1875,8 +1850,8 @@ fn proven_release(
     finish_copy_budget: impl Fn(usize) -> Option<usize>,
     decode_peak: impl FnOnce(usize) -> Option<usize>,
 ) -> Option<RetainBudget> {
-    // `remaining'` after the retirement, in main's view (a suspended proof
-    // never inflates the need; the release retires it first).
+    // `remaining'` after the retirement, in main's view (optional headers
+    // never inflate the need; the release reclaims them first).
     let resident = {
         let _blocking = BlockingResidentMeasure::enter();
         codex_cursor::bound_for_main(context, state_bytes())?
@@ -2186,19 +2161,16 @@ fn lineage_retainable(accumulator: &SnapshotAccumulator) -> bool {
     let today = !accumulator.codex_is_fork
         && accumulator.codex_parent_session_ref.is_none()
         && accumulator.codex_sidecar_parent.is_none();
-    // (2) A fork whose boundary was decided from in-file header fields only:
-    // exact_start → Ordinal, history_base → AllLocal, subagent legacy trigger
-    // → AllLocal. Not a created thread or sidecar-ambiguous file (native_only),
-    // and no parent ledger was read.
+    // (2) A fork using in-file ownership: exact_start → Ordinal, or
+    // history_base, subagent legacy trigger and ordinary forks → AllLocal.
+    // Created threads and sidecar-ambiguous files remain native_only.
     let in_file_fork = accumulator.codex_is_fork
         && !accumulator.codex_created_thread_native_only
-        && !accumulator.codex_parent_ledger_consulted
         && matches!(
             accumulator.codex_ownership_boundary,
             CodexOwnershipBoundary::Ordinal { .. } | CodexOwnershipBoundary::AllLocal
         );
-    // NativeCreatedThread: false until step 2 (G-CT). Ledger-resolved
-    // AwaitingParentPrefix → AllLocal: false until U1a-2.
+    // NativeCreatedThread: false until step 2 (G-CT).
     today || in_file_fork
 }
 
@@ -2206,7 +2178,6 @@ pub(super) struct ParserOptions<'a> {
     pub(super) source: SnapshotSource,
     pub(super) metadata: &'a CodexTitleMetadata,
     pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
-    pub(super) parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     pub(super) identity_capture: bool,
     pub(super) cache: Option<&'a Arc<SharedCache>>,
 }
@@ -2221,7 +2192,6 @@ pub(super) fn new_source_parser(
         source,
         metadata,
         traces,
-        parents,
         identity_capture,
         cache,
     } = options;
@@ -2267,7 +2237,6 @@ pub(super) fn new_source_parser(
         },
         (source == SnapshotSource::Codex).then_some(metadata),
         traces,
-        parents,
     )?;
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
@@ -2335,6 +2304,44 @@ mod claude_sidecar_reduction_tests;
 #[cfg(test)]
 mod cache_lifecycle_tests {
     use super::*;
+
+    /// [behaviour] Cache root and both measured states are charged once.
+    /// The ordinary heap walk refuses busy state instead of blocking.
+    #[test]
+    fn shared_cache_root_formula_and_nonblocking_measure() {
+        use crate::heap_layout_bound::bound;
+        use std::mem::{align_of, size_of};
+        let cache = Arc::new(SharedCache::default());
+        assert_eq!(
+            bound(&cache, usize::MAX).is_some(),
+            crate::heap_layout_bound::layout_supported()
+        );
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut whole = Counter::new(usize::MAX);
+        cache.heap_bound(&mut whole).unwrap();
+        let mut parts = Counter::new(usize::MAX);
+        cache.inner.heap_bound(&mut parts).unwrap();
+        cache.cursor.heap_bound(&mut parts).unwrap();
+        cache.withheld_memo.heap_bound(&mut parts).unwrap();
+        assert_eq!(
+            whole.bytes,
+            OFF_MAIN_SHARED_BYTES
+                + align_of::<SharedCache>()
+                + 2 * size_of::<usize>()
+                + parts.bytes
+        );
+        {
+            let _held = cache.inner.lock().unwrap();
+            assert!(bound(&cache, usize::MAX).is_none());
+        }
+        {
+            let _held = cache.cursor.lock().unwrap();
+            assert!(bound(&cache, usize::MAX).is_none());
+        }
+        assert!(bound(&cache, usize::MAX).is_some());
+    }
 
     #[test]
     fn cache_lifecycle_poisoned_lock_is_not_reported_as_absent() {

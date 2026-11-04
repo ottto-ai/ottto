@@ -396,6 +396,17 @@ pub(super) fn hydrate_txn(
         "state_v2_unknown_presence_field"
     );
     macro_rules! load {
+        // These earlier retirements keep their stored rows, as before D203.
+        (retired_upload_context_fingerprint, $($rest:tt)*) => {};
+        (retired_claude_desktop_census_witness, $($rest:tt)*) => {};
+        ($f:ident, Misc, (retired none), [$kind:literal], $h:ident) => {
+            // Consume and seed old bytes without installing any retired state.
+            mapper::rows(tx, $kind, |tx, h| {
+                let _: Box<serde_json::value::RawValue> =
+                    mapper::read(tx, &h, Some(&mut cx.digests))?;
+                Ok(())
+            })?;
+        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };

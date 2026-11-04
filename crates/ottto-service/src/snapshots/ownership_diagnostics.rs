@@ -1,7 +1,6 @@
 use super::*;
 pub(super) const INVENTORY: usize = 0;
 pub(super) const CREATED: usize = 1;
-pub(super) const PARENT: usize = 2;
 pub(super) const ABSENT: usize = 3;
 pub(super) const GROUP: usize = 4;
 pub(super) const PARSER: usize = 5;

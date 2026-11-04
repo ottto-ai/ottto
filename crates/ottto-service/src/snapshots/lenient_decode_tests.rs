@@ -224,10 +224,6 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
         "schema_version",
         "generation",
         "accepted_snapshot_fingerprint_ledger_version",
-        "codex_parent_side_generation",
-        "codex_parent_proof_seq",
-        "codex_parent_proof_wrap_epoch",
-        "codex_proof_index_incarnation",
     ] {
         for bad in [
             "null",
@@ -240,17 +236,7 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
             "\"not-a-token\"",
         ] {
             // Some matrix values are valid native controls; test only hostile combinations.
-            if matches!(
-                field,
-                "generation"
-                    | "codex_parent_side_generation"
-                    | "codex_parent_proof_seq"
-                    | "codex_parent_proof_wrap_epoch"
-            ) && bad == "256"
-            {
-                continue;
-            }
-            if field == "codex_proof_index_incarnation" && bad.starts_with('"') {
+            if field == "generation" && bad == "256" {
                 continue;
             }
             for bounded in [false, true] {
@@ -1050,8 +1036,6 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
         "claude_stale_family_carry",
         "claude_owned_start_census",
         "claude_duplicate_request_owners",
-        "codex_parent_ownership_refs",
-        "codex_parent_ownership_ledgers",
         "bounded_sweep_had_unsettled_upload",
     ];
     for field in fields {
@@ -1084,7 +1068,6 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
                 "claude_request_identity_contract" => bad.is_null() || bad.is_string(),
                 "claude_request_identity_contract_changed"
                 | "bounded_sweep_had_unsettled_upload" => false,
-                "codex_parent_ownership_refs" => bad == serde_json::json!([]),
                 "claude_stale_family_carry" => {
                     bad == serde_json::json!({}) || bad == serde_json::json!([])
                 }
@@ -1404,19 +1387,13 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
 fn every_persisted_field_fixture() -> ScanIndex {
     let mut seed = fixture();
     seed.insert_retry_pending_claude_authority_for_test("valid-family");
-    seed.codex_parent_prefix_proofs.insert(
-        "child".into(),
-        CodexParentProofState::Owed(CodexParentProofOwed::new(
-            "parent".into(),
-            1,
-            CAUSE_NO_EVIDENCE,
-            OwedOrigin::Lineage,
-        )),
-    );
     let mut value = serde_json::to_value(&seed).unwrap();
     // Explicit, non-default fixture for EVERY registry member. New fields must
     // add native evidence here as well as serializer/registry/dispatch entries.
     for &field in lenient_decode::FIELDS {
+        if retired_codex_field(field) {
+            continue;
+        }
         let replacement = match field {
             "schema_version"
             | "files"
@@ -1466,7 +1443,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,
                 "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
                 "seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},
-                    "scope":codex_parent_side_scope().0,"sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+                    "scope":"retired","sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
             "claude_desktop_title_files" => {
                 serde_json::json!({"sidecar":{"cli_session_id":"session","title":"title","user_set":true}})
             }
@@ -1600,17 +1577,18 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             .iter()
             .copied()
             .filter(|name| {
-                !matches!(
-                    *name,
-                    "reread_guard"
-                        | "upload_context_fingerprint"
-                        | "claude_desktop_census_witness"
-                        | "claude_desktop_store_inventory"
-                        | "claude_folder_login_ledger"
-                        | "context_curve_capability_enabled"
-                        | "context_curve_replay_epoch"
-                        | "completed_context_curve_replay_generation"
-                )
+                !retired_codex_field(name)
+                    && !matches!(
+                        *name,
+                        "reread_guard"
+                            | "upload_context_fingerprint"
+                            | "claude_desktop_census_witness"
+                            | "claude_desktop_store_inventory"
+                            | "claude_folder_login_ledger"
+                            | "context_curve_capability_enabled"
+                            | "context_curve_replay_epoch"
+                            | "completed_context_curve_replay_generation"
+                    )
             })
             .collect()
     );
@@ -4144,7 +4122,9 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 } else {
                     defaults[*name].clone()
                 };
-                expected[*name] = value.clone();
+                if *name != "parent_unresolvable" {
+                    expected[*name] = value.clone();
+                }
                 value
             })
             .collect::<Vec<_>>();
@@ -4276,4 +4256,50 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "tail_discovery",
         ]
     );
+}
+fn retired_codex_field(field: &str) -> bool {
+    matches!(
+        field,
+        "codex_parent_ownership_refs"
+            | "codex_parent_ownership_ledgers"
+            | "codex_parent_side_requests"
+            | "codex_parent_side"
+            | "codex_parent_side_generation"
+            | "codex_parent_proof_wrap_epoch"
+            | "codex_parent_prefix_proofs"
+            | "codex_parent_proof_cursor"
+            | "codex_parent_side_cursor"
+            | "codex_parent_proof_seq"
+            | "codex_proof_index_incarnation"
+    )
+}
+
+/// [format] Retired fields consume old values in native, bounded and streaming
+/// decoders, without admitting damage in neighboring live controls.
+#[test]
+fn retired_codex_fields_decode_and_drop() {
+    let current = serde_json::to_value(fixture()).unwrap();
+    for field in lenient_decode::FIELDS
+        .iter()
+        .filter(|f| retired_codex_field(f))
+    {
+        assert!(current.get(*field).is_none());
+        for old in [
+            Value::Null,
+            serde_json::json!({"old": [1, 2]}),
+            serde_json::json!("old"),
+        ] {
+            let mut document = current.clone();
+            document[*field] = old;
+            let bytes = serde_json::to_vec(&document).unwrap();
+            let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+            let streaming =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+            let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+            for decoded in [native, streaming, bounded] {
+                assert!(decoded.decode_holds.is_empty());
+                assert_eq!(serde_json::to_value(decoded).unwrap(), current);
+            }
+        }
+    }
 }

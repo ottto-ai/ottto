@@ -512,35 +512,6 @@ fn comparison_target_read_calls_no_observer() {
     assert_eq!(recorder.events(), Vec::new());
 }
 
-/// A side read is rejected by the same begin predicate.
-#[test]
-fn side_read_calls_no_observer() {
-    let root = Root::new("ld-side");
-    append(
-        &root.file(SESSION),
-        &[raw(&row("/w/one", "u1")), b"\n".to_vec()].concat(),
-    );
-    let recorder = Recorder::default();
-    let mut scan = step_until(
-        new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer("test", Box::new(recorder.clone())),
-        |scan| scan.active_file.is_some(),
-    );
-    let active = scan.active_file.as_deref_mut().unwrap();
-    active.side_origin = Some(SideOrigin {
-        guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard::start(1),
-        dev_ino: (0, 0),
-    });
-    scan.line_delivery
-        .as_mut()
-        .unwrap()
-        .begin_armed(scan.active_file.as_deref().unwrap(), &scan.roots);
-    let active = scan.active_file.as_deref_mut().unwrap();
-    active.side_origin.take().unwrap().end();
-    finish(scan);
-    assert_eq!(recorder.events(), Vec::new());
-}
-
 /// Codex group member reads replay through the group job and call
 /// no observer.
 #[test]
@@ -1430,32 +1401,8 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                     "open counts growth once despite recovery"
                 );
             }
-            if source == SnapshotSource::Codex {
-                assert_eq!(
-                    codex_parent_outside_window(
-                        &index,
-                        &path(name),
-                        &File::open(path(name)).unwrap(),
-                        rfc3339_unix_seconds(NOW),
-                        7,
-                    ),
-                    !retained,
-                    "Codex parent {name}"
-                );
-                if recovery_overlap && name == "grown" {
-                    assert_eq!(
-                        discovery_page(source.api_slug())["discovery_retained"],
-                        json!({"grown": 1}),
-                        "parent counts growth once despite recovery"
-                    );
-                }
-            }
         }
-        let expected = if source == SnapshotSource::Codex {
-            6
-        } else {
-            4
-        };
+        let expected = 4;
         // In the overlap case the grown key's per-gate events were drained above;
         // the held key still contributes once at each of the same gates.
         let expected = if recovery_overlap {
@@ -2885,11 +2832,6 @@ fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salv
             serde_json::to_value(&bare_index.files).unwrap(),
             serde_json::to_value(&seen_index.files).unwrap(),
             "TierReplay receipts and ownership checkpoints"
-        );
-        assert_eq!(
-            serde_json::to_value(&bare_index.codex_parent_prefix_proofs).unwrap(),
-            serde_json::to_value(&seen_index.codex_parent_prefix_proofs).unwrap(),
-            "fresh-session proof maps may both be empty; inherited proof is not covered"
         );
         assert!(
             bare_index

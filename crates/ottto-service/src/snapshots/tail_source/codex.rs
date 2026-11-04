@@ -6,10 +6,10 @@
 //! holds the
 //! walk's `I` fields Codex keeps in its head: whether priority decisions
 //! exist, the parse-time totals (head state on Codex, not finish output), the
-//! parent proof's use and refusal, and the sidecar's projected ordinal this
+//! retired parent-proof slots, and the sidecar's projected ordinal this
 //! head was made under. Pages: the four dictionaries in
 //! stable slots (tombstones for the three that remove), the physical
-//! signatures, the cache requests, the compaction timestamps, the usage and
+//! retired signatures, the cache requests, the compaction timestamps, the usage and
 //! capability hours through the shared hour codec, the changed-file hashes,
 //! and the shared session facts (title, first prompt, workspace, opening
 //! settings, agent label, prelude), so content never re-derives. Live fields come from this read's inputs through `install_live`;
@@ -198,7 +198,7 @@ impl TailSource for Codex {
                 .codex_observed_priority_turns
                 .as_ref()
                 .map_or(0, |_| slots.priority_turns.len()),
-            Collection::Signatures => acc.codex_physical_signatures.len(),
+            Collection::Signatures => 0,
             Collection::Requests => acc.cache_requests.len(),
             Collection::Compactions => acc.compaction_timestamps.len(),
             Collection::UsageHours => acc.usage_buckets.len(),
@@ -351,11 +351,7 @@ impl TailSource for Codex {
                     .collect::<Result<Vec<_>, Refuse>>()?;
                 fixed_pages(&turns, PRIORITY_G, |turn, e| turn.put(e))
             }
-            Collection::Signatures => fixed_pages(
-                &acc.codex_physical_signatures,
-                SIGNATURES_G,
-                |signature, e| signature.put_h(e, "SnapshotAccumulator.codex_physical_signatures"),
-            ),
+            Collection::Signatures => Ok(Vec::new()),
             Collection::Requests => {
                 fixed_pages(&acc.cache_requests, REQUESTS_G, |request, e| request.put(e))
             }
@@ -478,10 +474,9 @@ impl TailSource for Codex {
                 })
             }
             Collection::Signatures => {
-                let signatures = &mut into.codex_physical_signatures;
-                slot_start(page, SIGNATURES_G, signatures.len())?;
+                // Retired pages remain decodable; their contents install no state.
                 read_page(bytes, SIGNATURES_G, |d| {
-                    signatures.push(String::take_h(d)?);
+                    let _ = String::take_h(d)?;
                     Ok(())
                 })
             }
@@ -524,8 +519,7 @@ impl TailSource for Codex {
     /// check either installs them or names why not: absent evidence holds the
     /// file (`Unavailable`), changed or incompatible evidence is a counted
     /// reconstruction. Never a silent success. In order: the counting rule,
-    /// the priority decisions, the sidecar's projected ordinal, the parent
-    /// evidence the stored boundary used; then the traces, ledgers and file
+    /// the priority decisions, the sidecar's projected ordinal; then the traces and file
     /// birth. Last, the file's lineage (D131): the stored head continues only
     /// the session its owning header named when it was written, so a header
     /// rewritten to another id is another file (a counted `Identity`
@@ -570,7 +564,6 @@ impl TailSource for Codex {
             (Some(made_under), Some(now)) if now < made_under => return Err(incompatible),
             _ => {}
         }
-        install_parent(stored, live)?;
         match crate::snapshots::codex_file_join::header_owner(fresh) {
             Ok(owner) if stored.codex_creator_header_id.as_deref() == Some(owner.as_str()) => {}
             Ok(_) => return Err(LiveLoadError::Reconstruct(ReconstructCause::Identity)),
@@ -581,90 +574,90 @@ impl TailSource for Codex {
             .claude_file_birth
             .refresh_opened(&live.claude_file_birth);
         stored.codex_turn_traces = live.codex_turn_traces.clone();
-        stored.codex_parent_ownership_ledgers = live.codex_parent_ownership_ledgers.clone();
         Ok(())
     }
 }
 
-/// The parent prefix the stored boundary used, from this read's evidence.
-/// The prefix itself is live (never stored): a child still comparing against
-/// its parent gets the same ledger or proof back, or none. A child before its
-/// header takes this read's proof, as a fresh read would.
-fn install_parent(
-    stored: &mut SnapshotAccumulator,
-    live: &SnapshotAccumulator,
-) -> Result<(), LiveLoadError> {
-    let incompatible = LiveLoadError::Reconstruct(ReconstructCause::Incompatible);
-    let parent = stored.codex_parent_session_ref.as_deref();
-    let ledger = parent.and_then(|parent| {
-        live.codex_parent_ownership_ledgers
-            .as_ref()
-            .and_then(|ledgers| ledgers.lock().ok())
-            .and_then(|ledgers| ledgers.get(parent).cloned())
+/// Decode-only compatibility for the retired trailer slots. No loaded value
+/// reaches the accumulator; new heads write the original empty slots.
+mod retired {
+    use super::*;
+    type WakeStamp = sampled_scan::codex_cursor::OpenStamp;
+    pub(super) struct CodexParentPrefixProof {
+        parent: String,
+        parent_seal: crate::transcript_acquisition::PrefixSeal,
+        matched: u64,
+        child_digest: String,
+        owned: bool,
+        published: bool,
+    }
+    pub(super) enum ProofWake {
+        Due,
+        ParentChanged {
+            parent: WakeStamp,
+            child: WakeStamp,
+        },
+        ChildChanged {
+            parent: WakeStamp,
+            child: WakeStamp,
+        },
+        Rewritten {
+            parent: Option<WakeStamp>,
+            child: WakeStamp,
+        },
+        Census {
+            matches: String,
+            child: WakeStamp,
+        },
+        ParentHeld {
+            parent_key: String,
+            generation: u64,
+            parent_entry: String,
+            parent: WakeStamp,
+            lineage: bool,
+            needed_extent: u64,
+        },
+        Backoff,
+    }
+    pub(super) enum ProofRefusal {
+        Identity(CodexParentUnresolvable),
+        Side(ProofWake),
+        Seal(crate::transcript_acquisition::FullReason),
+        Decision,
+    }
+    crate::durable_tail_codec::durable_struct!(CodexParentPrefixProof {
+        U parent: String,
+        D parent_seal: crate::transcript_acquisition::PrefixSeal,
+        N matched: u64,
+        H child_digest: String,
+        N owned: bool,
+        N published: bool,
     });
-    let proof = live
-        .codex_parent_prefix_proof
-        .as_ref()
-        .filter(|(proof, _)| parent == Some(proof.parent.as_str()));
-    if stored.codex_ownership_boundary == CodexOwnershipBoundary::Undetermined {
-        stored.codex_parent_prefix_proof = live.codex_parent_prefix_proof.clone();
-        return Ok(());
-    }
-    if !stored.codex_parent_ledger_consulted {
-        return Ok(());
-    }
-    // A proof job's ring is that job's alone.
-    if stored.codex_proof_decision_only {
-        return Err(incompatible);
-    }
-    let awaiting = stored.codex_ownership_boundary == CodexOwnershipBoundary::AwaitingParentPrefix;
-    if let Some(identity) = stored.codex_parent_ledger_identity_used.as_deref() {
-        let Some(ledger) = ledger.filter(|ledger| ledger.scan_complete) else {
-            return Err(LiveLoadError::Unavailable);
-        };
-        if ledger.opened_object_identity != identity || ledger.signatures.is_empty() {
-            return Err(incompatible);
-        }
-        if awaiting {
-            stored.codex_parent_signatures = Some(CodexParentPrefix::Ledger(ledger.signatures));
-        }
-        return Ok(());
-    }
-    if let Some((used, _)) = stored.codex_parent_proof_used.as_ref() {
-        let Some((fresh, digest)) = proof else {
-            return Err(LiveLoadError::Unavailable);
-        };
-        if fresh != used {
-            return Err(incompatible);
-        }
-        if awaiting {
-            stored.codex_parent_signatures = Some(CodexParentPrefix::Proof {
-                matched: used.matched,
-                digest: *digest,
-            });
-        }
-        return Ok(());
-    }
-    if awaiting {
-        // Comparing against a parent prefix neither the ledger nor a proof
-        // supplied contradicts the stored state.
-        return Err(LiveLoadError::Reconstruct(ReconstructCause::Corrupt));
-    }
-    if stored.codex_parent_unresolvable.is_some() {
-        // A witnessed-unusable parent: the fork stays absorbing, as stored.
-        stored.codex_parent_signatures = Some(CodexParentPrefix::Ledger(Vec::new()));
-        return Ok(());
-    }
-    if stored.codex_parent_resolution_pending() {
-        // Evidence that has arrived since cures the child only from its start.
-        return Err(if ledger.is_some() || proof.is_some() {
-            incompatible
-        } else {
-            LiveLoadError::Unavailable
-        });
-    }
-    Ok(())
+    crate::durable_tail_codec::durable_enum!(ProofWake {
+        0 => Due,
+        1 => ParentChanged { D parent: WakeStamp, D child: WakeStamp },
+        2 => ChildChanged { D parent: WakeStamp, D child: WakeStamp },
+        3 => Rewritten { D parent: Option<WakeStamp>, D child: WakeStamp },
+        4 => Census { N matches: String, D child: WakeStamp },
+        5 => ParentHeld {
+            N parent_key: String,
+            N generation: u64,
+            N parent_entry: String,
+            D parent: WakeStamp,
+            N lineage: bool,
+            N needed_extent: u64,
+        },
+        6 => Backoff,
+    });
+    crate::durable_tail_codec::durable_enum!(ProofRefusal {
+        0 => Identity(D reason: CodexParentUnresolvable),
+        1 => Side(D wake: ProofWake),
+        2 => Seal(D reason: crate::transcript_acquisition::FullReason),
+        3 => Decision,
+    });
 }
+
+use retired::{CodexParentPrefixProof, ProofRefusal};
 
 /// The walk's `I` fields a Codex head keeps after the walk.
 struct Trailer {
@@ -691,8 +684,8 @@ impl Trailer {
             priority_present: acc.codex_observed_priority_turns.is_some(),
             session_cumulative_usage: acc.session_cumulative_usage.clone(),
             accepted_usage_totals: acc.accepted_usage_totals.clone(),
-            codex_parent_proof_used: acc.codex_parent_proof_used.clone(),
-            codex_parent_proof_refusal: acc.codex_parent_proof_refusal.clone(),
+            codex_parent_proof_used: None,
+            codex_parent_proof_refusal: None,
             codex_sidecar_projected_next_ordinal: acc.codex_sidecar_projected_next_ordinal,
             codex_sidecar_binding: acc.codex_sidecar_binding.clone(),
         }
@@ -701,8 +694,6 @@ impl Trailer {
         acc.codex_observed_priority_turns = self.priority_present.then(BTreeMap::new);
         acc.session_cumulative_usage = self.session_cumulative_usage;
         acc.accepted_usage_totals = self.accepted_usage_totals;
-        acc.codex_parent_proof_used = self.codex_parent_proof_used;
-        acc.codex_parent_proof_refusal = self.codex_parent_proof_refusal;
         acc.codex_sidecar_projected_next_ordinal = self.codex_sidecar_projected_next_ordinal;
         acc.codex_sidecar_binding = self.codex_sidecar_binding;
     }

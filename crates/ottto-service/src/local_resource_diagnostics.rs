@@ -191,7 +191,6 @@ pub(crate) mod claude_absence;
 pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
-pub(crate) mod codex_side_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
 #[cfg(unix)]
@@ -610,15 +609,9 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64, u64, u64) {
 #[serde(default)]
 pub(crate) struct CapCounts {
     #[serde(skip_serializing_if = "is_zero")]
-    pub boundary_overflow_events: u64,
-    #[serde(skip_serializing_if = "is_zero")]
     pub bootstrap_overflow_events: u64,
     #[serde(skip_serializing_if = "is_zero")]
-    pub parent_signature_clear_events: u64,
-    #[serde(skip_serializing_if = "is_zero")]
     pub price_trace_row_limit_hits: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub parent_ref_refusals: u64,
 }
 impl CapCounts {
     pub(crate) fn is_empty(&self) -> bool {
@@ -626,15 +619,9 @@ impl CapCounts {
     }
     pub(crate) fn drain(&mut self, source: &str) -> Self {
         for (event, total) in [
-            &mut self.boundary_overflow_events,
-            &mut self.bootstrap_overflow_events,
-            &mut self.parent_signature_clear_events,
-            &mut self.price_trace_row_limit_hits,
-            &mut self.parent_ref_refusals,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            (1, &mut self.bootstrap_overflow_events),
+            (3, &mut self.price_trace_row_limit_hits),
+        ] {
             *total = total.saturating_add(source_count(source, CAP_EVENT_START + event, |n| {
                 n.swap(0, Relaxed)
             }));
@@ -652,7 +639,7 @@ impl CapCounts {
     }
 }
 
-crate::heap_layout_bound::fields!(CapCounts; boundary_overflow_events, bootstrap_overflow_events, parent_signature_clear_events, price_trace_row_limit_hits, parent_ref_refusals);
+crate::heap_layout_bound::fields!(CapCounts; bootstrap_overflow_events, price_trace_row_limit_hits);
 
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -900,51 +887,6 @@ pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
 /// session scalars for a resource limit. Counts only.
 pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
-}
-
-/// Cumulative shared-process Codex parent side-record totals (U1a-2a):
-/// lifetime counters plus last-measured gauges, NOT events attributed to the
-/// finishing page/source. Codex scans only.
-pub(crate) fn codex_side_lifecycle_totals(source: &str) {
-    if source == "codex" {
-        traversal_point(
-            "process_codex_side_lifecycle_totals",
-            "codex",
-            &codex_side_lifecycle::snapshot(),
-        );
-    }
-}
-
-/// The two point lines of one side read (`codex_side_lifecycle::SideReadGuard`).
-pub(crate) enum SideReadPoint {
-    Start { pseq: u64, attempts: u8 },
-    End { pseq: u64, abandoned: bool },
-}
-
-/// One content-free line per side read start or end, on the existing
-/// best-effort stderr carrier. With `process_id`, a start that has no matching
-/// end before a new `process_id` is the only crash evidence; nothing is
-/// persisted, and no CPU/RSS sample is taken.
-pub(crate) fn side_read_point(point: SideReadPoint) {
-    #[derive(Serialize)]
-    struct Start {
-        pseq: u64,
-        attempts: u8,
-    }
-    #[derive(Serialize)]
-    struct End {
-        pseq: u64,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        abandoned: bool,
-    }
-    match point {
-        SideReadPoint::Start { pseq, attempts } => {
-            traversal_point("side_read_start", "codex", &Start { pseq, attempts })
-        }
-        SideReadPoint::End { pseq, abandoned } => {
-            traversal_point("side_read_end", "codex", &End { pseq, abandoned })
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -2108,7 +2050,6 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) protected_history: AssessedBool,
     pub(crate) forced_family: AssessedBool,
     pub(crate) comparison_target: AssessedBool,
-    pub(crate) parent_proof_required: AssessedBool,
     pub(crate) audit_debt_present: AssessedBool,
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
@@ -2678,7 +2619,6 @@ mod tests {
                 protected_history: gate,
                 forced_family: gate,
                 comparison_target: gate,
-                parent_proof_required: gate,
                 audit_debt_present: gate,
                 audit_slot_available: gate,
                 sampling_allowed: gate,
@@ -3259,97 +3199,6 @@ mod tests {
         assert_eq!(actual[0]["stage"], record["stage"]);
         let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
         assert!(none.is_empty());
-    }
-
-    #[test]
-    fn codex_side_lifecycle_record_is_bounded_and_explicitly_process_global() {
-        let (_, records) = capture(|| {
-            traversal_point(
-                "process_codex_side_lifecycle_totals",
-                "codex",
-                &codex_side_lifecycle::Record::maximum(),
-            );
-        });
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record["stage"], "process_codex_side_lifecycle_totals");
-        assert_eq!(record["source"], "codex");
-        let keys: Vec<_> = record["counts"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        // Option B: exactly ten lifetime totals and five last-measured gauges.
-        assert_eq!(
-            keys,
-            [
-                "side_ledger_entries",
-                "side_ledger_evictions",
-                "side_not_due",
-                "side_proof_drops",
-                "side_proof_release_drops",
-                "side_reads_ended",
-                "side_reads_started",
-                "side_record_bytes",
-                "side_records",
-                "side_records_written",
-                "side_refusals",
-                "side_request_bytes",
-                "side_requests",
-                "side_requests_rearmed",
-                "side_requests_tombstoned",
-            ]
-        );
-        assert!(record["counts"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(|value| *value == u64::MAX));
-        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
-        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        let width = serde_json::to_string(record).unwrap().len();
-        println!("CODEX_SIDE_LIFECYCLE_MAX_WIDTH bytes={width}");
-        assert!(width < 2048);
-        let (_, actual) = capture(|| codex_side_lifecycle_totals("codex"));
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0]["stage"], record["stage"]);
-        let (_, none) = capture(|| codex_side_lifecycle_totals("claude_code"));
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn side_read_lines_are_one_start_and_at_most_one_end_per_read() {
-        use codex_side_lifecycle::{observe, SideReadGuard};
-        let ((_, lines), counts) = observe(|| {
-            capture(|| {
-                SideReadGuard::start(3).end();
-                drop(SideReadGuard::start(7));
-            })
-        });
-        assert_eq!(counts.side_reads_started, 2);
-        assert_eq!(counts.side_reads_ended, 2);
-        let stages: Vec<_> = lines.iter().map(|line| line["stage"].clone()).collect();
-        assert_eq!(
-            stages,
-            [
-                "side_read_start",
-                "side_read_end",
-                "side_read_start",
-                "side_read_end"
-            ]
-        );
-        assert_eq!(lines[0]["counts"]["attempts"], 3);
-        assert_eq!(lines[0]["counts"]["pseq"], lines[1]["counts"]["pseq"]);
-        assert!(lines[1]["counts"].get("abandoned").is_none());
-        assert_eq!(lines[2]["counts"]["pseq"], lines[3]["counts"]["pseq"]);
-        assert_ne!(lines[0]["counts"]["pseq"], lines[2]["counts"]["pseq"]);
-        assert_eq!(lines[3]["counts"]["abandoned"], true);
-        for line in &lines {
-            assert_eq!(line["source"], "codex");
-            assert!(line["process_id"].is_u64());
-            assert!(serde_json::to_string(line).unwrap().len() < 2048);
-        }
     }
 
     #[test]

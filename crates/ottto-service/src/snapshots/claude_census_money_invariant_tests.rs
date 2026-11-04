@@ -150,7 +150,6 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         apply_claude_code_line,
         None,
         None,
-        None,
     )
     .expect("claude parser");
     fs::remove_file(&path).expect("remove transcript fixture");
@@ -475,13 +474,7 @@ fn every_absence_exit_drops_census_marks_and_removals() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_after = None;
     traversal.reconciliation_upper_bound = Some(key.into());
-    reconcile_missing_index_entries_with_side(
-        &mut index,
-        10,
-        None,
-        None,
-        SnapshotSource::ClaudeCode,
-    );
+    reconcile_missing_index_entries_with_side(&mut index, 10, None, SnapshotSource::ClaudeCode);
     assert_eq!(lifetime_kept(&index, key), gone, "main reconciliation");
     holder_kept(&index);
 }

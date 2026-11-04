@@ -28,7 +28,6 @@ pub(in crate::snapshots) fn new_group_parser(
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
-    ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
     refuse_compressed_codex(
@@ -43,7 +42,6 @@ pub(in crate::snapshots) fn new_group_parser(
         apply_codex_line,
         Some(metadata),
         traces,
-        ledgers,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
@@ -108,8 +106,6 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
-        parent_ref: None,
-        parent_unresolvable: None,
     }
 }
 
@@ -125,8 +121,6 @@ fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
-        parent_ref: None,
-        parent_unresolvable: None,
     }
 }
 
@@ -634,17 +628,9 @@ impl GroupBoot {
             &file,
             inputs.metadata,
             inputs.traces.clone(),
-            inputs.ledgers.clone(),
         )?;
-        let mut parser = new_group_parser(
-            file,
-            &first,
-            inputs.metadata,
-            inputs.traces,
-            inputs.ledgers,
-            evidence,
-        )
-        .map_err(|_| GroupEnd::Strict)?;
+        let mut parser = new_group_parser(file, &first, inputs.metadata, inputs.traces, evidence)
+            .map_err(|_| GroupEnd::Strict)?;
         let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
         join.begin_member(0);
@@ -680,8 +666,6 @@ impl GroupBoot {
             cursor: None,
             charged_bytes: 0,
             hold_offset: None,
-            // U1a-2a: a group job is never a side read.
-            side_origin: None,
             group: Some(Box::new(GroupJob {
                 key,
                 owner: group.owner,
@@ -715,8 +699,6 @@ impl GroupBoot {
 pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
-    pub(in crate::snapshots) ledgers:
-        Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
@@ -744,7 +726,6 @@ fn legacy_tee(
     file: &File,
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
-    ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
     refuse_compressed_codex(
         Some(&member.path),
@@ -763,7 +744,6 @@ fn legacy_tee(
         apply_codex_line,
         Some(metadata),
         traces,
-        ledgers,
     )
     .map(|tee| Some(Box::new(tee)))
     .map_err(|_| GroupEnd::Strict)
@@ -842,11 +822,9 @@ impl GroupJob {
     pub(in crate::snapshots) fn reinstall_tee_inputs(
         &mut self,
         traces: Option<Arc<CodexTurnTraceMap>>,
-        parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     ) {
         if let Some(tee) = self.tee.as_mut() {
             tee.accumulator.codex_turn_traces = traces;
-            tee.accumulator.codex_parent_ownership_ledgers = parents;
         }
     }
 }
@@ -1208,11 +1186,6 @@ fn open_member(
         &file,
         inputs.metadata,
         active.parser.accumulator.codex_turn_traces.clone(),
-        active
-            .parser
-            .accumulator
-            .codex_parent_ownership_ledgers
-            .clone(),
     )?;
     let previous = group
         .previous_receipts
@@ -1374,7 +1347,6 @@ pub(in crate::snapshots) fn end_group(
                                     &group.members.last().expect("live member").path,
                                     stamp,
                                 ),
-                                None,
                                 None,
                                 disclosure.clone(),
                             )

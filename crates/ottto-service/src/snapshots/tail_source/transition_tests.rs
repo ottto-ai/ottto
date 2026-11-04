@@ -367,23 +367,23 @@ fn a_codex_restart_continues_with_the_cold_body_across_two_restarts() {
 }
 
 /// [behaviour] A slot collection that shrinks deletes its vanished pages and the
-/// head still loads: Codex's signature list clears at its cap.
+/// head still loads after a collection's contents are retired.
 #[test]
 fn a_shrunk_collection_retires_its_vanished_pages() {
     let mut route = route_for(Source::Codex);
     let path = route.dir.join(Codex::name());
     rewrite(&path, &codex_lines(3));
     let (tail, native) = complete::<Codex>(&route, &path, None, |acc| {
-        acc.codex_physical_signatures.clear();
+        acc.compaction_timestamps.clear();
         for n in 0..300 {
-            acc.codex_physical_signatures
-                .push(sha256_hex(&["tail-transition-signature", &n.to_string()]));
+            acc.compaction_timestamps
+                .push(sha256_hex(&["tail-transition-compaction", &n.to_string()]));
         }
     });
     let key = tail.key.clone();
     assert!(tail.publish(&native));
     route.save(false);
-    assert!(pages::<Codex>(&route, &key).contains_key(&(Collection::Signatures, 1)));
+    assert!(pages::<Codex>(&route, &key).contains_key(&(Collection::Compactions, 1)));
 
     let committed = head::<Codex>(&route, &key);
     let mut base = TailBase::new(&committed.body);
@@ -393,16 +393,16 @@ fn a_shrunk_collection_retires_its_vanished_pages() {
     })
     .unwrap();
     let (tail, native) = complete::<Codex>(&route, &path, Some(base), |acc| {
-        acc.codex_physical_signatures.clear();
+        acc.compaction_timestamps.clear();
     });
     let staged = tail.staged_for_test().expect("the shrink restates");
-    assert!(staged.obsolete.contains(&(Collection::Signatures, 0)));
-    assert!(staged.obsolete.contains(&(Collection::Signatures, 1)));
+    assert!(staged.obsolete.contains(&(Collection::Compactions, 0)));
+    assert!(staged.obsolete.contains(&(Collection::Compactions, 1)));
     assert!(tail.publish(&native));
     route.save(false);
     assert!(!pages::<Codex>(&route, &key)
         .keys()
-        .any(|(collection, _)| *collection == Collection::Signatures));
+        .any(|(collection, _)| *collection == Collection::Compactions));
     assert!(matches!(
         load_at::<Codex>(&route, &path, &key),
         Load::Reused(..)
@@ -826,7 +826,6 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
             SnapshotSource::Codex,
             apply_codex_line,
             Some(metadata),
-            None,
             None,
         )
         .unwrap()

@@ -311,6 +311,32 @@ pub(crate) fn route_for_test(
     routed_for_test(cache, index, &dir)
 }
 
+/// The saved, already-indexed walk used by a quiet restart. Like the
+/// discovery-growth fixture, it keeps the roster across the restart; only
+/// unchanged members already represented by the committed index are drained.
+pub(crate) fn retain_indexed_walk_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    collected_at: &str,
+    backfill_window_days: u64,
+) {
+    ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    advance_bounded_directory_traversal(source, index, backfill_window_days, None);
+    let walk = index.traversal.as_ref().expect("indexed walk");
+    assert!(walk.pending_directories.is_empty(), "the walk is complete");
+    for candidate in &walk.pending_candidates {
+        let metadata = std::fs::symlink_metadata(&candidate.path).unwrap();
+        let entry = &index.files[&local_index_key(&candidate.path)];
+        assert!(entry.same_listing_stamp_as(&metadata));
+        assert!(!entry.rearmed());
+        // A retained walk keeps a sampled prefix until its audit deadline;
+        // listing_unchanged would reject even that not-yet-due obligation.
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+    }
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+}
+
 /// The time a fixture's next visit is taken to come after its last. The
 /// fixtures' `collected_at` never moves, so a kept generation's metadata
 /// re-listing (`LISTING_INTERVAL_SECONDS`) and its owed-file pace
@@ -775,7 +801,6 @@ pub(super) fn parse_ordinary_with_metadata(
         path,
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
-        None,
         None,
         None,
     )?;

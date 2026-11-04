@@ -186,7 +186,7 @@ fn bare_builders_and_missing_object_identity_do_not_publish() {
 }
 
 #[test]
-fn shared_role_gate_excludes_comparison_side_and_other_sources() {
+fn shared_role_gate_excludes_comparison_and_other_sources() {
     let f = fixture();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut scan = step_until(
@@ -205,12 +205,6 @@ fn shared_role_gate_excludes_comparison_side_and_other_sources() {
     active.comparison_target = true;
     assert!(!active.is_primary_for(SnapshotSource::Codex));
     active.comparison_target = false;
-    active.side_origin = Some(SideOrigin {
-        guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard::start(1),
-        dev_ino: (0, 0),
-    });
-    assert!(!active.is_primary_for(SnapshotSource::Codex));
-    active.side_origin.take().unwrap().end();
     assert!(active.is_primary_for(SnapshotSource::Codex));
     // The publication itself can borrow a held accumulator while I/O is denied.
     while !active.parser.step().unwrap() {}

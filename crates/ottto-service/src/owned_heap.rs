@@ -49,6 +49,7 @@ impl<T: HeapLayoutBound> OwnedVec<T> {
             base,
         })
     }
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.values.clear();
         self.elements = Some(0);

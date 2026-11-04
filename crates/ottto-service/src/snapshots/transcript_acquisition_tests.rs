@@ -92,7 +92,6 @@ fn native_parser_with(
         },
         Some(metadata),
         None,
-        None,
     )
     .unwrap();
     (parser, expected, scope)
@@ -852,7 +851,6 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
                 accumulator.codex_ownership_boundary
             );
             assert!(!accumulator.codex_created_thread_native_only, "{case}");
-            assert!(!accumulator.codex_parent_ledger_consulted, "{case}");
         }
         for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
             let next_ordinal = (values.len() + step) as u64;
@@ -1300,9 +1298,7 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
     fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     let traces = Arc::new(CodexTurnTraceMap::default());
-    let parents = Arc::new(Mutex::new(BTreeMap::new()));
     parser.accumulator.codex_turn_traces = Some(traces.clone());
-    parser.accumulator.codex_parent_ownership_ledgers = Some(parents.clone());
     parser.prepare_acquisition(None, &scope, None, 100).unwrap();
     while !parser.step().unwrap() {}
     for limit in [0, crate::transcript_cache::ENTRY_BYTES] {
@@ -1310,14 +1306,6 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         assert!(Arc::ptr_eq(
             parser.accumulator.codex_turn_traces.as_ref().unwrap(),
             &traces
-        ));
-        assert!(Arc::ptr_eq(
-            parser
-                .accumulator
-                .codex_parent_ownership_ledgers
-                .as_ref()
-                .unwrap(),
-            &parents
         ));
     }
     let completed = parser
@@ -1334,18 +1322,9 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         )
     );
     assert_eq!(Arc::strong_count(&traces), 2);
-    assert_eq!(Arc::strong_count(&parents), 2);
     assert!(Arc::ptr_eq(
         parser.accumulator.codex_turn_traces.as_ref().unwrap(),
         &traces
-    ));
-    assert!(Arc::ptr_eq(
-        parser
-            .accumulator
-            .codex_parent_ownership_ledgers
-            .as_ref()
-            .unwrap(),
-        &parents
     ));
 }
 
@@ -1354,87 +1333,61 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for inputs in ["traces", "parents", "both"] {
-        let fixture = ScanFixture::new(SnapshotSource::Codex);
-        fixture
-            .file
-            .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
-        fixture
-            .file
-            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let setup = |scan: &mut OwnedSourceScan| {
-            if inputs != "parents" {
-                let traces = Arc::new(CodexTurnTraceMap {
-                    since_epoch: 0,
-                    priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
-                    incomplete: false,
-                });
-                assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
-                scan.codex_turn_traces = Some(traces);
-            }
-            if inputs != "traces" {
-                let parents = Arc::new(Mutex::new(
-                    (0..5000)
-                        .map(|n| {
-                            (
-                                format!("unrelated-parent-{n}"),
-                                CodexParentOwnershipLedger {
-                                    signatures: Vec::new(),
-                                    scan_complete: true,
-                                    opened_object_identity: "synthetic-unrelated".into(),
-                                    unresolvable: None,
-                                    opened_changed_nanos: 0,
-                                    opened_modified_nanos: 0,
-                                    opened_birth_nanos: 0,
-                                },
-                            )
-                        })
-                        .collect(),
-                ));
-                assert!(crate::heap_layout_bound::bound(&parents, 31 * 1024 * 1024).is_none());
-                scan.codex_parent_ownership_ledgers = Some(parents);
-            }
-        };
-        let (index, _, _, _) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        fixture
-            .file
-            .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
-        let (_, tail, modes, bytes) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            index,
-            Some(cache),
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        assert_eq!(modes, (0, 1, 0), "unrelated live {inputs}");
-        let full_bytes = fixture.file.0.metadata().unwrap().len();
-        assert!(bytes.0 + bytes.1 < full_bytes);
-        let (_, full, _, _) = production_scan_at_with_setup(
-            &fixture,
-            SnapshotSource::Codex,
-            ScanIndex::default(),
-            None,
-            "live-inputs",
-            NOW,
-            setup,
-        );
-        assert_eq!(
-            production_body(SnapshotSource::Codex, tail),
-            production_body(SnapshotSource::Codex, full)
-        );
-        eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
-    }
+    let fixture = ScanFixture::new(SnapshotSource::Codex);
+    fixture
+        .file
+        .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
+    fixture
+        .file
+        .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let setup = |scan: &mut OwnedSourceScan| {
+        let traces = Arc::new(CodexTurnTraceMap {
+            since_epoch: 0,
+            priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+            incomplete: false,
+        });
+        assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
+        scan.codex_turn_traces = Some(traces);
+    };
+    let (index, _, _, _) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    fixture
+        .file
+        .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
+    let (_, tail, modes, bytes) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        index,
+        Some(cache),
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    assert_eq!(modes, (0, 1, 0), "unrelated live traces");
+    let full_bytes = fixture.file.0.metadata().unwrap().len();
+    assert!(bytes.0 + bytes.1 < full_bytes);
+    let (_, full, _, _) = production_scan_at_with_setup(
+        &fixture,
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        None,
+        "live-inputs",
+        NOW,
+        setup,
+    );
+    assert_eq!(
+        production_body(SnapshotSource::Codex, tail),
+        production_body(SnapshotSource::Codex, full)
+    );
+    eprintln!("SAMPLED_LIVE_INPUTS inputs=traces full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
 }
 
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
@@ -1508,6 +1461,86 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
             production_body(source, full)
         );
     }
+}
+
+/// [money] An ordinary Codex page over an unchanged file keeps a future
+/// exact-body refusal cooldown: it emits nothing, the cooldown survives, and
+/// the retained refusal settles before its deadline and blocks at it.
+#[test]
+fn ordinary_codex_page_preserves_future_exact_body_cooldown_and_settlement() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    for id in 1..=3 {
+        fixture
+            .file
+            .append(&usage(source, id as u64 * 100, id, "fixture-model"));
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut settled, first, _) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "cooldown-fixture",
+    );
+    assert!(!first.snapshots.is_empty(), "page 1 parsed the file");
+    let fingerprint = settled.file_snapshot_fingerprints[&local_index_key(&fixture.file.0)]
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let body = "synthetic-refused-body";
+    let now = time::OffsetDateTime::parse(NOW, &time::format_description::well_known::Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    let deadline = now + 86_400;
+    let mut record = snapshot_quarantine_record(source);
+    record.retry_after_unix_seconds = 0; // ordinary retry is due; only the exact-body cooldown defers it
+    record.upload_body_witness = Some(body.into());
+    settled.accepted_snapshot_fingerprints.remove(&fingerprint);
+    settled
+        .quarantined_snapshot_fingerprints
+        .insert(fingerprint.clone(), record.clone());
+    settled.activate_quarantine_witness_for_test(source);
+    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(
+        fingerprint.clone(),
+        body.to_string(),
+    )]));
+    assert!(settled.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(settled.reason_reoffer_cooldown_deferred_count(), 1);
+    let (index, control, _) =
+        production_scan(&fixture, source, settled, Some(cache), "cooldown-fixture");
+    assert!(
+        control.snapshots.is_empty(),
+        "ordinary selection skips the unchanged cooldown body"
+    );
+    assert!(index.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert!(
+        crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record.clone(),
+            body,
+            now,
+            deadline
+        ),
+        "future reservation remains nonblocking for settlement"
+    );
+    assert!(
+        !crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record,
+            body,
+            deadline,
+            deadline
+        ),
+        "the same retained refusal blocks at its actual deadline"
+    );
 }
 
 /// One sampled Claude page of `fixture` through `cache`: (index, modes).

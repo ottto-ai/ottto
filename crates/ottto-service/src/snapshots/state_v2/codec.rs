@@ -164,6 +164,11 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         &[
             &["counts", "listing_owed_pace_evicted"],
             &["counts", "caps", "inventory_hold_keys_discarded"],
+            &["codex_parent_resolution_retry_required"],
+            &["counts", "parent_unresolvable"],
+            &["counts", "caps", "boundary_overflow_events"],
+            &["counts", "caps", "parent_signature_clear_events"],
+            &["counts", "caps", "parent_ref_refusals"],
         ]
     } else {
         &[]
@@ -477,11 +482,11 @@ mod tests {
         assert_eq!(reencoded, serde_json::to_vec(&current).unwrap());
         assert_eq!(seed, old);
         assert!(strict_json::<Option<Checkpoint>>(&old).is_ok());
-        row["counts"]["caps"]["parent_ref_refusals"] = 5.into();
+        row["counts"]["caps"]["price_trace_row_limit_hits"] = 5.into();
         let old = serde_json::to_vec(&row).unwrap();
         let (loaded, _) = exact_json::<Option<Checkpoint>>(&old).unwrap();
         let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
-        assert_eq!(caps, &serde_json::json!({"parent_ref_refusals": 5}));
+        assert_eq!(caps, &serde_json::json!({"price_trace_row_limit_hits": 5}));
     }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
@@ -605,6 +610,15 @@ mod alias_tests {
             crate::snapshots::claude_family_census_shadow_tests::traversal(),
         ))
         .unwrap();
+        let mut legacy_fork = traversal.clone();
+        legacy_fork["codex_parent_resolution_retry_required"] = true.into();
+        legacy_fork["counts"]["parent_unresolvable"] =
+            serde_json::json!({"counts": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]});
+        legacy_fork["counts"]["caps"] = serde_json::json!({
+            "boundary_overflow_events": 1,
+            "parent_signature_clear_events": 2,
+            "parent_ref_refusals": 3
+        });
         let mut pace = traversal.clone();
         pace["counts"]["listing_owed_pace_evicted"] = 2.into();
         let mut hold = traversal;
@@ -617,6 +631,7 @@ mod alias_tests {
             ("upload_context_proof", proof, ""),
             ("traversal", pace, "/counts"),
             ("traversal", hold, "/counts/caps"),
+            ("traversal", legacy_fork, "/counts/caps"),
         ] {
             let mut root = serde_json::json!({"files": {}});
             root[field] = value;

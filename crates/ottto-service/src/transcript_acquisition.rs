@@ -369,6 +369,7 @@ impl Checkpoint {
     }
 
     /// `seal_as` under this checkpoint's own scope.
+    #[cfg(test)]
     pub(crate) fn seal(&self, now: u64) -> PrefixSeal {
         self.seal_as(now, &self.scope)
     }
@@ -388,6 +389,7 @@ impl Checkpoint {
     /// edit at the checkpoint's length, or a shrink to a length above `s`, is
     /// growth to the seal and is not refused (see `PrefixSeal::admits`).
     /// `commit_sealed_prefix` checkpoints already store `length = s`.
+    #[cfg(test)]
     pub(crate) fn seal_as(&self, now: u64, scope: &Scope) -> PrefixSeal {
         let mut stamp = self.stamp.clone();
         stamp.length = self.samples.sealed_offset;
@@ -449,16 +451,11 @@ crate::durable_tail_codec::durable_struct!(PrefixSeal {
     N audit_debt_unix_seconds: Option<u64>,
 });
 
+#[cfg(test)]
 impl PrefixSeal {
-    pub(crate) fn sealed_offset(&self) -> u64 {
-        self.stamp.length
-    }
     #[cfg(test)]
     pub(crate) fn has_debt(&self) -> bool {
         self.audit_debt_unix_seconds.is_some()
-    }
-    pub(crate) fn scope_is(&self, scope: &Scope) -> bool {
-        self.scope == scope.0
     }
 
     /// Whether this seal was minted already outlived: it carries staged debt
@@ -468,27 +465,6 @@ impl PrefixSeal {
     pub(crate) fn outlived(&self) -> bool {
         self.audit_debt_unix_seconds
             .is_some_and(|due| due <= self.sealed_unix_seconds)
-    }
-
-    /// U1a-2a (fix round 4, AutoReview #3), metadata only: whether this seal
-    /// is in `scope` and inside its horizon at `now` for `admits` (no clock
-    /// regression, no due or out-of-range staged debt, verified less than
-    /// `AUDIT_INTERVAL_SECONDS` ago). It reads no byte and admits nothing:
-    /// `admits` still decides on the FD.
-    pub(crate) fn admits_in_time(&self, scope: &Scope, now: u64) -> bool {
-        let debt_ok = self.audit_debt_unix_seconds.map_or(true, |due| {
-            now < due
-                && now
-                    .checked_add(AUDIT_INTERVAL_SECONDS)
-                    .is_some_and(|latest| due <= latest)
-        });
-        self.scope == scope.0
-            && now >= self.verified_unix_seconds
-            && debt_ok
-            && self
-                .verified_unix_seconds
-                .checked_add(AUDIT_INTERVAL_SECONDS)
-                .is_some_and(|due| now < due)
     }
 
     /// `prepare`'s decision (`select_mode`) with this seal as the checkpoint
@@ -588,8 +564,6 @@ impl PrefixSeal {
     /// admission. The caller keeps its object, extent, scope and freshness
     /// fences, and `admits` / `append_compatible` still decide admission.
     pub(crate) fn samples_match(&self, file: &mut File) -> bool {
-        #[cfg(test)]
-        SAMPLES_MATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
         let sealed = self.stamp.length;
         let len = self.sample_len as usize;
         if u64::from(self.sample_len) != sealed.min(SAMPLE_BYTES as u64)
@@ -758,7 +732,9 @@ fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -
     Ok(read_sample(file, offset, expected.len(), count)? == expected)
 }
 
+#[cfg(test)]
 use crate::hex::is_sha256_lower as digest_shaped;
+#[cfg(test)]
 use crate::hex::sha256_lower as sha256_hex;
 
 /// The parts of a prior certificate `prepare`'s decision reads, borrowed from
@@ -1280,6 +1256,7 @@ crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
 crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
+#[cfg(test)]
 crate::heap_layout_bound::fields!(PrefixSeal; stamp, scope, sample_len, head_sha256, boundary_sha256,
     verified_unix_seconds, sealed_unix_seconds, audit_debt_unix_seconds);
 impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
@@ -1542,7 +1519,6 @@ thread_local! {
     pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A retained checkpoint `prepare` must refuse as `InvalidCheckpoint`.
     pub(crate) static OLD_CHECKPOINT_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1563,13 +1539,6 @@ fn between_guards() {
 #[cfg(test)]
 pub(crate) fn set_between_guards(hook: Option<Box<dyn FnMut()>>) {
     BETWEEN_GUARDS.with(|slot| *slot.borrow_mut() = hook);
-}
-
-/// Tests only: `PrefixSeal::samples_match` calls on this thread
-/// since the last call, which resets the count.
-#[cfg(test)]
-pub(crate) fn samples_match_calls() -> u64 {
-    SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
 }
 
 /// Test-only observations at the actual File::read call in read_sample.

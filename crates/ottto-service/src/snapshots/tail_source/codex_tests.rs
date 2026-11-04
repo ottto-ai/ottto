@@ -4,13 +4,12 @@
 //! state is a classified reconstruction, the finish-field list is Codex's own,
 //! and live installation waits or rebuilds as its evidence says.
 use super::super::page_bytes;
-use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction, NOW};
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction};
 use super::*;
 use crate::durable_tail_codec::Enc;
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::StagedFile;
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(in crate::snapshots) const SESSION: &str = "019a0c2a-8e11-7222-8333-944445555777";
 
@@ -151,13 +150,6 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
             .priority_turns
             .note(&format!("turn-{n:04}"));
     }
-    acc.codex_physical_signatures.clear();
-    for n in 0..300 {
-        // Multiplicity and order are data: every tenth repeats its predecessor.
-        let n = n - usize::from(n % 10 == 9);
-        acc.codex_physical_signatures
-            .push(sha256_hex(&["tail-codex-signature", &n.to_string()]));
-    }
     let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let (acc, _, _) = reduction.finish_view();
     assert_eq!(Codex::finish_field_nonempty(acc), None);
@@ -180,7 +172,6 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
         Collection::CodexActiveTurns,
         Collection::CodexOpenCalls,
         Collection::PriorityTurns,
-        Collection::Signatures,
     ] {
         assert!(
             staged.pages.contains_key(&(collection, 1)),
@@ -212,10 +203,6 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
         back.codex_observed_priority_turns,
         acc.codex_observed_priority_turns
     );
-    assert_eq!(
-        *back.codex_physical_signatures,
-        *acc.codex_physical_signatures
-    );
     assert_eq!(*back.compaction_timestamps, *acc.compaction_timestamps);
     assert_eq!(
         back.activity_changed_file_hashes,
@@ -231,8 +218,6 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
     );
     // Live inputs never come back from storage.
     assert!(back.codex_turn_traces.is_none() && back.codex_tier_replay.is_none());
-    assert!(back.codex_parent_signatures.is_none());
-    assert!(back.codex_parent_prefix_proof.is_none());
     assert_reencodes(&reduction, &certificate, &staged);
 }
 
@@ -709,116 +694,6 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     );
 }
 
-fn child(boundary: CodexOwnershipBoundary) -> SnapshotAccumulator {
-    let mut stored = continuable();
-    stored.codex_parent_ledger_consulted = true;
-    stored.codex_parent_session_ref = Some("parent".into());
-    stored.codex_ownership_boundary = boundary;
-    stored
-}
-
-fn with_ledger(ledger: CodexParentOwnershipLedger) -> SnapshotAccumulator {
-    let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
-    live.codex_parent_ownership_ledgers = Some(Arc::new(Mutex::new(BTreeMap::from([(
-        "parent".to_owned(),
-        ledger,
-    )]))));
-    live
-}
-
-fn ledger(identity: &str, scan_complete: bool) -> CodexParentOwnershipLedger {
-    CodexParentOwnershipLedger {
-        signatures: vec!["s0".into(), "s1".into()],
-        scan_complete,
-        opened_object_identity: identity.into(),
-        ..Default::default()
-    }
-}
-
-/// [money] A child comparing against the parent ledger it used gets that
-/// ledger back, waits while it is missing or partial, and rebuilds when the
-/// parent changed. Never a continuation without its parent prefix.
-#[test]
-fn install_live_restores_the_parent_ledger_the_child_used() {
-    let used = || {
-        let mut stored = child(CodexOwnershipBoundary::AwaitingParentPrefix);
-        stored.codex_parent_ledger_identity_used = Some("parent-open-1".into());
-        stored
-    };
-    let mut stored = used();
-    assert_eq!(
-        install(&mut stored, &with_ledger(ledger("parent-open-1", true))),
-        Ok(())
-    );
-    assert!(matches!(
-        stored.codex_parent_signatures,
-        Some(CodexParentPrefix::Ledger(ref signatures)) if signatures.len() == 2
-    ));
-    assert!(!stored.codex_parent_resolution_pending());
-    assert_eq!(
-        install(
-            &mut used(),
-            &SnapshotAccumulator::new(SnapshotSource::Codex)
-        ),
-        Err(LiveLoadError::Unavailable)
-    );
-    assert_eq!(
-        install(&mut used(), &with_ledger(ledger("parent-open-1", false))),
-        Err(LiveLoadError::Unavailable)
-    );
-    assert_eq!(
-        install(&mut used(), &with_ledger(ledger("parent-open-2", true))),
-        INCOMPATIBLE
-    );
-    // Comparing with neither a ledger nor a proof contradicts the stored state.
-    assert_eq!(
-        install(
-            &mut child(CodexOwnershipBoundary::AwaitingParentPrefix),
-            &with_ledger(ledger("parent-open-1", true))
-        ),
-        Err(LiveLoadError::Reconstruct(ReconstructCause::Corrupt))
-    );
-    // A proof job's ring is that job's alone.
-    let mut paged = used();
-    paged.codex_proof_decision_only = true;
-    assert_eq!(
-        install(&mut paged, &with_ledger(ledger("parent-open-1", true))),
-        INCOMPATIBLE
-    );
-}
-
-/// [money] A child pending its parent holds until parent evidence exists,
-/// then rebuilds; a witnessed-unusable parent stays absorbing, as stored.
-#[test]
-fn install_live_holds_a_child_pending_its_parent() {
-    let pending = || child(CodexOwnershipBoundary::AmbiguousFork);
-    assert_eq!(
-        install(
-            &mut pending(),
-            &SnapshotAccumulator::new(SnapshotSource::Codex)
-        ),
-        Err(LiveLoadError::Unavailable)
-    );
-    assert_eq!(
-        install(&mut pending(), &with_ledger(ledger("parent-open-1", true))),
-        INCOMPATIBLE
-    );
-    let mut witnessed = pending();
-    witnessed.codex_parent_unresolvable = Some(CodexParentUnresolvable::NoLedger);
-    assert_eq!(
-        install(
-            &mut witnessed,
-            &SnapshotAccumulator::new(SnapshotSource::Codex)
-        ),
-        Ok(())
-    );
-    assert!(matches!(
-        witnessed.codex_parent_signatures,
-        Some(CodexParentPrefix::Ledger(ref signatures)) if signatures.is_empty()
-    ));
-    assert!(!witnessed.codex_parent_resolution_pending());
-}
-
 /// [format] Codex's content is session facts in the shared slot collection:
 /// title, first prompt, workspace, the agent label (kind 4) and the prelude
 /// parser (kind 5) each load back from its own page, and the head stores none
@@ -871,138 +746,4 @@ fn codex_content_loads_back_from_its_session_facts() {
         Codex::decode_page(Collection::SessionFacts, 6, &unknown, &mut into).err(),
         Some(ReconstructCause::Incompatible)
     );
-}
-
-const PROOF_PARENT: &str = "019fd6a0-0000-7000-8000-0000000000a1";
-
-fn proof_turn(at: &str, turn: &str) -> serde_json::Value {
-    json!({"timestamp":at,"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5"}})
-}
-
-fn proof_tokens(at: &str, total: u64, last: u64) -> serde_json::Value {
-    json!({"timestamp":at,"type":"event_msg","payload":{"type":"token_count","info":{
-        "total_token_usage":{"input_tokens":total,"output_tokens":total / 10},
-        "last_token_usage":{"input_tokens":last,"output_tokens":last / 10},
-        "model":"gpt-5"}}})
-}
-
-/// A real parent prefix proof: P written and sealed as `Checkpoint::seal_as`
-/// mints it, the child's shared leading signatures matched against P's, and
-/// the chain digest over the child's signatures up to the deciding one.
-fn real_proof() -> (CodexParentPrefixProof, PrefixDigest) {
-    let parent = [
-        json!({"timestamp":"2026-10-18T10:00:00Z","type":"session_meta",
-            "payload":{"id":PROOF_PARENT,"thread_source":"user"}}),
-        proof_turn("2026-10-18T10:00:01Z", "parent-turn"),
-        proof_tokens("2026-10-18T10:00:02Z", 100, 100),
-        proof_turn("2026-10-18T10:30:01Z", "parent-later"),
-        proof_tokens("2026-10-18T10:30:02Z", 150, 50),
-    ];
-    let child = [
-        parent[1].clone(),
-        parent[2].clone(),
-        proof_turn("2026-10-18T10:20:01Z", "child-local"),
-        proof_tokens("2026-10-18T10:20:02Z", 115, 15),
-    ];
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ottto-tail-codex-proof-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("rollout-2026-10-18T10-00-00-{PROOF_PARENT}.jsonl"));
-    let body: String = parent.iter().map(|line| line.to_string() + "\n").collect();
-    std::fs::write(&path, body).unwrap();
-    let seal = crate::snapshots::codex_parent_proof_use_tests::seal_of(
-        &File::open(&path).unwrap(),
-        NOW,
-        "tail-codex-proof",
-    );
-    std::fs::remove_dir_all(&dir).unwrap();
-    let signatures = |values: &[serde_json::Value]| -> Vec<String> {
-        values
-            .iter()
-            .filter_map(codex_ownership_signature)
-            .collect()
-    };
-    let (parent, child) = (signatures(&parent), signatures(&child));
-    let matched = parent
-        .iter()
-        .zip(&child)
-        .take_while(|(parent, child)| parent == child)
-        .count();
-    assert!(
-        matched > 0 && matched < child.len(),
-        "the child diverges after a shared prefix"
-    );
-    let mut digest = codex_parent_prefix_seed();
-    for signature in &child[..=matched] {
-        digest = codex_parent_prefix_chain(&digest, signature);
-    }
-    let proof = CodexParentPrefixProof {
-        parent: PROOF_PARENT.into(),
-        parent_seal: seal,
-        matched: matched as u64,
-        child_digest: codex_digest_hex(&digest),
-        owned: true,
-        published: false,
-    };
-    assert_eq!(codex_digest_from_hex(&proof.child_digest), Some(digest));
-    (proof, digest)
-}
-
-/// [money] A child whose stored boundary used a parent prefix proof continues
-/// only on that same proof from this read's evidence: it gets the proof's
-/// prefix back (matched count and digest), waits while no proof is installed,
-/// and rebuilds on a different proof. The used proof round-trips the head.
-#[test]
-fn install_live_restores_the_parent_proof_the_child_used() {
-    let (proof, digest) = real_proof();
-    let used = || {
-        let mut stored = continuable();
-        stored.codex_parent_ledger_consulted = true;
-        stored.codex_parent_session_ref = Some(PROOF_PARENT.into());
-        stored.codex_ownership_boundary = CodexOwnershipBoundary::AwaitingParentPrefix;
-        stored.codex_parent_proof_used = Some((proof.clone(), None));
-        stored
-    };
-    let live = |proof: Option<CodexParentPrefixProof>| {
-        let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
-        live.codex_parent_prefix_proof = proof.map(|proof| (proof, digest));
-        live
-    };
-
-    let mut stored = used();
-    assert_eq!(install(&mut stored, &live(Some(proof.clone()))), Ok(()));
-    assert!(matches!(
-        stored.codex_parent_signatures,
-        Some(CodexParentPrefix::Proof { matched, digest: installed })
-            if matched == proof.matched && installed == digest
-    ));
-    assert_eq!(
-        install(&mut used(), &live(None)),
-        Err(LiveLoadError::Unavailable),
-        "no installed proof cannot show the prefix holds"
-    );
-    let mut other = proof.clone();
-    other.matched += 1;
-    assert_eq!(install(&mut used(), &live(Some(other))), INCOMPATIBLE);
-    let mut elsewhere = proof.clone();
-    elsewhere.parent = "019fd6a0-0000-7000-8000-0000000000a2".into();
-    assert_eq!(
-        install(&mut used(), &live(Some(elsewhere))),
-        Err(LiveLoadError::Unavailable),
-        "another parent's proof is no evidence for this one"
-    );
-
-    // The used proof is head state: it survives a stage and load.
-    let (mut reduction, certificate) = parse(&lines(1));
-    reduction.accumulator_for_test().codex_parent_proof_used = Some((proof.clone(), None));
-    let back = loaded(&stage_reduction::<Codex>(
-        &reduction,
-        &certificate,
-        &identity(),
-    ));
-    assert_eq!(back.codex_parent_proof_used, Some((proof, None)));
 }
