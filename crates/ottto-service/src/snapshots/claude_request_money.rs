@@ -4,9 +4,6 @@ pub(crate) mod body;
 pub(crate) mod copy_removals;
 pub(crate) mod e2;
 mod emit;
-// Census decoding still validates legacy ledger facts until their separate cutover.
-#[path = "claude_request_money/census_facts_compat.rs"]
-pub(crate) mod facts;
 pub(crate) use super::claude_history_upgrade::{
     is_request_owned_literal, request_owned_family_root,
 };

@@ -4145,9 +4145,6 @@ pub struct ScanIndex {
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
-    /// Accepted intent members still owing revision debt; rebuilt each prepare.
-    #[serde(skip)]
-    pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4366,7 +4363,6 @@ impl Default for ScanIndex {
             copy_prefix_last_accepted_nonce: None,
             retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: TailDiscovery::default(),
-            copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -7755,7 +7751,6 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub records: usize,
     pub hashes: usize,
     pub hash_budget_usage_percent: usize,
-    pub hash_budget_warning: bool,
     pub transient_limited: bool,
     pub transient_peak_bytes: usize,
     pub duplicate_hashes: usize,
@@ -30992,8 +30987,6 @@ impl OwnedSourceScan {
                     } else if !held_progress_audit || (source_verified && parse_complete) {
                         // An unsuccessful virtual audit keeps its old hold:
                         // it has no sampled marker carrying the obligation.
-                        let accepted_recovery_member =
-                            index.copy_prefix_recovery_scope.contains(&candidate.path);
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -31001,7 +30994,6 @@ impl OwnedSourceScan {
                                 index_key: &index_key,
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
-                                held_index_keys: &residue_index_keys,
                                 complete: parse_complete,
                                 lossy: dropped_usage_record_count > 0
                                     || recognized_usage_drop_count > 0
@@ -31026,7 +31018,6 @@ impl OwnedSourceScan {
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
-                                accepted_recovery_member,
                             },
                             &parsed,
                         );
@@ -32044,7 +32035,6 @@ impl OwnedSourceScan {
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
                         claude_request_census::settle_claude_request_census_terminal(
                             index,
-                            &traversal_snapshot.observed_index_keys,
                             &traversal_snapshot.residue.index_keys,
                             &census_window_end,
                         )
@@ -45066,8 +45056,7 @@ fn reconcile_missing_index_entries_with_side(
             && codex_counting_version::tombstone_before_retire(index, key)
         {
             index.record_confirmed_absent_claude_account_member(key);
-            index.files.remove(key);
-            index.confirmed_empty_files.remove(key);
+            index.drop_file_entry(key);
             index.file_snapshot_fingerprints.remove(key);
             index.drop_codex_proof_items(key, codex_side_drop);
         }
@@ -51825,7 +51814,6 @@ impl ScanIndex {
                     persistence_v2: state.persistence_v2.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
-                    growth_checked: Default::default(),
                 })
             }),
             persistence_root: previous.persistence_root.clone(),
@@ -51919,7 +51907,6 @@ impl ScanIndex {
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
             retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: self.tail_discovery,
-            copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -52204,7 +52191,8 @@ impl ScanIndex {
     /// key's snapshot fingerprints and account hold stay, because each
     /// removal path ends in the state main already reaches for the same key:
     /// main's reconciliation keeps an audit-debt entry and its fingerprints
-    /// forever, so this path drops only the entry and its marker, while a
+    /// forever, so this path drops only the entry with its lifetime facts
+    /// (`drop_file_entry`) and its marker, while a
     /// vanished entry without audit debt goes through `remove_file_entry`,
     /// which drops its fingerprints and hold just as main's reconciliation
     /// does at the next healthy terminal. The hold is later dropped by a
@@ -52220,10 +52208,8 @@ impl ScanIndex {
         }) {
             return false;
         }
-        self.files.remove(key);
+        self.drop_file_entry(key);
         self.terminal_jsonl_dispositions.remove(key);
-        self.confirmed_empty_files.remove(key);
-        self.claude_request_census.remove(key);
         true
     }
 
@@ -52332,11 +52318,20 @@ impl ScanIndex {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
         self.record_confirmed_absent_claude_account_member(key);
-        self.files.remove(key);
+        self.drop_file_entry(key);
         self.terminal_jsonl_dispositions.remove(key);
-        self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
         self.claude_account_deferred_holds.remove(key);
+    }
+
+    /// The one lifetime core of a positive-absence exit: the index entry and
+    /// the facts that live exactly as long as it (confirmed-empty mark,
+    /// request census, money marks, stored copy removals). Every exit calls
+    /// it after its own guards; dispositions, fingerprints, holds and Codex
+    /// proof stay with each caller. Nothing else ends a census record.
+    fn drop_file_entry(&mut self, key: &str) {
+        self.files.remove(key);
+        self.confirmed_empty_files.remove(key);
         self.claude_request_census.remove(key);
         self.claude_money_birth_store.set_money_marks(key, 0);
         self.claude_copy_removals
@@ -82983,7 +82978,7 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, pending_occurrence_cap_alarm, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;

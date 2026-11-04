@@ -160,7 +160,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
-    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
     into.withheld_memo = from.withheld_memo.clone();
 }
 
