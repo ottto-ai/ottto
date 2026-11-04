@@ -161,6 +161,18 @@ pub(super) fn hydrate_txn(
     // because no group happens to scan it. Inventory the closed kind catalogue
     // in bounded pages before installing any semantic state. The same walk
     // names every retired kind's rows, from their headers only.
+    // Only held Codex members carry old first-seen evidence. Empty manifests
+    // and other sources retain main's ordinary retired-kind cleanup.
+    let legacy_archive_members = matches!(
+        binding.source,
+        super::super::scan_index_persistence::Source::Codex
+    ) && !tx
+        .scan_kind(
+            &RecordKind::parse("v1_field.archives")?,
+            Some(&mapper::key("v1_field.archives", "", 0)?),
+            1,
+        )?
+        .is_empty();
     let mut after = None;
     let mut retired = BTreeSet::new();
     loop {
@@ -185,10 +197,11 @@ pub(super) fn hydrate_txn(
             // Legacy archive member keys retain first-seen evidence. Their
             // values stay inert; no policy state or baseline digest is loaded.
             if catalogue::retired(kind.name())
-                && !matches!(
-                    kind.name(),
-                    "v1_field.archives" | "v1_field.archive_deferred_alarm_count"
-                )
+                && !(legacy_archive_members
+                    && matches!(
+                        kind.name(),
+                        "v1_field.archives" | "v1_field.archive_deferred_alarm_count"
+                    ))
             {
                 retired.insert(header.key.clone());
             }

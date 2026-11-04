@@ -293,6 +293,10 @@ impl TailStage {
                 || self.erase.contains(&to)),
             "state_v2_tail_carry_conflict"
         );
+        // Discovery ran before the carry proof and may have staged this name
+        // as a new physical input. Its observation cannot replace the proved
+        // predecessor's logical representation or existing debt/pages.
+        self.debt.remove(&to);
         if let Some(debt) = self.debt.remove(from) {
             self.debt.insert(to.clone(), debt);
         }

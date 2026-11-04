@@ -21153,12 +21153,6 @@ impl OwnedSourceScan {
                     for index_key in census.removed_index_keys.iter() {
                         traversal.observed_index_keys.remove(index_key);
                     }
-                    // A positive absence in this page also updates the retained
-                    // listing roster; only a present observation on THIS page wins.
-                    traversal.codex_rollout_paths.retain(|key| {
-                        !census.removed_index_keys.contains(key)
-                            || census.observed_index_keys.contains(key)
-                    });
                     traversal
                         .observed_index_keys
                         .extend(census.observed_index_keys.iter().cloned());

@@ -727,21 +727,26 @@ fn never_seen_old_compressed_and_plain_rollouts_share_first_read_skip() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut control = None;
+    let (c, compressed_path, encoded) = legacy_age_corpus();
     for compressed in [false, true] {
-        let (c, path, _) = legacy_age_corpus();
         let path = if compressed {
-            path
+            fs::remove_file(c.path(MAIN)).unwrap();
+            fs::write(&compressed_path, &encoded).unwrap();
+            compressed_path.clone()
         } else {
-            fs::remove_file(&path).unwrap();
+            fs::remove_file(&compressed_path).unwrap();
             c.write(MAIN, Some("a"));
             c.path(MAIN)
         };
         aged_mtime(&path);
-        let (session, prior) = StateV2ColdSession::publish(
-            Source::Codex,
-            &ScanIndex::default(),
-            &c.scratch.join("state"),
-        );
+        let state = c.scratch.join(if compressed {
+            "compressed-state"
+        } else {
+            "plain-state"
+        });
+        crate::test_scratch::create_private_dir(&state).unwrap();
+        let (session, prior) =
+            StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &state);
         let (index, scan, _, _, _) =
             page(&c, prior, Arc::new(sampled_scan::SharedCache::default()));
         assert!(!index.files.contains_key(&local_index_key(&path)));

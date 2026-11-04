@@ -131,6 +131,17 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
         let header =
             mapper::put(&mut tx, &key, &serde_json::json!({"future": [false, 7]})).unwrap();
         expected.push((key, header));
+        if kind == "v1_field.archives" {
+            // Real held custody has a member, unlike an empty retired manifest.
+            let key = mapper::key(kind, "/synthetic/archived/held.jsonl.zst", 1).unwrap();
+            let header = mapper::put(
+                &mut tx,
+                &key,
+                &serde_json::json!({"future":[false,7],"header_attempts":4}),
+            )
+            .unwrap();
+            expected.push((key, header));
+        }
     }
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();

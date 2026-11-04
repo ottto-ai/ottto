@@ -13326,6 +13326,7 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{
     archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress,
+    codex_transition_cold_batches,
 };
 
 #[cfg(test)]
