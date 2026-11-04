@@ -84,7 +84,6 @@ fn page_under(c: &Corpus, scanner: &E2ScanFixture, mut index: ScanIndex, mode: M
         modes,
         disposition: Default::default(),
         released: Default::default(),
-        unhealthy: Default::default(),
         stats: Default::default(),
         delivered: None,
         upload_policy: mode.policy,
