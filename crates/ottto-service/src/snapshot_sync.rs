@@ -22437,9 +22437,14 @@ mod tests {
         std::thread::spawn(move || {
             let receipt_count = hints.len();
             let mut hints = hints.into_iter();
-            for _ in 0..receipt_count * 3 + usize::from(batch.is_some()) {
+            let mut ordinary_requests = receipt_count * 3;
+            loop {
                 let (mut stream, _) = listener.accept().expect("accept snapshot status request");
                 let request = read_complete_http_request(&mut stream);
+                // A batch fixture exercises ordinary uploads and fresh relay
+                // acquisition too; its terminal status ends the conversation.
+                let terminal = batch.is_some()
+                    && request.starts_with("POST /api/v1/agent-session-snapshots/status ");
                 let body = if request.contains("/telemetry/devices/") {
                     captured
                         .lock()
@@ -22482,6 +22487,15 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write snapshot status response");
+                if terminal {
+                    break;
+                }
+                if batch.is_none() {
+                    ordinary_requests -= 1;
+                    if ordinary_requests == 0 {
+                        break;
+                    }
+                }
             }
         });
         format!("http://{address}")

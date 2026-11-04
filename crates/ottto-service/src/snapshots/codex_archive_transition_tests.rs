@@ -161,7 +161,10 @@ fn route(index: &ScanIndex, scan: &SourceScanResult, posts: Vec<Vec<u8>>) -> Rou
     route
 }
 fn emitted(index: &ScanIndex, scan: &SourceScanResult) -> RouteResult {
-    oracle::scan_money(SnapshotSource::Codex, index, scan)
+    let posts = crate::snapshot_sync::codex_transition_cold_batches(&scan.snapshots);
+    let mut result = RouteResult::emitted(Mode::Ram, SnapshotSource::Codex, posts, &scan.snapshots);
+    result.codex_evidence = oracle::codex_evidence(index, scan);
+    result
 }
 fn assert_quiet(c: &Corpus, prior: ScanIndex, expected: &RouteResult) -> (ScanIndex, RouteResult) {
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);

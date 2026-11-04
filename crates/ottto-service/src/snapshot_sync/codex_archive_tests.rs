@@ -11,6 +11,40 @@ pub(crate) fn archive_upload_checkpoint(
         .0
 }
 
+fn codex_transition_batch(items: Vec<SnapshotItem>) -> Vec<u8> {
+    let request = snapshot_batch_request(
+        SnapshotSource::Codex,
+        "synthetic-machine",
+        items,
+        SnapshotUploadPolicy::default(),
+        crate::client_report::ClientReport::empty(),
+    );
+    serde_json::to_vec(&request).unwrap()
+}
+
+/// Cold and restored drivers both use the ordinary uploader's native ordering
+/// and batch envelope. No transcript read, remote POST or persisted ACK here.
+pub(crate) fn codex_transition_cold_batches(items: &[SnapshotItem]) -> Vec<Vec<u8>> {
+    let mut posts = Vec::new();
+    let mut progress = test_upload_progress();
+    let result = upload_resumable_batches_with_body_witness(
+        items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |items| {
+            posts.push(codex_transition_batch(items.clone()));
+            ack_retention_tests::exact_ack(items)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Completed);
+    posts
+}
+
 impl ScanIndex {
     pub(crate) fn checkpoint_with_captured_posts(
         self,
@@ -52,14 +86,7 @@ impl ScanIndex {
                 |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |items| {
-                    let request = snapshot_batch_request(
-                        SnapshotSource::Codex,
-                        "synthetic-machine",
-                        items.to_vec(),
-                        SnapshotUploadPolicy::default(),
-                        crate::client_report::ClientReport::empty(),
-                    );
-                    posts.push(serde_json::to_vec(&request).unwrap());
+                    posts.push(codex_transition_batch(items.to_vec()));
                     if outcome == "shed" {
                         Err(anyhow::Error::new(UploadShed {
                             status: 503,
