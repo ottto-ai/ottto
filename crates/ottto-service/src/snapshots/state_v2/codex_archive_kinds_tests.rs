@@ -124,9 +124,8 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut expected = Vec::new();
     for kind in RETIRED_ARCHIVE_KINDS {
-        assert!(catalogue::OWNED
-            .iter()
-            .any(|(name, introduced)| *name == kind && *introduced == 2));
+        assert!(catalogue::OWNED.iter().any(|(name, _)| *name == kind));
+        assert_eq!(catalogue::introduced(kind).unwrap(), 2);
         // Deliberately incompatible payload: attempting active decode must fail.
         let key = mapper::key(kind, "", 0).unwrap();
         let header =
@@ -136,7 +135,6 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
     assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     db.finish_import().unwrap();
-    drop(db);
     let reopen = || {
         let mut db =
             sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
@@ -196,7 +194,6 @@ fn a_repeat_refused_archive_pass_dirties_no_row_and_keeps_the_page_limit() {
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
     db.finish_import().unwrap();
-    drop(db);
     let mut db =
         sqlite::Sqlite::open(&scratch.0.join("index.v2.sqlite.import"), &identity).unwrap();
     db.path_extractor(private_paths);

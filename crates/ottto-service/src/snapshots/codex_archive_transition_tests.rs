@@ -356,8 +356,8 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let moved_head = state_v2::load_head(&index, &new_key, REVISION)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            moved_head.table, head.table,
+        assert!(
+            moved_head.table == head.table,
             "all page commitments unchanged"
         );
         let mut moved_revisions = Vec::new();

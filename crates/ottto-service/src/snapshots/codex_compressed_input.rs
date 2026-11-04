@@ -1,8 +1,6 @@
 //! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
 //! Encoding never grants ownership or acceptance authority.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
-#[cfg(test)]
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;

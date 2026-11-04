@@ -358,7 +358,7 @@ impl ScanIndex {
             move_set(&mut residue.index_keys, from, to);
         }
         if let Some(walk) = self.traversal.as_mut() {
-            move_set(&mut walk.observed_index_keys, from, to);
+            move_set(walk.observed_index_keys.make_mut(), from, to);
             move_set(&mut walk.codex_rollout_paths, from, to);
             move_set(&mut walk.residue.index_keys, from, to);
             move_map(&mut walk.listing_owed_requeued_unix_seconds, from, to);

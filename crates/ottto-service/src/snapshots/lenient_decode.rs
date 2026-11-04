@@ -1881,7 +1881,6 @@ impl<R: BufRead + Seek> Decoder<R> {
             } else {
                 self.typed(value)
             };
-            let decoded = decoded.or_else(|error| unknown.map(|f| f()).ok_or(error));
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {

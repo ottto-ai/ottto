@@ -2,6 +2,7 @@
 use super::super::tail_route::{carry_tail, pending_carries};
 use super::*;
 use crate::snapshots::{sampled_audit, ScanResidueWitness};
+use std::os::unix::fs::MetadataExt;
 
 const MOVED: &str = "/synthetic/tail/file.jsonl.zst";
 fn facts() -> InventoryFacts {

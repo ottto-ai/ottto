@@ -3593,7 +3593,11 @@ pub struct ScanIndex {
         skip_serializing_if = "upload_context_receipt::ProofState::is_empty"
     )]
     pub(crate) upload_context_proof: upload_context_receipt::ProofState,
-    // Retired archive fields retain their frozen decode/catalogue slots.
+    // Inert accepted fields preserve the catalogue and old positional slots.
+    #[serde(rename = "archives", default)]
+    retired_archives: serde::de::IgnoredAny,
+    #[serde(rename = "archive_deferred_alarm_count", default)]
+    retired_archive_deferred_alarm_count: serde::de::IgnoredAny,
     /// Runtime capability only: never persisted, absent hint defaults OFF.
     #[serde(skip)]
     pub(crate) copy_unproven_enabled: bool,
@@ -3773,6 +3777,8 @@ impl Default for ScanIndex {
             generation: 0,
             upload_ack_retirement_handoff: None,
             retired_upload_context_fingerprint: serde::de::IgnoredAny,
+            retired_archives: serde::de::IgnoredAny,
+            retired_archive_deferred_alarm_count: serde::de::IgnoredAny,
             files: SharedMap::default(),
             retired_reread_guard: serde::de::IgnoredAny,
             session_account_bindings: BTreeMap::new(),
@@ -23022,7 +23028,7 @@ impl OwnedSourceScan {
     }
 
     fn step_with_capture_credit(
-        mut self,
+        self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
@@ -25506,9 +25512,9 @@ impl OwnedSourceScan {
                 let parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
 
-                    Err(error) => {
+                    Err(_error) => {
                         #[cfg(test)]
-                        sampled_scan::test_hooks::record_finish_error(&error);
+                        sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::invalidate_claude_request_census(
                                 index,
@@ -43222,7 +43228,7 @@ impl ScanIndex {
         self.codex_counting_tombstones.clear();
         self.codex_counting_evicted_legacy = Default::default();
         let active = self.active_effective_upload_body_witness_revision;
-        for (key, entry) in self.files.slots_mut() {
+        for (_, entry) in self.files.slots_mut() {
             let entry = entry.make_mut();
             if entry.has_unverified_source() {
                 let due = entry.unverified_deadline().unwrap_or(0);
@@ -46010,6 +46016,8 @@ impl ScanIndex {
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
             retired_upload_context_fingerprint: serde::de::IgnoredAny,
+            retired_archives: serde::de::IgnoredAny,
+            retired_archive_deferred_alarm_count: serde::de::IgnoredAny,
             retired_reread_guard: serde::de::IgnoredAny,
             files: files.into(),
             session_account_bindings: self.session_account_bindings.clone(),

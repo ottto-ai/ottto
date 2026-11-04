@@ -38,9 +38,13 @@ impl ScanIndex {
                 |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |items| {
-                    let mut request = crate::snapshots::tests::valid_v6_batch_request();
-                    request.source = SnapshotSource::Codex.api_slug().into();
-                    request.snapshots = items.to_vec();
+                    let request = snapshot_batch_request(
+                        SnapshotSource::Codex,
+                        "synthetic-machine",
+                        items.to_vec(),
+                        SnapshotUploadPolicy::default(),
+                        Default::default(),
+                    );
                     posts.push(serde_json::to_vec(&request).unwrap());
                     if outcome == "shed" {
                         Err(anyhow::Error::new(UploadShed {

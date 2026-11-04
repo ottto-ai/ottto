@@ -192,14 +192,14 @@ fn read_header_bytes_encoded(
     let stamp = FileStamp::capture(before.clone())?;
     let input = OpenedInput::encoded(file, &candidate.path, cache)?.header_only();
     let mut reader = BufReader::with_capacity(1024, input.take((MAX_HEADER_BYTES + 1) as u64));
-    let mut bytes = Vec::new();
     #[cfg(all(test, unix))]
     header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Once reading begins, a failed attempt may have consumed the whole
     // recognition prefix. A funding refusal above consumes no header bytes.
     *read_work = MAX_HEADER_BYTES + 1;
     let acquired = (|| -> Result<_> {
-        bytes = read_header_line(&mut reader)?.context("Codex header exceeds its read bound")?;
+        let bytes =
+            read_header_line(&mut reader)?.context("Codex header exceeds its read bound")?;
         *read_work = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
         let after = reader.get_ref().get_ref().get_ref().metadata()?;
         let witness = metadata_witness(&before);
@@ -2190,9 +2190,6 @@ pub(super) mod tests {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let mut inventory =
             HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
-        // Funding returns on an ordinary later attempt, not by spinning this
-        // inventory while a suspended reader still owns mandatory credit.
-        let mut inventory = HeaderInventory::new(&[sessions.clone()], &paths, Some(&directories));
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
         assert!(inventory.complete);
         assert_eq!(inventory.headers.len(), 1);
@@ -2200,7 +2197,8 @@ pub(super) mod tests {
         assert_eq!(inventory.owner_for_path(&compressed), None);
 
         let paths = BTreeSet::from([local_index_key(&compressed)]);
-        let mut inventory = HeaderInventory::new(&[sessions.clone()], &paths, Some(&directories));
+        let mut inventory =
+            HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
         assert!(!inventory.step_encoded(&metadata, None));
         assert!(inventory.pending.is_empty());
         assert!(!inventory.complete);
@@ -2209,6 +2207,9 @@ pub(super) mod tests {
         assert_eq!(inventory.read_bytes, 0);
         assert!(!inventory.content_unchanged());
         assert!(inventory.affected_owners().is_none());
+        // A later ordinary attempt retries after funding returns.
+        let mut inventory =
+            HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
         assert!(inventory.complete);
         assert_eq!(inventory.headers.len(), 1);
