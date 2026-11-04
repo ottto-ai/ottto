@@ -404,19 +404,6 @@ fn telemetry_retention_keeps_every_dependency() {
             match row {
                 Dependency::NamedByPage => {
                     c.root(HELD, &line(HELD, "x1", AT, 9));
-                    // A real sidechain line: Claude Code writes the agent id
-                    // and the sidechain flag, which the parser turns into
-                    // the parent and root refs.
-                    let agent = "a4d1585d310070d0f";
-                    let mut sidechain: serde_json::Value =
-                        serde_json::from_str(line(HELD, "x2", AT, 8).trim()).unwrap();
-                    sidechain["agentId"] = serde_json::json!(agent);
-                    sidechain["isSidechain"] = serde_json::json!(true);
-                    c.write_at(
-                        &format!("{HELD}/subagents/agent-{agent}.jsonl"),
-                        &(sidechain.to_string() + "\n"),
-                        AT,
-                    );
                     let mut page = c.raw(
                         &E2ScanFixture::capturing_identity(),
                         ScanIndex::default(),
@@ -426,13 +413,24 @@ fn telemetry_retention_keeps_every_dependency() {
                     );
                     // Read where the sync loop reads it: after enrichment.
                     page.enrich(&c);
-                    let others = page
+                    // HELD's own body is left out. ROOT's body names HELD the
+                    // way the desktop app records a session it started from
+                    // another one (the provider's own producer, real shape).
+                    let mut others = page
                         .scan
                         .snapshots
                         .iter()
                         .filter(|item| item.source_session_id != HELD)
                         .cloned()
                         .collect::<Vec<_>>();
+                    others
+                        .iter_mut()
+                        .find(|item| item.source_session_id == ROOT)
+                        .expect("the page carries the starting root's body")
+                        .attribution_facts
+                        .extend(crate::session_attribution::claude_desktop_spawn_facts(
+                            HELD, ROOT, AT,
+                        ));
                     assert!(
                         others
                             .iter()
@@ -447,7 +445,6 @@ fn telemetry_retention_keeps_every_dependency() {
                     named = crate::snapshot_sync::claude_evidence_session_ids(&others);
                     assert!(named.iter().any(|session| session == HELD));
                     std::fs::remove_file(Path::new(&held)).unwrap();
-                    std::fs::remove_dir_all(c.root.join(HELD)).unwrap();
                 }
                 Dependency::PendingWitness => {
                     warm.index
