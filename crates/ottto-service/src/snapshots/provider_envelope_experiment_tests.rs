@@ -53,6 +53,11 @@ struct SelectionFixture {
 }
 impl SelectionFixture {
     fn new() -> Self {
+        Self::with_audit_deadline(true)
+    }
+    /// `audit` gives B its overdue audit deadline; without it no prior member
+    /// is unverified.
+    fn with_audit_deadline(audit: bool) -> Self {
         let scratch = crate::test_scratch::ScratchDir::new("envelope-selection-matrix");
         let root = scratch.join("native");
         fs::create_dir_all(&root).unwrap();
@@ -93,11 +98,13 @@ impl SelectionFixture {
                 previous.accepted_snapshot_fingerprints.insert(body);
             }
         }
-        previous
-            .files
-            .get_mut(&local_index_key(&paths[1]))
-            .unwrap()
-            .set_unverified_deadline(1);
+        if audit {
+            previous
+                .files
+                .get_mut(&local_index_key(&paths[1]))
+                .unwrap()
+                .set_unverified_deadline(1);
+        }
         let index_path = scratch.join("index.json");
         previous.save(&index_path).unwrap();
         Self {
@@ -273,11 +280,13 @@ fn incomplete_census_keeps_its_existing_traversal_owner() {
     assert!(index.traversal.is_some());
 }
 
-fn replace_candidate(state: &OwnedSourceScan) -> PathBuf {
+/// Replaces the first selected file with a directory before the ordinary open.
+/// A directory cannot supply transcript bytes, even to a privileged reader;
+/// ordinary files replaced by other files may legitimately be reparsed.
+fn refuse_candidate_open(state: &OwnedSourceScan) -> PathBuf {
     let path = state.identified_candidates[0].path.clone();
-    let replacement = path.with_extension("replacement");
-    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(replacement, &path).unwrap();
+    fs::rename(&path, path.with_extension("refused-backup")).unwrap();
+    fs::create_dir(&path).unwrap();
     path
 }
 
@@ -285,7 +294,7 @@ fn replace_candidate(state: &OwnedSourceScan) -> PathBuf {
 fn replaced_selected_file_keeps_safe_open_failure_visible() {
     let fixture = SelectionFixture::new();
     let state = fixture.prepare(fixture.previous.clone(), 1);
-    let path = replace_candidate(&state);
+    let path = refuse_candidate_open(&state);
     let key = local_index_key(&path);
     let old = serde_json::to_vec(&state.index.files[&key]).unwrap();
     let (index, scan) = finish(state);
@@ -307,11 +316,7 @@ fn replaced_selected_file_keeps_safe_open_failure_visible() {
 fn failed_selected_file_keeps_dependent_source_unresolved() {
     let fixture = SelectionFixture::new();
     let state = fixture.prepare(fixture.previous.clone(), 2);
-    let path = state.identified_candidates[0].path.clone();
-    // A directory cannot supply transcript bytes, even to a privileged reader.
-    // Ordinary files replaced by other files may legitimately be reparsed.
-    fs::rename(&path, path.with_extension("refused-backup")).unwrap();
-    fs::create_dir(&path).unwrap();
+    let path = refuse_candidate_open(&state);
     let key = local_index_key(&path);
     let old = serde_json::to_vec(&state.index.files[&key]).unwrap();
     let (index, scan) = finish(state);
@@ -395,7 +400,12 @@ fn authority_quarantine_preserves_body_and_correction_debt() {
 }
 
 fn selected_fixture() -> (SelectionFixture, ScanIndex, SourceScanResult, ScanIndex) {
-    let fixture = SelectionFixture::new();
+    selected_fixture_from(SelectionFixture::new())
+}
+
+fn selected_fixture_from(
+    fixture: SelectionFixture,
+) -> (SelectionFixture, ScanIndex, SourceScanResult, ScanIndex) {
     let previous = fixture.previous.clone();
     let (mut index, mut scan) = finish(OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
@@ -838,7 +848,9 @@ fn unknown_input_creates_no_false_credit_or_new_debt() {
 #[test]
 fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
     for partial in [false, true] {
-        let (fixture, mut index, mut scan, mut previous) = selected_fixture();
+        // No prior member is unverified: only the synthetic audits remain.
+        let (fixture, mut index, mut scan, mut previous) =
+            selected_fixture_from(SelectionFixture::with_audit_deadline(false));
         let copy = queued_prior_key(&index, &previous);
         let key = local_index_key(&fixture.paths[2]);
         let entry = index.files[&key].clone();
