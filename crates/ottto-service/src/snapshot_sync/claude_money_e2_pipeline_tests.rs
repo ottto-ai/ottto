@@ -984,6 +984,10 @@ fn ready(
 ) -> Page {
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
+    deliver_page(p)
+}
+/// Upload `p`'s final bodies once and keep their exact ACKs (`delivered`).
+fn deliver_page(mut p: Page) -> Page {
     let mut send = twin(&p);
     send.finish();
     let mut progress = e2_progress();
@@ -2033,6 +2037,24 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
     });
 }
 
+/// [`ready`] under a cycle with the cache mode off: as in production, the
+/// upload seam drops the cache rows before delivery, so each ACK proves the
+/// body the page keeps and a retry copy is an ordinary owned body.
+fn ready_without_cache(
+    corpus: &Corpus,
+    scanner: &E2ScanFixture,
+    index: ScanIndex,
+    limit: usize,
+    sampled: bool,
+) -> Page {
+    let mut page = corpus.raw(scanner, index, limit, sampled, &[]);
+    page.enrich(corpus);
+    for snapshot in &mut page.scan.snapshots {
+        prepare_snapshot_cache_for_upload(snapshot, &e2_progress(), false, false, &BTreeSet::new());
+    }
+    deliver_page(page)
+}
+
 fn retry_case(conflict: bool) {
     with_e2(|| {
         let mut c = Corpus::new(if conflict {
@@ -2049,7 +2071,7 @@ fn retry_case(conflict: bool) {
             "2026-08-02T06:57:00Z",
         );
         let scanner = E2ScanFixture::default();
-        let mut holder = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let mut holder = ready_without_cache(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(total(&holder), 1);
         holder.finish();
         let committed = c.reload(&mut holder.index);
@@ -2062,7 +2084,7 @@ fn retry_case(conflict: bool) {
             &(prefix + &conflict_lines + &line(ROOT, "own", AT, 20)),
         );
         c.agent(0, &line(ROOT, "agent", AT, 5));
-        let mut p = ready(&c, &scanner, committed.clone(), 100, false);
+        let mut p = ready_without_cache(&c, &scanner, committed.clone(), 100, false);
         literal(&p);
         let root = p
             .scan
@@ -2134,7 +2156,7 @@ fn retry_case(conflict: bool) {
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         )
         .unwrap();
-        let mut restart = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        let mut restart = ready_without_cache(&c, &E2ScanFixture::default(), prior, 100, false);
         restart.finish();
         assert_eq!(
             canonical(&restart.scan.snapshots),
@@ -2155,7 +2177,7 @@ fn retry_case(conflict: bool) {
         );
         // Late telemetry must not mutate an already captured retry body.
         c.evidence(&[api("own", 20, 200), api("agent", 5, 50)], &[]);
-        let mut late = ready(
+        let mut late = ready_without_cache(
             &c,
             &E2ScanFixture::default(),
             restart.index.clone(),
@@ -3749,6 +3771,13 @@ fn without_file_fingerprint(body: &impl Serialize) -> serde_json::Value {
         .expect("bodies carry a source file fingerprint");
     body
 }
+/// [`without_file_fingerprint`] without cache rows either: the released
+/// fixture predates Claude cache rows.
+fn without_file_fingerprint_or_cache(body: &impl Serialize) -> serde_json::Value {
+    let mut body = without_file_fingerprint(body);
+    body.as_object_mut().unwrap().remove("cache_observations");
+    body
+}
 /// The five token counters of a serialized body.
 fn body_tokens(body: &serde_json::Value) -> [u64; 5] {
     [
@@ -4082,8 +4111,10 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             "the two own turns keep their tokens"
         );
         assert_eq!(
-            canonical(&without_file_fingerprint(body(&on, OTHER).unwrap())),
-            canonical(&without_file_fingerprint(&released("audit.other"))),
+            canonical(&without_file_fingerprint_or_cache(
+                body(&on, OTHER).unwrap()
+            )),
+            canonical(&without_file_fingerprint_or_cache(&released("audit.other"))),
             "unrelated body unchanged"
         );
     });

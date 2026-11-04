@@ -54,6 +54,8 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
+#[cfg(test)]
+mod claude_cache_ack_tests;
 pub(crate) mod continuation;
 #[cfg(test)]
 mod identity_bucket_progress_tests;

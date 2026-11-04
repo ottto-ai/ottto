@@ -2988,10 +2988,11 @@ fn codex_cache_break_lines(index: usize) -> [Value; 2] {
     ]
 }
 
-fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
+fn uploaded_cache_breaks(body: &Value) -> Vec<String> {
     let wire = &body[0]["cache_observations"];
-    assert_eq!(wire["coverage"], json!("partial"));
-    let refs = wire["operations"]
+    assert_eq!(wire["coverage"], json!("complete"));
+    assert_eq!(wire["omitted_observation_count"], Value::Null);
+    wire["operations"]
         .as_array()
         .unwrap()
         .iter()
@@ -3002,12 +3003,11 @@ fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
                 .unwrap()
                 .to_string()
         })
-        .collect();
-    (refs, &wire["omitted_observation_count"])
+        .collect()
 }
 
-/// A Codex session past the cache-observation cap keeps tailing with full-read
-/// parity, and every pass uploads the same first breaks with an exact count of the rest.
+/// A Codex session past one upload patch of cache breaks keeps tailing with
+/// full-read parity, and every pass keeps every break in session order.
 #[test]
 fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -3021,16 +3021,18 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
             fixture.append(&line);
         }
     }
-    let first = (0..64)
-        .map(|n| format!("resp_{}", 2 * n + 1))
-        .collect::<Vec<_>>();
+    let breaks = |count: usize| {
+        (0..count)
+            .map(|n| format!("resp_{}", 2 * n + 1))
+            .collect::<Vec<_>>()
+    };
     let (retained, mode, _, body) = acquire(&fixture, source, None, 100);
     assert_eq!(
         mode,
         ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
     );
     assert_eq!(body, oracle(&fixture, source));
-    assert_eq!(uploaded_cache_breaks(&body), (first.clone(), &json!(1)));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(65));
     assert!(retained.is_some(), "the over-cap session is retained");
     for index in 130..140 {
         for line in codex_cache_break_lines(index) {
@@ -3040,7 +3042,7 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(body, oracle(&fixture, source));
-    assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(70));
 }
 
 #[cfg(unix)]

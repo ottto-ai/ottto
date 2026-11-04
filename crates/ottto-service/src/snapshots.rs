@@ -9422,7 +9422,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     let mut context_file_birth = ClaudeContextFileBirthCounts::default();
     #[cfg(test)]
     let mut posture_admissions = BTreeMap::new();
-    for item in snapshots.iter_mut() {
+    let cache_births = claude_context_file_birth::cache_content_births(snapshots);
+    for (item, cache_birth) in snapshots.iter_mut().zip(cache_births) {
         let root_session_id = claude_snapshot_family_root(item);
         let family = proven
             .get(&root_session_id)
@@ -9464,8 +9465,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         } else if !source_certified {
             clear_claude_context_posture(item);
         } else {
-            // Cache observations and the curve below still read the strict
-            // `posture_owned`: only the scalar tuple and session start move.
+            // The curve below still reads the strict `posture_owned`: only
+            // the scalar tuple and session start move.
             let multi_file = multi_file_members.contains(&item.source_session_id);
             let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
                 item,
@@ -9522,54 +9523,24 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 clear_claude_context_posture(item);
             }
         }
-        if posture_owned
-            && item.claude_context_curve_identity_complete
-            && item.claude_context_curve_request_index_complete
-            && (census_complete || claude_owned_start_was_census_verified(item, index))
-            && !index
-                .claude_usage_family_pending
-                .view(&root_session_id)
-                .is_some_and(|pending| pending.invalid() || pending.window() != census_window_end)
-        {
-            let owned = item
-                .cache_requests
-                .iter()
-                .filter(|request| {
-                    let hash = format!("{:x}", Sha256::digest(request.slot.request_ref.as_bytes()));
-                    !excluded_request_hashes.contains(&hash)
-                })
-                .map(|request| {
-                    let mut request = request.clone();
-                    if request.slot.effort.is_none() {
-                        let efforts = family
-                            .and_then(|family| family.rows_by_member.get(&item.source_session_id))
-                            .into_iter()
-                            .flatten()
-                            .filter(|row| {
-                                row.request_id == request.slot.request_ref
-                                    && CLAUDE_EFFORT_TIERS.contains(&row.effort.as_str())
-                            })
-                            .map(|row| row.effort.clone())
-                            .collect::<BTreeSet<_>>();
-                        if efforts.len() == 1 {
-                            request.slot.effort = efforts.into_iter().next();
-                        }
-                    }
-                    request
-                })
-                .collect::<Vec<_>>();
-            item.cache_observations = cache_wire_for_requests(&item.source_session_id, &owned);
-            if !item.cache_requests_complete {
-                item.cache_observations = Some(CacheObservations {
-                    schema_version: 1,
-                    operations: Vec::new(),
-                    coverage: "partial".into(),
-                    omitted_observation_count: None,
-                });
-            }
-        } else {
-            item.cache_observations = None;
-        }
+        // Cache rows ship only for an owned file (a strict owned start or an
+        // Admitted file birth), and only its own requests: those not more
+        // than the copy slack before its content birth. No content birth (no
+        // timed own response) ships nothing.
+        item.cache_observations = cache_birth
+            .filter(|_| {
+                posture_owned
+                    || item.claude_file_birth_verdict == Some(ClaudeFileBirthVerdict::Admitted)
+            })
+            .map(|birth| {
+                cache_wire(
+                    &item.source_session_id,
+                    item.cache_requests.iter().filter(|request| {
+                        claude_context_file_birth::cache_owns(birth, &request.slot.occurred_at)
+                    }),
+                    item.cache_requests_complete,
+                )
+            });
         // Context posture participates in semantic identity. Recompute after
         // the ownership fold.
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
@@ -12209,20 +12180,6 @@ fn claude_snapshot_family_root_ref(item: &SnapshotItem) -> &str {
                 .map(|(root, _)| root)
         })
         .unwrap_or(&item.source_session_id)
-}
-
-fn claude_owned_start_was_census_verified(item: &SnapshotItem, index: &ScanIndex) -> bool {
-    item.source_file_fingerprint
-        .as_deref()
-        .is_some_and(|fingerprint| {
-            index
-                .claude_owned_start_census
-                .get(&item.source_session_id)
-                .is_some_and(|witness| {
-                    witness.marker_source_file_fingerprint == fingerprint
-                        && witness.verified_source_file_fingerprint.as_deref() == Some(fingerprint)
-                })
-        })
 }
 
 /// One request's legacy owner: its root and the owner's evidence fingerprint.
@@ -18872,6 +18829,10 @@ impl SnapshotAccumulator {
             CLAUDE_RECORDS_PER_FILE_ALARM,
         );
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
+        // The previous resolved response's end when it ended a turn (no tool
+        // use); `None` after a tool use or an unresolved response. A response
+        // whose prompt follows it starts a turn: the time between is idle.
+        let mut turn_end: Option<String> = None;
         for response in responses {
             let mut response = match response.resolve_classified(&selectors) {
                 Ok(response) => response,
@@ -18880,6 +18841,7 @@ impl SnapshotAccumulator {
                 // root publishes; it is not drop residue held for retry. Gate
                 // off (dark): unchanged drop residue, still counted.
                 Err(ClaudeResolveFailure::Conflict) => {
+                    turn_end = None;
                     if let Some(money) = money.as_mut() {
                         money.note_resolver_conflict();
                     }
@@ -18891,6 +18853,7 @@ impl SnapshotAccumulator {
                 // An undecodable compact record is loss held for retry, never
                 // a resolver conflict.
                 Err(ClaudeResolveFailure::Decode) => {
+                    turn_end = None;
                     self.note_dropped_usage();
                     continue;
                 }
@@ -18909,9 +18872,17 @@ impl SnapshotAccumulator {
                         .any(|b| b.response_count_before == response.sequence),
                     configuration_changed: false,
                     configuration_witness: None,
-                    idle_seconds: None,
+                    idle_seconds: turn_end
+                        .as_deref()
+                        .zip(response.preceding_user_timestamp.as_deref())
+                        .and_then(|(end, prompt)| cache_observations::elapsed_seconds(end, prompt)),
                 });
             }
+            turn_end = response
+                .tool_uses
+                .is_empty()
+                .then(|| response.terminal_timestamp.clone())
+                .flatten();
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
@@ -19092,20 +19063,13 @@ impl SnapshotAccumulator {
         user_ts: Option<&str>,
         assistant_ts: Option<&str>,
     ) {
-        let (Some(user_ts), Some(assistant_ts)) = (user_ts, assistant_ts) else {
+        let Some(Ok(duration_ms)) = user_ts
+            .zip(assistant_ts)
+            .and_then(|(user, assistant)| cache_observations::elapsed(user, assistant))
+            .map(|elapsed| u64::try_from(elapsed.whole_milliseconds()))
+        else {
             return;
         };
-        let (Ok(user), Ok(assistant)) = (
-            OffsetDateTime::parse(user_ts, &Rfc3339),
-            OffsetDateTime::parse(assistant_ts, &Rfc3339),
-        ) else {
-            return;
-        };
-        let millis = (assistant - user).whole_milliseconds();
-        if millis < 0 {
-            return;
-        }
-        let duration_ms = millis as u64;
         self.latency_duration_ms_sum = self.latency_duration_ms_sum.saturating_add(duration_ms);
         self.latency_duration_ms_count += 1;
         self.latency_duration_ms_max = self.latency_duration_ms_max.max(duration_ms);
@@ -20380,18 +20344,13 @@ impl SnapshotAccumulator {
             Vec::new()
         };
         if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
-            self.cache_observations =
-                codex_cache_wire_for_requests(&source_session_id, &self.cache_requests);
-            if !self.cache_requests_complete {
-                // The book exceeded 65,536 records or the physical read report
-                // was incomplete: neither can certify an exact overflow count.
-                self.cache_observations = Some(CacheObservations {
-                    schema_version: 1,
-                    operations: Vec::new(),
-                    coverage: "partial".into(),
-                    omitted_observation_count: None,
-                });
-            }
+            // An incomplete book (over 65,536 records, or an incomplete
+            // physical read report) cannot certify an exact omitted count.
+            self.cache_observations = Some(cache_wire(
+                &source_session_id,
+                self.cache_requests.iter(),
+                self.cache_requests_complete,
+            ));
         }
         let session_start = match self.source {
             SnapshotSource::ClaudeCode => std::mem::take(&mut *self.session_start).finish(
@@ -31995,6 +31954,13 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
                 }
             }
         }
+        if !wire.validate() {
+            // Over the server's per-patch bound: send only what it lacks, so
+            // the rest of a long session follows on its next upload.
+            let held = cache_rows_held(prior);
+            wire.operations
+                .retain(|operation| !cache_row_held(&held, operation));
+        }
         let Some(state) = cache_state_from_patch(prior, &wire) else {
             item.cache_observations = None;
             item.cache_observations_state = None;
@@ -32025,10 +31991,15 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     };
     wire = patch.clone();
     wire.coverage = "partial".into();
+    let held = cache_rows_held(prior);
     wire.operations.retain(|operation| {
         matches!(operation,
         cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
+            && !cache_row_held(&held, operation)
     });
+    // The earliest rows the server lacks, at most one patch's worth; later
+    // rows follow on the next upload.
+    wire.operations.truncate(cache_observations::MAX_OPERATIONS);
     loop {
         let Some(mut state) = cache_state_from_patch(prior, &wire) else {
             item.cache_observations = None;
@@ -32062,6 +32033,29 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     }
 }
 
+/// The accepted rows by event id. An unreadable row is left out, so its
+/// replacement is sent.
+fn cache_rows_held(prior: Option<&Value>) -> BTreeMap<String, cache_observations::Observation> {
+    prior
+        .and_then(|prior| prior["observations"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()
+        })
+        .map(|row| (row.event_id.clone(), row))
+        .collect()
+}
+
+/// An upsert of a row the server already holds unchanged.
+fn cache_row_held(
+    held: &BTreeMap<String, cache_observations::Observation>,
+    operation: &cache_observations::Operation,
+) -> bool {
+    matches!(operation, cache_observations::Operation::Upsert { observation }
+        if held.get(&observation.event_id) == Some(observation.as_ref()))
+}
+
 fn cache_state_within_limits(state: &Value) -> bool {
     state["observations"].as_array().is_some_and(|rows| {
         rows.len() <= cache_observations::MAX_ROWS
@@ -32070,33 +32064,24 @@ fn cache_state_within_limits(state: &Value) -> bool {
         .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_WIRE_BYTES)
 }
 
-fn codex_cache_wire_for_requests(
+/// One session's cache wire, shared by every source. A replayed request is
+/// one request; a conflicting replay or an unparseable time cannot certify
+/// an omitted count, nor can an incomplete request book: those ship
+/// `partial` with no rows. Rows stay in session order, so an upload that
+/// must trim drops the latest first.
+fn cache_wire<'a>(
     session: &str,
-    requests: &[OwnedRequest],
-) -> Option<CacheObservations> {
-    cache_wire_for_requests_inner(session, requests, true)
-}
-
-fn cache_wire_for_requests(session: &str, requests: &[OwnedRequest]) -> Option<CacheObservations> {
-    cache_wire_for_requests_inner(session, requests, false)
-}
-
-fn cache_wire_for_requests_inner(
-    session: &str,
-    requests: &[OwnedRequest],
-    codex_prefix: bool,
-) -> Option<CacheObservations> {
-    // Existing replay/dedup scratch remains unchanged. The Codex selection below
-    // adds only a fixed prefix; this is not yet an incremental semantic stream.
+    requests: impl IntoIterator<Item = &'a OwnedRequest>,
+    complete: bool,
+) -> CacheObservations {
     let mut seen = BTreeMap::new();
-    let mut conflict = false;
     let mut unique = Vec::new();
     for request in requests {
         if OffsetDateTime::parse(&request.slot.occurred_at, &Rfc3339).is_err() {
-            conflict = true;
+            return CacheObservations::partial(None);
         }
         match seen.get(&request.slot.request_ref) {
-            Some(prior) if prior != &request.slot => conflict = true,
+            Some(prior) if prior != &request.slot => return CacheObservations::partial(None),
             Some(_) => {}
             None => {
                 seen.insert(request.slot.request_ref.clone(), request.slot.clone());
@@ -32104,46 +32089,19 @@ fn cache_wire_for_requests_inner(
             }
         }
     }
-    if conflict {
-        // Conflicting duplicate slots or unparseable timestamps cannot certify
-        // an overflow count. Identical replays were deduplicated above.
-        return Some(CacheObservations {
-            schema_version: 1,
-            operations: Vec::new(),
-            coverage: "partial".into(),
-            omitted_observation_count: None,
-        });
+    if !complete {
+        return CacheObservations::partial(None);
     }
-    if codex_prefix {
-        // Keep at most 64 selected rows in session order, including under cap:
-        // a byte-budget fallback must trim the latest selected request first.
-        // Preparation restores event-ID wire order when a complete patch fits.
-        let (rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
-        return Some(CacheObservations {
-            schema_version: 1,
-            operations: rows
-                .into_iter()
-                .map(|observation| cache_observations::Operation::Upsert {
-                    observation: Box::new(observation),
-                })
-                .collect(),
-            coverage: if overflow == 0 { "complete" } else { "partial" }.into(),
-            omitted_observation_count: (overflow != 0).then_some(overflow),
-        });
-    }
-    let (rows, overflow) =
-        cache_observations::detect_bounded(session, &unique, cache_observations::MAX_OPERATIONS);
-    let patch = cache_observations::reconcile(&BTreeMap::new(), &rows);
-    let omitted = rows.len() as u64 + overflow;
-    if overflow == 0 && patch.validate() {
-        Some(patch)
-    } else {
-        Some(CacheObservations {
-            schema_version: 1,
-            operations: Vec::new(),
-            coverage: "partial".into(),
-            omitted_observation_count: Some(omitted),
-        })
+    CacheObservations {
+        schema_version: 1,
+        operations: cache_observations::detect_unique(session, &unique)
+            .into_iter()
+            .map(|observation| cache_observations::Operation::Upsert {
+                observation: Box::new(observation),
+            })
+            .collect(),
+        coverage: "complete".into(),
+        omitted_observation_count: None,
     }
 }
 
@@ -32264,14 +32222,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .cache_task_complete_at
             .as_deref()
             .zip(value.get("timestamp").and_then(Value::as_str))
-            .and_then(|(end, start)| {
-                let end = OffsetDateTime::parse(end, &Rfc3339).ok()?;
-                let start = OffsetDateTime::parse(start, &Rfc3339).ok()?;
-                if start < end {
-                    return None;
-                }
-                u64::try_from((start - end).whole_seconds()).ok()
-            });
+            .and_then(|(end, start)| cache_observations::elapsed_seconds(end, start));
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
         if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
@@ -48812,6 +48763,9 @@ mod tests {
     }
     mod claude_context_file_birth_tests {
         include!("snapshots/claude_context_file_birth_tests.rs");
+        mod claude_cache_gate_tests {
+            include!("snapshots/claude_cache_gate_tests.rs");
+        }
     }
     mod claude_request_census_tests {
         include!("snapshots/claude_request_census_tests.rs");
@@ -51873,36 +51827,10 @@ mod tests {
                     .iter()
                     .find(|item| item.source_session_id == "a-stable")
                     .expect("corrective stable snapshot");
-                if duplicate {
-                    assert!(stable_item.cache_observations.is_none());
-                } else {
-                    let cache = stable_item
-                        .cache_observations
-                        .as_ref()
-                        .expect("recovered cache evidence");
-                    assert_eq!(cache.coverage, "complete");
-                    assert_eq!(cache.operations.len(), 1);
-                    let cache_observations::Operation::Upsert { observation } =
-                        &cache.operations[0]
-                    else {
-                        panic!("expected recovered warm-cold-warm observation");
-                    };
-                    assert_eq!(observation.affected_request_ref, "req_cold");
-                    let previous = observation.previous.as_ref().expect("warm previous");
-                    let next = observation.immediate_next.as_ref().expect("warm recovery");
-                    assert_eq!(previous.request_ref, "req_owned");
-                    assert_eq!(next.request_ref, "req_recovered");
-                    for slot in [previous, &observation.affected, next] {
-                        assert_eq!(slot.prompt_tokens, Some(100_000));
-                        assert_eq!(slot.cache_creation_tokens, Some(0));
-                        assert_eq!(slot.output_tokens, Some(2));
-                        assert_ne!(slot.request_ref, "req_parent");
-                    }
-                    assert_eq!(previous.cache_read_tokens, Some(90_000));
-                    assert_eq!(observation.affected.cache_read_tokens, Some(0));
-                    assert_eq!(observation.affected.uncached_tokens, Some(100_000));
-                    assert_eq!(next.cache_read_tokens, Some(90_000));
-                }
+                // Cache rows follow the file birth verdict, never the census,
+                // and neither arm's file is Admitted (a strict-owned start
+                // leaves no verdict).
+                assert!(stable_item.cache_observations.is_none());
             }
             finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
             assert!(!first.census_complete);
@@ -58142,7 +58070,12 @@ mod tests {
             (Some(10), Some(10), Some(10), Some(0))
         );
         assert_eq!(child.session_start, expected_child_start);
-        assert!(child.cache_observations.is_none());
+        // The Admitted child ships its own request's cache rows; the invalid
+        // family census is no longer read for them.
+        assert!(child
+            .cache_observations
+            .as_ref()
+            .is_some_and(|cache| cache.coverage == "complete" && cache.operations.is_empty()));
         let hidden_copy = &items[2];
         assert_eq!(hidden_copy.usage_accounting_contract, None);
         // Every record predates the copy's file birth: nothing is its own.
@@ -63998,7 +63931,7 @@ mod tests {
             // these two surviving warm requests complete and retracts the
             // previously accepted loss anchored on the missing cold request.
             let mut unfenced = item.clone();
-            unfenced.cache_observations = cache_wire_for_requests(id, &item.cache_requests);
+            unfenced.cache_observations = Some(cache_wire(id, &item.cache_requests, true));
             prepare_cache_observations(&mut unfenced, Some(&prior));
             assert!(matches!(
                 unfenced
@@ -64845,11 +64778,21 @@ mod tests {
             "requestId":"copied-request", "message":{"id":"copied-message", "model":"claude-opus-4-8",
             "usage":{"input_tokens":100,"output_tokens":50}}});
         fs::write(&path, format!("{prefix}{owned_start}\n{record}\n")).unwrap();
-        let mut item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
-            &path,
-            "2026-09-30T10:05:00Z",
-            "f".repeat(64),
-            metadata,
+        // Born before its first line, as a fork's file is; the test file
+        // system's birth (now) would make both responses copied.
+        let born = OffsetDateTime::parse("2026-09-30T09:58:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp_nanos() as u64;
+        let mut item = crate::snapshots::claude_history_upgrade::with_staged_births_for_test(
+            BTreeMap::from([(local_index_key(&path), born)]),
+            || {
+                crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary_with_metadata(
+                    &path,
+                    "2026-09-30T10:05:00Z",
+                    "f".repeat(64),
+                    metadata,
+                )
+            },
         )
         .unwrap()
         .remove(0);
@@ -75868,7 +75811,7 @@ pub(crate) mod cache_adapter_tests {
                     .map(|seconds| seconds.floor() as u64);
             }
             parser.cache_requests = requests.into();
-            let wire = cache_wire_for_requests(&session, &parser.cache_requests).unwrap();
+            let wire = cache_wire(&session, parser.cache_requests.iter(), true);
             let affected = wire
                 .operations
                 .iter()
@@ -76017,7 +75960,7 @@ pub(crate) mod cache_adapter_tests {
             );
         }
         assert_eq!(parser.cache_requests.len(), 3);
-        let wire = cache_wire_for_requests("session", &parser.cache_requests).unwrap();
+        let wire = cache_wire("session", parser.cache_requests.iter(), true);
         assert_eq!(wire.operations.len(), 1);
         assert_eq!(parser.cache_requests[1].slot.uncached_tokens, Some(100_000));
         let mut child = SnapshotAccumulator::new(SnapshotSource::Codex);
@@ -76049,8 +75992,7 @@ pub(crate) mod cache_adapter_tests {
         assert_eq!(parser.cache_requests.len(), 3);
         assert_eq!(parser.cache_requests[1].slot.output_tokens, Some(2));
         assert_eq!(
-            cache_wire_for_requests("session", &parser.cache_requests)
-                .unwrap()
+            cache_wire("session", parser.cache_requests.iter(), true)
                 .operations
                 .len(),
             1
@@ -76064,47 +76006,6 @@ pub(crate) mod cache_adapter_tests {
         assert_eq!(absent.cache_read_tokens, None);
         assert_eq!(absent.cache_creation_tokens, None);
         assert_eq!(absent.prompt_tokens, None);
-    }
-    #[test]
-    fn cache_wire_overflow_discloses_and_preserves_prior_on_correction() {
-        let warm = OwnedRequest {
-            slot: RequestSlot {
-                request_ref: "A".into(),
-                occurred_at: "2026-09-30T10:00:00Z".into(),
-                model: Some("m".into()),
-                prompt_tokens: Some(100_000),
-                cache_read_tokens: Some(90_000),
-                ..Default::default()
-            },
-            ordering: "sequential".into(),
-            compaction_before: false,
-            configuration_changed: false,
-            configuration_witness: None,
-            idle_seconds: None,
-        };
-        let mut cold = warm.clone();
-        cold.slot.request_ref = "B".into();
-        cold.slot.cache_read_tokens = Some(0);
-        let mut pathological = vec![warm.clone()];
-        for index in 0..65 {
-            let mut cold = cold.clone();
-            cold.slot.request_ref = format!("cold_{index}");
-            pathological.push(cold);
-        }
-        let overflow = cache_wire_for_requests("s", &pathological).unwrap();
-        assert!(overflow.operations.is_empty());
-        assert_eq!(overflow.coverage, "partial");
-        assert_eq!(overflow.omitted_observation_count, Some(65));
-        let patch = cache_wire_for_requests("s", &[warm.clone(), cold]).unwrap();
-        let prior = cache_state_from_patch(None, &patch).unwrap();
-        let current = cache_wire_for_requests("s", &[warm]).unwrap();
-        let mut item = super::tests::sample_session_artifact_item();
-        item.cache_observations = Some(current);
-        prepare_cache_observations(&mut item, Some(&prior));
-        assert!(matches!(
-            item.cache_observations.unwrap().operations[0],
-            cache_observations::Operation::Retract { .. }
-        ));
     }
 }
 
