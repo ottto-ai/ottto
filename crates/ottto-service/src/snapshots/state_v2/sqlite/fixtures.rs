@@ -86,17 +86,6 @@ pub(in super::super) fn delete_row_elsewhere_for_test(
     tx.commit().unwrap();
     (before, db.stamp().unwrap())
 }
-pub(in super::super) fn corrupt_row_header_for_test(db: &Sqlite, key: &RowKey) {
-    let table = key.table();
-    let sql = format!(
-        "UPDATE {} SET header=X'00' WHERE {}",
-        table.name(),
-        predicate(table)
-    );
-    let values = key.values().unwrap();
-    let changed = db.conn().unwrap().execute(&sql, params_from_iter(values));
-    assert_eq!(changed.unwrap(), 1);
-}
 pub(in super::super) struct ReaderForTest {
     _conn: Connection,
 }

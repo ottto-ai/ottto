@@ -1282,7 +1282,7 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
 fn mutable_row_over_its_target_commits_and_alarms() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = mapper::key("proof.account", "synthetic-family", 1).unwrap();
+    let key = mapper::key("proof.usage", "synthetic-family", 1).unwrap();
     // One family's proof JSON: ~1.5 MiB.
     let row = serde_json::json!({
         "members": {},
@@ -1294,7 +1294,7 @@ fn mutable_row_over_its_target_commits_and_alarms() {
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     });
     let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
-    let gauge = serde_json::json!({ "percent": 150, "kind": "proof.account" });
+    let gauge = serde_json::json!({ "percent": 150, "kind": "proof.usage" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 150));
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1453,7 +1453,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
         (file("file".into()), Fixed::None),
         (census("file".into()), Fixed::None),
         (
-            RowKey::record("account_window", b"family".to_vec(), 17).unwrap(),
+            RowKey::record("file.entities", b"family".to_vec(), 17).unwrap(),
             Fixed::None,
         ),
         (
@@ -1606,7 +1606,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
 fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    let rec = RowKey::record("account.current", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
+    let rec = RowKey::record("proof.usage", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
     let shared = RowKey::RequestSet(1);
     assert_ne!(
         sqlite::owner_for_test(&rec),
@@ -1666,63 +1666,6 @@ fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
     }
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
 }
-/// [format] positions and current pointer survive retirement without renumbering.
-#[test]
-fn positions_and_current_pointer_survive_retirement_without_renumbering() {
-    let tmp = Scratch::new();
-    let mut db = tmp.store();
-    let kind = "account_window";
-    let root = b"family".to_vec();
-    let f = Fixed::None;
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    for pos in [17, 18, 19] {
-        let k = RowKey::record(kind, root.clone(), pos).unwrap();
-        tx.put(RowInput {
-            value_version: 1,
-            key: &k,
-            fixed: &f,
-            value: &[],
-        })
-        .unwrap();
-    }
-    let pointer = RowKey::record("account.current", root.clone(), 0).unwrap();
-    put(&mut tx, &pointer, &19_u64.to_be_bytes());
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.delete(&RowKey::record(kind, root.clone(), 17).unwrap())
-        .unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    let k = RecordKind::parse(kind).unwrap();
-    let after = RowKey::record(kind, root.clone(), 17).unwrap();
-    let page = tx.scan_kind(&k, Some(&after), 1).unwrap();
-    assert_eq!(page.len(), 1);
-    assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
-    assert_eq!(tx.scan_kind(&k, None, 128).unwrap().len(), 2);
-    // One exact key: every position from the start, and pages by position.
-    let page = tx.scan_record_key(&k, &root, None, 1).unwrap();
-    assert!(matches!(page[0].key, RowKey::Record { position: 18, .. }));
-    let page = tx.scan_record_key(&k, &root, Some(18), 128).unwrap();
-    assert_eq!(page.len(), 1);
-    assert!(matches!(page[0].key, RowKey::Record { position: 19, .. }));
-    assert!(tx
-        .scan_record_key(&k, b"fam", None, 128)
-        .unwrap()
-        .is_empty());
-    assert!(tx
-        .scan_record_key(&k, b"family2", None, 128)
-        .unwrap()
-        .is_empty());
-    for pos in [18, 19] {
-        assert!(tx
-            .get(&RowKey::record(kind, root.clone(), pos).unwrap())
-            .unwrap()
-            .is_some());
-    }
-    let h = tx.get(&pointer).unwrap().unwrap();
-    assert_eq!(value(&mut tx, &h), 19_u64.to_be_bytes());
-}
-
 fn test_record(key: String) -> RowKey {
     RowKey::record("raw_hold.files", key.into_bytes(), 0).unwrap()
 }

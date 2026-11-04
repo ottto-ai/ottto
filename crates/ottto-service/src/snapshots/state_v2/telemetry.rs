@@ -88,19 +88,6 @@ thread_local! {
 pub(in super::super) fn take_thread_event_for_test(name: &str) -> Option<serde_json::Value> {
     THREAD_EVENTS.with(|events| events.borrow_mut().remove(name))
 }
-/// Cumulative process-lifetime count, kept in the same inventory as events.
-pub(super) fn count(name: &'static str, n: u64) {
-    if let Ok(mut stats) = stats().lock() {
-        let total = stats
-            .latest
-            .get(name)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(n);
-        stats.latest.insert(name, total.into());
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
-    }
-}
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     Save,
@@ -191,13 +178,7 @@ pub(super) fn hydrate_checkpoint(
         process_cpu_us: crate::local_resource_diagnostics::state_v2_cpu_us(),
         save_digests: Some(save_digests),
         // Hydrate-owned maps; no key/value walks or serialized size estimates.
-        kind_cx_entries: cx.map(|cx| {
-            cx.presence.len()
-                + cx.account_ids.len()
-                + cx.digests.len()
-                + cx.cold_rolled.len()
-                + cx.compaction.done.len()
-        }),
+        kind_cx_entries: cx.map(|cx| cx.presence.len() + cx.digests.len()),
         ..Default::default()
     };
     #[cfg(test)]
@@ -370,7 +351,6 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 
 #[derive(Default, Serialize)]
 struct RetainedHeap {
-    account_pending: Option<u64>,
     census: Option<u64>,
     side_maps: Option<u64>,
     files: Option<u64>,
@@ -399,7 +379,6 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     let hashes = index.claude_request_census.hash_total();
     RetainedHeap {
-        account_pending: heap(&index.claude_account_family_pending),
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
         side_maps: side_maps(index),

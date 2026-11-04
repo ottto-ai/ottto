@@ -154,7 +154,8 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
 }
 /// Shared-evidence kinds: (kind, field holding request-set references, class).
 /// `file.census` keeps one set in its field; the others keep a map of sets.
-/// Retired `usage.pending` stays listed so removing its rows releases its sets.
+/// Retired `account_window` and `usage.pending` stay listed so removing their
+/// rows releases their sets.
 const SHARED: [(&str, &str, &str); 4] = [
     ("account_window", "r", "account"),
     ("usage.pending", "member_request_id_hashes", "requests"),
@@ -453,24 +454,6 @@ impl Rows<'_> {
             } else if let Some(tx) = self.tx.as_deref_mut() {
                 put(tx, &key, value)?;
             }
-        }
-        ensure!(
-            self.next.insert(key, digest).is_none(),
-            "state_v2_duplicate_row"
-        );
-        Ok(())
-    }
-    /// Carry a row this save did not load. Only its committed digest, or the
-    /// one recorded when it was decoded, proves it unchanged. Anything else
-    /// is Unknown: the save refuses, and the row is never removed.
-    pub(super) fn keep(&mut self, key: RowKey, digest: [u8; 32]) -> Result<()> {
-        let known = match self.old.remove(&key) {
-            Some(known) => Some(known),
-            None => self.seed.remove(&key),
-        };
-        if known != Some(digest) {
-            telemetry::count("cold_row_unknown", 1);
-            anyhow::bail!("state_v2_cold_row_unknown");
         }
         ensure!(
             self.next.insert(key, digest).is_none(),

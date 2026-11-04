@@ -126,16 +126,6 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
             serde_json::json!({"proof_correction": {"owed_member_ids": {"unknown": true}}, "disposition": "unproven_terminal"}),
         ),
         (
-            "claude_account_family_pending",
-            "family".into(),
-            serde_json::json!({"invalid": "false"}),
-        ),
-        (
-            "claude_account_family_witnesses",
-            "family".into(),
-            serde_json::json!({"members": 17}),
-        ),
-        (
             "claude_usage_family_witnesses",
             "family".into(),
             serde_json::json!({"legacy_owners": [17]}),
@@ -1566,6 +1556,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                             | "context_curve_replay_epoch"
                             | "completed_context_curve_replay_generation"
                             | "claude_usage_family_pending"
+                            | "claude_account_family_witnesses"
+                            | "claude_account_family_pending"
                             | "claude_duplicate_request_owners"
                             | "claude_duplicate_request_witness_overflowed"
                             | "claude_owned_start_census"
@@ -1931,22 +1923,19 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 // A prior, valid native family witness exists on disk before
                 // corruption. The real scan supplies its member revision;
                 // this fixture does not construct a hold or infer authority.
-                index.claude_account_family_witnesses.insert(
+                index.claude_usage_family_witnesses.insert(
                     session.into(),
-                    ClaudeAccountFamilyWitness {
-                        account_identifier_hash: "a".repeat(64),
-                        evidence_request_count: 1,
-                        members: BTreeMap::from([(
-                            session.into(),
-                            index.files[&key].modified_unix_seconds,
-                        )]),
-                        member_request_id_fingerprints: BTreeMap::new(),
-                    },
+                    serde_json::from_value(serde_json::json!({
+                        "evidence_fingerprint": "e".repeat(64),
+                        "member_request_id_fingerprints": {session: "f".repeat(64)},
+                        "assigned_request_id_fingerprints": {},
+                    }))
+                    .unwrap(),
                 );
             }
             index.save(&path).unwrap();
             let (field, held_key) = if family_slot {
-                ("claude_account_family_witnesses", session.to_owned())
+                ("claude_usage_family_witnesses", session.to_owned())
             } else {
                 ("files", key.clone())
             };
@@ -3169,7 +3158,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     let original_carry = rebuilt.accepted_rebuild_incidence.clone();
     rebuilt.save(&path).unwrap();
     let mut value = serde_json::to_value(&rebuilt).unwrap();
-    value["claude_account_family_witnesses"] =
+    value["claude_usage_family_witnesses"] =
         serde_json::json!({session: {"members": [false], "opaque": "future"}});
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let mut held = ScanIndex::load(&path).unwrap();
@@ -3204,7 +3193,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     // A compatible repair understands/removes the bad witness; the missing
     // derived file entry now forces actual reconstruction on a healthy pass.
     let mut repaired = serde_json::to_value(&restarted).unwrap();
-    repaired["claude_account_family_witnesses"] = serde_json::json!({});
+    repaired["claude_usage_family_witnesses"] = serde_json::json!({});
     fs::write(&path, serde_json::to_vec(&repaired).unwrap()).unwrap();
     let mut healthy = ScanIndex::load(&path).unwrap();
     let release = scan(&mut healthy, "2026-10-22T00:02:00Z");

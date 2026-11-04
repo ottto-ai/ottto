@@ -2028,19 +2028,6 @@ unavailable scalar counts are null and missing kinds are unknown, not zero.
 timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
 counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
-`account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history; `account_windows_retained`
-also reports `uncollapsed`, the windows older than their equal-evidence run's
-newest left in a store-only archive (boundaries unchecked), and `replaced` and
-`pushed`, the store-only archive rollovers this save wrote that replaced their
-run's newest window or were appended (resident archives, kept only with raw
-holds or before a complete v2 load, are not counted). A complete v2 load keeps archived account
-windows in the store, so the retained-pending byte diagnostic is unavailable while
-any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
-`cold_row_unknown`) when a stored archived row no longer matches its baseline, and
-with `state_v2_cold_lineage_miss` (count `cold_lineage_miss`) when a graph's archive
-view predates a commit it shares no rollover with; both hold and remove nothing.
-These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows
 
