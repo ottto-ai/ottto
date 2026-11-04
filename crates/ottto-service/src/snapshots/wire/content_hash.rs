@@ -376,20 +376,6 @@ pub(crate) fn snapshot_revision_v2_hash(
     format!("{:x}", digest.finalize())
 }
 
-impl SnapshotItem {
-    /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
-    /// The backend refuses a base token combined with a challenge; the answer
-    /// replaces the stale base rather than adding to it.
-    fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
-        match &self.cache_conflict_answer {
-            Some((challenge, revision)) => {
-                (None, Some(challenge.clone()), Some(revision.clone()), true)
-            }
-            None => (self.cache_base_head_etag.clone(), None, None, false),
-        }
-    }
-}
-
 pub(crate) fn snapshot_semantic_envelope(
     source: SnapshotSource,
     item: &SnapshotItem,

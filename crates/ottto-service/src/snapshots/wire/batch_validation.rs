@@ -4,7 +4,7 @@ use super::content_hash::{
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
     snapshot_semantic_envelope,
 };
-use super::{SnapshotBatchRequest, SnapshotItem, SnapshotItemWire};
+use super::{SnapshotBatchRequest, SnapshotItemWire};
 use crate::snapshots::{
     snapshot_source_from_api_slug, validate_snapshot_item, MAX_SEMANTIC_ENVELOPE_BYTES,
     MAX_SNAPSHOT_BATCH_WIRE_BYTES, MAX_SNAPSHOT_ITEM_WIRE_BYTES, SNAPSHOT_SCHEMA_VERSION,
