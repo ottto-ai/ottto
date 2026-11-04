@@ -31,7 +31,7 @@ pub(crate) fn after_retirement(_retained: bool) {
         }
     });
 }
-/// The ordinary test collector's rotation budget.
+// The ordinary test collector's rotation budget.
 thread_local! {
     static ROTATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }

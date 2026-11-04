@@ -6077,21 +6077,6 @@ impl ClaudeLegacyRequestOwners {
     }
 }
 
-fn claude_legacy_request_owners_from_rows<'a>(
-    api_rows: impl IntoIterator<
-        Item = (
-            &'a String,
-            &'a Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
-        ),
-    >,
-    trace_rows_by_root: &BTreeMap<
-        String,
-        Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
-    >,
-) -> Option<ClaudeLegacyRequestOwners> {
-    classify_claude_legacy_request_owners(api_rows, trace_rows_by_root).ok()
-}
-
 fn classify_claude_legacy_request_owners<'a>(
     api_rows: impl IntoIterator<
         Item = (

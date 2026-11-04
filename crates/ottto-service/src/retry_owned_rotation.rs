@@ -223,7 +223,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
     }
     fn step(
         &mut self,
-        mut frame: SourcePreparation,
+        frame: SourcePreparation,
         _remaining: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
         let pi = frame.source == SnapshotSource::Pi;
