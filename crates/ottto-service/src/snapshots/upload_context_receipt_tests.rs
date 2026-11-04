@@ -2314,7 +2314,7 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
             census_member: true,
             watcher_hint: false,
         },
-        &f.index.files
+        &f.index
     ));
     f.index.traversal = None;
     ensure_bounded_traversal(

@@ -36,7 +36,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups across registered homes.
+  singleton sessions and joined groups across registered homes. A header owner that changes
+  during a pass holds that pass’s Codex publication until revalidation on the next pass.
+  A rollout moved while a reader owns it waits for a later pass. Multi-file compressed
+  sessions remain unsupported for grouped replay.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not

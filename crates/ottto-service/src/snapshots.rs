@@ -22072,8 +22072,10 @@ impl OwnedSourceScan {
         }
     }
 
-    pub(crate) fn rehome_withheld_baseline(&self, baseline: &mut ScanIndex) {
+    pub(crate) fn rehome_withheld_baseline(&self, baseline: &mut ScanIndex) -> Result<()> {
+        baseline.rehome_codex_carry_baseline(&self.index)?;
         baseline.rehome_withheld_baseline(&self.index);
+        Ok(())
     }
 
     /// Stage 1 (K6): the cooperative deadline of a continuation page, on the
@@ -22235,6 +22237,9 @@ impl OwnedSourceScan {
             backfill_window_days,
             Some(&resource_probe.discovery_growth),
         );
+        if source == SnapshotSource::Codex {
+            index.prepare_codex_carries(None);
+        }
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -22259,7 +22264,8 @@ impl OwnedSourceScan {
             );
         }
         let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
-        let traversal = index.traversal.as_mut().expect("traversal initialized");
+        let mut selection_traversal = index.traversal.take().expect("traversal initialized");
+        let traversal = &mut selection_traversal;
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
         let mut pending_paths = scoped_prefix_paths;
@@ -22311,7 +22317,7 @@ impl OwnedSourceScan {
             && traversal.codex_freshness_yield
             && codex_census_turn_was_last(&traversal.scan_roots)
             && traversal.pending_candidates.iter().any(|candidate| {
-                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+                !candidate.census_member && !codex_fresh_data_pending(candidate, index)
             });
         let freshness_page = source == SnapshotSource::Codex
             && selection_limit > 0
@@ -22319,7 +22325,7 @@ impl OwnedSourceScan {
             && traversal
                 .pending_candidates
                 .iter()
-                .any(|candidate| codex_fresh_data_pending(candidate, &index.files))
+                .any(|candidate| codex_fresh_data_pending(candidate, index))
             && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
         let census_page = source == SnapshotSource::Codex
             && selection_limit > 0
@@ -22342,7 +22348,7 @@ impl OwnedSourceScan {
                 selection_limit
             };
             let ordinary_only = |candidate: &ScanTraversalPath| {
-                !candidate.census_member && !codex_fresh_data_pending(candidate, &index.files)
+                !candidate.census_member && !codex_fresh_data_pending(candidate, index)
             };
             if ordinary_turn {
                 traversal.pending_candidates.retain(|candidate| {
@@ -22366,10 +22372,9 @@ impl OwnedSourceScan {
                 };
                 let eligible = pending_paths.len() < limit
                     && if freshness_page {
-                        codex_fresh_data_pending(&candidate, &index.files)
+                        codex_fresh_data_pending(&candidate, index)
                     } else if census_page {
-                        candidate.census_member
-                            && !codex_fresh_data_pending(&candidate, &index.files)
+                        candidate.census_member && !codex_fresh_data_pending(&candidate, index)
                     } else {
                         ordinary_only(&candidate)
                     };
@@ -22547,6 +22552,7 @@ impl OwnedSourceScan {
         }
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
+        index.traversal = Some(selection_traversal);
         let claude_queued_family_deferred_paths = if source == SnapshotSource::ClaudeCode {
             // Credit service at this observation, within the admission horizon.
             // The retained census clock stays frozen for proof and completeness.
@@ -23221,13 +23227,6 @@ impl OwnedSourceScan {
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
-                    let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-                    for header in &inventory.headers {
-                        owners
-                            .entry(header.owner.clone())
-                            .or_default()
-                            .insert(header.home.clone());
-                    }
                     let current_owners = inventory
                         .headers
                         .iter()
@@ -23284,7 +23283,7 @@ impl OwnedSourceScan {
                             }
                         }
                     }
-                    let affected_owners = inventory.affected_owners(&BTreeSet::new());
+                    let affected_owners = inventory.affected_owners();
                     census.unreadable_path_count += inventory.refused.len();
                     census.unreadable_causes.merge(inventory.unreadable_causes);
                     let mut grouped_paths = BTreeSet::new();
@@ -23358,9 +23357,8 @@ impl OwnedSourceScan {
                         if (group.members.len() < 2
                             && !previously_joined
                             && !protected_history_missing
-                            && owners
-                                .get(&group.owner)
-                                .map_or(true, |homes| homes.len() <= 1))
+                            && inventory
+                                .membership_complete(&group.owner, affected_owners.as_ref()))
                             || !group
                                 .members
                                 .iter()
@@ -23415,9 +23413,6 @@ impl OwnedSourceScan {
                             || group.members.iter().any(|member| {
                                 repurposed_protected_paths.contains(&local_index_key(&member.path))
                             })
-                            || owners
-                                .get(&group.owner)
-                                .is_some_and(|homes| homes.len() > 1)
                             || group.members.len() < 2
                         {
                             census.ownership_incomplete_file_count += group.members.len();
@@ -24423,15 +24418,18 @@ impl OwnedSourceScan {
                                 &active.candidate.path,
                             );
                         }
-                        if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                        if source == SnapshotSource::Codex
+                            && error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
                         {
                             sampled_scan::codex_cursor::requeue(
                                 index,
                                 &codex_selected_flags,
                                 &active.candidate,
                             );
+                            active.parser.reader.reader.close();
+                            pending!();
                         }
                         active.parser.reader.reader.close();
                         census.record_unreadable_file(
@@ -26566,6 +26564,16 @@ impl OwnedSourceScan {
                 // absent beneath the configured root above, so retire the corresponding
                 // derived index state directly. Any recreation after this absence witness
                 // belongs to the next generation.
+                if source == SnapshotSource::Codex {
+                    index.prepare_codex_carries(sampling.as_ref());
+                    census.removed_index_keys.retain(|key| {
+                        index.files.contains_key(key)
+                            && !index
+                                .traversal
+                                .as_ref()
+                                .is_some_and(|walk| walk.observed_index_keys.contains(key))
+                    });
+                }
                 let account_members = index.observed_account_members();
                 let unacked = index.unacked_bodies(census.removed_index_keys.iter());
                 for index_key in census.removed_index_keys.iter() {
@@ -27169,15 +27177,21 @@ impl OwnedSourceScan {
                             ticket,
                         )
                     });
-                let codex_join_validation = codex_join_inventory.map(|inventory| {
-                    let surviving = pending_finalization
+                let codex_join_validation = codex_join_inventory.and_then(|inventory| {
+                    let surviving: BTreeSet<_> = pending_finalization
                         .iter()
                         .filter_map(|pending| {
                             inventory.owner_for_path(Path::new(&pending.index_key))
                         })
                         .map(str::to_owned)
                         .collect();
-                    codex_file_join::Validation::new(inventory, codex_join_completed, &surviving)
+                    (!surviving.is_empty()).then(|| {
+                        codex_file_join::Validation::new(
+                            inventory,
+                            codex_join_completed,
+                            &surviving,
+                        )
+                    })
                 });
                 let scan = SourceScanResult {
                     census_status,
@@ -27396,6 +27410,29 @@ impl OwnedSourceScan {
                 with_claude_absence_counters(|counters| {
                     counters.tombstone_hits = counters.tombstone_hits.saturating_add(1);
                 });
+            }
+            if source == SnapshotSource::Codex {
+                match index.codex_unchanged_decision(
+                    &candidate,
+                    &codex_title_metadata,
+                    audit_now,
+                    true,
+                    false,
+                ) {
+                    Ok(Some((CandidateDecision::Skip, _))) => {
+                        page_selection(source.api_slug(), PageSelection::Skipped, 1);
+                        pending!();
+                    }
+                    Err(_) => {
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                        pending!();
+                    }
+                    _ => {}
+                }
             }
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
@@ -27985,9 +28022,10 @@ impl OwnedSourceScan {
                 Ok(parser) => parser,
 
                 Err(error) => {
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                    if source == SnapshotSource::Codex
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
                     {
                         sampled_scan::codex_cursor::requeue(
                             index,
@@ -37819,18 +37857,23 @@ fn note_codex_census_turn(roots: &[PathBuf], census: bool) {
 /// Priority only, never read admission. Byte length is content-relevant;
 /// ctime, inode, permissions and mtime alone cannot promote an unchanged file.
 /// New paths need a watcher/roster hint so a cold history walk stays FIFO.
-fn codex_fresh_data_pending(
-    candidate: &ScanTraversalPath,
-    files: &SharedMap<String, ScanIndexEntry>,
-) -> bool {
-    let entry = files.get(&local_index_key(&candidate.path));
-    if codex_archive_path(&candidate.path) || (entry.is_none() && !candidate.watcher_hint) {
+fn codex_fresh_data_pending(candidate: &ScanTraversalPath, index: &ScanIndex) -> bool {
+    let key = local_index_key(&candidate.path);
+    let entry = index.files.get(&key);
+    if entry.is_none() && !candidate.watcher_hint {
         return false;
     }
     fs::symlink_metadata(&candidate.path).is_ok_and(|metadata| {
         metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && entry.map_or(true, |entry| entry.size_bytes != metadata.len())
+            && index
+                .codex_physical_matches(&key, &metadata)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || entry.map_or(true, |entry| entry.size_bytes != metadata.len()),
+                    |unchanged| !unchanged,
+                )
     })
 }
 
@@ -38615,6 +38658,17 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .cmp(&right.as_ref().map(|entry| entry.file_name()).ok())
         });
+        let sibling_paths: BTreeSet<_> = traversal
+            .codex_rollout_paths
+            .iter()
+            .cloned()
+            .chain(
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_ref().ok())
+                    .map(|entry| local_index_key(&entry.path())),
+            )
+            .collect();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -38661,6 +38715,9 @@ fn advance_bounded_directory_traversal_with_budget(
             }
             if source == SnapshotSource::Codex {
                 traversal.codex_rollout_paths.insert(local_index_key(&path));
+                if codex_file_join::shadowed_compressed_path(&path, &sibling_paths) {
+                    continue;
+                }
             }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -38679,6 +38736,38 @@ fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
             };
+            if source == SnapshotSource::Codex {
+                let candidate = codex_file_join::header_candidate(
+                    directory.scan_root.clone(),
+                    path.clone(),
+                    &metadata,
+                );
+                index.traversal = Some(traversal);
+                let carried = state_v2::runtime_path(index).and_then(|route| {
+                    route.map_or(Ok(false), |route| {
+                        index.carry_codex_rollout(&route, &candidate, None)
+                    })
+                });
+                traversal = index
+                    .traversal
+                    .take()
+                    .expect("carry keeps traversal custody");
+                pending = traversal
+                    .pending_candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.path.clone(), i))
+                    .collect();
+                if carried.is_err() {
+                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                        scan_root: directory.scan_root.clone(),
+                        path,
+                        census_member: directory.census_member,
+                        watcher_hint: directory.watcher_hint,
+                    });
+                    continue;
+                }
+            }
             if source == SnapshotSource::ClaudeCode {
                 index.rehome_discovered_account_hold(
                     &mut traversal,
@@ -38766,10 +38855,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
 
-                owed_unchanged = index
-                    .files
-                    .get(&key)
-                    .is_some_and(|entry| entry.same_listing_stamp_as(&metadata));
+                owed_unchanged = index.listing_stamp_matches(&path, &metadata);
                 if owed_unchanged
                     && !pending.contains_key(&path)
                     && !pace_listing_owed(&mut traversal, &key)
@@ -39101,6 +39187,9 @@ fn reconcile_missing_index_entries_with_side(
     cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
+    if source == SnapshotSource::Codex {
+        index.prepare_codex_carries(None);
+    }
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
     };
@@ -43643,10 +43732,21 @@ impl ScanIndex {
     /// unverified sampled generation). Other reasons to read an unchanged file
     /// were weighed by this generation's walk; their owners and the next walk
     /// re-offer them, as on main, rather than every pass. Stat-only.
+    fn listing_stamp_matches(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        let key = local_index_key(path);
+        let entry = self.files.get(&key);
+        if entry.is_some_and(|entry| {
+            entry.codex_counting_owner.is_some() || entry.codex_protected_owner.is_some()
+        }) {
+            if let Ok(Some(unchanged)) = self.codex_physical_matches(&key, metadata) {
+                return unchanged;
+            }
+        }
+        entry.is_some_and(|entry| entry.same_listing_stamp_as(metadata))
+    }
+
     fn listing_unchanged(&self, path: &Path, metadata: &fs::Metadata) -> bool {
-        self.files
-            .get(&local_index_key(path))
-            .is_some_and(|entry| entry.same_listing_stamp_as(metadata))
+        self.listing_stamp_matches(path, metadata)
             && !sampled_audit::path_requires_verification(&self.files, path)
     }
 
@@ -70971,6 +71071,9 @@ mod tests {
     /// unfunded censuses sample zero archive bytes, even with a saved header.
     #[test]
     fn codex_archive_inventory_preserves_plain_usage_through_paged_restart() {
+        let _lock = codex_compressed_input::tests::DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_dir("codex-archive-paged");
         let child_id = "019fc428-0000-7000-8000-000000000001";
         let parent_id = "019fc428-0000-7000-8000-000000000002";
@@ -71029,7 +71132,19 @@ mod tests {
         for with_archive in [false, true] {
             if with_archive {
                 let archive = root.join("zz-held.jsonl.zst");
-                fs::write(&archive, b"invalid archive header").unwrap();
+                let header = json!({"timestamp":"2026-08-02T08:00:00Z", "type":"session_meta", "payload":{"id":"independent-compressed-session"}});
+                let usage = codex_test_token_line(
+                    "2026-08-02T08:00:02Z",
+                    None,
+                    (100, 80, 10, 2),
+                    Some((100, 80, 10, 2)),
+                );
+                let bytes = format!("{header}\n{usage}\n");
+                fs::write(
+                    &archive,
+                    zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
+                )
+                .unwrap();
             }
             let checkpoint = root.join("scan-index.json");
             if checkpoint.exists() {
@@ -71049,11 +71164,14 @@ mod tests {
                     &[],
                     false,
                 );
+                state = state.with_sampled_acquisition(
+                    Arc::new(sampled_scan::SharedCache::default()),
+                    crate::transcript_acquisition::Scope("paged-encoding-fixture".into()),
+                );
                 let mut completed = None;
                 for _ in 0..256 {
                     // Reproduce the permitting macOS gate on every platform;
                     // no cache or reservation-save owner exists on this route.
-                    state.index.archive_pass.power = true;
                     match state.step(None) {
                         OwnedSourceScanStep::Pending(next) => state = next,
                         OwnedSourceScanStep::Complete {
@@ -71066,10 +71184,6 @@ mod tests {
                     }
                 }
                 let mut scan = completed.expect("paged archive scan makes bounded progress");
-                assert!(
-                    !index.archive_pass.dirty,
-                    "unfunded work cannot await a save"
-                );
                 child_snapshot = scan
                     .snapshots
                     .iter()
@@ -71097,9 +71211,6 @@ mod tests {
             } else {
                 control = Some(body);
             }
-            if with_archive {
-                assert!(index.archive_owed_count() > 0);
-            }
         }
         // Isolate physical archive samples from the plain parent/child reads.
         let archive_root = root.join("unfunded");
@@ -71124,64 +71235,61 @@ mod tests {
             8192,
             "physical-read seam observes head and tail"
         );
-        for validated in [false, true] {
-            let checkpoint = root.join(format!("unfunded-index-{validated}.json"));
-            let key = local_index_key(&archive);
-            let mut index = ScanIndex::default();
-            if validated {
-                let mut evidence = codex_compressed_input::ArchiveEvidence::from_metadata(
-                    fs::metadata(&archive).unwrap(),
-                )
-                .unwrap();
-                let h =
-                    codex_compressed_input::ValidatedHeader::from_bytes(header.as_bytes()).unwrap();
-                evidence.owner = Some(h.owner.clone());
-                evidence.work.as_mut().unwrap().header = Some(Box::new(h));
-                index.archives.insert(key.clone(), evidence);
+        fs::write(
+            &archive,
+            zstd::stream::encode_all(header.as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+        for retired_header in [false, true] {
+            let checkpoint = root.join(format!("ordinary-index-{retired_header}.json"));
+            let mut legacy = serde_json::to_value(ScanIndex::default()).unwrap();
+            if retired_header {
+                legacy["archives"] = json!({local_index_key(&archive): {"owner":"unfunded-session", "disposition":{"Held":{"cause":"CompressedAdmissionRefused", "quiet":false}}, "work":{"header":{"owner":"unfunded-session"},"attempts":1}}});
             }
-            for pass in 0..3 {
-                index.save(&checkpoint).unwrap();
-                index = ScanIndex::load(&checkpoint).unwrap();
-                index.traversal = None; // A fresh ordinary census, not a paced re-list.
-                let saved_generation = index.generation;
-                let saved_bytes = fs::read(&checkpoint).unwrap();
-                let before = samples();
-                let mut state = OwnedSourceScan::new(
-                    SnapshotSource::Codex,
-                    std::slice::from_ref(&archive_root),
-                    index,
-                    &format!("2026-08-02T10:{pass:02}:00Z"),
-                    BACKFILL_WINDOW_DAYS,
-                    10,
-                    None,
-                    &[],
-                    false,
-                );
-                let mut completed = None;
-                for _ in 0..256 {
-                    state.index.archive_pass.power = true;
-                    match state.step(None) {
-                        OwnedSourceScanStep::Pending(next) => state = next,
-                        OwnedSourceScanStep::Complete { index: next, .. } => {
-                            completed = Some(next);
-                            break;
-                        }
+            fs::write(&checkpoint, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let index = ScanIndex::load(&checkpoint).unwrap();
+            assert!(index.decode_holds.is_empty());
+            assert!(serde_json::to_value(&index)
+                .unwrap()
+                .get("archives")
+                .is_none());
+            let mut state = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&archive_root),
+                index,
+                "2026-08-02T10:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+                10,
+                None,
+                &[],
+                false,
+            )
+            .with_sampled_acquisition(
+                Arc::new(sampled_scan::SharedCache::default()),
+                crate::transcript_acquisition::Scope("ordinary-encoding-fixture".into()),
+            );
+            let mut completed = None;
+            for _ in 0..1024 {
+                match state.step(None) {
+                    OwnedSourceScanStep::Pending(next) => state = next,
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        assert!(scan.snapshots.is_empty(), "header-only input has no money");
+                        assert!(index.accepted_snapshot_fingerprints.is_empty());
+                        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                        index.save(&checkpoint).unwrap();
+                        completed = Some(index);
+                        break;
                     }
                 }
-                index = completed.expect("unfunded archive census completes");
-                assert_eq!(
-                    index.generation, saved_generation,
-                    "no unowned archive save"
-                );
-                assert_eq!(fs::read(&checkpoint).unwrap(), saved_bytes);
-                assert_eq!(samples(), before, "no physical head/tail archive reads");
-                assert!(index.archive_owed_count() > 0);
-                assert!(!index.archive_pass.dirty);
-                assert!(index.archives.contains_key(&key));
-                if validated {
-                    assert!(index.archives[&key].header().is_some());
-                }
             }
+            assert!(
+                completed.is_some(),
+                "ordinary encoded input makes bounded progress"
+            );
         }
         let _ = fs::remove_dir_all(root);
     }

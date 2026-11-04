@@ -1,8 +1,7 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, Common, InventoryFacts, Observation, PathCarry, SetAside, SetAsideCause,
-    StagedFile, TailHead, TailStage,
+    Collection, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
 };
 use super::*;
 
@@ -28,19 +27,6 @@ fn pending_carry(index: &ScanIndex, key: &str) -> Result<Option<PathCarry>> {
     };
     with_state(&path, |state| Ok(state.tail.carry_for(key).cloned()))
 }
-/// Populate the optional physical facts without replacing any staged debt.
-pub(in crate::snapshots) fn inventory_tail(
-    path: &Path,
-    key: &str,
-    common: Common,
-    facts: InventoryFacts,
-) -> Result<()> {
-    with_state(path, |state| {
-        state.tail.inventory(key, common, facts);
-        Ok(())
-    })
-}
-
 /// Staged state never declines; a later completion of the file merges into it.
 pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile) -> Result<()> {
     with_state(path, |state| {

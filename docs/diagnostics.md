@@ -1720,7 +1720,10 @@ state-memory credit, and the existing per-header recognition bound remains.
 `inventory_hold` uses the existing unreadable causes and sampled failed-file counts.
 A proven acquisition failure withholds only its dependent ownership set; an unknown
 header remains a wildcard over every potentially colliding session. Header/listing
-uncertainty still prevents absence-based evidence collection.
+uncertainty still prevents absence-based evidence collection. An owning-header change
+holds that pass’s Codex publication until the next pass; a rollout moved while it is being
+read is carried on a later pass. Multi-file compressed sessions remain unsupported for
+grouped replay.
 
 A proven representation/path carry preserves old logical fingerprints, ACK/context
 facts and debt in one paired save rollback unit. Rename performs no header, sample,

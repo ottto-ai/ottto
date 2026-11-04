@@ -212,9 +212,6 @@ impl<R: Read> Read for BoundedDecoder<R> {
 
 impl<R: Read> Drop for BoundedDecoder<R> {
     fn drop(&mut self) {
-        if self.physical_limit != u64::MAX {
-            return;
-        }
         crate::local_resource_diagnostics::traversal_point(
             "codex_zst_input",
             "codex",

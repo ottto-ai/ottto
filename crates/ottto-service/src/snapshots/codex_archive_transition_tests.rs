@@ -538,11 +538,10 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     // Repair to a disjoint same-id response through the shared native rows.
     let rows = codex_file_join::tests::member(MAIN, "side-response", 100, 400);
     let repaired = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
-    fs::write(
-        &sibling,
-        zstd::stream::encode_all(repaired.as_bytes(), 1).unwrap(),
-    )
-    .unwrap();
+    // Group replay still requires physical plaintext certificates. The
+    // provider's repaired plaintext takes the existing generic group path.
+    fs::remove_file(&sibling).unwrap();
+    fs::write(sibling.with_extension(""), repaired).unwrap();
     let (_, cold, _, _, _) = page(
         &c,
         ScanIndex::default(),
@@ -591,6 +590,7 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     money_oracle::assert_equivalent(&emitted(&index, &cold_a), &route(&index, &recovered, posts));
     let (mut index, _) = assert_quiet(&c, index, &accepted);
     // Unknown headers remain a wildcard, including a misleading owner name.
+    fs::remove_file(sibling.with_extension("")).unwrap();
     fs::write(&sibling, b"unknown header").unwrap();
     append(&c.path(OTHER), &turn(4));
     e2_pipeline_scan_fixture::age_listing_for_test(&mut index);

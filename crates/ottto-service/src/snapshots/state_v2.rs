@@ -50,9 +50,9 @@ pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carry_tail, erase_tail, inventory_tail, load_head, load_revisions, load_tail, observe_tail,
-    observe_tails, pending_carries, retire_tail, set_aside_tail, stage_tail, tail_head_keys,
-    tail_route_path, tail_set_aside,
+    carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail, observe_tails,
+    pending_carries, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
+    tail_set_aside,
 };
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(

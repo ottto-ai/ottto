@@ -26,6 +26,25 @@ use crate::snapshots::state_v2::{Collection, Shape as PageShape};
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
+/// Read only the existing head's dependency witness, never transcript bytes.
+pub(in crate::snapshots) fn sidecar_binding(
+    revision: u32,
+    body: &[u8],
+) -> Result<Option<String>, ReconstructCause> {
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Codex::decode_head(revision, body, &mut stored)?;
+    Ok(stored.codex_sidecar_binding)
+}
+
+pub(in crate::snapshots) fn owning_session(
+    revision: u32,
+    body: &[u8],
+) -> Result<Option<String>, ReconstructCause> {
+    let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Codex::decode_head(revision, body, &mut stored)?;
+    Ok(stored.source_session_id)
+}
+
 const DICTIONARY_G: u32 = 64;
 const PRIORITY_G: u32 = 256;
 const SIGNATURES_G: u32 = 256;

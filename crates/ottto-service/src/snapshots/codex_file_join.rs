@@ -573,7 +573,6 @@ impl HeaderInventory {
         // The second landing must preserve 11b's early skip and test warm -> held.
         let key = local_index_key(&path);
         self.reuse_misses += 1;
-        let before_step_bytes = self.read_bytes;
         let mut retry_candidate = None;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
@@ -590,25 +589,56 @@ impl HeaderInventory {
                 None,
             );
             retry_candidate = Some(candidate.clone());
-            let mut reused = index.as_deref().and_then(|index| {
-                let head = state_v2::load_head(index, &key, u32::MAX).ok()??;
-                let facts = head.common.inventory?;
+            if let Some(index) = index.as_deref_mut() {
+                if let Some(route) = state_v2::runtime_path(index)? {
+                    index
+                        .carry_codex_rollout(&route, &candidate, None)
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "Codex carry deferred",
+                            )
+                        })?;
+                }
+            }
+            let stored_head =
+                index
+                    .as_deref()
+                    .map(|index| {
+                        state_v2::load_head(index, &key,
+                <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION)
+                    })
+                    .transpose()?
+                    .flatten();
+            let mut reused = index.as_deref().zip(stored_head).and_then(|(index, head)| {
+                let facts = head.common.inventory.clone();
                 let current = open_candidate_beneath_root(&candidate)
                     .ok()?
                     .metadata()
                     .ok()?;
                 let stamp = FileStamp::capture(current.clone()).ok()?;
-                facts.stamp.matches_acquisition(&stamp).then(|| {
-                    (
-                        CachedHeader {
-                            stamp,
-                            owner: facts.owner,
-                            created_unix_ms: facts.created_unix_ms,
-                            read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
-                        },
-                        metadata_witness(&current),
-                    )
-                })
+                if index.codex_physical_matches(&key, &current).ok()? != Some(true) {
+                    return None;
+                }
+                let owner = facts
+                    .as_ref()
+                    .map(|facts| facts.owner.clone())
+                    .or_else(|| {
+                        tail_source::codex::owning_session(head.revision, &head.body)
+                            .ok()
+                            .flatten()
+                    })?;
+                Some((
+                    CachedHeader {
+                        stamp,
+                        owner,
+                        created_unix_ms: facts.as_ref().and_then(|facts| facts.created_unix_ms),
+                        read_bytes: facts.as_ref().map_or(0, |facts| {
+                            usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
+                        }),
+                    },
+                    metadata_witness(&current),
+                ))
             });
             if let Some((facts, _)) = &reused {
                 self.reuse_hits += 1;
@@ -663,29 +693,6 @@ impl HeaderInventory {
         })();
         match result {
             Ok(header) => {
-                if let Some(index) = index.as_deref() {
-                    if let Some(metadata) = open_candidate_beneath_root(&header.candidate)
-                        .and_then(|file| file.metadata())
-                        .ok()
-                        .filter(|metadata| {
-                            FileStamp::capture(metadata.clone())
-                                .is_ok_and(|stamp| header.stamp.same_content(&stamp))
-                        })
-                    {
-                        let _ = codex_rollout_carry::observe_codex_inventory(
-                            index,
-                            &key,
-                            state_v2::InventoryFacts {
-                                owner: header.owner.clone(),
-                                created_unix_ms: header.created_unix_ms,
-                                stamp: sampled_scan::codex_cursor::OpenStamp::of(&metadata)
-                                    .content_stamp(),
-                                read_bytes: self.read_bytes.saturating_sub(before_step_bytes)
-                                    as u64,
-                            },
-                        );
-                    }
-                }
                 self.headers.push(header);
             }
             Err(error) => {
@@ -741,20 +748,13 @@ impl HeaderInventory {
         }
         groups
     }
-    /// Resolve failed keys once per selection/boundary. A failed header without
-    /// current ownership is a wildcard; a body failure with a proven header
-    /// affects its owner and every member of that owner's group.
-    pub(super) fn affected_owners(
-        &self,
-        failed_keys: &BTreeSet<String>,
-    ) -> Option<BTreeSet<String>> {
+    /// Header uncertainty remains a wildcard; complete current headers name
+    /// only the owners whose cross-home membership conflicts.
+    pub(super) fn affected_owners(&self) -> Option<BTreeSet<String>> {
         if !self.complete || !self.pending.is_empty() {
             return None;
         }
         let mut affected = BTreeSet::new();
-        for key in self.refused.keys().chain(failed_keys) {
-            affected.insert(self.owner_for_path(Path::new(key))?.to_owned());
-        }
         let mut homes = BTreeMap::new();
         for header in &self.headers {
             if homes
@@ -792,8 +792,8 @@ impl HeaderInventory {
         Ok(checked_headers)
     }
     fn current_membership_failures(&self) -> Result<(BTreeSet<String>, usize)> {
-        let mut affected = self
-            .affected_owners(&BTreeSet::new())
+        let affected = self
+            .affected_owners()
             .context("Codex joining header inventory is incomplete")?;
         // Uniqueness spans all registered homes, even a home with no selected
         // owner. An unread or changed directory there may hide a new collision.
@@ -819,10 +819,10 @@ impl HeaderInventory {
                 continue;
             }
             let (current, _) = read_header_settled(&header.candidate).0?;
-            if current.owner != header.owner {
-                affected.insert(header.owner.clone());
-                affected.insert(current.owner);
-            }
+            anyhow::ensure!(
+                current.owner == header.owner,
+                "Codex joining header ownership changed"
+            );
         }
         Ok((affected, checked_headers))
     }
@@ -875,19 +875,6 @@ impl Validation {
             .intersection(owners)
             .cloned()
             .collect::<BTreeSet<_>>();
-        if selected.is_empty() {
-            return Ok(0);
-        }
-        let known = self
-            .inventory
-            .headers
-            .iter()
-            .map(|header| &header.owner)
-            .collect::<BTreeSet<_>>();
-        anyhow::ensure!(
-            selected.iter().all(|owner| known.contains(owner)),
-            "Codex publication owner is unproved"
-        );
         // One fresh roster check per home/boundary, independent of group count.
         // Never cache this result across capture, network or checkpoint boundaries.
         let checked_headers = self.inventory.validate_memberships(&selected)?;
@@ -897,37 +884,6 @@ impl Validation {
             }
         }
         Ok(checked_headers)
-    }
-    /// Reclassify a failed boundary once, then let the caller hold that subset
-    /// and freshly validate the survivors. An unknown header/namespace remains
-    /// a wildcard over every registered publication owner.
-    pub(super) fn invalid_owners(&self) -> BTreeSet<String> {
-        let affected = self
-            .inventory
-            .current_membership_failures()
-            .ok()
-            .map(|(affected, _)| affected);
-        let known = self
-            .inventory
-            .headers
-            .iter()
-            .map(|header| &header.owner)
-            .collect::<BTreeSet<_>>();
-        let mut invalid = self
-            .owners
-            .iter()
-            .filter(|owner| {
-                !known.contains(owner)
-                    || !self.inventory.membership_complete(owner, affected.as_ref())
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for group in &self.groups {
-            if Self::validate_group(group).is_err() {
-                invalid.insert(group.owner.clone());
-            }
-        }
-        invalid
     }
     /// Existing group-hold rollback also removes singleton publication owners.
     /// Keep the full inventory: other-home dependencies still constrain survivors.
@@ -2242,7 +2198,7 @@ pub(super) mod tests {
         assert!(inventory.refused.is_empty());
         assert_eq!(inventory.read_bytes, 0);
         assert!(!inventory.content_unchanged());
-        assert!(inventory.affected_owners(&BTreeSet::new()).is_none());
+        assert!(inventory.affected_owners().is_none());
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
         assert!(inventory.complete);
         assert_eq!(inventory.headers.len(), 1);
@@ -2362,43 +2318,17 @@ pub(super) mod tests {
             replay_group(group, None, &ScanIndex::default()),
             Err(GroupEnd::Strict)
         ));
-        let affected = inventory.affected_owners(&BTreeSet::from([local_index_key(&failed)]));
-        assert_eq!(affected, Some(BTreeSet::from([owner.clone()])));
-        assert!(!inventory.membership_complete(&owner, affected.as_ref()));
+        let affected = inventory.affected_owners();
+        assert!(inventory.membership_complete(&owner, affected.as_ref()));
         assert!(inventory.membership_complete(healthy, affected.as_ref()));
-        // Preserve the known failed key in existing refusal residue so boundary
-        // validators apply the very same dependency predicate.
-        inventory
-            .refused
-            .insert(local_index_key(&failed), path_witness(&failed));
         let validation = Validation::new(
             inventory.clone(),
             Vec::new(),
-            &BTreeSet::from([owner.clone(), healthy.into()]),
+            &BTreeSet::from([healthy.into()]),
         );
-        assert_eq!(validation.invalid_owners(), BTreeSet::from([owner.clone()]));
-        assert!(validation
-            .validate(&BTreeSet::from([healthy.into()]))
-            .is_ok());
-        assert!(validation.validate_all().is_err());
-        let mut surviving = validation.clone();
-        surviving.remove_owners(&BTreeSet::from([owner.clone()]));
-        assert!(surviving.validate_all().is_ok());
-        assert!(inventory
-            .affected_owners(&BTreeSet::from([local_index_key(
-                &root.join("unproved.jsonl")
-            )]))
-            .is_none());
+        assert!(validation.validate_all().is_ok());
         fs::write(&healthy_path, b"{malformed}\n").unwrap();
-        let validation = Validation::new(
-            inventory,
-            Vec::new(),
-            &BTreeSet::from([owner.clone(), healthy.into()]),
-        );
-        assert_eq!(
-            validation.invalid_owners(),
-            BTreeSet::from([owner, healthy.into()])
-        );
+        assert!(validation.validate_all().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2447,24 +2377,20 @@ pub(super) mod tests {
         let validation = Validation::new(inventory.clone(), Vec::new(), &selected);
         assert_eq!(validation.validate_all().unwrap(), 4);
         write(&remote_path, healthy);
-        assert_eq!(
-            validation.invalid_owners(),
-            BTreeSet::from([healthy.into()])
-        );
         assert!(validation
             .validate(&BTreeSet::from([owner.clone()]))
-            .is_ok());
+            .is_err());
         assert!(validation
             .validate(&BTreeSet::from([healthy.into()]))
             .is_err());
         fs::write(&remote_path, b"{unknown}\n").unwrap();
-        assert_eq!(validation.invalid_owners(), selected);
+        assert!(validation.validate_all().is_err());
         assert!(validation.validate_all().is_err());
         write(&remote_path, remote);
         assert!(validation.validate_all().is_ok());
         // A new unproved entry in an unselected home is still a wildcard.
         fs::write(other.join("late.jsonl"), b"{unknown}\n").unwrap();
-        assert_eq!(validation.invalid_owners(), selected);
+        assert!(validation.validate_all().is_err());
         assert!(validation.validate_all().is_err());
         fs::remove_dir_all(root).unwrap();
     }

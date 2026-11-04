@@ -63,6 +63,81 @@ impl ScanIndex {
             .map(|head| physical_matches(head, metadata)))
     }
 
+    /// Physical equality refines the ordinary decision without replacing its
+    /// audit, evidence, exact-body/context or sidecar dependency authority.
+    pub(super) fn codex_unchanged_decision(
+        &self,
+        candidate: &CandidateFile,
+        metadata: &CodexTitleMetadata,
+        now: u64,
+        body_witness_adoption: bool,
+        growth_only: bool,
+    ) -> Result<Option<(CandidateDecision, Option<CandidateParseReason>)>> {
+        let key = local_index_key(&candidate.path);
+        let file = open_candidate_beneath_root(candidate)?;
+        let stat = file.metadata()?;
+        if self.codex_physical_matches(&key, &stat)? != Some(true) {
+            return Ok(None);
+        }
+        let revision = <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION;
+        let head = state_v2::load_head(self, &key, revision)?.context("codex_carry_certificate")?;
+        let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
+            .filter(|value| !value.is_empty());
+        if tail_source::codex::sidecar_binding(head.revision, &head.body)
+            .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
+            != binding
+        {
+            return Ok(None);
+        }
+        let entry = self.files.get(&key).context("codex_carry_progress")?;
+        let mut logical = candidate.clone();
+        logical.size_bytes = entry.size_bytes;
+        logical.modified_unix_seconds = entry.modified_unix_seconds;
+        logical.modified_unix_nanos = entry
+            .modified_unix_nanos
+            .unwrap_or(entry.modified_unix_seconds.saturating_mul(1_000_000_000));
+        logical
+            .source_file_fingerprint
+            .clone_from(&entry.source_file_fingerprint);
+        Ok(Some(self.candidate_decision_with_reason_gated(
+            &logical,
+            now,
+            body_witness_adoption,
+            growth_only,
+        )))
+    }
+
+    /// Reconcile the discovered namespace before either absence consumer.
+    /// Failures retain ordinary pending/observation custody, never grant reads.
+    pub(super) fn prepare_codex_carries(&mut self, sampling: Option<&sampled_scan::Context>) {
+        let Some(walk) = self.traversal.as_ref() else {
+            return;
+        };
+        let paths = walk.codex_rollout_paths.clone();
+        let candidates: Vec<_> = paths
+            .iter()
+            .filter_map(|key| {
+                let path = Path::new(key);
+                if codex_file_join::shadowed_compressed_path(path, &paths) {
+                    return None;
+                }
+                let root = walk.owning_scan_root(path)?.clone();
+                let stat = fs::symlink_metadata(path).ok()?;
+                Some(codex_file_join::header_candidate(
+                    root,
+                    path.to_path_buf(),
+                    &stat,
+                ))
+            })
+            .collect();
+        let Ok(Some(route)) = state_v2::runtime_path(self) else {
+            return;
+        };
+        for candidate in candidates {
+            let _ = self.carry_codex_rollout(&route, &candidate, sampling);
+        }
+    }
+
     /// Called on a metadata-only candidate, before any sample/header/body read
     /// and before either absence-retirement path. Returns false for ordinary
     /// acquisition, including a newly materialized plaintext object.
@@ -77,16 +152,6 @@ impl ScanIndex {
             return Ok(false);
         }
         let home = codex_file_join::member_home(&candidate.scan_root);
-        let route = state_v2::runtime_path(self)?.context("codex_carry_route")?;
-        ensure!(
-            route == index_path && fs::canonicalize(&home)? == home,
-            "codex_carry_route"
-        );
-        // Exact sibling precedence belongs to discovery too. The carry cannot
-        // turn an extant plaintext into a second owner.
-        if codex_archive_path(&candidate.path) && !absent(&candidate.path.with_extension("")) {
-            return Ok(false);
-        }
         let sessions = codex_session_id_candidates_from_path(&candidate.path);
         let owners: BTreeSet<_> = sessions
             .iter()
@@ -116,6 +181,17 @@ impl ScanIndex {
         if possible.is_empty() {
             return Ok(false);
         }
+        // Existing observation custody also fences either retirement path if
+        // a carry precondition cannot be proved in this pass.
+        if let Some(walk) = self.traversal.as_mut() {
+            walk.observed_index_keys
+                .extend(possible.iter().map(|(from, _, _)| from.clone()));
+        }
+        let route = state_v2::runtime_path(self)?.context("codex_carry_route")?;
+        ensure!(
+            route == index_path && fs::canonicalize(&home)? == home,
+            "codex_carry_route"
+        );
         let file = open_candidate_beneath_root(candidate)?;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "codex_carry_nonregular");
@@ -274,6 +350,10 @@ impl ScanIndex {
         }
     }
 
+    pub(crate) fn has_pending_codex_carry(&self) -> Result<bool> {
+        Ok(!state_v2::pending_carries(self)?.is_empty())
+    }
+
     /// Align an owned committed baseline before local-hold/partial restoration.
     /// The paired stage is the authority; this never settles or copies ACKs.
     pub(crate) fn rehome_codex_carry_baseline(&mut self, working: &ScanIndex) -> Result<()> {
@@ -286,43 +366,6 @@ impl ScanIndex {
         }
         Ok(())
     }
-}
-
-/// Safely fill the existing optional facts from an ordinary proven header,
-/// preserving staged revisions and G7 first-change ages.
-pub(super) fn observe_codex_inventory(
-    index: &ScanIndex,
-    key: &str,
-    facts: state_v2::InventoryFacts,
-) -> Result<()> {
-    let Some(route) = state_v2::runtime_path(index)? else {
-        return Ok(());
-    };
-    let head = state_v2::load_head(
-        index,
-        key,
-        <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION,
-    )?;
-    // Header facts are independent of reduction. On an already reduced file,
-    // do not replace its checkpoint/carry stamp with a newly grown or edited
-    // header's stamp before those bytes have actually been applied.
-    if head.as_ref().is_some_and(|head| {
-        !head.metadata_only
-            && !head
-                .common
-                .inventory
-                .as_ref()
-                .is_some_and(|old| old.stamp == facts.stamp)
-            && tail_source::certified_content_stamp(&head.body).ok() != Some(facts.stamp)
-    }) {
-        return Ok(());
-    }
-    state_v2::inventory_tail(
-        &route,
-        key,
-        head.map_or_else(state_v2::Common::default, |head| head.common),
-        facts,
-    )
 }
 
 #[cfg(test)]

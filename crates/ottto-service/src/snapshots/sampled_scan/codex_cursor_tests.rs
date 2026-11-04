@@ -3629,7 +3629,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
                 (
                     candidate.census_member,
                     candidate.watcher_hint,
-                    codex_fresh_data_pending(candidate, &index.files),
+                    codex_fresh_data_pending(candidate, &index),
                 )
             })
     };

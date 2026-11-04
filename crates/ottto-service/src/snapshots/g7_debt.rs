@@ -645,7 +645,13 @@ impl<'a> Page<'a> {
         let Some(entry) = index.files.get(key) else {
             return live;
         };
-        let unchanged = entry.same_listing_stamp_as(metadata);
+        let unchanged = index.listing_stamp_matches(listing.path, metadata);
+        let len = if unchanged { entry.size_bytes } else { len };
+        live.len = len;
+        if unchanged {
+            live.representation = Representation::Tail;
+        }
+
         let birth = metadata.created().ok().and_then(unix_nanos);
         let same_object = entry.opened_birth_nanos == 0 || birth == Some(entry.opened_birth_nanos);
         let grown = !compressed && !unchanged && same_object && len > entry.size_bytes;
@@ -655,11 +661,7 @@ impl<'a> Page<'a> {
         // The stored size, never the live one: a matching Codex fragment's
         // entry records only its certified prefix.
         live.read = if unchanged || grown {
-            if compressed {
-                len
-            } else {
-                entry.size_bytes.min(len)
-            }
+            entry.size_bytes.min(len)
         } else {
             0
         };

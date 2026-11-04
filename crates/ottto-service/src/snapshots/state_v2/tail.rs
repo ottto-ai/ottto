@@ -328,6 +328,11 @@ impl TailStage {
             _ => None,
         }
     }
+    /// Graph-free saves cannot publish either half of a staged path carry.
+    pub(super) fn require_graph_free(&self) -> Result<()> {
+        ensure!(self.carries.is_empty(), Hold::ReloadRequired);
+        Ok(())
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.carries.is_empty()
             && self.files.is_empty()
@@ -1543,7 +1548,7 @@ pub(super) fn commit_exit(
     stage: &TailStage,
 ) -> Result<()> {
     // A graph-free exit cannot publish a path move's Tail half.
-    ensure!(stage.carries.is_empty(), Hold::ReloadRequired);
+    stage.require_graph_free()?;
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     let span = kinds::SaveSpan::begin(db);
     db.validate_save(identity, expected)?;
