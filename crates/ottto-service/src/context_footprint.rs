@@ -14,7 +14,8 @@ use crate::instruction_inventory::{
 };
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
+    load_snapshot_device_credentials, ActivityHintResponse, RelayTokenAuthorizationRejected,
+    SnapshotApiClient,
 };
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
@@ -422,6 +423,15 @@ fn harvest_recent_workspaces(
                     Ok(false) => skipped += 1,
                     Err(error) => {
                         failed += 1;
+                        if let Some(rejected) =
+                            error.downcast_ref::<RelayTokenAuthorizationRejected>()
+                        {
+                            eprintln!(
+                                "context footprint upload unauthorized: HTTP {}",
+                                rejected.status
+                            );
+                            continue;
+                        }
                         eprintln!(
                             "context footprint upload skipped for workspace_hash={}: {}",
                             request.workspace_hash,
@@ -683,7 +693,14 @@ fn capture_claude_context(
 }
 
 fn configure_claude_context_command(command: &mut Command, include_mcp_servers: bool) -> Duration {
-    command.args(["-p", "/context", "--output-format", "json"]);
+    // Like the /usage refresher: a probe must not leave a saved session behind.
+    command.args([
+        "-p",
+        "/context",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+    ]);
     if !include_mcp_servers {
         // Keep strict mode everywhere except the single sampled workspace.
         // Dropping it globally would double-count MCP across the context and
@@ -1817,7 +1834,8 @@ mod tests {
                 payload
             );
             let arguments = fs::read_to_string(fixture.fake.root.join("arguments")).unwrap();
-            assert!(arguments.starts_with("\n-p\n/context\n--output-format\njson\n"));
+            assert!(arguments
+                .starts_with("\n-p\n/context\n--no-session-persistence\n--output-format\njson\n"));
             assert_eq!(arguments.contains("--strict-mcp-config"), !sampled);
             assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
         }
