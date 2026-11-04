@@ -1315,9 +1315,6 @@ where
     (id_less, points_refused)
 }
 
-/// Past this a Codex file's cache observations are incomplete; usage is unaffected.
-const MAX_CODEX_CACHE_REQUESTS_PER_FILE: usize = 65_536;
-
 mod wire;
 pub use wire::batch_validation::validate_snapshot_batch_request;
 pub(crate) use wire::batch_validation::validate_snapshot_batch_request_with_item_limit;
@@ -12195,8 +12192,8 @@ impl SnapshotAccumulator {
             Vec::new()
         };
         if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
-            // An incomplete book (over 65,536 records, or an incomplete
-            // physical read report) cannot certify an exact omitted count.
+            // An incomplete physical read report cannot certify an exact
+            // omitted count.
             self.cache_observations = Some(cache_wire(
                 &source_session_id,
                 self.cache_requests.iter(),
@@ -16703,34 +16700,6 @@ impl OwnedSourceScan {
                             pending!();
                         }
                     }
-                }
-                let retained_bytes = index
-                    .files
-                    .iter()
-                    .filter(|(key, _)| !applied_receipts.contains_key(*key))
-                    .filter_map(|(_, entry)| entry.codex_applied_tier_receipt.as_ref())
-                    .map(|receipt| receipt.retained_bytes())
-                    .sum::<usize>();
-                let incoming_bytes = applied_receipts
-                    .values()
-                    .flatten()
-                    .map(|receipt| receipt.retained_bytes())
-                    .sum::<usize>();
-                if retained_bytes.saturating_add(incoming_bytes)
-                    > codex_file_join::MAX_RECEIPT_BYTES
-                {
-                    if let Some((context, publication)) =
-                        sampling.as_ref().zip(cursor_publication.take())
-                    {
-                        context.cache.cursor_published(publication, false);
-                    }
-                    census.ownership_incomplete_file_count += aliases.len().max(1);
-                    census.causes.add(ownership::GROUP, aliases.len().max(1));
-                    census.record_unreadable(UnreadableCause::AliasParser, 1);
-                    residue_index_keys.insert(local_index_key(&candidate.path));
-                    residue_index_keys
-                        .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                    pending!();
                 }
                 // The existing copy budget funds two simultaneous allocations:
                 // retained reduction and native finish/output. Reserve the extra
@@ -23079,11 +23048,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .and_then(|(end, start)| cache_observations::elapsed_seconds(end, start));
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
-        if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
-            accumulator.cache_requests.push(request);
-        } else {
-            accumulator.cache_requests_complete = false;
-        }
+        accumulator.cache_requests.push(request);
         accumulator.cache_pending_idle = None;
     }
     if accumulator.source_session_id.is_none() {
@@ -33636,10 +33601,9 @@ impl ScanIndex {
         &self,
         previous: &ScanIndex,
         snapshots: &[SnapshotItem],
-    ) -> (ScanIndex, BTreeSet<String>, BTreeSet<String>) {
+    ) -> (ScanIndex, BTreeSet<String>) {
         let mut staged = previous.clone();
         let mut changed = BTreeSet::new();
-        let mut held = BTreeSet::new();
         let by_source = snapshots
             .iter()
             .filter_map(|item| {
@@ -33711,59 +33675,13 @@ impl ScanIndex {
                 .or_default()
                 .push((key.clone(), capture));
         }
-        let bytes = |files: &SharedMap<String, ScanIndexEntry>| {
-            files
-                .values()
-                .flat_map(|entry| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                })
-        };
-        let mut retained = bytes(&staged.files);
         for (owner, entries) in by_owner {
-            let old = entries
-                .iter()
-                .filter_map(|(key, _)| staged.files.get(key))
-                .flat_map(|entry| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                });
-            let new = entries
-                .iter()
-                .flat_map(|(_, entry)| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                });
-            let next = retained.saturating_sub(old).saturating_add(new);
-            if next > codex_file_join::MAX_RECEIPT_BYTES {
-                held.insert(owner);
-                continue;
-            }
-            retained = next;
             changed.insert(owner);
             for (key, entry) in entries {
                 staged.files.insert(key, entry);
             }
         }
-        (staged, changed, held)
+        (staged, changed)
     }
     pub(crate) fn reconcile_codex_recovery_settlement(
         &mut self,
@@ -47737,6 +47655,38 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [regress] A file past the former 65,536-request limit keeps every owned
+    /// request and certifies complete cache coverage.
+    #[test]
+    fn cache_codex_file_past_former_request_limit_keeps_every_request() {
+        let root = temp_dir("cache-codex-request-limit");
+        let id = "00000000-0000-7000-8000-000000000002";
+        let path = root.join(format!("rollout-{id}.jsonl"));
+        let mut body = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","timestamp":"2026-09-30T10:00:00Z","payload":{"id":id}}),
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}})
+        );
+        let requests = 65_537;
+        for index in 0..requests {
+            body.push_str(&format!(
+                "{}\n",
+                json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:01Z","payload":{"response_id":format!("resp_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"cache_write_input_tokens":0,"output_tokens":1}}})
+            ));
+        }
+        fs::write(&path, body).unwrap();
+        let parsed = parse_codex_test(&path);
+        fs::remove_dir_all(root).unwrap();
+        assert!(parsed.report.complete());
+        let item = &parsed.snapshots[0];
+        assert_eq!(item.cache_requests.len(), requests);
+        assert!(item.cache_requests_complete);
+        assert_eq!(
+            item.cache_observations.as_ref().unwrap().coverage,
+            "complete"
+        );
     }
 
     #[test]

@@ -7523,14 +7523,8 @@ fn capture_codex_recovery_evidence(
     progress_path: &Path,
     validate_authority: impl Fn() -> Result<()>,
 ) {
-    let (mut captured, changed, held) =
+    let (mut captured, changed) =
         index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
-    scan_result.hold_codex_groups(
-        index,
-        committed_index,
-        &held,
-        "recovery capture exceeds retained evidence cap",
-    );
     if !changed.is_empty() {
         let protected = scan_result
             .snapshots
