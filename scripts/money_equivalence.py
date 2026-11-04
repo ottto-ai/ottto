@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from collections import Counter
 
 
 def command(args, **kwargs):
@@ -26,10 +27,29 @@ DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision")
 BASE_ONLY_DISK_FIXTURES = ("downgrade_then_reupgrade",)
 
 
-# Only base -> head ADDITIONS at the batch envelope may be ignored. Never
-# allowlist money or identity fields (including usage, cost, bucket, refusal or
-# request fields). This is a capability declaration, not snapshot content.
-# Additions must also match the exact string values below.
+# Base and head bodies must match exactly. The only accepted difference is a
+# new key ADDED where both sides have the record, and only when it is not money:
+# - In-tree, for every PR: a batch-envelope capability constant listed below,
+#   with exactly the string value below.
+# - Per PR: a key the PR body declares (see parse_declarations). The receipts
+#   must show no changed or removed path, and every added path must be declared.
+#   A declared key is a direct child of a batch envelope (a `*_contract` key
+#   with an exact non-empty string) or of a snapshot present on both sides
+#   (a new key, not in the snapshot schema, whose value is exactly [] or {}).
+#   A key found anywhere in the base body never qualifies: that field moved.
+#   New entities (a snapshot, bucket, request or data-map key) and anything
+#   nested deeper never qualify. A declaration belongs to its PR only; a run
+#   with an explicit base, or without a unique open PR, has none.
+# Never accept money or identity fields here: tokens, cost, request or
+# response counts, model, placement, account or organization identity, or
+# upload/ACK state that feeds money.
+# An INTENDED money change uses the same block's `money` part, signed by the
+# PR's independent money review: for each fixture, every remaining path with
+# its class (added, changed or removed) and a sha256 over its raw path (every
+# real key and index, including redacted ones) and its value. The gate passes
+# only if the observed remaining diff equals that list exactly; any extra,
+# missing, reclassified, re-keyed or re-valued path stays red. The base is never
+# changed, and the signature never carries to another PR or a release cut.
 ENVELOPE_ADDITION_ALLOWLIST = {
     # Keep in sync with snapshots.rs::USAGE_DECREASE_HOLD_ACK_CONTRACT.
     "usage_decrease_hold_ack_contract": "usage_decrease_hold_ack:v1",
@@ -87,6 +107,134 @@ _ENVELOPE_DIFF_SCHEMA = {key: {} for key in (
 )}
 _ENVELOPE_DIFF_SCHEMA["snapshots"] = _SNAPSHOT_DIFF_SCHEMA
 
+DECLARATIONS_INFO = "money-eq-declared-additions"
+# A CommonMark fence line: indent 0-3, then 3+ backticks or 3+ tildes.
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+MONEY_CLASSES = ("added", "changed", "removed")
+_SHA = re.compile(r"[0-9a-f]{64}")
+_HEAD = re.compile(r"[0-9a-f]{40}")
+
+
+def _schema_keys(schema):
+    return set(schema).union(*(_schema_keys(child) for child in schema.values()))
+
+
+def parse_declarations(body):
+    """Return the PR body's declared additions, or None without a block.
+
+    The block is one fenced code block with the info string above, holding
+    {"envelope": {key: value}, "snapshot": {key: value}, "money": {...}}; any
+    part may be omitted. Anything else fails closed.
+    """
+    # Follow fences like CommonMark: nothing inside a fence opens another, and a
+    # fence closes only with the same character, at least as long, and no info.
+    blocks, fence, block = [], None, None
+    for line in (body or "").replace("\r\n", "\n").split("\n"):
+        match = _FENCE.match(line)
+        if fence is None:
+            if match and not (match[1][0] == "`" and "`" in match[2]):
+                fence = match[1]
+                block = [] if match[2].strip() == DECLARATIONS_INFO else None
+        elif (match and match[1][0] == fence[0] and len(match[1]) >= len(fence)
+              and not match[2].strip()):
+            if block is not None:
+                blocks.append("\n".join(block))
+            fence = block = None
+        elif block is not None:
+            block.append(line)
+    if block is not None:
+        raise RuntimeError("declared additions: unterminated block")
+    if not blocks:
+        return None
+    if len(blocks) > 1:
+        raise RuntimeError("declared additions: more than one block")
+    try:
+        parsed = json.loads(blocks[0], parse_float=Decimal, parse_constant=_reject_constant,
+                            object_pairs_hook=_json_object)
+    except ValueError as error:
+        raise RuntimeError(f"declared additions: invalid JSON ({error})") from None
+    if not isinstance(parsed, dict) or not parsed.keys() <= {"envelope", "snapshot", "money"}:
+        raise RuntimeError("declared additions: expected an object with envelope/snapshot/money parts")
+    snapshot_vocabulary = _schema_keys(_SNAPSHOT_DIFF_SCHEMA)
+    for part, declared in parsed.items():
+        if not isinstance(declared, dict):
+            raise RuntimeError(f"declared additions: {part} must be an object")
+        if part == "money":
+            continue
+        for key, value in declared.items():
+            if part == "envelope":
+                if not key.endswith("_contract") or key in ENVELOPE_ADDITION_ALLOWLIST:
+                    raise RuntimeError(f"declared additions: envelope key {key!r} is not a new *_contract")
+                if type(value) is not str or not value:
+                    raise RuntimeError(f"declared additions: envelope {key!r} needs a non-empty string")
+            else:
+                if not key or key in snapshot_vocabulary:
+                    raise RuntimeError(f"declared additions: snapshot key {key!r} is schema vocabulary")
+                if type(value) not in (list, dict) or value:
+                    raise RuntimeError(f"declared additions: snapshot {key!r} must be [] or {{}}")
+            if key.startswith("<key#"):
+                raise RuntimeError(f"declared additions: {key!r} looks like a redacted-key label")
+    if "money" in parsed:
+        _check_money(parsed["money"], {*parsed.get("envelope", {}), *parsed.get("snapshot", {})})
+    return parsed
+
+
+def _check_money(money, declared_keys):
+    """Validate a signed expected money diff; fail closed."""
+    if money.keys() != {"signed_by", "head", "diff"}:
+        raise RuntimeError("declared additions: money needs exactly signed_by, head and diff")
+    signed_by = money["signed_by"]
+    if type(signed_by) is not str or not signed_by.strip() or len(signed_by) > 200 or not signed_by.isprintable():
+        raise RuntimeError("declared additions: money signed_by must be a printable 1-200 char string")
+    if type(money["head"]) is not str or not _HEAD.fullmatch(money["head"]):
+        raise RuntimeError("declared additions: money head must be 40 lowercase hex")
+    if not isinstance(money["diff"], dict):
+        raise RuntimeError("declared additions: money diff must be an object")
+    for fixture, entries in money["diff"].items():
+        if not isinstance(entries, list):
+            raise RuntimeError(f"declared additions: money diff {fixture!r} must be a list")
+        paths = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.keys() != {"path", "class", "sha256"}:
+                raise RuntimeError(f"declared additions: money entry in {fixture!r} needs path, class, sha256")
+            path = entry["path"]
+            if type(path) is not str or not path.startswith("/") or path in paths:
+                raise RuntimeError(f"declared additions: money path {path!r} in {fixture!r} is bad or repeated")
+            paths.add(path)
+            if entry["class"] not in MONEY_CLASSES:
+                raise RuntimeError(f"declared additions: money class {entry['class']!r} is not one of {MONEY_CLASSES}")
+            if type(entry["sha256"]) is not str or not _SHA.fullmatch(entry["sha256"]):
+                raise RuntimeError(f"declared additions: money sha256 for {path!r} must be 64 lowercase hex")
+            leaf = path.rsplit("/", 1)[1].replace("~1", "/").replace("~0", "~")
+            if leaf in declared_keys:
+                raise RuntimeError(f"declared additions: {path!r} is both a non-money addition and money")
+
+
+def signed_money_lists(declarations, fixtures):
+    """{fixture: signed entries} when a money part exists, else None."""
+    money = (declarations or {}).get("money")
+    if money is None:
+        return None
+    unknown = sorted(set(money["diff"]) - set(fixtures))
+    if unknown:
+        raise RuntimeError(f"declared additions: money diff names unknown fixtures {unknown}")
+    return {name: money["diff"].get(name, []) for name in fixtures}
+
+
+def pr_declarations(prs, explicit):
+    """(PR number, declarations) for the branch's unique open PR, else (None, None)."""
+    if explicit or len(prs) != 1:
+        return None, None
+    return prs[0]["number"], parse_declarations(prs[0].get("body"))
+
+
+def canonical_declarations(declarations):
+    """(canonical JSON, sha256), or (None, None) without declarations."""
+    if declarations is None:
+        return None, None
+    text = json.dumps(declarations, sort_keys=True, separators=(",", ":"))
+    return text, hashlib.sha256(text.encode()).hexdigest()
+
 
 def _json_object(pairs):
     result = {}
@@ -101,11 +249,28 @@ def _reject_constant(_value):
     raise ValueError("non-finite JSON number")
 
 
-def _load_json(data, path):
+class _JsonNumber(str):
+    """A body number's exact JSON text: 0.01 vs 1e-2 or 0 vs -0 differ.
+
+    A distinct type, so a number never equals a string (or a bool).
+    """
+    __slots__ = ()
+
+
+_BYTE = re.compile(r"0|[1-9][0-9]{0,2}")
+
+
+def _is_byte(value):
+    exact = type(value) is _JsonNumber and _BYTE.fullmatch(value)
+    return (type(value) is int or exact) and 0 <= int(value) <= 255
+
+
+def _load_json(data, path, exact_numbers=False):
     try:
-        # Exact decimals avoid hiding cost changes through float rounding.
-        return json.loads(data, parse_float=Decimal, parse_constant=_reject_constant,
-                          object_pairs_hook=_json_object)
+        # Exact number text never hides a cost change through rounding or respelling.
+        return json.loads(data, parse_float=_JsonNumber if exact_numbers else Decimal,
+                          parse_int=_JsonNumber if exact_numbers else None,
+                          parse_constant=_reject_constant, object_pairs_hook=_json_object)
     except (ValueError, UnicodeDecodeError):
         # Errors, like diffs, must never print body values.
         raise ValueError(f"invalid JSON at {path or '/'}") from None
@@ -122,10 +287,10 @@ def decode_receipt(data):
         raise ValueError("expected nonempty receipt array at /")
 
     def body(value, path):
-        if not isinstance(value, list) or not value or any(
-                type(byte) is not int or not 0 <= byte <= 255 for byte in value):
+        # Bodies keep exact number text; their encoded batches are byte arrays.
+        if not isinstance(value, list) or not value or not all(map(_is_byte, value)):
             raise ValueError(f"expected encoded body at {path}")
-        return _load_json(bytes(value), path)
+        return _load_json(bytes(map(int, value)), path, exact_numbers=True)
 
     decoded, envelopes = [], set()
     for i, encoded in enumerate(receipt):
@@ -149,52 +314,139 @@ def decode_receipt(data):
     return decoded, envelopes
 
 
-def receipt_diff(base, head):
-    """Structural paths only; order and JSON scalar types remain significant."""
+def _object_keys(value):
+    if isinstance(value, dict):
+        return set(value).union(*map(_object_keys, value.values()))
+    if isinstance(value, list):
+        return set().union(*map(_object_keys, value))
+    return set()
+
+
+def _canonical_value(value):
+    """Sorted keys, compact separators, UTF-8; numbers keep their JSON text."""
+    if type(value) is _JsonNumber:
+        return str(value)
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(key, ensure_ascii=False) + ":" + _canonical_value(value[key])
+                              for key in sorted(value)) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_canonical_value, value)) + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def value_sha256(value):
+    return hashlib.sha256(_canonical_value(value).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def entry_sha256(raw_path, value):
+    """Digest of {"path": raw segments from the receipt root, "value": value}.
+
+    Display paths redact opaque keys as ordinals; the raw path binds which key
+    it really is (never printed), so a renamed key cannot reuse a signature.
+    """
+    return value_sha256({"path": list(raw_path), "value": value})
+
+
+def _entry_key(entry):
+    return entry["path"], entry["class"], entry["sha256"]
+
+
+def signed_mismatch(observed, signed):
+    """(missing, extra): signed entries not observed, observed entries not signed."""
+    missing = Counter(map(_entry_key, signed))
+    missing.subtract(map(_entry_key, observed))
+    extra = Counter(map(_entry_key, observed))
+    extra.subtract(map(_entry_key, signed))
+
+    def entries(counts):
+        return [dict(zip(("path", "class", "sha256"), key))
+                for key in sorted(counts) for _ in range(counts[key])]
+    return entries(missing), entries(extra)
+
+
+def receipt_diff(base, head, declarations=None, signed=None):
+    """Structural paths only; order and JSON scalar types remain significant.
+
+    `observed` lists each remaining (not allowed) path with its class and the
+    entry_sha256 of its raw path and head value (base value when removed).
+    With `signed` (the fixture's signed money list), an exact match moves them
+    to signed_money.
+    """
     left, left_envelopes = decode_receipt(base)
     right, right_envelopes = decode_receipt(head)
     envelopes = left_envelopes & right_envelopes
     display_envelopes = left_envelopes | right_envelopes
-    diff = {kind: [] for kind in ("added", "removed", "changed", "allowed_additions")}
+    declarations = declarations or {}
+    # A key the base already has anywhere was moved, not added.
+    base_keys = _object_keys(left)
+    diff = {kind: [] for kind in ("added", "removed", "changed", "allowed_additions",
+                                  "signed_money", "signed_missing")}
+    observed = []
+
+    def record(kind, path, raw, value):
+        diff[kind].append(path)
+        observed.append({"path": path, "class": kind, "sha256": entry_sha256(raw, value)})
 
     def child(path, key):
         # RFC 6901 JSON Pointer escaping keeps paths unambiguous.
         return path + "/" + str(key).replace("~", "~0").replace("/", "~1")
 
-    def walk(a, b, path, schema):
+    def walk(a, b, path, raw, schema, scope=None):
+        # raw: the real key/index segments of path, for entry digests only.
+        # scope: "envelope" for a batch envelope on both sides, "snapshot" for
+        # an index of its snapshots list present on both sides, else None.
         if path in display_envelopes:
             schema = _ENVELOPE_DIFF_SCHEMA
+            scope = "envelope" if path in envelopes else None
+        declared = declarations.get(scope, {}) if isinstance(a, dict) else {}
         if type(a) is not type(b):
-            diff["changed"].append(path)
+            record("changed", path, raw, b)
         elif isinstance(a, dict):
             # Stable ordinals use the sorted base/head union, independently of
             # insertion order or which side owns a key. Never print raw data keys.
-            labels = {key: key if key in schema else f"<key#{i}>"
+            labels = {key: key if key in schema or key in declared else f"<key#{i}>"
                       for i, key in enumerate(sorted(a.keys() | b.keys()))}
             for key in sorted(b.keys() - a.keys()):
-                kind = ("allowed_additions" if path in envelopes and
-                        key in ENVELOPE_ADDITION_ALLOWLIST and
-                        type(b[key]) is str and
-                        b[key] == ENVELOPE_ADDITION_ALLOWLIST[key] else "added")
-                diff[kind].append(child(path, labels[key]))
+                allowed = (scope == "envelope" and key in ENVELOPE_ADDITION_ALLOWLIST and
+                           type(b[key]) is str and b[key] == ENVELOPE_ADDITION_ALLOWLIST[key])
+                allowed = allowed or (key in declared and key not in base_keys and
+                                      type(b[key]) is type(declared[key]) and
+                                      b[key] == declared[key])
+                if allowed:
+                    diff["allowed_additions"].append(child(path, labels[key]))
+                else:
+                    record("added", child(path, labels[key]), raw + (key,), b[key])
             for key in sorted(a.keys() - b.keys()):
-                diff["removed"].append(child(path, labels[key]))
+                record("removed", child(path, labels[key]), raw + (key,), a[key])
             for key in sorted(a.keys() & b.keys()):
-                walk(a[key], b[key], child(path, labels[key]), schema.get(key, {}))
+                walk(a[key], b[key], child(path, labels[key]), raw + (key,), schema.get(key, {}),
+                     "snapshots" if scope == "envelope" and key == "snapshots" else None)
         elif isinstance(a, list):
             for i in range(min(len(a), len(b))):
-                walk(a[i], b[i], child(path, i), schema)
-            diff["removed"].extend(child(path, i) for i in range(len(b), len(a)))
-            diff["added"].extend(child(path, i) for i in range(len(a), len(b)))
+                walk(a[i], b[i], child(path, i), raw + (i,), schema,
+                     "snapshot" if scope == "snapshots" else None)
+            for i in range(len(b), len(a)):
+                record("removed", child(path, i), raw + (i,), a[i])
+            for i in range(len(a), len(b)):
+                record("added", child(path, i), raw + (i,), b[i])
         elif a != b:
-            diff["changed"].append(path)
+            record("changed", path, raw, b)
 
-    walk(left, right, "", {})
+    walk(left, right, "", (), {})
+    diff["observed"] = observed
+    if signed is not None:
+        missing, extra = signed_mismatch(observed, signed)
+        # A signed path that did not occur fails too, even with nothing observed.
+        diff["signed_missing"] = [entry["path"] for entry in missing]
+        if not missing and not extra:
+            diff["signed_money"] = observed
+            for kind in MONEY_CLASSES:
+                diff[kind] = []
     return diff
 
 
 def has_forbidden_diff(diff):
-    return any(diff[kind] for kind in ("added", "removed", "changed"))
+    return any(diff[kind] for kind in ("added", "removed", "changed", "signed_missing"))
 
 
 def require_base_scan_fixture(base):
@@ -221,11 +473,12 @@ def main():
     receipts.mkdir(parents=True)
     ref = os.environ.get("MONEY_EQUIVALENCE_BASE", "").strip()
     explicit = bool(ref)
+    prs = []
     if not ref:
         # workflow_dispatch has no pull_request payload. Resolve the branch's
         # unique open PR base; never assume its base is the candidate branch.
         prs = json.loads(output(["gh", "pr", "list", "--head", os.environ["GITHUB_REF_NAME"],
-                                "--json", "baseRefName"]))
+                                "--json", "number,baseRefName,body"]))
         bases = {pr["baseRefName"] for pr in prs}
         if len(bases) > 1:
             raise RuntimeError("ambiguous PR base: supply money_equivalence_base")
@@ -245,10 +498,35 @@ def main():
         # base changes are not this branch's.
         base_sha = output(["git", "merge-base", base_sha, "HEAD"])
     head_sha = output(["git", "rev-parse", "HEAD"])
-    manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
+    # Declarations come from the public PR body, so the receipt records them.
+    pr_number, declarations = pr_declarations(prs, explicit)
+    declared_text, declared_sha = canonical_declarations(declarations)
+    print(f"MONEY_EQUIVALENCE_DECLARATIONS {declared_sha or 'none'} {declared_text or 'none'}",
+          flush=True)
+    money = (declarations or {}).get("money")
+    _, money_sha = canonical_declarations(money)
+    manifest = {"base": base_sha, "head": head_sha, "base_ref": ref, "pr": pr_number,
+                "declarations": declared_text,
+                "money_signed_by": money and money["signed_by"],
+                "money_signed_head": money and money["head"],
+                "money_signed_sha256": money_sha,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
                 "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES)}
+    if declared_sha:
+        manifest["declarations_sha256"] = declared_sha
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    declared_keys = sorted(f"{part}.{key}" for part in ("envelope", "snapshot")
+                           for key in (declarations or {}).get(part, {}))
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as f:
+        f.write(f"Money equivalence declared additions (PR {pr_number or 'none'}, head `{head_sha}`): "
+                f"{', '.join(declared_keys) or 'none'}; sha256 `{declared_sha or 'none'}`; "
+                f"`{declared_text or 'none'}`.\n\n")
+        if money:
+            signed_line = (f"MONEY_EQUIVALENCE_SIGNED_FILE {money_sha} signed_by={money['signed_by']} "
+                           f"signed_head={money['head']} built_head={head_sha}")
+            print(signed_line, flush=True)
+            f.write(f"Money equivalence signed money diff: `{signed_line}` "
+                    f"head_matches_signed: {str(money['head'] == head_sha).lower()}.\n\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
     try:
@@ -300,6 +578,7 @@ def main():
         if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
             raise RuntimeError("missing or extra fixture receipts")
         failures = []
+        signed_lists = signed_money_lists(declarations, names)
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
             if (left / inputs).read_bytes() != (right / inputs).read_bytes():
@@ -313,8 +592,18 @@ def main():
                     digest = directory / body_name.with_suffix(".sha256")
                     if digest.read_text() != hashlib.sha256(data).hexdigest():
                         raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
+            signed = None if signed_lists is None else signed_lists[name]
             diff = receipt_diff((left / cross_name).read_bytes(),
-                                (right / cross_name).read_bytes())
+                                (right / cross_name).read_bytes(), declarations, signed)
+            # Paths, classes and value digests only: the review signs these lines.
+            observed = diff.pop("observed")
+            if observed:
+                print(f"MONEY_EQUIVALENCE_OBSERVED {name} " + json.dumps(observed), flush=True)
+            if signed is not None:
+                missing, extra = signed_mismatch(observed, signed)
+                print(f"MONEY_EQUIVALENCE_SIGNED {name} " + (
+                    "MATCH" if not missing and not extra else
+                    f"MISMATCH missing={json.dumps(missing)} extra={json.dumps(extra)}"), flush=True)
             print(f"MONEY_EQUIVALENCE_DIFF {name} " + json.dumps(diff, sort_keys=True), flush=True)
             if has_forbidden_diff(diff):
                 failures.append(name)
