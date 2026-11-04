@@ -4378,7 +4378,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         let populated = page(&root, &paths, &cache);
         assert_eq!(populated.reuse_misses, paths.len());
         assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
             .unwrap());

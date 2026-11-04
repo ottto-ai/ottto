@@ -434,7 +434,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `durable_tail_restart_full_alarm` | retired: `tail_reconstruct_after_head` counts each case |
 | `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
-| `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
+| `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads` (reuse is `tail_db_loads.hit`). Retired on the page block; `restore_outcome.miss` stays |
 | `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
 | `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
 | `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
@@ -1389,29 +1389,24 @@ counters rather than treating diagnostic row count as a page/file count.
   next real content change. User effect: such sessions may show no
   subscription until then.
 
-`retained_cache_page_events` reuses the existing cache lifecycle event keys and
-sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
-`copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
-`prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
-cumulative, cross-source and labelled `unknown`), these are exact deltas from
-operations executed by that source's page. Eviction/clear counts describe the
-causing page, **not** the source of each victim in the shared cache. No victim
-identity/history is retained. Existing refusal causes include entry/key/frozen
-charge, layout/disabled, live reservation, missing/invalid plan, incomplete or
-lossy reduction, unsealed EOF, clone/finalization bounds and poisoned locks.
+`retained_cache_page_events` keeps its name but carries only the content-free
+page counters that share `process_retained_cache_lifecycle_totals`' event keys:
+`prefix_excluded_bodies`, `prefix_tag_clears`, `pi_cost_refused_overflow`,
+`pi_cost_precision_rounded`, `pi_fork_copies_skipped_entries`,
+`pi_fork_copies_skipped_tokens`, `codex_non_default_thread_tier`,
+`usage_iteration_model_differs` and `usage_unknown_numeric_key`. Unlike the
+process totals (cumulative, cross-source, labelled `unknown`), these are exact
+deltas from that source's page.
 
-Three additional page-only keys refine those existing sites:
-
-- `insert_count_entries_evicted` and `insert_byte_entries_evicted` partition
-  `insert_entries_evicted`: each victim counts as count pressure when the count
-  cap is exceeded before removal, otherwise byte/layout-bound pressure. Entry
-  bound refusals remain `insert_entry_bound_refused`; they are not evictions.
-- `reinsert_failed`: one destructive cache hit whose acquisition ends without a
-  successful reinsertion, including eligibility/prepare/parse/retention failure
-  and refused insertion. A fixed boolean follows the active read across steps;
-  it stores no identity and disarms only after admission. Events are recorded
-  when that attempt ends, potentially on a later cooperative step. Process
-  termination cannot report an unfinished attempt.
+The in-memory reduction cache is gone: every continuation loads its stored
+Tail state, counted by `tail_db_loads` (reuse is `tail_db_loads.hit`). Its
+keys are no longer emitted: `take_*`, `insert_*`,
+`cursor_reservation_entries_evicted`, `copy_refusal_*`, `clear_*`,
+`retention_*`, `insert_count_entries_evicted`, `insert_byte_entries_evicted`,
+`reinsert_failed`, and in `sampled_acquisition.acquisition_admission`
+`cache_lookup_miss_unknown_origin`, `retained_entry` and
+`retained_entry_rejected_by_eligibility`. `sampled_audit_account_release`
+no longer reports `marker_staged`.
 
 All diagnostics are best-effort local stderr observations. Their counters never
 feed collection, proof, save, memory admission, account attribution or upload
@@ -1541,9 +1536,9 @@ The digest is RAM-only authority and is never emitted in diagnostic records.
 
 Completed `native_collection_page` records can include
 `counts.full_causes.restore_outcome.miss.<class>` for every source: saturating
-u64 counts, scoped to that page, of files read with neither a retained
-reduction nor a Tail load, by the class below. A Tail load's outcome is counted
-by `tail_db_loads` instead.
+u64 counts, scoped to that page, of files read without a Tail load, by the
+class below. A Tail load's outcome is counted by `tail_db_loads` instead; reuse
+is `tail_db_loads.hit`, with no `restored` alias.
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.

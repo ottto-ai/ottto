@@ -739,9 +739,8 @@ impl ApcFixture {
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
         // The production finish order. The opt-in account-audit release has
-        // an empty cache, so no retained custody: a released hold's entry is
-        // cleared and queued for retry.
-        let no_custody = crate::snapshots::sampled_scan::SharedCache::default();
+        // no retained custody: a released hold's entry is cleared and queued
+        // for retry.
         let fully_settled = finish_selected_settlement(
             &mut index,
             SelectedSettlementInputs {
@@ -755,7 +754,6 @@ impl ApcFixture {
                 comparison: None,
                 audit_release: self.audit_release.get().then_some(AccountAuditRelease {
                     previous: &committed_index,
-                    cache: &no_custody,
                     roots: std::slice::from_ref(&self.root),
                     backfill_window_days: 183,
                 }),

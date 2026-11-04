@@ -802,42 +802,33 @@ fn test_latch() -> &'static AtomicBool {
     Box::leak(Box::new(AtomicBool::new(false)))
 }
 
-/// W8(a), W9: a worker that panics while holding any of the cache's locks
+/// W8(a), W9: a worker that panics while holding the cache's cursor lock
 /// comes back as `Failed`; the latch then refuses every further ticket and
-/// readiness, and the poisoned or recovered lock fails closed.
+/// readiness, and the poisoned lock fails closed.
 #[test]
-fn a_worker_panic_under_any_cache_lock_latches_and_fails_closed() {
-    use crate::snapshots::sampled_scan::TestLock;
-    for lock in [TestLock::Cursor, TestLock::Retained] {
-        let cache = Arc::new(SharedCache::default());
-        let dir = std::env::temp_dir();
-        let mut port = CodexContinuation::new(&cache, &dir, &dir);
-        port.latch = test_latch();
-        let panicked = on_worker(|| cache.panic_under_lock_for_test(lock));
-        assert_eq!(panicked, Err(WorkerFailure::Panicked), "{lock:?}");
-        assert!(matches!(
-            page_end(
-                panicked.map(|()| WorkerEnd::Stopped),
-                Instant::now(),
-                Instant::now(),
-                port.latch
-            ),
-            PageEnd::Failed(_)
-        ));
-        assert!(port.latched(), "{lock:?}");
-        assert!(port.ticket_for(&empty_scan()).is_none());
-        let page = CursorTicket::codex(CodexCursorTicket::unready_for_test());
-        assert!(!port.ready(&page), "{lock:?}");
-        match lock {
-            // The cursor stays poisoned: nothing is admitted or readied.
-            TestLock::Cursor => {
-                assert!(cache.lock_poisoned_for_test(lock));
-                assert!(!CodexCursorPort::new(Arc::clone(&cache))
-                    .ready(&CodexCursorTicket::unready_for_test()));
-            }
-            TestLock::Retained => assert!(cache.lock_poisoned_for_test(lock)),
-        }
-    }
+fn a_worker_panic_under_the_cursor_lock_latches_and_fails_closed() {
+    let cache = Arc::new(SharedCache::default());
+    let dir = std::env::temp_dir();
+    let mut port = CodexContinuation::new(&cache, &dir, &dir);
+    port.latch = test_latch();
+    let panicked = on_worker(|| cache.panic_under_cursor_lock_for_test());
+    assert_eq!(panicked, Err(WorkerFailure::Panicked));
+    assert!(matches!(
+        page_end(
+            panicked.map(|()| WorkerEnd::Stopped),
+            Instant::now(),
+            Instant::now(),
+            port.latch
+        ),
+        PageEnd::Failed(_)
+    ));
+    assert!(port.latched());
+    assert!(port.ticket_for(&empty_scan()).is_none());
+    let page = CursorTicket::codex(CodexCursorTicket::unready_for_test());
+    assert!(!port.ready(&page));
+    // The cursor stays poisoned: nothing is admitted or readied.
+    assert!(cache.cursor_poisoned_for_test());
+    assert!(!CodexCursorPort::new(Arc::clone(&cache)).ready(&CodexCursorTicket::unready_for_test()));
 }
 
 fn attach_inputs(mut ticket: ContinuationTicket, inputs: ContinuationInputs) -> ContinuationTicket {

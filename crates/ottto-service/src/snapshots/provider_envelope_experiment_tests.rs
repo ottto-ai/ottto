@@ -2761,16 +2761,14 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
             index.files.insert(audit_key.clone(), audit_entry.clone());
             previous.files.insert(audit_key, audit_entry);
         }
-        // No optional copy remains: the same release path must preserve
-        // unknown acquisition custody without touching the retained terminal.
-        let cache = sampled_scan::SharedCache::default();
+        // The release path must preserve unknown acquisition custody without
+        // touching the retained terminal.
         let selected = if partial {
             let progress = fixture.dir.join("released-fallback-progress.json");
             crate::snapshot_sync::checkpoint_account_release_for_test(
                 index,
                 &previous,
                 &mut scan,
-                &cache,
                 std::slice::from_ref(&fixture.dir),
                 &mut fallback,
                 (&path, &progress),
@@ -2781,7 +2779,6 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
                 index,
                 &previous,
                 &mut scan,
-                &cache,
                 std::slice::from_ref(&fixture.dir),
                 Some(&mut fallback),
             );

@@ -1666,53 +1666,6 @@ impl SessionStartState {
         start.into_measured()
     }
 
-    /// X_out family U2 (#665, c22 amendment 2): an upper bound on the heap the
-    /// boxed `finish` output owns, read from this state without consuming it.
-    /// Moved strings (`client_version`, each file's `tool` and `repo_path`) are
-    /// charged at their resident capacity, `ext` (a <= 8-byte key suffix) at
-    /// its key's suffix, and `path_hash` / the config fingerprint at their
-    /// fixed output length (`PATH_HASH_LEN` at most doubled by `format!`'s
-    /// growth; `CONFIG_FINGERPRINT_LEN` exact). Every tracked file is charged,
-    /// not only the <= 64 `finish` keeps. `None` past `limit`.
-    pub(super) fn finished_heap_bound(
-        &self,
-        attribution: bool,
-        device_salt: bool,
-        limit: usize,
-    ) -> Option<usize> {
-        use std::mem::{align_of, size_of};
-        // The `Box` slot, charged as `heap_layout_bound` charges it.
-        let mut bytes = size_of::<SnapshotSessionStart>()
-            .checked_add(align_of::<SnapshotSessionStart>())?
-            .checked_add(self.client_version.as_ref().map_or(0, String::capacity))?;
-        // `finish` collects the arrived files (amortized growth from 4, so a
-        // power-of-two capacity) and maps them into candidates, which std may
-        // do in that same allocation: charge the larger of the two.
-        let files = self.files.len();
-        let collected = if files == 0 {
-            0
-        } else {
-            files.checked_next_power_of_two()?.max(4)
-        };
-        let in_place = collected.checked_mul(size_of::<(String, usize, OpeningFileState)>())?;
-        let fresh = files
-            .min(MAX_OPENING_FILES)
-            .checked_mul(size_of::<OpeningFileCandidate>())?;
-        bytes = bytes.checked_add(in_place.max(fresh))?;
-        let path_hash = if attribution { 2 * PATH_HASH_LEN } else { 0 };
-        for (key, file) in &self.files {
-            bytes = bytes
-                .checked_add(file.tool.capacity())?
-                .checked_add(file.repo_path.as_ref().map_or(0, String::capacity))?
-                .checked_add(extension(key).map_or(0, str::len))?
-                .checked_add(path_hash)?;
-        }
-        if device_salt && self.config_digest.is_some() {
-            bytes = bytes.checked_add(CONFIG_FINGERPRINT_LEN)?;
-        }
-        (bytes <= limit).then_some(bytes)
-    }
-
     /// Path matching saw only part of the injected instruction text (its
     /// budget, or a Codex rollout without `world_state`).
     fn file_matching_incomplete(&self) -> bool {

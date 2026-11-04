@@ -216,8 +216,7 @@ fn a_load_earns_no_credit() {
         panic!("the committed head is reused");
     };
     let mut parser = route.open(&path);
-    let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), &scope(), None, NOW + 1_000)
-    else {
+    let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), None, NOW + 1_000) else {
         panic!("the read prepares");
     };
     assert!(matches!(mode, ReadMode::Tail));
@@ -274,7 +273,7 @@ fn a_proven_change_names_its_full() {
     std::fs::write(&path, lines(3).join("\n") + "\n").unwrap();
     let mut parser = route.open(&path);
     let Ok(ReadMode::Full(FullReason::StateMissing)) =
-        parser.prepare_acquisition_owned(None, &scope(), None, NOW)
+        parser.prepare_acquisition(None, &scope(), None, NOW)
     else {
         panic!("no checkpoint");
     };

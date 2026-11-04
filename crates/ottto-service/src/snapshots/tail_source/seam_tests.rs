@@ -188,11 +188,7 @@ impl Route {
         scope: &Scope,
     ) -> (PendingTail, Result<ParsedJsonlFile>) {
         let completed = parser
-            .retain_reduction(
-                scope,
-                NOW,
-                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
-            )
+            .retain_reduction(scope, NOW)
             .unwrap()
             .expect("a clean fixture is certified");
         at_pre(&mut parser.accumulator);

@@ -282,12 +282,6 @@ pub(crate) fn desktop_scoped_acquisition() {
 pub(crate) struct CachePage {
     #[serde(flatten, serialize_with = "sparse_cache")]
     pub(crate) events: cache_lifecycle::Counts,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) insert_count_entries_evicted: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) insert_byte_entries_evicted: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) reinsert_failed: u64,
 }
 fn sparse_cache<S: serde::Serializer>(
     counts: &cache_lifecycle::Counts,
@@ -298,31 +292,10 @@ fn sparse_cache<S: serde::Serializer>(
 impl CachePage {
     fn is_empty(&self) -> bool {
         self.events.is_empty()
-            && self.insert_count_entries_evicted == 0
-            && self.insert_byte_entries_evicted == 0
-            && self.reinsert_failed == 0
     }
     fn merge(&mut self, other: Self) {
         self.events.merge(other.events);
-        self.insert_count_entries_evicted = self
-            .insert_count_entries_evicted
-            .saturating_add(other.insert_count_entries_evicted);
-        self.insert_byte_entries_evicted = self
-            .insert_byte_entries_evicted
-            .saturating_add(other.insert_byte_entries_evicted);
-        self.reinsert_failed = self.reinsert_failed.saturating_add(other.reinsert_failed);
     }
-}
-pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
-    update(|counts| {
-        let cache = &mut counts.retained_cache_page_events;
-        let n = if count_pressure {
-            &mut cache.insert_count_entries_evicted
-        } else {
-            &mut cache.insert_byte_entries_evicted
-        };
-        *n = n.saturating_add(1);
-    });
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
@@ -496,30 +469,6 @@ pub(crate) fn authority_normalization(cleared: u64) {
     });
 }
 
-/// Follows a destructive hit through eligibility, parse and retention. Carries
-/// no identity or state; disarmed only after a successful cache admission.
-#[derive(Default)]
-pub(crate) struct Reinsertion(Cell<bool>);
-impl Reinsertion {
-    pub(crate) fn new(hit: bool) -> Self {
-        Self(Cell::new(hit && active()))
-    }
-    pub(crate) fn admitted(&self) {
-        self.0.set(false);
-    }
-}
-impl Drop for Reinsertion {
-    fn drop(&mut self) {
-        if self.0.get() {
-            update(|counts| {
-                let n = &mut counts.retained_cache_page_events.reinsert_failed;
-                *n = n.saturating_add(1);
-            });
-        }
-    }
-}
-crate::heap_layout_bound::no_heap!(false; Reinsertion);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,7 +479,7 @@ mod tests {
         {
             let other = Scope::begin(false);
             clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             assert_eq!(other.finish(), Counts::default());
         }
         let nested = Scope::begin(true);
@@ -549,7 +498,7 @@ mod tests {
         assert!(!active());
     }
     #[test]
-    fn sparse_counts_saturate_and_count_failed_reinsertion_once() {
+    fn sparse_counts_saturate_and_page_cache_events_stay_sparse() {
         assert_eq!(
             serde_json::to_value(Counts::default()).unwrap(),
             serde_json::json!({})
@@ -557,16 +506,10 @@ mod tests {
         let scope = Scope::begin(true);
         desktop_inventory_restart();
         desktop_scoped_acquisition();
-        {
-            let _failed = Reinsertion::new(true);
-            let success = Reinsertion::new(true);
-            success.admitted();
-            let _absent = Reinsertion::new(false);
-        }
+        cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
         authority_normalization(u64::MAX);
         authority_normalization(1);
         let counts = scope.finish();
-        assert_eq!(counts.retained_cache_page_events.reinsert_failed, 1);
         assert_eq!(
             counts.claude_reread.authority_normalization_cleared,
             u64::MAX
@@ -574,7 +517,7 @@ mod tests {
         let value = serde_json::to_value(counts).unwrap();
         assert_eq!(
             value["retained_cache_page_events"],
-            serde_json::json!({"reinsert_failed": 1})
+            serde_json::json!({"prefix_excluded_bodies": 1})
         );
         assert_eq!(value["claude_reread"].as_object().unwrap().len(), 1);
     }

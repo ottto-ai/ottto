@@ -122,10 +122,10 @@ pub(super) fn counted(loaded: &Loaded) -> (String, Vec<String>) {
 pub(super) fn read(
     route: &Route,
     path: &Path,
-    taken: Option<Box<Taken<CachedJsonlReduction>>>,
+    taken: Option<Box<Retained<CachedJsonlReduction>>>,
 ) -> (OwnedJsonlParser, ReadMode, u64) {
     let mut parser = route.open(path);
-    let Ok(mode) = parser.prepare_acquisition_owned(taken, &scope(), None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(taken, &scope(), None, NOW) else {
         panic!("the read prepares");
     };
     let start = parser

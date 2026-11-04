@@ -1972,8 +1972,6 @@ impl AssessedBool {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct AcquisitionAdmission {
     pub(crate) attempts: usize,
-    pub(crate) cache_lookup_miss_unknown_origin: usize,
-    pub(crate) retained_entry: AssessedBool,
     pub(crate) owning_header_current: AssessedBool,
     pub(crate) state_census_complete: AssessedBool,
     pub(crate) sidecar_census_complete: AssessedBool,
@@ -1986,7 +1984,6 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) audit_debt_present: AssessedBool,
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
-    pub(crate) retained_entry_rejected_by_eligibility: usize,
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
@@ -2541,8 +2538,6 @@ mod tests {
             completed_guard_bytes: u64::MAX,
             acquisition_admission: AcquisitionAdmission {
                 attempts: usize::MAX,
-                cache_lookup_miss_unknown_origin: usize::MAX,
-                retained_entry: gate,
                 owning_header_current: gate,
                 state_census_complete: gate,
                 sidecar_census_complete: gate,
@@ -2555,7 +2550,6 @@ mod tests {
                 audit_debt_present: gate,
                 audit_slot_available: gate,
                 sampling_allowed: gate,
-                retained_entry_rejected_by_eligibility: usize::MAX,
                 prepare_started: usize::MAX,
                 prepare_failed: usize::MAX,
             },
@@ -2923,7 +2917,7 @@ mod tests {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
             claude_reread::clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
             probe.collection(
@@ -2938,7 +2932,7 @@ mod tests {
             // Another source's page: its retained-cache events and nothing else.
             let scope = claude_reread::Scope::begin(true);
             claude_reread::clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
             probe.collection(
@@ -2962,12 +2956,12 @@ mod tests {
             1
         );
         assert_eq!(
-            rows[0]["counts"]["retained_cache_page_events"]["take_hit"],
+            rows[0]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
         assert_eq!(
-            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            rows[1]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
             1
         );
         assert_eq!(rows[2]["stage"], "native_comparison_decision");

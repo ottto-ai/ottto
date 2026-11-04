@@ -164,7 +164,7 @@ fn accounts(result: &RouteResult) -> BTreeSet<String> {
     out
 }
 
-/// [money] A restarted Tail and pressure-evicted owner preserve two-account
+/// [money] A restarted Tail and an evicted owner preserve two-account
 /// placement, tagged rows and side calls; swapped placement fails the oracle.
 #[test]
 fn append_after_restart_and_eviction_preserves_placement() {
@@ -195,7 +195,7 @@ fn append_after_restart_and_eviction_preserves_placement() {
         assert!(stored.modes.1 > 0);
         let warm = result(&stored, Mode::Restart);
         money_oracle::assert_equivalent(&cold, &warm);
-        scanner.evict_for_pressure(&prior);
+        scanner.evict(&prior);
         let mut evicted = c.raw(&scanner, prior, 100, true, &[]);
         evicted.enrich(&c);
         money_oracle::assert_equivalent(&cold, &result(&evicted, Mode::EvictRetry));

@@ -327,12 +327,7 @@ fn prefix_legacy_partial_lossy_and_growing_reads_keep_the_obligation() {
                 next.files[&key].has_unverified_source(),
                 "{source:?}/{arm}: keeps marker"
             );
-            if matches!(arm, "partial" | "lossy" | "failed_validation") {
-                assert!(
-                    cache.retained_checkpoint(&key).is_none(),
-                    "uncertified copy cannot retire"
-                );
-            } else {
+            if !matches!(arm, "partial" | "lossy" | "failed_validation") {
                 assert!(continuation(source, &cache, &next, &key)
                     .unwrap()
                     .audit_debt()
@@ -597,9 +592,6 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
         assert_eq!(modes, (0, 1, 0));
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
-        let verified = continuation(source, &cache, &index, &key)
-            .unwrap()
-            .last_full_verified();
         for selected_at in [due - 1, due] {
             sampled_scan::set_test_now(Some(selected_at));
             let ((next, _, modes, _), diagnostics) =
@@ -633,12 +625,7 @@ fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
                 index.files[&key].has_unverified_source(),
                 selected_at != due
             );
-            // A codec source's obligation lives in the index, asserted above.
-            if crate::snapshots::tail_source::keeps_ram(source) {
-                let checkpoint = cache.retained_checkpoint(&key).unwrap();
-                assert_eq!(checkpoint.audit_debt().is_some(), selected_at != due);
-                assert_eq!(checkpoint.last_full_verified(), verified);
-            }
+            // The obligation lives in the index, asserted above.
             let page = diagnostics
                 .iter()
                 .find(|row| row["stage"] == "native_collection_page")
@@ -1180,7 +1167,6 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
                 working,
                 &committed,
                 &mut raw,
-                &cache,
                 std::slice::from_ref(&fixture.root),
                 None,
             );
@@ -1293,7 +1279,6 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                     scanned,
                     &committed,
                     &mut candidates,
-                    &cache,
                     std::slice::from_ref(&fixture.root),
                     None,
                 )
@@ -1792,7 +1777,7 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_upper_bound = Some(key.clone());
     let (done, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        let done = reconcile_missing_index_entries_with_side(&mut index, 10, None, source);
+        let done = reconcile_missing_index_entries_with_side(&mut index, 10, source);
         crate::local_resource_diagnostics::Probe::start().collection(
             source.api_slug(),
             crate::local_resource_diagnostics::CollectionCounts {
@@ -1868,7 +1853,6 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
         assert!(reconcile_missing_index_entries_with_side(
             &mut index,
             10,
-            None,
             SnapshotSource::Codex
         ));
         if full_tombstones {
@@ -2090,7 +2074,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
 fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
     let _clock = Clock::at(START);
     let source = SnapshotSource::Pi;
-    for evict in [false, true] {
+    for same_owner in [false, true] {
         sampled_scan::set_test_now(Some(START));
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -2114,8 +2098,7 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         let state = fixture.dir.join("pi-recordless-audit-index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &state);
         let mut index = ScanIndex::load(&state).unwrap();
-        let cache = if evict {
-            cache.clear();
+        let cache = if same_owner {
             cache
         } else {
             Arc::new(sampled_scan::SharedCache::default())
@@ -2156,9 +2139,8 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         assert_eq!(events["audits_completed"], 1);
         assert!(!index.files[&key].has_unverified_source());
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &state);
-        // Lose the verified copy too: retirement must survive without RAM,
-        // and the later real change must exercise the transitional Full.
-        cache.clear();
+        // Retirement survives from the saved index, and the later real
+        // change must exercise the transitional Full.
         // Past where a marker re-staged by the verification Full would fall due.
         sampled_scan::set_test_now(Some(
             due + 2 * crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,

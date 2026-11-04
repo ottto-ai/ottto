@@ -93,8 +93,6 @@ use account_pending_retention::ArchivedWindows;
 pub(crate) mod cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
-#[cfg(test)]
-mod cache_policy_tests;
 mod change_reason;
 mod claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
@@ -11824,37 +11822,6 @@ struct SnapshotAccumulator {
 }
 
 impl SnapshotAccumulator {
-    /// A count that grows with every accepted usage record (its token totals
-    /// and request count) and every Claude response record: a guard
-    /// compares it between a retained copy's take and its
-    /// completion. Saturating; no allocation.
-    fn usage_witness(&self) -> u64 {
-        let UsageTotals {
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_creation_5m_tokens,
-            cache_creation_1h_tokens,
-            reasoning_output_tokens,
-            unattributed_total_tokens,
-            request_count,
-            costs: _,
-        } = &self.accepted_usage_totals;
-        [
-            *input_tokens,
-            *output_tokens,
-            *cache_read_tokens,
-            *cache_creation_5m_tokens,
-            *cache_creation_1h_tokens,
-            *reasoning_output_tokens,
-            *unattributed_total_tokens,
-            *request_count,
-            self.claude_response_record_count as u64,
-        ]
-        .into_iter()
-        .fold(0u64, u64::saturating_add)
-    }
-
     fn new(source: SnapshotSource) -> Self {
         Self {
             source,
@@ -13363,379 +13330,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    /// X_out family U1 (#665, c22 amendment 2): what `apply_claude_title_metadata`
-    /// and `into_items` allocate from `metadata`, measured on the resident
-    /// metadata without applying it. `fixed` charges every live copy of each
-    /// string (the accumulator's, the item's clone, and for `source_created_at`
-    /// the rewrite) plus the two transient sets of `session_account_evidence`;
-    /// `per_usage_row` is the account hash each `model_usage` row clones
-    /// (family D multiplies it). A subagent transcript names itself from agent
-    /// metadata on disk (IO): `None`, so the proof releases nothing.
-    fn claude_title_metadata_bound(
-        &self,
-        path: &Path,
-        metadata: &ClaudeTitleMetadata,
-    ) -> Option<TitleMetadataBound> {
-        let stem = path.file_stem().and_then(|value| value.to_str());
-        let Some(session_id) = self.source_session_id.as_deref().or(stem) else {
-            return Some(TitleMetadataBound::default());
-        };
-        if claude_subagent_identity(path).is_some() {
-            return None;
-        }
-        let per_usage_row = metadata
-            .account_identifier_hash(session_id)
-            .map_or(0, str::len);
-        let mut fixed = per_usage_row;
-        let native = stem == Some(session_id);
-        if self.claude_owned_session_id_observed && native {
-            let entries = metadata.original_identity_evidence.get(session_id);
-            // `session_account_evidence` clones at most one value per field.
-            let mut longest = [0usize; 3];
-            for entry in entries.into_iter().flatten() {
-                let values = [
-                    &entry.account_identifier_hash,
-                    &entry.provider_workspace_hash,
-                    &entry.source_created_at,
-                ];
-                for (slot, value) in longest.iter_mut().zip(values) {
-                    *slot = (*slot).max(value.as_ref().map_or(0, String::len));
-                }
-            }
-            let strings = longest
-                .iter()
-                .try_fold(0usize, |sum, len| sum.checked_add(*len))?;
-            let sets = crate::heap_layout_bound::tree_node_bytes::<&String, ()>()?
-                .checked_mul(entries.map_or(0, BTreeSet::len).checked_add(1)?)?
-                .checked_mul(2)?;
-            fixed = fixed
-                .checked_add(strings.checked_mul(3)?)?
-                .checked_add(sets)?;
-        }
-        if native {
-            if let Some(lineage) = metadata.spawn_lineage(session_id) {
-                fixed = fixed.checked_add(lineage.parent_session_id.len())?;
-            }
-        }
-        if let Some(candidate) = metadata.titles.get(session_id) {
-            // The title's normalization scratch and the item's clone
-            // (`desktop_title_bound`), plus both copies of "desktop_title".
-            fixed = fixed
-                .checked_add(desktop_title_bound(candidate.title.len())?)?
-                .checked_add(2 * "desktop_title".len())?;
-        }
-        Some(TitleMetadataBound {
-            fixed,
-            per_usage_row,
-        })
-    }
-
-    /// X_out (#665): an allocation-free upper bound of
-    /// `completed_bound(&parsed_file, ..)` once this Claude transcript is
-    /// finished, together with the finalize and `into_items` scratch beside
-    /// it, measured before any copy or eviction (hunk map §0-§3). `None`, so
-    /// the proof releases nothing: a non-Claude or subagent transcript (its
-    /// agent metadata is read from disk), a workspace whose repository
-    /// identity was not peeked, an unsupported layout, or a bound past
-    /// `limit`.
-    ///
-    /// By family (`x_out_coverage_witness_names_every_finished_field`):
-    /// - R: the response book's `completion_bounds` output; and per resolved
-    ///   response, what its row copies take from this accumulator (the
-    ///   running selector, the model fallback).
-    /// - D and M: every other finished field is a move, a clone, or a
-    ///   derivation no larger than one accumulator field (outside the book),
-    ///   and at most three of each are live at once (the field, its output,
-    ///   one transient), so three charges of the accumulator without the
-    ///   book. Usage rows have `ROW_COPIES` copies, and each emitted row
-    ///   clones the account hash and five cost texts; the vectors `finalize`
-    ///   and `into_items` grow are charged from their lengths.
-    /// - K: constant-capped text: digests, provenance, the unavailable
-    ///   context curve, cost text, attribution facts.
-    /// - U: title metadata (U1), `session_start` (U2) and the peeked
-    ///   repository identity, which `finish` must receive (U3), twice.
-    ///
-    /// Transients without a term (fresh-r1 N1; T6 measures them,
-    /// `x_out_t6_covers_tiny_file_rows_with_attribution`):
-    /// - `snapshot_fingerprint`'s semantic JSON <= the per-row node charge.
-    ///   It holds each usage row twice (the item's `model_usage` and its
-    ///   bucket's), each a 23-key map (at most 5 `(String, Value)` nodes of
-    ///   at most 728 B, about 400 B of keys, clones of the row's strings),
-    ///   plus at most twice its serialized text (about 1 KB): about 13 KB
-    ///   plus 4x the row's strings per row. Each row is charged at least 5
-    ///   whole `(RowKey, BucketRowAccumulator)` nodes, each 256 + 12*8 +
-    ///   11*(216 + 320) = 6,248 B on 64-bit, so at least 31 KB, and 5 copies
-    ///   of its strings: a file row by `3*state` and `2*usage_buckets`, a
-    ///   resolved response by R's `ROW_COPIES + 1` nodes.
-    /// - `enforce_fact_limits`' scratch (the pre-trim facts' text, the
-    ///   dropped field names, their sort and `join`, one `to_vec` buffer
-    ///   escaped 6x) is charged by `fact_limit_scratch_bound` in K, at its
-    ///   caps; no residual relies on the item's slack (c22, r33).
-    /// - `SessionStartState::finish`'s stable sort of the arrived files: no
-    ///   allocation below 21 files, else at most `max(len, 48)` slots of
-    ///   `(String, usize, OpeningFileState)`, at most 3x the `files` map's
-    ///   own entry storage from 21 entries on. That map is accumulator
-    ///   state, so D/M's `3*(accumulator - book)` covers it; U2 charges the
-    ///   collected vector and the candidates.
-    /// - `claude_buffered_request_hashes` (itemless Claude files only, built
-    ///   just before `finish` and live across it) is charged by
-    ///   `buffered_request_hashes_bound` from every record the book stores,
-    ///   limit-exceeded responses included (c22, r35).
-    fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
-        use crate::heap_layout_bound::tree_node_bytes;
-        use crate::session_attribution::{
-            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
-            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
-            MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
-            MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
-            MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
-        };
-        use claude_response_records::{RFC3339_TEXT_BYTES, ROW_COPIES, SHA256_HEX_TEXT_BYTES};
-        use std::mem::size_of;
-        /// `usd_picos_string`: at most 39 integer digits, a point and 12
-        /// fraction digits, in a `format!` buffer at most twice that.
-        const USD_TEXT_BYTES: usize = 2 * (39 + 1 + 12);
-        /// A top-level Claude item's attribution facts come from four
-        /// producers (`direct_provider_facts`, desktop spawn, launch,
-        /// grouping), each stopping at `MAX_SESSION_ATTRIBUTION_FACTS`
-        /// (`push_labeled_fact`); `extend` at most doubles the capacity.
-        const FACT_SLOTS: usize = 2 * 4 * MAX_SESSION_ATTRIBUTION_FACTS;
-
-        if self.source != SnapshotSource::ClaudeCode
-            || !crate::heap_layout_bound::layout_supported()
-            || claude_subagent_identity(input.path).is_some()
-        {
-            return None;
-        }
-        let FinishOutputInput {
-            path,
-            collected_at,
-            source_file_fingerprint,
-            opened_object_identity,
-            title_metadata,
-            attribution,
-            repository_identity,
-        } = input;
-        let heap = |bytes: Option<usize>| bytes.filter(|bytes| *bytes <= limit);
-        // U1, U2, U3.
-        let title = match title_metadata {
-            Some(metadata) => self.claude_title_metadata_bound(path, metadata)?,
-            None => TitleMetadataBound::default(),
-        };
-        let session_start = self
-            .session_start
-            .finished_heap_bound(attribution, true, limit)?;
-        let repository = match (&self.workspace_path, repository_identity) {
-            (None, _) => 0,
-            (Some(_), Some(identity)) => heap(completed_heap(identity, limit))?.checked_mul(2)?,
-            (Some(_), None) => return None,
-        };
-        // R: the book, and what each resolved response's rows take from here.
-        let book_bounds = self.claude_responses.completion_bounds(limit)?;
-        let responses = book_bounds.output?;
-        let resolved = self.claude_responses.values().count();
-        // Charged for every Claude file: whether it is itemless (no positive
-        // usage evidence) is the parser's to know, not this accumulator's.
-        let buffered_records = self
-            .claude_responses
-            .values()
-            .try_fold(0usize, |records, response| {
-                records.checked_add(response.records.len())
-            })?;
-        let request_hashes = buffered_request_hashes_bound(buffered_records)?;
-        let current_selector = heap(completed_heap(&self.current_selector, limit))?;
-        let model_fallback = self
-            .latest_model
-            .as_ref()
-            .map_or(0, String::capacity)
-            .checked_add("unknown".len())?;
-        let per_response = current_selector
-            .checked_mul(2)? // the row's maps and its hoisted billing text
-            .checked_add(model_fallback)?
-            .checked_mul(ROW_COPIES)?;
-        // D and M.
-        let book = heap(completed_heap(&self.claude_responses, limit))?;
-        let state = heap(completed_heap(self, limit))?.checked_sub(book)?;
-        let usage_buckets = heap(completed_heap(&self.usage_buckets, limit))?;
-        let file_rows = self
-            .usage_buckets
-            .values()
-            .try_fold(0usize, |rows, bucket| rows.checked_add(bucket.rows.len()))?;
-        let rows = file_rows.checked_add(resolved)?;
-        let per_row = self
-            .account_identifier_hash
-            .as_ref()
-            .map_or(0, String::capacity)
-            .checked_add(title.per_usage_row)?
-            .checked_add(5 * USD_TEXT_BYTES)?
-            .checked_mul(2)?;
-        // Vectors grown by `push` from the file's own length: cache requests,
-        // usage buckets, the file's rows' `SnapshotModelUsage` slots (the
-        // book charges each resolved response's).
-        let slots = self
-            .cache_requests
-            .len()
-            .checked_mul(2)?
-            .checked_add(4)?
-            .checked_mul(size_of::<cache_observations::OwnedRequest>())?
-            .checked_add(
-                self.usage_buckets
-                    .len()
-                    .checked_mul(2)?
-                    .checked_add(4)?
-                    .checked_mul(size_of::<SnapshotUsageBucket>())?,
-            )?
-            .checked_add(file_rows.checked_mul(7 * size_of::<SnapshotModelUsage>())?)?;
-        // `claude_compaction_summary`'s pairing maps and timestamp vectors.
-        let compaction = tree_node_bytes::<u64, usize>()?
-            .checked_add(tree_node_bytes::<usize, ()>()?.checked_mul(2)?)?
-            .checked_add(3 * size_of::<String>())?
-            .checked_mul(self.claude_compaction_observations.len())?
-            .checked_add((MAX_COMPACTION_TIMESTAMPS + 4) * size_of::<String>())?;
-        // K.
-        let session_id = match self.source_session_id {
-            Some(_) => 0,
-            None => path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map_or(0, str::len)
-                .checked_mul(3)?,
-        };
-        let single_fact = MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
-            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
-            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
-            + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
-            + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
-            + 3 * FACT_LITERAL_BYTES;
-        // Past one fact the wire budget bounds every kept string; capacity is
-        // at most twice the length, at least 8 for each of a fact's 9 texts.
-        let facts = MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
-            .checked_add(single_fact)?
-            .checked_add(collected_at.len())?
-            .checked_mul(2)?
-            .checked_add(9 * 8 * MAX_SESSION_ATTRIBUTION_FACTS)?
-            .checked_add(
-                FACT_SLOTS
-                    .checked_mul(size_of::<crate::session_attribution::SessionAttributionFact>())?,
-            )?;
-        let constants = SHA256_HEX_TEXT_BYTES // snapshot_fingerprint
-            .checked_add("final".len())?
-            .checked_add(collected_at.len())?
-            .checked_add(source_file_fingerprint.len().checked_mul(2)?)?
-            .checked_add(opened_object_identity.len())? // the ownership ledger's
-            .checked_add(2 * ("claude_code_jsonl".len() + "uncached".len()))?
-            .checked_add(5 * USD_TEXT_BYTES + "pi_usage_cost".len())?
-            .checked_add("agent_capability_usage:v2".len())?
-            .checked_add(RFC3339_TEXT_BYTES)? // a fallback bucket input
-            .checked_add(session_id)?
-            .checked_add(facts)?
-            .checked_add(fact_limit_scratch_bound(
-                if attribution { 4 } else { 2 },
-                collected_at.len(),
-            )?)?;
-        // E: the fold, itemized.
-        let money_output = { self.e2_fold_output_bound(path, book_bounds.fold?, limit)? };
-        let mut out = crate::heap_layout_bound::Counter::new(limit);
-        for bytes in [
-            money_output,
-            size_of::<ParsedJsonlFile>(),
-            size_of::<SnapshotItem>(), // `vec![item]`
-            responses,
-            resolved.checked_mul(per_response)?,
-            current_selector, // `add_usage_with_selector`'s `merged`
-            state.checked_mul(3)?,
-            usage_buckets.checked_mul(ROW_COPIES.checked_sub(3)?)?,
-            rows.checked_mul(per_row)?,
-            slots,
-            compaction,
-            constants,
-            title.fixed,
-            session_start,
-            repository,
-            request_hashes,
-        ] {
-            out.add(bytes)?;
-        }
-        Some(out.bytes)
-    }
-
-    /// X_out's E term with the gate on: the fold
-    /// `finalize_claude_responses_e2` builds, from what it reads here
-    /// (`FileFold::finish_heap_bound`). A key's context copies the base
-    /// selector's context besides its response's.
-    fn e2_fold_output_bound(
-        &self,
-        path: &Path,
-        keys: claude_response_records::FoldKeys,
-        limit: usize,
-    ) -> Option<usize> {
-        use claude_response_records::KEY_CONTEXT_FIELDS;
-        let current_selector = completed_heap(&self.current_selector, limit)?;
-        let model_fallback = self
-            .latest_model
-            .as_ref()
-            .map_or(0, String::capacity)
-            .checked_add("unknown".len())?;
-        let base_context =
-            self.current_selector
-                .context
-                .iter()
-                .try_fold(0usize, |bytes, (key, value)| {
-                    bytes
-                        .checked_add(key.capacity())?
-                        .checked_add(value.capacity())
-                })?;
-        // `reasoning_effort` past the capped fields.
-        let base_entries = self.current_selector.context.len().min(KEY_CONTEXT_FIELDS) + 1;
-        let (accounts, partition, marker_runs) =
-            claude_request_identity::RequestAccounts::finish_heap_bound(
-                self.claude_org_markers.as_deref(),
-                self.account_identifier_hash
-                    .as_ref()
-                    .map_or(0, String::capacity),
-            )?;
-        let path_text = path.as_os_str().len();
-        // The copy's folder key (lossy text of its parent directory, no
-        // longer than PATH_MAX) with its path and lossy copies, beside the
-        // fork parent's key with its path and lossy copies.
-        let proof = usize::try_from(libc::PATH_MAX)
-            .ok()?
-            .checked_mul(3)?
-            .checked_add(path_text.checked_mul(7)?)?
-            .max(match self.claude_fork_parent.as_deref() {
-                Some(parent) if !parent.is_empty() => path_text
-                    .checked_add(parent.len())?
-                    .checked_add(".jsonl".len())?
-                    .checked_mul(8)?,
-                _ => 0,
-            });
-        claude_request_money::e2::FileFold::finish_heap_bound(
-            &claude_request_money::e2::FoldShape {
-                responses: keys.responses,
-                modelless: keys.modelless,
-                model: keys.max_model.max(model_fallback),
-                context_strings: keys
-                    .context_strings
-                    .checked_add(keys.responses.checked_mul(base_context)?)?,
-                context_entries: keys
-                    .context_entries
-                    .checked_add(keys.responses.checked_mul(base_entries)?)?,
-                base_selector: current_selector,
-                // `fallback_bucket_timestamp`'s clone.
-                bucket_fallback: self
-                    .last_activity_at
-                    .as_ref()
-                    .or(self.started_at.as_ref())
-                    .map_or(0, String::capacity)
-                    .max(claude_response_records::RFC3339_TEXT_BYTES),
-                partition,
-                accounts,
-                marker_runs,
-                proof,
-            },
-        )
-    }
-
     fn apply_first_prompt_fallback(&mut self) {
         if self.title.is_some() {
             return;
@@ -14683,173 +14277,6 @@ impl SnapshotAccumulator {
     }
 }
 
-/// Observed-input bound of Claude title metadata (X_out family U1, #665).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TitleMetadataBound {
-    fixed: usize,
-    per_usage_row: usize,
-}
-
-/// What `SnapshotAccumulator::finish_output_bound` measures besides the
-/// accumulator (X_out, #665): the `finish` arguments, resident at the proof.
-struct FinishOutputInput<'a> {
-    path: &'a Path,
-    collected_at: &'a str,
-    source_file_fingerprint: &'a str,
-    opened_object_identity: &'a str,
-    title_metadata: Option<&'a ClaudeTitleMetadata>,
-    attribution: bool,
-    /// The identity peeked for `workspace_path` (U3); `finish` must take
-    /// exactly this value (`finish_with_repository_identity`).
-    repository_identity: Option<&'a crate::context_footprint::RepositoryIdentity>,
-}
-
-/// A fact's `field`, `kind` and `strength` are literals at their call sites
-/// (every `push_fact`/`push_labeled_fact` caller in `session_attribution.rs`
-/// passes one; the longest is 22 bytes). The contract is stated at
-/// `push_labeled_fact`: `'static` literals of at most 64 bytes; raise this
-/// first for a longer or dynamic one.
-const FACT_LITERAL_BYTES: usize = 64;
-/// Keys and punctuation of one serialized fact, at most 161 bytes: ten keys
-/// (100 bytes) with their quotes and colons (30), the quotes of nine strings
-/// (18), two objects' braces (4), their eight commas and the array's one.
-const FACT_JSON_SYNTAX_BYTES: usize = 192;
-
-/// X_out family K (#665 r33, c22: no residual may rely on slack): the worst
-/// case of what `enforce_fact_limits` (session_attribution.rs:1374-1411)
-/// holds beside an item's facts, from the caps it and `push_labeled_fact`
-/// enforce. Stack-only, checked; `None` on overflow.
-///
-/// `producers` fact lists reach `into_items`' unconditional call: direct
-/// provider and desktop spawn facts always, launch and grouping facts only
-/// with an attribution context (a top-level Claude item: no subagent lists).
-/// Each list stops at `MAX_SESSION_ATTRIBUTION_FACTS` = 24
-/// (session_attribution.rs:28, the `facts.len()` check at 1504). Each fact's
-/// text is a `to_string` copy (capacity = length; `evidence_ref`'s `format!`
-/// text is 71 bytes) of at most: three literals (`FACT_LITERAL_BYTES`), the
-/// value (128, :31, checked at 1506), the label (96, :34, at 1518), the label
-/// source (32, :35, at 1521), the source version (32, :32, at 1507), the
-/// evidence ref (96, :33, at 1512) and `observed_at` (`collected_at`, 1535).
-/// A growing `Vec` briefly holds its old and new buffers (the allocation
-/// probe's overlap). Charged together, though the phases do not all coexist:
-/// - every pre-trim fact's text (K's `facts` term charges only the kept
-///   facts' text);
-/// - `dropped_fields`: at most `24 * producers` names in slots grown by
-///   doubling (old and new at most 3 slots per name), the cloned names (at
-///   most `FACT_LITERAL_BYTES` each), the stable sort's scratch (at most
-///   `max(len, 48)` slots) and the `join` text with its ", " separators;
-/// - one `serde_json::to_vec` buffer (only one is live per loop step) of at
-///   most 24 facts (the count cap truncates first, 1378-1385): each text byte
-///   escapes to at most 6 bytes (`\u00XX`), plus `FACT_JSON_SYNTAX_BYTES` per
-///   fact and the array's brackets. `to_vec` starts at 128 bytes, and each
-///   write is one string's unescaped run, a 6-byte escape or punctuation
-///   (serde_json 1.0.149 `format_escaped_str_contents`), so while every
-///   string fits in 128 bytes each growth doubles: the last buffer is
-///   `128 * 2^k`, with half of it alongside during the copy. A longer
-///   `collected_at` falls back to three times the length (a previous buffer
-///   shorter than the length and a next at most twice that, or the length).
-fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usize> {
-    use crate::session_attribution::{
-        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
-        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
-        MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
-        MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
-    };
-    use std::mem::size_of;
-    let text = (3 * FACT_LITERAL_BYTES
-        + MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
-        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
-        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
-        + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
-        + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES)
-        .checked_add(collected_at)?;
-    let facts = producers.checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?;
-    let pre_trim = facts.checked_mul(text)?;
-    let dropped = facts
-        .checked_mul(3 * size_of::<String>())? // slots, old and new
-        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES)?)? // cloned names
-        .checked_add(facts.max(48).checked_mul(size_of::<String>())?)? // sort
-        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES + 2)?)?; // `join`
-    let json_len = text
-        .checked_mul(6)?
-        .checked_add(FACT_JSON_SYNTAX_BYTES)?
-        .checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?
-        .checked_add(2)?;
-    let json = if collected_at <= MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES {
-        let last = json_len
-            .div_ceil(128)
-            .checked_next_power_of_two()?
-            .checked_mul(128)?;
-        last.checked_add(if last > 128 { last / 2 } else { 0 })?
-    } else {
-        json_len.checked_mul(3)?
-    };
-    pre_trim.checked_add(dropped)?.checked_add(json)
-}
-
-/// X_out (#665 r35, c22: no residual may rely on slack): the most
-/// `claude_buffered_request_hashes` (claude_request_census.rs:2218-2239)
-/// holds. The caller builds it for an itemless Claude file just before
-/// `finish` (`snapshots.rs`, `claude_itemless_request_hashes`) and keeps it
-/// across `finish`. It collects one `u64` per book record with a request id
-/// (every response's stored records, limit-exceeded ones included: at most
-/// `records`) through `flat_map`/`filter_map`/`take`, whose lower size hint
-/// is 0 (`heap_layout_bound::pushed_vec_peak`). `claude_request_hash` and
-/// `sort_unstable`/`dedup` allocate nothing. Stack-only, checked; `None` on
-/// overflow.
-fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
-    crate::heap_layout_bound::pushed_vec_peak::<u64>(records)
-}
-
-/// X_out U1 (#665 r36, AutoReview P2): the most a `len`-byte desktop title
-/// allocates in `finish`, charged together: `apply_claude_title_metadata`
-/// (:14746, `candidate.title.clone()`) -> `set_title` (:14612) ->
-/// `normalize_display_title` (:38445) -> `normalize_title` (:38436) and
-/// `is_safe_display_title` (:38553), then `into_items`' clone (:15846).
-/// - The input clone: exact, `len`; dropped only when `normalize_title`
-///   returns.
-/// - `split_whitespace().collect::<Vec<&str>>()`: at most `ceil(len / 2)`
-///   words (every word and every gap is at least one byte), from a lower
-///   size hint of 0, so 4 slots doubling: the last `4 * 2^k` plus the half
-///   beside it during the last growth (the allocation probe's overlap).
-/// - `join(" ")`: one exact allocation of at most `len`
-///   (`join_generic_copy`'s `Vec::with_capacity(reserved_len)`), alongside
-///   the words.
-/// - `chars().take(255).collect::<String>()`: at most
-///   `min(len, 4 * 255)` bytes, reserved from the lower size hint and then
-///   grown by amortized pushes (at least 8): old and new together are under
-///   three times that.
-/// - `is_safe_display_title` (allocates only for at most 120 chars, so 480
-///   bytes): its `to_ascii_lowercase` copy and one helper's at a time
-///   (`looks_like_raw_identifier`, `contains_blocked_prompt_fragment`; the
-///   `custom_title`-only segment vector is not reached for "desktop_title").
-/// - The item's clone of the kept title: exact.
-///
-/// Stack-only, checked; `None` on overflow.
-fn desktop_title_bound(len: usize) -> Option<usize> {
-    const MAX_TITLE_CHARS: usize = 255;
-    const MAX_DISPLAY_CHARS: usize = 120;
-    let words = crate::heap_layout_bound::pushed_vec_peak::<&str>(len.div_ceil(2))?;
-    let kept = len.min(4 * MAX_TITLE_CHARS);
-    let collect = kept.max(8).checked_mul(3)?;
-    let safety = kept.min(4 * MAX_DISPLAY_CHARS).checked_mul(2)?;
-    len.checked_mul(2)? // the input and the joined text
-        .checked_add(words)?
-        .checked_add(collect)?
-        .checked_add(safety)?
-        .checked_add(kept)
-}
-
-/// `completed_heap_bound` of `value` on a fresh counter.
-fn completed_heap<T: crate::heap_layout_bound::HeapLayoutBound>(
-    value: &T,
-    limit: usize,
-) -> Option<usize> {
-    let mut counter = crate::heap_layout_bound::Counter::new(limit);
-    value.completed_heap_bound(&mut counter)?;
-    Some(counter.bytes)
-}
-
 type RepositoryIdentityCache =
     BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
 
@@ -14868,16 +14295,6 @@ fn fresh_repository_identity(
         .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
         .unwrap_or(false)
         .then(|| identity.clone())
-}
-
-/// Read-only view of the repository-identity cache for the M-a release proof
-/// (#665, X_out family U3): no IO, no insert, no TTL refresh. A miss, an
-/// expired entry or a poisoned lock is `None`, so the proof refuses.
-pub(super) fn peek_repository_identity(
-    workspace: &Path,
-) -> Option<crate::context_footprint::RepositoryIdentity> {
-    let guard = repository_identity_cache().lock().ok()?;
-    fresh_repository_identity(&guard, workspace, SystemTime::now())
 }
 
 fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
@@ -17199,17 +16616,6 @@ impl OwnedSourceScan {
                 }
             }
         }
-        let (copy_budget, step_measure) = self.sampled_copy_step();
-        if copy_budget == 0 {
-            // The resident bound and active charge from this same
-            // walk, before any parse progress, admission or await; never
-            // carried to another step.
-            sampled_scan::release_cache_to_fit(
-                self.sampling.as_ref(),
-                self.active_file.as_deref(),
-                step_measure,
-            );
-        }
         let Self {
             mut native_comparison,
             mut resource_probe,
@@ -18818,75 +18224,6 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                // The completion step walks the finished job exactly,
-                // once, for the budget its retention consumes below. A group
-                // and an unsampled read keep the step-start budget. Any other
-                // sampled singleton is measured exactly at completion
-                // (`try_lock`, so contention gives 0).
-                // A Tail/Unchanged singleton, or a grown Full with an owned
-                // finish bound (a legacy one takes the plain walk), also decides,
-                // under blocking locks, whether a release of lower-ranked
-                // residents would make its copy fit; that release is deferred
-                // into its retention, after
-                // every non-budget gate. Nothing is evicted here. Each branch
-                // also returns the walk behind its budget (`copy_measure`, for
-                // `retire_headers_beside_copy`); `copy_budget` is the
-                // pre-release budget, which header reclamation and decode
-                // peak reserve against (U1a-2a, #667).
-                let (retain_budget, copy_measure, release_proof) = if active.cursor.is_some() {
-                    let (budget, measure) =
-                        sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active);
-                    (
-                        sampled_scan::RetainBudget::granted_unclassified(budget),
-                        measure,
-                        None,
-                    )
-                } else if active.sampling.is_some()
-                    && sampled_scan::codex_cursor::byte_charged(&active)
-                {
-                    (
-                        sampled_scan::RetainBudget::granted_unclassified(copy_budget),
-                        step_measure,
-                        None,
-                    )
-                } else if active.sampling.is_some() {
-                    let full = active.sampling.as_ref().is_some_and(|sampling| {
-                        matches!(
-                            sampling.mode,
-                            crate::transcript_acquisition::ReadMode::Full(_)
-                        )
-                    });
-                    let legacy_full = full
-                        && matches!(
-                            sampled_scan::x_out_for(source, || None),
-                            sampled_scan::XOut::Legacy
-                        );
-                    if sampled_scan::releases_at_completion(&active, index) && !legacy_full {
-                        sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
-                    } else {
-                        let (budget, measure) = sampled_scan::copy_budget_step(
-                            sampling.as_ref(),
-                            Some(&mut *active),
-                            true,
-                        );
-                        (
-                            sampled_scan::RetainBudget::from((budget, measure)),
-                            measure,
-                            None,
-                        )
-                    }
-                } else {
-                    (
-                        sampled_scan::RetainBudget::granted_unclassified(copy_budget),
-                        step_measure,
-                        None,
-                    )
-                };
-                let copy_budget = retain_budget.raw();
-                // A deferred release's peak-reserved `budget_after`, set where
-                // its retention is attempted; the finalization limit only
-                // where that release actually ran.
-                let mut released_finalization_budget = None;
                 // #631 review: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
@@ -19139,8 +18476,6 @@ impl OwnedSourceScan {
                 });
                 let _first_read = first_read;
                 let mut parser = parser;
-                // The repository identity X_out measured, if any (#665 U3).
-                let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
                         Ok(receipt) => {
@@ -19219,23 +18554,8 @@ impl OwnedSourceScan {
                     );
                     pending!();
                 }
-                // The existing copy budget funds two simultaneous allocations:
-                // retained reduction and native finish/output. Reserve the extra
-                // decoded response peak BEFORE either clone or decode. Active
-                // compact records and their selector table were already charged
-                // by copy_budget_step. A refusal disables retention, preserving
-                // the ordinary native finish and its loss/output semantics.
-                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
-                    && aliases.is_empty()
-                    && applied_receipts.values().all(Option::is_none);
-                // Retain the reduction only when every applied byte is in
-                // the certified prefix `[0, s)`; a lossy job publishes
-                // uncertified with its prepared debt, like a lossy full read.
-                let sealed_only = parser.reader.sealed_fragment()
-                    || parser.reader.consumed_bytes() == parser.reader.last_complete_line_end();
                 // N4 (fe-seam-ack §5): the file branch decides its H3c route
-                // before the retire below. A grown Claude prefix retains
-                // nothing, so it must not retire a suspended proof.
+                // before its completion.
                 let file_acquisition = file_sampling
                     .as_ref()
                     .filter(|_| cursor_certificate.is_none());
@@ -19288,55 +18608,10 @@ impl OwnedSourceScan {
                     }
                     None => (None, None),
                 };
-                let h3c_route = prefix.is_some();
-                // Reclaim optional headers before either clone, only where
-                // a copy can be retained under both measured copy shares.
-                #[cfg(unix)]
-                let keeps_ram = tail_source::keeps_ram(source);
-                #[cfg(not(unix))]
-                let keeps_ram = true;
-                let retaining = cache_compatible
-                    && keeps_ram
-                    && match cursor_certificate.as_ref() {
-                        Some(certificate) => certificate.is_some() && sealed_only,
-                        None => file_sampling.is_some(),
-                    };
-                sampled_scan::retire_headers_beside_copy(
-                    sampling.as_ref(),
-                    if retaining && !h3c_route {
-                        copy_budget
-                    } else {
-                        0
-                    },
-                    copy_measure,
-                );
-                // An H3c completion retains nothing: reserve no copy/decode
-                // peak; it reclaims no headers and releases no resident.
-                let finish_copy_budget = if retaining && !h3c_route {
-                    parser
-                        .accumulator
-                        .claude_responses
-                        .finish_copy_budget(copy_budget)
-                } else {
-                    None
-                };
-                let copy_budget = finish_copy_budget.unwrap_or(0);
-                let mut completed_acquisition = if let Some(certificate) = cursor_certificate {
-                    certificate.map(|checkpoint| {
-                        parser.retain_sealed_prefix(
-                            checkpoint,
-                            // Never a release on a sealed prefix: excluded and
-                            // unsealed keep the pre-release budget for the
-                            // packet only; a retainable job is admitted
-                            // against main's peak-reserved `copy_budget`.
-                            if !cache_compatible {
-                                retain_budget.excluded()
-                            } else if !sealed_only {
-                                retain_budget.unsealed()
-                            } else {
-                                sampled_scan::RetainBudget::granted_unclassified(copy_budget)
-                            },
-                        )
+                let completed_acquisition = if let Some(certificate) = cursor_certificate {
+                    certificate.map(|checkpoint| sampled_jsonl::CompletedNativeAcquisition {
+                        checkpoint,
+                        unsealed: true,
                     })
                 } else if let Some(acquisition) = file_sampling.as_ref() {
                     if let Some(prefix) = prefix {
@@ -19377,81 +18652,13 @@ impl OwnedSourceScan {
                             census.record_unreadable_file(cause, &candidate.path);
                             pending!();
                         }
-                        // #665 second-lander condition: only a retaining,
-                        // non-H3c completion may measure X_out, reserve a peak,
-                        // or prove a deferred release. Excluded reads keep none.
-                        let retain_budget = if retaining && !h3c_route {
-                            // #667: the decode peak is reserved from the budget the
-                            // copy is admitted against: main's `copy_budget` above for
-                            // a granted one. M-a (S-a): only now, after main's proof
-                            // retirement and that reservation, may a releasing completion
-                            // (`releases_at_completion`) prove its release; its
-                            // `budget_after` is peak-reserved the same way.
-                            // X_out (#665): Claude's finish-output bound, only for a
-                            // proof. The repository identity it measured (U3) is the
-                            // one `finish` takes below; a miss refuses.
-                            let x_out = sampled_scan::x_out_for(source, || {
-                                release_proof.as_ref()?;
-                                measured_repository_identity = parser
-                                    .accumulator
-                                    .workspace_path
-                                    .as_deref()
-                                    .and_then(peek_repository_identity);
-                                parser.finish_output_bound(
-                                    FinishOutputInput {
-                                        path: &candidate.path,
-                                        collected_at: collected_at.as_str(),
-                                        source_file_fingerprint: &source_file_fingerprint,
-                                        opened_object_identity: &candidate.opened_object_identity,
-                                        title_metadata: Some(&claude_title_metadata),
-                                        attribution: attribution_context.is_some(),
-                                        repository_identity: measured_repository_identity.as_ref(),
-                                    },
-                                    // `proven_release` checks it against `remaining'`.
-                                    usize::MAX,
-                                )
-                            });
-                            sampled_scan::prove_release(
-                                retain_budget.reserve_peak(copy_budget, |budget| {
-                                    parser
-                                        .accumulator
-                                        .claude_responses
-                                        .finish_copy_budget(budget)
-                                }),
-                                release_proof,
-                                sampling.as_ref(),
-                                x_out,
-                                |budget| {
-                                    parser
-                                        .accumulator
-                                        .claude_responses
-                                        .finish_copy_budget(budget)
-                                },
-                                |limit| {
-                                    parser.accumulator.claude_responses.decode_peak_bound(limit)
-                                },
-                            )
-                        } else {
-                            retain_budget.excluded()
-                        };
-                        released_finalization_budget = retain_budget.released_budget();
                         #[cfg(test)]
                         sampled_scan::test_hooks::fire(
                             sampled_scan::test_hooks::Point::BeforeRetain,
                         );
-                        // A codec source's reduction is never retained in
-                        // RAM: its Tail is its continuation.
-                        #[cfg(unix)]
-                        let cache_compatible = cache_compatible && tail_source::keeps_ram(source);
-                        match parser.retain_reduction(
-                            &acquisition.scope,
-                            sampled_scan::now_seconds(),
-                            if cache_compatible {
-                                retain_budget
-                            } else {
-                                retain_budget.excluded()
-                            },
-                        ) {
+                        match parser
+                            .retain_reduction(&acquisition.scope, sampled_scan::now_seconds())
+                        {
                             Ok(completed) => completed,
                             Err(_) => {
                                 if source == SnapshotSource::ClaudeCode {
@@ -19584,7 +18791,7 @@ impl OwnedSourceScan {
                     claude_title_metadata: (source == SnapshotSource::ClaudeCode)
                         .then_some(&claude_title_metadata),
                     attribution_context,
-                    repository_identity: measured_repository_identity,
+                    repository_identity: None,
                     money_context: Some(claude_request_money::e2::ReadContext {
                         index,
                         path: &candidate.path,
@@ -19764,31 +18971,6 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
-                // #667's peak-reserved finalization limit: from `budget_after`
-                // where this completion's deferred release actually ran (and
-                // its peak was reserved there), otherwise main's. `None`
-                // refuses the copy; never 0 or `F_prev` in its place.
-                let finalization_budget = if completed_acquisition
-                    .as_ref()
-                    .is_some_and(|completed| completed.released.is_some())
-                {
-                    released_finalization_budget
-                } else {
-                    finish_copy_budget
-                };
-                let finalization_charge = finalization_budget.and_then(|budget| {
-                    crate::heap_layout_bound::completed_bound(&parsed_file, budget)
-                });
-                if finalization_charge.is_none() {
-                    if let Some(completed) = completed_acquisition.as_mut() {
-                        if completed.reduction.is_some() {
-                            crate::local_resource_diagnostics::cache_lifecycle::record(
-                                crate::local_resource_diagnostics::cache_lifecycle::Event::RetentionFinalizationBoundRefused,
-                            );
-                        }
-                        completed.reduction = None;
-                    }
-                }
                 let parse_complete = parsed_file.complete();
                 // Claude response conflicts may be discovered only by native
                 // finalization. A prefix cannot publish that late loss: it
@@ -20205,25 +19387,16 @@ impl OwnedSourceScan {
                     } else {
                         ScanParseOutcome::ConfirmedEmpty
                     };
-                    // N2: with the certified prefix continued (its retained
-                    // copy, or for a codec source its staged Tail head), the
-                    // entry records only `[0, s)` as read, so the next page
-                    // tails the withheld record with main's EOF behavior.
-                    // Without a continuation it records the length read and
-                    // the staged debt re-selects it at the audit cadence.
-                    #[cfg(unix)]
-                    let prefix_continued =
-                        |completed: &sampled_jsonl::CompletedNativeAcquisition| {
-                            completed.reduction.is_some() || tail_reused == Some(true)
-                        };
-                    #[cfg(not(unix))]
-                    let prefix_continued =
-                        |completed: &sampled_jsonl::CompletedNativeAcquisition| {
-                            completed.reduction.is_some()
-                        };
+                    // N2: with the certified prefix continued (its staged
+                    // Tail head), the entry records only `[0, s)` as read, so
+                    // the next page tails the withheld record with main's EOF
+                    // behavior. Without a continuation it records the length
+                    // read and the staged debt re-selects it at the audit
+                    // cadence.
+                    let prefix_continued = tail_reused == Some(true);
                     let bound_fragment = cursor_fragment.and_then(|fragment| {
                         completed_acquisition.as_ref().and_then(|completed| {
-                            (prefix_continued(completed)
+                            (prefix_continued
                                 && completed.checkpoint.sealed_offset() == fragment.offset)
                                 .then(|| {
                                     codex_fragment::BoundFragment::bind(&candidate, fragment.offset)
@@ -20233,7 +19406,7 @@ impl OwnedSourceScan {
                     });
                     let mut recorded = candidate;
                     if let Some(fragment) = cursor_fragment
-                        .filter(|_| completed_acquisition.as_ref().is_some_and(prefix_continued))
+                        .filter(|_| prefix_continued && completed_acquisition.is_some())
                     {
                         recorded.size_bytes = fragment.offset;
                     }
@@ -20351,11 +19524,7 @@ impl OwnedSourceScan {
                     // settles the degraded publication.
                     if let Some(mut completed) = completed_acquisition {
                         if let Some(context) = sampling.as_mut() {
-                            #[cfg(unix)]
-                            let retained =
-                                completed.reduction.is_some() || tail_reused == Some(true);
-                            #[cfg(not(unix))]
-                            let retained = completed.reduction.is_some();
+                            let retained = tail_reused == Some(true);
                             let quiet_retired = quiet_audit_checked
                                 && !completed.unsealed
                                 && retained
@@ -20372,38 +19541,14 @@ impl OwnedSourceScan {
                             if quiet_retired {
                                 completed.checkpoint.retire_quiet_audit();
                             }
-                            // A clone allocates exactly its length, and is the
-                            // sampled key: R0's insert term assumes both.
-                            let key = index_key.clone();
-                            debug_assert_eq!(key.capacity(), key.len());
-                            debug_assert!(file_sampling
-                                .as_ref()
-                                .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            // No codec source's reduction lives in RAM: its
-                            // completion has its committed head, or no
-                            // continuation. Another source's is admitted, by
-                            // the rule retention and the take key on.
-                            #[cfg(unix)]
+                            // The completion's continuation is its committed
+                            // head on its route, or none.
                             let quiet_proven = quiet_retired
-                                && context.cache.quiet_certified(&key, &completed.checkpoint);
-                            #[cfg(unix)]
-                            let admitted = if !tail_source::keeps_ram(source) {
-                                drop(completed);
-                                tail_reused == Some(true)
-                            } else {
-                                context.cache.insert_admitted(
-                                    key,
-                                    completed,
-                                    finalization_charge.unwrap_or(0),
-                                )
-                            };
-                            #[cfg(not(unix))]
-                            let admitted = context.cache.insert_admitted(
-                                key,
-                                completed,
-                                finalization_charge.unwrap_or(0),
-                            );
-                            if admitted {
+                                && context
+                                    .cache
+                                    .quiet_certified(&index_key, &completed.checkpoint);
+                            drop(completed);
+                            if retained {
                                 if quiet_retired {
                                     // A partial save may restore the old marker.
                                     // Preserve this path AND its exact scope root
@@ -20433,9 +19578,6 @@ impl OwnedSourceScan {
                                     // Reuse only on the next committed scan:
                                     // partial-save reconciliation may restore
                                     // this marker without accepting its body.
-                                }
-                                if let Some(active) = file_sampling.as_ref() {
-                                    active.reinsertion.admitted();
                                 }
                             }
                         }
@@ -20758,11 +19900,7 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                index.count_unacked_retired(
-                    source,
-                    unacked,
-                    sampling.as_ref().map(|context| &*context.cache),
-                );
+                index.count_unacked_retired(source, unacked);
                 // G1: only census members hold discovery. A pending re-read
                 // (growth after this generation processed its path) is
                 // next-generation evidence; retiring drops it and the next
@@ -20875,11 +20013,7 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(
-                        index,
-                        sampling.as_ref().map(|context| &*context.cache),
-                        source,
-                    )
+                    reconcile_missing_index_entries_bounded(index, source)
                 } else {
                     false
                 };
@@ -21933,17 +21067,13 @@ impl OwnedSourceScan {
                         hook(&candidate.path);
                     }
                 });
-                // Fresh-first page budget, decided before any retained state is
+                // Fresh-first page budget, decided before any stored state is
                 // consumed: the optimistic read is the tail extent when a
-                // retained entry exists, the whole file otherwise.
+                // continuation exists, the whole file otherwise. The
+                // continuation is the committed head on its route, so an
+                // append is sized from the head's sealed offset.
                 let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
-                // A codec source keeps no RAM copy: its continuation is the
-                // committed head on its route, so an append is sized from the
-                // head's sealed offset.
-                let continued = context.cache.retained_sealed_offset(&key);
-                #[cfg(unix)]
-                let continued =
-                    continued.or_else(|| tail_source::committed_sealed_offset(source, index, &key));
+                let continued = tail_source::committed_sealed_offset(source, index, &key);
                 let expected = extent.saturating_sub(continued.unwrap_or(0));
                 if index.context_only_read(&candidate) {
                     context_read_budget.charge_cursor_ordinary(&mut codex_page);
@@ -22063,10 +21193,9 @@ impl OwnedSourceScan {
                 .filter(|_| !parser.reader.reader.is_compressed())
             {
                 let key = local_index_key(&candidate.path);
-                // A codec source's continuation is its committed Tail, never
-                // a RAM copy; a source without a codec takes its RAM copy
-                // back, by the rule its retention keys on. A route that
-                // cannot be read now holds the file for its next selection.
+                // Every source's continuation is its committed Tail. A route
+                // that cannot be read now holds the file for its next
+                // selection.
                 #[cfg(unix)]
                 let tail_route = match state_v2::tail_route_path(index) {
                     Ok(route) => route,
@@ -22076,56 +21205,20 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
-                // No database route (v1, a paused import, no support dir): a
-                // codec source keeps no RAM copy either, so its growth reads Full.
+                // No database route (v1, a paused import, no support dir): its
+                // growth reads Full.
                 #[cfg(unix)]
                 if tail_route.is_none() && index.files.contains_key(&key) {
                     tail_source::counters::bump(source, "tail_bootstrap_full", "unrouted");
                 }
                 #[cfg(not(unix))]
                 let tail_route: Option<PathBuf> = None;
-                #[cfg(unix)]
-                let taken = tail_source::keeps_ram(source)
-                    .then(|| context.cache.take(&key).map(Box::new))
-                    .flatten();
-                #[cfg(not(unix))]
-                let taken = context.cache.take(&key).map(Box::new);
-                // Kept beside the moved copy for R0's completion decision.
-                let taken_admission = taken.as_ref().map(|taken| {
-                    (
-                        taken.modified_hint,
-                        taken.finalization_charge,
-                        taken.retained.state.usage_witness(),
-                    )
-                });
                 // On a Tail route the held-new custody is durable: the
                 // withheld read's census record, and its committed head.
-                #[cfg(unix)]
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
                     && tail_route.is_some()
                     && tail_source::load::held_new(index, &key);
-                #[cfg(not(unix))]
-                let e2_held_new_file = source == SnapshotSource::ClaudeCode
-                    && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
-                let mut retained = taken;
-                let retained_present = retained.is_some();
-                let reinsertion =
-                    crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
-                        retained_present,
-                    );
                 context.admission.attempts = context.admission.attempts.saturating_add(1);
-                context.admission.retained_entry.observe(retained_present);
-                if !retained_present {
-                    // No historical expiry/eviction/clear/admission reason is
-                    // carried by this lookup (including a failed cache lock).
-                    context.admission.cache_lookup_miss_unknown_origin = context
-                        .admission
-                        .cache_lookup_miss_unknown_origin
-                        .saturating_add(1);
-                }
-                retained_offset = retained
-                    .as_ref()
-                    .map(|taken| taken.retained.checkpoint.sealed_offset());
                 let owning_header_is_current = source != SnapshotSource::Codex
                     || codex_join_inventory.as_ref().is_some_and(|inventory| {
                         inventory.complete
@@ -22159,12 +21252,6 @@ impl OwnedSourceScan {
                     && source == SnapshotSource::ClaudeCode
                     && !sidecar_census_complete
                     && (index.files.contains_key(&key) || e2_held_new_file);
-                if !(owning_header_is_current
-                    && state_census_complete
-                    && (sidecar_census_complete || scoped_claude_metadata))
-                {
-                    drop(retained.take());
-                }
                 if owning_header_is_current
                     && state_census_complete
                     && (sidecar_census_complete || scoped_claude_metadata)
@@ -22183,9 +21270,6 @@ impl OwnedSourceScan {
                         .admission
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
-                    if reduction_sidecar.is_none() {
-                        drop(retained.take());
-                    }
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt = sampled_audit::debt_for_key(index, &key, audit_now);
                         let protected_entry = index.files.get(&key);
@@ -22230,12 +21314,10 @@ impl OwnedSourceScan {
                             .audit_slot_available
                             .observe(context.audit_slots > 0);
                         let scope = context.file_scope(source, &candidate, &reduction_sidecar);
-                        // On a Tail route a RAM miss loads the committed
-                        // Tail.
+                        // On a Tail route a read loads the committed Tail.
                         #[cfg(unix)]
                         let tail_load = tail_route.as_deref().filter(|_| {
-                            retained.is_none()
-                                && allow_sample
+                            allow_sample
                                 && tail_source::load::reuses_stored(
                                     index,
                                     &key,
@@ -22257,8 +21339,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut tail_proven_full = None;
                         #[cfg(unix)]
-                        let (mut retained, taken_admission, debt) = match (retained, tail_load) {
-                            (None, Some(route)) => {
+                        let (mut retained, debt) = match tail_load {
+                            Some(route) => {
                                 match tail_source::load_candidate(
                                     source,
                                     index,
@@ -22269,7 +21351,7 @@ impl OwnedSourceScan {
                                     parser.reader.reader.get_mut(),
                                     &scope,
                                 ) {
-                                    tail_source::load::Load::Reused(taken, base) => {
+                                    tail_source::load::Load::Reused(retained, base) => {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
@@ -22284,14 +21366,8 @@ impl OwnedSourceScan {
                                                 CANDIDATE_PARSE_REASON_NAMES[reason as usize],
                                             );
                                         }
-                                        retained_offset =
-                                            Some(taken.retained.checkpoint.sealed_offset());
-                                        let admission = (
-                                            taken.modified_hint,
-                                            taken.finalization_charge,
-                                            taken.retained.state.usage_witness(),
-                                        );
-                                        (Some(taken), Some(admission), debt)
+                                        retained_offset = Some(retained.checkpoint.sealed_offset());
+                                        (Some(retained), debt)
                                     }
                                     // A newer build's head: untouched, held as residue.
                                     tail_source::load::Load::Held => {
@@ -22300,13 +21376,11 @@ impl OwnedSourceScan {
                                     }
                                     tail_source::load::Load::Cold(proven) => {
                                         tail_proven_full = proven;
-                                        (None, taken_admission, debt)
+                                        (None, debt)
                                     }
                                 }
                             }
-                            (None, None)
-                                if allow_sample && !parser.reader.reader.is_compressed() =>
-                            {
+                            None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 // A read with no stored continuation: counted by why.
                                 resource_probe.full_causes.restore_outcome.record(
                                     sampled_scan::ram_miss_class(
@@ -22315,9 +21389,9 @@ impl OwnedSourceScan {
                                         context.cache.quiet_registered(source),
                                     ),
                                 );
-                                (None, taken_admission, debt)
+                                (None, debt)
                             }
-                            (retained, _) => (retained, taken_admission, debt),
+                            None => (None, debt),
                         };
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
@@ -22333,11 +21407,11 @@ impl OwnedSourceScan {
                                 .get(&key)
                                 .is_some_and(ScanIndexEntry::has_unverified_source)
                             && !retained.as_ref().is_some_and(|old| {
-                                old.retained.checkpoint.audit_debt().is_none()
-                                    && old.retained.checkpoint.sealed_offset() == candidate.size_bytes
-                                    && old.retained.checkpoint.scope() == &scope
+                                old.checkpoint.audit_debt().is_none()
+                                    && old.checkpoint.sealed_offset() == candidate.size_bytes
+                                    && old.checkpoint.scope() == &scope
                                     && old
-                                        .retained.checkpoint
+                                        .checkpoint
                                         .stamp_matches(parser.reader.reader.get_ref())
                                         .unwrap_or(false)
                             })
@@ -22354,29 +21428,21 @@ impl OwnedSourceScan {
                             allow_sample = false;
                         }
                         context.admission.sampling_allowed.observe(allow_sample);
-                        if retained_present && !allow_sample {
-                            context.admission.retained_entry_rejected_by_eligibility = context
-                                .admission
-                                .retained_entry_rejected_by_eligibility
-                                .saturating_add(1);
-                        }
                         if !allow_sample {
                             drop(retained.take());
                         }
-                        let mut old = retained;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition_owned(
-                            old.take(),
+                        let mode = match parser.prepare_acquisition(
+                            retained,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
                         ) {
                             Ok(mode) => mode,
-                            Err(rejected) => {
+                            Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
-                                drop(rejected.taken);
                                 if source == SnapshotSource::ClaudeCode {
                                     claude_request_census::invalidate_claude_request_census(
                                         index,
@@ -22442,22 +21508,11 @@ impl OwnedSourceScan {
                                 })
                             });
                         planned_mode = Some((mode, audit_due));
-                        // Only a continued copy (Tail or Unchanged) carries
-                        // its admission facts; `prepare` falls back to Full
-                        // when the old copy is filtered.
-                        let continued = taken_admission.filter(|_| {
-                            !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
-                        });
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
                             audit_due,
-                            retained_hint: continued.map(|(hint, _, _)| hint),
-                            retained_finalization_charge: continued
-                                .map_or(0, |(_, charge, _)| charge),
-                            retained_usage: continued.map(|(_, _, usage)| usage),
-                            reinsertion,
                             tier_prefix_replay: false,
                         });
                     }
@@ -22521,10 +21576,6 @@ impl OwnedSourceScan {
                             scope,
                             mode,
                             audit_due: None,
-                            retained_hint: None,
-                            retained_finalization_charge: 0,
-                            retained_usage: None,
-                            reinsertion: Default::default(),
                             tier_prefix_replay: false,
                         });
                     }
@@ -23730,20 +22781,8 @@ impl OwnedJsonlParser {
         )
     }
 
-    /// `SnapshotAccumulator::finish_output_bound` (X_out, #665) without the
-    /// scan's live shared inputs (Codex turn traces): no
-    /// finished field holds them, and `retention_bound` leaves them out the
-    /// same way.
-    fn finish_output_bound(&mut self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
-        let inputs = self.take_live_reduction_inputs();
-        let bound = self.accumulator.finish_output_bound(input, limit);
-        self.restore_live_reduction_inputs(inputs);
-        bound
-    }
-
-    /// `finish`, with the repository identity the M-a release proof measured
-    /// (#665, X_out family U3). `Some` is used as-is, so the finished item never
-    /// re-resolves (IO) a value the proof did not measure.
+    /// `finish`, with a caller-supplied repository identity. `Some` is used
+    /// as-is, so the finished item never re-resolves (IO) it.
     #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     fn finish_with_repository_identity(
         self,
@@ -32615,23 +31654,18 @@ fn candidate_from_traversal_path_at(
 }
 
 #[inline(never)]
-fn reconcile_missing_index_entries_bounded(
-    index: &mut ScanIndex,
-    cache: Option<&sampled_scan::SharedCache>,
-    source: SnapshotSource,
-) -> bool {
-    reconcile_missing_index_entries_with_side(index, MAX_BACKFILL_FILES_PER_SOURCE, cache, source)
+fn reconcile_missing_index_entries_bounded(index: &mut ScanIndex, source: SnapshotSource) -> bool {
+    reconcile_missing_index_entries_with_side(index, MAX_BACKFILL_FILES_PER_SOURCE, source)
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, SnapshotSource::ClaudeCode)
+    reconcile_missing_index_entries_with_side(index, limit, SnapshotSource::ClaudeCode)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
-    cache: Option<&sampled_scan::SharedCache>,
     source: SnapshotSource,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
@@ -32777,7 +31811,7 @@ fn reconcile_missing_index_entries_with_side(
             index.file_snapshot_fingerprints.remove(key);
         }
     }
-    index.count_unacked_retired(source, unacked, cache);
+    index.count_unacked_retired(source, unacked);
     let done = regular_done && residue_count < limit;
     if let Some(traversal) = index.traversal.as_mut() {
         traversal.reconciliation_started = true;
@@ -38968,21 +38002,14 @@ impl ScanIndex {
     }
 
     /// Counts each of `unacked` the retirement removed; it holds or resends nothing.
-    fn count_unacked_retired(
-        &self,
-        source: SnapshotSource,
-        unacked: Vec<&String>,
-        cache: Option<&sampled_scan::SharedCache>,
-    ) {
+    fn count_unacked_retired(&self, source: SnapshotSource, unacked: Vec<&String>) {
         for key in unacked
             .into_iter()
             .filter(|key| !self.files.contains_key(*key))
         {
-            // A codec source keeps no resident copy: its committed head
-            // carries the totals when the codec stores them.
-            let usage = cache.and_then(|cache| cache.resident_usage(source, key));
-            #[cfg(unix)]
-            let usage = usage.or_else(|| tail_source::stored_usage(source, self, key));
+            // The committed head carries the totals when the codec stores
+            // them.
+            let usage = tail_source::stored_usage(source, self, key);
             crate::local_resource_diagnostics::unacked_usage_lost_to_deletion(
                 source.api_slug(),
                 usage,
@@ -60494,41 +59521,6 @@ mod tests {
             "native own creator"
         );
 
-        // Created threads are never tail-retained, so an admitted parentless
-        // file is a full re-parse on each change. A tail resume would otherwise
-        // reuse the bound thread-history extent. Every other reduction conjunct
-        // holds; a fork is admitted only with an in-file boundary and without
-        // the native-only flag, so only clearing `codex_is_fork` (today's
-        // class) admits this copy. A change that retains created threads must
-        // fail here.
-        let root = temp_dir("codex-parentless-not-retained");
-        let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
-        let body = jsonl_body(&values);
-        fs::write(&path, &body).expect("write retention fixture");
-        let metadata = parentless_metadata(&path, PARENTLESS_CHILD, &clock, &body);
-        let mut parser = OwnedJsonlParser::new(
-            File::open(&path).expect("open retention fixture"),
-            &path,
-            SnapshotSource::Codex,
-            apply_codex_line,
-            Some(&metadata),
-            None,
-        )
-        .expect("retention parser");
-        // A sampled full read observes priority turns, as `prepare_acquisition` does.
-        parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
-        while !parser.step().expect("step retention parser") {}
-        assert!(parser.accumulator.codex_parent_session_ref.is_none());
-        assert!(parser.accumulator.codex_sidecar_parent.is_none());
-        assert!(parser.accumulator.codex_usage_accounting_complete());
-        assert!(parser.accumulator.codex_is_fork);
-        assert!(!sampled_scan::compatible_reduction(&parser.accumulator));
-        let mut not_fork = parser.accumulator.clone();
-        not_fork.codex_is_fork = false;
-        assert!(sampled_scan::compatible_reduction(&not_fork));
-        drop(parser);
-        let _ = fs::remove_dir_all(root);
-
         // First-request equality ignores the parser-defaulted request count.
         let mut request_count_only = values.clone();
         request_count_only[3]["payload"]["info"]["total_token_usage"]["request_count"] = json!(5);
@@ -60590,106 +59582,6 @@ mod tests {
             |_, _| {},
         );
         assert_parentless_held(&parsed, "appended header", PARENTLESS_CHILD);
-    }
-
-    /// The tail-cache lineage lift admits only forks whose
-    /// ownership boundary came from in-file header fields. A parented created
-    /// thread and a pre-trigger legacy
-    /// subagent stay unretained even where every other reduction conjunct holds.
-    #[test]
-    fn codex_lineage_lift_keeps_created_and_pre_trigger_forks_unretained() {
-        fn reduced(path: &Path, metadata: &CodexTitleMetadata) -> SnapshotAccumulator {
-            let mut parser = OwnedJsonlParser::new(
-                File::open(path).expect("open lineage fixture"),
-                path,
-                SnapshotSource::Codex,
-                apply_codex_line,
-                Some(metadata),
-                None,
-            )
-            .expect("lineage parser");
-            // A sampled full read observes priority turns, as `prepare_acquisition` does.
-            parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
-            while !parser.step().expect("step lineage parser") {}
-            parser.accumulator.clone()
-        }
-
-        // A provider-created thread with a trusted parent: complete native
-        // accounting, but native-only and outside the in-file boundaries.
-        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
-        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-
-        let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
-            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a03e99-5000-7000-8000-000000000001","trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
-            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"01a03e99-5000-7000-8000-000000000001","model":"gpt-5.6-sol"}}),
-            json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}),
-            codex_test_token_line(
-                "2026-08-02T08:20:03Z",
-                Some(4),
-                (12, 8, 2, 1),
-                Some((12, 8, 2, 1)),
-            ),
-        ];
-        let root = temp_dir("codex-lineage-lift-created-thread");
-        let path = root.join(format!("rollout-{child_id}.jsonl"));
-        fs::write(&path, jsonl_body(&child)).expect("write created-thread fixture");
-        let mut metadata = CodexTitleMetadata::default();
-        metadata.state_created_threads.insert(child_id.to_string());
-        metadata
-            .spawn_parents
-            .insert(child_id.to_string(), parent_id.to_string());
-        metadata.state_threads.insert(
-            child_id.to_string(),
-            CodexStateThread {
-                tokens_used: 1,
-                created_at: Some("2026-08-02T08:20:00Z".to_string()),
-                ..CodexStateThread::default()
-            },
-        );
-        let created = reduced(&path, &metadata);
-        assert_eq!(
-            created.codex_ownership_boundary,
-            CodexOwnershipBoundary::NativeCreatedThread
-        );
-        assert!(created.codex_is_fork && created.codex_created_thread_native_only);
-        assert!(created.codex_parent_session_ref.is_some());
-        assert!(created.codex_usage_accounting_complete());
-        assert!(!sampled_scan::compatible_reduction(&created));
-        // Each exclusion holds on its own: a cleared native-only flag leaves
-        // the created boundary, and an in-file boundary keeps the flag.
-        let mut flag_cleared = created.clone();
-        flag_cleared.codex_created_thread_native_only = false;
-        assert!(!sampled_scan::compatible_reduction(&flag_cleared));
-        let mut in_file_boundary = created.clone();
-        in_file_boundary.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
-        assert!(in_file_boundary.codex_usage_accounting_complete());
-        assert!(!sampled_scan::compatible_reduction(&in_file_boundary));
-        let _ = fs::remove_dir_all(root);
-
-        // A legacy subagent before its trigger turn has no local boundary yet.
-        let path = write_codex_test_values(
-            "codex-lineage-lift-pre-trigger",
-            &[
-                json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"child-pre-trigger","forked_from_id":"root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
-                codex_test_token_line(
-                    "2026-08-02T06:00:01Z",
-                    None,
-                    (1_000, 800, 100, 20),
-                    Some((1_000, 800, 100, 20)),
-                ),
-            ],
-        );
-        let pre_trigger = reduced(&path, &CodexTitleMetadata::default());
-        assert_eq!(
-            pre_trigger.codex_ownership_boundary,
-            CodexOwnershipBoundary::AwaitingLegacyTrigger
-        );
-        assert!(pre_trigger.codex_is_fork);
-        // Excluded by the accounting conjunct; the boundary is not in-file either.
-        assert!(!pre_trigger.codex_usage_accounting_complete());
-        assert!(!sampled_scan::compatible_reduction(&pre_trigger));
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -66114,7 +65006,6 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
     }
 }
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
-// Measurement only (#665, X_out family U3): the identity the release proof peeks.
 crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
@@ -66542,9 +65433,6 @@ const _: () = {
     assert!(
         size_of::<OwnedActiveFile>()
             <= 880 + size_of::<Option<crate::local_resource_diagnostics::FirstRead>>()
-    );
-    assert!(
-        size_of::<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>() <= 4928
     );
 };
 pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {

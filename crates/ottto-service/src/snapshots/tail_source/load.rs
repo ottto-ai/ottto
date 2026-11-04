@@ -33,13 +33,13 @@ use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::{self, Hold};
 use crate::snapshots::*;
 use crate::transcript_acquisition::{CertificateRefusal, FullReason, Scope};
-use crate::transcript_cache::{Retained, Taken};
+use crate::transcript_cache::Retained;
 
 /// What a load hands the read.
 pub(in crate::snapshots) enum Load {
     /// Continue from the stored reduction. `base` is `None` for a file set
     /// aside, so its next stage replaces every stored row.
-    Reused(Box<Taken<CachedJsonlReduction>>, Option<TailBase>),
+    Reused(Box<Retained<CachedJsonlReduction>>, Option<TailBase>),
     /// A newer build's head, or a live input not available now: the file
     /// waits, untouched, with its debt.
     Held,
@@ -244,7 +244,7 @@ enum Miss {
 
 /// What a hit loaded: the reduction, its base, and the bytes it read.
 struct Hit {
-    taken: Box<Taken<CachedJsonlReduction>>,
+    retained: Box<Retained<CachedJsonlReduction>>,
     base: TailBase,
     head_bytes: u64,
     page_bytes: u64,
@@ -273,7 +273,7 @@ pub(super) fn load<S: TailSource>(
             counters::bump(source, "tail_db_loads", "hit");
             counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
             counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
-            return Load::Reused(hit.taken, base);
+            return Load::Reused(hit.retained, base);
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
@@ -409,17 +409,11 @@ fn stored<S: TailSource>(
     if toggled {
         reduction.scrub_context_digest();
     }
-    let taken = Taken {
-        modified_hint: checkpoint.modified_hint(),
-        retained: Retained {
+    Ok(Hit {
+        retained: Box::new(Retained {
             checkpoint,
             state: reduction,
-        },
-        finalization_charge: 0,
-        e2_held_new_file: false,
-    };
-    Ok(Hit {
-        taken: Box::new(taken),
+        }),
         base,
         head_bytes: head.body.len() as u64,
         page_bytes,
