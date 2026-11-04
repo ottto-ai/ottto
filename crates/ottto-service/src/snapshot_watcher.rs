@@ -35,7 +35,9 @@ pub(crate) enum ListingTrigger {
     FreshTraversal,
 }
 
-const LISTING_TRIGGER_LABELS: [&str; 6] = [
+const LISTING_TRIGGERS: usize = ListingTrigger::FreshTraversal as usize + 1;
+
+const LISTING_TRIGGER_LABELS: [&str; LISTING_TRIGGERS] = [
     "start",
     "watcher",
     "overflow",
@@ -47,7 +49,7 @@ const LISTING_TRIGGER_LABELS: [&str; 6] = [
 /// One source's listing request: how often each trigger fired since the
 /// last listing began. Any count requests one listing of every root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ListingRequest([u32; 6]);
+pub struct ListingRequest([u32; LISTING_TRIGGERS]);
 
 impl ListingRequest {
     pub(crate) fn record(&mut self, trigger: ListingTrigger) {
@@ -94,14 +96,7 @@ pub struct PendingSnapshotPaths {
 
 fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
     static PENDING: OnceLock<Mutex<PendingSnapshotPathsState>> = OnceLock::new();
-    PENDING.get_or_init(|| {
-        let mut start = ListingRequest::default();
-        start.record(ListingTrigger::Start);
-        Mutex::new(PendingSnapshotPathsState {
-            list_all: [start; 3],
-            ..PendingSnapshotPathsState::default()
-        })
-    })
+    PENDING.get_or_init(|| Mutex::new(PendingSnapshotPathsState::default()))
 }
 
 fn lock_pending_snapshot_paths() -> std::sync::MutexGuard<'static, PendingSnapshotPathsState> {

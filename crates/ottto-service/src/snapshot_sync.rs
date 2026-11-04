@@ -4621,6 +4621,10 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             // cycle. Otherwise phase is set by install or restart time, and every
             // fleet-wide event re-aligns every machine onto the same tick.
             std::thread::sleep(phase_offset);
+            // Nothing watched the transcripts while the daemon was down.
+            crate::snapshot_watcher::request_listing_all(
+                crate::snapshot_watcher::ListingTrigger::Start,
+            );
             // Best effort, and deliberately so: the loop below is driven by the
             // cadence tiers and the unconditional sweep, and the watcher only ever
             // shortens a wait. A machine that cannot watch its transcripts (no

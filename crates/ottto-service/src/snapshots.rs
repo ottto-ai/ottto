@@ -26418,7 +26418,7 @@ impl OwnedSourceScan {
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    #[allow(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
