@@ -72,7 +72,7 @@ pub(crate) fn codex_evidence_of_items(
 /// file holds it.
 pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
     let copy = if super::super::e2_pipeline_scan_fixture::route_of(index).is_some() {
-        let mut copy = super::super::state_v2::money_test_support::resident(index);
+        let mut copy = index.clone();
         copy.v2_mut().persistence_v2 = None;
         copy.generation = 0;
         copy

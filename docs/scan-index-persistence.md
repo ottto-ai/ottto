@@ -548,8 +548,8 @@ fsynced staging precede BEGIN. The restart owner receives `post_commit` only aft
 an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 
 If restart staging excludes any file, the complete save is discarded and the
-committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement,
-owned-start census or account-window retirement from that attempt is published.
+committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement
+or owned-start census from that attempt is published.
 The route retains excluded keys through a 60-second parsing backoff while
 independent files can commit. Excluded keys stay in bounded discovery and age
 retention; their committed extent, prior restart reference and owed debt remain

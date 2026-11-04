@@ -3110,7 +3110,8 @@ struct CarryCounts {
     /// transcript, a seed over the key cap, or a run a no-account row ended.
     no_seed: bool,
     /// Counted own telemetry that names no valid account (API key, cloud,
-    /// placeholder).
+    /// placeholder), or a request refused because its named owner could not
+    /// be read. Either way no session-start fill reaches this file.
     blocked_no_account: bool,
     /// Runtime-only resource verdict, propagated into the existing item HOLD.
     keys_over_cap: bool,
@@ -3772,7 +3773,14 @@ pub(crate) fn reconcile_request_accounts(
             if blocked {
                 carry.block(occurrence.usage.request_count);
             }
-            let account = if blocked {
+            // The classifier's refusal for an owner the scope names but could
+            // not read: no marker, carry, start or binding fills it.
+            let unreadable_owner = matches!(
+                identity,
+                Some(IdentityRef::Refused(Refusal::IncompleteEvidence))
+            ) && evidence.owner_unreadable(root, request.as_str());
+            let account = if blocked || unreadable_owner {
+                carry.counts.blocked_no_account |= unreadable_owner;
                 None
             } else if preserve_org {
                 own_marker.and_then(|run| run.account.clone())
@@ -4147,9 +4155,11 @@ fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
 pub(crate) struct ScanEvidence<'a> {
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
-    /// The request roots of this pass's whole corpus, from the cross-root
-    /// evidence the strict read built root by root.
-    cross_request_roots: Option<&'a super::claude_cross_root_evidence::RequestRootJoins>,
+    /// This pass's scope and the cross-root answers the strict read built
+    /// root by root over it.
+    cross: Option<&'a super::claude_cross_root_evidence::CrossRootEvidence>,
+    /// The request roots come from `cross`, not from the loaded rows.
+    streamed: bool,
     /// Test-only reachable fallback for the whole-corpus oracle: request roots
     /// of the loaded rows, built on the first request without rows of its own.
     request_roots: std::cell::OnceCell<RequestRootIndex>,
@@ -4261,14 +4271,36 @@ impl<'a> ScanEvidence<'a> {
         evidence
     }
 
-    /// The whole corpus's cross-root answers, for a pass whose reports hold
-    /// only the page roots: request roots.
+    /// The scope's cross-root answers, for a pass whose reports hold only the
+    /// page roots: request roots and named owners.
     pub(crate) fn with_cross_root(
         mut self,
         cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
     ) -> Self {
-        self.cross_request_roots = Some(&cross.request_roots);
+        self.cross = Some(cross);
+        self.streamed = true;
         self
+    }
+
+    /// The whole-corpus oracle: its reports hold every scope root's rows; the
+    /// scope still names the owners.
+    pub(crate) fn with_scope(
+        mut self,
+        cross: &'a super::claude_cross_root_evidence::CrossRootEvidence,
+    ) -> Self {
+        self.cross = Some(cross);
+        self
+    }
+
+    /// The scope names another session as this request's owner (a census
+    /// holder or the file's fork parent) whose side files could not be read.
+    /// Only for a request with no API row of its own.
+    pub(crate) fn owner_unreadable(&self, root: &str, request_id: &str) -> bool {
+        self.cross.is_some_and(|cross| {
+            cross
+                .named_owners(root, request_id)
+                .any(|owner| self.unhealthy_roots.contains(owner))
+        })
     }
 
     pub(crate) fn with_unhealthy_reasons(
@@ -4312,8 +4344,8 @@ impl<'a> ScanEvidence<'a> {
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
     fn request_root(&self, request_id: &str) -> Option<Option<u32>> {
-        if let Some(roots) = self.cross_request_roots {
-            return roots.get(request_id);
+        if let Some(cross) = self.cross.filter(|_| self.streamed) {
+            return cross.request_roots.get(request_id);
         }
         self.request_roots
             .get_or_init(|| {
@@ -4529,6 +4561,11 @@ pub(crate) fn classify_ref<'k>(
                     }
                     Some(_) => Refusal::IncompleteEvidence,
                 });
+            }
+            // An owner the scope names but could not read leaves the request
+            // unproven: the copy's markers never claim it.
+            if evidence.owner_unreadable(facts.root, facts.request_id) {
+                return Refused(Refusal::IncompleteEvidence);
             }
             // Rows are keyed by trace root: a fork or resume copy holds its
             // original's request with the original's rows under another root.

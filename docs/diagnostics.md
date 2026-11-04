@@ -1842,41 +1842,18 @@ backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
 
-## Codex state-only identity coverage
+## Codex state-only fallback (removed)
 
-Prior coverage retains both the uniquely resolved filename identity and the
-existing committed header/counting or protected owner hash, including a header
-outside both filename candidates. Accepted-owner coverage requires nonempty
-exact file incidence whose entities are accepted, not quarantined or decode-held;
-a permanent refusal or local wire-size rejection grants no new coverage.
+The daemon no longer sends a Codex session's bare total from the local state
+database when the session has no readable rollout. Every Codex usage body comes
+from a parsed rollout. A session whose rollout is gone sends nothing in its
+place, and the server keeps the body it already holds. A rollout that parses to
+no usage stays uncounted. The `codex_state_only*` `local_resources` lines are
+gone. An older store's state-only fields and the residue's blocked session ids
+decode and drop; the next save writes neither. The status body no longer carries
+`last_census_residue_blocked_session_count`, so the server reads it as 0.
 
-Checkpoint retention and expiry follow the existing rules; local retention
-changes are deferred. The backend downgrade fence
-(`usage_accounting_authority_downgrade`) protects attributed usage floors against
-an uncontracted state-only successor. Local coverage reduces redundant emission;
-it does not replace that backend money protection.
-
-With a prior snapshot fingerprint, exactly two evidence-supported filename
-identities, and no committed owner coverage, both candidates are withheld from
-state-only output. No fingerprint preserves ordinary fallback; zero supported
-candidates are not counted. The existing `local_resources` carrier emits at most
-one `codex_state_only_ambiguous_identity` line per state-only pass, whose
-`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
-observations in that pass. Repeated passes observe the same entries again: this
-is NOT a distinct-entry/file/session count, and sums must not be reported as
-files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
-is the saturating sum of the supported state threads' `tokens_used` per observed
-ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
-possibly withheld state-only usage: repeated candidates and already-covered
-usage can contribute again. A zero-token observation reports zero tokens. Only
-aggregate counts and token sums are logged, with no paths, ids or per-session
-values.
-
-A later complete native parse still emits its exclusive body for a session with
-an earlier state-only row. An emitted total alone does not prove a server-side
-overwrite; backend authority rules independently govern successor acceptance.
-
-### Retired-pin recovery
+## Retired-pin recovery
 
 An exact retired v1 pin is a missing reduction, never decoded as current.
 Quiet files consume zero transcript bytes. A grown file takes the existing
@@ -2023,19 +2000,6 @@ unavailable scalar counts are null and missing kinds are unknown, not zero.
 timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
 counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
-`account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history; `account_windows_retained`
-also reports `uncollapsed`, the windows older than their equal-evidence run's
-newest left in a store-only archive (boundaries unchecked), and `replaced` and
-`pushed`, the store-only archive rollovers this save wrote that replaced their
-run's newest window or were appended (resident archives, kept only with raw
-holds or before a complete v2 load, are not counted). A complete v2 load keeps archived account
-windows in the store, so the retained-pending byte diagnostic is unavailable while
-any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
-`cold_row_unknown`) when a stored archived row no longer matches its baseline, and
-with `state_v2_cold_lineage_miss` (count `cold_lineage_miss`) when a graph's archive
-view predates a commit it shares no rollover with; both hold and remove nothing.
-These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows
 

@@ -196,23 +196,42 @@ PATH_MOD = re.compile(r'#\[path\s*=\s*"([^"]+)"\](?:\s*#\[[^\]]*\])*\s*(?:pub(?:
 
 
 def module_name(path: Path) -> str:
-    """The module a .rs file defines, qualified when its own name is generic."""
+    """The module a .rs file defines, qualified when its own name is generic.
+
+    `path` is relative to the directory that holds the crates, so folders
+    above the checkout never count."""
     if path.stem in ("mod", "lib", "main"):
         path = path.parent
     # A bare `tests` would match nearly every test; keep its parent.
-    return f"{path.parent.name}::tests" if path.stem == "tests" else path.stem
+    if path.stem == "tests":
+        return f"{path.parent.name}::tests"
+    # A file under a `tests/` module directory of a crate's src tree names a
+    # topic (`snapshots/tests/upload.rs`); keep its owner so a generic topic
+    # stem cannot match other modules' tests.
+    parts = path.parts
+    owners = [i for i, part in enumerate(parts[:-1]) if part == "tests" and "src" in parts[:i]]
+    if owners:
+        cut = owners[-1]
+        owner = [] if parts[cut - 1] == "src" else [parts[cut - 1]]
+        return "::".join([*owner, "tests", *parts[cut + 1:-1], path.stem])
+    return path.stem
 
 
 def oracle_modules(root: Path) -> set[str]:
     """Module names of the .rs files under `root` that use the money oracle,
     including the name a `#[path = "..."] mod <name>;` loads such a file as."""
+    base = root.resolve()
     texts = {path.resolve(): path.read_text(encoding="utf-8", errors="replace") for path in root.rglob("*.rs")}
     money = {path for path, text in texts.items() if "money_oracle" in text}
-    found = {module_name(path) for path in money}
+
+    def name(path: Path) -> str:
+        return module_name(path.relative_to(base) if path.is_relative_to(base) else path)
+
+    found = {name(path) for path in money}
     for path, text in texts.items():
-        for target, name in PATH_MOD.findall(text):
+        for target, module in PATH_MOD.findall(text):
             if (path.parent / target).resolve() in money:
-                found.add(f"{module_name(path)}::{name}")
+                found.add(f"{name(path)}::{module}")
     return found
 
 

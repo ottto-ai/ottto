@@ -196,8 +196,8 @@ fn condition_b(class: &str) {
         // flags. Only the candidate passes through composed populate/hydrate.
         let mut v1: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
-        // The restore arm loads as a live pass does, archives cold; its
-        // resident view is read back for the custody comparison only.
+        // The restore arm loads as a live pass does; the imported view is
+        // read back for the custody comparison only.
         let (mut store, v2, v2_view) = crate::snapshots::StateV2ColdStore::roundtrip(
             &v1,
             &c.base
@@ -340,18 +340,12 @@ fn condition_b(class: &str) {
             }
         }
         if class == "pending" {
-            // Restart arm: the family rolls inside the page; the cold page
-            // saves through the production delta, reloads cold and scans the
-            // next page. v1 takes the same rollover in RAM and through a real
-            // v1 save and load. The rollover is the scan's own `archive()`
-            // applied directly: this corpus pins the census window (input
-            // clock), so no scan advances it.
-            let end = "2026-10-30T00:00:00Z";
-            let mut ram: ScanIndex =
-                serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
-            crate::snapshots::state_v2_roll_account_families(&mut ram, end);
+            // Restart arm: the v2 page saves through the production delta,
+            // reloads and scans the next page. v1 takes the same page in RAM
+            // and through a real v1 save and load. The retired account field
+            // of the seeded store is decoded and dropped on every arm.
             let ram: ScanIndex =
-                serde_json::from_slice(&serde_json::to_vec(&ram).unwrap()).unwrap();
+                serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
             let restart = {
                 let dir = c.base.join("v1-restart");
                 std::fs::create_dir_all(&dir).unwrap();
@@ -366,12 +360,7 @@ fn condition_b(class: &str) {
             };
             let [_, _, disk] = pages;
             let mut page = disk.index;
-            let (cold, view) = store.roll_save_reload(&mut page, end);
-            assert!(crate::snapshots::state_v2_has_cold_archive(&cold));
-            let placement = |index: &ScanIndex| {
-                serde_json::to_value(index).unwrap()["claude_account_family_pending"].clone()
-            };
-            assert_eq!(placement(&view), placement(&ram), "account placement");
+            let cold = store.save_reload(&mut page);
             // The next page switches account and captures identity, so its
             // rows are tagged and accepted shares are recorded.
             grow(&path, "r3", 30);
@@ -692,7 +681,7 @@ fn cold_row(name: &str) {
         );
         // Tail rows share this store: their presence must not move money.
         crate::snapshots::state_v2_stage_tail_for_test(custody.path());
-        let v2 = custody.save_reload(&mut v2).0;
+        let v2 = custody.save_reload(&mut v2);
         assert!(crate::snapshots::state_v2_tail_published_for_test(&v2));
         v1.generation = v2.generation;
         let mut pages = [v1, v2].map(|prior| c.raw(&scanner(), prior, 100, false, &[]));

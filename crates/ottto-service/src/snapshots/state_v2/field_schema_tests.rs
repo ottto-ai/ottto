@@ -661,39 +661,11 @@ fn unwritten(kind: &str) -> bool {
         )
 }
 
-/// Fields whose readers take only their own encoding: the fixture's values,
-/// with the account windows completed by `base`.
-const KEPT: [&str; 3] = [
-    "claude_request_census",
-    "claude_request_census_shadow",
-    "claude_account_family_pending",
-];
-/// The fixture, its account windows complete, with packed member requests
-/// and an absent member.
-fn base() -> ScanIndex {
-    use crate::snapshots::{ArchivedWindows, ClaudeAccountRequestSet};
-    let mut index = fixture();
-    let hashes: BTreeSet<String> = ["1", "2"].iter().map(|n| n.repeat(64)).collect();
-    for pending in index.claude_account_family_pending.values_mut() {
-        let ArchivedWindows::Resident(previous) = &mut pending.previous_windows else {
-            panic!("resident account windows");
-        };
-        for window in previous.iter_mut().chain([&mut pending.current]) {
-            let mut set = ClaudeAccountRequestSet::from_full_hashes(&hashes).unwrap();
-            set.identity_revision = Some("3".repeat(64));
-            window.census_complete = true;
-            window.members.insert("synthetic-file".into(), 2);
-            window.member_requests.insert("synthetic-file".into(), set);
-        }
-        pending
-            .confirmed_absent_members
-            .insert("synthetic-absent".into());
-    }
-    index
-}
+/// Fields whose readers take only their own encoding: the fixture's values.
+const KEPT: [&str; 2] = ["claude_request_census", "claude_request_census_shadow"];
 /// The base index with every other stored field filled from its type.
 fn sample() -> ScanIndex {
-    let mut index = base();
+    let mut index = fixture();
     let mut synth = Synth::new();
     for (name, fill) in fills() {
         if !KEPT.contains(&name) {

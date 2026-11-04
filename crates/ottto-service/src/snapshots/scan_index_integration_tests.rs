@@ -109,9 +109,11 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
     ];
     for (map, field) in fields.into_iter().enumerate() {
         for cause in causes {
-            // The usage map's records are retired: they decode and drop, so
-            // no record in it can withhold the map.
-            if field == Field::UsagePending && cause == UnavailableCause::Decode {
+            // The usage and account maps' records are retired: they decode
+            // and drop, so no record in them can withhold the map.
+            if matches!(field, Field::UsagePending | Field::AccountPending)
+                && cause == UnavailableCause::Decode
+            {
                 continue;
             }
             let mut fixture = Fixture::new();
@@ -160,12 +162,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 healthy.accepted_snapshot_fingerprints
             );
             assert_eq!(loaded.upload_context_proof, healthy.upload_context_proof);
-            if map != 0 {
-                assert_eq!(
-                    loaded.claude_account_family_pending,
-                    healthy.claude_account_family_pending
-                );
-            }
             if map != 2 {
                 assert_eq!(
                     serde_json::to_vec(&loaded.claude_request_census).unwrap(),
@@ -189,9 +185,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             );
             assert!(loaded.decode_holds_family("arbitrary-family"));
             assert!(loaded.decode_holds_entity("arbitrary-body"));
-            let pending_before = loaded.claude_account_family_pending.clone();
-            loaded.retire_committed_claude_account_pending_windows();
-            assert_eq!(loaded.claude_account_family_pending, pending_before);
             let old_move_hold = loaded.claude_history_move_released;
             loaded.note_claude_history_cutoff(PriorHistory::Moved, true, false);
             assert_eq!(loaded.claude_history_move_released, old_move_hold);
@@ -603,13 +596,11 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             scan_index_persistence::UnavailableCause::Digest
         );
         let old_context = unknown.upload_context_proof.clone();
-        let old_pending = unknown.claude_account_family_pending.clone();
         let old_release = unknown.claude_history_move_released;
         let old_files = serde_json::to_vec(&unknown.files).unwrap();
         let ((held_scan, manifest, held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    unknown.retire_committed_claude_account_pending_windows();
                     recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })
             });
@@ -625,7 +616,6 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
             .to_string()
             .contains("scan_index_map_unavailable"));
         assert_eq!(unknown.upload_context_proof, old_context);
-        assert_eq!(unknown.claude_account_family_pending, old_pending);
         assert_eq!(unknown.claude_history_move_released, old_release);
         assert_eq!(serde_json::to_vec(&unknown.files).unwrap(), old_files);
 
