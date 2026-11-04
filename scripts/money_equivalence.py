@@ -506,14 +506,19 @@ def native_coverage(arm, stdout):
     return expected
 
 
-def receipt_names(left, right, expected):
-    """(compared, uncompared) receipt names: base must be a subset of head, and
-    only a head-only fixture the base does not emit is uncompared."""
+def receipt_names(left, right, head_expected, base_expected=None):
+    """(compared, uncompared) receipt names. Each arm's receipts are exactly its
+    VERIFIED fixtures (base_expected defaults to head_expected); base must be a
+    subset of head, and only a head-only fixture absent on base is uncompared."""
     def listed(directory):
         return {p.name for p in directory.glob("*.json") if not p.name.endswith(".cross-build.json")}
+
+    def files(expected):
+        return {f"{name}.json" for name in expected}
     base, head = listed(left), listed(right)
-    if (len(head) != len(expected) or not base <= head
-            or not head - base <= {f"{name}.json" for name in HEAD_ONLY_FIXTURES}):
+    base_expected = head_expected if base_expected is None else base_expected
+    if (base != files(base_expected) or head != files(head_expected) or not base <= head
+            or not head - base <= files(HEAD_ONLY_FIXTURES)):
         raise RuntimeError("missing or extra fixture receipts")
     return sorted(base & head), sorted(head - base)
 
@@ -650,9 +655,10 @@ def main():
             result.check_returncode()
             expected[arm] = native_coverage(arm, result.stdout)
         left, right = receipts / "base", receipts / "head"
-        names, uncompared = receipt_names(left, right, expected["head"])
+        names, uncompared = receipt_names(left, right, expected["head"], expected["base"])
         signed_lists = signed_money_lists(declarations, names + uncompared)
-        uncompared_records, failures = uncompared_receipts(right, uncompared, signed_lists)
+        uncompared_records, signed_uncompared = uncompared_receipts(right, uncompared, signed_lists)
+        failures = []
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
             if (left / inputs).read_bytes() != (right / inputs).read_bytes():
@@ -677,8 +683,14 @@ def main():
             print(f"MONEY_EQUIVALENCE_DIFF {name} " + json.dumps(diff, sort_keys=True), flush=True)
             if has_forbidden_diff(diff):
                 failures.append(name)
+        errors = []
         if failures:
-            raise RuntimeError("base/head decoded cross-build bodies differ: " + ", ".join(failures))
+            errors.append("base/head decoded cross-build bodies differ: " + ", ".join(failures))
+        if signed_uncompared:
+            errors.append("signed money diff on uncompared head-only fixtures (absent on base, "
+                          "nothing to match): " + ", ".join(signed_uncompared))
+        if errors:
+            raise RuntimeError("; ".join(errors))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:

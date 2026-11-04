@@ -906,7 +906,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
     def coverage_and_receipts(self, base, head):
         expected = {"base": native_coverage("base", arm_log("base", base)),
                     "head": native_coverage("head", arm_log("head", head))}
-        return receipt_names(*self.receipts(base, head), expected["head"])
+        return receipt_names(*self.receipts(base, head), expected["head"], expected["base"])
 
     def test_empty_head_only_set_is_todays_gate(self):
         self.assertEqual(money_equivalence.HEAD_ONLY_FIXTURES, ())
@@ -923,6 +923,13 @@ class HeadOnlyFixtureTests(unittest.TestCase):
             verified_summary(names, [], "b", "h", 1.0),
             "Money equivalence VERIFIED: 10 + 2 disk-restore fixtures, base `b`, head `h`. "
             "1.0s. Family vector/Pi remain ignored.\n")
+
+    def test_alias_receipt_on_both_arms_is_red(self):
+        # Receipt files must be exactly the VERIFIED names, not just the right count.
+        names = sorted(NATIVE_FIXTURES)
+        aliased = [name for name in names if name != "side_owner"] + ["side_owner_alias"]
+        with self.assertRaisesRegex(RuntimeError, "^missing or extra fixture receipts$"):
+            receipt_names(*self.receipts(aliased, aliased), NATIVE_FIXTURES, NATIVE_FIXTURES)
 
     @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
     def test_head_only_fixture_absent_on_base_is_uncompared(self):
