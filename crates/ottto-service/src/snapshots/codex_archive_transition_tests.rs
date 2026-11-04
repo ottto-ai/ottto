@@ -637,7 +637,7 @@ pub(super) fn carried_downgrade_index(root: &Path) -> ScanIndex {
     .expect("a prepared carry retains the next ordinary save's authenticated lineage");
     index.save(session.path()).unwrap();
     let index = ScanIndex::load(session.path()).unwrap();
-    let mut value = serde_json::to_value(state_v2::money_test_support::resident(&index)).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
     // Keep provider objects alive for any historical census the driver runs.
     let sessions = root.join("carried/sessions");
     fs::create_dir_all(&sessions).unwrap();

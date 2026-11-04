@@ -16596,13 +16596,6 @@ impl OwnedSourceScan {
                     census.ownership_incomplete_file_count += held.len();
                     census.causes.add(ownership::INVENTORY, held.len());
                     residue_index_keys.extend(held.iter().cloned());
-                    let held_owners = inventory
-                        .headers
-                        .iter()
-                        .filter(|header| held.contains(&local_index_key(&header.candidate.path)))
-                        .map(|header| header.owner.clone())
-                        .collect::<BTreeSet<_>>();
-                    residue_blocked_session_ids.extend(held_owners);
                     identified_candidates
                         .retain(|candidate| !held.contains(&local_index_key(&candidate.path)));
                     while !identified_candidates.is_empty()
