@@ -383,6 +383,51 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn('[crate::snapshots::money::birth -> crate::snapshots::sources::money::birth]', out)
 
+    LONG = code('''
+        /// Checks both arguments.
+        fn long_signature(first_argument: Option<&str>, second_argument: u64) -> bool {
+            first_argument == Some("a b") && second_argument > 0
+        }
+    ''')
+    WRAPPED = code('''
+        /// Checks both arguments.
+        pub(super) fn long_signature(
+            first_argument: Option<&str>,
+            second_argument: u64,
+        ) -> bool {
+            first_argument == Some("a b") && second_argument > 0
+        }
+    ''')
+
+    def move_long(self, moved):
+        files = {src('snapshots.rs'): ROOT + self.LONG}
+        if (self.repo.root / src('snapshots/wide.rs')).exists():
+            files[src('snapshots/wide.rs')] = None
+        base = self.repo.commit(files)
+        head = self.repo.commit({src('snapshots.rs'): ROOT + 'mod wide;\n', src('snapshots/wide.rs'): moved})
+        return run(self.repo, base, head)
+
+    def test_a_rustfmt_reflow_after_a_visibility_token_is_a_reflowed_move(self):
+        status, out = self.move_long(self.WRAPPED)
+        self.assertEqual(status, 0, out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+        self.assertIn('reflowed fn long_signature (crates/demo/src/snapshots.rs:', out)
+        self.assertIn('move-only', out)
+
+    def test_a_reflow_that_hides_a_changed_identifier_or_literal_fails(self):
+        for old, new in (('second_argument: u64,', 'second_arg: u64,'), ('Some("a b")', 'Some("a c")')):
+            with self.subTest(new=new):
+                status, out = self.move_long(self.WRAPPED.replace(old, new))
+                self.assertEqual(status, 1, out)
+                self.assertIn('changed: fn long_signature', out)
+                self.assertIn(' 0 reflowed,', out)
+
+    def test_whitespace_inside_a_string_literal_is_not_a_reflow(self):
+        status, out = self.move_long(self.WRAPPED.replace('Some("a b")', 'Some("a  b")'))
+        self.assertEqual(status, 1, out)
+        self.assertIn('changed: fn long_signature', out)
+        self.assertIn(' 0 reflowed,', out)
+
     def test_report_mode_exits_zero_and_no_rust_change_is_a_pass(self):
         status, out = self.move(ROOT.replace('fn second() {}', 'fn second() { todo!() }'), None, '--report')
         self.assertEqual(status, 0)

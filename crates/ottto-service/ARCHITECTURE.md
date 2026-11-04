@@ -147,8 +147,9 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 - Existing subtrees that stay as they are: `state_v2/` and `tail_source/`.
 - `tests/`: tests that span stages; test data under `tests/fixtures/`.
 
-Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte;
-only visibility, `use`/`mod` lines, path literals and wrappers change) and
+Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
+or token for token when rustfmt re-wraps it; only visibility, `use`/`mod` lines, path literals and
+wrappers change) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.

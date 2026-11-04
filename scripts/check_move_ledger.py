@@ -18,9 +18,12 @@ across files. Before comparing, only these glue classes are reversed:
 
 Then every base item must equal exactly one head item byte for byte (comments,
 attributes, cfgs), and items that land in one file keep their base order. An
-item must sit under the same module attributes (`#[cfg(..)]` and the like), may
-only lose nesting, and every path literal must resolve, from its new file, to
-a target with the same bytes.
+item rustfmt re-wraps (say once a visibility token makes its signature too
+long) still matches, listed as `reflowed`: its tokens must be equal once
+whitespace and a trailing `,` that ends a line before `)` or `>` are dropped;
+literals and comments stay exact. An item must sit under the same module
+attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
+literal must resolve, from its new file, to a target with the same bytes.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -73,6 +76,10 @@ class Unit:
     def key(self) -> tuple[str, str]:
         return self.container, self.text
 
+    @property
+    def reflow_key(self) -> tuple[str, tuple[str, ...]]:
+        return self.container, reflow_tokens(self.text)
+
     def where(self) -> str:
         return f"{self.file}:{self.line}"
 
@@ -80,6 +87,23 @@ class Unit:
 def squash(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.replace("( ", "(").replace(" )", ")")
+
+
+def reflow_tokens(text: str) -> tuple[str, ...]:
+    """The tokens of `text` without whitespace and without the trailing `,` rustfmt adds when it breaks
+    a list over lines (a `,` that ends a line before `)` or `>`). Literals and comments are tokens."""
+    tokens = rst.tokenize(text)
+    pieces = [(token.kind, text[token.start:token.end]) for token in tokens]
+    kept: list[str] = []
+    for index, (kind, piece) in enumerate(pieces):
+        if kind == "ws":
+            continue
+        after = pieces[index + 1:index + 3]
+        if (kind == "punct" and piece == "," and len(after) == 2 and after[0][0] == "ws" and "\n" in after[0][1]
+                and after[1] in (("punct", ")"), ("punct", ">"))):
+            continue
+        kept.append(piece)
+    return tuple(kept)
 
 
 def dedent(text: str, columns: int) -> str:
@@ -248,20 +272,22 @@ def show(module: tuple[str, ...] | None) -> str:
 @dataclass
 class Ledger:
     pairs: list[tuple[Unit, Unit]] = field(default_factory=list)
+    reflowed: list[tuple[Unit, Unit]] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     widened: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
-def match_units(base: list[Unit], head: list[Unit]) -> tuple[list[tuple[Unit, Unit]], list[Unit], list[Unit]]:
-    """Pair equal units: same file first, then in base order."""
-    head_by_key: dict[tuple[str, str], list[Unit]] = {}
+def match_units(base: list[Unit], head: list[Unit], key=lambda unit: unit.key
+                ) -> tuple[list[tuple[Unit, Unit]], list[Unit], list[Unit]]:
+    """Pair units with equal keys: same file first, then in base order."""
+    head_by_key: dict[tuple, list[Unit]] = {}
     for unit in head:
-        head_by_key.setdefault(unit.key, []).append(unit)
+        head_by_key.setdefault(key(unit), []).append(unit)
     pairs, lost = [], []
     pending: list[Unit] = []
     for unit in base:
-        candidates = head_by_key.get(unit.key)
+        candidates = head_by_key.get(key(unit))
         same = next((c for c in candidates or [] if c.file == unit.file), None)
         if same is not None:
             candidates.remove(same)
@@ -269,7 +295,7 @@ def match_units(base: list[Unit], head: list[Unit]) -> tuple[list[tuple[Unit, Un
         else:
             pending.append(unit)
     for unit in pending:
-        candidates = head_by_key.get(unit.key)
+        candidates = head_by_key.get(key(unit))
         if candidates:
             pairs.append((unit, candidates.pop(0)))
         else:
@@ -302,8 +328,9 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
           allow_widened: set[str]) -> Ledger:
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
-    ledger.pairs = sorted(pairs, key=lambda pair: (pair[0].file, pair[0].seq))
-    moves = module_moves(pairs, head_modules)
+    ledger.reflowed, lost, gained = match_units(lost, gained, key=lambda unit: unit.reflow_key)
+    ledger.pairs = sorted(pairs + ledger.reflowed, key=lambda pair: (pair[0].file, pair[0].seq))
+    moves = module_moves(ledger.pairs, head_modules)
     explain_differences(ledger, lost, gained)
     by_destination: dict[tuple[str, str], list[tuple[Unit, Unit]]] = {}
     for old, new in ledger.pairs:
@@ -490,11 +517,14 @@ def main(argv: list[str] | None = None) -> int:
     moved = sum(1 for old, new in ledger.pairs if old.file != new.file or old.module != new.module)
     print(f"move-ledger: {len(base_units)} base items in {len(base_files)} files, "
           f"{len(head_units)} head items in {len(head_files)} files: "
-          f"{len(ledger.pairs) - moved} untouched, {moved} moved, {len(ledger.widened)} widened, "
+          f"{len(ledger.pairs) - moved} untouched, {moved} moved, {len(ledger.reflowed)} reflowed, "
+          f"{len(ledger.widened)} widened, "
           f"{len(ledger.failures)} problems")
     limit = REPORT_LIMIT if args.report else None
     for row in rows[:limit]:
         print(f"  moved {row}")
+    for old, new in ledger.reflowed[:limit]:
+        print(f"  reflowed {old.label} ({old.where()} -> {new.where()})")
     for row in ledger.widened[:limit]:
         print(f"  {row}")
     for note in ledger.notes[:limit]:
