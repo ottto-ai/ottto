@@ -197,13 +197,18 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         Err(ReconstructCause::Corrupt)
     );
 
-    // A header time without a parent never comes from the reducer.
-    let (mut orphan, certificate) = parse(&lines(2, 0, None));
-    orphan.accumulator_for_test().seen_pi_usage_keys.fork = Some(Box::new(PiFork {
-        has_parent: false,
-        header_nanos: Some(1),
-    }));
-    let staged = stage(&orphan, &certificate);
+    // A header time without a parent never comes from the reducer: a stored
+    // head with one is corrupt.
+    let (forked, certificate) = parse(&lines(2, 0, Some("synthetic-parent.jsonl")));
+    let fork = forked.finish_view().0.seen_pi_usage_keys.fork_parts();
+    assert!(fork.0 && fork.1.is_some());
+    let mut staged = stage(&forked, &certificate);
+    let stored = crate::durable_tail_codec::Enc::count_write(64, |e| fork.put(e)).unwrap();
+    let orphan =
+        crate::durable_tail_codec::Enc::count_write(64, |e| (false, fork.1).put(e)).unwrap();
+    assert!(staged.head.ends_with(&stored));
+    staged.head.truncate(staged.head.len() - stored.len());
+    staged.head.extend(orphan);
     assert_eq!(
         Pi::decode_head(staged.revision, &staged.head, &mut fresh()).map(|_| ()),
         Err(ReconstructCause::Corrupt)
