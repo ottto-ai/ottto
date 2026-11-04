@@ -33,6 +33,12 @@ const SIGNATURES_G: u32 = 256;
 const REQUESTS_G: u32 = 64;
 const COMPACTIONS_G: u32 = 64;
 const SLOTS_FIELD: &str = "SnapshotAccumulator.codex_dictionary_slots";
+// `install_live`'s refusals, by the check that refused, as their counter labels.
+const INCOMPATIBLE_SIDECAR_BINDING: &str = "incompatible_sidecar_binding";
+const INCOMPATIBLE_COUNTING_VERSION: &str = "incompatible_counting_version";
+const INCOMPATIBLE_PRIORITY_WITNESS: &str = "incompatible_priority_witness";
+const INCOMPATIBLE_PRIORITY_DECISION: &str = "incompatible_priority_decision";
+const INCOMPATIBLE_ORDINAL: &str = "incompatible_ordinal";
 
 const COLLECTIONS: [CollectionSpec; 11] = [
     slot(Collection::CodexActiveTurns, DICTIONARY_G),
@@ -446,7 +452,8 @@ impl TailSource for Codex {
     /// The stored state continues only under this read's inputs, and each
     /// check either installs them or names why not: absent evidence holds the
     /// file (`Unavailable`), changed or incompatible evidence is a counted
-    /// reconstruction. Never a silent success. In order: the counting rule,
+    /// reconstruction, labelled with the check that refused it
+    /// (`INCOMPATIBLE_*`). Never a silent success. In order: the counting rule,
     /// the priority decisions, the sidecar's projected ordinal; then the traces and file
     /// birth. Last, the file's lineage (D131): the stored head continues only
     /// the session its owning header named when it was written, so a header
@@ -460,27 +467,28 @@ impl TailSource for Codex {
         fresh: &CandidateFile,
         live: &SnapshotAccumulator,
     ) -> Result<(), LiveLoadError> {
-        let incompatible = LiveLoadError::Reconstruct(ReconstructCause::Incompatible);
+        let incompatible =
+            |label: &'static str| LiveLoadError::Reconstruct(ReconstructCause::Incompatible(label));
         // The same dependency that invalidates the RAM reduction: ownership
         // classification/lineage changes require the existing counted Full.
         if stored.codex_sidecar_binding != live.codex_sidecar_binding {
-            return Err(incompatible);
+            return Err(incompatible(INCOMPATIBLE_SIDECAR_BINDING));
         }
         if !codex_counting_version::reusable(
             stored.codex_counting.as_deref(),
             live.codex_counting.as_deref(),
         ) {
-            return Err(incompatible);
+            return Err(incompatible(INCOMPATIBLE_COUNTING_VERSION));
         }
         // A stored read that dropped its witnesses cannot show its decisions
         // still hold.
         let Some(observed) = stored.codex_observed_priority_turns.as_ref() else {
-            return Err(incompatible);
+            return Err(incompatible(INCOMPATIBLE_PRIORITY_WITNESS));
         };
         match priority_decisions(observed, live.codex_turn_traces.as_ref()) {
             PriorityDecisions::Hold => {}
             PriorityDecisions::Unavailable => return Err(LiveLoadError::Unavailable),
-            PriorityDecisions::Changed => return Err(incompatible),
+            PriorityDecisions::Changed => return Err(incompatible(INCOMPATIBLE_PRIORITY_DECISION)),
         }
         // The projection only advances with the sidecar; a lower one is
         // another sidecar.
@@ -489,7 +497,9 @@ impl TailSource for Codex {
             live.codex_sidecar_projected_next_ordinal,
         ) {
             (Some(_), None) => return Err(LiveLoadError::Unavailable),
-            (Some(made_under), Some(now)) if now < made_under => return Err(incompatible),
+            (Some(made_under), Some(now)) if now < made_under => {
+                return Err(incompatible(INCOMPATIBLE_ORDINAL))
+            }
             _ => {}
         }
         match crate::snapshots::codex_file_join::header_owner(fresh) {

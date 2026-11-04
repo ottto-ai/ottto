@@ -853,7 +853,8 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     }
     let mut resumed = Vec::new();
     let mut cold = Vec::new();
-    let reconstructions = super::super::counters::total("tail_reconstruct", "incompatible");
+    let reconstructions =
+        super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding");
     for (n, path) in paths.iter().enumerate() {
         let key = local_index_key(path);
         let mut parser = open_with(path, &after);
@@ -901,7 +902,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
         cold.extend(native.unwrap().snapshots);
     }
     assert_eq!(
-        super::super::counters::total("tail_reconstruct", "incompatible"),
+        super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding"),
         reconstructions + 1
     );
     assert!(

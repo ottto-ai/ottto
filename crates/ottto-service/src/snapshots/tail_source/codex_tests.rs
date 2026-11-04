@@ -593,8 +593,12 @@ fn install_live_continues_only_the_stored_lineage() {
     );
 }
 
-const INCOMPATIBLE: Result<(), LiveLoadError> =
-    Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible));
+/// `install_live` refused under the check counted as `label`.
+fn incompatible(label: &'static str) -> Result<(), LiveLoadError> {
+    Err(LiveLoadError::Reconstruct(ReconstructCause::Incompatible(
+        label,
+    )))
+}
 
 /// [behaviour] Every prior decision holding installs this cycle's inputs, and
 /// the fresh parser keeps its own for the read's preparation.
@@ -635,7 +639,10 @@ fn install_live_compares_the_projected_ordinal() {
         install(&mut stored(), &live(None)),
         Err(LiveLoadError::Unavailable)
     );
-    assert_eq!(install(&mut stored(), &live(Some(4))), INCOMPATIBLE);
+    assert_eq!(
+        install(&mut stored(), &live(Some(4))),
+        incompatible(INCOMPATIBLE_ORDINAL)
+    );
     let mut grown = stored();
     assert_eq!(install(&mut grown, &live(Some(6))), Ok(()));
     assert_eq!(grown.codex_sidecar_projected_next_ordinal, Some(6));
@@ -652,10 +659,16 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
         codex_counting_version::AckEvidence::None,
         Some(1),
     )));
-    assert_eq!(install(&mut stored, &live), INCOMPATIBLE);
+    assert_eq!(
+        install(&mut stored, &live),
+        incompatible(INCOMPATIBLE_COUNTING_VERSION)
+    );
 
     let mut stored = SnapshotAccumulator::new(SnapshotSource::Codex);
-    assert_eq!(install(&mut stored, &live), INCOMPATIBLE);
+    assert_eq!(
+        install(&mut stored, &live),
+        incompatible(INCOMPATIBLE_PRIORITY_WITNESS)
+    );
 
     let decided = |priority: bool| {
         let mut stored = continuable();
@@ -684,7 +697,7 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     };
     assert_eq!(
         install(&mut decided(true), &with_traces(false)),
-        INCOMPATIBLE,
+        incompatible(INCOMPATIBLE_PRIORITY_DECISION),
         "complete traces prove the change"
     );
     assert_eq!(
@@ -692,6 +705,53 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
         Err(LiveLoadError::Unavailable),
         "incomplete traces do not"
     );
+}
+
+/// [behaviour] Each `install_live` refusal counts under its own label: a
+/// stored head that differs from a continuable one in exactly one input
+/// names that check on `tail_reconstruct`, so an incompatible Full says
+/// which input changed.
+#[test]
+fn install_live_labels_each_incompatible_check() {
+    let live = || SnapshotAccumulator::new(SnapshotSource::Codex);
+    let rows: [(
+        &'static str,
+        fn(&mut SnapshotAccumulator, &mut SnapshotAccumulator),
+    ); 5] = [
+        ("incompatible_sidecar_binding", |stored, _| {
+            stored.codex_sidecar_binding = Some("another binding".into());
+        }),
+        ("incompatible_counting_version", |stored, _| {
+            stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
+                codex_counting_version::AckEvidence::None,
+                Some(1),
+            )));
+        }),
+        ("incompatible_priority_witness", |stored, _| {
+            stored.codex_observed_priority_turns = None;
+        }),
+        ("incompatible_priority_decision", |stored, live| {
+            stored
+                .codex_observed_priority_turns
+                .as_mut()
+                .unwrap()
+                .insert("t".into(), true);
+            live.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap::default()));
+        }),
+        ("incompatible_ordinal", |stored, live| {
+            stored.codex_sidecar_projected_next_ordinal = Some(5);
+            live.codex_sidecar_projected_next_ordinal = Some(4);
+        }),
+    ];
+    for (label, differ) in rows {
+        let (mut stored, mut live) = (continuable(), live());
+        differ(&mut stored, &mut live);
+        let Err(LiveLoadError::Reconstruct(cause)) = install(&mut stored, &live) else {
+            panic!("{label}: a counted reconstruction");
+        };
+        assert_eq!(cause, ReconstructCause::Incompatible(label));
+        assert_eq!(cause.label(), label, "the tail_reconstruct label");
+    }
 }
 
 /// [format] Codex's content is session facts in the shared slot collection:
@@ -744,6 +804,6 @@ fn codex_content_loads_back_from_its_session_facts() {
     .unwrap();
     assert_eq!(
         Codex::decode_page(Collection::SessionFacts, 6, &unknown, &mut into).err(),
-        Some(ReconstructCause::Incompatible)
+        Some(ReconstructCause::INCOMPATIBLE)
     );
 }
