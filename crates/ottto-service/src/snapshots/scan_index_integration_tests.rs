@@ -185,13 +185,6 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             );
             assert!(loaded.decode_holds_family("arbitrary-family"));
             assert!(loaded.decode_holds_entity("arbitrary-body"));
-            assert!(matches!(
-                loaded.lower_claude_retired_family_tombstone_fence(
-                    &BTreeSet::new(),
-                    &BTreeSet::new()
-                ),
-                ClaudeTombstoneFenceRepair::Kept { .. }
-            ));
             let old_move_hold = loaded.claude_history_move_released;
             loaded.note_claude_history_cutoff(PriorHistory::Moved, true, false);
             assert_eq!(loaded.claude_history_move_released, old_move_hold);
@@ -608,13 +601,6 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let ((held_scan, manifest, held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    assert!(matches!(
-                        unknown.lower_claude_retired_family_tombstone_fence(
-                            &BTreeSet::new(),
-                            &BTreeSet::new()
-                        ),
-                        ClaudeTombstoneFenceRepair::Kept { .. }
-                    ));
                     recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
                 })
             });

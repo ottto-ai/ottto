@@ -1551,6 +1551,63 @@ fn retired_raw_holds_load_and_are_purged_by_the_next_save() {
     db.audit_headers().unwrap();
 }
 
+/// [format] An earlier store's retired-family tombstone rows (a map entry with
+/// its manifest, the marker and a raised uncertainty fence) still load:
+/// hydrate names their keys without reading them, no file is re-armed for a
+/// re-read, and the next save removes every row.
+#[test]
+fn retired_family_tombstone_rows_load_and_are_purged_by_the_next_save() {
+    let (_scratch, mut db) = Scratch::live_store();
+    let index = fixture();
+    commit_populate(&mut db, &index);
+    let map = "tombstone.claude_retired_family_tombstones";
+    let rows = [
+        (mapper::key(map, "", 0).unwrap(), serde_json::json!(1)),
+        (
+            mapper::key(map, &"a".repeat(64), 1).unwrap(),
+            serde_json::json!(7),
+        ),
+        (
+            mapper::key(
+                "setting.claude_retired_family_tombstones_initialized",
+                "",
+                0,
+            )
+            .unwrap(),
+            serde_json::json!(true),
+        ),
+        (
+            mapper::key("setting.claude_retired_family_tombstones_uncertain", "", 0).unwrap(),
+            serde_json::json!(true),
+        ),
+    ];
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for (key, value) in &rows {
+        mapper::put(&mut tx, key, value).unwrap();
+    }
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let keys = rows
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    let (restored, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(cx.retired, keys);
+    assert_eq!(
+        serde_json::to_value(&restored.files).unwrap(),
+        serde_json::to_value(&index.files).unwrap(),
+        "no file is re-armed for a re-read"
+    );
+    purge(&mut db, Scratch::binding()).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for key in &keys {
+        assert!(tx.get(key).unwrap().is_none(), "the save removes {key:?}");
+    }
+    drop(tx);
+    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert!(cx.retired.is_empty());
+    db.audit_headers().unwrap();
+}
+
 /// [format] Hydrate visits a retired row's header only: a value no codec
 /// can read does not fail the load, and the row is still named for removal.
 #[test]

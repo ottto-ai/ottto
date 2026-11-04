@@ -23,8 +23,6 @@ fn fixture() -> ScanIndex {
         "legacy_excluded_request_id_hashes":
             {"synthetic-file": excluded, "same-member": excluded},
     });
-    raw["claude_retired_family_tombstones"] = json!({"a".repeat(64):u64::MAX});
-    raw["claude_retired_family_tombstones_initialized"] = json!(true);
     // MISC multi-segment scalar alongside FILES, ACCOUNTS and CENSUS owners.
     raw["historical_replay_generation"] = json!("x".repeat(3 * 64 * 1024 + 17));
     serde_json::from_value(raw).unwrap()
@@ -80,9 +78,9 @@ fn assert_refs(db: &mut sqlite::Sqlite) -> BTreeMap<RowKey, u64> {
     actual
 }
 
-/// [money] money presence empty null zero and tombstones survive all kind hydration.
+/// [money] money presence empty null and zero survive all kind hydration.
 #[test]
-fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
+fn money_presence_empty_null_and_zero_survive_all_kind_hydration() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-presence");
     for (n, value) in [None, Some(serde_json::Value::Null), Some(json!(0))]
         .into_iter()
@@ -127,12 +125,11 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
     }
 }
 
-/// [money] money missing owner tombstone or segment refuses complete hydration.
+/// [money] money missing owner or segment refuses complete hydration.
 #[test]
-fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
+fn money_missing_owner_or_segment_refuses_complete_hydration() {
     for kind in [
         "v1_field.census_shadow",
-        "tombstone.claude_retired_family_tombstones",
         "proof.usage",
         "file.census",
         "file.entities",

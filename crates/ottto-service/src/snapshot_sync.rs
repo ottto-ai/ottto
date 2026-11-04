@@ -9428,9 +9428,6 @@ pub struct ClaudeLocalEvidenceStats {
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_census: Option<crate::snapshots::ClaudeRequestCensusShadowCounts>,
-    /// RetryPending families whose returning root retains a retirement
-    /// tombstone, separate from all other RetryPending causes. Local only.
-    pub returning_family_grown_held: usize,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -10444,7 +10441,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.request_census = scan_result.claude_request_census_shadow;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
-    stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal

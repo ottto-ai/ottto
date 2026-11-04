@@ -720,14 +720,6 @@ fn given() -> Vec<(&'static str, Vec<Given>)> {
             vec![g(|s| Ok(s.string().into()))],
         ),
         (
-            "claude_retired_family_tombstones",
-            vec![g(|s| {
-                let mut roots = serde_json::Map::new();
-                roots.insert(s.string(), 1.into());
-                Ok(Json::Object(roots))
-            })],
-        ),
-        (
             "claude_money_birth_store",
             vec![g(|_| Ok(BIRTH_STORE.into()))],
         ),
