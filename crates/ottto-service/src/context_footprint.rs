@@ -2746,7 +2746,7 @@ mod tests {
     #[test]
     fn source_disabled_refusal_is_not_a_receipt() {
         let support = temp_dir("footprint-source-disabled");
-        let (client, server) = crate::snapshot_client::tests::config_upload_backend(
+        let (client, server) = crate::snapshot_client::config_upload_backend(
             r#"{"accepted":false,"reason":"source_disabled"}"#,
         );
         let mut request = sample_request();
@@ -2769,7 +2769,7 @@ mod tests {
         assert!(error.is::<crate::snapshot_client::UploadRefused>());
         assert!(!cache_path(&support, &request.workspace_hash).exists());
 
-        let (client, server) = crate::snapshot_client::tests::config_upload_backend(
+        let (client, server) = crate::snapshot_client::config_upload_backend(
             r#"{"accepted":false,"reason":"source_disabled"}"#,
         );
         request.agent_source = "codex".to_string();

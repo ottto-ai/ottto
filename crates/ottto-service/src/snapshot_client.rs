@@ -3509,7 +3509,10 @@ pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) use tests::config_upload_backend;
+
+#[cfg(test)]
+mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;

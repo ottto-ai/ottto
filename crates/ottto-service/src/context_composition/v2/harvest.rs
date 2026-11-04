@@ -2680,7 +2680,7 @@ pub(super) mod tests {
             upload::{ack_path, upload_scope, UploadTarget},
         };
         let state = crate::test_scratch::private_dir("composition-upload-reply");
-        let (client, server) = crate::snapshot_client::tests::config_upload_backend(body);
+        let (client, server) = crate::snapshot_client::config_upload_backend(body);
         let mut uploader = super::ClientUploader {
             client: &client,
             relay_token: "synthetic-relay".to_string(),
