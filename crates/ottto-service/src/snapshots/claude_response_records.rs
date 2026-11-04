@@ -38,10 +38,6 @@ pub(super) struct ClaudeResponseBook {
 }
 
 impl ClaudeResponseBook {
-    pub(super) fn is_empty(&self) -> bool {
-        self.responses.is_empty()
-    }
-
     /// Responses in first-seen order.
     pub(super) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
         self.responses.iter()
@@ -101,13 +97,6 @@ impl ClaudeSelectorTable {
         }
         self.selectors.push(selector);
         CompactClaudeSelector::Interned((self.selectors.len() - 1) as u32)
-    }
-
-    fn get<'a>(&'a self, selector: &'a CompactClaudeSelector) -> Option<&'a SelectorCapture> {
-        match selector {
-            CompactClaudeSelector::Interned(index) => self.selectors.get(*index as usize),
-            CompactClaudeSelector::Inline(selector) => Some(selector),
-        }
     }
 
     fn decode(&self, selector: CompactClaudeSelector) -> Option<SelectorCapture> {

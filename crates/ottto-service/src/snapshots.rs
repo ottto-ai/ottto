@@ -16548,7 +16548,7 @@ impl OwnedSourceScan {
 
     #[inline(never)]
     fn step_with_capture_credit_inner(
-        mut self,
+        self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         mut capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {

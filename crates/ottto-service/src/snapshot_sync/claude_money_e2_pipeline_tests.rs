@@ -149,6 +149,7 @@ impl Corpus {
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        let committed = index.clone();
         let (index, scan, modes) = scanner.scan(
             std::slice::from_ref(&self.root),
             &self.support,
@@ -159,6 +160,8 @@ impl Corpus {
             hints,
         );
         Page {
+            cache: scanner.cache.clone(),
+            committed,
             index,
             scan,
             modes,
@@ -188,6 +191,8 @@ impl Drop for Corpus {
     }
 }
 struct Page {
+    cache: std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    committed: ScanIndex,
     index: ScanIndex,
     scan: SourceScanResult,
     modes: (usize, usize, usize),
@@ -723,6 +728,8 @@ fn streamed_evidence_equals_whole_corpus() {
 
 fn twin(p: &Page) -> Page {
     Page {
+        cache: p.cache.clone(),
+        committed: p.committed.clone(),
         index: p.index.clone(),
         scan: p.scan.clone(),
         modes: p.modes,

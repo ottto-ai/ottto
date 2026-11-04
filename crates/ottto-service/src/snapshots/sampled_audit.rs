@@ -326,7 +326,7 @@ impl SourceScanResult {
         backfill_window_days: u64,
     ) {
         let mut queued = 0_u64;
-        for (key, fingerprint) in self.completed_parses() {
+        for (key, _) in self.completed_parses() {
             if !previous.claude_account_deferred_holds.contains_key(key)
                 || index.claude_account_deferred_holds.contains_key(key)
                 || !index
