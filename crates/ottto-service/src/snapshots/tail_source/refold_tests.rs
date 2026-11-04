@@ -223,7 +223,7 @@ fn a_conflict_owed_session_reads_native_full() {
     assert_eq!(page["read"]["head_conflict"]["native_bytes"], 7);
 }
 
-/// [money] A2: once the session's challenge clears (an ordinary accept or an
+/// [money] Once the session's challenge clears (an ordinary accept or an
 /// unchanged ACK removes it from the ledger, and the next prepare mirrors no
 /// open challenge), its file continues from the Tail again: no
 /// `ConflictOwed` miss and no Full. An unchanged file re-folds reading no

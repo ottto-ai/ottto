@@ -354,7 +354,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         assert!(answered.modes.0 > 0, "the owed answer reads a native Full");
         money_oracle::assert_equivalent(&cold, &result(&answered, Mode::ColdFull));
 
-        // A2: the answer is accepted and the challenge clears, so the next
+        // The answer is accepted and the challenge clears, so the next
         // prepare mirrors none. The next pass continues the session's files
         // from the Tail: the root's growth and its subagent member's growth
         // (the member the family pull brings in) read no Full and miss no

@@ -2582,7 +2582,7 @@ fn mixed_route(
     result
 }
 
-/// [money] E1 + E1p: a mixed page (a patched forked session beside an
+/// [money] A mixed page (a patched forked session beside an
 /// unpatched one that switches organization mid-session, plus a side call)
 /// emits equal bodies, totals and
 /// account/organization placement, including the actual post-ACK ledger, on
@@ -2629,9 +2629,8 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
         assert!(sent
             .iter()
             .any(|item| item.source_session_id == UNPATCHED && item.cache_observations.is_none()));
-        let (result, wire, _) = upload(&sent, &mut progress, ack);
+        let (result, _, _) = upload(&sent, &mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-        assert_eq!(wire.len(), 2, "one request per patch class");
         settle_index_after_upload(&mut first.index, &first.committed, &progress);
         accept_upload_context_acks_for_test(
             &mut first.index,
@@ -2789,7 +2788,7 @@ fn assert_mixed_placement_corruption_detected(
     assert!(std::panic::catch_unwind(|| money_oracle::assert_equivalent(cold, &wrong)).is_err());
 }
 
-/// [money] E1p: one combined positive control on a MIXED page. The patched
+/// [money] One combined positive control on a MIXED page. The patched
 /// forked session switches account mid-session (two accounts and two
 /// organizations), has a side call with no transcript owner and a response
 /// with no evidence beside tagged rows (by design the gap carries the
@@ -2835,7 +2834,7 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             c.evidence(&api, &traces);
         };
         // (request, tokens) on the unpatched session: its organizations come
-        // from transcript markers, as in E1.
+        // from transcript markers, as on the mixed page above.
         let other_evidence = |rows: &[(&str, u64)]| {
             let api = rows
                 .iter()

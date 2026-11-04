@@ -1358,7 +1358,7 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
     if legacy {
         2
     } else {
-        u8::from(snapshot.cache_observations.is_some())
+        u8::from(crate::snapshot_client::declares_head_cas(snapshot))
     }
 }
 
@@ -16857,6 +16857,11 @@ mod tests {
     mod e2_upload_tests {
         use super::*;
         include!("snapshot_sync/e2_upload_tests.rs");
+    }
+
+    mod class_split_tests {
+        use super::*;
+        include!("snapshot_sync/class_split_tests.rs");
     }
 
     #[derive(Clone, Serialize)]
